@@ -71,6 +71,7 @@ mod retroarch_materialization;
 mod rpcs3_local;
 mod shared_preview;
 mod shared_transaction;
+mod xemu_local;
 mod xenia_install_plan;
 mod xenia_local;
 mod xenia_patch_document;
@@ -515,6 +516,14 @@ pub use shared_transaction::{
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
     require_dolphin_managed_gamehacking_verification,
+};
+pub use xemu_local::{
+    XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,
+    XemuGameIdMapping, XemuGameInspection, XemuGameRequest, XemuHealth, XemuInstallationType,
+    XemuProfile, XemuProfileBlocker, XemuProfileBlockerKind, XemuProfileDiscovery,
+    XemuProfileDiscoveryRoots, XemuProfileScope, XemuSystemFile, XemuSystemFileKind,
+    XemuSystemFileState, XemuWarning, XemuWarningKind, discover_xemu_profiles, inspect_xemu_game,
+    parse_xemu_version,
 };
 pub use xenia_install_plan::{
     LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,

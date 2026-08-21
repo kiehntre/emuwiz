@@ -42,6 +42,7 @@ pub mod settings;
 pub mod stale;
 pub mod status;
 pub mod verification;
+pub mod whdload;
 
 #[cfg(test)]
 mod stage1b_tests;
