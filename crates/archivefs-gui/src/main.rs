@@ -144,6 +144,7 @@ pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_game;
 pub(crate) mod romm_source;
+pub(crate) mod rpcs3_page;
 pub(crate) mod selected_evidence_no_intro;
 pub(crate) mod selected_evidence_page;
 pub mod selection_guard;
@@ -3778,6 +3779,12 @@ struct ArchiveFsApp {
     /// reloads the application.
     doctor_scan: DoctorScanState,
     doctor_scan_generation: RefreshGeneration,
+    /// Emulator Adapter Batch B: the read-only RPCS3 environment/status
+    /// panel on the Selected page - see `rpcs3_page`'s own module doc.
+    /// Starts `Idle`; loading is always an explicit action, never
+    /// automatic.
+    rpcs3_status: rpcs3_page::Rpcs3State,
+    rpcs3_status_generation: u64,
     /// The Cheat Sources page, loaded lazily the first time it is opened so
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
@@ -4244,6 +4251,8 @@ impl ArchiveFsApp {
             config_previously_confirmed: false,
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
+            rpcs3_status: rpcs3_page::Rpcs3State::Idle,
+            rpcs3_status_generation: 0,
             doctor_selected_finding: None,
             doctor_repair_review: None,
             doctor_repair_result: None,
@@ -5057,6 +5066,67 @@ impl ArchiveFsApp {
             scan,
             finished_at_unix_seconds,
         }));
+    }
+
+    /// Emulator Adapter Batch B: starts the one real, background RPCS3
+    /// environment check. Explicit only (a button press); never called
+    /// automatically. `verified_title_id` must already be authoritative -
+    /// this method never derives one; see `rpcs3_page`'s own module doc.
+    fn start_rpcs3_status_load(
+        &mut self,
+        context: egui::Context,
+        verified_title_id: Option<String>,
+    ) {
+        self.rpcs3_status_generation += 1;
+        let generation = self.rpcs3_status_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.rpcs3_status = rpcs3_page::Rpcs3State::Loading {
+            generation,
+            receiver,
+        };
+        thread::spawn(move || {
+            let outcome = rpcs3_page::gather_rpcs3_status(verified_title_id);
+            let _ = sender.send((generation, outcome));
+            context.request_repaint();
+        });
+    }
+
+    /// Emulator Adapter Batch B: applies the pure
+    /// [`rpcs3_page::Rpcs3Action`] the panel returned this frame - the
+    /// only thing it can ever ask for, and read-only.
+    fn handle_rpcs3_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<rpcs3_page::Rpcs3Action>,
+    ) {
+        if let Some(rpcs3_page::Rpcs3Action::Load) = action {
+            // No selected-ROM identity pipeline reaches this branch of the
+            // GUI yet (see `rpcs3_page`'s own module doc) - always `None`
+            // for now, so this panel only ever shows RPCS3's own
+            // environment health, never a game mapping. Once a verified
+            // PS3 title ID becomes available here, thread it through
+            // unchanged rather than deriving one in this method.
+            self.start_rpcs3_status_load(context.clone(), None);
+        }
+    }
+
+    /// Emulator Adapter Batch B: drains a completed RPCS3 status check,
+    /// discarding anything whose generation is no longer current - the
+    /// same stale-result guard every other background loader in this app
+    /// uses.
+    fn poll_rpcs3_status(&mut self) {
+        if let rpcs3_page::Rpcs3State::Loading {
+            generation,
+            receiver,
+        } = &self.rpcs3_status
+            && let Ok((message_generation, outcome)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            self.rpcs3_status = rpcs3_page::Rpcs3State::Ready {
+                generation: message_generation,
+                outcome,
+            };
+        }
     }
 
     /// Opens the confirmation screen for a repair. Opening it changes
@@ -14118,6 +14188,7 @@ impl ArchiveFsApp {
         self.poll_diagnostics();
         self.poll_setup_action(context);
         self.poll_doctor_scan();
+        self.poll_rpcs3_status();
         self.poll_platform_action(context);
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
@@ -15507,6 +15578,14 @@ impl ArchiveFsApp {
                         &self.plan_preview,
                     );
                     self.handle_plan_preview_action(context, plan_preview_action);
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    let rpcs3_action = rpcs3_page::show_rpcs3_panel(
+                        ui,
+                        self.ui_mode == GuiMode::AdvancedView,
+                        None,
+                        &self.rpcs3_status,
+                    );
+                    self.handle_rpcs3_action(context, rpcs3_action);
                     self.handle_mount_page_action(context, action);
                     return;
                 }

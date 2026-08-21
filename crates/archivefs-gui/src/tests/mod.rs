@@ -1158,6 +1158,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         identity_sources_generation: 0,
         plan_preview: plan_preview_page::PlanPreviewState::Idle,
         plan_preview_generation: 0,
+        rpcs3_status: rpcs3_page::Rpcs3State::Idle,
+        rpcs3_status_generation: 0,
         romm_ui: RommCardState::default(),
         romm_config_draft: None,
         romm_preview: None,
