@@ -58,6 +58,7 @@ mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod ppsspp_local;
 mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
@@ -387,6 +388,16 @@ pub use pcsx2_provider::{
     Pcsx2CheatConfidence, Pcsx2CheatProviderCatalogue, Pcsx2CheatProviderRecord,
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
+};
+pub use ppsspp_local::{
+    PPSSPP_MAX_CHEAT_BYTES, PPSSPP_MAX_CHEAT_ENTRIES, PPSSPP_MAX_CONFIG_BYTES,
+    PPSSPP_MAX_ENTRIES_VISITED, PPSSPP_MAX_PROFILES, PPSSPP_MAX_TEXTURE_DEPTH,
+    PPSSPP_MAX_TEXTURE_FILES, PpssppCheatInventory, PpssppDiscoveryError, PpssppExecutable,
+    PpssppGameIdMapping, PpssppGameInspection, PpssppGameRequest, PpssppGlobalConfig, PpssppHealth,
+    PpssppInspectionWarning, PpssppInspectionWarningKind, PpssppInstallationType, PpssppProfile,
+    PpssppProfileBlocker, PpssppProfileBlockerKind, PpssppProfileDiscovery,
+    PpssppProfileDiscoveryRoots, PpssppProfileScope, PpssppSaveDataInventory, PpssppSettings,
+    PpssppTextureInventory, discover_ppsspp_profiles, inspect_ppsspp_game, parse_ppsspp_version,
 };
 pub use resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
