@@ -16,6 +16,7 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+pub mod amiga_disk;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
