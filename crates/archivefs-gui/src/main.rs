@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, TryRecvError},
 };
@@ -148,6 +148,8 @@ pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_game;
 pub(crate) mod romm_source;
+pub(crate) mod selected_evidence_no_intro;
+pub(crate) mod selected_evidence_page;
 pub mod selection_guard;
 pub mod status_wording;
 mod ui;
@@ -1800,6 +1802,95 @@ impl DoctorScanState {
     fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
     }
+}
+
+/// GUI Batch A closeout: wires the persisted DAT source registry
+/// (`archivefs_core::dat::sources::DatSourceRegistry`) into
+/// [`selected_evidence_page::gather_selected_evidence`]'s No-Intro lookup,
+/// so the Selected page's evidence panel can use whatever No-Intro DAT the
+/// user has already registered - not just a hardcoded `None`.
+///
+/// Runs entirely off the UI thread (called from inside the same
+/// `thread::spawn` `start_selected_evidence_load` already uses). Order of
+/// operations:
+///
+/// 1. Read the file once and run the real structural detectors to learn the
+///    candidate platform - cheap header parsing, not hashing.
+/// 2. Load the registry (the same on-disk file `DatSourcesPageState::load`
+///    reads; this is not a second persistent registry, just another read of
+///    the same one) and resolve it through `no_intro_source_cache`, which
+///    only re-parses a DAT file when the registry's relevant, platform-
+///    scoped fingerprint has actually changed since the last resolve - see
+///    `selected_evidence_no_intro::NoIntroSourceCache`.
+/// 3. Hand the resolved source (if exactly one) to the existing, unchanged
+///    `gather_selected_evidence`, which does the real hashing and lookup.
+///    Ambiguity is never resolved to a first pick: when more than one
+///    enabled, platform-relevant source qualifies, the report's
+///    `no_intro` field is patched to `NoIntroLookupResult::Ambiguous`
+///    instead, naming every competing source.
+fn gather_selected_evidence_with_registry(
+    path: &Path,
+    no_intro_source_cache: &Mutex<selected_evidence_no_intro::NoIntroSourceCache>,
+) -> Result<selected_evidence_page::SelectedEvidenceReport, String> {
+    let dat_sources_config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
+    gather_selected_evidence_with_registry_at(
+        path,
+        no_intro_source_cache,
+        dat_sources_config_path.as_deref().ok(),
+    )
+}
+
+/// [`gather_selected_evidence_with_registry`] with the DAT sources config
+/// path injected, so a test never reads or depends on the real home
+/// directory's registry file. `None` (no resolvable path, e.g. `HOME`
+/// unset) behaves exactly like an empty registry - `NotImported` - the same
+/// honest fallback `DatSourcesPageState` itself uses when the path cannot be
+/// resolved.
+fn gather_selected_evidence_with_registry_at(
+    path: &Path,
+    no_intro_source_cache: &Mutex<selected_evidence_no_intro::NoIntroSourceCache>,
+    dat_sources_config_path: Option<&std::path::Path>,
+) -> Result<selected_evidence_page::SelectedEvidenceReport, String> {
+    let platform = std::fs::read(path)
+        .ok()
+        .map(|bytes| selected_evidence_page::gather_structural_evidence(path, &bytes))
+        .and_then(|structural_facts| {
+            archivefs_core::platform_evidence_fusion::fuse_platform_evidence(structural_facts)
+                .resolved_platform
+        });
+
+    let registry = dat_sources_config_path
+        .and_then(|config_path| {
+            archivefs_core::dat::sources::load_dat_sources_config_from(config_path).ok()
+        })
+        .map(|config| archivefs_core::dat::sources::DatSourceRegistry::from_config(&config).0)
+        .unwrap_or_default();
+
+    let no_intro_state = no_intro_source_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .resolve(&registry, platform)
+        .clone();
+
+    let ambiguity_note =
+        selected_evidence_no_intro::no_intro_source_note(&no_intro_state).filter(|_| {
+            matches!(
+                no_intro_state,
+                selected_evidence_no_intro::NoIntroSourceState::Ambiguous(_)
+            )
+        });
+    let resolved_source = match &no_intro_state {
+        selected_evidence_no_intro::NoIntroSourceState::Selected(imported) => {
+            Some(imported.as_ref())
+        }
+        _ => None,
+    };
+
+    let mut result = selected_evidence_page::gather_selected_evidence(path, resolved_source);
+    if let (Ok(report), Some(note)) = (&mut result, ambiguity_note) {
+        report.no_intro = selected_evidence_page::NoIntroLookupResult::Ambiguous { note };
+    }
+    result
 }
 
 /// Collects the path-based Doctor inputs. Runs on a worker thread.
@@ -3855,6 +3946,20 @@ struct ArchiveFsApp {
     romm_snapshot: Option<Box<RommSnapshot>>,
     romm_operation: Option<RunningRommOperation>,
     romm_generation: u64,
+    /// GUI Batch A: the Selected page's real, read-only identity/evidence
+    /// panel state - see `selected_evidence_page`'s own module doc. Starts
+    /// `Idle`; loading is always an explicit action, never automatic.
+    selected_evidence: selected_evidence_page::SelectedEvidenceState,
+    selected_evidence_generation: u64,
+    /// Resolves the registered DAT source registry down to the No-Intro
+    /// source relevant to a selected file's platform, without ever
+    /// reparsing an unchanged registry - see
+    /// `selected_evidence_no_intro::NoIntroSourceCache`. Shared behind
+    /// `Arc<Mutex<_>>` because the resolve+lookup itself runs inside the
+    /// same background thread `start_selected_evidence_load` already
+    /// spawns, and the cache must survive across separate loads to be
+    /// useful.
+    no_intro_source_cache: Arc<Mutex<selected_evidence_no_intro::NoIntroSourceCache>>,
     romm_ui: RommCardState,
     /// The configuration dialog's draft. `Some` exactly while it is open, which is
     /// the same open/closed convention every other dialog in this app uses - and is
@@ -4207,6 +4312,11 @@ impl ArchiveFsApp {
             romm_snapshot: None,
             romm_operation: None,
             romm_generation: 0,
+            selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
+            selected_evidence_generation: 0,
+            no_intro_source_cache: Arc::new(Mutex::new(
+                selected_evidence_no_intro::NoIntroSourceCache::new(),
+            )),
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,
@@ -8171,6 +8281,138 @@ impl ArchiveFsApp {
             let _ = sender.send(Ok((worker_request, report)));
             context.request_repaint();
         });
+    }
+
+    /// GUI Batch A: starts (or restarts, on a new selection) the real,
+    /// off-UI-thread evidence gather for the Selected page's identity
+    /// panel - see `selected_evidence_page::gather_selected_evidence`.
+    /// Explicit only (a button press); never called automatically on
+    /// selection.
+    fn start_selected_evidence_load(&mut self, context: egui::Context, path: PathBuf) {
+        self.selected_evidence_generation += 1;
+        let generation = self.selected_evidence_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
+            generation,
+            path: path.clone(),
+            receiver,
+        };
+        let no_intro_source_cache = Arc::clone(&self.no_intro_source_cache);
+        thread::spawn(move || {
+            let result = gather_selected_evidence_with_registry(&path, &no_intro_source_cache);
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+    }
+
+    /// GUI Batch A: the explicit "Check Hasheous" action - a real network
+    /// call, always off the UI thread, never started automatically. Uses
+    /// the adapter's own default host/timeout constants; clicking the
+    /// button is itself the opt-in this batch requires.
+    fn start_selected_hasheous_check(&mut self, context: egui::Context) {
+        let selected_evidence_page::SelectedEvidenceState::Ready {
+            generation, report, ..
+        } = &mut self.selected_evidence
+        else {
+            return;
+        };
+        let Some(sha1) = report.hashes.as_ref().map(|hashes| hashes.sha1.clone()) else {
+            return;
+        };
+        let generation = *generation;
+        let (sender, receiver) = mpsc::channel();
+        if let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
+            &mut self.selected_evidence
+        {
+            *hasheous = selected_evidence_page::HasheousState::Loading {
+                generation,
+                receiver,
+            };
+        }
+        thread::spawn(move || {
+            use archivefs_core::identity_source::hasheous::client::{
+                HASHEOUS_DEFAULT_BASE_URL, HasheousConfig, REQUEST_TIMEOUT,
+            };
+            let config = HasheousConfig {
+                enabled: true,
+                base_url: HASHEOUS_DEFAULT_BASE_URL.to_string(),
+                timeout: REQUEST_TIMEOUT,
+            };
+            let outcome = selected_evidence_page::run_hasheous_check_live(&config, &sha1);
+            let _ = sender.send((generation, outcome));
+            context.request_repaint();
+        });
+    }
+
+    /// GUI Batch A: applies the pure [`selected_evidence_page::SelectedEvidenceAction`]
+    /// the panel returned this frame - the only two things it can ever ask
+    /// for, both read-only.
+    fn handle_selected_evidence_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<selected_evidence_page::SelectedEvidenceAction>,
+    ) {
+        match action {
+            Some(selected_evidence_page::SelectedEvidenceAction::Load(path)) => {
+                self.start_selected_evidence_load(context.clone(), path);
+            }
+            Some(selected_evidence_page::SelectedEvidenceAction::CheckHasheous) => {
+                self.start_selected_hasheous_check(context.clone());
+            }
+            None => {}
+        }
+    }
+
+    /// GUI Batch A: drains a completed evidence-load or Hasheous-check
+    /// message, discarding anything whose generation is no longer current
+    /// (the same stale-result guard every other background loader in this
+    /// app uses).
+    fn poll_selected_evidence(&mut self) {
+        if let selected_evidence_page::SelectedEvidenceState::Loading {
+            generation,
+            path,
+            receiver,
+        } = &self.selected_evidence
+            && let Ok((message_generation, result)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            let path = path.clone();
+            self.selected_evidence = match result {
+                Ok(report) => selected_evidence_page::SelectedEvidenceState::Ready {
+                    generation: message_generation,
+                    report: Box::new(report),
+                    hasheous: selected_evidence_page::HasheousState::Idle,
+                },
+                Err(message) => selected_evidence_page::SelectedEvidenceState::Error {
+                    generation: message_generation,
+                    path,
+                    message,
+                },
+            };
+        }
+        // Two separate borrows of `self.selected_evidence` (read to poll the
+        // channel, then a fresh mutable one to write the result) rather than
+        // one collapsed condition - the write must start after the read
+        // borrow above has already ended.
+        #[allow(clippy::collapsible_if)]
+        if let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
+            &self.selected_evidence
+            && let selected_evidence_page::HasheousState::Loading {
+                generation,
+                receiver,
+            } = hasheous
+            && let Ok((message_generation, outcome)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            if let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
+                &mut self.selected_evidence
+            {
+                *hasheous = selected_evidence_page::HasheousState::Done {
+                    generation: message_generation,
+                    outcome,
+                };
+            }
+        }
     }
 
     fn start_cheat_preview(&mut self, context: egui::Context) {
@@ -13779,6 +14021,7 @@ impl ArchiveFsApp {
         self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
         self.poll_archive_inspection();
+        self.poll_selected_evidence();
         self.poll_missing_removal(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
@@ -15132,6 +15375,14 @@ impl ArchiveFsApp {
                     );
                     ui.add_space(crate::ui::theme::SECTION_GAP);
                     self.show_romm_game_panel(context, ui);
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    let evidence_action = selected_evidence_page::show_selected_evidence_panel(
+                        ui,
+                        self.ui_mode == GuiMode::AdvancedView,
+                        self.archive_context.focused.as_deref(),
+                        &self.selected_evidence,
+                    );
+                    self.handle_selected_evidence_action(context, evidence_action);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -41796,6 +42047,334 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
+    // -- GUI Batch A closeout: registry-backed No-Intro wiring -----------
+    //
+    // `gather_selected_evidence_with_registry_at` is exactly what
+    // `start_selected_evidence_load` calls in the real, running GUI (via
+    // `gather_selected_evidence_with_registry`, which only adds the real
+    // default config path). These tests exercise that same function
+    // end-to-end against real files - a temp DAT source, a real registry
+    // config on disk, and a real ROM file - never against the developer's
+    // own home directory.
+    mod selected_evidence_registry_wiring {
+        use super::*;
+        use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind, DatSourceRegistry};
+        use std::io::Write;
+
+        const GB_NO_INTRO_XML: &str = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Nintendo - Game Boy</name>
+        <version>20250101-120000</version>
+        <author>No-Intro</author>
+    </header>
+    <game name="Alleyway (World)">
+        <rom name="Alleyway (World).gb" size="336" crc="00000000" sha1="__SHA1__"/>
+    </game>
+</datafile>"#;
+
+        const GB_NO_INTRO_XML_OTHER: &str = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Nintendo - Game Boy (Rebuild)</name>
+        <version>20250601-000000</version>
+        <author>No-Intro</author>
+    </header>
+    <game name="Tetris (World)">
+        <rom name="Tetris (World).gb" size="1" crc="00000000" sha1="0000000000000000000000000000000000000a"/>
+    </game>
+</datafile>"#;
+
+        /// A self-cleaning fixture directory - matches
+        /// `selected_evidence_page::tests::FixtureDir`'s own convention.
+        struct FixtureDir(PathBuf);
+
+        impl FixtureDir {
+            fn new(label: &str) -> Self {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let dir = std::env::temp_dir().join(format!(
+                    "archivefs-gui-selected-evidence-registry-{label}-{now}"
+                ));
+                std::fs::create_dir_all(&dir).expect("create fixture dir");
+                Self(dir)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// A minimal, deterministic synthetic Game Boy ROM - same
+        /// convention `selected_evidence_page::tests::gb_rom_bytes` uses.
+        fn gb_rom_bytes() -> Vec<u8> {
+            let mut bytes = vec![0u8; 0x150];
+            let logo: [u8; 48] = [
+                0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
+                0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6,
+                0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC,
+                0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+            ];
+            bytes[0x104..0x134].copy_from_slice(&logo);
+            bytes[0x134..0x143].copy_from_slice(b"TESTGAME\0\0\0\0\0\0\0");
+            let checksum = archivefs_core::gb_header_evidence::compute_header_checksum(&bytes)
+                .expect("checksum computable");
+            bytes[0x14D] = checksum;
+            bytes
+        }
+
+        fn write_rom(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = dir.join(name);
+            let mut file = std::fs::File::create(&path).expect("create rom fixture");
+            file.write_all(bytes).expect("write rom fixture");
+            path
+        }
+
+        fn write_dat_matching(dir: &Path, name: &str, rom_bytes: &[u8]) -> PathBuf {
+            let sha1 = archivefs_core::identity_source::hashing::hash_file(
+                &write_rom(dir, "sha1-source.gb", rom_bytes),
+                &archivefs_core::safe_read::TrustedRoots::from_paths([dir]),
+                None,
+            )
+            .expect("hash the fixture rom")
+            .sha1;
+            let xml = GB_NO_INTRO_XML.replace("__SHA1__", &sha1);
+            let path = dir.join(name);
+            std::fs::write(&path, xml).expect("write dat fixture");
+            path
+        }
+
+        fn write_dat_sources_config(dir: &Path, sources: &DatSourceRegistry) -> PathBuf {
+            let config_path = dir.join("dat_sources.toml");
+            archivefs_core::dat::sources::save_dat_sources_config_to(
+                &config_path,
+                &sources.to_config(),
+            )
+            .expect("write dat sources config");
+            config_path
+        }
+
+        fn file_source(id: &str, path: PathBuf, platform: Option<&str>) -> DatSourceEntry {
+            let mut entry =
+                DatSourceEntry::new(id.to_string(), id.to_string(), path, DatSourceKind::File);
+            entry.platform = platform.map(str::to_string);
+            entry
+        }
+
+        #[test]
+        fn configured_no_intro_source_reaches_the_real_selected_evidence_lookup() {
+            let dir = FixtureDir::new("configured");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "Alleyway (Test).gb", &rom_bytes);
+            let dat_path = write_dat_matching(dir.path(), "gb.dat", &rom_bytes);
+
+            let mut registry = DatSourceRegistry::new();
+            registry
+                .add(file_source("gb-no-intro", dat_path, Some("Game Boy")))
+                .unwrap();
+            let config_path = write_dat_sources_config(dir.path(), &registry);
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let report = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+
+            match report.no_intro {
+                selected_evidence_page::NoIntroLookupResult::Matched { system_name, .. } => {
+                    assert_eq!(system_name, "Nintendo - Game Boy");
+                }
+                other => panic!("expected a real registry-backed match, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn no_configured_source_is_not_imported() {
+            let dir = FixtureDir::new("none");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "game.gb", &rom_bytes);
+            let config_path = write_dat_sources_config(dir.path(), &DatSourceRegistry::new());
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let report = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+
+            assert!(matches!(
+                report.no_intro,
+                selected_evidence_page::NoIntroLookupResult::NotImported
+            ));
+        }
+
+        #[test]
+        fn disabled_source_is_ignored_by_the_real_gather_path() {
+            let dir = FixtureDir::new("disabled");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "game.gb", &rom_bytes);
+            let dat_path = write_dat_matching(dir.path(), "gb.dat", &rom_bytes);
+
+            let mut registry = DatSourceRegistry::new();
+            let mut entry = file_source("gb-no-intro", dat_path, Some("Game Boy"));
+            entry.enabled = false;
+            registry.add(entry).unwrap();
+            let config_path = write_dat_sources_config(dir.path(), &registry);
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let report = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+
+            assert!(matches!(
+                report.no_intro,
+                selected_evidence_page::NoIntroLookupResult::NotImported
+            ));
+        }
+
+        #[test]
+        fn wrong_platform_source_is_ignored_by_the_real_gather_path() {
+            let dir = FixtureDir::new("wrong-platform");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "game.gb", &rom_bytes);
+            let dat_path = write_dat_matching(dir.path(), "gb.dat", &rom_bytes);
+
+            let mut registry = DatSourceRegistry::new();
+            registry
+                .add(file_source("gb-no-intro", dat_path, Some("NES")))
+                .unwrap();
+            let config_path = write_dat_sources_config(dir.path(), &registry);
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let report = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+
+            assert!(matches!(
+                report.no_intro,
+                selected_evidence_page::NoIntroLookupResult::NotImported
+            ));
+        }
+
+        #[test]
+        fn multiple_compatible_sources_fail_closed_to_ambiguous_never_a_first_pick() {
+            let dir = FixtureDir::new("ambiguous");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "game.gb", &rom_bytes);
+            let dat_path_a = write_dat_matching(dir.path(), "gb-a.dat", &rom_bytes);
+            let dat_path_b = dir.path().join("gb-b.dat");
+            std::fs::write(&dat_path_b, GB_NO_INTRO_XML_OTHER).unwrap();
+
+            let mut registry = DatSourceRegistry::new();
+            registry
+                .add(file_source("gb-a", dat_path_a, Some("Game Boy")))
+                .unwrap();
+            registry
+                .add(file_source("gb-b", dat_path_b, Some("Game Boy")))
+                .unwrap();
+            let config_path = write_dat_sources_config(dir.path(), &registry);
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let report = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+
+            match report.no_intro {
+                selected_evidence_page::NoIntroLookupResult::Ambiguous { note } => {
+                    assert!(note.contains("gb-a"));
+                    assert!(note.contains("gb-b"));
+                }
+                other => panic!("expected Ambiguous, got {other:?}"),
+            }
+            // Ambiguity must never leak a fabricated match into the merged
+            // evidence set - `base_observations` must carry no LocalNoIntro
+            // observation when the source could not be honestly resolved.
+            assert!(report.base_observations.iter().all(|observation| {
+                observation.provenance.channel
+                    != archivefs_core::platform_evidence_fusion::evidence_lineage::EvidenceChannel::LocalNoIntro
+            }));
+        }
+
+        #[test]
+        fn a_stale_disabled_source_does_not_keep_serving_cached_evidence() {
+            let dir = FixtureDir::new("stale");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "game.gb", &rom_bytes);
+            let dat_path = write_dat_matching(dir.path(), "gb.dat", &rom_bytes);
+
+            let mut registry = DatSourceRegistry::new();
+            registry
+                .add(file_source("gb-no-intro", dat_path, Some("Game Boy")))
+                .unwrap();
+            let config_path = write_dat_sources_config(dir.path(), &registry);
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let first = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+            assert!(matches!(
+                first.no_intro,
+                selected_evidence_page::NoIntroLookupResult::Matched { .. }
+            ));
+
+            // Disable the source on disk and rewrite the same config path -
+            // the same cache instance must notice on the very next gather,
+            // not keep serving the earlier Matched result.
+            registry.get_mut("gb-no-intro").unwrap().enabled = false;
+            write_dat_sources_config(dir.path(), &registry);
+
+            let second = gather_selected_evidence_with_registry_at(
+                &rom_path,
+                &cache,
+                Some(config_path.as_path()),
+            )
+            .expect("gather succeeds");
+            assert!(matches!(
+                second.no_intro,
+                selected_evidence_page::NoIntroLookupResult::NotImported
+            ));
+        }
+
+        #[test]
+        fn absent_config_path_behaves_like_an_empty_registry_not_a_panic() {
+            let dir = FixtureDir::new("no-config");
+            let rom_bytes = gb_rom_bytes();
+            let rom_path = write_rom(dir.path(), "game.gb", &rom_bytes);
+
+            let cache = Mutex::new(selected_evidence_no_intro::NoIntroSourceCache::new());
+            let report = gather_selected_evidence_with_registry_at(&rom_path, &cache, None)
+                .expect("gather succeeds even with no resolvable config path");
+
+            assert!(matches!(
+                report.no_intro,
+                selected_evidence_page::NoIntroLookupResult::NotImported
+            ));
+        }
+    }
+
     #[test]
     fn gui_version_line_matches_the_workspace_package_version() {
         assert_eq!(
@@ -54749,6 +55328,11 @@ $Instant Growth [Nayr]\n";
             romm_snapshot: None,
             romm_operation: None,
             romm_generation: 0,
+            selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
+            selected_evidence_generation: 0,
+            no_intro_source_cache: Arc::new(Mutex::new(
+                selected_evidence_no_intro::NoIntroSourceCache::new(),
+            )),
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,

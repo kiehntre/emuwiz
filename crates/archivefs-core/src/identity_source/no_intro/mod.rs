@@ -37,9 +37,17 @@
 
 pub mod convert;
 pub mod import;
+pub mod registry;
 
 pub use convert::{claim_for_representation, lookup_no_intro, observations_from_no_intro_matches};
 pub use import::{ImportedNoIntroSource, NoIntroImportError, NoIntroVariant, import_no_intro_dat};
+pub use registry::{
+    NoIntroSourceLabel, NoIntroSourceSelection, no_intro_selection_fingerprint,
+    select_no_intro_source,
+};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod registry_tests;
