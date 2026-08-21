@@ -142,6 +142,7 @@ pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
 pub(crate) mod identity_sources_page;
+pub(crate) mod plan_preview_page;
 pub(crate) mod repair_history_page;
 pub(crate) mod repair_review_page;
 pub(crate) mod rom_organisation_page;
@@ -3967,6 +3968,11 @@ struct ArchiveFsApp {
     /// always an explicit action, never automatic.
     identity_sources: identity_sources_page::IdentitySourcesState,
     identity_sources_generation: u64,
+    /// GUI Batch C: the read-only "Plan Preview" for the selected file -
+    /// see `plan_preview_page`'s own module doc. Starts `Idle`; loading is
+    /// always an explicit action, never automatic.
+    plan_preview: plan_preview_page::PlanPreviewState,
+    plan_preview_generation: u64,
     romm_ui: RommCardState,
     /// The configuration dialog's draft. `Some` exactly while it is open, which is
     /// the same open/closed convention every other dialog in this app uses - and is
@@ -4326,6 +4332,8 @@ impl ArchiveFsApp {
             )),
             identity_sources: identity_sources_page::IdentitySourcesState::Idle,
             identity_sources_generation: 0,
+            plan_preview: plan_preview_page::PlanPreviewState::Idle,
+            plan_preview_generation: 0,
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,
@@ -8471,6 +8479,74 @@ impl ArchiveFsApp {
             self.identity_sources = identity_sources_page::IdentitySourcesState::Ready {
                 generation: message_generation,
                 status,
+            };
+        }
+    }
+
+    /// GUI Batch C: starts (or refreshes) the read-only "Plan Preview" load
+    /// for the currently-ready selected-evidence report - see
+    /// `plan_preview_page`'s own module doc. Explicit only (a button
+    /// press); never called automatically. A no-op when the evidence
+    /// report is not `Ready` (nothing to plan for yet).
+    fn start_plan_preview_load(&mut self, context: egui::Context) {
+        let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
+            &self.selected_evidence
+        else {
+            return;
+        };
+        let source_path = report.path.clone();
+        let identity = report.identity_result.clone();
+        let identity_presentation = report.identity.clone();
+
+        self.plan_preview_generation += 1;
+        let generation = self.plan_preview_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.plan_preview = plan_preview_page::PlanPreviewState::Loading {
+            generation,
+            receiver,
+        };
+        thread::spawn(move || {
+            let master_root = Config::load_default()
+                .ok()
+                .and_then(|config| config.master_rom_root);
+            let outcome = plan_preview_page::gather_plan_preview(
+                &source_path,
+                &identity,
+                &identity_presentation,
+                master_root.as_deref(),
+            );
+            let _ = sender.send((generation, outcome));
+            context.request_repaint();
+        });
+    }
+
+    /// GUI Batch C: applies the pure
+    /// [`plan_preview_page::PlanPreviewAction`] the panel returned this
+    /// frame - the only thing it can ever ask for, and read-only.
+    fn handle_plan_preview_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<plan_preview_page::PlanPreviewAction>,
+    ) {
+        if let Some(plan_preview_page::PlanPreviewAction::Load) = action {
+            self.start_plan_preview_load(context.clone());
+        }
+    }
+
+    /// GUI Batch C: drains a completed plan-preview load, discarding
+    /// anything whose generation is no longer current - the same
+    /// stale-result guard `poll_identity_sources` already uses.
+    fn poll_plan_preview(&mut self) {
+        if let plan_preview_page::PlanPreviewState::Loading {
+            generation,
+            receiver,
+        } = &self.plan_preview
+            && let Ok((message_generation, outcome)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            self.plan_preview = plan_preview_page::PlanPreviewState::Ready {
+                generation: message_generation,
+                outcome,
             };
         }
     }
@@ -14083,6 +14159,7 @@ impl ArchiveFsApp {
         self.poll_archive_inspection();
         self.poll_selected_evidence();
         self.poll_identity_sources();
+        self.poll_plan_preview();
         self.poll_missing_removal(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
@@ -15451,6 +15528,14 @@ impl ArchiveFsApp {
                         &self.identity_sources,
                     );
                     self.handle_identity_sources_action(context, identity_sources_action);
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    let plan_preview_action = plan_preview_page::show_plan_preview_panel(
+                        ui,
+                        self.ui_mode == GuiMode::AdvancedView,
+                        self.archive_context.focused.as_deref(),
+                        &self.plan_preview,
+                    );
+                    self.handle_plan_preview_action(context, plan_preview_action);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -55403,6 +55488,8 @@ $Instant Growth [Nayr]\n";
             )),
             identity_sources: identity_sources_page::IdentitySourcesState::Idle,
             identity_sources_generation: 0,
+            plan_preview: plan_preview_page::PlanPreviewState::Idle,
+            plan_preview_generation: 0,
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,

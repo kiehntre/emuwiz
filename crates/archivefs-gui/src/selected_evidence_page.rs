@@ -66,7 +66,7 @@ use archivefs_core::platform_evidence_fusion::evidence_lineage::{
 };
 use archivefs_core::platform_evidence_fusion::fuse_platform_evidence;
 use archivefs_core::platform_evidence_fusion::identity_orchestrator::{
-    IdentityInspectionInput, inspect_identity,
+    IdentityInspectionInput, IdentityResult, inspect_identity,
 };
 use archivefs_core::platform_evidence_fusion::identity_presentation::{
     IdentityPresentation, IdentityStatus, present_identity,
@@ -181,6 +181,12 @@ pub(crate) struct SelectedEvidenceReport {
     pub path: PathBuf,
     pub structural_facts: Vec<ContentEvidence>,
     pub identity: IdentityPresentation,
+    /// The raw identity result `identity` was presented from - kept
+    /// alongside it (rather than only its presentation) so a planning
+    /// preview (GUI Batch C) can feed the exact same identity into the
+    /// existing library planner without recomputing it and risking drift
+    /// between what the evidence panel shows and what gets planned.
+    pub identity_result: IdentityResult,
     pub hashes: Option<LocalHashes>,
     pub no_intro: NoIntroLookupResult,
     /// Structural + (if matched) direct No-Intro observations, ready to be
@@ -229,6 +235,7 @@ pub(crate) fn gather_selected_evidence(
         path: path.to_path_buf(),
         structural_facts,
         identity,
+        identity_result,
         hashes,
         no_intro,
         base_observations,
@@ -370,7 +377,10 @@ pub(crate) enum SelectedEvidenceAction {
 // Rendering
 // ---------------------------------------------------------------------
 
-fn status_tone_for(status: IdentityStatus) -> widgets::StatusTone {
+/// Shared with `plan_preview_page` (GUI Batch C), so the resolver-result
+/// tone shown there is the exact same mapping this panel already uses -
+/// never a second, possibly-diverging one.
+pub(crate) fn status_tone_for(status: IdentityStatus) -> widgets::StatusTone {
     match status {
         IdentityStatus::Conflict => widgets::StatusTone::Blocked,
         IdentityStatus::Ambiguous => widgets::StatusTone::Pending,
@@ -1042,13 +1052,15 @@ mod tests {
     }
 
     fn make_report(base_observations: Vec<EvidenceObservation>) -> SelectedEvidenceReport {
+        let identity_result = inspect_identity(IdentityInspectionInput::default());
         SelectedEvidenceReport {
             path: PathBuf::from("test.gb"),
             structural_facts: Vec::new(),
             identity:
                 archivefs_core::platform_evidence_fusion::identity_presentation::present_identity(
-                    &inspect_identity(IdentityInspectionInput::default()),
+                    &identity_result,
                 ),
+            identity_result,
             hashes: None,
             no_intro: NoIntroLookupResult::NotImported,
             base_observations,
