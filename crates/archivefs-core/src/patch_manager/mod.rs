@@ -17,6 +17,7 @@
 //! shape, and CLI output listed above remains exactly as it was.
 
 mod adapter;
+mod amiga_whdload_local;
 mod bsfree;
 mod bsfree_gamecube;
 mod bsfree_wii;
@@ -89,6 +90,15 @@ use crate::{Database, PersistedArchive};
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
     HypotheticalDestination, InstallationCandidate,
+};
+pub use amiga_whdload_local::{
+    AMIGA_MAX_CONFIG_BYTES, AMIGA_MAX_PROFILES, AMIGA_MAX_SAVE_STATE_CANDIDATES, AmigaConfig,
+    AmigaEmulatorKind, AmigaGameInspection, AmigaGameRequest, AmigaHdfInspection,
+    AmigaHdfPartitionInspection, AmigaHealth, AmigaInstallationType, AmigaKickstart,
+    AmigaKickstartState, AmigaMachineProfile, AmigaProfile, AmigaProfileDiscovery,
+    AmigaProfileDiscoveryRoots, AmigaProfileScope, AmigaSlaveCandidate, AmigaWarning,
+    AmigaWarningKind, discover_amiga_profiles, inspect_amiga_hdf, inspect_amiga_whdload_game,
+    parse_amiga_version,
 };
 pub use bsfree::{
     BSFREE_DATABASE_FILE, BSFREE_DATABASE_URL, BSFREE_DOWNLOAD_HOST, BSFREE_EXPECTED_SHA256,
