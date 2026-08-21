@@ -591,13 +591,16 @@ fn kind_key(kind: AmigaEmulatorKind) -> u8 {
     }
 }
 fn executable_kind(executable: &AmigaExecutable) -> AmigaEmulatorKind {
-    executable
+    if executable
         .path
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.to_ascii_lowercase().contains("amiberry"))
-        .then_some(AmigaEmulatorKind::Amiberry)
-        .unwrap_or(AmigaEmulatorKind::FsUae)
+    {
+        AmigaEmulatorKind::Amiberry
+    } else {
+        AmigaEmulatorKind::FsUae
+    }
 }
 fn global_config(root: &Path, kind: AmigaEmulatorKind) -> Option<PathBuf> {
     let names: &[&str] = match kind {
@@ -848,7 +851,7 @@ fn read_text(path: &Path, warnings: &mut Vec<AmigaWarning>) -> Option<String> {
             warnings.push(warning(
                 AmigaWarningKind::UnreadablePath,
                 path,
-                &error.to_string(),
+                error.to_string(),
             ));
             return None;
         }
@@ -889,7 +892,7 @@ fn read_text(path: &Path, warnings: &mut Vec<AmigaWarning>) -> Option<String> {
             warnings.push(warning(
                 AmigaWarningKind::UnreadablePath,
                 path,
-                &error.to_string(),
+                error.to_string(),
             ));
             return None;
         }
@@ -938,7 +941,7 @@ fn safe_regular(path: &Path, warnings: &mut Vec<AmigaWarning>) -> bool {
             warnings.push(warning(
                 AmigaWarningKind::UnreadablePath,
                 path,
-                &error.to_string(),
+                error.to_string(),
             ));
             false
         }
