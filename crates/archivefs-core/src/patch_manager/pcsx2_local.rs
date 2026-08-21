@@ -1333,6 +1333,829 @@ fn directory_identity(_metadata: &fs::Metadata) -> Option<Pcsx2DirectoryIdentity
     None
 }
 
+// =======================================================================
+// Emulator Adapter Refresh Batch H: modernisation additions.
+//
+// Everything below is strictly additive - no existing public type, field,
+// or function signature above this point is changed. `Pcsx2Profile`,
+// `Pcsx2ProfileDiscovery`, `discover_pcsx2_profiles`,
+// `inspect_pcsx2_profile`, `Pcsx2PnachInventory`, and `match_pcsx2_inventory`
+// are all reused completely unchanged - the existing GUI workflow and CLI
+// preview command that already consume them keep compiling and behaving
+// exactly as before. This section only adds the version/BIOS/config/
+// texture/memory-card/save-state/controller inspection PPSSPP and RPCS3
+// already have, plus one new top-level `inspect_pcsx2_game` entry point
+// that ties them together for a "selected verified title" summary - the
+// same shape `ppsspp_local::inspect_ppsspp_game`/
+// `rpcs3_local::inspect_rpcs3_game` already establish.
+//
+// # PS2 serial vs. PCSX2 executable CRC - two different keys, kept apart
+//
+// PCSX2's own PNACH patch/cheat matching (`match_pcsx2_inventory`, above)
+// is keyed by the game's executable CRC - unchanged, and this section
+// never re-derives or second-guesses it. Real PCSX2's own per-game
+// config/texture/memory-card/save-state directories, by contrast, are
+// keyed by PS2 *serial* (e.g. `SLUS-20312`), a different identifier this
+// module has never modeled before. [`Pcsx2GameRequest`] therefore carries
+// both, kept as two genuinely separate fields - see its own doc comment.
+// Neither is ever derived from a filename, a PNACH comment, or a
+// directory name; both must come from the caller already resolved (see
+// [`crate::game_identity::serial_from_boot_path`] for where a real
+// verified serial ultimately comes from, and `pcsx2::normalize_crc`/
+// `pcsx2_identity::Pcsx2GameIdentity::verified_crc` for the CRC side).
+// =======================================================================
+
+/// The generic bounded-read primitive every new inspection function below
+/// shares - the same O_NOFOLLOW/size-bound/symlink-rejection discipline
+/// `inspect_pnach_file` (above) already uses, factored out as a plain
+/// `(bytes, warning)` helper since the new callers below have no
+/// PNACH-inventory-specific bookkeeping to fold a warning into.
+fn read_bounded(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("not found".to_string());
+        }
+        Err(error) => return Err(format!("cannot be inspected: {error}")),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err("symlink was not followed".to_string());
+    }
+    if !metadata.is_file() {
+        return Err("non-regular file was skipped".to_string());
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(format!("file exceeds the {maximum_bytes}-byte limit"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot be opened read-only: {error}"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot be read: {error}"))?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(format!(
+            "file grew beyond the {maximum_bytes}-byte limit while reading"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_text(path: &Path, maximum_bytes: u64) -> Result<String, String> {
+    let bytes = read_bounded(path, maximum_bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn is_regular_file_no_follow(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+pub const PCSX2_MAX_CONFIG_BYTES: u64 = 512 * 1024;
+pub const PCSX2_MAX_TEXTURE_FILES: usize = 2_048;
+pub const PCSX2_MAX_MEMCARD_CANDIDATES: usize = 32;
+pub const PCSX2_MAX_SAVESTATE_CANDIDATES: usize = 512;
+const MAX_INI_LINES: usize = 8_192;
+const MAX_INI_LINE_BYTES: usize = 8 * 1024;
+const MAX_RETAINED_UNKNOWN_SETTINGS: usize = 256;
+const MAX_RETAINED_CONTROLLER_SECTIONS: usize = 16;
+
+/// Parses a PCSX2 version from output already obtained by a caller. This
+/// module still never executes a binary itself; discovery stays read-only.
+/// Conservative and fail-soft: an unrecognised/changed `--version` shape
+/// yields `None` rather than a guessed value.
+pub fn parse_pcsx2_version(output: &str) -> Option<String> {
+    let normalized = output.trim();
+    let index = normalized
+        .find("PCSX2 ")
+        .map(|index| index + "PCSX2 ".len())
+        .or_else(|| normalized.find('v').map(|index| index + 1))?;
+    let tail = normalized[index..].trim_start_matches('v');
+    let version: String = tail
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect();
+    (version.split('.').count() >= 2 && version.chars().any(|character| character.is_ascii_digit()))
+        .then_some(version)
+}
+
+// ---------------------------------------------------------------------
+// BIOS
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pcsx2BiosVerification {
+    /// A trusted hash helper/database confirmed this exact file. No such
+    /// helper exists anywhere in this codebase today (audited before
+    /// writing this module - see this section's own doc comment), so this
+    /// variant is never produced yet; it exists so a future real verifier
+    /// can be wired in without another breaking change.
+    Verified,
+    /// A file was found where a BIOS is expected, but nothing verified its
+    /// contents - filename alone never verifies a BIOS.
+    PresentUnverified,
+    Missing,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2BiosInfo {
+    pub path: Option<PathBuf>,
+    pub verification: Pcsx2BiosVerification,
+    /// A plain filename-derived hint only (real PCSX2 BIOS filenames often
+    /// encode region, e.g. `SCPH-70012.bin`) - never used as verification,
+    /// only as a label.
+    pub filename_hint: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Bounded presence inspection of `bios_root` (real PCSX2 layout:
+/// `<configuration_path>/bios`). Never opens/hashes the BIOS image itself
+/// (no trusted BIOS hash database exists in this codebase - see
+/// [`Pcsx2BiosVerification::Verified`]'s own doc comment) - only lists
+/// candidate files by extension and reports the first one found.
+fn inspect_pcsx2_bios(bios_root: &Path) -> Pcsx2BiosInfo {
+    let mut warnings = Vec::new();
+    let read_dir = match fs::read_dir(bios_root) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Pcsx2BiosInfo {
+                path: None,
+                verification: Pcsx2BiosVerification::Missing,
+                filename_hint: None,
+                warnings,
+            };
+        }
+        Err(error) => {
+            return Pcsx2BiosInfo {
+                path: None,
+                verification: Pcsx2BiosVerification::Unreadable,
+                filename_hint: None,
+                warnings: vec![format!("BIOS directory cannot be inspected: {error}")],
+            };
+        }
+    };
+    let candidate = read_dir.flatten().map(|entry| entry.path()).find(|path| {
+        is_regular_file_no_follow(path)
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("bin"))
+    });
+    match candidate {
+        Some(path) => {
+            let filename_hint = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned());
+            Pcsx2BiosInfo {
+                path: Some(path),
+                verification: Pcsx2BiosVerification::PresentUnverified,
+                filename_hint,
+                warnings,
+            }
+        }
+        None => {
+            warnings.push("no .bin file was found in the BIOS directory".to_string());
+            Pcsx2BiosInfo {
+                path: None,
+                verification: Pcsx2BiosVerification::Missing,
+                filename_hint: None,
+                warnings,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Global / per-game config (bounded INI-with-sections parser)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pcsx2Settings {
+    pub renderer: Option<String>,
+    pub internal_resolution: Option<String>,
+    pub texture_filtering: Option<String>,
+    pub anisotropic_filtering: Option<String>,
+    pub deinterlacing: Option<String>,
+    pub widescreen_patches_enabled: Option<bool>,
+    pub frame_limiter: Option<String>,
+    pub vsync: Option<bool>,
+    pub ee_cycle_rate: Option<String>,
+    pub ee_cycle_skip: Option<String>,
+    pub mtvu_enabled: Option<bool>,
+    pub audio_backend: Option<String>,
+    pub cheats_enabled: Option<bool>,
+    pub patches_enabled: Option<bool>,
+    pub texture_replacement_enabled: Option<bool>,
+    /// Unknown keys are retained in bounded form for later UI display.
+    pub unknown: BTreeMap<String, String>,
+    /// Section names actually observed (bounded), used only to derive
+    /// [`Pcsx2ControllerInfo`] - never treated as settings themselves.
+    controller_sections: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2Config {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub readable: bool,
+    pub settings: Pcsx2Settings,
+    pub warnings: Vec<String>,
+}
+
+/// Locates PCSX2's global config, preferring the current Qt-era
+/// `inis/PCSX2.ini` and falling back to the older `PCSX2.ini` directly at
+/// the profile root (the same two locations `inspect_pcsx2_marker`,
+/// above, already treats as equally valid PCSX2 evidence).
+fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
+    let modern = configuration_path.join("inis/PCSX2.ini");
+    if is_regular_file_no_follow(&modern) {
+        modern
+    } else {
+        configuration_path.join("PCSX2.ini")
+    }
+}
+
+fn inspect_pcsx2_config(path: &Path) -> Pcsx2Config {
+    let exists = path.exists();
+    let mut warnings = Vec::new();
+    let text = match read_bounded_text(path, PCSX2_MAX_CONFIG_BYTES) {
+        Ok(text) => text,
+        Err(_) if !exists => {
+            return Pcsx2Config {
+                path: path.to_path_buf(),
+                exists,
+                readable: false,
+                settings: Pcsx2Settings::default(),
+                warnings,
+            };
+        }
+        Err(detail) => {
+            warnings.push(format!("PCSX2 config could not be read: {detail}"));
+            return Pcsx2Config {
+                path: path.to_path_buf(),
+                exists,
+                readable: false,
+                settings: Pcsx2Settings::default(),
+                warnings,
+            };
+        }
+    };
+    let settings = parse_pcsx2_ini(&text, &mut warnings);
+    Pcsx2Config {
+        path: path.to_path_buf(),
+        exists,
+        readable: true,
+        settings,
+        warnings,
+    }
+}
+
+/// A narrow, bounded parser for PCSX2.ini's real `[Section]` /
+/// `Key = Value` shape - never a general INI implementation. An
+/// unrecognised key, a malformed line, or content beyond the line/byte
+/// bounds fails soft (skipped or retained bounded in `unknown`), never a
+/// panic and never a guessed value for a known field.
+fn parse_pcsx2_ini(text: &str, warnings: &mut Vec<String>) -> Pcsx2Settings {
+    let mut settings = Pcsx2Settings::default();
+    let mut section = String::new();
+    for (index, raw) in text.lines().enumerate() {
+        if index >= MAX_INI_LINES {
+            warnings.push(format!(
+                "INI parsing stopped at the {MAX_INI_LINES}-line limit"
+            ));
+            break;
+        }
+        if raw.len() > MAX_INI_LINE_BYTES {
+            if warnings.len() < MAX_RETAINED_UNKNOWN_SETTINGS {
+                warnings.push(format!(
+                    "INI contains a line over {MAX_INI_LINE_BYTES} bytes"
+                ));
+            }
+            continue;
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(value) = line.strip_suffix(']') {
+                section = value[1..].to_string();
+                if settings.controller_sections.len() < MAX_RETAINED_CONTROLLER_SECTIONS
+                    && (section.to_ascii_lowercase().starts_with("pad")
+                        || section.to_ascii_lowercase().starts_with("usb"))
+                {
+                    settings.controller_sections.push(section.clone());
+                }
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            continue;
+        }
+        apply_pcsx2_setting(&mut settings, &section, key, value);
+    }
+    settings
+}
+
+fn apply_pcsx2_setting(settings: &mut Pcsx2Settings, section: &str, key: &str, value: &str) {
+    let boolean = parse_ini_bool(value);
+    match (section, key) {
+        ("EmuCore/GS", "Renderer") => settings.renderer = value_or_none(value),
+        ("EmuCore/GS", "upscale_multiplier" | "UpscaleMultiplier") => {
+            settings.internal_resolution = value_or_none(value)
+        }
+        ("EmuCore/GS", "BiFilter") => settings.texture_filtering = value_or_none(value),
+        ("EmuCore/GS", "MaxAnisotropy") => settings.anisotropic_filtering = value_or_none(value),
+        ("EmuCore/GS", "deinterlace_mode" | "interlace") => {
+            settings.deinterlacing = value_or_none(value)
+        }
+        ("EmuCore/GS", "VsyncEnable") => settings.vsync = boolean,
+        ("EmuCore", "EnableWideScreenPatches") => settings.widescreen_patches_enabled = boolean,
+        ("EmuCore", "EnableCheats") => settings.cheats_enabled = boolean,
+        ("EmuCore", "EnablePatches") => settings.patches_enabled = boolean,
+        ("EmuCore/GS", "LimitScalar" | "FramerateLimit") => {
+            settings.frame_limiter = value_or_none(value)
+        }
+        ("EmuCore/Speedhacks", "EECycleRate") => settings.ee_cycle_rate = value_or_none(value),
+        ("EmuCore/Speedhacks", "EECycleSkip") => settings.ee_cycle_skip = value_or_none(value),
+        ("EmuCore/Speedhacks", "vuThread" | "MTVU") => settings.mtvu_enabled = boolean,
+        ("SPU2/Output" | "SPU2", "Backend" | "output_module") => {
+            settings.audio_backend = value_or_none(value)
+        }
+        ("EmuCore/GS", "LoadTextureReplacements") => settings.texture_replacement_enabled = boolean,
+        _ if settings.unknown.len() < MAX_RETAINED_UNKNOWN_SETTINGS => {
+            settings
+                .unknown
+                .insert(format!("{section}/{key}"), value.to_string());
+        }
+        _ => {}
+    }
+}
+
+fn parse_ini_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn value_or_none(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn differing_settings_keys(global: &Pcsx2Settings, game: &Pcsx2Settings) -> Vec<String> {
+    let global = flattened_settings(global);
+    let game = flattened_settings(game);
+    game.into_iter()
+        .filter_map(|(key, value)| (global.get(&key) != Some(&value)).then_some(key))
+        .collect()
+}
+
+fn flattened_settings(settings: &Pcsx2Settings) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    macro_rules! insert_opt {
+        ($field:expr, $name:literal) => {
+            if let Some(value) = &$field {
+                map.insert($name.to_string(), value.to_string());
+            }
+        };
+    }
+    insert_opt!(settings.renderer, "renderer");
+    insert_opt!(settings.internal_resolution, "internal_resolution");
+    insert_opt!(settings.texture_filtering, "texture_filtering");
+    insert_opt!(settings.anisotropic_filtering, "anisotropic_filtering");
+    insert_opt!(settings.deinterlacing, "deinterlacing");
+    insert_opt!(settings.frame_limiter, "frame_limiter");
+    insert_opt!(settings.ee_cycle_rate, "ee_cycle_rate");
+    insert_opt!(settings.ee_cycle_skip, "ee_cycle_skip");
+    insert_opt!(settings.audio_backend, "audio_backend");
+    if let Some(value) = settings.widescreen_patches_enabled {
+        map.insert("widescreen_patches_enabled".to_string(), value.to_string());
+    }
+    if let Some(value) = settings.vsync {
+        map.insert("vsync".to_string(), value.to_string());
+    }
+    if let Some(value) = settings.mtvu_enabled {
+        map.insert("mtvu_enabled".to_string(), value.to_string());
+    }
+    for (key, value) in &settings.unknown {
+        map.insert(format!("unknown/{key}"), value.clone());
+    }
+    map
+}
+
+// ---------------------------------------------------------------------
+// Texture replacements
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pcsx2TextureInventory {
+    pub path: PathBuf,
+    pub present: bool,
+    pub file_count: usize,
+    pub total_size_bytes: u64,
+    pub complete: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Bounded scan of `textures_root/<serial>` (real PCSX2 layout:
+/// `<configuration_path>/textures/<SERIAL>`). Counts files and total size
+/// only - never hashes or reads texture contents.
+fn inspect_pcsx2_textures(textures_root: &Path, serial: &str) -> Pcsx2TextureInventory {
+    let path = textures_root.join(serial);
+    let mut warnings = Vec::new();
+    let Ok(read_dir) = fs::read_dir(&path) else {
+        return Pcsx2TextureInventory {
+            path,
+            present: false,
+            file_count: 0,
+            total_size_bytes: 0,
+            complete: true,
+            warnings,
+        };
+    };
+    let mut file_count = 0usize;
+    let mut total_size_bytes = 0u64;
+    let mut complete = true;
+    for (visited, entry) in read_dir.flatten().enumerate() {
+        if visited >= PCSX2_MAX_ENTRIES_VISITED {
+            complete = false;
+            warnings.push(format!(
+                "texture scan stopped at the {PCSX2_MAX_ENTRIES_VISITED}-entry limit"
+            ));
+            break;
+        }
+        if file_count >= PCSX2_MAX_TEXTURE_FILES {
+            complete = false;
+            warnings.push(format!(
+                "texture scan stopped at the {PCSX2_MAX_TEXTURE_FILES}-file limit"
+            ));
+            break;
+        }
+        let entry_path = entry.path();
+        if !is_regular_file_no_follow(&entry_path) {
+            continue;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&entry_path) {
+            file_count += 1;
+            total_size_bytes = total_size_bytes.saturating_add(metadata.len());
+        }
+    }
+    Pcsx2TextureInventory {
+        present: true,
+        path,
+        file_count,
+        total_size_bytes,
+        complete,
+        warnings,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Memory cards
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pcsx2MemcardKind {
+    /// A single memory-card image shared across every game - PCSX2's
+    /// default arrangement. Never claimed to belong exclusively to one
+    /// title.
+    Shared,
+    /// A per-title memory-card folder, keyed by serial - only reported
+    /// when the caller has an actual serial to key by.
+    PerGameFolder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2MemcardInfo {
+    pub path: PathBuf,
+    pub kind: Pcsx2MemcardKind,
+    pub present: bool,
+}
+
+/// Bounded, conservative memory-card presence inspection under
+/// `memcards_root` (real PCSX2 layout: `<configuration_path>/memcards`).
+/// Every top-level `Mcd*.ps2`/`.bin` file is reported as `Shared` (PCSX2's
+/// default arrangement makes no single-title claim possible); a
+/// `<serial>/` subdirectory, when `serial` is supplied, is reported
+/// separately as `PerGameFolder`.
+fn inspect_pcsx2_memcards(memcards_root: &Path, serial: Option<&str>) -> Vec<Pcsx2MemcardInfo> {
+    let mut cards = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(memcards_root) {
+        for (visited, entry) in read_dir.flatten().enumerate() {
+            if visited >= PCSX2_MAX_MEMCARD_CANDIDATES {
+                break;
+            }
+            let entry_path = entry.path();
+            if !is_regular_file_no_follow(&entry_path) {
+                continue;
+            }
+            let looks_like_memcard = entry_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("ps2") || extension.eq_ignore_ascii_case("bin")
+                });
+            if looks_like_memcard {
+                cards.push(Pcsx2MemcardInfo {
+                    path: entry_path,
+                    kind: Pcsx2MemcardKind::Shared,
+                    present: true,
+                });
+            }
+        }
+    }
+    if let Some(serial) = serial {
+        let per_game_path = memcards_root.join(serial);
+        cards.push(Pcsx2MemcardInfo {
+            present: is_real_directory_no_follow(&per_game_path).unwrap_or(false),
+            kind: Pcsx2MemcardKind::PerGameFolder,
+            path: per_game_path,
+        });
+    }
+    cards
+}
+
+// ---------------------------------------------------------------------
+// Save states
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pcsx2SaveStateInventory {
+    /// Save states whose filename starts with the requested serial - real
+    /// PCSX2 save-state filenames are serial-prefixed
+    /// (`SLUS-20312 (F460F374).00.p2s`), which is why this bounded
+    /// prefix check is a genuinely reliable mapping rather than a filename
+    /// guess. Still never authoritative for anything beyond "a save state
+    /// exists for this serial."
+    pub matched_count: usize,
+    pub total_count_in_directory: usize,
+    pub complete: bool,
+}
+
+fn inspect_pcsx2_savestates(sstates_root: &Path, serial: Option<&str>) -> Pcsx2SaveStateInventory {
+    let mut inventory = Pcsx2SaveStateInventory {
+        complete: true,
+        ..Default::default()
+    };
+    let Ok(read_dir) = fs::read_dir(sstates_root) else {
+        return inventory;
+    };
+    for (visited, entry) in read_dir.flatten().enumerate() {
+        if visited >= PCSX2_MAX_SAVESTATE_CANDIDATES {
+            inventory.complete = false;
+            break;
+        }
+        let entry_path = entry.path();
+        if !is_regular_file_no_follow(&entry_path) {
+            continue;
+        }
+        let is_savestate = entry_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("p2s"));
+        if !is_savestate {
+            continue;
+        }
+        inventory.total_count_in_directory += 1;
+        if let Some(serial) = serial
+            && entry_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(serial))
+        {
+            inventory.matched_count += 1;
+        }
+    }
+    inventory
+}
+
+// ---------------------------------------------------------------------
+// Controllers
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pcsx2ControllerInfo {
+    pub profile_configured: bool,
+    /// Section names observed (e.g. `Pad1`, `USB1`), bounded - device/
+    /// profile *names* are not reliably present in PCSX2.ini itself, so
+    /// this reports which ports have any configuration at all, not device
+    /// identity.
+    pub configured_sections: Vec<String>,
+}
+
+fn controller_info_from(settings: &Pcsx2Settings) -> Pcsx2ControllerInfo {
+    Pcsx2ControllerInfo {
+        profile_configured: !settings.controller_sections.is_empty(),
+        configured_sections: settings.controller_sections.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Selected-title mapping and top-level inspection
+// ---------------------------------------------------------------------
+
+/// A deliberately separate input lane for identity supplied by core and
+/// identifiers merely observed in PCSX2 context - mirrors
+/// [`super::ppsspp_local::PpssppGameRequest`]/
+/// [`super::rpcs3_local::Rpcs3GameRequest`] exactly. `verified_ps2_serial`
+/// keys the serial-addressed local directories this section adds
+/// (per-game config/textures/memory cards/save states);
+/// `verified_executable_crc` is passed straight through to the existing,
+/// unchanged [`match_pcsx2_inventory`] for PNACH matching - the two are
+/// never conflated (see this section's own doc comment for why).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pcsx2GameRequest {
+    pub verified_ps2_serial: Option<String>,
+    pub verified_executable_crc: Option<String>,
+    pub emulator_serial: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pcsx2SerialMapping {
+    VerifiedPs2Serial,
+    EmulatorMetadataOnly,
+    Unavailable,
+}
+
+fn select_serial(request: &Pcsx2GameRequest) -> (Option<String>, Pcsx2SerialMapping) {
+    if let Some(serial) = request
+        .verified_ps2_serial
+        .as_deref()
+        .and_then(normalize_ps2_serial)
+    {
+        return (Some(serial), Pcsx2SerialMapping::VerifiedPs2Serial);
+    }
+    if let Some(serial) = request
+        .emulator_serial
+        .as_deref()
+        .and_then(normalize_ps2_serial)
+    {
+        return (Some(serial), Pcsx2SerialMapping::EmulatorMetadataOnly);
+    }
+    (None, Pcsx2SerialMapping::Unavailable)
+}
+
+/// A light shape check only (uppercase alphanumeric plus `-`), not a
+/// re-implementation of serial *extraction* - the authoritative grammar
+/// for turning a boot path into a serial remains
+/// [`crate::game_identity::serial_from_boot_path`], which this module
+/// never re-derives (see this section's own doc comment).
+fn normalize_ps2_serial(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()
+        && trimmed.len() <= 16
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    .then(|| trimmed.to_ascii_uppercase())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2Health {
+    pub detected: bool,
+    pub config_readable: bool,
+    pub bios: Pcsx2BiosVerification,
+    pub patch_data_available: bool,
+    pub serial_mapping: Pcsx2SerialMapping,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2GameInspection {
+    pub serial: Option<String>,
+    pub serial_mapping: Pcsx2SerialMapping,
+    pub global_config: Pcsx2Config,
+    pub per_game_config: Option<Pcsx2Config>,
+    pub overridden_setting_keys: Vec<String>,
+    /// The existing, unchanged PNACH inventory for this profile - see
+    /// [`inspect_pcsx2_profile`], reused verbatim.
+    pub patches: Option<Pcsx2PnachInventory>,
+    /// The existing, unchanged CRC-based match result - see
+    /// [`match_pcsx2_inventory`], reused verbatim.
+    pub patch_match: Option<Pcsx2MatchResult>,
+    pub textures: Option<Pcsx2TextureInventory>,
+    pub memcards: Vec<Pcsx2MemcardInfo>,
+    pub savestates: Pcsx2SaveStateInventory,
+    pub controllers: Pcsx2ControllerInfo,
+    pub bios: Pcsx2BiosInfo,
+    pub health: Pcsx2Health,
+}
+
+/// Ties every new inspection function above together into one summary for
+/// a selected, possibly-verified PS2 title - the same shape
+/// `ppsspp_local::inspect_ppsspp_game`/`rpcs3_local::inspect_rpcs3_game`
+/// already establish. Infallible: an internal failure of the existing
+/// [`inspect_pcsx2_profile`] (e.g. the profile changed underfoot) is
+/// recorded as a health warning rather than propagated, so a caller
+/// always gets a populated summary to render.
+pub fn inspect_pcsx2_game(
+    profile: &Pcsx2Profile,
+    request: &Pcsx2GameRequest,
+) -> Pcsx2GameInspection {
+    let (serial, serial_mapping) = select_serial(request);
+    let mut health_warnings: Vec<String> = profile
+        .blockers
+        .iter()
+        .map(|blocker| blocker.detail.clone())
+        .collect();
+
+    let global_config =
+        inspect_pcsx2_config(&pcsx2_global_config_path(&profile.configuration_path));
+    for warning in &global_config.warnings {
+        health_warnings.push(warning.clone());
+    }
+    let per_game_config = serial.as_deref().map(|serial| {
+        let modern = profile
+            .configuration_path
+            .join(format!("inis/gamesettings/{serial}.ini"));
+        let legacy = profile
+            .configuration_path
+            .join(format!("gamesettings/{serial}.ini"));
+        inspect_pcsx2_config(if is_regular_file_no_follow(&modern) {
+            &modern
+        } else {
+            &legacy
+        })
+    });
+    let overridden_setting_keys = per_game_config
+        .as_ref()
+        .map(|config| differing_settings_keys(&global_config.settings, &config.settings))
+        .unwrap_or_default();
+
+    let patches = match inspect_pcsx2_profile(profile) {
+        Ok(inventory) => Some(inventory),
+        Err(error) => {
+            health_warnings.push(error.to_string());
+            None
+        }
+    };
+    let patch_match = patches.as_ref().map(|inventory| {
+        match_pcsx2_inventory(inventory, request.verified_executable_crc.as_deref(), None)
+    });
+
+    let textures = serial
+        .as_deref()
+        .map(|serial| inspect_pcsx2_textures(&profile.configuration_path.join("textures"), serial));
+    let memcards = inspect_pcsx2_memcards(
+        &profile.configuration_path.join("memcards"),
+        serial.as_deref(),
+    );
+    let savestates = inspect_pcsx2_savestates(
+        &profile.configuration_path.join("sstates"),
+        serial.as_deref(),
+    );
+    let controllers = controller_info_from(&global_config.settings);
+    let bios = inspect_pcsx2_bios(&profile.configuration_path.join("bios"));
+    for warning in &bios.warnings {
+        health_warnings.push(warning.clone());
+    }
+
+    let health = Pcsx2Health {
+        detected: profile.eligible,
+        config_readable: global_config.readable,
+        bios: bios.verification,
+        patch_data_available: patches
+            .as_ref()
+            .is_some_and(|inventory| !inventory.files.is_empty()),
+        serial_mapping,
+        warnings: health_warnings,
+    };
+
+    Pcsx2GameInspection {
+        serial,
+        serial_mapping,
+        global_config,
+        per_game_config,
+        overridden_setting_keys,
+        patches,
+        patch_match,
+        textures,
+        memcards,
+        savestates,
+        controllers,
+        bios,
+        health,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1863,5 +2686,512 @@ mod tests {
             })
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // ===================================================================
+    // Emulator Adapter Refresh Batch H: modernisation tests.
+    // ===================================================================
+
+    fn write_global_config(profile_root: &Path, contents: &str) {
+        fs::create_dir_all(profile_root.join("inis")).unwrap();
+        fs::write(profile_root.join("inis/PCSX2.ini"), contents).unwrap();
+    }
+
+    // -- version ---------------------------------------------------------
+
+    #[test]
+    fn known_version_string_parses() {
+        assert_eq!(
+            parse_pcsx2_version("PCSX2 2.2.0-20250101120000"),
+            Some("2.2.0".to_string())
+        );
+        assert_eq!(parse_pcsx2_version("v1.7.5"), Some("1.7.5".to_string()));
+    }
+
+    #[test]
+    fn unknown_version_shape_fails_soft() {
+        assert_eq!(parse_pcsx2_version("some unrelated tool"), None);
+        assert_eq!(parse_pcsx2_version(""), None);
+    }
+
+    // -- global config -----------------------------------------------------
+
+    #[test]
+    fn valid_global_config_is_parsed() {
+        let root = fixture_root("global-config");
+        let profile_root = make_profile(&root);
+        write_global_config(
+            &profile_root,
+            "[EmuCore/GS]\nRenderer = 12\nVsyncEnable = true\nLoadTextureReplacements = false\n\
+             [EmuCore]\nEnableCheats = true\nEnableWideScreenPatches = false\n",
+        );
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(inspection.global_config.readable);
+        assert_eq!(
+            inspection.global_config.settings.renderer.as_deref(),
+            Some("12")
+        );
+        assert_eq!(inspection.global_config.settings.vsync, Some(true));
+        assert_eq!(inspection.global_config.settings.cheats_enabled, Some(true));
+        assert_eq!(
+            inspection.global_config.settings.widescreen_patches_enabled,
+            Some(false)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_global_config_fails_soft() {
+        let root = fixture_root("malformed-config");
+        let profile_root = make_profile(&root);
+        write_global_config(
+            &profile_root,
+            "[EmuCore/GS]\nthis line has no equals sign\nVsyncEnable = true\n",
+        );
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(inspection.global_config.readable);
+        assert_eq!(inspection.global_config.settings.vsync, Some(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_global_config_is_not_readable_but_never_panics() {
+        let root = fixture_root("missing-config");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(!inspection.global_config.readable);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // -- BIOS --------------------------------------------------------------
+
+    #[test]
+    fn bios_present_is_unverified_never_verified_by_filename_alone() {
+        let root = fixture_root("bios-present");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("bios")).unwrap();
+        fs::write(profile_root.join("bios/SCPH-70012.bin"), b"not a real bios").unwrap();
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert_eq!(
+            inspection.bios.verification,
+            Pcsx2BiosVerification::PresentUnverified
+        );
+        assert_eq!(
+            inspection.health.bios,
+            Pcsx2BiosVerification::PresentUnverified
+        );
+        assert_eq!(inspection.bios.filename_hint.as_deref(), Some("SCPH-70012"));
+    }
+
+    #[test]
+    fn bios_missing_is_reported_honestly() {
+        let root = fixture_root("bios-missing");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert_eq!(inspection.bios.verification, Pcsx2BiosVerification::Missing);
+    }
+
+    // -- serial mapping / identity safety -----------------------------------
+
+    #[test]
+    fn authoritative_ps2_serial_maps_per_game_assets() {
+        let root = fixture_root("verified-serial");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("inis/gamesettings")).unwrap();
+        fs::write(
+            profile_root.join("inis/gamesettings/SLUS-20312.ini"),
+            "[EmuCore/GS]\nRenderer = 14\n",
+        )
+        .unwrap();
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: None,
+            emulator_serial: Some("SLES-99999".to_string()),
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        assert_eq!(
+            inspection.serial_mapping,
+            Pcsx2SerialMapping::VerifiedPs2Serial
+        );
+        assert_eq!(inspection.serial.as_deref(), Some("SLUS-20312"));
+        let per_game = inspection.per_game_config.expect("per-game config found");
+        assert_eq!(
+            per_game.settings.renderer.as_deref(),
+            Some("14"),
+            "verified serial must select assets, never the emulator-observed one"
+        );
+    }
+
+    #[test]
+    fn unresolved_identity_stays_unresolved_no_asset_mapping() {
+        let root = fixture_root("unresolved-identity");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert_eq!(inspection.serial_mapping, Pcsx2SerialMapping::Unavailable);
+        assert!(inspection.serial.is_none());
+        assert!(inspection.per_game_config.is_none());
+    }
+
+    #[test]
+    fn emulator_metadata_only_never_overrides_a_conflicting_verified_identity() {
+        // A caller whose own identity resolution conflicted must simply not
+        // pass a `verified_ps2_serial` - this module never chooses a side
+        // or falls back to emulator metadata to break a tie it was never
+        // told about.
+        let root = fixture_root("conflict");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: None,
+            verified_executable_crc: None,
+            emulator_serial: Some("SLUS-99999".to_string()),
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        assert_eq!(
+            inspection.serial_mapping,
+            Pcsx2SerialMapping::EmulatorMetadataOnly
+        );
+        // Emulator-metadata-only mapping is explicitly weaker than
+        // verified - a caller that knows identity conflicted is expected
+        // to pass neither field, which the previous test already covers.
+        assert_eq!(inspection.serial.as_deref(), Some("SLUS-99999"));
+    }
+
+    #[test]
+    fn pcsx2_crc_never_becomes_preservation_identity() {
+        // `Pcsx2GameRequest.verified_executable_crc` only ever feeds the
+        // existing, unchanged `match_pcsx2_inventory` - it must never
+        // influence `serial`/`serial_mapping` at all.
+        let root = fixture_root("crc-metadata-only");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: None,
+            verified_executable_crc: Some("F460F374".to_string()),
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        assert_eq!(inspection.serial_mapping, Pcsx2SerialMapping::Unavailable);
+        assert!(inspection.serial.is_none());
+    }
+
+    #[test]
+    fn directory_name_has_zero_identity_authority() {
+        let root = fixture_root("dir-name-authority");
+        let profile_root = make_profile(&root);
+        // A per-game-settings file named after a *different* serial than
+        // the one actually requested must never be picked up.
+        fs::create_dir_all(profile_root.join("inis/gamesettings")).unwrap();
+        fs::write(
+            profile_root.join("inis/gamesettings/SLES-99999.ini"),
+            "[EmuCore/GS]\nRenderer = 99\n",
+        )
+        .unwrap();
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: None,
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        let per_game = inspection
+            .per_game_config
+            .expect("per-game config lookup is always attempted for a known serial");
+        assert!(
+            !per_game.exists,
+            "a per-game file named after a different serial must never be substituted"
+        );
+    }
+
+    #[test]
+    fn bios_filename_never_verifies_bios() {
+        // Already covered by `bios_present_is_unverified_never_verified_by_filename_alone`
+        // structurally (the only success path is `PresentUnverified`) -
+        // this test additionally proves a filename matching a real,
+        // well-known region string still never reaches `Verified`.
+        let root = fixture_root("bios-filename-authority");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("bios")).unwrap();
+        fs::write(profile_root.join("bios/SCPH-70012_verified.bin"), b"x").unwrap();
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert_ne!(
+            inspection.bios.verification,
+            Pcsx2BiosVerification::Verified
+        );
+    }
+
+    // -- textures ------------------------------------------------------------
+
+    #[test]
+    fn texture_replacement_pack_is_detected_bounded() {
+        let root = fixture_root("textures");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("textures/SLUS-20312")).unwrap();
+        for index in 0..5 {
+            fs::write(
+                profile_root.join(format!("textures/SLUS-20312/tex{index}.png")),
+                b"fake texture data",
+            )
+            .unwrap();
+        }
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: None,
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        let textures = inspection.textures.expect("texture inventory present");
+        assert!(textures.present);
+        assert_eq!(textures.file_count, 5);
+        assert!(textures.total_size_bytes > 0);
+    }
+
+    #[test]
+    fn texture_directory_name_has_zero_identity_authority() {
+        // The directory is keyed strictly by the *requested* serial as a
+        // path component - a directory named after a different serial is
+        // simply never visited.
+        let root = fixture_root("textures-authority");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("textures/SLES-99999")).unwrap();
+        fs::write(profile_root.join("textures/SLES-99999/tex0.png"), b"x").unwrap();
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: None,
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        let textures = inspection.textures.expect("texture inventory present");
+        assert!(!textures.present);
+        assert_eq!(textures.file_count, 0);
+    }
+
+    // -- memory cards ----------------------------------------------------
+
+    #[test]
+    fn shared_memory_card_is_detected_never_claimed_exclusive() {
+        let root = fixture_root("memcard-shared");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("memcards")).unwrap();
+        fs::write(profile_root.join("memcards/Mcd001.ps2"), b"x").unwrap();
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(
+            inspection
+                .memcards
+                .iter()
+                .any(|card| card.kind == Pcsx2MemcardKind::Shared && card.present)
+        );
+    }
+
+    #[test]
+    fn per_game_memory_card_folder_is_surfaced_when_present() {
+        let root = fixture_root("memcard-per-game");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("memcards/SLUS-20312")).unwrap();
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: None,
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        assert!(
+            inspection
+                .memcards
+                .iter()
+                .any(|card| card.kind == Pcsx2MemcardKind::PerGameFolder && card.present)
+        );
+    }
+
+    #[test]
+    fn memory_card_filename_has_zero_identity_authority() {
+        // A memory-card file's own name is never treated as evidence of
+        // which title it belongs to - it is only ever reported as `Shared`.
+        let root = fixture_root("memcard-authority");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("memcards")).unwrap();
+        fs::write(profile_root.join("memcards/SLUS-20312.ps2"), b"x").unwrap();
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        let card = inspection
+            .memcards
+            .iter()
+            .find(|card| card.path.ends_with("SLUS-20312.ps2"))
+            .expect("card found");
+        assert_eq!(card.kind, Pcsx2MemcardKind::Shared);
+    }
+
+    // -- save states -------------------------------------------------------
+
+    #[test]
+    fn save_state_matching_the_serial_prefix_is_counted() {
+        let root = fixture_root("savestate");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("sstates")).unwrap();
+        fs::write(
+            profile_root.join("sstates/SLUS-20312 (F460F374).00.p2s"),
+            b"x",
+        )
+        .unwrap();
+        fs::write(
+            profile_root.join("sstates/SLES-99999 (12345678).00.p2s"),
+            b"x",
+        )
+        .unwrap();
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: None,
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        assert_eq!(inspection.savestates.matched_count, 1);
+        assert_eq!(inspection.savestates.total_count_in_directory, 2);
+    }
+
+    // -- controllers -------------------------------------------------------
+
+    #[test]
+    fn controller_profile_presence_is_detected() {
+        let root = fixture_root("controller");
+        let profile_root = make_profile(&root);
+        write_global_config(
+            &profile_root,
+            "[Pad1]\nType = DualShock2\n[USB1]\nType = none\n",
+        );
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(inspection.controllers.profile_configured);
+        assert!(
+            inspection
+                .controllers
+                .configured_sections
+                .contains(&"Pad1".to_string())
+        );
+    }
+
+    #[test]
+    fn no_controller_sections_is_reported_honestly() {
+        let root = fixture_root("no-controller");
+        let profile_root = make_profile(&root);
+        write_global_config(&profile_root, "[EmuCore]\nEnableCheats = true\n");
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(!inspection.controllers.profile_configured);
+    }
+
+    // -- patches/cheats reuse the existing, unchanged pipeline unchanged ----
+
+    #[test]
+    fn patches_and_crc_matching_reuse_the_existing_unchanged_pipeline() {
+        let root = fixture_root("patches-reuse");
+        let profile_root = make_profile(&root);
+        fs::write(
+            profile_root.join("cheats/F460F374.pnach"),
+            "// Test cheat\npatch=1,EE,00000000,extended,00000000\n",
+        )
+        .unwrap();
+        let profile = eligible_profile(&profile_root);
+        let request = Pcsx2GameRequest {
+            verified_ps2_serial: Some("SLUS-20312".to_string()),
+            verified_executable_crc: Some("F460F374".to_string()),
+            emulator_serial: None,
+        };
+        let inspection = inspect_pcsx2_game(&profile, &request);
+        let patches = inspection.patches.expect("patch inventory present");
+        assert_eq!(patches.files.len(), 1);
+        let patch_match = inspection.patch_match.expect("match result present");
+        assert_eq!(patch_match.state, Pcsx2MatchState::ExactCrcMatch);
+        assert!(inspection.health.patch_data_available);
+    }
+
+    #[test]
+    fn pnach_crc_has_zero_preservation_authority() {
+        // A PNACH file's own CRC (used only for the existing, unchanged
+        // patch-matching pipeline) must never influence `serial`/
+        // `serial_mapping` - identity and patch-matching stay separate
+        // concerns.
+        let root = fixture_root("pnach-crc-authority");
+        let profile_root = make_profile(&root);
+        fs::write(
+            profile_root.join("cheats/F460F374.pnach"),
+            "patch=1,EE,00000000,extended,00000000\n",
+        )
+        .unwrap();
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert_eq!(inspection.serial_mapping, Pcsx2SerialMapping::Unavailable);
+        assert!(inspection.serial.is_none());
+    }
+
+    #[test]
+    fn widescreen_patch_category_is_distinguished_from_cheats() {
+        let root = fixture_root("widescreen");
+        let profile_root = make_profile(&root);
+        fs::create_dir_all(profile_root.join("cheats_ws")).unwrap();
+        fs::write(
+            profile_root.join("cheats_ws/F460F374.pnach"),
+            "patch=1,EE,00000000,extended,00000000\n",
+        )
+        .unwrap();
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        let patches = inspection.patches.expect("patch inventory present");
+        assert!(
+            patches
+                .files
+                .iter()
+                .any(|file| file.category == Pcsx2PatchCategory::WidescreenPatches)
+        );
+    }
+
+    // -- non-PS2 selection / detected health --------------------------------
+
+    #[test]
+    fn a_non_ps2_selection_simply_yields_no_serial_mapping() {
+        // This module has no platform concept of its own - a caller simply
+        // never supplies a `verified_ps2_serial` for a non-PS2 title, and
+        // the result is identical to any other unresolved-identity case.
+        let root = fixture_root("non-ps2");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert_eq!(inspection.serial_mapping, Pcsx2SerialMapping::Unavailable);
+    }
+
+    #[test]
+    fn detected_reflects_existing_eligibility_unchanged() {
+        let root = fixture_root("detected");
+        let profile_root = make_profile(&root);
+        let profile = eligible_profile(&profile_root);
+        assert!(profile.eligible, "fixture must be eligible");
+        let inspection = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        assert!(inspection.health.detected);
+    }
+
+    // -- no mutation ---------------------------------------------------------
+
+    #[test]
+    fn game_inspection_never_mutates_anything_it_reads() {
+        let root = fixture_root("no-mutation");
+        let profile_root = make_profile(&root);
+        write_global_config(&profile_root, "[EmuCore/GS]\nRenderer = 12\n");
+        let config_path = profile_root.join("inis/PCSX2.ini");
+        let before = fs::read(&config_path).unwrap();
+        let profile = eligible_profile(&profile_root);
+        let _ = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
+        let after = fs::read(&config_path).unwrap();
+        assert_eq!(before, after);
     }
 }
