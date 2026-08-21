@@ -66,6 +66,7 @@ mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
 mod retroarch_materialization;
+mod rpcs3_local;
 mod shared_preview;
 mod shared_transaction;
 mod xenia_install_plan;
@@ -437,6 +438,17 @@ pub use retroarch_materialization::{
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, RetroArchMaterializedSource,
     materialize_retroarch_shared_preview,
+};
+pub use rpcs3_local::{
+    RPCS3_MAX_DLC_ENTRIES, RPCS3_MAX_ENTRIES_VISITED, RPCS3_MAX_PATCH_ENTRIES, RPCS3_MAX_PROFILES,
+    RPCS3_MAX_SAVE_TROPHY_CANDIDATES, RPCS3_MAX_SFO_SCAN_ENTRIES, Rpcs3DiscoveryError,
+    Rpcs3DlcEntry, Rpcs3DlcInventory, Rpcs3Executable, Rpcs3FirmwareStatus, Rpcs3GameIdMapping,
+    Rpcs3GameInspection, Rpcs3GameRequest, Rpcs3Health, Rpcs3InspectionWarning,
+    Rpcs3InspectionWarningKind, Rpcs3InstallationType, Rpcs3InstalledGame, Rpcs3PatchEntry,
+    Rpcs3PatchInventory, Rpcs3PerGameConfig, Rpcs3Profile, Rpcs3ProfileBlocker,
+    Rpcs3ProfileBlockerKind, Rpcs3ProfileDiscovery, Rpcs3ProfileDiscoveryRoots, Rpcs3ProfileScope,
+    Rpcs3SaveTrophyInventory, Rpcs3Settings, Rpcs3UpdateInfo, discover_rpcs3_profiles,
+    inspect_rpcs3_game, parse_rpcs3_version,
 };
 pub use shared_preview::{
     PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,
