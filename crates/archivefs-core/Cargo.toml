@@ -134,6 +134,10 @@ nod = { version = "1.4.4", default-features = false, features = ["compress-zstd"
 # no native/C dependency. Reused rather than hand-writing an XDVDFS
 # filesystem stack from scratch.
 xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std", "sync"] }
+# Read-only Amiga OFS/FFS traversal.  The crate is MIT-licensed and is used
+# solely through its `BlockDevice` trait, which our partition-range adapter
+# backs with positional reads and a hard read budget.
+affs-read = "0.4.1"
 
 [features]
 chd-optical-specialist = ["dep:opticaldiscs"]
