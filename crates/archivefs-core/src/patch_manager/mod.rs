@@ -368,15 +368,20 @@ pub use pcsx2_install_plan::{
     pcsx2_crc_filename, pcsx2_pnach_filename, stage_pcsx2_pnach,
 };
 pub use pcsx2_local::{
-    PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH, PCSX2_MAX_ENTRIES_VISITED,
-    PCSX2_MAX_LINE_BYTES, PCSX2_MAX_LINES_PER_FILE, PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE,
+    PCSX2_MAX_CONFIG_BYTES, PCSX2_MAX_DIRECTORIES_TRAVERSED, PCSX2_MAX_DIRECTORY_DEPTH,
+    PCSX2_MAX_ENTRIES_VISITED, PCSX2_MAX_LINE_BYTES, PCSX2_MAX_LINES_PER_FILE,
+    PCSX2_MAX_MEMCARD_CANDIDATES, PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE,
     PCSX2_MAX_PNACH_FILE_BYTES, PCSX2_MAX_PNACH_FILES, PCSX2_MAX_PROFILES,
-    PCSX2_MAX_TOTAL_PNACH_BYTES, Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2InspectionError,
+    PCSX2_MAX_SAVESTATE_CANDIDATES, PCSX2_MAX_TEXTURE_FILES, PCSX2_MAX_TOTAL_PNACH_BYTES,
+    Pcsx2BiosInfo, Pcsx2BiosVerification, Pcsx2Config, Pcsx2ControllerInfo, Pcsx2DirectoryIdentity,
+    Pcsx2DiscoveryError, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2Health, Pcsx2InspectionError,
     Pcsx2InspectionWarning, Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2MatchResult,
-    Pcsx2MatchState, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
-    Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
-    Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    discover_pcsx2_profiles, inspect_pcsx2_profile, match_pcsx2_inventory,
+    Pcsx2MatchState, Pcsx2MemcardInfo, Pcsx2MemcardKind, Pcsx2PatchCategory, Pcsx2PatchDirectory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, Pcsx2SaveStateInventory, Pcsx2SerialMapping,
+    Pcsx2Settings, Pcsx2TextureInventory, discover_pcsx2_profiles, inspect_pcsx2_game,
+    inspect_pcsx2_profile, match_pcsx2_inventory, parse_pcsx2_version,
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
