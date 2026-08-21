@@ -8497,6 +8497,7 @@ impl ArchiveFsApp {
         let source_path = report.path.clone();
         let identity = report.identity_result.clone();
         let identity_presentation = report.identity.clone();
+        let physical_hash = report.hashes.as_ref().map(|hashes| hashes.sha1.clone());
 
         self.plan_preview_generation += 1;
         let generation = self.plan_preview_generation;
@@ -8513,6 +8514,7 @@ impl ArchiveFsApp {
                 &source_path,
                 &identity,
                 &identity_presentation,
+                physical_hash.as_deref(),
                 master_root.as_deref(),
             );
             let _ = sender.send((generation, outcome));
