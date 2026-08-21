@@ -1,4 +1,7 @@
-//! Read-only bounded Amiga HDF/RDB container inspection. No filesystem traversal.
+//! Read-only bounded Amiga HDF/RDB container inspection and OFS/FFS traversal.
+//!
+//! Filesystem access is deliberately constrained to an RDB partition range;
+//! it never mounts, repairs, or writes an HDF.
 use crate::platform_evidence_fusion::evidence_lineage::{
     ClaimStrength, ClaimType, EvidenceChannel, EvidenceObservation, IdentityScope, LineageRelation,
     Provenance, Representation, SourceFamily,
@@ -268,5 +271,12 @@ fn classify(raw: u32) -> FileSystem {
         _ => FileSystem::Unknown(raw),
     }
 }
+
+mod filesystem;
+pub use filesystem::{
+    AmigaDosFamily, AmigaFilesystem, DiscoveredSlave, FilesystemError, HdfSlaveDiscovery,
+    PartitionTraversalLimits, discover_whdload_slaves, inspect_amiga_filesystem,
+    structural_discovered_slave_observation,
+};
 #[cfg(test)]
 mod tests;

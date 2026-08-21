@@ -46,6 +46,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "affs-read"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb588e8c4d973b4a404cabde76446fd1ae628bfcce6fa1853ecb1c3431748b6b"
+dependencies = [
+ "memchr",
+ "simdutf8",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -125,6 +135,7 @@ dependencies = [
 name = "archivefs-core"
 version = "0.8.0-alpha"
 dependencies = [
+ "affs-read",
  "chd",
  "encoding_rs",
  "flate2",
