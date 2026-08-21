@@ -141,6 +141,7 @@ pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+pub(crate) mod pcsx2_page;
 pub(crate) mod repair_history_page;
 pub(crate) mod repair_review_page;
 pub(crate) mod rom_organisation_page;
@@ -3723,6 +3724,18 @@ struct ArchiveFsApp {
     /// automatic.
     rpcs3_status: rpcs3_page::Rpcs3State,
     rpcs3_status_generation: u64,
+    /// PCSX2 GUI Integration Batch H2: the read-only PCSX2
+    /// environment/status panel on the Selected page - see `pcsx2_page`'s
+    /// own module doc. Starts `Idle`; loading is always an explicit
+    /// action, never automatic.
+    pcsx2_status: pcsx2_page::Pcsx2StatusState,
+    pcsx2_status_generation: u64,
+    /// Which selected-archive path `pcsx2_status` was loaded (or is
+    /// loading) for. Compared against the currently focused archive on
+    /// every render of the Selected page so that switching the selected
+    /// ROM invalidates a stale/in-flight result rather than showing it
+    /// against the wrong title.
+    pcsx2_status_archive_path: Option<PathBuf>,
     /// The Cheat Sources page, loaded lazily the first time it is opened so
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
@@ -4166,6 +4179,9 @@ impl ArchiveFsApp {
             doctor_scan_generation: RefreshGeneration::INITIAL,
             rpcs3_status: rpcs3_page::Rpcs3State::Idle,
             rpcs3_status_generation: 0,
+            pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
+            pcsx2_status_generation: 0,
+            pcsx2_status_archive_path: None,
             doctor_selected_finding: None,
             doctor_repair_review: None,
             doctor_repair_result: None,
@@ -5027,6 +5043,96 @@ impl ArchiveFsApp {
             && message_generation == *generation
         {
             self.rpcs3_status = rpcs3_page::Rpcs3State::Ready {
+                generation: message_generation,
+                outcome,
+            };
+        }
+    }
+
+    fn start_pcsx2_status_load(
+        &mut self,
+        context: egui::Context,
+        archive_path: Option<PathBuf>,
+        verified_ps2_serial: Option<String>,
+        verified_executable_crc: Option<String>,
+    ) {
+        self.pcsx2_status_generation += 1;
+        let generation = self.pcsx2_status_generation;
+        self.pcsx2_status_archive_path = archive_path;
+        let (sender, receiver) = mpsc::channel();
+        self.pcsx2_status = pcsx2_page::Pcsx2StatusState::Loading {
+            generation,
+            receiver,
+        };
+        thread::spawn(move || {
+            let outcome =
+                pcsx2_page::gather_pcsx2_status(verified_ps2_serial, verified_executable_crc);
+            let _ = sender.send((generation, outcome));
+            context.request_repaint();
+        });
+    }
+
+    /// PCSX2 GUI Integration Batch H2: resets the PCSX2 status panel to
+    /// `Idle` whenever the focused selected-ROM archive has changed since
+    /// the current (or in-flight) result was loaded for, so a stale
+    /// per-title mapping for the previous selection is never shown against
+    /// the new one. Cheap no-op when the selection has not changed. Called
+    /// once per frame right before rendering the panel.
+    fn invalidate_pcsx2_status_if_selection_changed(&mut self, focused_archive: Option<&Path>) {
+        if self.pcsx2_status_archive_path.as_deref() != focused_archive {
+            self.pcsx2_status = pcsx2_page::Pcsx2StatusState::Idle;
+            self.pcsx2_status_archive_path = focused_archive.map(Path::to_path_buf);
+        }
+    }
+
+    /// PCSX2 GUI Integration Batch H2: applies the pure
+    /// [`pcsx2_page::Pcsx2StatusAction`] the panel returned this frame -
+    /// the only thing it can ever ask for, and read-only. The verified PS2
+    /// serial/CRC come exclusively from `pcsx2_identity_for_workflow`,
+    /// which itself only ever surfaces a value core already marked
+    /// `IdentityStatus::Verified` (see that helper and
+    /// `Pcsx2GameIdentity::from_report`) - an unresolved, ambiguous, or
+    /// conflicting selection, or one for which no cheat workflow has been
+    /// opened yet, yields `None` here, exactly like RPCS3's still-pending
+    /// wiring above.
+    fn handle_pcsx2_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<pcsx2_page::Pcsx2StatusAction>,
+    ) {
+        if let Some(pcsx2_page::Pcsx2StatusAction::Load) = action {
+            let identity = self
+                .cheat_workflow
+                .as_ref()
+                .and_then(pcsx2_identity_for_workflow);
+            let verified_ps2_serial = identity.as_ref().and_then(|id| id.serial.clone());
+            let verified_executable_crc = identity
+                .as_ref()
+                .and_then(|id| id.verified_crc())
+                .map(str::to_string);
+            let archive_path = self.archive_context.focused.clone();
+            self.start_pcsx2_status_load(
+                context.clone(),
+                archive_path,
+                verified_ps2_serial,
+                verified_executable_crc,
+            );
+        }
+    }
+
+    /// PCSX2 GUI Integration Batch H2: drains a completed PCSX2 status
+    /// check, discarding anything whose generation is no longer current -
+    /// the same stale-result guard every other background loader in this
+    /// app uses.
+    fn poll_pcsx2_status(&mut self) {
+        if let pcsx2_page::Pcsx2StatusState::Loading {
+            generation,
+            receiver,
+        } = &self.pcsx2_status
+            && let Ok((message_generation, outcome)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            self.pcsx2_status = pcsx2_page::Pcsx2StatusState::Ready {
                 generation: message_generation,
                 outcome,
             };
@@ -13840,6 +13946,7 @@ impl ArchiveFsApp {
         self.poll_setup_action(context);
         self.poll_doctor_scan();
         self.poll_rpcs3_status();
+        self.poll_pcsx2_status();
         self.poll_platform_action(context);
         self.poll_bulk_platform_action(context);
         self.poll_alias_action(context);
@@ -15211,6 +15318,21 @@ impl ArchiveFsApp {
                         &self.rpcs3_status,
                     );
                     self.handle_rpcs3_action(context, rpcs3_action);
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    let focused_archive = self.archive_context.focused.clone();
+                    self.invalidate_pcsx2_status_if_selection_changed(focused_archive.as_deref());
+                    let verified_ps2_serial = self
+                        .cheat_workflow
+                        .as_ref()
+                        .and_then(pcsx2_identity_for_workflow)
+                        .and_then(|id| id.serial);
+                    let pcsx2_action = pcsx2_page::show_pcsx2_panel(
+                        ui,
+                        self.ui_mode == GuiMode::AdvancedView,
+                        verified_ps2_serial.as_deref(),
+                        &self.pcsx2_status,
+                    );
+                    self.handle_pcsx2_action(context, pcsx2_action);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -54729,6 +54851,9 @@ $Instant Growth [Nayr]\n";
             doctor_scan_generation: RefreshGeneration::INITIAL,
             rpcs3_status: rpcs3_page::Rpcs3State::Idle,
             rpcs3_status_generation: 0,
+            pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
+            pcsx2_status_generation: 0,
+            pcsx2_status_archive_path: None,
             doctor_selected_finding: None,
             doctor_repair_review: None,
             doctor_repair_result: None,
