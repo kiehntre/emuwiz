@@ -141,6 +141,7 @@ pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+pub(crate) mod identity_sources_page;
 pub(crate) mod repair_history_page;
 pub(crate) mod repair_review_page;
 pub(crate) mod rom_organisation_page;
@@ -3960,6 +3961,12 @@ struct ArchiveFsApp {
     /// spawns, and the cache must survive across separate loads to be
     /// useful.
     no_intro_source_cache: Arc<Mutex<selected_evidence_no_intro::NoIntroSourceCache>>,
+    /// GUI Batch B: the read-only "Sources & Providers" status shown on the
+    /// Selected page below the evidence panel - see
+    /// `identity_sources_page`'s own module doc. Starts `Idle`; loading is
+    /// always an explicit action, never automatic.
+    identity_sources: identity_sources_page::IdentitySourcesState,
+    identity_sources_generation: u64,
     romm_ui: RommCardState,
     /// The configuration dialog's draft. `Some` exactly while it is open, which is
     /// the same open/closed convention every other dialog in this app uses - and is
@@ -4317,6 +4324,8 @@ impl ArchiveFsApp {
             no_intro_source_cache: Arc::new(Mutex::new(
                 selected_evidence_no_intro::NoIntroSourceCache::new(),
             )),
+            identity_sources: identity_sources_page::IdentitySourcesState::Idle,
+            identity_sources_generation: 0,
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,
@@ -8412,6 +8421,57 @@ impl ArchiveFsApp {
                     outcome,
                 };
             }
+        }
+    }
+
+    /// GUI Batch B: starts (or refreshes) the read-only "Sources &
+    /// Providers" status load - see `identity_sources_page`'s own module
+    /// doc. Explicit only (a button press); never called automatically.
+    fn start_identity_sources_load(&mut self, context: egui::Context) {
+        self.identity_sources_generation += 1;
+        let generation = self.identity_sources_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.identity_sources = identity_sources_page::IdentitySourcesState::Loading {
+            generation,
+            receiver,
+        };
+        thread::spawn(move || {
+            let config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
+            let status =
+                identity_sources_page::gather_no_intro_sources_status(config_path.as_deref().ok());
+            let _ = sender.send((generation, status));
+            context.request_repaint();
+        });
+    }
+
+    /// GUI Batch B: applies the pure
+    /// [`identity_sources_page::IdentitySourcesAction`] the panel returned
+    /// this frame - the only thing it can ever ask for, and read-only.
+    fn handle_identity_sources_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<identity_sources_page::IdentitySourcesAction>,
+    ) {
+        if let Some(identity_sources_page::IdentitySourcesAction::Load) = action {
+            self.start_identity_sources_load(context.clone());
+        }
+    }
+
+    /// GUI Batch B: drains a completed sources-status load, discarding
+    /// anything whose generation is no longer current - the same
+    /// stale-result guard `poll_selected_evidence` already uses.
+    fn poll_identity_sources(&mut self) {
+        if let identity_sources_page::IdentitySourcesState::Loading {
+            generation,
+            receiver,
+        } = &self.identity_sources
+            && let Ok((message_generation, status)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            self.identity_sources = identity_sources_page::IdentitySourcesState::Ready {
+                generation: message_generation,
+                status,
+            };
         }
     }
 
@@ -14022,6 +14082,7 @@ impl ArchiveFsApp {
         self.poll_library_view_action(context);
         self.poll_archive_inspection();
         self.poll_selected_evidence();
+        self.poll_identity_sources();
         self.poll_missing_removal(context);
         self.poll_operation(context);
         self.poll_mount_all(context);
@@ -15383,6 +15444,13 @@ impl ArchiveFsApp {
                         &self.selected_evidence,
                     );
                     self.handle_selected_evidence_action(context, evidence_action);
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    let identity_sources_action = identity_sources_page::show_identity_sources_panel(
+                        ui,
+                        self.ui_mode == GuiMode::AdvancedView,
+                        &self.identity_sources,
+                    );
+                    self.handle_identity_sources_action(context, identity_sources_action);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -55333,6 +55401,8 @@ $Instant Growth [Nayr]\n";
             no_intro_source_cache: Arc::new(Mutex::new(
                 selected_evidence_no_intro::NoIntroSourceCache::new(),
             )),
+            identity_sources: identity_sources_page::IdentitySourcesState::Idle,
+            identity_sources_generation: 0,
             romm_ui: RommCardState::default(),
             romm_config_draft: None,
             romm_preview: None,
