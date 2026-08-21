@@ -386,9 +386,11 @@ fn evidence_from_text(
             platform: platform.to_string(),
             machine_key: carries_machine_key.then(|| text.to_string()),
             kind,
-            confidence: authoritative
-                .then_some(DatPlatformConfidence::Strong)
-                .unwrap_or(DatPlatformConfidence::Weak),
+            confidence: if authoritative {
+                DatPlatformConfidence::Strong
+            } else {
+                DatPlatformConfidence::Weak
+            },
             detail: format!(
                 "{} `{text}` names this platform via `{segment}`",
                 kind.label()
