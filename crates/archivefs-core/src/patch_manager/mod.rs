@@ -42,6 +42,7 @@ mod dolphin_dedup;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
+mod duckstation_local;
 mod emulator_profile_memory;
 mod gamehacking_catalogue;
 mod gamehacking_gamecube_install_plan;
@@ -287,6 +288,21 @@ pub use dolphin_local::{
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinSettingsDirectoryState,
     discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_profile, match_dolphin_inventory,
     select_dolphin_profile,
+};
+pub use duckstation_local::{
+    DUCKSTATION_MAX_CHEAT_BYTES, DUCKSTATION_MAX_CONFIG_BYTES, DUCKSTATION_MAX_DIRECTORY_ENTRIES,
+    DUCKSTATION_MAX_PATCH_BYTES, DUCKSTATION_MAX_PLAYLIST_BYTES, DUCKSTATION_MAX_PLAYLIST_ENTRIES,
+    DUCKSTATION_MAX_PROFILES, DUCKSTATION_MAX_SAVE_STATE_CANDIDATES, DUCKSTATION_MAX_TEXTURE_DEPTH,
+    DUCKSTATION_MAX_TEXTURE_FILES, DuckStationBiosInventory, DuckStationBiosState,
+    DuckStationCheatInventory, DuckStationConfigInspection, DuckStationDiscContext,
+    DuckStationDiscoveryError, DuckStationExecutable, DuckStationGameInspection,
+    DuckStationGameRequest, DuckStationHealth, DuckStationInstallationType,
+    DuckStationMemoryCardInventory, DuckStationPatchInventory, DuckStationPlaylistInventory,
+    DuckStationProfile, DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots,
+    DuckStationSaveStateInventory, DuckStationSerialMapping, DuckStationSettings,
+    DuckStationTextureInventory, DuckStationWarning, DuckStationWarningKind,
+    discover_duckstation_profiles, inspect_duckstation_game, inspect_duckstation_playlist,
+    normalize_duckstation_ps1_serial, parse_duckstation_version,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
