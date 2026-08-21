@@ -69,6 +69,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut games: Vec<DatGameEntry> = Vec::new();
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
+    let mut current_game_year: Option<String> = None;
+    let mut current_game_manufacturer: Option<String> = None;
     let mut current_game_id: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
     let mut current_game_rom_of: Option<String> = None;
@@ -115,6 +117,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut text_buf = String::new();
     let mut depth: usize = 0;
     let mut in_game_element: bool = false;
+    let mut is_software_list: bool = false;
     let mut buf = Vec::new();
 
     loop {
@@ -194,6 +197,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     // handling below still overwrites these unconditionally, so
                     // normal `<header>` parsing keeps winning.
                     "softwarelist" => {
+                        is_software_list = true;
                         name = attr_str_checked(
                             start_bytes,
                             b"name",
@@ -223,6 +227,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut current_game_name,
                             &mut current_game_id,
                             &mut current_game_desc,
+                            &mut current_game_year,
+                            &mut current_game_manufacturer,
                             &mut current_game_clone_of,
                             &mut current_game_rom_of,
                             &mut current_game_sample_of,
@@ -321,6 +327,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             None
                         };
                         current_game_desc = None;
+                        current_game_year = None;
+                        current_game_manufacturer = None;
                         current_game_metadata = DatOriginalMetadata::default();
                         for (key, attribute) in [
                             ("category", b"category".as_slice()),
@@ -419,6 +427,17 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         current_rom_status = attr_str_opt(
                             start_bytes,
                             b"status",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        warn_nodump_with_hash(
+                            current_rom_status.as_deref(),
+                            [
+                                current_rom_crc.as_deref(),
+                                current_rom_md5.as_deref(),
+                                current_rom_sha1.as_deref(),
+                                current_rom_sha256.as_deref(),
+                            ],
                             &mut warnings,
                             limits.max_warnings,
                         );
@@ -628,6 +647,18 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             current_game_desc = Some(text);
                         }
                     }
+                    "year" if in_game_element => {
+                        let text = trimmed(&text_buf);
+                        if !text.is_empty() {
+                            current_game_year = Some(text);
+                        }
+                    }
+                    "publisher" | "manufacturer" if in_game_element => {
+                        let text = trimmed(&text_buf);
+                        if !text.is_empty() {
+                            current_game_manufacturer = Some(text);
+                        }
+                    }
                     "category" | "type" | "content_type" | "media" | "release_type"
                     | "archive_devstatus"
                         if in_game_element =>
@@ -783,6 +814,17 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     );
                     let status =
                         attr_str_opt(empty_bytes, b"status", &mut warnings, limits.max_warnings);
+                    warn_nodump_with_hash(
+                        status.as_deref(),
+                        [
+                            crc.as_deref(),
+                            md5.as_deref(),
+                            sha1.as_deref(),
+                            sha256.as_deref(),
+                        ],
+                        &mut warnings,
+                        limits.max_warnings,
+                    );
                     let merge =
                         attr_str_opt(empty_bytes, b"merge", &mut warnings, limits.max_warnings);
                     let date =
@@ -1052,6 +1094,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_game_name,
         &mut current_game_id,
         &mut current_game_desc,
+        &mut current_game_year,
+        &mut current_game_manufacturer,
         &mut current_game_clone_of,
         &mut current_game_rom_of,
         &mut current_game_sample_of,
@@ -1071,7 +1115,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut games,
     );
 
-    let ecosystem = detect_logiqx_ecosystem(&name, &author, &description);
+    let ecosystem =
+        detect_logiqx_ecosystem(is_software_list, &name, &author, &description, &version);
 
     let source = DatSource {
         format: DatFormat::Logiqx,
@@ -1084,7 +1129,22 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         homepage,
         clrmamepro_header,
         entry_count: games.len(),
-        rom_count: games.iter().map(|g| g.roms.len()).sum(),
+        rom_count: games
+            .iter()
+            .map(|game| {
+                game.roms.len()
+                    + game
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            part.data_areas
+                                .iter()
+                                .map(|area| area.roms.len())
+                                .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum(),
         parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
     };
 
@@ -1264,6 +1324,8 @@ fn drop_current_game(
     name: &mut Option<String>,
     id: &mut Option<String>,
     desc: &mut Option<String>,
+    year: &mut Option<String>,
+    manufacturer: &mut Option<String>,
     clone_of: &mut Option<String>,
     rom_of: &mut Option<String>,
     sample_of: &mut Option<String>,
@@ -1309,8 +1371,8 @@ fn drop_current_game(
             parts: std::mem::take(parts),
             board: None,
             rebuild_to: None,
-            year: None,
-            manufacturer: None,
+            year: year.take(),
+            manufacturer: manufacturer.take(),
             source_file: None,
             comment: None,
             original_metadata: std::mem::take(metadata),
@@ -1318,6 +1380,8 @@ fn drop_current_game(
             unsupported_structure: had_unsupported_structure,
         });
     } else {
+        year.take();
+        manufacturer.take();
         rom_of.take();
         sample_of.take();
         is_bios.take();
@@ -1445,18 +1509,55 @@ fn attr_u64(
     })
 }
 
+/// A `nodump` declaration is authoritative over any contradictory checksum:
+/// retain both raw fields for audit, but make the inconsistency visible to a
+/// caller that may otherwise assume every parsed hash is usable evidence.
+fn warn_nodump_with_hash(
+    status: Option<&str>,
+    hashes: [Option<&str>; 4],
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
+) {
+    if status.is_some_and(|value| value.eq_ignore_ascii_case("nodump"))
+        && hashes.iter().any(Option::is_some)
+    {
+        record_warning(
+            warnings,
+            max_warnings,
+            "nodump_with_hash",
+            "ROM declares status=nodump together with a checksum; the checksum is retained as raw metadata but must not become identity evidence".to_string(),
+        );
+    }
+}
+
 fn detect_logiqx_ecosystem(
+    is_software_list: bool,
     name: &Option<String>,
     author: &Option<String>,
-    _description: &Option<String>,
+    description: &Option<String>,
+    version: &Option<String>,
 ) -> DatEcosystem {
-    let name_lower = name.as_deref().unwrap_or("").to_ascii_lowercase();
-    let author_lower = author.as_deref().unwrap_or("").to_ascii_lowercase();
+    // The root element is a structural declaration, unlike the free-form
+    // header text below. A software list is MAME data even when its list name
+    // contains no spelling of "MAME" (which is the normal case).
+    if is_software_list {
+        return DatEcosystem::MAMESoftwareList;
+    }
+    // Ecosystem identity is declared by the DAT, never inferred from its
+    // filename.  Publishers vary which header field carries their name, so
+    // inspect every standard internal text field the parser preserves.
+    let fields = [name, author, description, version];
+    let contains = |needle: &str| {
+        fields
+            .iter()
+            .filter_map(|field| field.as_deref())
+            .any(|field| field.to_ascii_lowercase().contains(needle))
+    };
 
-    if name_lower.contains("no-intro") || author_lower.contains("no-intro") {
+    if contains("no-intro") {
         return DatEcosystem::NoIntro;
     }
-    if name_lower.contains("redump") || author_lower.contains("redump") {
+    if contains("redump") {
         return DatEcosystem::Redump;
     }
 

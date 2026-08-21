@@ -23,6 +23,7 @@ pub enum DatEcosystem {
     GenericLogiqx,
     NoIntro,
     Redump,
+    MAMESoftwareList,
     GenericClrMamePro,
     Tosec,
 }
@@ -33,6 +34,7 @@ impl DatEcosystem {
             Self::GenericLogiqx => "Generic Logiqx",
             Self::NoIntro => "No-Intro",
             Self::Redump => "Redump",
+            Self::MAMESoftwareList => "MAME software list",
             Self::GenericClrMamePro => "Generic ClrMamePro",
             Self::Tosec => "TOSEC",
         }

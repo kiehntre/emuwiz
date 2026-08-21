@@ -42,6 +42,7 @@ mod dolphin_dedup;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
+mod duckstation_local;
 mod emulator_profile_memory;
 mod gamehacking_catalogue;
 mod gamehacking_gamecube_install_plan;
@@ -58,6 +59,7 @@ mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod ppsspp_local;
 mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
@@ -287,6 +289,21 @@ pub use dolphin_local::{
     discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_profile, match_dolphin_inventory,
     select_dolphin_profile,
 };
+pub use duckstation_local::{
+    DUCKSTATION_MAX_CHEAT_BYTES, DUCKSTATION_MAX_CONFIG_BYTES, DUCKSTATION_MAX_DIRECTORY_ENTRIES,
+    DUCKSTATION_MAX_PATCH_BYTES, DUCKSTATION_MAX_PLAYLIST_BYTES, DUCKSTATION_MAX_PLAYLIST_ENTRIES,
+    DUCKSTATION_MAX_PROFILES, DUCKSTATION_MAX_SAVE_STATE_CANDIDATES, DUCKSTATION_MAX_TEXTURE_DEPTH,
+    DUCKSTATION_MAX_TEXTURE_FILES, DuckStationBiosInventory, DuckStationBiosState,
+    DuckStationCheatInventory, DuckStationConfigInspection, DuckStationDiscContext,
+    DuckStationDiscoveryError, DuckStationExecutable, DuckStationGameInspection,
+    DuckStationGameRequest, DuckStationHealth, DuckStationInstallationType,
+    DuckStationMemoryCardInventory, DuckStationPatchInventory, DuckStationPlaylistInventory,
+    DuckStationProfile, DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots,
+    DuckStationSaveStateInventory, DuckStationSerialMapping, DuckStationSettings,
+    DuckStationTextureInventory, DuckStationWarning, DuckStationWarningKind,
+    discover_duckstation_profiles, inspect_duckstation_game, inspect_duckstation_playlist,
+    normalize_duckstation_ps1_serial, parse_duckstation_version,
+};
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
     RememberedEmulatorProfile, default_emulator_profile_memory_path, forget_emulator_profile_at,
@@ -387,6 +404,16 @@ pub use pcsx2_provider::{
     Pcsx2CheatConfidence, Pcsx2CheatProviderCatalogue, Pcsx2CheatProviderRecord,
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
+};
+pub use ppsspp_local::{
+    PPSSPP_MAX_CHEAT_BYTES, PPSSPP_MAX_CHEAT_ENTRIES, PPSSPP_MAX_CONFIG_BYTES,
+    PPSSPP_MAX_ENTRIES_VISITED, PPSSPP_MAX_PROFILES, PPSSPP_MAX_TEXTURE_DEPTH,
+    PPSSPP_MAX_TEXTURE_FILES, PpssppCheatInventory, PpssppDiscoveryError, PpssppExecutable,
+    PpssppGameIdMapping, PpssppGameInspection, PpssppGameRequest, PpssppGlobalConfig, PpssppHealth,
+    PpssppInspectionWarning, PpssppInspectionWarningKind, PpssppInstallationType, PpssppProfile,
+    PpssppProfileBlocker, PpssppProfileBlockerKind, PpssppProfileDiscovery,
+    PpssppProfileDiscoveryRoots, PpssppProfileScope, PpssppSaveDataInventory, PpssppSettings,
+    PpssppTextureInventory, discover_ppsspp_profiles, inspect_ppsspp_game, parse_ppsspp_version,
 };
 pub use resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
