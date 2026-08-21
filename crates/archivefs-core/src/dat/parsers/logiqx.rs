@@ -1071,7 +1071,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut games,
     );
 
-    let ecosystem = detect_logiqx_ecosystem(&name, &author, &description);
+    let ecosystem = detect_logiqx_ecosystem(&name, &author, &description, &version);
 
     let source = DatSource {
         format: DatFormat::Logiqx,
@@ -1448,15 +1448,24 @@ fn attr_u64(
 fn detect_logiqx_ecosystem(
     name: &Option<String>,
     author: &Option<String>,
-    _description: &Option<String>,
+    description: &Option<String>,
+    version: &Option<String>,
 ) -> DatEcosystem {
-    let name_lower = name.as_deref().unwrap_or("").to_ascii_lowercase();
-    let author_lower = author.as_deref().unwrap_or("").to_ascii_lowercase();
+    // Ecosystem identity is declared by the DAT, never inferred from its
+    // filename.  Publishers vary which header field carries their name, so
+    // inspect every standard internal text field the parser preserves.
+    let fields = [name, author, description, version];
+    let contains = |needle: &str| {
+        fields
+            .iter()
+            .filter_map(|field| field.as_deref())
+            .any(|field| field.to_ascii_lowercase().contains(needle))
+    };
 
-    if name_lower.contains("no-intro") || author_lower.contains("no-intro") {
+    if contains("no-intro") {
         return DatEcosystem::NoIntro;
     }
-    if name_lower.contains("redump") || author_lower.contains("redump") {
+    if contains("redump") {
         return DatEcosystem::Redump;
     }
 
