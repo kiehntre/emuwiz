@@ -53,7 +53,7 @@ use crate::platform::{
     platform_for_alias, platform_magic_confidence_from_bytes, strip_mame_software_list_suffix,
 };
 
-use super::model::{DatGameEntry, ParsedDat};
+use super::model::{DatEcosystem, DatGameEntry, ParsedDat};
 
 /// Where one piece of DAT-source platform evidence came from.
 ///
@@ -311,11 +311,12 @@ const HEADER_SEGMENT_SEPARATORS: &[&str] = &[" - ", "/", "&", ","];
 pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence> {
     // A bare MAME software-list root's `name`/`description` land in exactly
     // the same `DatSource` fields a `<header>` would populate (see the
-    // `dat::parsers::logiqx` fix that preserves them). The two cases are
-    // distinguished here only for the evidence *label*, using the presence of
-    // software-list `<part>` structure as the signal - it never changes
-    // whether or how strongly the text resolves.
-    let is_software_list = dat.games.iter().any(|game| !game.parts.is_empty());
+    // `dat::parsers::logiqx` fix that preserves them). A software-list name
+    // is a structural hint, not a canonical platform assertion: MAME list
+    // shortnames and canonical platform IDs deliberately live in distinct
+    // namespaces. Keep the evidence for display/audit, but never use it to
+    // resolve a platform automatically.
+    let is_software_list = dat.source.ecosystem == DatEcosystem::MAMESoftwareList;
     let (name_kind, description_kind) = if is_software_list {
         (
             DatPlatformEvidenceKind::SoftwareListName,
@@ -330,16 +331,27 @@ pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence>
 
     let mut evidence = Vec::new();
     if let Some(name) = dat.source.name.as_deref() {
-        evidence.extend(strong_evidence_from_text(name, name_kind, is_software_list));
+        evidence.extend(evidence_from_text(
+            name,
+            name_kind,
+            is_software_list,
+            !is_software_list,
+        ));
     }
     if let Some(description) = dat.source.description.as_deref() {
-        evidence.extend(strong_evidence_from_text(
+        evidence.extend(evidence_from_text(
             description,
             description_kind,
             false,
+            !is_software_list,
         ));
     }
-    evidence.extend(machine_shortname_evidence(&dat.games));
+    // `<software name>` is a MAME software namespace key, not a machine
+    // shortname. Letting it through the machine resolver would make a title
+    // such as `neocd` falsely assert a canonical platform.
+    if !is_software_list {
+        evidence.extend(machine_shortname_evidence(&dat.games));
+    }
     evidence.extend(filename_hint_evidence_from_path(&dat.source.file_path));
     evidence.extend(folder_hint_evidence_from_path(&dat.source.file_path));
     evidence
@@ -350,16 +362,16 @@ pub fn identify_dat_source(dat: &ParsedDat) -> DatPlatformIdentity {
     resolve_dat_platform_identity(gather_dat_platform_evidence(dat))
 }
 
-/// Strong evidence from one piece of header/software-list text: the whole
-/// string first, then each conservatively split segment. `carries_machine_key`
+/// Evidence from one piece of header/software-list text: the whole string
+/// first, then each conservatively split segment. `carries_machine_key`
 /// attaches `text` itself as the [`DatPlatformEvidence::machine_key`] of every
-/// fact produced - true only for a software-list's own `name`, which really
-/// is the DAT's machine/system shortname, never for free-text description or
-/// header prose.
-fn strong_evidence_from_text(
+/// fact produced. `authoritative` is false for a MAME list root because list
+/// names belong to a separate namespace from canonical platform IDs.
+fn evidence_from_text(
     text: &str,
     kind: DatPlatformEvidenceKind,
     carries_machine_key: bool,
+    authoritative: bool,
 ) -> Vec<DatPlatformEvidence> {
     let mut seen: BTreeSet<&'static str> = BTreeSet::new();
     let mut evidence = Vec::new();
@@ -374,7 +386,9 @@ fn strong_evidence_from_text(
             platform: platform.to_string(),
             machine_key: carries_machine_key.then(|| text.to_string()),
             kind,
-            confidence: DatPlatformConfidence::Strong,
+            confidence: authoritative
+                .then_some(DatPlatformConfidence::Strong)
+                .unwrap_or(DatPlatformConfidence::Weak),
             detail: format!(
                 "{} `{text}` names this platform via `{segment}`",
                 kind.label()
@@ -1454,7 +1468,7 @@ mod tests {
         }
 
         #[test]
-        fn bare_mame_software_list_c128_flop_resolves_to_c128() {
+        fn bare_mame_software_list_c128_flop_is_structural_metadata_not_platform_identity() {
             let dat = parse(
                 r#"<?xml version="1.0"?>
 <softwarelist name="c128_flop" description="Commodore 128 (Floppy)">
@@ -1467,18 +1481,14 @@ mod tests {
     </software>
 </softwarelist>"#,
             );
-            let identity = identify_dat_source(&dat);
-            assert_eq!(identity.platform(), Some("Commodore 128"));
-            match identity {
-                DatPlatformIdentity::Resolved { machine_key, .. } => {
-                    assert_eq!(machine_key.as_deref(), Some("c128_flop"));
-                }
-                other => panic!("expected Resolved, got {other:?}"),
-            }
+            assert!(matches!(
+                identify_dat_source(&dat),
+                DatPlatformIdentity::Unknown
+            ));
         }
 
         #[test]
-        fn bare_mame_software_list_megacd_resolves_to_sega_cd() {
+        fn bare_mame_software_list_megacd_is_not_automatic_sega_cd_identity() {
             let dat = parse(
                 r#"<?xml version="1.0"?>
 <softwarelist name="megacd" description="Sega Mega-CD / Sega CD">
@@ -1491,7 +1501,10 @@ mod tests {
     </software>
 </softwarelist>"#,
             );
-            assert_eq!(identify_dat_source(&dat).platform(), Some("Sega CD"));
+            assert!(matches!(
+                identify_dat_source(&dat),
+                DatPlatformIdentity::Unknown
+            ));
         }
 
         #[test]
@@ -1664,7 +1677,7 @@ mod tests {
         }
 
         #[test]
-        fn a_bare_software_list_root_identifies_correctly_without_any_nested_header() {
+        fn a_bare_software_list_root_retains_non_authoritative_structural_hint() {
             let dat = parse(
                 r#"<?xml version="1.0"?>
 <softwarelist name="neocd" description="Neo Geo CD">
@@ -1677,13 +1690,17 @@ mod tests {
     </software>
 </softwarelist>"#,
             );
-            let identity = identify_dat_source(&dat);
-            assert_eq!(identity.platform(), Some("Neo Geo CD"));
+            assert!(matches!(
+                identify_dat_source(&dat),
+                DatPlatformIdentity::Unknown
+            ));
             assert!(
-                identity
-                    .evidence()
+                gather_dat_platform_evidence(&dat)
                     .iter()
-                    .any(|item| item.kind == DatPlatformEvidenceKind::SoftwareListName)
+                    .any(
+                        |item| item.kind == DatPlatformEvidenceKind::SoftwareListName
+                            && item.confidence == DatPlatformConfidence::Weak
+                    )
             );
         }
 
@@ -1814,7 +1831,7 @@ mod tests {
         }
 
         #[test]
-        fn bare_software_list_c128_flop_resolves_despite_a_stray_conflicting_machine_name() {
+        fn bare_software_list_c128_flop_remains_unknown_despite_a_stray_machine_name() {
             let dat = parse(
                 r#"<?xml version="1.0"?>
 <softwarelist name="c128_flop" description="Commodore 128 (Floppy)">
@@ -1836,15 +1853,16 @@ mod tests {
     </software>
 </softwarelist>"#,
             );
-            // A single stray `c64` machine name amid several unrelated,
-            // unresolved entries must never win MachineShortname gating, and
-            // must never be allowed to conflict with the root's own Strong
-            // SoftwareListName evidence either.
-            assert_eq!(identify_dat_source(&dat).platform(), Some("Commodore 128"));
+            // Neither an untrusted list shortname nor one stray software
+            // shortname may manufacture a canonical platform identity.
+            assert!(matches!(
+                identify_dat_source(&dat),
+                DatPlatformIdentity::Unknown
+            ));
         }
 
         #[test]
-        fn bare_software_list_megacd_resolves_despite_heterogeneous_machine_entries() {
+        fn bare_software_list_megacd_remains_unknown_despite_heterogeneous_entries() {
             let dat = parse(
                 r#"<?xml version="1.0"?>
 <softwarelist name="megacd" description="Sega Mega-CD / Sega CD">
@@ -1866,7 +1884,10 @@ mod tests {
     </software>
 </softwarelist>"#,
             );
-            assert_eq!(identify_dat_source(&dat).platform(), Some("Sega CD"));
+            assert!(matches!(
+                identify_dat_source(&dat),
+                DatPlatformIdentity::Unknown
+            ));
         }
 
         #[test]

@@ -30,6 +30,7 @@ pub mod artwork;
 pub mod cache;
 pub mod hasheous;
 pub mod hashing;
+pub mod mame_software_list;
 pub mod matching;
 pub mod model;
 pub mod net_policy;
