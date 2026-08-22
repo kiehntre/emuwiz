@@ -91,6 +91,47 @@ fn dos_and_unsupported_fs() {
         ))
     }
 }
+// A minimal flat (non-RDB) AmigaDOS image: a real-world WHDLoad CD32
+// pack shape - the whole file is one filesystem starting at byte 0, no
+// RDSK block anywhere. `1024` bytes is comfortably above the 512-byte
+// minimum and stays a whole number of sectors.
+fn flat_image(dos_type: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 1024];
+    p32(&mut b, 0, dos_type);
+    b
+}
+
+#[test]
+fn flat_amigados_image_is_recognised_as_one_whole_image_partition() {
+    let (_d, p) = file(&flat_image(0x444f_5301));
+    let disk = inspect_amiga_image(&p).unwrap();
+    assert_eq!(disk.rdb.partitions.len(), 1);
+    let partition = &disk.rdb.partitions[0];
+    assert_eq!(partition.byte_offset, 0);
+    assert_eq!(partition.byte_length, 1024);
+    assert_eq!(partition.filesystem, FileSystem::Dos(1));
+}
+
+#[test]
+fn flat_image_with_no_recognised_boot_signature_is_still_an_error() {
+    let (_d, p) = file(&vec![0u8; 1024]);
+    assert!(matches!(inspect_amiga_image(&p), Err(DiskError::NoRdb)));
+}
+
+#[test]
+fn inspect_amiga_image_still_prefers_a_real_rdb_when_present() {
+    let (_d, p) = file(&image(&[(2, 3, NONE, 0x444f5301)]));
+    let disk = inspect_amiga_image(&p).unwrap();
+    assert_eq!(disk.rdb.partitions.len(), 1);
+    assert_eq!(disk.rdb.partitions[0].byte_offset, 20480);
+}
+
+#[test]
+fn inspect_amiga_image_still_reports_real_errors_not_just_no_rdb() {
+    let (_d, p) = file(&vec![0u8; 100]); // below the 512-byte minimum
+    assert!(matches!(inspect_amiga_image(&p), Err(DiskError::TooSmall)));
+}
+
 #[test]
 fn beyond_eof_and_evidence() {
     let (_d, p) = file(&image(&[(99, 199, NONE, 0x444f5300)]));

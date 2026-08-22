@@ -356,6 +356,11 @@ fn a_stored_hash_promotes_a_matching_record_to_confirmed() {
         verification: ExternalVerification::StrongExternal,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
     };
 
     // Without a stored hash nothing local has been compared, so the verdict rests on
@@ -415,6 +420,11 @@ fn a_stored_hash_that_disagrees_does_not_promote_and_keeps_both_sides() {
         verification: ExternalVerification::StrongExternal,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
     };
     record.file_size_bytes = Some(std::fs::metadata(&file).expect("metadata").len());
 

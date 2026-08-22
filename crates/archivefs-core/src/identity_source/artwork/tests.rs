@@ -107,6 +107,7 @@ impl RommTransport for FakeArtworkServer {
         url: &str,
         authorization: Option<&str>,
         _max_bytes: usize,
+        _timeout: std::time::Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         self.requests
             .lock()

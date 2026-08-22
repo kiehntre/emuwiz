@@ -162,8 +162,8 @@ fn plan_entry(
         OrganisationMode::MoveRealFile => {
             if kind != ObjectKind::RegularFile {
                 let reason = if kind == ObjectKind::Symlink || kind == ObjectKind::BrokenSymlink {
-                    "the source is a symlink; use 'Organise symlink only' to move the link \
-                     object without touching its target"
+                    "this is a shortcut, not a real file; use 'Keep original files where they \
+                     are' to reorganise the shortcut without touching its target"
                 } else {
                     "this mode organises regular files only"
                 };
@@ -172,7 +172,10 @@ fn plan_entry(
         }
         OrganisationMode::OrganiseSymlinkOnly => {
             if kind != ObjectKind::Symlink && kind != ObjectKind::BrokenSymlink {
-                return blocked("this mode organises symlinks only; the source is not a symlink");
+                return blocked(
+                    "this is a real file, not a shortcut; 'Keep original files where they are' \
+                     only reorganises shortcuts that already exist",
+                );
             }
         }
         OrganisationMode::RenameInPlace => {

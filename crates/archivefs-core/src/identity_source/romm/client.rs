@@ -39,8 +39,34 @@ use crate::identity_source::net_policy::{
 
 /// Connect timeout for one request.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Total per-request timeout, including reading the body.
+/// Total per-request timeout, including reading the body, for every request
+/// except a ROM page fetched with per-file detail. Every other endpoint this
+/// client calls (`heartbeat`, `openapi.json`, `platforms`, and a ROM page
+/// without file detail) has been observed to answer in well under a second on
+/// a real instance, so this stays tight.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total per-request timeout for a ROM page requested *with* per-file detail
+/// (`with_files=true`).
+///
+/// Measured live, 2026-08-22, against a real RomM 5.2.0 instance: a
+/// single-record request for the one pathological record on that catalogue
+/// (28,831 files, id 43030 - see [`super::import`]'s module doc) took 22s,
+/// 25s and 187s across three separate samples, taken minutes apart, with
+/// `romm-db` (MariaDB) observed at 100% CPU during the slow ones. The
+/// variance is real database query cost under contention, not something a
+/// client-side retry or a bigger response-size ceiling would fix: the
+/// server has to finish generating the row before it can send any of it, so
+/// a request for this record cannot answer meaningfully faster than the
+/// query itself finishes. 30 seconds cut this request off before RomM could
+/// ever answer, which is what turned a slow-but-real response into a hard
+/// failure. 240 seconds gives roughly 30% margin over the worst sample
+/// observed, while still being a bound rather than the "unlimited" this
+/// project does not offer anywhere. Every *other* `with_files=true`
+/// request - the overwhelming majority of them - answers in well under a
+/// second regardless, so this longer ceiling costs nothing in the ordinary
+/// case; it only matters for the page(s) that happen to include this one
+/// record.
+pub const DETAIL_REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 /// The most any single response body may be. A RomM page of 200 ROMs is a few
 /// hundred kilobytes; the OpenAPI document on the verified instance is 331 KiB.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -140,12 +166,16 @@ pub trait RommTransport {
     /// Performs one authenticated GET and returns `(status, body)`.
     ///
     /// `authorization` is already the finished header value; an implementation
-    /// must not log it.
+    /// must not log it. `timeout` overrides the transport's own default for
+    /// this one request - see [`REQUEST_TIMEOUT`] and
+    /// [`DETAIL_REQUEST_TIMEOUT`] for the two values a caller actually asks
+    /// for and why they differ.
     fn get(
         &self,
         url: &str,
         authorization: Option<&str>,
         max_bytes: usize,
+        timeout: Duration,
     ) -> Result<RommHttpResponse, RommRequestError>;
 }
 
@@ -192,12 +222,16 @@ impl RommTransport for UreqTransport {
         url: &str,
         authorization: Option<&str>,
         max_bytes: usize,
+        timeout: Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         let mut request = self.agent.get(url);
         if let Some(authorization) = authorization {
             request = request.header("Authorization", authorization);
         }
         request = request.header("Accept", "application/json");
+        // Overrides the agent's own default for this one request - see the
+        // trait doc comment for why a caller asks for two different values.
+        let request = request.config().timeout_global(Some(timeout)).build();
         let response = match request.call() {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(status)) => {
@@ -307,7 +341,7 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         &self,
         cancel: Option<&AtomicBool>,
     ) -> Result<RommHeartbeat, RommRequestError> {
-        let document = self.get_json("/api/heartbeat", false, cancel)?;
+        let document = self.get_json("/api/heartbeat", false, REQUEST_TIMEOUT, cancel)?;
         RommHeartbeat::parse(&document).ok_or(RommRequestError::MalformedResponse {
             detail: "the heartbeat did not report SYSTEM.VERSION".to_string(),
         })
@@ -319,7 +353,7 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         &self,
         cancel: Option<&AtomicBool>,
     ) -> Result<RommApiCapability, RommRequestError> {
-        let document = self.get_json("/openapi.json", false, cancel)?;
+        let document = self.get_json("/openapi.json", false, REQUEST_TIMEOUT, cancel)?;
         Ok(RommApiCapability::from_openapi(&document))
     }
 
@@ -374,7 +408,7 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         &self,
         cancel: Option<&AtomicBool>,
     ) -> Result<Vec<serde_json::Value>, RommRequestError> {
-        let document = self.get_json("/api/platforms", true, cancel)?;
+        let document = self.get_json("/api/platforms", true, REQUEST_TIMEOUT, cancel)?;
         document
             .as_array()
             .cloned()
@@ -418,7 +452,16 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         } else {
             format!("/api/roms?limit={limit}&offset={offset}")
         };
-        let document = self.get_json(&path, true, cancel)?;
+        // A page carrying per-file detail is the one shape that has been
+        // observed to legitimately take minutes rather than milliseconds -
+        // see [`DETAIL_REQUEST_TIMEOUT`]'s own reasoning. A page without file
+        // detail keeps the tight default.
+        let timeout = if with_files {
+            DETAIL_REQUEST_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        let document = self.get_json(&path, true, timeout, cancel)?;
         let items = document
             .get("items")
             .and_then(serde_json::Value::as_array)
@@ -458,6 +501,7 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         &self,
         path: &str,
         authenticate: bool,
+        timeout: Duration,
         cancel: Option<&AtomicBool>,
     ) -> Result<serde_json::Value, RommRequestError> {
         if cancelled(cancel) {
@@ -473,10 +517,11 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
         // request actually needs it.
         let response = if authenticate {
             self.source.token().with_header_value(|header| {
-                self.transport.get(&url, Some(header), MAX_RESPONSE_BYTES)
+                self.transport
+                    .get(&url, Some(header), MAX_RESPONSE_BYTES, timeout)
             })
         } else {
-            self.transport.get(&url, None, MAX_RESPONSE_BYTES)
+            self.transport.get(&url, None, MAX_RESPONSE_BYTES, timeout)
         }?;
 
         if cancelled(cancel) {

@@ -37,6 +37,25 @@ pub const SUGGESTED_TOKEN_PATH: &str = "~/.config/emuwiz/romm-token";
 pub const MAX_CONFIGURED_PAGE_SIZE: u32 = 200;
 pub const MIN_CONFIGURED_PAGE_SIZE: u32 = 10;
 
+/// The bounds on how long a full catalogue import may run before it is
+/// abandoned (previous cache preserved, exactly as any other import failure
+/// leaves it). Finite on both ends deliberately: a floor because a shorter
+/// limit than this could not realistically finish even a small catalogue's
+/// first few pages, and a ceiling because "unlimited" is not a safe setting
+/// to offer - an import that is never going to finish should eventually say
+/// so rather than run for ever.
+pub const MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS: u32 = 300;
+pub const MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS: u32 = 3600;
+/// 30 minutes. Chosen from a real 36,194-record catalogue's measured
+/// throughput (2026-08-22): two full-import attempts against the previous
+/// 600-second limit reached 48% (18,973 records) before timing out, which
+/// projects to roughly 19 minutes for the whole catalogue at that same
+/// (adaptive-pagination-limited) rate - and that measurement already
+/// included the single most expensive pathological record on this
+/// catalogue. Comfortable margin over that puts 30 minutes well clear of a
+/// real worst case without being open-ended.
+pub const DEFAULT_IMPORT_TIMEOUT_SECONDS: u32 = 1800;
+
 /// Non-secret settings as persisted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
@@ -45,6 +64,12 @@ pub struct ProviderSettings {
     /// Preferred page size, within the bounds above. `None` uses the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u32>,
+    /// How long a full catalogue import may run before it is abandoned, in
+    /// seconds, within the bounds above. `None` uses the default. A larger
+    /// library or a slower RomM server may need more than the default - see
+    /// [`DEFAULT_IMPORT_TIMEOUT_SECONDS`]'s own reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_timeout_seconds: Option<u32>,
 }
 
 impl ProviderSettings {
@@ -53,6 +78,20 @@ impl ProviderSettings {
         self.page_size
             .unwrap_or(super::romm::import::DEFAULT_PAGE_SIZE)
             .clamp(MIN_CONFIGURED_PAGE_SIZE, MAX_CONFIGURED_PAGE_SIZE)
+    }
+
+    /// The full-import deadline to use, clamped to the safe range whatever is
+    /// stored.
+    pub fn effective_import_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.import_timeout_seconds
+                .unwrap_or(DEFAULT_IMPORT_TIMEOUT_SECONDS)
+                .clamp(
+                    MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS,
+                    MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS,
+                )
+                .into(),
+        )
     }
 }
 
@@ -365,4 +404,57 @@ pub fn default_identity_root() -> Result<PathBuf, String> {
         .parent()
         .ok_or_else(|| "the data directory could not be resolved".to_string())?
         .join("identity"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_configured_timeout_uses_the_default() {
+        let settings = ProviderSettings::default();
+        assert_eq!(
+            settings.effective_import_timeout(),
+            std::time::Duration::from_secs(DEFAULT_IMPORT_TIMEOUT_SECONDS as u64)
+        );
+    }
+
+    #[test]
+    fn a_configured_timeout_within_bounds_is_used_as_is() {
+        let mut settings = ProviderSettings::default();
+        settings.import_timeout_seconds = Some(900);
+        assert_eq!(
+            settings.effective_import_timeout(),
+            std::time::Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn a_configured_timeout_below_the_floor_is_clamped_up() {
+        let mut settings = ProviderSettings::default();
+        settings.import_timeout_seconds = Some(1);
+        assert_eq!(
+            settings.effective_import_timeout(),
+            std::time::Duration::from_secs(MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS as u64)
+        );
+    }
+
+    #[test]
+    fn a_configured_timeout_above_the_ceiling_is_clamped_down() {
+        let mut settings = ProviderSettings::default();
+        settings.import_timeout_seconds = Some(u32::MAX);
+        assert_eq!(
+            settings.effective_import_timeout(),
+            std::time::Duration::from_secs(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS as u64),
+            "there must be no way to configure an effectively unlimited import"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_finite_and_bounded() {
+        // Item 4's explicit requirement: no "unlimited" setting is offered.
+        assert!(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS < u32::MAX);
+        assert!(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS > DEFAULT_IMPORT_TIMEOUT_SECONDS);
+        assert!(MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS < DEFAULT_IMPORT_TIMEOUT_SECONDS);
+    }
 }

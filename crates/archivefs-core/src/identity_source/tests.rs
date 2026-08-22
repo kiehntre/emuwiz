@@ -1423,6 +1423,29 @@ mod identity_model {
         assert_eq!(counts.usable(), 4, "confirmed + strong + probable");
     }
 
+    #[test]
+    fn with_game_information_counts_enrichment_independently_of_verification() {
+        // A weakly-verified record can still carry rich game information, and
+        // a strongly-verified one can carry none - the two properties are
+        // unrelated, and `with_game_information` must reflect only the
+        // second.
+        let mut has_synopsis = record_with_hashes(Vec::new());
+        has_synopsis.verification = ExternalVerification::Unmatched;
+        has_synopsis.synopsis = Some("A story.".to_string());
+
+        let mut has_genre_only = record_with_hashes(Vec::new());
+        has_genre_only.verification = ExternalVerification::ConfirmedExternal;
+        has_genre_only.genres = vec!["Platformer".to_string()];
+
+        let mut has_nothing = record_with_hashes(Vec::new());
+        has_nothing.verification = ExternalVerification::ConfirmedExternal;
+
+        let counts = IdentityImportCounts::of(&[has_synopsis, has_genre_only, has_nothing.clone()]);
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.with_game_information, 2);
+        assert!(!has_nothing.has_game_information());
+    }
+
     /// Test 42: a record round-trips through JSON, since the cache is JSON.
     #[test]
     fn a_record_round_trips_through_json() {
@@ -1435,6 +1458,41 @@ mod identity_model {
         // The provider and level serialise as stable snake_case strings.
         assert!(json.contains("\"romm\""));
         assert!(json.contains("\"probable_external\""));
+    }
+
+    /// Game metadata milestone (2026-08-22): a cache file written before
+    /// `synopsis`/`genres`/`players`/`rating`/`release_year` existed - the
+    /// exact shape of every real identity cache already on disk when this
+    /// milestone shipped - must still deserialise, with all five simply
+    /// absent, never a refused/corrupt cache and never a panic.
+    #[test]
+    fn a_record_from_before_the_enrichment_fields_existed_still_deserialises() {
+        let record = record_with_hashes(vec![
+            ExternalHash::parse(HashAlgorithm::Md5, &"a".repeat(32)).expect("valid"),
+        ]);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&record).expect("serialises"))
+                .expect("valid json");
+        let object = json
+            .as_object_mut()
+            .expect("record serialises as an object");
+        for field in ["synopsis", "genres", "players", "rating", "release_year"] {
+            assert!(
+                object.remove(field).is_some(),
+                "fixture must actually carry {field} before it is removed"
+            );
+        }
+        let restored: ExternalIdentityRecord =
+            serde_json::from_value(json).expect("deserialises without the enrichment fields");
+        assert_eq!(restored.synopsis, None);
+        assert!(restored.genres.is_empty());
+        assert_eq!(restored.players, None);
+        assert_eq!(restored.rating, None);
+        assert_eq!(restored.release_year, None);
+        // Nothing else about the record was disturbed by their absence.
+        assert_eq!(restored.provider_game_id, record.provider_game_id);
+        assert_eq!(restored.title, record.title);
+        assert_eq!(restored.verification, record.verification);
     }
 
     fn record_with_hashes(hashes: Vec<ExternalHash>) -> ExternalIdentityRecord {
@@ -1468,6 +1526,11 @@ mod identity_model {
             verification: ExternalVerification::ProbableExternal,
             conflicts: Vec::new(),
             evidence: vec!["path and title agree".to_string()],
+            synopsis: None,
+            genres: Vec::new(),
+            players: None,
+            rating: None,
+            release_year: None,
         }
     }
 }

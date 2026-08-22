@@ -1241,6 +1241,31 @@ pub struct ScanPersistSummary {
     /// this is in-memory detail for the caller of *this* scan only, exactly
     /// like `folder_errors`/`platform_assignment_warnings` above.
     pub skipped_files: Vec<crate::SkippedFile>,
+    /// The mixed-collection breakdown from
+    /// [`crate::ingestion::discover_source`], run alongside (not instead
+    /// of) the archive scanner above for every folder that scanned
+    /// successfully. Best-effort: a folder whose ingestion pass itself
+    /// errors simply contributes nothing here, without failing the run -
+    /// this is reporting detail, never load-bearing for what actually gets
+    /// persisted as a library archive.
+    pub ingestion_stats: crate::ingestion::DiscoveryStats,
+    /// Always-exact per-[`crate::ingestion::SkipReason`] counts across the
+    /// whole run - the "needs attention" breakdown a collection health
+    /// view wants ("120 unknown items", "15 missing cue/bin pairs"),
+    /// never truncated the way `ingestion_skipped` below is.
+    pub ingestion_skip_reasons: crate::ingestion::SkipReasonCounts,
+    /// Recognised items' platforms, by display name, across the whole
+    /// run - "what did we actually find" broken down the way a person
+    /// asks the question, not just a content-kind bucket count.
+    pub ingestion_platform_counts: std::collections::BTreeMap<String, i64>,
+    /// A bounded sample of ingestion items with a
+    /// [`crate::ingestion::SkipReason`], re-bounded across the whole run
+    /// exactly like `skipped_files` above.
+    pub ingestion_skipped: Vec<crate::ingestion::GameDiscovery>,
+    /// A bounded sample of *accepted* ingestion items, for a collection
+    /// health view's "here's what was recognised" detail list. Re-bounded
+    /// across the whole run exactly like `ingestion_skipped` above.
+    pub ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery>,
 }
 
 impl ScanPersistSummary {
@@ -3802,6 +3827,12 @@ fn scan_and_persist_folders_transaction(
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
     let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
+    let mut ingestion_stats = crate::ingestion::DiscoveryStats::default();
+    let mut ingestion_skip_reasons = crate::ingestion::SkipReasonCounts::default();
+    let mut ingestion_platform_counts: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    let mut ingestion_skipped: Vec<crate::ingestion::GameDiscovery> = Vec::new();
+    let mut ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery> = Vec::new();
 
     for folder in folders {
         let folder_config = Config {
@@ -3836,6 +3867,44 @@ fn scan_and_persist_folders_transaction(
         if skipped_files.len() < crate::MAX_RETAINED_SKIPPED_FILES {
             let remaining = crate::MAX_RETAINED_SKIPPED_FILES - skipped_files.len();
             skipped_files.extend(discovery.skipped_files.into_iter().take(remaining));
+        }
+        // Best-effort second pass: the mixed-collection view (task 3/4 of
+        // the ingestion integration) alongside the archive scanner above,
+        // never in place of it - see `ScanPersistSummary::ingestion_stats`.
+        if let Ok(report) = crate::ingestion::discover_source(&folder.path) {
+            ingestion_stats.merge(&report.stats);
+            ingestion_skip_reasons.merge(&report.skip_reasons);
+            for item in &report.items {
+                if let Some(platform) = &item.platform_hint {
+                    *ingestion_platform_counts
+                        .entry(platform.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+            if ingestion_skipped.len() < crate::MAX_RETAINED_SKIPPED_FILES {
+                let remaining = crate::MAX_RETAINED_SKIPPED_FILES - ingestion_skipped.len();
+                ingestion_skipped.extend(
+                    report
+                        .items
+                        .iter()
+                        .filter(|item| item.skip_reason.is_some())
+                        .take(remaining)
+                        .cloned(),
+                );
+            }
+            if ingestion_recognised_sample.len() < crate::MAX_RETAINED_SKIPPED_FILES {
+                let remaining =
+                    crate::MAX_RETAINED_SKIPPED_FILES - ingestion_recognised_sample.len();
+                ingestion_recognised_sample.extend(
+                    report
+                        .items
+                        .into_iter()
+                        .filter(|item| {
+                            item.validation_state == crate::ingestion::ValidationState::Accepted
+                        })
+                        .take(remaining),
+                );
+            }
         }
         let archives = discovery.archives;
         if let Some(platform) = folder.assigned_platform.as_deref() {
@@ -3909,6 +3978,11 @@ fn scan_and_persist_folders_transaction(
         folder_errors,
         platform_assignment_warnings,
         skipped_files,
+        ingestion_stats,
+        ingestion_skip_reasons,
+        ingestion_platform_counts,
+        ingestion_skipped,
+        ingestion_recognised_sample,
     })
 }
 
@@ -9081,6 +9155,11 @@ mod tests {
                 verification: ExternalVerification::StrongExternal,
                 conflicts: Vec::new(),
                 evidence: Vec::new(),
+                synopsis: None,
+                genres: Vec::new(),
+                players: None,
+                rating: None,
+                release_year: None,
             }],
             rejected_hashes: Vec::new(),
             unknown_platforms: Vec::new(),
@@ -9248,5 +9327,183 @@ mod tests {
             &archive,
             "My Custom Platform"
         ));
+    }
+
+    // --- Universal ingestion integration (Stage 4A) -----------------------
+    //
+    // `scan_and_persist` now runs `ingestion::discover_source` alongside the
+    // existing `ArchiveScanner` for every folder, purely as an additive
+    // reporting pass (see `ScanPersistSummary::ingestion_stats`/
+    // `ingestion_skipped`). These tests exist to prove two things at once:
+    // the pre-existing scanner/persistence behaviour is completely
+    // unaffected (regression safety), and the new ingestion pass actually
+    // sees what the old one couldn't (loose ROMs, Amiga images, WHDLoad
+    // folders).
+
+    fn zip_fixture(dir: &Path, zip_name: &str, member_name: &str, member_bytes: &[u8]) -> PathBuf {
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+        let path = dir.join(zip_name);
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file(member_name, SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, member_bytes).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    fn put16(v: &mut [u8], at: usize, n: u16) {
+        v[at..at + 2].copy_from_slice(&n.to_be_bytes());
+    }
+    fn put32(v: &mut [u8], at: usize, n: u32) {
+        v[at..at + 4].copy_from_slice(&n.to_be_bytes());
+    }
+
+    /// A minimal valid RDB/HDF image with no partitions - mirrors the
+    /// fixture in `amiga_disk::tests`/`ingestion::tests`.
+    fn minimal_amiga_hdf() -> Vec<u8> {
+        let mut b = vec![0u8; 512 * 4];
+        b[..4].copy_from_slice(b"RDSK");
+        put32(&mut b, 16, 512);
+        put32(&mut b, 28, 0xffff_ffff);
+        put32(&mut b, 64, 20);
+        put32(&mut b, 68, 10);
+        put32(&mut b, 72, 2);
+        b
+    }
+
+    /// A minimal valid WHDLoad `.slave` HUNK binary - mirrors the fixture in
+    /// `identity_source::whdload::tests`/`ingestion::tests`.
+    fn minimal_whdload_slave() -> Vec<u8> {
+        let size: usize = 30;
+        let mut code = vec![0; (size + 64).next_multiple_of(4)];
+        code[..4].copy_from_slice(&[0x70, 0xff, 0x4e, 0x75]);
+        code[4..12].copy_from_slice(b"WHDLOADS");
+        put16(&mut code, 12, 1);
+        put16(&mut code, 14, 3);
+        put32(&mut code, 16, 524288);
+        put32(&mut code, 20, 1);
+        put32(&mut code, 24, 2);
+        put16(&mut code, 28, 0);
+        code[size..size + 5].copy_from_slice(b"Game\0");
+        code[size + 8..size + 13].copy_from_slice(b"Copy\0");
+        code[size + 16..size + 21].copy_from_slice(b"Info\0");
+        code[size + 24..size + 29].copy_from_slice(b"Kick\0");
+        code[size + 32..size + 39].copy_from_slice(b"Config\0");
+        let mut out = Vec::new();
+        for n in [
+            0x3f3_u32,
+            0,
+            1,
+            0,
+            0,
+            (code.len() / 4) as u32,
+            0x3e9,
+            (code.len() / 4) as u32,
+        ] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out.extend_from_slice(&code);
+        out.extend_from_slice(&0x3f2_u32.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn existing_zip_scanning_is_unaffected_by_the_ingestion_side_channel() {
+        let root = temp_dir("ingestion-zip-regression");
+        let source = root.join("roms");
+        fs::create_dir_all(&source).unwrap();
+        zip_fixture(&source, "Game.zip", "Game.gba", b"gba rom bytes");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        // Unchanged, pre-existing behaviour: the zip is a real persisted
+        // archive exactly as before.
+        assert_eq!(summary.counts.archives_seen, 1);
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].relative_path, Path::new("Game.zip"));
+        // The additive ingestion view sees the same file too.
+        assert_eq!(summary.ingestion_stats.archives, 1);
+    }
+
+    #[test]
+    fn loose_rom_is_visible_in_ingestion_stats_without_changing_archive_persistence() {
+        let root = temp_dir("ingestion-loose-rom");
+        let source = root.join("roms");
+        write_archive_file(&source, "Mario Kart 64.z64", &[0x80, 0x37, 0x12, 0x40]);
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        // The old scanner does not persist a loose .z64 as a library
+        // archive - that behaviour is unchanged by this integration.
+        assert_eq!(summary.counts.archives_seen, 0);
+        // The new ingestion pass does see it, and says why it matters.
+        assert_eq!(summary.ingestion_stats.loose_roms, 1);
+        assert_eq!(summary.ingestion_stats.unknown, 0);
+    }
+
+    #[test]
+    fn amiga_hdf_is_visible_in_ingestion_stats() {
+        let root = temp_dir("ingestion-amiga-hdf");
+        let source = root.join("amiga");
+        write_archive_file(&source, "Workbench.hdf", &minimal_amiga_hdf());
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        assert_eq!(summary.ingestion_stats.amiga_images, 1);
+    }
+
+    #[test]
+    fn whdload_folder_is_visible_in_ingestion_stats() {
+        let root = temp_dir("ingestion-whdload");
+        let source = root.join("amiga");
+        write_archive_file(
+            &source,
+            "Turrican II/Turrican2.slave",
+            &minimal_whdload_slave(),
+        );
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        assert_eq!(summary.ingestion_stats.game_folders, 1);
+    }
+
+    #[test]
+    fn a_mixed_source_reports_every_kind_through_the_ingestion_side_channel() {
+        let root = temp_dir("ingestion-mixed-folder");
+        let source = root.join("roms");
+        write_archive_file(&source, "Mario Kart 64.z64", &[0x80, 0x37, 0x12, 0x40]);
+        zip_fixture(&source, "Game.zip", "Game.gba", b"gba rom bytes");
+        write_archive_file(&source, "Workbench.hdf", &minimal_amiga_hdf());
+        write_archive_file(&source, "WHDLoad Game/Game.slave", &minimal_whdload_slave());
+        write_archive_file(&source, "Notes.xyz", b"not a game");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        assert_eq!(summary.ingestion_stats.loose_roms, 1);
+        assert_eq!(summary.ingestion_stats.archives, 1);
+        assert_eq!(summary.ingestion_stats.amiga_images, 1);
+        assert_eq!(summary.ingestion_stats.game_folders, 1);
+        assert_eq!(summary.ingestion_stats.unknown, 1);
+        // The old scanner still only persists the zip - unaffected.
+        assert_eq!(summary.counts.archives_seen, 1);
     }
 }

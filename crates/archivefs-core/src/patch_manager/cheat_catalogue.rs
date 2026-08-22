@@ -646,13 +646,21 @@ fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
 /// (`cheatN_code`, `cheatN_code_type`, ...) are read only far enough to
 /// confirm the key exists; their values are never stored anywhere in this
 /// module's output.
+///
+/// The `cheats = N` header is validated only for being syntactically a
+/// number, never compared against how many `cheatN_...` entries actually
+/// follow it (2026-08-22, live-QA Phase 8): real, working Libretro `.cht`
+/// files hand-edited over time routinely drift out of sync between the two,
+/// and RetroArch itself never enforces them matching when it loads cheats.
+/// Treating that mismatch as fatal was excluding genuinely usable files
+/// wholesale under a "MalformedCht" label; every entry actually found and
+/// successfully parsed is returned regardless of what the header claimed.
 fn parse_cht_cheats(
     text: &str,
     path: &Path,
 ) -> (Vec<CheatDefinition>, bool, Vec<CatalogueDiagnostic>) {
     use std::collections::BTreeMap;
 
-    let mut declared_cheat_count = None;
     let mut descriptions = BTreeMap::<u32, String>::new();
     let mut enabled = BTreeSet::<u32>::new();
     let mut seen_indices = BTreeSet::<u32>::new();
@@ -673,12 +681,14 @@ fn parse_cht_cheats(
         let key = raw_key.trim();
         let value = unquote_cht_value(raw_value.trim());
         if key == "cheats" {
-            match value.parse::<u32>() {
-                Ok(count) => declared_cheat_count = Some(count),
-                Err(_) => {
-                    complete = false;
-                    diagnostics.push(malformed_line_diagnostic(path, line_number));
-                }
+            // The declared count is read only far enough to confirm it is
+            // syntactically a number - a non-numeric value is genuinely
+            // malformed syntax. The count itself is not compared against
+            // how many `cheatN_...` entries actually follow; see the doc
+            // comment below `seen_indices` is finalised for why.
+            if value.parse::<u32>().is_err() {
+                complete = false;
+                diagnostics.push(malformed_line_diagnostic(path, line_number));
             }
             continue;
         }
@@ -714,10 +724,6 @@ fn parse_cht_cheats(
         // and any other field are intentionally not matched above - their
         // values are read into `value` for the length of this loop
         // iteration only and then dropped.
-    }
-
-    if declared_cheat_count.is_some_and(|count| count as usize != seen_indices.len()) {
-        complete = false;
     }
 
     let cheats = seen_indices

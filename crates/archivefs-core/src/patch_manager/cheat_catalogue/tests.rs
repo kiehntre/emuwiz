@@ -319,6 +319,36 @@ fn malformed_cht_is_a_bounded_non_fatal_exclusion() {
     );
 }
 
+/// A `cheats=N` header that disagrees with the actual number of `cheatN_...`
+/// entries present must NOT be treated as malformed (2026-08-22, live-QA
+/// Phase 8: real, working Libretro `.cht` files hand-edited over time
+/// routinely drift out of sync between the two, and RetroArch itself never
+/// enforces them matching - the earlier strict check was excluding
+/// genuinely usable files under a "MalformedCht" label). Every syntactically
+/// valid line here is otherwise well-formed; only the declared count (3) is
+/// wrong for the 2 entries actually present.
+#[test]
+fn a_cheats_header_count_mismatch_alone_does_not_mark_a_cht_file_malformed() {
+    let root = temp_root("cheats-count-mismatch");
+    fs::write(
+        root.join("Game.cht"),
+        "cheats = 3\ncheat0_desc = \"A\"\ncheat0_enable = true\ncheat1_desc = \"B\"\n",
+    )
+    .unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.complete);
+    assert!(
+        snapshot.excluded_entries.is_empty(),
+        "a header/entry-count mismatch alone must not exclude the file: {:?}",
+        snapshot.excluded_entries
+    );
+    assert_eq!(
+        snapshot.games.len(),
+        1,
+        "the two well-formed cheat entries must still be usable"
+    );
+}
+
 #[test]
 fn oversized_cht_file_is_skipped_with_diagnostic() {
     let root = temp_root("oversized-cht");

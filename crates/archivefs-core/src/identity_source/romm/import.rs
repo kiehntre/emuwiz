@@ -265,6 +265,14 @@ pub enum ImportFailure {
     },
     DeadlineExceeded {
         seconds: u64,
+        records_fetched: usize,
+        pages_fetched: u32,
+        /// The server's own reported total, when it looked trustworthy at the
+        /// point the deadline hit - the same estimate progress reporting
+        /// uses, so a caller can show "18,973 / 36,194 records" rather than
+        /// inventing an ETA from timing data that is not stable enough to
+        /// trust.
+        reported_total: Option<u64>,
     },
     /// Even a single record, asked for without its file list, exceeded the
     /// ceiling. There is nothing smaller left to ask for.
@@ -272,6 +280,20 @@ pub enum ImportFailure {
         offset: u32,
         page_size: u32,
         ceiling_bytes: usize,
+    },
+    /// One page request ran past its own per-request timeout - distinct from
+    /// [`ImportFailure::DeadlineExceeded`], which is the *whole import's*
+    /// budget. A real live catalogue's one pathological record (28,831
+    /// files) was measured taking up to 187 seconds to answer, which this
+    /// names precisely rather than reporting as an undifferentiated
+    /// transport failure. No record id is available: a timeout means the
+    /// request never completed, so nothing about which record it concerned
+    /// was ever received.
+    DetailRequestTimedOut {
+        offset: u32,
+        page_size: u32,
+        with_files: bool,
+        configured_timeout_seconds: u64,
     },
     /// Too many responses were refused for size. The import stops rather than
     /// spending the rest of the deadline reading bodies up to the ceiling and
@@ -307,8 +329,24 @@ impl ImportFailure {
                 "RomM reported {reported} records but {received} arrived, which is too large a \
                  discrepancy to treat as a complete import"
             ),
-            Self::DeadlineExceeded { seconds } => {
-                format!("the import did not finish within {seconds} seconds")
+            Self::DeadlineExceeded {
+                seconds,
+                records_fetched,
+                pages_fetched,
+                reported_total,
+            } => {
+                let progress = match reported_total {
+                    Some(total) if *total > 0 => {
+                        format!("fetching {records_fetched} of an estimated {total} records")
+                    }
+                    _ => format!("fetching {records_fetched} record(s)"),
+                };
+                format!(
+                    "RomM import reached the configured {seconds}-second time limit after \
+                     {progress} over {pages_fetched} page(s). Your existing cache was left \
+                     unchanged. A larger library or a slower RomM server may need a longer \
+                     time limit - see the RomM settings in Sources."
+                )
             }
             Self::OversizedRecord {
                 offset,
@@ -328,6 +366,17 @@ impl ImportFailure {
                  so continuing would spend the whole deadline discarding data. Nothing was \
                  published and any previous cache is untouched."
             ),
+            Self::DetailRequestTimedOut {
+                offset,
+                page_size,
+                with_files,
+                configured_timeout_seconds,
+            } => format!(
+                "`GET /api/roms?limit={page_size}&offset={offset}{files}` did not answer within \
+                 {configured_timeout_seconds} seconds. Nothing was published and any previous \
+                 cache is untouched.",
+                files = if *with_files { "&with_files=true" } else { "" },
+            ),
             Self::Cancelled => "the import was cancelled".to_string(),
             Self::Publish(failure) => failure.detail(),
         }
@@ -344,6 +393,7 @@ impl ImportFailure {
             Self::InconsistentTotal { .. } => "inconsistent_total",
             Self::DeadlineExceeded { .. } => "deadline_exceeded",
             Self::OversizedRecord { .. } => "oversized_record",
+            Self::DetailRequestTimedOut { .. } => "detail_request_timed_out",
             Self::TooManyOversizedPages { .. } => "too_many_oversized_pages",
             Self::Cancelled => "cancelled",
             Self::Publish(_) => "publish_failed",
@@ -476,6 +526,9 @@ pub(crate) fn import_identity_with_deadline<T: RommTransport>(
         if started.elapsed() > deadline {
             return Err(ImportFailure::DeadlineExceeded {
                 seconds: deadline.as_secs(),
+                records_fetched: records.len(),
+                pages_fetched: progress.pages_fetched,
+                reported_total: progress.reported_total,
             });
         }
         // Scaled by the smallest page size used so far, so stepping down cannot
@@ -488,6 +541,24 @@ pub(crate) fn import_identity_with_deadline<T: RommTransport>(
         // Fetch this offset, stepping the page size down until a response fits.
         // The offset is not touched in here: every attempt asks for the same
         // records, so nothing can be skipped or counted twice.
+        //
+        // Two consecutive refusals at one offset is the ordinary case (a page
+        // that is moderately over the ceiling usually fits after one or two
+        // steps down the ladder - see `the_page_size_steps_down_twice_when_it_has_to`)
+        // and is left to the normal ladder. A *third* consecutive refusal at the
+        // same offset is different: a live 36k-record catalogue showed that once
+        // a window still contains a genuinely pathological record (one with
+        // 28,831 files), intermediate batch sizes are not merely "still too big"
+        // but can take *longer* than fetching that one record alone - a batch of
+        // 25 containing it exceeded 90 seconds against 22 seconds for the record
+        // by itself, because RomM's own query cost does not scale linearly with
+        // batch size once a record like that is present. Past two failures in a
+        // row, further ladder rungs are paying for batch sizes already shown to
+        // be no safer, so the third jumps straight to a single-record request.
+        // This never asks for less than the ladder already would have (worst
+        // case still bottoms out at one record with its file list dropped,
+        // exactly as before) - it only skips the wasted intermediate attempts.
+        let mut oversized_events_at_this_offset: u32 = 0;
         let page = loop {
             if cancelled(cancel) {
                 return Err(ImportFailure::Cancelled);
@@ -495,12 +566,16 @@ pub(crate) fn import_identity_with_deadline<T: RommTransport>(
             if started.elapsed() > deadline {
                 return Err(ImportFailure::DeadlineExceeded {
                     seconds: deadline.as_secs(),
+                    records_fetched: records.len(),
+                    pages_fetched: progress.pages_fetched,
+                    reported_total: progress.reported_total,
                 });
             }
             match client.roms_page_detail(page_size, offset, with_files, cancel) {
                 Ok(page) => break page,
                 Err(RommRequestError::ResponseTooLarge { limit }) => {
                     adaptive.oversized_retries += 1;
+                    oversized_events_at_this_offset += 1;
                     // Each refusal costs a read up to the ceiling, so absorbing an
                     // unlimited number of them would spend the deadline on data
                     // that is thrown away.
@@ -513,7 +588,12 @@ pub(crate) fn import_identity_with_deadline<T: RommTransport>(
                     // The ceiling is not negotiable; what is asked for is. Raising
                     // the ceiling instead would remove the only bound on how much a
                     // server can make this process read.
-                    if let Some(smaller) = next_page_size(page_size) {
+                    let next = if oversized_events_at_this_offset >= 3 {
+                        (page_size > 1).then_some(1)
+                    } else {
+                        next_page_size(page_size)
+                    };
+                    if let Some(smaller) = next {
                         let reduction = PageSizeReduction {
                             offset,
                             from: page_size,
@@ -543,6 +623,22 @@ pub(crate) fn import_identity_with_deadline<T: RommTransport>(
                             ceiling_bytes: limit,
                         });
                     }
+                }
+                // Named precisely, with the request context available here,
+                // rather than surfacing as an undifferentiated transport
+                // failure - see `ImportFailure::DetailRequestTimedOut`'s own
+                // doc comment for the real measurement behind this.
+                Err(RommRequestError::Timeout) => {
+                    return Err(ImportFailure::DetailRequestTimedOut {
+                        offset,
+                        page_size,
+                        with_files,
+                        configured_timeout_seconds: if with_files {
+                            super::client::DETAIL_REQUEST_TIMEOUT.as_secs()
+                        } else {
+                            super::client::REQUEST_TIMEOUT.as_secs()
+                        },
+                    });
                 }
                 Err(other) => return Err(ImportFailure::Request(other)),
             }

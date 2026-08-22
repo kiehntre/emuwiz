@@ -92,6 +92,10 @@ struct FakeRomm {
     seen_urls: std::sync::Mutex<Vec<String>>,
     /// A body larger than the ceiling, for the oversized case.
     oversized: bool,
+    /// The `timeout` argument every call was given, in call order - so a test
+    /// can prove which requests asked for the tight default and which asked
+    /// for the longer detail-request allowance.
+    seen_timeouts: std::sync::Mutex<Vec<std::time::Duration>>,
 }
 
 impl FakeRomm {
@@ -125,6 +129,10 @@ impl FakeRomm {
     fn urls(&self) -> Vec<String> {
         self.seen_urls.lock().expect("lock").clone()
     }
+
+    fn timeouts(&self) -> Vec<std::time::Duration> {
+        self.seen_timeouts.lock().expect("lock").clone()
+    }
 }
 
 impl RommTransport for FakeRomm {
@@ -133,12 +141,14 @@ impl RommTransport for FakeRomm {
         url: &str,
         authorization: Option<&str>,
         max_bytes: usize,
+        timeout: std::time::Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         self.seen_authorization
             .lock()
             .expect("lock")
             .push(authorization.map(str::to_string));
         self.seen_urls.lock().expect("lock").push(url.to_string());
+        self.seen_timeouts.lock().expect("lock").push(timeout);
 
         if self.oversized {
             return Err(RommRequestError::ResponseTooLarge { limit: max_bytes });
@@ -819,4 +829,69 @@ fn the_verified_real_instance_contract_is_recorded() {
         parsed.major_version().expect("a major") >= MINIMUM_SUPPORTED_MAJOR,
         "the verified instance must satisfy the adapter's own minimum"
     );
+}
+
+// --- Per-request timeout: normal vs. detail (2026-08-22) -------------------
+//
+// A live RomM 5.2.0 instance's one pathological record (28,831 files, id
+// 43030) was measured taking 22s, 25s and 187s across three real samples -
+// well past the 30-second `REQUEST_TIMEOUT` every other request uses, which
+// is why a real full import was seeing "RomM did not answer in time" for
+// exactly this record's page. These tests pin that a ROM page asked for
+// *with* file detail gets the longer, still-bounded allowance, and that
+// every other request - including a ROM page *without* file detail - keeps
+// the tight default.
+
+#[test]
+fn a_rom_page_with_file_detail_is_given_the_longer_detail_timeout() {
+    let fake = FakeRomm::healthy();
+    let source = source();
+    let client = RommClient::new(&source, &fake);
+    client
+        .roms_page_detail(50, 0, true, None)
+        .expect("a page with file detail");
+    assert_eq!(
+        fake.timeouts(),
+        vec![DETAIL_REQUEST_TIMEOUT],
+        "a request carrying with_files=true must use the longer timeout"
+    );
+}
+
+#[test]
+fn a_rom_page_without_file_detail_keeps_the_normal_timeout() {
+    let fake = FakeRomm::healthy();
+    let source = source();
+    let client = RommClient::new(&source, &fake);
+    client
+        .roms_page_detail(50, 0, false, None)
+        .expect("a page without file detail");
+    assert_eq!(
+        fake.timeouts(),
+        vec![REQUEST_TIMEOUT],
+        "a request without file detail is never the slow shape, so it keeps \
+         the tight default"
+    );
+}
+
+#[test]
+fn every_other_endpoint_keeps_the_normal_timeout() {
+    let fake = FakeRomm::healthy();
+    let source = source();
+    let client = RommClient::new(&source, &fake);
+    client.heartbeat(None).expect("heartbeat");
+    client.api_capability(None).expect("capability");
+    client.platforms(None).expect("platforms");
+    assert_eq!(
+        fake.timeouts(),
+        vec![REQUEST_TIMEOUT, REQUEST_TIMEOUT, REQUEST_TIMEOUT],
+        "heartbeat, capability and platforms are not the pathological shape \
+         and must not silently inherit the longer allowance"
+    );
+}
+
+#[test]
+fn the_detail_timeout_is_a_real_bound_not_an_unlimited_wait() {
+    // Item 3's explicit requirement: no "unlimited" timeout anywhere.
+    assert!(DETAIL_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
+    assert!(DETAIL_REQUEST_TIMEOUT < std::time::Duration::from_secs(3600));
 }

@@ -19,6 +19,7 @@ use crate::safe_read::TrustedRoots;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 // --- Fixtures -------------------------------------------------------------
 
@@ -208,6 +209,7 @@ impl RommTransport for FakeRomm {
         url: &str,
         _authorization: Option<&str>,
         _max_bytes: usize,
+        _timeout: Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         self.urls.lock().expect("lock").push(url.to_string());
         let body = if url.contains("/api/platforms") {
@@ -1009,6 +1011,11 @@ fn record_for(server: &str, id: &str, path: Option<PathBuf>) -> ExternalIdentity
         verification: ExternalVerification::Unmatched,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
     }
 }
 
@@ -1328,6 +1335,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
             page_size: DEFAULT_PAGE_SIZE,
             hashes: &LocalHashCache::new(),
             cancel: None,
+            import_timeout: Duration::from_secs(600),
         },
         observe_facts,
         no_progress,
@@ -1353,6 +1361,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
+                        import_timeout: Duration::from_secs(600),
                     },
                     observe_facts,
                     no_progress,
@@ -1373,6 +1382,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
+                        import_timeout: Duration::from_secs(600),
                     },
                     observe_facts,
                     no_progress,
@@ -1394,6 +1404,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
+                        import_timeout: Duration::from_secs(600),
                     },
                     observe_facts,
                     no_progress,
@@ -1415,6 +1426,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: None,
+                        import_timeout: Duration::from_secs(600),
                     },
                     observe_facts,
                     no_progress,
@@ -1435,6 +1447,7 @@ fn every_kind_of_failed_refresh_keeps_the_previous_cache() {
                         page_size: DEFAULT_PAGE_SIZE,
                         hashes: &LocalHashCache::new(),
                         cancel: Some(&cancel),
+                        import_timeout: Duration::from_secs(600),
                     },
                     observe_facts,
                     no_progress,
@@ -1485,6 +1498,7 @@ fn a_first_ever_failed_import_leaves_no_fake_ready_state() {
                 page_size: DEFAULT_PAGE_SIZE,
                 hashes: &LocalHashCache::new(),
                 cancel: None,
+                import_timeout: Duration::from_secs(600),
             },
             observe_facts,
             no_progress,
@@ -1532,6 +1546,7 @@ fn cached_identity_is_browsable_with_no_network() {
             page_size: DEFAULT_PAGE_SIZE,
             hashes: &LocalHashCache::new(),
             cancel: None,
+            import_timeout: Duration::from_secs(600),
         },
         observe_facts,
         no_progress,
@@ -2060,6 +2075,7 @@ fn one_path_can_be_matched_through_the_api() {
             page_size: DEFAULT_PAGE_SIZE,
             hashes: &LocalHashCache::new(),
             cancel: None,
+            import_timeout: Duration::from_secs(600),
         },
         observe_facts,
         no_progress,
@@ -2117,6 +2133,7 @@ fn an_end_to_end_import_produces_matched_records_and_a_status() {
                 page_size: DEFAULT_PAGE_SIZE,
                 hashes: &LocalHashCache::new(),
                 cancel: None,
+                import_timeout: Duration::from_secs(600),
             },
             observe_facts,
             no_progress,
@@ -2310,6 +2327,9 @@ struct AdaptiveRomm {
     /// How many requests came in without `with_files`.
     files_omitted: Mutex<usize>,
     hook: Option<CallHook>,
+    /// The `timeout` every `/api/roms` call was given, alongside whether it
+    /// asked for `with_files`, in call order.
+    timeouts: Mutex<Vec<(bool, Duration)>>,
 }
 
 impl AdaptiveRomm {
@@ -2344,6 +2364,7 @@ impl AdaptiveRomm {
             calls: Mutex::new(0),
             files_omitted: Mutex::new(0),
             hook: None,
+            timeouts: Mutex::new(Vec::new()),
         }
     }
 
@@ -2384,6 +2405,11 @@ impl AdaptiveRomm {
     fn files_omitted_requests(&self) -> usize {
         *self.files_omitted.lock().expect("lock")
     }
+
+    /// Every `(with_files, timeout)` pair this fake was actually called with.
+    fn seen_timeouts(&self) -> Vec<(bool, Duration)> {
+        self.timeouts.lock().expect("lock").clone()
+    }
 }
 
 impl RommTransport for AdaptiveRomm {
@@ -2392,6 +2418,7 @@ impl RommTransport for AdaptiveRomm {
         url: &str,
         _authorization: Option<&str>,
         _max_bytes: usize,
+        timeout: Duration,
     ) -> Result<RommHttpResponse, RommRequestError> {
         if url.contains("/api/platforms") {
             return Ok(RommHttpResponse {
@@ -2422,6 +2449,10 @@ impl RommTransport for AdaptiveRomm {
             *self.files_omitted.lock().expect("lock") += 1;
         }
         self.requests.lock().expect("lock").push((offset, limit));
+        self.timeouts
+            .lock()
+            .expect("lock")
+            .push((with_files, timeout));
 
         let call_index = {
             let mut calls = self.calls.lock().expect("lock");
@@ -2526,6 +2557,160 @@ fn a_page_size_of_100_steps_down_to_50_and_completes() {
     // The first request was the configured size; the retry was the same offset.
     assert_eq!(fake.requests()[0], (0, 100));
     assert_eq!(fake.requests()[1], (0, 50));
+}
+
+/// The third consecutive refusal at one offset skips straight to a single
+/// record rather than trying the next ladder rung - even one that would
+/// actually have succeeded. Proven directly: size 10 is never asked for here,
+/// even though it is well within this fake's safe limit.
+#[test]
+fn a_third_consecutive_refusal_skips_the_remaining_ladder_rungs() {
+    let tree = Tree::new("adaptive-third-refusal-escalates");
+    // 100, 50 and 25 are all refused; 10 (and everything smaller) would
+    // succeed, but the third refusal must jump straight past it to 1.
+    let fake = AdaptiveRomm::new(80, 5);
+    let (outcome, seen) = adaptive_import(&tree, &fake, 100);
+    let outcome = outcome.expect("the import should complete at the smallest page size");
+
+    assert_eq!(outcome.cache.records.len(), 80);
+    // Only the reductions at the pathological offset (0) matter here - once
+    // past it, the page size is free to climb back up and refuse again
+    // further into this small catalogue, which is unrelated recovery
+    // behaviour, not a second escalation.
+    let steps: Vec<u32> = seen
+        .iter()
+        .filter_map(|progress| progress.reduction)
+        .filter(|reduction| reduction.offset == 0)
+        .map(|reduction| reduction.to)
+        .collect();
+    assert_eq!(
+        steps,
+        vec![50, 25, 1],
+        "the third refusal (at page size 25) must escalate directly to 1, \
+         never trying 10 or 5"
+    );
+    let attempts_at_offset_zero: Vec<u32> = fake
+        .requests()
+        .into_iter()
+        .filter(|(offset, _)| *offset == 0)
+        .map(|(_, limit)| limit)
+        .collect();
+    assert!(
+        !attempts_at_offset_zero.contains(&10),
+        "size 10 must never be tried once escalation has happened: {attempts_at_offset_zero:?}"
+    );
+}
+
+/// A transport that always answers `/api/platforms` but always times out on
+/// `/api/roms`, for testing what a real per-request timeout produces.
+struct AlwaysTimesOutOnRoms;
+
+impl RommTransport for AlwaysTimesOutOnRoms {
+    fn get(
+        &self,
+        url: &str,
+        _authorization: Option<&str>,
+        _max_bytes: usize,
+        _timeout: Duration,
+    ) -> Result<RommHttpResponse, RommRequestError> {
+        if url.contains("/api/platforms") {
+            return Ok(RommHttpResponse {
+                status: 200,
+                body: b"[]".to_vec(),
+                location: None,
+            });
+        }
+        Err(RommRequestError::Timeout)
+    }
+}
+
+#[test]
+fn a_timeout_on_a_with_files_request_is_reported_with_its_own_message_and_context() {
+    let tree = Tree::new("adaptive-timeout-message");
+    let failure = crate::identity_source::romm::import::import_identity(
+        &tree.source(),
+        &AlwaysTimesOutOnRoms,
+        ImportScope::Full,
+        &capability(),
+        100,
+        |_| {},
+        None,
+    )
+    .expect_err("a request that always times out cannot succeed");
+    assert_eq!(failure.code(), "detail_request_timed_out");
+    let detail = failure.detail();
+    assert!(
+        detail.contains("offset=0"),
+        "the offset must be named: {detail}"
+    );
+    assert!(
+        detail.contains("with_files=true"),
+        "the request shape must be named: {detail}"
+    );
+    assert!(
+        detail.contains(
+            &crate::identity_source::romm::client::DETAIL_REQUEST_TIMEOUT
+                .as_secs()
+                .to_string()
+        ),
+        "the configured timeout must be named: {detail}"
+    );
+    assert!(
+        detail.contains("untouched"),
+        "the technical detail must still confirm the cache was not touched: {detail}"
+    );
+    assert!(failure.previous_cache_preserved());
+}
+
+// --- Per-request timeout during a real import walk (2026-08-22) -----------
+
+#[test]
+fn every_with_files_request_during_an_import_uses_the_detail_timeout() {
+    let tree = Tree::new("adaptive-timeout-detail");
+    // Ordinary catalogue, nothing oversized - every request an import makes
+    // here carries with_files=true (the default), so every one of them must
+    // have asked for the longer allowance.
+    let fake = AdaptiveRomm::new(250, u32::MAX);
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    outcome.expect("an ordinary import should complete");
+    let timeouts = fake.seen_timeouts();
+    assert!(!timeouts.is_empty());
+    assert!(
+        timeouts.iter().all(|(with_files, timeout)| *with_files
+            && *timeout == crate::identity_source::romm::client::DETAIL_REQUEST_TIMEOUT),
+        "every page fetched with file detail must use the longer timeout: {timeouts:?}"
+    );
+}
+
+#[test]
+fn the_final_fallback_without_file_detail_uses_the_normal_timeout() {
+    let tree = Tree::new("adaptive-timeout-fallback");
+    // Mirrors the real pathological case: one record is unreadable with file
+    // detail at any page size, so the import must eventually ask for it
+    // without files - and that one request is not the slow shape any more,
+    // so it must not still be paying for the long timeout.
+    let fake = AdaptiveRomm::with_policy(
+        60,
+        Box::new(|offset, limit, with_files| offset <= 30 && limit + offset > 30 && with_files),
+    );
+    let (outcome, _) = adaptive_import(&tree, &fake, 100);
+    outcome.expect("dropping file detail should let the import finish");
+    let timeouts = fake.seen_timeouts();
+    let without_files: Vec<_> = timeouts
+        .iter()
+        .filter(|(with_files, _)| !with_files)
+        .collect();
+    assert_eq!(
+        without_files.len(),
+        1,
+        "exactly one record should have needed the without-files fallback: {timeouts:?}"
+    );
+    assert_eq!(
+        without_files[0].1,
+        crate::identity_source::romm::client::REQUEST_TIMEOUT,
+        "a request without file detail is fast, so it must use the normal timeout, not the \
+         longer one still associated with the request that failed"
+    );
 }
 
 /// Test A2: 100 and 50 are both too large, 25 succeeds.
@@ -2777,6 +2962,65 @@ fn the_deadline_still_applies_inside_a_retry_sequence() {
     assert!(failure.previous_cache_preserved());
 }
 
+/// A timeout must say something a person can act on: how much it actually
+/// got done, and that the existing cache is safe - never a bare "did not
+/// finish within N seconds" with no context.
+#[test]
+fn a_deadline_failure_reports_what_it_fetched_and_that_the_cache_is_safe() {
+    let tree = Tree::new("adaptive-deadline-reporting");
+    let fake = AdaptiveRomm::new(500, 200).reporting_totals(vec![500]);
+    let failure = crate::identity_source::romm::import::import_identity_with_deadline(
+        &tree.source(),
+        &fake,
+        ImportScope::Full,
+        &capability(),
+        100,
+        |_| {},
+        None,
+        // Long enough to fetch a few pages, short enough to still time out
+        // against a 500-record catalogue at page size 100.
+        std::time::Duration::from_millis(1),
+    )
+    .expect_err("an import past its deadline must stop");
+    assert_eq!(failure.code(), "deadline_exceeded");
+    assert!(failure.previous_cache_preserved());
+    let detail = failure.detail();
+    assert!(
+        detail.contains("Your existing cache was left unchanged"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("configured") && detail.contains("time limit"),
+        "the message should say this is a configured limit, not an unexplained \
+         number: {detail}"
+    );
+}
+
+/// The same failure, but the server's total was never trustworthy enough to
+/// report - the message must still be honest and useful without it.
+#[test]
+fn a_deadline_failure_with_no_trustworthy_total_still_reports_records_fetched() {
+    let tree = Tree::new("adaptive-deadline-no-total");
+    let fake = AdaptiveRomm::new(500, 200);
+    let failure = crate::identity_source::romm::import::import_identity_with_deadline(
+        &tree.source(),
+        &fake,
+        ImportScope::Full,
+        &capability(),
+        100,
+        |_| {},
+        None,
+        std::time::Duration::from_millis(1),
+    )
+    .expect_err("an import past its deadline must stop");
+    let detail = failure.detail();
+    assert!(
+        detail.contains("record"),
+        "even with no reliable total, the message should still say what was \
+         fetched: {detail}"
+    );
+}
+
 /// Test A12: a single record still too large fails safely.
 #[test]
 fn a_single_record_larger_than_the_ceiling_fails_with_its_offset() {
@@ -2802,24 +3046,26 @@ fn a_single_record_larger_than_the_ceiling_fails_with_its_offset() {
     );
     assert!(failure.previous_cache_preserved());
 
-    // It exhausted the ladder before giving up.
+    // It exhausted the ladder before giving up. A third consecutive refusal at
+    // the same offset jumps straight to one record rather than trying every
+    // remaining rung (10, then 5) - see the retry loop's own comment for why:
+    // a live catalogue showed those intermediate sizes are not necessarily any
+    // faster than a single record once that record is the problem.
     let steps: Vec<u32> = seen
         .iter()
         .filter_map(|progress| progress.reduction)
         .map(|reduction| reduction.to)
         .collect();
-    assert_eq!(steps, vec![50, 25, 10, 5, 1]);
-    // The ladder, then one last attempt for a single record without its file list:
-    // seven requests, every one of them at the same offset.
+    assert_eq!(steps, vec![50, 25, 1]);
+    // The ladder to 25, the escalation straight to one record, then one last
+    // attempt for that record without its file list: five requests, every one
+    // of them at the same offset.
     let attempts: Vec<(u32, u32)> = fake
         .requests()
         .into_iter()
         .filter(|(offset, _)| *offset == 0)
         .collect();
-    assert_eq!(
-        attempts,
-        vec![(0, 100), (0, 50), (0, 25), (0, 10), (0, 5), (0, 1), (0, 1)]
-    );
+    assert_eq!(attempts, vec![(0, 100), (0, 50), (0, 25), (0, 1), (0, 1)]);
     assert_eq!(
         fake.files_omitted_requests(),
         1,
@@ -2997,14 +3243,14 @@ fn a_record_whose_file_list_is_too_large_is_imported_without_it() {
     );
     assert!(record.related_files.is_empty());
 
-    // It stepped all the way down before dropping detail, so detail is only ever
-    // the last resort.
+    // It stepped down twice, then escalated straight to one record on the third
+    // consecutive refusal, and only then dropped detail as the last resort.
     let steps: Vec<u32> = seen
         .iter()
         .filter_map(|progress| progress.reduction)
         .map(|reduction| reduction.to)
         .collect();
-    assert_eq!(steps, vec![50, 25, 10, 5, 1]);
+    assert_eq!(steps, vec![50, 25, 1]);
 }
 
 /// After the fat region, the page size climbs back - or a long catalogue could

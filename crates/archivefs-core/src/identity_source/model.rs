@@ -304,6 +304,27 @@ pub struct ExternalIdentityRecord {
     pub conflicts: Vec<IdentityConflict>,
     /// The observed facts behind the verification level.
     pub evidence: Vec<String>,
+    /// Enrichment-only fields (game metadata milestone, 2026-08-22): display
+    /// information the provider publishes alongside identity, never
+    /// consulted for matching/verification and never promoted to identity
+    /// evidence. `#[serde(default)]` so a cache file written before this
+    /// field existed still deserialises - an older cached record simply has
+    /// none of these, exactly like a record from a provider that never
+    /// published them.
+    #[serde(default)]
+    pub synopsis: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    /// A free-form player-count description as the provider published it
+    /// (e.g. "1-2"), not a parsed range.
+    #[serde(default)]
+    pub players: Option<String>,
+    /// A community/critic rating, 0-100. Display-only. `Option<u8>` rather
+    /// than a float so this type can keep deriving `Eq`/`Hash`.
+    #[serde(default)]
+    pub rating: Option<u8>,
+    #[serde(default)]
+    pub release_year: Option<u16>,
 }
 
 impl ExternalIdentityRecord {
@@ -319,6 +340,23 @@ impl ExternalIdentityRecord {
 
     pub fn has_conflicts(&self) -> bool {
         !self.conflicts.is_empty()
+    }
+
+    /// Whether the provider published any display-only enrichment for this
+    /// record (synopsis, genre, players, rating, or release year).
+    ///
+    /// The single source of truth for "does this record have game
+    /// information" - used both to decide what a bulk metadata update
+    /// counts as found, and by [`crate::identity_source::romm::enrichment`]
+    /// to decide whether to claim a source for a single-game lookup. Reads
+    /// only the enrichment fields, never identity fields, matching the rule
+    /// that enrichment presence or absence never reflects on identity.
+    pub fn has_game_information(&self) -> bool {
+        self.synopsis.is_some()
+            || !self.genres.is_empty()
+            || self.players.is_some()
+            || self.rating.is_some()
+            || self.release_year.is_some()
     }
 
     /// A one-line summary for a list view.
@@ -348,6 +386,13 @@ pub struct IdentityImportCounts {
     pub with_hashes: usize,
     pub with_artwork: usize,
     pub multi_file: usize,
+    /// Records carrying at least one enrichment field (synopsis, genre,
+    /// players, rating, or release year) - see
+    /// [`ExternalIdentityRecord::has_game_information`]. Never affects, and
+    /// is never affected by, `confirmed`/`strong`/.../`unmatched` above:
+    /// those describe preservation-identity confidence, this describes an
+    /// unrelated, purely cosmetic property.
+    pub with_game_information: usize,
 }
 
 impl IdentityImportCounts {
@@ -373,6 +418,9 @@ impl IdentityImportCounts {
             }
             if !record.related_files.is_empty() {
                 counts.multi_file += 1;
+            }
+            if record.has_game_information() {
+                counts.with_game_information += 1;
             }
         }
         counts

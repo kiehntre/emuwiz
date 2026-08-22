@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::IdentityProvider;
 use super::net_policy::EndpointRefusal;
-use super::romm::client::{RommRequestError, RommTransport};
+use super::romm::client::{REQUEST_TIMEOUT, RommRequestError, RommTransport};
 use super::romm::config::ValidatedRommSource;
 
 /// The box a thumbnail must fit inside. Matches the GUI's cover aspect closely
@@ -689,18 +689,29 @@ impl ArtworkCache {
         // not offered first. It is only used if the instance actually refuses -
         // there is no reason to hand a credential to a request that does not want
         // one.
-        let response = match transport.get(&url, None, MAX_ARTWORK_RESPONSE_BYTES) {
+        let response = match transport.get(&url, None, MAX_ARTWORK_RESPONSE_BYTES, REQUEST_TIMEOUT)
+        {
             Ok(response) if response.status == 401 || response.status == 403 => source
                 .token()
                 .with_header_value(|header| {
-                    transport.get(&url, Some(header), MAX_ARTWORK_RESPONSE_BYTES)
+                    transport.get(
+                        &url,
+                        Some(header),
+                        MAX_ARTWORK_RESPONSE_BYTES,
+                        REQUEST_TIMEOUT,
+                    )
                 })
                 .map_err(ArtworkRefusal::Request)?,
             Ok(response) => response,
             Err(RommRequestError::Unauthorised { .. }) => source
                 .token()
                 .with_header_value(|header| {
-                    transport.get(&url, Some(header), MAX_ARTWORK_RESPONSE_BYTES)
+                    transport.get(
+                        &url,
+                        Some(header),
+                        MAX_ARTWORK_RESPONSE_BYTES,
+                        REQUEST_TIMEOUT,
+                    )
                 })
                 .map_err(ArtworkRefusal::Request)?,
             Err(error) => return Err(ArtworkRefusal::Request(error)),

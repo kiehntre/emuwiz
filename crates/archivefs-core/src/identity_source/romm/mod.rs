@@ -23,6 +23,7 @@
 pub mod capability;
 pub mod client;
 pub mod config;
+pub mod enrichment;
 pub mod import;
 pub mod normalise;
 

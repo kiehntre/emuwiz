@@ -67,6 +67,9 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # ZIP member streams are decoded from preflight-validated packed ranges rather
 # than `ZipArchive`'s name-keyed index (which collapses duplicate names).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Universal source ingestion (read-only TAR listing): pure-Rust, used only
+# to enumerate entry names for content classification - never unpacks.
+tar = { version = "0.4", default-features = false }
 # Experimental 7z archive-member reader (POST-ALPHA-1.1, zero production
 # callers). `sevenz-rust2` is the maintained fork of the (now unmaintained,
 # advisory-carrying) `sevenz-rust`; it is pure Rust, Apache-2.0. The

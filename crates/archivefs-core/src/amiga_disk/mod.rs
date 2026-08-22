@@ -181,6 +181,76 @@ pub fn inspect_hdf(path: &Path) -> Result<AmigaDisk, DiskError> {
         rdb: r,
     })
 }
+/// Read-only inspection of an Amiga disk image that tolerates two real
+/// on-disk shapes: an RDB-partitioned HDF ([`inspect_hdf`], unchanged) and
+/// a flat, unpartitioned AmigaDOS image with no RDB wrapper at all - the
+/// shape real-world WHDLoad CD32 packs commonly ship as, where the whole
+/// image is one boot-block-identified filesystem starting at byte 0.
+///
+/// A flat image is only recognised when its own boot block carries a
+/// signature [`classify`] already treats as a real filesystem (`DOS0`
+/// through `DOS7`, `PFS`, `SFS`, `MuFS`) - never merely because RDB
+/// parsing failed. The resulting single synthetic partition spans the
+/// whole file (`byte_offset: 0`, `byte_length` = file size) so downstream
+/// callers (e.g. [`super::filesystem::discover_whdload_slaves`]) work
+/// against it exactly as they would a real RDB partition.
+pub fn inspect_amiga_image(path: &Path) -> Result<AmigaDisk, DiskError> {
+    match inspect_hdf(path) {
+        Ok(disk) => Ok(disk),
+        Err(DiskError::NoRdb) => inspect_flat_amigados(path),
+        Err(other) => Err(other),
+    }
+}
+
+fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
+    let mut f = std::fs::File::open(path).map_err(|e| DiskError::Io(e.to_string()))?;
+    let len = f
+        .metadata()
+        .map_err(|e| DiskError::Io(e.to_string()))?
+        .len();
+    if len < 512 {
+        return Err(DiskError::TooSmall);
+    }
+    let boot = read_at(&mut f, len, 0, 4)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(DiskError::NoRdb)?;
+    let filesystem = classify(boot);
+    if matches!(filesystem, FileSystem::Unknown(_)) {
+        return Err(DiskError::NoRdb);
+    }
+    Ok(AmigaDisk {
+        path: path.into(),
+        image_size: len,
+        rdb: Rdb {
+            block_index: 0,
+            block_size: 512,
+            partition_head: NONE,
+            cylinders: 0,
+            sectors: 0,
+            heads: 0,
+            rdb_blocks_low: 0,
+            rdb_blocks_high: 0,
+            partitions: vec![Partition {
+                block_index: 0,
+                next: NONE,
+                name: None,
+                low_cyl: 0,
+                high_cyl: 0,
+                surfaces: 0,
+                blocks_per_track: 0,
+                boot_priority: 0,
+                dos_type: boot,
+                byte_offset: 0,
+                byte_length: len,
+                boot_signature: Some(boot),
+                filesystem,
+            }],
+        },
+    })
+}
+
 pub fn structural_hdf_observation(_: &AmigaDisk) -> EvidenceObservation {
     EvidenceObservation {
         provenance: Provenance {

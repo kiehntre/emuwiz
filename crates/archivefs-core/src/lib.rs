@@ -86,6 +86,12 @@ pub use library_views::{
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
 
+/// Universal source discovery: container-vs-content classification of a
+/// mixed collection (archives, loose ROMs, disc images, Amiga images,
+/// WHDLoad folders, extracted game folders), feeding the existing
+/// identity system rather than replacing it. See the module docs.
+pub mod ingestion;
+
 /// Provider-neutral DAT catalogue parsing and read-only audit.
 ///
 /// Parses Logiqx XML and ClrMamePro text DAT files (No-Intro, Redump, TOSEC)
@@ -3415,6 +3421,24 @@ pub struct ArchiveMetadata {
     pub genre: Option<String>,
     pub notes: Option<String>,
     pub source: Option<String>,
+    /// Enrichment-only fields (game metadata milestone, 2026-08-22): never
+    /// written by any identity/preservation code path, and never consulted
+    /// by DAT matching, platform detection, or the resolver. Populated only
+    /// by an enrichment `MetadataProvider` (see `identity_source::romm`'s
+    /// enrichment support) - a game with none of these set is exactly as
+    /// usable as one that never had a metadata provider configured at all.
+    pub synopsis: Option<String>,
+    /// A free-form player-count description as the enrichment source
+    /// published it (e.g. "1-2", "1-4"), not a parsed range - providers
+    /// disagree on shape too often to normalise further without risking a
+    /// wrong-looking precise number.
+    pub players: Option<String>,
+    /// A community/critic rating, 0-100 (RomM's `average_rating` is IGDB's
+    /// 0-100 convention; rounded to a whole number, which is all display
+    /// ever needs). Display-only: never used for sorting, filtering, or any
+    /// decision. `Option<u8>` rather than a float so `ArchiveMetadata` can
+    /// keep deriving `Eq`/`Hash`.
+    pub rating: Option<u8>,
 }
 
 impl ArchiveMetadata {
@@ -3432,6 +3456,9 @@ impl ArchiveMetadata {
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         }
     }
 }
@@ -5215,6 +5242,14 @@ pub enum PlatformProvenance {
     Heuristic,
     /// An exact folder-alias match in the `platform` registry.
     FolderAlias,
+    /// The `platform` registry's own strong-extension/layout/emulator-
+    /// context evidence (via [`platform::detect_platform_report`]), used
+    /// only after folder-alias matching finds nothing. Deliberately given
+    /// the same database persistence priority as [`Self::Heuristic`] (see
+    /// `database::provenance_priority`) - a strong extension is a
+    /// reasonable guess, not the deliberate signal folder-alias or a
+    /// header signature is.
+    RegistryDetector,
 }
 
 impl PlatformProvenance {
@@ -5226,6 +5261,7 @@ impl PlatformProvenance {
             Self::HeaderIdentity => "header_identity",
             Self::Heuristic => "heuristic-path-detector",
             Self::FolderAlias => "folder_alias",
+            Self::RegistryDetector => "registry_detector",
         }
     }
 }
@@ -5298,6 +5334,14 @@ pub fn detect_platform_with_details(
         });
     }
 
+    if let Some(platform) = detect_platform_from_registry(path, source_root) {
+        return Some(DetailedPlatformDetection {
+            platform,
+            provenance: PlatformProvenance::RegistryDetector,
+            matched_folder: None,
+        });
+    }
+
     detect_platform_from_known_heuristics(path, source_root).map(|platform| {
         DetailedPlatformDetection {
             platform,
@@ -5305,6 +5349,55 @@ pub fn detect_platform_with_details(
             matched_folder: None,
         }
     })
+}
+
+/// Falls back to the `platform` registry's own strong-extension/magic-
+/// byte/layout evidence (via [`platform::detect_platform_report`]) when
+/// folder-alias matching finds nothing. Only ever reached after folder
+/// alias has already failed, so this never overrides that stronger,
+/// deliberate signal - it only fills in a platform for collections whose
+/// folder is not named after the platform at all (a curated set name, a
+/// region pack, "roms", etc.), which real collections do constantly.
+///
+/// `Ambiguous`/`Unknown` confidence (several platforms fit equally, or
+/// nothing does) contributes nothing here, exactly like every other tier
+/// in this function refuses to guess. A bounded signature read is enabled
+/// so extension evidence can be corroborated by a magic-byte check when
+/// one exists - but layout evidence (`inspect_layout`, one `read_dir` per
+/// call) is deliberately left off, unlike `inspecting_content()`'s
+/// default: this function runs once per scanned file, so a directory
+/// listing here would turn one source folder's scan into an O(n^2) number
+/// of `read_dir` calls against that same folder. Punishing on any storage;
+/// measured 77x slower against a real 1,228-file FUSE-mounted collection
+/// during validation.
+///
+/// `Confirmed` evidence (an explicit assignment or a magic-byte
+/// signature) is always used. `Probable` evidence - typically a strong
+/// extension alone - is used only when the resolved platform's own
+/// [`platform::Platform::conflicts_with`] is empty: a `.gba` file is
+/// unambiguously Game Boy Advance, but a `.rvz`/`.wbfs` file is strong
+/// extension evidence shared between GameCube and Wii (each lists the
+/// other in `conflicts_with`), and this codebase deliberately leaves that
+/// specific ambiguity for a person to resolve (see
+/// `database::provenance_priority` and the source-platform-assignment
+/// workflow) rather than silently picking one. This is not a blanket "any
+/// strong extension is confirmed" rule - it only auto-resolves the
+/// platforms the registry itself already declares to have no known
+/// look-alike.
+fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<String> {
+    let mut request = platform::DetectionRequest::new(path, source_root);
+    request.read_signatures = true;
+    let report = platform::detect_platform_report(&request);
+    let platform = report.platform?;
+    match report.confidence {
+        platform::DetectionConfidence::Confirmed => Some(platform.to_string()),
+        platform::DetectionConfidence::Probable => {
+            let unambiguous = platform::platform_by_id(platform)
+                .is_some_and(|entry| entry.conflicts_with.is_empty());
+            unambiguous.then(|| platform.to_string())
+        }
+        platform::DetectionConfidence::Unknown | platform::DetectionConfidence::Ambiguous => None,
+    }
 }
 
 /// The original `detect_platform` heuristic, unchanged: a small set of
@@ -10918,6 +11011,54 @@ mod tests {
             detect_platform("/home/msx2/collection/game.zip", "/home/msx2/collection"),
             None
         );
+    }
+
+    // --- Registry-based fallback tier (Stage 4B real-collection fix) -----
+    //
+    // Real GBA/GB/etc collections are routinely organised under a curated
+    // set name ("Nintendo Game Boy Advance Champion Collection") rather
+    // than a folder alias - folder-alias matching finds nothing there, so
+    // every loose ROM in a real 1,228-file collection previously fell
+    // through to unresolved. These tests pin the fix: a strong,
+    // unambiguous extension resolves a platform on its own once folder
+    // alias has already failed, but a strong extension shared between
+    // conflicting platforms (GameCube/Wii's `.rvz`/`.wbfs`) still does
+    // not, matching `database::tests::saved_source_assignment_reclassifies_unknown_rvz_on_rescan`.
+
+    #[test]
+    fn an_unambiguous_strong_extension_resolves_a_platform_when_folder_alias_finds_nothing() {
+        let detection = detect_platform_with_details(
+            "/mnt/gba-roms/Nintendo Game Boy Advance Champion Collection/007 - NightFire (NA).gba",
+            "/mnt/gba-roms/Nintendo Game Boy Advance Champion Collection",
+        )
+        .expect("a .gba file should resolve via the registry fallback");
+        assert_eq!(detection.platform, "Game Boy Advance");
+        assert_eq!(detection.provenance, PlatformProvenance::RegistryDetector);
+    }
+
+    #[test]
+    fn an_extension_shared_between_conflicting_platforms_does_not_auto_resolve() {
+        // `.rvz` is a strong GameCube extension but GameCube declares
+        // `conflicts_with: &["Wii"]` - the registry tier must defer to a
+        // person rather than silently guess between the two.
+        assert_eq!(
+            detect_platform_with_details(
+                "/mnt/collection/unsorted/ZooCube (USA).rvz",
+                "/mnt/collection/unsorted",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn folder_alias_still_wins_over_the_registry_tier_when_both_could_answer() {
+        // Even though `.gba` alone is unambiguous, an exact folder alias
+        // is still checked first and still wins - this fix only ever
+        // fills in what folder-alias evidence leaves empty.
+        let detection =
+            detect_platform_with_details("/mnt/collection/gba/Some Game.gba", "/mnt/collection")
+                .unwrap();
+        assert_eq!(detection.provenance, PlatformProvenance::FolderAlias);
     }
 
     #[test]

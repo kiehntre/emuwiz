@@ -169,6 +169,42 @@ pub fn normalise_rom(
             small_reference: string_field(value, "path_cover_small"),
         });
 
+    // Enrichment (game metadata milestone, 2026-08-22): `summary` is a flat
+    // field on the ROM object itself, but `genres`/`player_count`/
+    // `average_rating`/`first_release_date` all live inside RomM's nested
+    // `metadatum` object (`RomMetadataSchema` in RomM's own API, confirmed
+    // against a real RomM release's response shape) - never at the top
+    // level. A record with no `metadatum` at all (an older RomM instance,
+    // or a game RomM never matched to a metadata source) simply carries
+    // none of these; nothing here treats that as an error.
+    let synopsis = string_field(value, "summary");
+    let metadatum = value.get("metadatum");
+    let genres = metadatum
+        .map(|m| string_array(m, "genres"))
+        .unwrap_or_default();
+    // RomM has been observed (live, 2026-08-22, Majora's Mask on a real
+    // instance) sending the literal JSON string "null" for `player_count`
+    // rather than JSON null, on records where the value was never set - a
+    // provider-side stringification quirk, not a genuine "unknown" value
+    // spelled that way. Treated the same as absent, enrichment-side only:
+    // this does not touch how any identity field is read.
+    let players = metadatum
+        .and_then(|m| string_field(m, "player_count"))
+        .filter(|value| !value.eq_ignore_ascii_case("null"));
+    let rating = metadatum
+        .and_then(|m| m.get("average_rating"))
+        .and_then(Value::as_f64)
+        .map(|value| value.round().clamp(0.0, 100.0) as u8);
+    // `metadatum.first_release_date` is milliseconds, not seconds - confirmed
+    // 2026-08-22 against a live RomM 5.2.0 instance (Ocarina of Time reports
+    // 911606400000, which is 1998-11-21 as milliseconds; read as seconds it
+    // overflows a plausible year and was silently discarded).
+    let release_year = metadatum
+        .and_then(|m| m.get("first_release_date"))
+        .and_then(Value::as_i64)
+        .and_then(|millis| millis.checked_div(1000))
+        .and_then(unix_seconds_to_year);
+
     // Multi-file structure, preserved rather than flattened.
     let related_files: Vec<String> = value
         .get("files")
@@ -261,7 +297,27 @@ pub fn normalise_rom(
         verification: ExternalVerification::Unmatched,
         conflicts: Vec::new(),
         evidence,
+        synopsis,
+        genres,
+        players,
+        rating,
+        release_year,
     })
+}
+
+/// A Unix timestamp's calendar year in UTC, bounded to a plausible release
+/// date range. `None` for a timestamp so implausible it is more likely a
+/// provider data error than a real game.
+///
+/// Reuses [`crate::database::format_unix_timestamp_utc`] (the project's one
+/// hand-rolled Unix-timestamp-to-calendar-date routine) rather than a
+/// second implementation of the same civil-calendar math.
+fn unix_seconds_to_year(seconds: i64) -> Option<u16> {
+    let formatted = crate::database::format_unix_timestamp_utc(seconds);
+    let year: i64 = formatted.get(0..4)?.parse().ok()?;
+    u16::try_from(year)
+        .ok()
+        .filter(|&year| (1950..=2100).contains(&year))
 }
 
 /// The path a RomM record describes, exactly as RomM gives it.
@@ -452,4 +508,143 @@ fn string_array(value: &Value, field: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity_source::path_map::{PathMappings, ProviderPathKind};
+    use serde_json::json;
+
+    fn no_mappings() -> PathMappings {
+        PathMappings::validate(&[], &[], ProviderPathKind::ProviderRelative)
+            .expect("an empty mapping set always validates")
+    }
+
+    /// A realistic ROM object, shaped exactly like a real RomM release's
+    /// `/api/roms` response (confirmed against RomM's own `RomSchema`/
+    /// `RomMetadataSchema` source, 2026-08-22): `summary` flat on the ROM
+    /// itself, everything else the enrichment milestone reads nested
+    /// inside `metadatum`, never at the top level.
+    fn rom_with_enrichment() -> serde_json::Value {
+        json!({
+            "id": 42,
+            "platform_id": 7,
+            "platform_slug": "gb",
+            "fs_name": "game.gb",
+            "name": "Example Game",
+            "summary": "A short adventure across five islands.",
+            "metadatum": {
+                "rom_id": 42,
+                "genres": ["Action", "Platformer"],
+                "franchises": [],
+                "collections": [],
+                "companies": ["Example Studio"],
+                "game_modes": [],
+                "age_ratings": [],
+                "player_count": "1-2",
+                // Milliseconds, as RomM's real metadatum actually reports it
+                // (confirmed live against a RomM 5.2.0 instance) - not seconds.
+                "first_release_date": 896_745_600_000_i64, // 1998-06-02T00:00:00Z
+                "average_rating": 87.4,
+            },
+        })
+    }
+
+    #[test]
+    fn enrichment_fields_are_read_from_the_nested_metadatum_object() {
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &rom_with_enrichment(),
+            "server",
+            &no_mappings(),
+            1,
+            &mut report,
+        )
+        .expect("a record with an id normalises");
+
+        assert_eq!(
+            record.synopsis.as_deref(),
+            Some("A short adventure across five islands.")
+        );
+        assert_eq!(record.genres, vec!["Action", "Platformer"]);
+        assert_eq!(record.players.as_deref(), Some("1-2"));
+        assert_eq!(record.rating, Some(87));
+        assert_eq!(record.release_year, Some(1998));
+    }
+
+    #[test]
+    fn a_release_date_taken_from_a_real_live_romm_response_normalises_to_the_correct_year() {
+        // The exact `first_release_date` a live RomM 5.2.0 instance returned
+        // for The Legend of Zelda: Ocarina of Time (rom id 2189, 2026-08-22) -
+        // milliseconds, not seconds. Read as seconds this overflows the
+        // plausible-year range and silently disappears; this test pins the
+        // real value so that regression can't recur unnoticed.
+        let mut value = rom_with_enrichment();
+        value["metadatum"]["first_release_date"] = json!(911_606_400_000_i64);
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.release_year, Some(1998));
+    }
+
+    #[test]
+    fn a_rom_with_no_metadatum_at_all_normalises_with_no_enrichment() {
+        // An older RomM instance, or a game RomM never matched to a
+        // metadata source - not an error, just nothing to enrich with.
+        let mut value = rom_with_enrichment();
+        value.as_object_mut().unwrap().remove("metadatum");
+        value.as_object_mut().unwrap().remove("summary");
+
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+
+        assert_eq!(record.synopsis, None);
+        assert!(record.genres.is_empty());
+        assert_eq!(record.players, None);
+        assert_eq!(record.rating, None);
+        assert_eq!(record.release_year, None);
+        // Identity fields are entirely unaffected by the missing metadatum.
+        assert_eq!(record.title.as_deref(), Some("Example Game"));
+    }
+
+    #[test]
+    fn a_literal_null_string_player_count_from_a_real_live_romm_response_is_treated_as_absent() {
+        // A live RomM 5.2.0 instance returned the four-character JSON string
+        // "null" (not JSON null) for The Legend of Zelda: Majora's Mask's
+        // `player_count`, 2026-08-22 - a provider-side stringification quirk
+        // that must not surface in the UI as the literal text "null".
+        let mut value = rom_with_enrichment();
+        value["metadatum"]["player_count"] = json!("null");
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.players, None);
+    }
+
+    #[test]
+    fn an_out_of_range_rating_is_clamped_not_rejected() {
+        let mut value = rom_with_enrichment();
+        value["metadatum"]["average_rating"] = json!(140.0);
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.rating, Some(100));
+    }
+
+    #[test]
+    fn unix_seconds_to_year_rejects_implausible_timestamps() {
+        assert_eq!(unix_seconds_to_year(896_745_600), Some(1998));
+        assert_eq!(
+            unix_seconds_to_year(0),
+            Some(1970),
+            "1970 is within the plausible release range"
+        );
+        assert_eq!(
+            unix_seconds_to_year(-2_000_000_000),
+            None,
+            "a wildly negative timestamp must not panic or produce a bogus year"
+        );
+    }
 }

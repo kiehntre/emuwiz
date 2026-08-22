@@ -64,6 +64,11 @@ fn romm_record(
         verification,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
     }
 }
 

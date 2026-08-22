@@ -61,7 +61,21 @@ pub const CHEAT_SOURCE_STAGING_FILES_PER_PROVIDER: usize = 1;
 pub const CHEAT_SOURCE_CONCURRENT_OPERATIONS_PER_PROVIDER: usize = 1;
 pub const CHEAT_SOURCE_INACTIVE_STAGING_CLEANUP_LIMIT: usize = 16;
 pub const CHEAT_SOURCE_RETAINED_SNAPSHOTS_MINIMUM: usize = 2;
-const REVISION_RESPONSE_LIMIT: u64 = 64 * 1024;
+/// Raised from 64 KiB (2026-08-22, live-QA Phase 8: a real update failed
+/// with `download_too_large: received at least 67872 bytes, exceeding
+/// configured limit 65536 bytes`). This only bounds the GitHub "get commit"
+/// response used to resolve `master` to an exact SHA - the response body
+/// needed is a single 40-character hex string, but GitHub's commit API
+/// always includes the full commit object (author, message, and a `files`
+/// array of everything the commit touched), which for a frequently-updated
+/// database like libretro-database can exceed 64 KiB on an unremarkable
+/// commit. 64 KiB was never a deliberate byte budget for that payload
+/// shape, just an assumption that broke in practice. 1 MiB gives real
+/// headroom over any observed or plausible commit-object size while
+/// staying two orders of magnitude below `CHEAT_SOURCE_DEFAULT_DOWNLOAD_LIMIT`
+/// (256 MiB, the actual archive download), so the two limits can't be
+/// confused with each other.
+const REVISION_RESPONSE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
