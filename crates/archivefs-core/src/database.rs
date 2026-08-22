@@ -9433,7 +9433,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_rom_is_visible_in_ingestion_stats_without_changing_archive_persistence() {
+    fn loose_rom_is_persisted_as_a_library_archive_with_ingestion_stats_intact() {
         let root = temp_dir("ingestion-loose-rom");
         let source = root.join("roms");
         write_archive_file(&source, "Mario Kart 64.z64", &[0x80, 0x37, 0x12, 0x40]);
@@ -9443,10 +9443,15 @@ mod tests {
 
         let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
 
-        // The old scanner does not persist a loose .z64 as a library
-        // archive - that behaviour is unchanged by this integration.
-        assert_eq!(summary.counts.archives_seen, 0);
-        // The new ingestion pass does see it, and says why it matters.
+        // The .z64 is now registered in `media_registry` as `DirectGameImage`
+        // and is therefore persisted as a library archive row. This is the
+        // intended behaviour change: loose cartridge ROM persistence closes
+        // the gap between source discovery and the existing Library
+        // Organisation planning/apply path.
+        assert_eq!(summary.counts.archives_seen, 1);
+        assert_eq!(summary.counts.archives_added, 1);
+        // The new ingestion pass still sees it as RomCartridge content,
+        // unchanged by the media-registry addition.
         assert_eq!(summary.ingestion_stats.loose_roms, 1);
         assert_eq!(summary.ingestion_stats.unknown, 0);
     }
@@ -9503,7 +9508,90 @@ mod tests {
         assert_eq!(summary.ingestion_stats.amiga_images, 1);
         assert_eq!(summary.ingestion_stats.game_folders, 1);
         assert_eq!(summary.ingestion_stats.unknown, 1);
-        // The old scanner still only persists the zip - unaffected.
+        // Both the .zip and the .z64 are now persisted (the .z64 as
+        // DirectGameImage — the media-registry gap is now closed).
+        assert_eq!(summary.counts.archives_seen, 2);
+    }
+
+    #[test]
+    fn loose_z64_is_scanned_and_persisted_as_direct_game_image() {
+        let root = temp_dir("loose-z64-persist");
+        let source = root.join("roms");
+        write_archive_file(&source, "Mario Kart 64.z64", &[0x80, 0x37, 0x12, 0x40]);
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
         assert_eq!(summary.counts.archives_seen, 1);
+        assert_eq!(summary.counts.archives_added, 1);
+
+        let abs = source.join("Mario Kart 64.z64");
+        let archive_id = database
+            .find_archive_id_by_absolute_path(&abs)
+            .unwrap()
+            .expect("persisted .z64 must be findable");
+        assert!(archive_id > 0);
+    }
+
+    #[test]
+    fn loose_gba_is_scanned_and_persisted_as_direct_game_image() {
+        let root = temp_dir("loose-gba-persist");
+        let source = root.join("roms");
+        write_archive_file(&source, "Pokemon.gba", b"gba dummy rom bytes");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+        assert_eq!(summary.counts.archives_seen, 1);
+        assert_eq!(summary.counts.archives_added, 1);
+
+        let abs = source.join("Pokemon.gba");
+        let archive_id = database
+            .find_archive_id_by_absolute_path(&abs)
+            .unwrap()
+            .expect("persisted .gba must be findable");
+        assert!(archive_id > 0);
+    }
+
+    #[test]
+    fn loose_sfc_persists_with_direct_game_image_kind() {
+        let root = temp_dir("loose-no-mount");
+        let source = root.join("roms");
+        write_archive_file(&source, "Game.sfc", b"snes rom bytes");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        let abs = source.join("Game.sfc");
+        let archive_id = database
+            .find_archive_id_by_absolute_path(&abs)
+            .unwrap()
+            .expect("persisted .sfc must be findable");
+
+        let archives = database.load_archives().unwrap();
+        let archive = archives
+            .iter()
+            .find(|a| a.id == archive_id)
+            .expect("must be a live archive row");
+        assert_eq!(archive.archive_kind, "direct_game_image");
+    }
+
+    #[test]
+    fn still_unrecognized_extensions_do_not_create_archive_rows() {
+        let root = temp_dir("still-unknown-ext");
+        let source = root.join("roms");
+        write_archive_file(&source, "notes.txt", b"not a game");
+        write_archive_file(&source, "game.exe", b"not a game either");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+        // Neither .txt nor .exe is in MEDIA_FORMATS — no archive rows are created.
+        assert_eq!(summary.counts.archives_seen, 0);
     }
 }

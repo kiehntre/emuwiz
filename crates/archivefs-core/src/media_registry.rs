@@ -124,6 +124,85 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "chd",
         kind: ArchiveKind::DirectGameImage,
     },
+    // --- Loose cartridge ROMs ---
+    //
+    // Every entry below is a self-evidencing cartridge-ROM extension whose
+    // platform (e.g. Nintendo 64, Game Boy Advance) needs no corroboration
+    // from folder/source/header evidence to decide *what kind of file* it
+    // is. Which *specific game system* it belongs to remains the platform
+    // registry's decision via strong/weak extension evidence, exactly as
+    // for `.iso`/`.d64`/`.chd` above. These extensions are already
+    // recognised by the ingestion content registry
+    // (`ContentKind::RomCartridge`) and by the per-platform strong-extension
+    // tables in `crate::platform::PLATFORMS`; adding them here lets the
+    // archive scanner persist them as `DirectGameImage` rows so the
+    // existing Library Organisation pipeline can obtain an `archive_id` and
+    // resolve a platform identity.
+    //
+    // Extensions that need corroboration (`.md`, `.bin`, `.gen`) are
+    // deliberately excluded — they stay in `CORROBORATION_CANDIDATE_EXTENSIONS`.
+    // Likewise, `.hdf` and `.smd` are already handled elsewhere and are not
+    // duplicated here.
+    // --- Nintendo 64 ---
+    MediaFormat {
+        extension: "z64",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "n64",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "v64",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Game Boy Advance ---
+    MediaFormat {
+        extension: "gba",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Game Boy / Game Boy Color ---
+    MediaFormat {
+        extension: "gb",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "gbc",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Super Nintendo / Super Famicom ---
+    MediaFormat {
+        extension: "sfc",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "smc",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Nintendo Entertainment System ---
+    MediaFormat {
+        extension: "nes",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "unf",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Nintendo DS ---
+    MediaFormat {
+        extension: "nds",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Sega Master System ---
+    MediaFormat {
+        extension: "sms",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // --- Sega Game Gear ---
+    MediaFormat {
+        extension: "gg",
+        kind: ArchiveKind::DirectGameImage,
+    },
 ];
 
 /// Extensions that never resolve to an [`ArchiveKind`] on their own - they
@@ -209,5 +288,107 @@ mod tests {
     fn an_unrecognised_extension_is_neither_a_kind_nor_watch_relevant() {
         assert_eq!(kind_for_extension("nfo"), None);
         assert!(!is_watch_relevant_extension("nfo"));
+    }
+
+    // --- Loose cartridge-ROM recognition (added for Library Organisation gap) ---
+
+    #[test]
+    fn z64_is_recognized_as_direct_game_image() {
+        assert_eq!(
+            kind_for_extension("z64"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn gba_is_recognized_as_direct_game_image() {
+        assert_eq!(
+            kind_for_extension("gba"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn snes_extensions_are_recognized() {
+        assert_eq!(
+            kind_for_extension("sfc"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            kind_for_extension("smc"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn gb_and_gbc_are_recognized() {
+        assert_eq!(kind_for_extension("gb"), Some(ArchiveKind::DirectGameImage));
+        assert_eq!(
+            kind_for_extension("gbc"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn nes_extensions_are_recognized() {
+        assert_eq!(
+            kind_for_extension("nes"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            kind_for_extension("unf"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn nds_is_recognized_as_direct_game_image() {
+        assert_eq!(
+            kind_for_extension("nds"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn sega_cartridge_extensions_are_recognized() {
+        assert_eq!(
+            kind_for_extension("sms"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(kind_for_extension("gg"), Some(ArchiveKind::DirectGameImage));
+    }
+
+    #[test]
+    fn n64_variants_are_all_recognized() {
+        assert_eq!(
+            kind_for_extension("n64"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            kind_for_extension("v64"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn still_unrecognized_extensions_fail_closed() {
+        // Extensions that are not in MEDIA_FORMATS and not corroboration
+        // candidates must still return None.
+        assert_eq!(kind_for_extension("exe"), None);
+        assert_eq!(kind_for_extension("pdf"), None);
+        assert_eq!(kind_for_extension("txt"), None);
+    }
+
+    #[test]
+    fn corroboration_candidates_are_still_not_self_evidencing() {
+        // `.md`, `.bin`, `.gen` need folder/source/header corroboration and
+        // must never resolve from `kind_for_extension` alone.
+        assert_eq!(kind_for_extension("md"), None);
+        assert_eq!(kind_for_extension("bin"), None);
+        assert_eq!(kind_for_extension("gen"), None);
+        // They are still watch-relevant though.
+        assert!(is_watch_relevant_extension("md"));
+        assert!(is_watch_relevant_extension("bin"));
+        assert!(is_watch_relevant_extension("gen"));
     }
 }
