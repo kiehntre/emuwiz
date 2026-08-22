@@ -753,7 +753,7 @@ fn expanding_the_activity_panel_does_not_compress_its_content() {
             match shape {
                 egui::Shape::Text(text_shape) => {
                     let text = text_shape.galley.text();
-                    if text.starts_with("Activity entry") || text == "Clear activity" {
+                    if text.starts_with("Activity entry") || text == "Clear activity history" {
                         *min_y = min_y.min(text_shape.pos.y);
                         *max_y = max_y.max(text_shape.pos.y + text_shape.galley.size().y);
                     }

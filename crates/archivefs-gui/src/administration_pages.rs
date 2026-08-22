@@ -3915,6 +3915,10 @@ pub(super) struct LoadedViewState<'a> {
     pub(super) library_view_last_plan: Option<&'a (LibraryViewConfig, LibraryViewPlan)>,
     pub(super) recent_scan: Option<&'a RecentScanAdditions>,
     pub(super) recent_view: bool,
+    /// The Library platform strip's search box - narrows the wrapped chip
+    /// list to matching platform names when a library detects dozens of
+    /// distinct platforms. Empty means show every platform.
+    pub(super) library_platform_query: &'a mut String,
 }
 
 pub(super) const REMOVE_MISSING_CANCEL_LABEL: &str = "Cancel";

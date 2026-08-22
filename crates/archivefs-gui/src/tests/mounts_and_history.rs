@@ -744,6 +744,11 @@ fn scan_completion_and_activity_use_every_truthful_non_overlapping_count() {
         folder_errors: vec![(PathBuf::from("/offline"), "unavailable".to_string())],
         platform_assignment_warnings: Vec::new(),
         skipped_files: Vec::new(),
+        ingestion_stats: Default::default(),
+        ingestion_skip_reasons: Default::default(),
+        ingestion_platform_counts: Default::default(),
+        ingestion_skipped: Vec::new(),
+        ingestion_recognised_sample: Vec::new(),
     };
 
     assert_eq!(
@@ -850,6 +855,47 @@ fn skipped_files_window_omits_the_reason_badge_when_already_filtered_to_one_reas
     // is active; what must not render is its *row*.
     assert!(rendered_text_contains(&output, "boxart.png"));
     assert!(!rendered_text_contains(&output, "RESOURCE.GEN"));
+}
+
+/// Phase 1 GUI cleanup: this window used to render its own full copy of
+/// `summary.ingestion_skipped` (badge + filename + suggested action per
+/// row) - exactly what the Collection Discovery panel's "Item details"
+/// section already shows from the same field. It now only points there,
+/// so a person is never shown the same "needs attention" item rendered
+/// two different ways in two different places with no link between them.
+#[test]
+fn skipped_files_window_redirects_to_collection_discovery_instead_of_duplicating_it() {
+    let ingestion_item = archivefs_core::ingestion::GameDiscovery {
+        path: PathBuf::from("Unknown.bin"),
+        container: archivefs_core::ingestion::ContainerKind::DirectFile,
+        content: None,
+        platform_hint: None,
+        identity_candidate: None,
+        validation_state: archivefs_core::ingestion::ValidationState::Skipped,
+        explanation: "test fixture".to_string(),
+        skip_reason: Some(archivefs_core::ingestion::SkipReason::MissingPairedFile),
+    };
+    let summary = ScanPersistSummary {
+        scan_run_id: 1,
+        counts: archivefs_core::ScanRunCounts::default(),
+        folder_errors: Vec::new(),
+        platform_assignment_warnings: Vec::new(),
+        skipped_files: Vec::new(),
+        ingestion_stats: Default::default(),
+        ingestion_skip_reasons: Default::default(),
+        ingestion_platform_counts: Default::default(),
+        ingestion_skipped: vec![ingestion_item],
+        ingestion_recognised_sample: Vec::new(),
+    };
+    let mut open = true;
+    let mut filter = None;
+    let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+
+    assert!(rendered_text_contains(&output, "Collection Discovery"));
+    // The old per-item row (badge + filename + suggested action) must
+    // not be duplicated here now that Collection Discovery owns it.
+    assert!(!rendered_text_contains(&output, "Unknown.bin"));
+    assert!(!rendered_text_contains(&output, "matching .cue/.bin pair"));
 }
 
 #[test]

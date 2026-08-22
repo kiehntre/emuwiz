@@ -50,6 +50,7 @@ fn real_counts() -> IdentityImportCounts {
         with_hashes: 36_000,
         with_artwork: 29_759,
         multi_file: 198,
+        with_game_information: 30_412,
     }
 }
 
@@ -100,6 +101,7 @@ fn snapshot(state: ProviderState, enabled: bool, configured: bool) -> RommSnapsh
         settings: ProviderSettings {
             source: config(enabled, configured),
             page_size: Some(100),
+            import_timeout_seconds: None,
         },
         status,
         artwork: artwork_stats(39, 2_434_474),
@@ -706,6 +708,8 @@ fn import_summary(published: bool, records: usize) -> RommImportSummary {
         unknown_platforms: 0,
         invalid_hashes: 0,
         multi_file_groups: 5,
+        with_game_information: records.saturating_sub(2),
+        game_information_failed: 1,
         pages_fetched: 1,
         elapsed_milliseconds: 612,
         adaptive: None,
@@ -752,6 +756,44 @@ fn a_sample_result_says_plainly_that_nothing_was_published() {
     assert!(
         !rows.contains(&"Published to".to_string()),
         "a sample has no cache path"
+    );
+}
+
+#[test]
+fn a_completed_import_reports_game_information_counts_using_human_wording() {
+    // records = 25, with_game_information = 23 (records - 2, from
+    // import_summary), game_information_failed = 1 - so "not found" must be
+    // the derived 25 - 23 = 2, never a raw internal field name.
+    let summary = import_summary(true, 25);
+    let view = build_result_view(
+        &RommOperation::Refresh,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    let by_label: std::collections::HashMap<String, String> = view
+        .rows
+        .iter()
+        .map(|row| (row.label.clone(), row.value.clone()))
+        .collect();
+    assert_eq!(
+        by_label.get("Game information found").map(String::as_str),
+        Some("23")
+    );
+    assert_eq!(
+        by_label
+            .get("Game information not found")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        by_label.get("Game information failed").map(String::as_str),
+        Some("1")
+    );
+    let labels = by_label.keys().collect::<Vec<_>>();
+    assert!(
+        labels.iter().all(|label| !label.contains("enrichment")),
+        "the result panel must use human wording (\"game information\"), not the internal \
+         term \"enrichment\": {labels:?}"
     );
 }
 
@@ -897,6 +939,49 @@ fn a_failed_import_says_whether_the_old_cache_survived() {
         first.notes.join(" ").contains("no previous cache to lose"),
         "{:?}",
         first.notes
+    );
+}
+
+#[test]
+fn a_detail_request_timeout_gets_its_own_plain_sentence_up_front() {
+    // A bare "RomM did not answer in time" says nothing about what to make
+    // of it. The specific failure code gets a plain, visible sentence
+    // instead - the technical offset/endpoint detail stays in the rows,
+    // behind Technical details.
+    let mut summary = import_summary(false, 0);
+    summary.failure = Some(
+        "`GET /api/roms?limit=100&offset=6800&with_files=true` did not answer within 240 \
+         seconds. Nothing was published and any previous cache is untouched."
+            .to_string(),
+    );
+    summary.failure_code = Some("detail_request_timed_out".to_string());
+    summary.previous_cache_usable = true;
+    let view = build_result_view(
+        &RommOperation::Refresh,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    assert!(!view.succeeded);
+    let visible = view.notes.first().cloned().unwrap_or_default();
+    assert!(
+        visible.contains("RomM took too long to return one catalogue record"),
+        "{visible}"
+    );
+    assert!(
+        visible.contains("untouched and still browsable"),
+        "the visible sentence should still say the cache is safe, not just the offset: {visible}"
+    );
+    assert!(
+        !visible.contains("offset=6800"),
+        "the raw endpoint/offset is technical detail, not the plain sentence: {visible}"
+    );
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.value.contains("offset=6800")),
+        "the endpoint/offset must still be available somewhere (rows, shown behind Technical \
+         details): {:?}",
+        view.rows
     );
 }
 

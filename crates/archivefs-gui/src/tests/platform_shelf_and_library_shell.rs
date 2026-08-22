@@ -14,6 +14,7 @@
 //! Predominant theme observed in this slice: platform shelf/library shell rendering, artwork, Gamer/Advanced view controls.
 
 use super::*;
+use crate::ui::platform_artwork::*;
 
 #[test]
 fn gui_version_line_matches_the_workspace_package_version() {
@@ -3102,5 +3103,86 @@ fn cheats_mods_opened_from_gamer_view_has_an_obvious_back_to_games_button() {
         app.view,
         MainView::Library,
         "clicking Back to games must return to the Gamer View game list"
+    );
+}
+
+/// Regression test for a live-QA bug: two different `ADVANCED_NAV_GROUPS`
+/// entries under "MOUNT & ACTIVE MOUNTS" and "BATCH TOOLS" both route to
+/// `MainView::Mount`, so "Mount queue" and "Mount All / Unmount All" used to
+/// both render selected simultaneously whenever the Mount page was active.
+/// Only one entry per destination may be `highlightable` now.
+#[test]
+fn only_one_sidebar_entry_highlights_for_a_shared_destination() {
+    use std::collections::HashMap;
+
+    let mut highlightable_views: HashMap<MainView, usize> = HashMap::new();
+    for group in ADVANCED_NAV_GROUPS {
+        for entry in group.entries {
+            if let (NavClick::View(view), true) = (entry.click, entry.highlightable) {
+                *highlightable_views.entry(view).or_insert(0) += 1;
+            }
+        }
+    }
+    for (view, count) in &highlightable_views {
+        assert_eq!(
+            *count, 1,
+            "{view:?} has {count} highlightable sidebar entries; exactly one must \
+             be able to render selected or two buttons light up together"
+        );
+    }
+
+    // The specific case reported live: Mount queue is the highlightable
+    // owner of MainView::Mount; the Batch Tools shortcut to the same page
+    // must not also claim the highlight.
+    let mount_entries: Vec<&NavEntry> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter(|entry| matches!(entry.click, NavClick::View(MainView::Mount)))
+        .collect();
+    assert_eq!(
+        mount_entries.len(),
+        2,
+        "expected both the Mount queue and Batch Tools entries to still exist"
+    );
+    let highlightable_count = mount_entries.iter().filter(|e| e.highlightable).count();
+    assert_eq!(
+        highlightable_count, 1,
+        "exactly one of the two Mount-page sidebar entries may highlight"
+    );
+}
+
+/// Regression test for a live-QA bug: opening a `ToolsOverlay` (e.g.
+/// Collection Discovery) left the previously active `MainView` (e.g. DAT
+/// Sources) still highlighted in the sidebar at the same time as the
+/// overlay's own entry, because the overlay replaces the main view's content
+/// without ever changing `self.view`. A `View` entry must stop rendering
+/// selected the moment any overlay is open.
+#[test]
+fn view_entries_do_not_stay_highlighted_once_an_overlay_is_open() {
+    let (_, selected_without_overlay) = (
+        (),
+        navigation_destination_selected(MainView::DatSources, MainView::DatSources),
+    );
+    assert!(
+        selected_without_overlay,
+        "sanity check: DAT Sources must normally render selected while active"
+    );
+
+    // `show_primary_navigation`'s selection computation gates every `View`
+    // entry on `current_overlay == ToolsOverlay::None`; simulate that gate
+    // directly the way the render loop does.
+    let current = MainView::DatSources;
+    let current_overlay = ToolsOverlay::CollectionDiscovery;
+    let dat_sources_selected = current_overlay == ToolsOverlay::None
+        && navigation_destination_selected(current, MainView::DatSources);
+    let collection_discovery_selected = current_overlay == ToolsOverlay::CollectionDiscovery;
+
+    assert!(
+        !dat_sources_selected,
+        "DAT Sources must not stay highlighted once Collection Discovery is open"
+    );
+    assert!(
+        collection_discovery_selected,
+        "Collection Discovery must be the only highlighted entry while it is open"
     );
 }

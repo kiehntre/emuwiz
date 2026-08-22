@@ -130,10 +130,15 @@ pub(crate) struct PlatformChoice {
 
 /// How many choices the picker shows at once.
 ///
-/// The registry is finite (74 today), so this is not protection against an
-/// unbounded list - it is what keeps the picker readable and forces the
-/// search box to be the way you find something, rather than scrolling.
-pub(crate) const MAX_PLATFORM_CHOICES: usize = 12;
+/// Raised from 12 to 100 (2026-08-22, live-QA Phase 7): 12 was tight enough
+/// that on registries approaching it, a person had to search just to see a
+/// platform that was already visible on screen elsewhere in EmuWiz. The
+/// registry is finite (74 today), so 100 already covers it outright with
+/// headroom for growth; this remains a readability bound, not real
+/// unbounded-list protection - the search box (and the bounded scroll area
+/// around the rendered list) is still how someone finds something quickly
+/// once the registry outgrows what fits on screen at once.
+pub(crate) const MAX_PLATFORM_CHOICES: usize = 100;
 
 /// Canonical platforms a source could still be given an exception for.
 ///
@@ -1283,32 +1288,38 @@ fn platform_exception_picker(
             return;
         }
 
-        for choice in &choices {
-            ui.horizontal(|ui| {
-                // Stated per row, because the whole point of the control is
-                // to change it and the user should not have to infer it.
-                ui.label(
-                    egui::RichText::new("Currently used")
-                        .color(widgets::StatusTone::Success.color(ui))
-                        .small(),
-                );
-                if widgets::action_button(
-                    ui,
-                    format!("Stop using for {}", choice.display_name),
-                    widgets::ActionStyle::Secondary,
-                    true,
-                )
-                .clicked()
-                    && action.is_none()
-                {
-                    action = Some(CheatSourcesPageAction::SetPlatformParticipation {
-                        id: row.id.clone(),
-                        platform: choice.id.to_string(),
-                        participating: false,
+        egui::ScrollArea::vertical()
+            .id_salt("cheat_sources_platform_picker")
+            .max_height(280.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for choice in &choices {
+                    ui.horizontal(|ui| {
+                        // Stated per row, because the whole point of the control is
+                        // to change it and the user should not have to infer it.
+                        ui.label(
+                            egui::RichText::new("Currently used")
+                                .color(widgets::StatusTone::Success.color(ui))
+                                .small(),
+                        );
+                        if widgets::action_button(
+                            ui,
+                            format!("Stop using for {}", choice.display_name),
+                            widgets::ActionStyle::Secondary,
+                            true,
+                        )
+                        .clicked()
+                            && action.is_none()
+                        {
+                            action = Some(CheatSourcesPageAction::SetPlatformParticipation {
+                                id: row.id.clone(),
+                                platform: choice.id.to_string(),
+                                participating: false,
+                            });
+                        }
                     });
                 }
             });
-        }
 
         if total > choices.len() {
             ui.label(

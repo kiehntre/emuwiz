@@ -50,6 +50,11 @@ fn record(id: &str, title: &str) -> ExternalIdentityRecord {
         verification: ExternalVerification::StrongExternal,
         conflicts: Vec::new(),
         evidence: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
     }
 }
 

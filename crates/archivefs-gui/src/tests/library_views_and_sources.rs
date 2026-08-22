@@ -109,6 +109,7 @@ fn sources_page_scan_result_inspect_reuses_the_shared_skipped_files_window() {
         scope: SourcesScanScope::One(PathBuf::from("/roms")),
         archives_found: 5,
         skipped_total: 1,
+        ingestion_stats: Default::default(),
     });
     app.show_skipped_files = false;
     app.skipped_files_filter = Some(archivefs_core::SkipReason::AmbiguousPlatform);

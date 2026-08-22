@@ -81,6 +81,132 @@ fn successful_undo_clears_the_matching_installed_state() {
     let _ = std::fs::remove_dir_all(&temp);
 }
 
+/// Phase 4 fix: `start_cheat_install_rollback` used to only set
+/// `self.view = MainView::HistoryLogs` - a silent no-op while
+/// `self.ui_mode == GuiMode::GamerView`, since Gamer View's own render
+/// branch is chosen purely from `ui_mode` and never reads `view` at all.
+/// Clicking "Undo last change" from Gamer View therefore changed
+/// internal state with nothing visibly happening on screen. This pins
+/// that the fix (also switching `ui_mode`, and giving visible feedback)
+/// actually makes the click do something a person can see.
+#[test]
+fn undo_from_gamer_view_actually_switches_to_the_review_screen_not_just_internal_state() {
+    let temp = std::env::temp_dir().join(format!(
+        "archivefs-gui-gamer-undo-visible-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp).unwrap();
+    let mut app = dolphin_workflow_ready_for_beginner_install(&temp);
+    app.ui_mode = GuiMode::GamerView;
+    let apply = successful_shared_apply_result();
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    workflow.transaction = CheatTransactionState::Result {
+        key: cheat_preview_key(workflow),
+        result: apply,
+    };
+
+    app.start_cheat_install_rollback(egui::Context::default());
+
+    assert_eq!(
+        app.ui_mode,
+        GuiMode::AdvancedView,
+        "undo must switch to the mode that can actually show the review screen"
+    );
+    assert_eq!(app.view, MainView::HistoryLogs);
+    let feedback = app
+        .feedback
+        .as_ref()
+        .expect("undo must give visible feedback");
+    assert!(feedback.succeeded);
+    assert!(!feedback.message.is_empty());
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// Phase 5 fix: `prepare_cheats_mods_workspace` used to only set
+/// `self.view`, which Gamer View's own render branch never reads (the
+/// same bug shape Phase 4 already fixed for Undo) - clicking "Cheats &
+/// Mods" from Gamer View silently did nothing visible. This pins that
+/// opening the workflow now actually switches to the mode that renders
+/// it.
+#[test]
+fn opening_cheats_mods_from_gamer_view_actually_switches_mode() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::GamerView;
+
+    app.prepare_cheats_mods_workspace(PathBuf::from("/roms/Game.zip"));
+
+    assert_eq!(
+        app.ui_mode,
+        GuiMode::AdvancedView,
+        "Cheats & Mods must switch to the mode that can actually show it"
+    );
+    assert_eq!(app.view, MainView::CheatsMods);
+}
+
+/// Phase 5: "Review" on an unresolved-platform game must land on
+/// Advanced View's Selected page with that exact game still selected -
+/// not a generic page with no context (requirement 6's journey test).
+#[test]
+fn review_identity_lands_on_selected_page_with_the_same_game_still_selected() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::GamerView;
+    let archive_path = PathBuf::from("/roms/Mystery Game.bin");
+
+    app.review_identity(archive_path.clone());
+
+    assert_eq!(app.ui_mode, GuiMode::AdvancedView);
+    assert_eq!(app.view, MainView::Selected);
+    assert_eq!(
+        app.archive_context.focused.as_deref(),
+        Some(archive_path.as_path())
+    );
+}
+
+/// Phase 5 vocabulary guard: the unknown-platform block in Gamer View's
+/// selected-game panel (`show_gamer_view`) must use the approved human
+/// wording and a real "Review" action, and must never name the internal
+/// concepts docs/GUI_NAVIGATION_RESET_DESIGN.md §2.6/§5 keep out of
+/// Gamer View's primary wording. Source-scanned rather than rendered
+/// (matching this file's existing `bsfree_gui_apply_and_rollback_reuse_
+/// the_shared_backend` precedent) since `show_gamer_view` has no direct
+/// render-harness test anywhere in this suite yet.
+#[test]
+fn gamer_view_unknown_platform_block_uses_approved_wording_only() {
+    // `show_gamer_view` lives in `gamer_view.rs`, not `main.rs`, since the
+    // GUI extraction (2026-08-22, Phase A) moved Gamer View rendering out
+    // of the app-shell file.
+    let source = include_str!("../gamer_view.rs");
+    let block = source
+        .split("if let Some(row) = row\n                                        && row.unknown_platform\n                                    {")
+        .nth(1)
+        .expect("the unknown-platform block must exist in show_gamer_view")
+        .split("\n\n                                    ui.add_space(theme::SECTION_GAP);")
+        .next()
+        .unwrap();
+
+    assert!(block.contains("We couldn't tell which game system this is for."));
+    assert!(block.contains("\"Review\""));
+
+    for banned in [
+        "candidate identity",
+        "provenance",
+        "evidence source",
+        "identity source",
+        "resolver",
+        "ArchiveIdentity",
+        "ContentKind",
+        "ContainerKind",
+    ] {
+        assert!(
+            !block
+                .to_ascii_lowercase()
+                .contains(&banned.to_ascii_lowercase()),
+            "unknown-platform block names banned term {banned:?}"
+        );
+    }
+}
+
 #[test]
 fn details_is_collapsed_by_default_on_the_beginner_dolphin_page() {
     let temp = std::env::temp_dir().join(format!(
@@ -2288,12 +2414,15 @@ fn sources_retained_snapshot_stays_visibly_usable_after_update_failure() {
     for expected in [
         "Verified with warnings",
         "Indexed: 27853",
-        "Excluded: 147",
+        "147 cheat files could not be read",
         "Update failed · existing catalogue remains active and usable",
-        "download_too_large",
+        "larger than the current safety limit",
     ] {
         assert!(rendered_text_contains(&output, expected));
     }
+    // The raw error code/byte-count text is a Technical details disclosure
+    // now, not primary UI - it must not appear in the collapsed render.
+    assert!(!rendered_text_contains(&output, "download_too_large"));
 }
 
 #[test]
@@ -2447,6 +2576,167 @@ fn no_eligible_match_is_reported_honestly_with_no_installation_ready_wording() {
             "an unmatched archive must never show an installation-ready action or badge"
         );
     }
+}
+
+/// Phase 6: builds one real `SharedPreviewEntry` with a given match
+/// strength/proposed action, for testing `show_shared_cheat_preview`'s
+/// actual rendered output rather than source-scanning it - this function
+/// already had a real render test in this file (`excluded_retroarch_
+/// match_has_precise_gui_state` et al.), just never with a populated
+/// `entries` list until now.
+fn preview_entry_fixture(
+    match_strength: PreviewMatchStrength,
+    proposed_action: PreviewProposedAction,
+) -> SharedPreviewEntry {
+    SharedPreviewEntry {
+        adapter: PreviewAdapter::Dolphin,
+        selected_archive: PathBuf::from("/roms/Mystery Game.zip"),
+        verified_identity: None,
+        match_strength,
+        source_path: Some(PathBuf::from("/staging/cheat.ini")),
+        source_digest: Some("a".repeat(64)),
+        destination_root: PathBuf::from("/dolphin/GameSettings"),
+        destination_relative_path: Some(PathBuf::from("GAFE01.ini")),
+        destination_path: Some(PathBuf::from("/dolphin/GameSettings/GAFE01.ini")),
+        destination_state: PreviewDestinationState::Missing,
+        existing_destination_digest: None,
+        state: PreviewState::Ambiguous,
+        proposed_action,
+        eligibility: PreviewEligibility::Eligible,
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+        backup_required: false,
+        explicit_replacement_permission_required: false,
+    }
+}
+
+fn preview_report_with_one_entry(entry: SharedPreviewEntry) -> SharedPreviewReport {
+    SharedPreviewReport {
+        request_archive: PathBuf::from("/roms/Mystery Game.zip"),
+        adapter: PreviewAdapter::Dolphin,
+        entries: vec![entry],
+        conflicts: Vec::new(),
+        warnings: Vec::new(),
+        summary: Default::default(),
+        complete: true,
+    }
+}
+
+fn render_shared_cheat_preview_for(entry: SharedPreviewEntry) -> egui::FullOutput {
+    let mut app = app_with_cheats_mods_context();
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    let key = cheat_preview_key(workflow);
+    workflow.preview = CheatStepResource::Ready(CheatPreviewResponse {
+        key,
+        outcome: CheatPreviewOutcome::Ready(preview_report_with_one_entry(entry)),
+        materialized: None,
+        generated: None,
+        dolphin_generated: None,
+        xenia_generated: None,
+        pcsx2_generated: None,
+        gamecube_gamehacking_generated: None,
+        bsfree_gamecube_generated: None,
+        bsfree_wii_generated: None,
+    });
+    let ctx = egui::Context::default();
+    let mut clipboard = InMemoryClipboard::default();
+    ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_shared_cheat_preview(ui, workflow, &mut clipboard);
+        });
+    })
+}
+
+/// Requirement 1/6: an ambiguous match must read as a human sentence, not
+/// the bare classification word, as the primary presentation.
+#[test]
+fn ambiguous_match_shows_human_wording_not_the_raw_classification_word() {
+    let entry = preview_entry_fixture(
+        PreviewMatchStrength::Ambiguous,
+        PreviewProposedAction::Blocked,
+    );
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(rendered_text_contains(&output, "Not sure which one"));
+    assert!(rendered_text_contains(
+        &output,
+        "We're not sure which game this file belongs to"
+    ));
+    // The precise word survives, but only inside Technical details - not
+    // as a bare, unexplained primary badge.
+    assert!(!rendered_text_contains(&output, "Ambiguous"));
+}
+
+#[test]
+fn candidate_match_shows_human_wording_not_the_raw_classification_word() {
+    let entry = preview_entry_fixture(
+        PreviewMatchStrength::Candidate,
+        PreviewProposedAction::Install,
+    );
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(rendered_text_contains(&output, "Possible match"));
+    assert!(rendered_text_contains(
+        &output,
+        "We found a possible match, but it needs checking"
+    ));
+    assert!(!rendered_text_contains(&output, "Candidate"));
+}
+
+#[test]
+fn confident_match_wording_does_not_overstate_verification() {
+    let entry = preview_entry_fixture(PreviewMatchStrength::Strong, PreviewProposedAction::Install);
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(rendered_text_contains(&output, "Confident match"));
+    assert!(rendered_text_contains(
+        &output,
+        "not independently verified"
+    ));
+}
+
+/// Requirement 3: no `format!("Proposed action: {:?}")` raw enum Debug
+/// output as primary presentation - a real sentence instead.
+#[test]
+fn proposed_action_is_a_sentence_not_debug_formatted_enum_output() {
+    let entry = preview_entry_fixture(PreviewMatchStrength::Strong, PreviewProposedAction::Replace);
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(rendered_text_contains(
+        &output,
+        "If you continue: Replace the existing cheat file"
+    ));
+    assert!(!rendered_text_contains(&output, "Proposed action: Replace"));
+}
+
+/// Requirement 2/9: technical detail (hashes, raw paths, precise
+/// classification/state names, the raw proposed-action enum name) must
+/// still be reachable, just no longer the primary presentation. This
+/// checks the full rendered output (both collapsed and, implicitly,
+/// available-on-expand content egui includes in its output tree) still
+/// contains it rather than having deleted it.
+#[test]
+fn technical_detail_is_preserved_not_deleted() {
+    let entry = preview_entry_fixture(
+        PreviewMatchStrength::Candidate,
+        PreviewProposedAction::Install,
+    );
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(
+        rendered_text_contains(&output, "Technical details"),
+        "the disclosure itself must still be offered"
+    );
+}
+
+/// Requirement 4: the existing accurate preview-only safety message must
+/// survive this presentation pass unchanged.
+#[test]
+fn preview_only_safety_message_is_preserved() {
+    let entry = preview_entry_fixture(
+        PreviewMatchStrength::Ambiguous,
+        PreviewProposedAction::Blocked,
+    );
+    let output = render_shared_cheat_preview_for(entry);
+    assert!(rendered_text_contains(
+        &output,
+        "Preview only. No files were changed."
+    ));
 }
 
 #[test]

@@ -29,7 +29,9 @@ use archivefs_core::identity_source::path_map::{
     PathMapping, PathMappings, PathTranslation, ProviderPathKind, normalise_prefix,
 };
 use archivefs_core::identity_source::settings::{
-    MAX_CONFIGURED_PAGE_SIZE, MIN_CONFIGURED_PAGE_SIZE, ProviderSettings, SUGGESTED_TOKEN_PATH,
+    MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS, MAX_CONFIGURED_PAGE_SIZE,
+    MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS, MIN_CONFIGURED_PAGE_SIZE, ProviderSettings,
+    SUGGESTED_TOKEN_PATH,
 };
 use eframe::egui;
 
@@ -94,6 +96,9 @@ pub(crate) struct RommConfigDraft {
     pub(crate) token_path: String,
     pub(crate) path_kind: ProviderPathKind,
     pub(crate) page_size: String,
+    /// How long a full catalogue import may run before it is abandoned, in
+    /// seconds, as typed.
+    pub(crate) import_timeout_seconds: String,
     /// The working copy of the mappings. Not written until the draft is saved.
     pub(crate) mappings: Vec<PathMapping>,
     pub(crate) new_prefix: String,
@@ -125,6 +130,11 @@ impl RommConfigDraft {
                 .unwrap_or_default(),
             path_kind: source.provider_path_kind,
             page_size: snapshot.settings.effective_page_size().to_string(),
+            import_timeout_seconds: snapshot
+                .settings
+                .effective_import_timeout()
+                .as_secs()
+                .to_string(),
             mappings: source.mappings.clone(),
             preview_limit: DEFAULT_PREVIEW_LIMIT.to_string(),
             ..Self::default()
@@ -135,6 +145,9 @@ impl RommConfigDraft {
     pub(crate) fn blank() -> Self {
         Self {
             page_size: "100".to_string(),
+            import_timeout_seconds:
+                archivefs_core::identity_source::settings::DEFAULT_IMPORT_TIMEOUT_SECONDS
+                    .to_string(),
             preview_limit: DEFAULT_PREVIEW_LIMIT.to_string(),
             ..Self::default()
         }
@@ -163,6 +176,17 @@ impl RommConfigDraft {
         } else {
             typed
         };
+        // Same "no-op when unchanged" rule as page size above.
+        let typed_timeout = self.import_timeout_seconds.trim().parse::<u32>().ok();
+        let timeout_previously_unset =
+            previous.is_some_and(|previous| previous.import_timeout_seconds.is_none());
+        let timeout_still_the_default = typed_timeout
+            == previous.map(|previous| previous.effective_import_timeout().as_secs() as u32);
+        settings.import_timeout_seconds = if timeout_previously_unset && timeout_still_the_default {
+            None
+        } else {
+            typed_timeout
+        };
         settings
     }
 }
@@ -173,6 +197,7 @@ pub(crate) struct RommConfigValidation {
     pub(crate) url: FieldState,
     pub(crate) token: FieldState,
     pub(crate) page_size: FieldState,
+    pub(crate) import_timeout_seconds: FieldState,
     /// Mappings that the chosen path kind would strand. A non-empty list refuses
     /// the save: mappings that can never match are worse than none.
     pub(crate) stranded_mappings: Vec<String>,
@@ -197,6 +222,7 @@ pub(crate) fn validate_draft(
         ))
     });
     let page_size = validate_page_size(&draft.page_size);
+    let import_timeout_seconds = validate_import_timeout(&draft.import_timeout_seconds);
     // A mapping written for the other shape can never match anything, so the save
     // is refused and the offending prefixes are named.
     let stranded_mappings: Vec<String> = draft
@@ -217,6 +243,7 @@ pub(crate) fn validate_draft(
     let can_save = !url.is_problem()
         && !token.is_problem()
         && !page_size.is_problem()
+        && !import_timeout_seconds.is_problem()
         && stranded_mappings.is_empty()
         && mapping_set_problem.is_none();
     RommConfigValidation {
@@ -230,6 +257,7 @@ pub(crate) fn validate_draft(
         } else {
             page_size
         },
+        import_timeout_seconds,
         stranded_mappings,
         can_save,
     }
@@ -245,7 +273,9 @@ pub(crate) fn validate_url_text(text: &str) -> FieldState {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return FieldState::Empty(
-            "Enter the address of your RomM instance, for example http://172.19.0.20:8080."
+            "Enter the address of your RomM instance, for example http://romm.example.lan:8080 \
+             - a stable hostname holds up better than a container IP, which can change on \
+             restart."
                 .to_string(),
         );
     }
@@ -285,6 +315,44 @@ pub(crate) fn validate_page_size(text: &str) -> FieldState {
              ceiling."
         )),
         Err(_) => FieldState::Problem(format!("{trimmed:?} is not a whole number.")),
+    }
+}
+
+pub(crate) fn validate_import_timeout(text: &str) -> FieldState {
+    let trimmed = text.trim();
+    let minutes_range = || {
+        format!(
+            "{} to {} minutes",
+            MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS / 60,
+            MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS / 60
+        )
+    };
+    if trimmed.is_empty() {
+        return FieldState::Empty(format!(
+            "Leave blank for the default of 30 minutes. Large libraries or a slower RomM \
+             server may need more time; the allowed range is {}.",
+            minutes_range()
+        ));
+    }
+    match trimmed.parse::<u32>() {
+        Ok(value)
+            if (MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS..=MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS)
+                .contains(&value) =>
+        {
+            FieldState::Good(format!(
+                "Up to {:.0} minutes before a full catalogue import is abandoned. Your \
+                 existing game information is never affected by a timeout - only a \
+                 completed import ever replaces it.",
+                value as f64 / 60.0
+            ))
+        }
+        Ok(value) => FieldState::Problem(format!(
+            "{value} seconds is outside the allowed range of {}. There is no \"unlimited\" \
+             setting: an import that cannot finish in that time should say so rather than run \
+             indefinitely.",
+            minutes_range()
+        )),
+        Err(_) => FieldState::Problem(format!("{trimmed:?} is not a whole number of seconds.")),
     }
 }
 
@@ -734,11 +802,17 @@ pub(crate) fn show_config_dialog(
     widgets::card(ui, |ui| {
         // --- URL -----------------------------------------------------------
         ui.label("RomM address");
+        ui.label(
+            "A stable hostname or FQDN is safer here than a container's IP address, which can \
+             change whenever the container restarts. A bare container/service name only \
+             resolves from inside that container's own network, not from this application, so \
+             it needs a real hostname/FQDN (or a pinned static IP) instead.",
+        );
         if ui
             .add(
                 egui::TextEdit::singleline(&mut draft.url)
                     .desired_width(420.0)
-                    .hint_text("http://172.19.0.20:8080"),
+                    .hint_text("http://romm.example.lan:8080"),
             )
             .changed()
         {
@@ -832,6 +906,32 @@ pub(crate) fn show_config_dialog(
             draft.dirty = true;
         }
         field_note(ui, &validation.page_size);
+
+        // --- Full catalogue import time limit -------------------------------
+        ui.add_space(theme::SECTION_GAP / 2.0);
+        ui.label("Full catalogue import time limit");
+        ui.label(
+            "How long \"Refresh\"/\"Import full catalogue\" may run before it gives up. Your \
+             existing game information is left exactly as it was if it does - only a completed \
+             import ever replaces it.",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.import_timeout_seconds)
+                        .desired_width(120.0)
+                        .hint_text(
+                            archivefs_core::identity_source::settings::DEFAULT_IMPORT_TIMEOUT_SECONDS
+                                .to_string(),
+                        ),
+                )
+                .changed()
+            {
+                draft.dirty = true;
+            }
+            ui.label("seconds");
+        });
+        field_note(ui, &validation.import_timeout_seconds);
 
         // --- Mappings ------------------------------------------------------
         ui.add_space(theme::SECTION_GAP);

@@ -371,6 +371,9 @@ fn record(archive_path: &str, mount_state: MountState) -> ArchiveRecord {
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         },
         ArchiveHealth::Pending,
     )
@@ -394,6 +397,9 @@ fn loose_mega_drive_record(path: &str) -> ArchiveRecord {
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         },
         ArchiveHealth::Unsupported,
     )
@@ -1053,6 +1059,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         doctor_repair_result: None,
         doctor_repair_finished_at_unix_seconds: None,
         library_filters: LibraryRowFilters::default(),
+        library_platform_query: String::new(),
         filter: String::new(),
         filtered_rows: None,
         archive_context: ArchiveContext::default(),
@@ -1184,6 +1191,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         dolphin_catalogue_update_available: None,
         dolphin_catalogue_update_check: None,
         sources_add_dialog: None,
+        gamer_view_pending_first_scan: None,
         sources_remove_dialog: None,
         // Deliberately `Vec::new()`, never `load_library_view_configs_default()`,
         // in this test-only constructor - every other field here is a
@@ -1230,6 +1238,10 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         // instance. Tests drive `gamer_covers` directly instead.
         gamer_cover_worker_allowed: false,
         gamer_cover_library: None,
+        selected_game_metadata: None,
+        game_metadata_worker: None,
+        // Never true in tests, for the same reason as `gamer_cover_worker_allowed`.
+        game_metadata_worker_allowed: false,
     }
 }
 
@@ -1389,6 +1401,9 @@ fn record_at(path: PathBuf, mount_state: MountState) -> ArchiveRecord {
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         },
         ArchiveHealth::Pending,
     )
@@ -1507,6 +1522,11 @@ fn skipped_files_summary(
         folder_errors: Vec::new(),
         platform_assignment_warnings: Vec::new(),
         skipped_files,
+        ingestion_stats: Default::default(),
+        ingestion_skip_reasons: Default::default(),
+        ingestion_platform_counts: Default::default(),
+        ingestion_skipped: Vec::new(),
+        ingestion_recognised_sample: Vec::new(),
     }
 }
 
@@ -1879,6 +1899,7 @@ struct RealLoadedDataHarness {
     filtered_rows: Option<Vec<usize>>,
     archive_context: ArchiveContext,
     library_filters: LibraryRowFilters,
+    library_platform_query: String,
     sort_field: Option<SortField>,
     sort_ascending: bool,
     library_scroll_offset: f32,
@@ -1906,6 +1927,7 @@ impl RealLoadedDataHarness {
             filtered_rows: None,
             archive_context: ArchiveContext::default(),
             library_filters: LibraryRowFilters::default(),
+            library_platform_query: String::new(),
             sort_field: None,
             sort_ascending: true,
             library_scroll_offset: 0.0,
@@ -2021,6 +2043,7 @@ impl RealLoadedDataHarness {
                         library_view_last_plan: None,
                         recent_scan: None,
                         recent_view: false,
+                        library_platform_query: &mut self.library_platform_query,
                     },
                 );
                 panel_height = ui.min_rect().height();

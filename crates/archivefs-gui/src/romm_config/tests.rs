@@ -78,6 +78,7 @@ fn snapshot(configured: bool, kind: ProviderPathKind, mappings: Vec<PathMapping>
                     .then(|| PathBuf::from("/home/user/.config/archivefs/romm-token")),
             },
             page_size: Some(100),
+            import_timeout_seconds: None,
         },
         status: ProviderStatus::not_configured(IdentityProvider::Romm),
         artwork: ArtworkCacheStats {
@@ -215,7 +216,7 @@ fn an_empty_url_is_not_yet_a_problem_but_cannot_be_saved() {
         "an empty field is not an error to shout about"
     );
     assert!(
-        state.message().contains("172.19.0.20"),
+        state.message().contains("http://"),
         "it should show the shape wanted"
     );
 }
@@ -271,6 +272,92 @@ fn the_page_size_is_bounded_and_explains_why() {
     assert!(validate_page_size("1").is_problem());
     assert!(validate_page_size("many").is_problem());
     assert!(matches!(validate_page_size(""), FieldState::Empty(_)));
+}
+
+// --- Full catalogue import time limit --------------------------------------
+
+#[test]
+fn the_import_timeout_is_bounded_and_explains_why() {
+    assert!(matches!(
+        validate_import_timeout("1800"),
+        FieldState::Good(_)
+    ));
+    assert!(matches!(
+        validate_import_timeout(&MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS.to_string()),
+        FieldState::Good(_)
+    ));
+    assert!(matches!(
+        validate_import_timeout(&MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS.to_string()),
+        FieldState::Good(_)
+    ));
+    let too_long =
+        validate_import_timeout(&(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS + 1).to_string());
+    assert!(too_long.is_problem());
+    assert!(
+        too_long.message().contains("unlimited"),
+        "there must be no way to read this as offering an unlimited setting: {}",
+        too_long.message()
+    );
+    let too_short =
+        validate_import_timeout(&(MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS - 1).to_string());
+    assert!(too_short.is_problem());
+    assert!(validate_import_timeout("soon").is_problem());
+    assert!(matches!(validate_import_timeout(""), FieldState::Empty(_)));
+}
+
+#[test]
+fn a_good_import_timeout_names_minutes_and_says_the_cache_is_safe() {
+    let good = validate_import_timeout("1800");
+    assert!(
+        good.message().contains("30 minutes"),
+        "the value should be shown in a unit a person thinks in, not just raw seconds: {}",
+        good.message()
+    );
+    assert!(
+        good.message().contains("never affected"),
+        "it should say plainly that a timeout cannot damage existing game information: {}",
+        good.message()
+    );
+}
+
+#[test]
+fn an_import_timeout_that_was_never_set_stays_unset_when_it_is_not_changed() {
+    let previous = ProviderSettings {
+        source: RommSourceConfig {
+            enabled: true,
+            url: "http://172.19.0.20:8080".to_string(),
+            mappings: Vec::new(),
+            provider_path_kind: ProviderPathKind::ProviderRelative,
+            token_path: None,
+        },
+        page_size: None,
+        import_timeout_seconds: None,
+    };
+    let draft = RommConfigDraft {
+        url: "http://172.19.0.20:8080".to_string(),
+        import_timeout_seconds: previous.effective_import_timeout().as_secs().to_string(),
+        path_kind: ProviderPathKind::ProviderRelative,
+        ..RommConfigDraft::blank()
+    };
+    assert_eq!(
+        draft.to_settings(Some(&previous)).import_timeout_seconds,
+        None,
+        "an untouched default must stay unset"
+    );
+
+    let mut changed = draft.clone();
+    changed.import_timeout_seconds = "900".to_string();
+    assert_eq!(
+        changed.to_settings(Some(&previous)).import_timeout_seconds,
+        Some(900)
+    );
+
+    let mut explicit = previous.clone();
+    explicit.import_timeout_seconds = Some(1800);
+    assert_eq!(
+        draft.to_settings(Some(&explicit)).import_timeout_seconds,
+        Some(1800)
+    );
 }
 
 // --- Token file -----------------------------------------------------------
@@ -474,6 +561,7 @@ fn a_page_size_that_was_never_set_stays_unset_when_it_is_not_changed() {
             token_path: None,
         },
         page_size: None,
+        import_timeout_seconds: None,
     };
     let draft = RommConfigDraft {
         url: "http://172.19.0.20:8080".to_string(),
@@ -511,6 +599,7 @@ fn to_settings_keeps_fields_the_dialog_does_not_edit() {
             token_path: None,
         },
         page_size: Some(50),
+        import_timeout_seconds: None,
     };
     let draft = RommConfigDraft {
         url: "http://172.19.0.20:8080".to_string(),
@@ -1219,4 +1308,36 @@ fn the_dialog_draws_the_mapping_and_the_path_shape_choices() {
         "/romm/library/snes/game.zip"
     ));
     assert!(rendered_text_contains(&output, "Path mappings"));
+}
+
+#[test]
+fn the_url_field_steers_towards_a_stable_hostname_over_a_container_ip() {
+    // Found in live validation: the app's own hint text used to model the
+    // exact anti-pattern (a container IP) that later drifted and broke the
+    // configured connection. The caption must now say so, and the hint
+    // itself must no longer be an IP literal.
+    let tree = Tree::new("render-hostname-caption");
+    let mut draft = RommConfigDraft::blank();
+    let validation = validate_draft(&draft, None, &tree.roots());
+    let mappings = build_mappings_view(&draft.mappings, draft.path_kind, &tree.roots());
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_config_dialog(
+                ui,
+                &mut draft,
+                &ConfigDialogInputs {
+                    validation: &validation,
+                    mappings: &mappings,
+                    preview: None,
+                    previous: None,
+                    busy: false,
+                    preview_running: false,
+                },
+                &mut NoClipboard,
+            );
+        });
+    });
+    assert!(rendered_text_contains(&output, "stable hostname"));
+    assert!(rendered_text_contains(&output, "container"));
 }

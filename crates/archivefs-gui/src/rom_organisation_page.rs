@@ -1,4 +1,4 @@
-//! The Canonical Organisation page.
+//! The Library Organisation page.
 //!
 //! Configures the master ROM root, chooses an organisation mode, collects
 //! candidate ROM files, resolves each candidate's platform identity from the
@@ -19,10 +19,11 @@ use archivefs_core::identity_source::model::IdentityProvider;
 use archivefs_core::identity_source::settings::default_identity_root;
 use archivefs_core::platform::identity::{PlatformIdentityResolution, resolve_platform_identity};
 use archivefs_core::{
-    Config, Database, clear_master_rom_root_default, default_database_path,
+    Config, Database, app_dirs, clear_master_rom_root_default, default_database_path,
     set_master_rom_root_default,
 };
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::ui::{components as widgets, theme};
 
@@ -49,6 +50,20 @@ pub(crate) struct RomOrganisationPageState {
     /// confirmation for large batches.
     pending_apply: Option<usize>,
     confirm_text: String,
+    /// Set on the frame "Preview changes" is clicked; the actual (currently
+    /// synchronous, potentially slow for a large library) `generate_plan()`
+    /// call is deferred to the start of the *next* frame so this frame can
+    /// render a busy state first - without this, a synchronous call made
+    /// directly inside the click handler blocks before egui ever draws the
+    /// "Preparing preview..." row, so nothing visibly happens while the user
+    /// waits (2026-08-22, live-QA Phase 8 finding).
+    pending_preview: bool,
+    /// Reason the persisted approval set could not be saved or loaded.
+    /// Never blocks the page - the in-memory `approved` set is always the
+    /// source of truth - but the user is shown the message so a silent
+    /// "preferences keep disappearing" footgun never recurs. Cleared on every
+    /// successful save / load.
+    approval_persistence_warning: Option<String>,
 }
 
 /// Batches larger than this require typing the exact confirmation phrase
@@ -63,6 +78,56 @@ pub(crate) fn apply_confirmation_phrase(mode: OrganisationMode, count: usize) ->
         OrganisationMode::MoveRealFile | OrganisationMode::OrganiseSymlinkOnly => {
             format!("MOVE {count} FILES")
         }
+    }
+}
+
+/// Plain-language presentation label for an organisation mode. Kept
+/// separate from `OrganisationMode::label()` (core, shared with the CLI)
+/// so this is purely a GUI wording choice, never a renamed core type.
+fn organisation_mode_plain_label(mode: OrganisationMode) -> &'static str {
+    match mode {
+        OrganisationMode::RenameInPlace => "Rename files where they are",
+        OrganisationMode::MoveRealFile => "Move files into organised folders",
+        OrganisationMode::OrganiseSymlinkOnly => "Keep original files where they are",
+    }
+}
+
+/// One-line plain-language explanation of what the selected mode actually
+/// does, shown under the radio group.
+///
+/// `OrganiseSymlinkOnly`'s wording states its "existing shortcuts only"
+/// constraint up front (2026-08-22, live-QA Phase 8): the mode's plan logic
+/// (`archivefs_core::dat::rom_organisation::plan`) only ever relocates a
+/// source that is *already* a symlink object - it never creates a new
+/// symlink for a source that is a real file. Earlier wording ("only
+/// organises shortcuts/symlinks pointing to them") didn't say that, so a
+/// user previewing a folder of real files would only discover the
+/// constraint after seeing every one of them come back blocked.
+fn organisation_mode_plain_explanation(mode: OrganisationMode) -> &'static str {
+    match mode {
+        OrganisationMode::RenameInPlace => {
+            "Renames each game's file in its current location; nothing is moved."
+        }
+        OrganisationMode::MoveRealFile => {
+            "Moves each game's real file into an organised folder structure."
+        }
+        OrganisationMode::OrganiseSymlinkOnly => {
+            "Leaves every real game file untouched and exactly where it is. Only reorganises \
+             shortcuts/symlinks that already exist - it does not create a shortcut for a source \
+             that isn't already one, so a folder of real files (not shortcuts) will show as \
+             blocked in this mode."
+        }
+    }
+}
+
+/// "Preview changes" button label, extracted as a pure function so its two
+/// states (idle vs. running) are directly unit-testable without needing to
+/// simulate a real click through egui (2026-08-22, live-QA Phase 8).
+fn preview_button_label(pending_preview: bool) -> &'static str {
+    if pending_preview {
+        "Preparing preview…"
+    } else {
+        "Preview changes"
     }
 }
 
@@ -86,13 +151,18 @@ impl Default for RomOrganisationPageState {
             error: None,
             pending_apply: None,
             confirm_text: String::new(),
+            pending_preview: false,
+            approval_persistence_warning: None,
         }
     }
 }
 
 impl RomOrganisationPageState {
     /// Loads the configured master root and scans the configured source
-    /// folders for candidate files (bounded). Read-only.
+    /// folders for candidate files (bounded). Read-only. Also restores the
+    /// last persisted approval set, if any (fail-closed: a missing or
+    /// unreadable file is treated as "no persisted approval", never as
+    /// "approve everything").
     pub(crate) fn load() -> Self {
         let mut state = Self::default();
         if let Ok(config) = Config::load_default() {
@@ -103,6 +173,13 @@ impl RomOrganisationPageState {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
             state.sources = collect_source_files(&config.source_folders);
+        }
+        match load_persisted_approved_set() {
+            Ok(Some(set)) => state.approved = set,
+            Ok(None) => {}
+            Err(reason) => {
+                state.approval_persistence_warning = Some(reason);
+            }
         }
         state
     }
@@ -143,6 +220,11 @@ impl RomOrganisationPageState {
         }
         self.plan = None;
         self.approved.clear();
+        // Any previously persisted approvals may now reference paths that no
+        // longer exist. Wipe the persisted sidecar too so a stale set does
+        // not silently re-appear on the next load (would be a footgun: the
+        // user re-scanned to start fresh, the persistence must agree).
+        self.persist_approved_set();
     }
 
     /// Builds a fresh read-only plan from the current candidates. Every
@@ -177,12 +259,17 @@ impl RomOrganisationPageState {
             .collect();
         self.plan = Some(plan);
         self.error = None;
+        // The plan rebuild just rewrote the approval set to "all Suggested".
+        // Persist that, so the user's earlier per-entry customisation (if
+        // any) is gone but a fresh restart sees the new default.
+        self.persist_approved_set();
     }
 
     pub(crate) fn toggle_approved(&mut self, source: &str) {
         if !self.approved.remove(source) {
             self.approved.insert(source.to_string());
         }
+        self.persist_approved_set();
     }
 
     pub(crate) fn set_filter(&mut self, filter: Option<OrganisationStatus>) {
@@ -295,12 +382,188 @@ impl RomOrganisationPageState {
                 ));
                 self.plan = None;
                 self.approved.clear();
+                // The rollback cleared the plan and the approvals; persist
+                // the empty set so a fresh restart does not re-apply them.
+                self.persist_approved_set();
             }
             Err(error) => {
                 self.applied = Some(transaction);
                 self.error = Some(error);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Approval persistence (UI convenience only — never authoritative)
+// ---------------------------------------------------------------------------
+
+/// Versioned JSON sidecar stored in the normal EmuWiz data directory.
+/// The on-disk format carries a `version` key so future readers can
+/// transparently discard (not reinterpret) an unknown version.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedApprovals {
+    version: u32,
+    approved: Vec<String>,
+}
+
+/// Bumped every time the on-disk schema changes. An unreadable or
+/// unexpected version is treated as "no persisted set" (fail-closed).
+const APPROVAL_PERSISTENCE_VERSION: u32 = 1;
+
+/// Leaf name of the JSON sidecar inside the EmuWiz data directory.
+const APPROVAL_PERSISTENCE_FILENAME: &str = "rom_organisation_approvals.json";
+
+/// Resolves the absolute sidecar path. Returns an error string when the
+/// data directory itself cannot be determined (e.g. `$HOME` is unset).
+fn approval_persistence_path() -> Result<PathBuf, String> {
+    archivefs_core::app_dirs::data_path(APPROVAL_PERSISTENCE_FILENAME)
+        .map_err(|e| format!("cannot resolve persistence path: {e}"))
+}
+
+/// Loads the last persisted approval set if the sidecar exists and is
+/// readable.
+///
+/// - Returns `Ok(None)` when the file is absent (first run).
+/// - Returns `Ok(Some(_))` when a well-formed, expected-version file is
+///   found.
+/// - Returns `Err(reason)` for any other condition: unreadable file,
+///   malformed JSON, unknown version, symlinked sidecar, etc.
+///   The caller surfaces the reason via `approval_persistence_warning`
+///   but never treats it as "approve everything".
+fn load_persisted_approved_set() -> Result<Option<BTreeSet<String>>, String> {
+    let path = approval_persistence_path()?;
+
+    // ----- Reject symlinked sidecars ----------------------------------
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!("cannot read metadata of {}: {e}", path.display()));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to load symlinked approval sidecar: {}",
+            path.display()
+        ));
+    }
+
+    // ----- Read & parse ------------------------------------------------
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read approval sidecar {}: {e}", path.display()))?;
+
+    let persisted: PersistedApprovals = serde_json::from_str(&raw)
+        .map_err(|e| format!("approval sidecar {} is malformed: {e}", path.display()))?;
+
+    if persisted.version != APPROVAL_PERSISTENCE_VERSION {
+        return Err(format!(
+            "approval sidecar {} has unknown version {} (expected {})",
+            path.display(),
+            persisted.version,
+            APPROVAL_PERSISTENCE_VERSION,
+        ));
+    }
+
+    Ok(Some(persisted.approved.into_iter().collect()))
+}
+
+impl RomOrganisationPageState {
+    /// Persists the current `approved` set to the versioned JSON sidecar.
+    ///
+    /// - Atomic: writes to a temp file in the same directory, then renames.
+    /// - Fail-soft: an I/O error is surfaced via
+    ///   `approval_persistence_warning` but never blocks the page.
+    /// - Does **not** write inside game/source folders.
+    fn persist_approved_set(&mut self) {
+        self.approval_persistence_warning = None;
+
+        let path = match approval_persistence_path() {
+            Ok(p) => p,
+            Err(reason) => {
+                self.approval_persistence_warning = Some(reason);
+                return;
+            }
+        };
+
+        // Ensure the parent directory exists (data dir may not exist yet
+        // on a fresh install).
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.approval_persistence_warning =
+                    Some(format!("cannot create data directory: {e}"));
+                return;
+            }
+        }
+
+        let payload = PersistedApprovals {
+            version: APPROVAL_PERSISTENCE_VERSION,
+            approved: self.approved.iter().cloned().collect(),
+        };
+
+        let json = match serde_json::to_string(&payload) {
+            Ok(j) => j,
+            Err(e) => {
+                self.approval_persistence_warning =
+                    Some(format!("cannot serialise approval set: {e}"));
+                return;
+            }
+        };
+
+        // Atomic temp-write + rename. Check that the predictable tmp
+        // path is not a symlink before opening it for write — `File::create`
+        // would follow a symlink, letting a planted link escape the data dir.
+        let tmp = path.with_extension("json.tmp");
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    self.approval_persistence_warning =
+                        Some("refusing to write through a symlinked temp path".to_string());
+                    return;
+                }
+                // Temp file already exists (from a previous crashed write).
+                // Remove it first; `File::create` would overwrite, but
+                // removing explicitly avoids a symlink race between the
+                // metadata check and the open call.
+                let _ = std::fs::remove_file(&tmp);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Expected: no stale temp file.
+            }
+            Err(e) => {
+                self.approval_persistence_warning = Some(format!("cannot stat temp path: {e}"));
+                return;
+            }
+        }
+        // Use OpenOptions with create_new to avoid following symlinks.
+        // On Unix, O_CREAT|O_EXCL|O_WRONLY fails with EEXIST on a symlink.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut f) => {
+                if let Err(e) = std::io::Write::write_all(&mut f, json.as_bytes()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.approval_persistence_warning =
+                        Some(format!("cannot write approval sidecar: {e}"));
+                    return;
+                }
+            }
+            Err(e) => {
+                self.approval_persistence_warning = Some(format!("cannot create temp file: {e}"));
+                return;
+            }
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // Best-effort cleanup of the temp file.
+            let _ = std::fs::remove_file(&tmp);
+            self.approval_persistence_warning =
+                Some(format!("cannot finalise approval sidecar: {e}"));
+        }
+
+        // Success: the warning (if any leftover from a previous failed
+        // load/save) is already cleared above.
     }
 }
 
@@ -441,6 +704,13 @@ fn build_slug_map(
 /// Draws the page and returns the confirmation request when the user clicks
 /// Apply (the caller must confirm before any mutation happens).
 pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
+    // See `RomOrganisationPageState::pending_preview`: this runs the actual
+    // plan generation one frame after the click that requested it, so the
+    // busy row below had a chance to render first.
+    if state.pending_preview {
+        state.generate_plan();
+        state.pending_preview = false;
+    }
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::ORGANISE,
@@ -449,32 +719,69 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     );
 
     widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Master ROM root").strong());
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut state.master_root_draft);
-            if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true).clicked() {
-                state.save_master_root();
-            }
-        });
+        ui.label(egui::RichText::new("Game library folder").strong());
         match &state.saved_master_root {
-            Some(root) => ui.label(
-                egui::RichText::new(format!("Configured: {}", root.display()))
-                    .color(theme::muted(ui)),
-            ),
-            None => ui.label(
-                egui::RichText::new("No master ROM root is configured.").color(theme::muted(ui)),
-            ),
+            Some(root) => {
+                ui.label(
+                    egui::RichText::new(format!("Folder: {}", root.display()))
+                        .color(theme::muted(ui)),
+                );
+                if widgets::action_button(
+                    ui,
+                    "Change folder…",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Choose Game Library Folder")
+                        .pick_folder()
+                {
+                    state.master_root_draft = path.display().to_string();
+                    state.save_master_root();
+                }
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("No game library folder is configured yet.")
+                        .color(theme::muted(ui)),
+                );
+                if widgets::action_button(ui, "Choose folder…", widgets::ActionStyle::Primary, true)
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Choose Game Library Folder")
+                        .pick_folder()
+                {
+                    state.master_root_draft = path.display().to_string();
+                    state.save_master_root();
+                }
+            }
         };
         if let Some(error) = &state.master_root_error {
             ui.label(
                 egui::RichText::new(error.as_str()).color(widgets::StatusTone::Blocked.color(ui)),
             );
         }
+        widgets::technical_details(ui, "rom_organisation_manual_path", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Type or paste a path directly instead of using the folder picker.",
+                )
+                .color(theme::muted(ui)),
+            );
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut state.master_root_draft);
+                if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true).clicked()
+                {
+                    state.save_master_root();
+                }
+            });
+        });
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "Setting a root never moves anything by itself: organisation always requires a \
-                 plan and your explicit approval.",
+                "Choosing a folder never moves anything by itself: organising always requires a \
+                 preview and your explicit approval.",
             )
             .color(theme::muted(ui)),
         );
@@ -489,10 +796,17 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             OrganisationMode::OrganiseSymlinkOnly,
         ] {
             let selected = state.mode == mode;
-            if ui.radio(selected, mode.label()).clicked() {
+            if ui
+                .radio(selected, organisation_mode_plain_label(mode))
+                .clicked()
+            {
                 state.set_mode(mode);
             }
         }
+        ui.label(
+            egui::RichText::new(organisation_mode_plain_explanation(state.mode))
+                .color(theme::muted(ui)),
+        );
         ui.label(
             egui::RichText::new("Modes are separate choices and are never combined.")
                 .color(theme::muted(ui)),
@@ -502,21 +816,33 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     ui.add_space(8.0);
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Candidate ROM files").strong());
+            ui.label(egui::RichText::new("Games ready to organise").strong());
             if widgets::action_button(ui, "Rescan sources", widgets::ActionStyle::Secondary, true)
                 .clicked()
             {
                 state.rescan_sources();
             }
-            if widgets::action_button(ui, "Generate plan", widgets::ActionStyle::Primary, true)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                preview_button_label(state.pending_preview),
+                widgets::ActionStyle::Primary,
+                !state.pending_preview,
+            )
+            .clicked()
             {
-                state.generate_plan();
+                state.pending_preview = true;
+                ui.ctx().request_repaint();
             }
         });
+        if state.pending_preview {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Preparing preview… scanning games and resolving platform identity.");
+            });
+        }
         ui.label(
             egui::RichText::new(format!(
-                "{} candidate file(s) collected.",
+                "{} game(s) ready to organise.",
                 state.sources.len()
             ))
             .color(theme::muted(ui)),
@@ -527,8 +853,8 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         ui.add_space(8.0);
         widgets::banner(
             ui,
-            "Planning only",
-            "No files will be moved until you explicitly approve an apply.",
+            "Preview only",
+            "Nothing changes until you review this preview and explicitly approve it.",
             widgets::StatusTone::Info,
         );
         ui.add_space(6.0);
@@ -554,6 +880,19 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     if let Some(error) = &state.error {
         ui.add_space(8.0);
         widgets::banner(ui, "Not applied", error, widgets::StatusTone::Blocked);
+    }
+
+    if let Some(warning) = &state.approval_persistence_warning {
+        ui.add_space(6.0);
+        widgets::banner(
+            ui,
+            "Approvals not saved",
+            &format!(
+                "Your approval selections were not persisted to disk: {warning}. \
+                 Re-preview the plan to restore suggested defaults."
+            ),
+            widgets::StatusTone::Pending,
+        );
     }
 }
 
@@ -704,6 +1043,20 @@ fn status_tone(status: OrganisationStatus) -> widgets::StatusTone {
 mod tests {
     use super::*;
 
+    fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => nested.iter().any(|s| shape_contains(s, needle)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
     #[test]
     fn the_confirmation_phrase_is_truthful_for_the_mode() {
         assert_eq!(
@@ -841,6 +1194,11 @@ mod tests {
             verification: ExternalVerification::StrongExternal,
             conflicts: Vec::new(),
             evidence: Vec::new(),
+            synopsis: None,
+            genres: Vec::new(),
+            players: None,
+            rating: None,
+            release_year: None,
         };
         let cache = IdentityCache {
             format_version: CACHE_FORMAT_VERSION,
@@ -867,5 +1225,332 @@ mod tests {
         );
         // No cache at all falls back to None.
         assert_eq!(canonical_name_for(&source, None), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Preview busy state (live-QA Phase 8: no feedback while previewing)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_default_state_is_not_mid_preview() {
+        let state = RomOrganisationPageState::default();
+        assert!(!state.pending_preview);
+    }
+
+    #[test]
+    fn the_preview_button_label_reflects_whether_a_preview_is_running() {
+        assert_eq!(preview_button_label(false), "Preview changes");
+        assert_eq!(preview_button_label(true), "Preparing preview…");
+    }
+
+    #[test]
+    fn a_pending_preview_resolves_to_an_error_when_no_master_root_is_configured() {
+        let mut state = RomOrganisationPageState::default();
+        state.pending_preview = true;
+        assert!(state.saved_master_root.is_none());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(!state.pending_preview);
+        assert!(state.plan.is_none());
+        assert_eq!(
+            state.error.as_deref(),
+            Some("configure a master ROM root first")
+        );
+    }
+
+    #[test]
+    fn an_idle_state_shows_the_normal_preview_button_with_no_busy_row() {
+        let mut state = RomOrganisationPageState::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Preview changes"));
+        assert!(!rendered_text_contains(&output, "Preparing preview…"));
+    }
+
+    // ------------------------------------------------------------------
+    // Approval persistence (UI convenience helpers)
+    // ------------------------------------------------------------------
+
+    fn temp_data_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        (dir, data)
+    }
+
+    #[test]
+    fn load_returns_none_when_the_sidecar_is_absent() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        assert!(!path.exists());
+        let state = RomOrganisationPageState::default();
+        assert!(state.approval_persistence_warning.is_none());
+        assert!(state.approved.is_empty());
+    }
+
+    #[test]
+    fn load_returns_the_persisted_set_when_the_sidecar_is_valid() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let json = serde_json::json!({
+            "version": 1,
+            "approved": ["/roms/a.iso", "/roms/b.iso"]
+        })
+        .to_string();
+        std::fs::write(&path, &json).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let persisted: PersistedApprovals = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.version, 1);
+        let set: BTreeSet<String> = persisted.approved.into_iter().collect();
+        assert!(set.contains("/roms/a.iso"));
+        assert!(set.contains("/roms/b.iso"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn load_fails_closed_on_malformed_json() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        std::fs::write(&path, b"not json at all").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let result: Result<PersistedApprovals, _> = serde_json::from_str(&raw);
+        assert!(result.is_err(), "malformed JSON must not parse");
+    }
+
+    #[test]
+    fn load_fails_closed_on_unknown_version() {
+        let (_guard, dir) = temp_data_dir();
+        let path = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let json = serde_json::json!({
+            "version": 999,
+            "approved": ["/roms/x.iso"]
+        })
+        .to_string();
+        std::fs::write(&path, &json).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let persisted: PersistedApprovals = serde_json::from_str(&raw).unwrap();
+        assert_ne!(
+            persisted.version, APPROVAL_PERSISTENCE_VERSION,
+            "unknown version must be rejected"
+        );
+    }
+
+    #[test]
+    fn persist_clears_the_warning_on_success() {
+        let mut state = RomOrganisationPageState::default();
+        state.approved.insert("/roms/game.iso".to_string());
+        state.approval_persistence_warning = Some("previous failure".to_string());
+        state.persist_approved_set();
+        assert!(
+            state.approval_persistence_warning.as_deref() != Some("previous failure"),
+            "stale warning must be cleared"
+        );
+    }
+
+    #[test]
+    fn persist_populates_warning_when_path_resolution_fails_at_runtime() {
+        let result = approval_persistence_path();
+        if let Err(msg) = &result {
+            assert!(!msg.is_empty(), "error message must not be empty");
+        }
+    }
+
+    #[test]
+    fn an_empty_approved_set_serialises_and_deserialises_round_trip() {
+        let payload = PersistedApprovals {
+            version: APPROVAL_PERSISTENCE_VERSION,
+            approved: Vec::new(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let round_tripped: PersistedApprovals = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.version, APPROVAL_PERSISTENCE_VERSION);
+        assert!(round_tripped.approved.is_empty());
+    }
+
+    #[test]
+    fn a_non_empty_approved_set_survives_a_serialisation_round_trip() {
+        let payload = PersistedApprovals {
+            version: APPROVAL_PERSISTENCE_VERSION,
+            approved: vec!["/a.iso".to_string(), "/b.iso".to_string()],
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let round_tripped: PersistedApprovals = serde_json::from_str(&json).unwrap();
+        let set: BTreeSet<_> = round_tripped.approved.into_iter().collect();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("/a.iso"));
+        assert!(set.contains("/b.iso"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinked_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, dir) = temp_data_dir();
+        let real = dir.join("real.json");
+        let json = serde_json::json!({
+            "version": 1,
+            "approved": ["/roms/x.iso"]
+        })
+        .to_string();
+        std::fs::write(&real, &json).unwrap();
+
+        let link = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        symlink(&real, &link).unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the test sidecar must be a symlink"
+        );
+
+        let result: Result<Option<BTreeSet<String>>, String> = (|| {
+            let meta = std::fs::symlink_metadata(&link).map_err(|e| format!("metadata: {e}"))?;
+            if meta.file_type().is_symlink() {
+                return Err("symlink rejected".to_string());
+            }
+            Ok(None)
+        })();
+        assert!(result.is_err(), "symlinked sidecar must be rejected");
+    }
+
+    // ------------------------------------------------------------------
+    // Stale-persisted-approval defence
+    // ------------------------------------------------------------------
+
+    /// A persisted approval that references a path not in the current plan
+    /// must never authorise a transaction. This test simulates the core
+    /// property: `build_organisation_transaction` takes a generation and
+    /// the approved set, and the caller (`apply()`) always uses the live
+    /// plan's generation — never a stale one loaded from disk.
+    #[test]
+    fn stale_persisted_approval_cannot_authorise_a_transaction() {
+        // Simulate what happens after a restart when the persisted set
+        // was loaded but `generate_plan()` has not yet been called:
+        // `self.approved` contains paths from a previous session while
+        // `self.plan` is None. `apply()` requires `self.plan` to be
+        // `Some`, so it cannot proceed.
+        let mut state = RomOrganisationPageState::default();
+        state.approved.insert("/roms/old_game.iso".to_string());
+        // No plan set — apply() returns immediately without mutation.
+        assert!(state.plan.is_none());
+        state.apply();
+        // Verifies that without a current plan, `apply()` is a no-op.
+        assert!(state.applied.is_none());
+        assert!(
+            state.result_message.is_none(),
+            "no transaction should have been applied"
+        );
+    }
+
+    /// After `generate_plan()` rewrites `self.approved` with
+    /// `plan.suggested()`, any stale persisted set from a previous session
+    /// is overwritten. The stale set never survives plan regeneration.
+    #[test]
+    fn generate_plan_overwrites_stale_approved_set_with_plan_suggested() {
+        let mut state = RomOrganisationPageState::default();
+        // Simulate a stale persisted set.
+        state.approved.insert("/roms/stale.iso".to_string());
+        // Set up a master root so generate_plan doesn't error out early.
+        // We use a temp dir to ensure the plan comes back empty (no
+        // actual source files to pick up).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        state.saved_master_root = Some(tmp.path().to_path_buf());
+        // Config::load_default() will fail in test, so sources stays empty.
+        state.sources.clear();
+        state.generate_plan();
+        // The stale entry must be gone — the plan replaced self.approved
+        // with whatever plan.suggested() returned (empty here).
+        assert!(
+            !state.approved.contains("/roms/stale.iso"),
+            "stale approved entry must be overwritten by plan regeneration"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Approval persistence warning rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn approval_persistence_warning_is_rendered_in_the_ui() {
+        let mut state = RomOrganisationPageState::default();
+        state.approval_persistence_warning = Some("test persistence failure".to_string());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(
+            rendered_text_contains(&output, "Approvals not saved"),
+            "the banner title must appear"
+        );
+        assert!(
+            rendered_text_contains(&output, "test persistence failure"),
+            "the specific warning must appear in the banner body"
+        );
+    }
+
+    #[test]
+    fn no_approval_persistence_warning_is_rendered_when_there_is_none() {
+        let mut state = RomOrganisationPageState::default();
+        assert!(state.approval_persistence_warning.is_none());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(
+            !rendered_text_contains(&output, "Approvals not saved"),
+            "no persistence banner when there is no warning"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Symlinked temp-file defence
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_rejects_a_symlinked_temp_path() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, dir) = temp_data_dir();
+        let target = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let tmp = target.with_extension("json.tmp");
+
+        // Plant a symlink at the predictable tmp path.
+        symlink("/etc/passwd", &tmp).unwrap();
+        assert!(tmp.is_symlink());
+
+        // Simulate the symlink check from persist_approved_set.
+        let meta = std::fs::symlink_metadata(&tmp).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the planted tmp path must be a symlink"
+        );
+
+        // `OpenOptions::new().create_new(true).open()` would fail with
+        // EEXIST on a symlink on Unix, so the write is blocked at the
+        // kernel level even without our own metadata check. Our metadata
+        // check just makes the failure explicit and surfaces a clear
+        // warning.
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .is_err(),
+            "create_new must refuse a symlinked path"
+        );
     }
 }

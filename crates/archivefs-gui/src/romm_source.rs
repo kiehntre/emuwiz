@@ -291,6 +291,13 @@ pub(crate) struct RommImportSummary {
     pub(crate) unknown_platforms: usize,
     pub(crate) invalid_hashes: usize,
     pub(crate) multi_file_groups: usize,
+    /// Records with at least one enrichment field (synopsis, genre, players,
+    /// rating, or release year) - unrelated to `confirmed`/`strong`/etc.
+    /// above, which describe preservation-identity confidence.
+    pub(crate) with_game_information: usize,
+    /// Entries RomM returned that never became a record at all, so were
+    /// never in a position to carry game information either.
+    pub(crate) game_information_failed: usize,
     pub(crate) pages_fetched: u32,
     pub(crate) elapsed_milliseconds: u128,
     pub(crate) adaptive: Option<AdaptivePagination>,
@@ -1105,11 +1112,23 @@ fn build_connection_result(summary: &RommConnectionSummary) -> RommResultView {
 
 fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultView {
     if let Some(failure) = &summary.failure {
-        let mut notes = vec![if summary.previous_cache_usable {
+        // A per-request timeout on one catalogue record gets its own plain
+        // sentence up front - "RomM did not answer in time" on its own does
+        // not say what to make of that, and the offset/endpoint that did
+        // answer are exactly the kind of detail that belongs behind
+        // Technical details, not in the first thing a person reads.
+        let cache_note = if summary.previous_cache_usable {
             "The identity you already had is untouched and still browsable.".to_string()
         } else {
             "Nothing was published, and there was no previous cache to lose.".to_string()
-        }];
+        };
+        let mut notes = if summary.failure_code.as_deref() == Some("detail_request_timed_out") {
+            vec![format!(
+                "RomM took too long to return one catalogue record. {cache_note}"
+            )]
+        } else {
+            vec![cache_note]
+        };
         if let Some(adaptive) = &summary.adaptive
             && adaptive.reductions > 0
         {
@@ -1154,6 +1173,21 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
         row("Unknown platforms", summary.unknown_platforms.to_string()),
         row("Invalid hashes", summary.invalid_hashes.to_string()),
         row("Multi-file groups", summary.multi_file_groups.to_string()),
+        row(
+            "Game information found",
+            summary.with_game_information.to_string(),
+        ),
+        row(
+            "Game information not found",
+            (summary
+                .records
+                .saturating_sub(summary.with_game_information))
+            .to_string(),
+        ),
+        row(
+            "Game information failed",
+            summary.game_information_failed.to_string(),
+        ),
         row(
             "Pages",
             format!(

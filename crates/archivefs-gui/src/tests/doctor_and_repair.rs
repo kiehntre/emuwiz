@@ -1479,6 +1479,119 @@ fn the_empty_list_wording_names_the_actual_reason() {
     );
 }
 
+/// Phase 3: the "Add games" first-run call-to-action must only show for
+/// the genuinely-empty-library case - never when a search or platform
+/// filter is merely hiding existing games, where a folder picker would
+/// not help and would be actively misleading.
+#[test]
+fn add_games_button_shows_only_for_the_true_first_run_empty_state() {
+    assert!(gamer_view_shows_add_games_button(true, true, true));
+    assert!(!gamer_view_shows_add_games_button(false, true, true));
+    assert!(!gamer_view_shows_add_games_button(true, false, true));
+    assert!(!gamer_view_shows_add_games_button(true, true, false));
+}
+
+/// Phase 3: Gamer View's own wording for the scan its "Add games" flow
+/// chains must never contain the Advanced-View "source(s)"/"archive(s)"
+/// vocabulary `source_action_success_message` uses for the same event.
+#[test]
+fn gamer_view_first_scan_message_uses_plain_language() {
+    let mut summary = ScanPersistSummary {
+        scan_run_id: 1,
+        counts: archivefs_core::ScanRunCounts::default(),
+        folder_errors: Vec::new(),
+        platform_assignment_warnings: Vec::new(),
+        skipped_files: Vec::new(),
+        ingestion_stats: Default::default(),
+        ingestion_skip_reasons: Default::default(),
+        ingestion_platform_counts: Default::default(),
+        ingestion_skipped: Vec::new(),
+        ingestion_recognised_sample: Vec::new(),
+    };
+    assert_eq!(
+        gamer_view_first_scan_message(&summary),
+        "We looked through that folder but didn't find any games in it. Double-check it's the \
+         right folder, or try another one."
+    );
+
+    summary.ingestion_stats.loose_roms = 1;
+    assert_eq!(gamer_view_first_scan_message(&summary), "Found 1 game!");
+
+    summary.ingestion_stats.loose_roms = 1228;
+    summary.ingestion_stats.archives = 5;
+    let message = gamer_view_first_scan_message(&summary);
+    assert_eq!(message, "Found 1233 games!");
+    for banned in ["source", "archive", "catalogue", "scan"] {
+        assert!(
+            !message.to_ascii_lowercase().contains(banned),
+            "Gamer View's scan message must not name {banned:?}: {message:?}"
+        );
+    }
+}
+
+/// Phase 3: Gamer View's own wording for a cached/unvalidated row must
+/// never say "Cached" - that's Advanced View's precise internal state
+/// name, banned-vocabulary-in-spirit for the beginner-facing panel.
+#[test]
+fn gamer_view_row_origin_labels_avoid_the_word_cached() {
+    for origin in [
+        RowOrigin::CachedAwaitingValidation,
+        RowOrigin::CachedMissing,
+        RowOrigin::CachedUnavailable,
+    ] {
+        let label = origin.gamer_view_label();
+        assert!(!label.is_empty());
+        assert!(
+            !label.to_ascii_lowercase().contains("cached"),
+            "{origin:?} -> {label:?} still names \"Cached\""
+        );
+    }
+}
+
+/// Phase 4: every mount/unmount/scan failure reaching Gamer View is, at
+/// the source, `ArchiveFsError`'s raw `Display` output - e.g. "scanner
+/// error: ...", "database error: ...", or a bare OS error like
+/// "/path: Permission denied (os error 13)". None of that internal or
+/// OS-level vocabulary may survive `gamer_view_failure_message`'s
+/// translation, and every result must still say what a person can do
+/// next and that their games are safe.
+#[test]
+fn gamer_view_failure_message_removes_internal_and_os_level_vocabulary() {
+    let permission =
+        gamer_view_failure_message("mount error: /roms/Game.zip: Permission denied (os error 13)");
+    assert!(permission.to_ascii_lowercase().contains("permission"));
+    assert!(!permission.contains("os error"));
+    assert!(!permission.to_ascii_lowercase().contains("mount error"));
+
+    let missing = gamer_view_failure_message(
+        "io error: /roms/Game.zip: No such file or directory (os error 2)",
+    );
+    assert!(!missing.contains("os error"));
+    assert!(!missing.to_ascii_lowercase().contains("io error"));
+
+    for raw in [
+        "scanner error: failed to enumerate /roms",
+        "database error: could not open catalogue.sqlite3",
+        "config error: config.toml is malformed",
+        "unmount error: device or resource busy",
+    ] {
+        let translated = gamer_view_failure_message(raw);
+        for banned in ["scanner", "database", "config error", "catalogue", "sqlite"] {
+            assert!(
+                !translated.to_ascii_lowercase().contains(banned),
+                "translating {raw:?} leaked {banned:?} into {translated:?}"
+            );
+        }
+        // Every failure message must say the user's data/games are safe
+        // and give a real next step the app actually supports.
+        assert!(translated.to_ascii_lowercase().contains("safe"));
+        assert!(
+            translated.to_ascii_lowercase().contains("try again")
+                || translated.to_ascii_lowercase().contains("advanced view")
+        );
+    }
+}
+
 /// A platform genuinely holding nothing still reports so - the truthful
 /// empty state must survive the fix that removed the false one.
 #[test]
@@ -2751,6 +2864,10 @@ fn long_content_pages_use_shared_scrolling_without_changing_table_pages() {
         MainView::Sources,
         MainView::HistoryLogs,
         MainView::RepairHistory,
+        // Library Organisation's preview/plan results list has no
+        // `ScrollArea` of its own (live-QA Phase 8: a generated preview
+        // extended below the window with the footer unreachable).
+        MainView::CanonicalOrganisation,
     ] {
         assert!(main_view_uses_page_scroll(view));
     }
@@ -2801,4 +2918,28 @@ fn recently_found_uses_exact_latest_scan_paths() {
     assert!(recent_scan_contains(&recent, &alien.absolute_path));
     assert!(!recent_scan_contains(&recent, &other.absolute_path));
     assert!(alien.display_name.to_ascii_lowercase().contains("alien 3"));
+}
+
+/// Phase 5: a game with unresolved platform must show the same "Needs
+/// attention" word a blocked mount already uses in the list - not a
+/// silently different, unexplained state - and the mount state must
+/// still take priority for its own label when the platform *is* known.
+#[test]
+fn unknown_platform_rows_are_needs_attention_in_the_list_too() {
+    assert_eq!(
+        gamer_view_row_state_label(true, MountState::Pending),
+        "Needs attention"
+    );
+    assert_eq!(
+        gamer_view_row_state_label(true, MountState::NotMountable),
+        "Needs attention"
+    );
+    assert_eq!(
+        gamer_view_row_state_label(false, MountState::Pending),
+        "Ready to mount"
+    );
+    assert_eq!(
+        gamer_view_row_state_label(false, MountState::NotMountable),
+        "Ready to play"
+    );
 }

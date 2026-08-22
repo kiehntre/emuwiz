@@ -1472,6 +1472,9 @@ fn legacy_unsupported_record(
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         },
         ArchiveHealth::Unsupported,
     );
@@ -2191,22 +2194,21 @@ fn sources_and_tools_overlay_navigation_never_touches_library_state_or_activity(
 }
 
 /// Mirrors `show_primary_navigation`'s exact layout (same widgets, same
-/// order, same enabled predicate, same selected predicate) purely to
-/// discover each button's rendered `Rect` for click simulation. The
-/// production function itself only returns `Option<MainView>`, not
-/// per-button geometry; egui's vertical layout is fully deterministic
-/// from widget order and size alone, so this mirror's rects match the
-/// real function's. Iterates the same `PRIMARY_NAVIGATION_DESTINATIONS`
-/// const production uses, so the mirror cannot drift from the real
-/// destination list - now just one section since sidebar consolidation
-/// removed the secondary "LIBRARY TOOLS" section entirely.
-/// The actual click below is driven through the real production
-/// function, not this mirror.
+/// group order, same enabled/selected predicates) purely to discover each
+/// button's rendered `Rect` for click simulation. The production function
+/// itself only returns `Option<NavClick>`, not per-button geometry; egui's
+/// vertical layout is fully deterministic from widget order and size
+/// alone, so this mirror's rects match the real function's. Iterates the
+/// same `ADVANCED_NAV_GROUPS` const production uses (docs/
+/// GUI_NAVIGATION_RESET_DESIGN.md §3.2's grouped sidebar), so the mirror
+/// cannot drift from the real, grouped destination list. The actual click
+/// below is driven through the real production function, not this mirror.
 fn primary_nav_rects(
     ctx: &egui::Context,
     current: MainView,
+    current_overlay: ToolsOverlay,
     has_database: bool,
-) -> Vec<(MainView, egui::Rect)> {
+) -> Vec<(NavClick, egui::Rect)> {
     let mut rects = Vec::new();
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2214,19 +2216,29 @@ fn primary_nav_rects(
                 ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
                 ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
                 ui.add_space(18.0);
-                ui.label(
-                    egui::RichText::new("WORKFLOWS")
-                        .small()
-                        .strong()
-                        .color(theme::muted(ui)),
-                );
-                for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
-                    let enabled = navigation_destination_enabled(view, has_database);
-                    let selected = navigation_destination_selected(current, view);
-                    let button = egui::Button::selectable(selected, label)
-                        .min_size(egui::vec2(ui.available_width(), 34.0));
-                    let resp = ui.add_enabled(enabled, button);
-                    rects.push((view, resp.rect));
+                for group in ADVANCED_NAV_GROUPS {
+                    if let Some(heading) = group.heading {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(heading)
+                                .small()
+                                .strong()
+                                .color(theme::muted(ui)),
+                        );
+                    }
+                    for entry in group.entries {
+                        let (enabled, selected) = match entry.click {
+                            NavClick::View(view) => (
+                                navigation_destination_enabled(view, has_database),
+                                navigation_destination_selected(current, view),
+                            ),
+                            NavClick::Overlay(overlay) => (true, current_overlay == overlay),
+                        };
+                        let button = egui::Button::selectable(selected, entry.label)
+                            .min_size(egui::vec2(ui.available_width(), 30.0));
+                        let resp = ui.add_enabled(enabled, button);
+                        rects.push((entry.click, resp.rect));
+                    }
                 }
             });
         });
@@ -2238,24 +2250,27 @@ fn primary_nav_rects(
 fn all_navigation_destinations_are_reachable_via_a_real_click() {
     let ctx = egui::Context::default();
 
-    let all_destinations = PRIMARY_NAVIGATION_DESTINATIONS
+    let all_destinations: Vec<NavClick> = ADVANCED_NAV_GROUPS
         .iter()
-        .map(|(view, _)| *view);
+        .flat_map(|group| group.entries.iter().map(|entry| entry.click))
+        .collect();
     for target in all_destinations {
-        let rects = primary_nav_rects(&ctx, MainView::Library, true);
+        let rects = primary_nav_rects(&ctx, MainView::Library, ToolsOverlay::None, true);
         let target_rect = rects
             .iter()
-            .find(|(view, _)| *view == target)
+            .find(|(click, _)| *click == target)
             .map(|(_, rect)| *rect)
             .unwrap_or_else(|| panic!("{target:?} must be one of the rendered nav labels"));
 
-        let clicked_view: std::rc::Rc<std::cell::RefCell<Option<MainView>>> =
+        let clicked: std::rc::Rc<std::cell::RefCell<Option<NavClick>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
-        let captured = std::rc::Rc::clone(&clicked_view);
+        let captured = std::rc::Rc::clone(&clicked);
         let render = move |ui: &mut egui::Ui| -> egui::Response {
-            let inner = ui.scope(|ui| show_primary_navigation(ui, MainView::Library, true));
-            if let Some(view) = inner.inner {
-                *captured.borrow_mut() = Some(view);
+            let inner = ui.scope(|ui| {
+                show_primary_navigation(ui, MainView::Library, ToolsOverlay::None, true)
+            });
+            if let Some(click) = inner.inner {
+                *captured.borrow_mut() = Some(click);
             }
             inner.response
         };
@@ -2267,11 +2282,28 @@ fn all_navigation_destinations_are_reachable_via_a_real_click() {
         );
 
         assert_eq!(
-            *clicked_view.borrow(),
+            *clicked.borrow(),
             Some(target),
             "clicking the {target:?} label must select it as the primary destination"
         );
     }
+}
+
+#[test]
+fn about_is_no_longer_a_flat_sidebar_entry() {
+    // About moved to the Help menu window (docs/GUI_NAVIGATION_RESET_
+    // DESIGN.md §3.2: "About moves to a footer link... in both modes"),
+    // which already existed independently of the old flat sidebar entry -
+    // this pins that the now-redundant sidebar entry is really gone from
+    // the rendered grouped nav, not just reachable a second way.
+    let ctx = egui::Context::default();
+    let rects = primary_nav_rects(&ctx, MainView::Library, ToolsOverlay::None, true);
+    assert!(
+        !rects
+            .iter()
+            .any(|(click, _)| *click == NavClick::View(MainView::About)),
+        "About must not render as a grouped sidebar entry any more"
+    );
 }
 
 fn fully_visible_exact_text_count(output: &egui::FullOutput, needles: &[String]) -> usize {
@@ -2498,6 +2530,7 @@ fn render_show_loaded_data_for_test(
     let mut confirm_remove_missing = None;
     let mut missing_removal_typed_count = String::new();
     let mut sort_field = None;
+    let mut library_platform_query = String::new();
     let mut sort_ascending = true;
     let mut library_scroll_offset = 0.0;
     let mut clipboard = InMemoryClipboard::default();
@@ -2571,6 +2604,7 @@ fn render_show_loaded_data_for_test(
                     library_view_last_plan: None,
                     recent_scan: None,
                     recent_view: false,
+                    library_platform_query: &mut library_platform_query,
                 },
             );
         });
@@ -2676,6 +2710,7 @@ fn recently_found_still_shows_its_own_heading_with_no_library_duplicate() {
     let mut confirm_remove_missing = None;
     let mut missing_removal_typed_count = String::new();
     let mut sort_field = None;
+    let mut library_platform_query = String::new();
     let mut sort_ascending = true;
     let mut library_scroll_offset = 0.0;
     let mut clipboard = InMemoryClipboard::default();
@@ -2747,6 +2782,7 @@ fn recently_found_still_shows_its_own_heading_with_no_library_duplicate() {
                     library_view_last_plan: None,
                     recent_scan: None,
                     recent_view: true,
+                    library_platform_query: &mut library_platform_query,
                 },
             );
         });
@@ -3062,6 +3098,7 @@ fn sources_last_scan_banner_shows_counts_and_inspect_when_files_were_skipped() {
         scope: SourcesScanScope::One(PathBuf::from("/mnt/usbdrive/retro")),
         archives_found: 42,
         skipped_total: 3,
+        ingestion_stats: Default::default(),
     };
     let mut clicked = false;
     let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -3091,6 +3128,7 @@ fn sources_last_scan_banner_hides_inspect_when_nothing_was_skipped() {
         scope: SourcesScanScope::AllEnabled,
         archives_found: 10,
         skipped_total: 0,
+        ingestion_stats: Default::default(),
     };
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -3104,4 +3142,104 @@ fn sources_last_scan_banner_hides_inspect_when_nothing_was_skipped() {
         !rendered_text_contains(&output, "Inspect skipped"),
         "Inspect skipped must not be offered when skipped_files_total() is 0"
     );
+}
+
+fn ingestion_item(
+    file_name: &str,
+    content: Option<archivefs_core::ingestion::ContentKind>,
+    platform_hint: Option<&str>,
+    validation_state: archivefs_core::ingestion::ValidationState,
+    skip_reason: Option<archivefs_core::ingestion::SkipReason>,
+) -> archivefs_core::ingestion::GameDiscovery {
+    archivefs_core::ingestion::GameDiscovery {
+        path: PathBuf::from(file_name),
+        container: archivefs_core::ingestion::ContainerKind::DirectFile,
+        content,
+        platform_hint: platform_hint.map(str::to_string),
+        identity_candidate: None,
+        validation_state,
+        explanation: "test fixture".to_string(),
+        skip_reason,
+    }
+}
+
+#[test]
+fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
+    use archivefs_core::ingestion::{ContentKind, SkipReason, ValidationState};
+
+    let mut ingestion_stats = archivefs_core::ingestion::DiscoveryStats::default();
+    ingestion_stats.loose_roms = 2;
+    ingestion_stats.disc_images = 1;
+
+    let mut ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts::default();
+    ingestion_skip_reasons.unsupported_extension = 3;
+    ingestion_skip_reasons.missing_paired_file = 1;
+
+    let mut ingestion_platform_counts = std::collections::BTreeMap::new();
+    ingestion_platform_counts.insert("Game Boy Advance".to_string(), 2_i64);
+
+    let summary = ScanPersistSummary {
+        scan_run_id: 1,
+        counts: archivefs_core::ScanRunCounts::default(),
+        folder_errors: Vec::new(),
+        platform_assignment_warnings: Vec::new(),
+        skipped_files: Vec::new(),
+        ingestion_stats,
+        ingestion_skip_reasons,
+        ingestion_platform_counts,
+        ingestion_skipped: vec![ingestion_item(
+            "Unknown.bin",
+            None,
+            None,
+            ValidationState::Skipped,
+            Some(SkipReason::MissingPairedFile),
+        )],
+        ingestion_recognised_sample: vec![ingestion_item(
+            "Pokemon.gba",
+            Some(ContentKind::RomCartridge),
+            Some("Game Boy Advance"),
+            ValidationState::Accepted,
+            None,
+        )],
+    };
+
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_collection_discovery_panel(ui, Some(&summary));
+        });
+    });
+
+    // Human-facing: counts, platform names, plain descriptions.
+    assert!(rendered_text_contains(&output, "ROMs"));
+    assert!(rendered_text_contains(&output, "Game Boy Advance"));
+    assert!(rendered_text_contains(&output, "Pokemon.gba"));
+    assert!(rendered_text_contains(&output, "Recognised"));
+    assert!(rendered_text_contains(&output, "Needs attention"));
+    assert!(rendered_text_contains(&output, "Unknown.bin"));
+    assert!(rendered_text_contains(&output, "Suggested:"));
+
+    // Never the raw internal type/variant names.
+    for internal_term in [
+        "ContentKind",
+        "ContainerKind",
+        "ArchiveKind",
+        "RomCartridge",
+    ] {
+        assert!(
+            !rendered_text_contains(&output, internal_term),
+            "internal type name {internal_term:?} leaked into the collection discovery panel"
+        );
+    }
+}
+
+#[test]
+fn collection_discovery_panel_has_a_friendly_empty_state() {
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_collection_discovery_panel(ui, None);
+        });
+    });
+    assert!(rendered_text_contains(&output, "No scan has completed yet"));
 }

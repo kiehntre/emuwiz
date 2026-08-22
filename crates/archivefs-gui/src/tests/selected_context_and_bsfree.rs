@@ -14,6 +14,7 @@
 //! Predominant theme observed in this slice: selected-archive context menus, BSFree browser, gamer cover artwork.
 
 use super::*;
+use crate::ui::platform_artwork::*;
 
 #[test]
 fn right_click_on_a_row_already_in_the_selection_preserves_the_multi_selection() {
@@ -1188,6 +1189,7 @@ fn existing_global_unmount_all_confirmation_wording_is_unchanged() {
     let mut confirm_remove_missing = None;
     let mut missing_removal_typed_count = String::new();
     let mut sort_field = None;
+    let mut library_platform_query = String::new();
     let mut sort_ascending = true;
     let mut library_scroll_offset = 0.0;
     let mut clipboard = InMemoryClipboard::default();
@@ -1266,6 +1268,7 @@ fn existing_global_unmount_all_confirmation_wording_is_unchanged() {
                     library_view_last_plan: None,
                     recent_scan: None,
                     recent_view: false,
+                    library_platform_query: &mut library_platform_query,
                 },
             );
         });
@@ -3004,6 +3007,117 @@ fn text_rect(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
         walk(&clipped.shape, needle, &mut found);
     }
     found
+}
+
+/// The furthest-right edge any shape actually painted to, across the whole
+/// frame - a genuinely long value (a long absolute mount path, most often)
+/// pushing a widget past the viewport shows up here even though the exact
+/// truncated text can't be searched for by content.
+fn max_shape_right(output: &egui::FullOutput) -> f32 {
+    fn walk(shape: &egui::Shape, max_right: &mut f32) {
+        match shape {
+            egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, max_right)),
+            other => *max_right = max_right.max(other.visual_bounding_rect().right()),
+        }
+    }
+    let mut max_right = 0.0_f32;
+    for clipped in &output.shapes {
+        walk(&clipped.shape, &mut max_right);
+    }
+    max_right
+}
+
+/// A very long mount path (2026-08-22, live-QA Phase 8: "Selected archive"
+/// content extended off the right edge of the window, including a
+/// partially-hidden Mount-related stat) must not push the panel wider than
+/// the viewport - `detail_row_with_copy`'s `.truncate()` on the Mount path
+/// row only has anything to truncate against once the enclosing
+/// `egui::Grid` column actually has a bounded width (see
+/// `show_selected_archive`'s `.max_col_width` on `selected_archive_details`).
+#[test]
+fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport() {
+    let width = 1280.0_f32;
+    let height = 720.0_f32;
+    let archive = Archive::from_path(&PathBuf::from("/roms/a.zip")).unwrap();
+    let long_mount_path = PathBuf::from(format!(
+        "/mnt/archivefs/{}/very-long-game-title",
+        "extremely-long-platform-directory-segment".repeat(6)
+    ));
+    let record = ArchiveRecord::new(
+        MountPlan::new(archive, long_mount_path),
+        MountState::Mounted,
+        ArchiveMetadata {
+            title: None,
+            platform: None,
+            region: None,
+            languages: None,
+            version: None,
+            disc: None,
+            publisher: None,
+            developer: None,
+            release_year: None,
+            genre: None,
+            notes: None,
+            source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
+        },
+        ArchiveHealth::Pending,
+    );
+
+    let EmptySelectedArchiveViewStateParts {
+        mut confirm_unmount,
+        mut confirm_lazy_unmount,
+        mut focus_lazy_cancel,
+        lazy_unmount_offers,
+        remount_offers,
+        mut cleanup_after_unmount,
+        mut platform_choice,
+        mut platform_custom_text,
+        mut clipboard,
+    } = empty_selected_archive_view_state_parts();
+
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_archive(
+                    ui,
+                    Some(&record),
+                    None,
+                    None,
+                    None,
+                    SelectedArchiveViewState {
+                        operation: None,
+                        busy: false,
+                        block_reason: None,
+                        action_readiness_debug_lines: &[],
+                        confirm_unmount: &mut confirm_unmount,
+                        confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                        focus_lazy_cancel: &mut focus_lazy_cancel,
+                        lazy_unmount_offers: &lazy_unmount_offers,
+                        remount_offers: &remount_offers,
+                        cleanup_after_unmount: &mut cleanup_after_unmount,
+                        platform_choice: &mut platform_choice,
+                        platform_custom_text: &mut platform_custom_text,
+                        platform_busy: false,
+                        clipboard: &mut clipboard,
+                    },
+                );
+            });
+        },
+    );
+
+    assert!(
+        max_shape_right(&output) <= width,
+        "a long mount path must not push the Selected archive panel past the {width}px viewport"
+    );
 }
 
 #[test]

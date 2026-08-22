@@ -539,15 +539,23 @@ fn the_picker_offers_only_canonical_platforms() {
 #[test]
 fn the_picker_is_bounded_and_reports_what_it_truncated() {
     let all = available_platform_choices(&[], "");
+    let total = available_platform_count(&[], "");
     assert!(
         all.len() <= MAX_PLATFORM_CHOICES,
         "the list shown must stay bounded, got {}",
         all.len()
     );
-    assert!(
-        available_platform_count(&[], "") > all.len(),
-        "the registry has more platforms than the picker shows, so the count must differ \
-         and the UI can say 'showing N of M'"
+    // The registry (74 today) fits comfortably under the 100-choice
+    // headroom, so nothing is truncated right now - that is expected, not
+    // a regression (2026-08-22, live-QA Phase 7: headroom raised from 12
+    // to 100). The invariant this test actually protects is that showing
+    // fewer choices than the total count can only ever happen because of
+    // the cap, never because of a bug that silently drops entries.
+    assert_eq!(
+        all.len(),
+        total.min(MAX_PLATFORM_CHOICES),
+        "shown choices must be exactly min(total matches, the cap), got {} shown of {total} total",
+        all.len()
     );
 }
 

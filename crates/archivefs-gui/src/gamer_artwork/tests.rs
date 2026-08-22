@@ -38,6 +38,11 @@ fn record(id: &str, artwork: Option<ArtworkReference>) -> ExternalIdentityRecord
         evidence: Vec::new(),
         verification: ExternalVerification::Unmatched,
         conflicts: Vec::new(),
+        synopsis: None,
+        genres: Vec::new(),
+        players: None,
+        rating: None,
+        release_year: None,
     }
 }
 

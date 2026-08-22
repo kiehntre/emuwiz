@@ -1,8 +1,10 @@
 use std::path::Path;
 
+use archivefs_core::ArchiveKind;
 use eframe::egui;
 
 use super::theme;
+use crate::{ClipboardBackend, open_folder_in_file_manager};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionStyle {
@@ -89,6 +91,36 @@ pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: St
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).color(color).strong());
         });
+}
+
+/// A small neutral label pill for a piece of metadata a game carries (a
+/// genre, a tag) - never a status. Reuses [`status_badge`]'s exact visual
+/// grammar (Frame fill/stroke/corner radius/margin) so it reads as the same
+/// design language, but with no tone colour and no glyph: a genre is not a
+/// state something is in, and prefixing "Adventure" with a status icon
+/// would misread as one.
+pub(crate) fn info_chip(ui: &mut egui::Ui, label: &str) {
+    let color = theme::muted(ui);
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(theme::border(ui))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(color).size(12.5));
+        });
+}
+
+/// A row of [`info_chip`]s that wraps onto further lines rather than
+/// running off the side of the panel - for a field like genre that can
+/// carry several values.
+pub(crate) fn info_chip_row(ui: &mut egui::Ui, labels: &[&str]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        for label in labels {
+            info_chip(ui, label);
+        }
+    });
 }
 
 /// A page header with a leading icon, for the major navigation pages. The
@@ -395,6 +427,134 @@ pub(crate) fn copyable_value(ui: &mut egui::Ui, label: &str, full: &str) -> bool
         copy = action_button(ui, "Copy", ActionStyle::Quiet, true).clicked();
     });
     copy
+}
+
+/// The shared header every `ToolsOverlay` screen that doesn't already
+/// provide its own dismiss action (unlike Diagnostics, whose own
+/// `show_setup_diagnostics` already returns `Continue`/`ViewLastSnapshot`)
+/// renders - a heading plus one "Back to Library" button. Returns `true`
+/// exactly when that button was clicked, so the caller can close the
+/// overlay.
+///
+/// Reviewed for the Library IA migration and deliberately left as-is:
+/// despite the label, clicking it does not navigate anywhere - it only
+/// clears `self.tools_overlay`, returning to whatever `view` was already
+/// active (Mount, Settings, or anything else a Tools overlay can be
+/// opened from, not only Library). The label predates the unified
+/// Library shell and is a pre-existing minor inaccuracy for the
+/// non-Library case, not something this migration introduced or should
+/// fix in passing - changing its target to actually navigate to Library
+/// would be a real, unrelated behaviour change for users who open a
+/// Tools overlay from a non-Library page.
+///
+/// Extracted verbatim from `main.rs` (2026-08-22, GUI extraction pass 2):
+/// a shared primitive used by five different overlay renderers, not any
+/// one page's own concern.
+pub(crate) fn show_tools_overlay_header(ui: &mut egui::Ui, title: &str) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.heading(title);
+        if ui.button("Back to Library").clicked() {
+            close = true;
+        }
+    });
+    ui.separator();
+    close
+}
+
+// --- Detail-grid rows ------------------------------------------------------
+//
+// Extracted verbatim from `main.rs` (2026-08-22, GUI extraction pass 3):
+// shared by the Selected archive panel and Gamer View's Details screen, so
+// this lives with the other shared widgets rather than in either page's own
+// module - moving it into just one would have made the other page depend on
+// it.
+
+pub(crate) fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.strong(label);
+    ui.add(egui::Label::new(value).selectable(true).wrap());
+    ui.end_row();
+}
+
+pub(crate) fn optional_detail_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        detail_row(ui, label, value);
+    }
+}
+
+pub(crate) fn detail_row_with_copy(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    ui.strong(label);
+    ui.vertical(|ui| {
+        let response = ui
+            .add(
+                egui::Label::new(value)
+                    .selectable(true)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(value);
+        if ui.small_button("Copy").clicked() {
+            let _ = clipboard.set_text(value.to_string());
+        }
+        response.context_menu(|ui| {
+            if ui.button("Copy").clicked() {
+                let _ = clipboard.set_text(value.to_string());
+                ui.close();
+            }
+            if ui.button("Select all").clicked() {
+                let _ = clipboard.set_text(value.to_string());
+                ui.close();
+            }
+            if ui.button("Show containing folder").clicked() {
+                let folder = Path::new(value).parent().unwrap_or(Path::new(value));
+                let _ = open_folder_in_file_manager(folder);
+                ui.close();
+            }
+        });
+    });
+    ui.end_row();
+}
+
+pub(crate) fn archive_kind_name(kind: ArchiveKind) -> &'static str {
+    match kind {
+        ArchiveKind::Zip => "ZIP",
+        ArchiveKind::SevenZip => "7z",
+        ArchiveKind::Rar => "RAR",
+        ArchiveKind::MegaDriveRom => "Mega Drive ROM",
+        ArchiveKind::DirectGameImage => "Game image",
+    }
+}
+
+pub(crate) fn format_size(size_bytes: Option<u64>) -> String {
+    size_bytes
+        .map(|size| format!("{size} bytes"))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+pub(crate) fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
+    // Explicit tighter vertical margin than `egui::Frame::group`'s default
+    // (6px all sides): with the app-wide readability item_spacing bump
+    // (see `apply_readability_style`), the Health and Duplicates pages'
+    // multi-card summary rows read as having excessive empty space around
+    // each card's small text. Horizontal margin is left roomier for
+    // legibility; only the vertical footprint is tightened.
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            // Never allow a horizontal container to crush a counter into
+            // one-character-wide vertical text. Narrow viewports scroll or
+            // wrap whole cards instead.
+            ui.set_min_width(96.0);
+            ui.vertical_centered(|ui| {
+                ui.strong(value.to_string());
+                ui.small(label);
+            });
+        });
 }
 
 #[cfg(test)]

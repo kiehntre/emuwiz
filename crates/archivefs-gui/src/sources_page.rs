@@ -36,6 +36,29 @@ pub(super) fn show_sources_last_scan_banner(
                 ui.weak("·");
                 ui.label(format!("{} skipped", last_scan.skipped_total));
             });
+            // The archive count above is the existing scanner's own
+            // total; this breakdown is the additive mixed-collection view
+            // from `archivefs_core::ingestion`, so a mostly-loose-ROM
+            // collection isn't hidden behind an "archives found" number
+            // that only ever describes a fraction of it.
+            let stats = &last_scan.ingestion_stats;
+            let breakdown = [
+                ("Loose ROMs", stats.loose_roms),
+                ("Disc images", stats.disc_images),
+                ("Amiga images", stats.amiga_images),
+                ("Computer disks", stats.computer_disks),
+                ("Game folders", stats.game_folders),
+                ("Unknown", stats.unknown),
+            ];
+            if breakdown.iter().any(|(_, count)| *count > 0) {
+                ui.add_space(4.0);
+                ui.weak("What was found in this source:");
+                for (label, count) in breakdown {
+                    if count > 0 {
+                        ui.label(format!("{label}: {count}"));
+                    }
+                }
+            }
             if last_scan.skipped_total > 0
                 && widgets::action_button(ui, "Inspect skipped", widgets::ActionStyle::Quiet, true)
                     .clicked()
@@ -200,7 +223,12 @@ pub(super) fn show_retroarch_catalogue_manager(
                             ui.label(format!("Indexed: {count}"));
                         }
                         if let Some(count) = entry.excluded_file_count {
-                            ui.label(format!("Excluded: {count}"));
+                            if count > 0 {
+                                ui.label(format!(
+                                    "{count} cheat file{} could not be read (see Technical details below)",
+                                    if count == 1 { "" } else { "s" }
+                                ));
+                            }
                         }
                         if let Some(bytes) = entry.total_bytes {
                             ui.label(format!("Verified size: {}", format_size(Some(bytes))));
@@ -226,8 +254,20 @@ pub(super) fn show_retroarch_catalogue_manager(
                             } else {
                                 "Update failed · no usable active catalogue"
                             },
-                            &error.to_string(),
+                            cheat_source_error_human_detail(error),
                             widgets::StatusTone::Warning,
+                        );
+                        widgets::technical_details(
+                            ui,
+                            ("catalogue_entry_last_error", &entry.source.source_id),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(error.to_string()).monospace(),
+                                    )
+                                    .wrap(),
+                                );
+                            },
                         );
                         if let Some(timestamp) = entry.last_error_at_unix_seconds {
                             ui.label(format!(
@@ -313,12 +353,12 @@ pub(super) fn show_retroarch_catalogue_manager(
                                     .show(ui, |ui| {
                                         for example in &entry.exclusion_examples {
                                             ui.label(format!(
-                                                "{:?}: {}",
-                                                example.kind,
+                                                "{} {}",
                                                 example.relative_path.as_deref().unwrap_or(
-                                                    "path bytes are not representable safely as \
-                                                     UTF-8"
-                                                )
+                                                    "A file (path bytes are not representable \
+                                                     safely as UTF-8)"
+                                                ),
+                                                cheat_source_exclusion_reason(example.kind)
                                             ));
                                         }
                                     });
@@ -422,11 +462,7 @@ pub(super) fn show_retroarch_catalogue_manager(
             Err(error) => widgets::failure_summary(
                 ui,
                 "catalogue_result_error",
-                if error.code == "cancelled" {
-                    "Cheat database download cancelled"
-                } else {
-                    "Cheat database update failed"
-                },
+                cheat_source_error_headline(error),
                 Some("Your existing cheat database, if any, remains active and usable."),
                 &error.to_string(),
             ),
@@ -461,6 +497,53 @@ pub(super) fn show_retroarch_catalogue_manager(
         }
     }
     action
+}
+
+/// Plain-language headline for a failed catalogue fetch/update. `error.code`
+/// values like "download_too_large" or "revision_response_invalid" are
+/// internal identifiers meant for the Technical details disclosure (already
+/// shown separately via `error.to_string()`), never primary UI text - a
+/// live-QA finding (Phase 8) reported seeing the raw code and byte counts
+/// directly in the failure banner.
+pub(super) fn cheat_source_error_headline(error: &CheatSourceError) -> &'static str {
+    match error.code.as_str() {
+        "cancelled" => "Cheat database download cancelled",
+        "download_too_large" => {
+            "Cheat database update could not finish because the download was larger than the current safety limit"
+        }
+        _ => "Cheat database update failed",
+    }
+}
+
+/// Plain-language explanation shown as a failed catalogue entry's banner
+/// body; the exact `error.to_string()` (internal code plus byte counts)
+/// moves to a Technical details disclosure alongside it instead.
+pub(super) fn cheat_source_error_human_detail(error: &CheatSourceError) -> &'static str {
+    match error.code.as_str() {
+        "cancelled" => "The download was cancelled.",
+        "download_too_large" => {
+            "The download was larger than the current safety limit and could not finish."
+        }
+        _ => "An unexpected error occurred while updating the cheat database.",
+    }
+}
+
+/// Plain-language reason for one excluded catalogue file, shown next to its
+/// path in the Technical details disclosure. Replaces raw `{:?}` Debug
+/// formatting of `CheatSourceExclusionKind` (e.g. "MalformedCht: ..."),
+/// which a live-QA finding (Phase 8) flagged as reading like an internal
+/// error code rather than something a person could understand.
+pub(super) fn cheat_source_exclusion_reason(kind: CheatSourceExclusionKind) -> &'static str {
+    match kind {
+        CheatSourceExclusionKind::MalformedCht => "could not be read",
+        CheatSourceExclusionKind::UnsupportedContentEncoding => {
+            "is not UTF-8 text and could not be read"
+        }
+        CheatSourceExclusionKind::UnsupportedPathEncoding => {
+            "has a file name that could not be read safely"
+        }
+        CheatSourceExclusionKind::UnsupportedContent => "is not a recognised cheat file",
+    }
 }
 
 pub(super) fn catalogue_progress_label(phase: CheatSourceProgressPhase) -> &'static str {
@@ -1652,11 +1735,23 @@ pub(super) fn show_bsfree_source_card(
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Import local BSFree SQLite database");
-            ui.add(
-                egui::TextEdit::singleline(&mut state.import_path)
-                    .desired_width(360.0)
-                    .hint_text("/path/to/bsfree.4cfee26.db"),
-            );
+            if widgets::action_button(
+                ui,
+                "Choose database file…",
+                widgets::ActionStyle::Secondary,
+                !busy,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose BSFree SQLite database")
+                    .add_filter("SQLite database", &["db", "sqlite", "sqlite3"])
+                    .pick_file()
+            {
+                state.import_path = path.display().to_string();
+            }
+            if !state.import_path.trim().is_empty() {
+                ui.label(egui::RichText::new(state.import_path.trim()).color(theme::muted(ui)));
+            }
             if widgets::action_button(
                 ui,
                 "Import local database",
@@ -1669,6 +1764,19 @@ pub(super) fn show_bsfree_source_card(
                     state.import_path.trim(),
                 )));
             }
+        });
+        widgets::technical_details(ui, "bsfree_import_manual_path", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Type or paste a path directly instead of using the file picker.",
+                )
+                .color(theme::muted(ui)),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut state.import_path)
+                    .desired_width(360.0)
+                    .hint_text("/path/to/bsfree.4cfee26.db"),
+            );
         });
         if busy {
             ui.horizontal(|ui| {

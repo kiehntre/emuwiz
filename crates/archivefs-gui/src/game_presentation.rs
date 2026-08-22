@@ -194,6 +194,9 @@ mod tests {
             genre: None,
             notes: None,
             source: None,
+            synopsis: None,
+            players: None,
+            rating: None,
         };
         ArchiveRecord::new(plan, mount_state, metadata, ArchiveHealth::Pending)
     }

@@ -36,7 +36,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use archivefs_core::dat::rename_apply::{
     EntryState, RenameTransaction, RollbackOutcome, RollbackResult, TransactionSummary,
-    journal_path, list_journals, read_journal, reconcile_recovery, rollback_transaction,
+    journal_path, list_journals, read_journal, reconcile_recovery, remove_journal,
+    rollback_transaction,
 };
 use archivefs_core::repair::execute::{
     RepairReverifyEntry, RepairReverifyOutcome, reverify_transaction,
@@ -91,6 +92,22 @@ pub(crate) struct RepairHistoryPageState {
     /// complete (distinct from a reported partial/failed rollback, which
     /// lands in `undo_outcome` instead - see [`RollbackResult`]).
     pub(crate) undo_error: Option<String>,
+    /// Set when the user asked to clear completed history; holds the exact
+    /// transaction ids that will be removed, frozen at the moment the
+    /// confirmation opened so a concurrent refresh can never silently widen
+    /// what gets deleted.
+    pub(crate) clear_confirm: Option<Vec<String>>,
+    /// The outcome of the last "Clear completed history" run: how many
+    /// journals were actually removed, and any that failed to delete.
+    pub(crate) clear_outcome: Option<ClearHistoryOutcome>,
+}
+
+/// The result of removing every provably-safe-to-remove transaction's
+/// journal.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClearHistoryOutcome {
+    pub(crate) removed: usize,
+    pub(crate) failed: Vec<String>,
 }
 
 impl RepairHistoryPageState {
@@ -117,6 +134,8 @@ impl RepairHistoryPageState {
             undo_running: false,
             undo_outcome: None,
             undo_error: None,
+            clear_confirm: None,
+            clear_outcome: None,
         };
         state.refresh();
         state
@@ -291,6 +310,67 @@ impl RepairHistoryPageState {
             }
         }
     }
+
+    /// The transactions "Clear completed history" would remove: every one
+    /// [`RenameTransaction::is_rollbackable`] reports as *not* rollbackable
+    /// - the exact same core predicate `can_undo` already trusts, just
+    /// inverted. This never touches a transaction that still has applied
+    /// entries awaiting rollback, or one left interrupted by a crash and
+    /// needing recovery; both remain `is_rollbackable() == true` and are
+    /// never included here (2026-08-22, live-QA Phase 8).
+    pub(crate) fn clearable_transaction_ids(&self) -> Vec<String> {
+        self.transactions
+            .iter()
+            .filter(|transaction| !transaction.is_rollbackable())
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect()
+    }
+
+    /// Opens the "Clear completed history" confirmation, freezing exactly
+    /// which transaction ids will be removed. A no-op when there is nothing
+    /// clearable.
+    pub(crate) fn open_clear_confirmation(&mut self) {
+        let ids = self.clearable_transaction_ids();
+        if ids.is_empty() {
+            return;
+        }
+        self.clear_confirm = Some(ids);
+    }
+
+    /// Dismisses the "Clear completed history" confirmation without
+    /// removing anything.
+    pub(crate) fn cancel_clear_confirmation(&mut self) {
+        self.clear_confirm = None;
+    }
+
+    /// Removes exactly the frozen set of journals from the confirmation,
+    /// re-checking each one is still not rollbackable immediately before
+    /// deleting it (in case something changed the on-disk state since the
+    /// dialog opened - e.g. another process). Always refreshes from disk
+    /// afterward.
+    pub(crate) fn confirm_clear(&mut self) {
+        let Some(ids) = self.clear_confirm.take() else {
+            return;
+        };
+        let mut outcome = ClearHistoryOutcome::default();
+        for transaction_id in &ids {
+            let still_safe = self
+                .transaction_by_id(transaction_id)
+                .is_none_or(|transaction| !transaction.is_rollbackable());
+            if !still_safe {
+                outcome
+                    .failed
+                    .push(format!("{transaction_id}: no longer safe to remove"));
+                continue;
+            }
+            match remove_journal(&self.journal_dir, transaction_id) {
+                Ok(()) => outcome.removed += 1,
+                Err(error) => outcome.failed.push(format!("{transaction_id}: {error}")),
+            }
+        }
+        self.clear_outcome = Some(outcome);
+        self.refresh();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +520,7 @@ pub(crate) fn show_repair_history_page(
     );
 
     show_undo_confirmation_dialog(ui, state);
+    show_clear_confirmation_dialog(ui, state);
 
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
@@ -447,6 +528,22 @@ pub(crate) fn show_repair_history_page(
                 .clicked()
             {
                 state.refresh();
+            }
+            let clearable = state.clearable_transaction_ids();
+            if widgets::action_button(
+                ui,
+                "Clear completed history",
+                widgets::ActionStyle::Secondary,
+                !clearable.is_empty(),
+            )
+            .on_hover_text(
+                "Removes only transactions with nothing left to undo - already rolled back, or \
+                 never actually changed anything on disk. A transaction with applied changes \
+                 still awaiting rollback is never touched.",
+            )
+            .clicked()
+            {
+                state.open_clear_confirmation();
             }
             ui.label(
                 egui::RichText::new(format!("{} transaction(s)", state.transactions.len()))
@@ -461,6 +558,31 @@ pub(crate) fn show_repair_history_page(
             .color(theme::muted(ui)),
         );
     });
+
+    if let Some(outcome) = &state.clear_outcome {
+        ui.add_space(6.0);
+        if outcome.failed.is_empty() {
+            widgets::banner(
+                ui,
+                "History cleared",
+                &format!(
+                    "{} transaction{} with nothing left to undo {} removed.",
+                    outcome.removed,
+                    if outcome.removed == 1 { "" } else { "s" },
+                    if outcome.removed == 1 { "was" } else { "were" }
+                ),
+                widgets::StatusTone::Success,
+            );
+        } else {
+            widgets::failure_summary(
+                ui,
+                "clear_history_result",
+                "Some history could not be cleared",
+                Some("Anything not removed is left exactly as it was."),
+                &outcome.failed.join("\n"),
+            );
+        }
+    }
 
     if !state.load_problems.is_empty() {
         ui.add_space(6.0);
@@ -798,6 +920,74 @@ fn show_undo_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistoryPag
         state.cancel_undo_confirmation();
     } else if undo_clicked {
         state.confirm_undo();
+    }
+}
+
+/// The "Clear completed history" confirmation dialog. A no-op draw when
+/// nothing is pending. Names exactly which transactions will be removed -
+/// the frozen ids from [`RepairHistoryPageState::open_clear_confirmation`] -
+/// and states plainly what "safe to remove" means here, since "clear
+/// history" could otherwise be misread as touching anything still
+/// recoverable.
+fn show_clear_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistoryPageState) {
+    let Some(ids) = state.clear_confirm.clone() else {
+        return;
+    };
+    let mut cancel_clicked = false;
+    let mut clear_clicked = false;
+    let mut open = true;
+
+    egui::Window::new("Clear completed history?")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} transaction{} will be removed from history",
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
+                ))
+                .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Only transactions that were already rolled back, or that never actually \
+                     changed anything on disk, are included. Nothing with an applied change \
+                     still awaiting rollback, or left interrupted, is ever removed - this never \
+                     touches ROM files themselves, only the history record.",
+                )
+                .color(theme::muted(ui)),
+            );
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for id in &ids {
+                        ui.label(egui::RichText::new(id).monospace().small());
+                    }
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Cancel")).clicked() {
+                    cancel_clicked = true;
+                }
+                if ui
+                    .add(egui::Button::new("Clear completed history").fill(theme::DANGER))
+                    .clicked()
+                {
+                    clear_clicked = true;
+                }
+            });
+        });
+
+    if cancel_clicked || !open {
+        state.cancel_clear_confirmation();
+    } else if clear_clicked {
+        state.confirm_clear();
     }
 }
 

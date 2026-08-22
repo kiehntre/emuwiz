@@ -72,6 +72,7 @@ mod romm_dispatch_tests {
                     token_path: None,
                 },
                 page_size: Some(100),
+                import_timeout_seconds: None,
             },
             status,
             artwork: ArtworkCacheStats {
@@ -1705,6 +1706,11 @@ mod romm_dispatch_tests {
             verification: ExternalVerification::StrongExternal,
             conflicts: Vec::new(),
             evidence: Vec::new(),
+            synopsis: None,
+            genres: Vec::new(),
+            players: None,
+            rating: None,
+            release_year: None,
         };
         let cache = IdentityCache {
             format_version: CACHE_FORMAT_VERSION,

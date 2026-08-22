@@ -313,6 +313,148 @@ fn undo_is_disabled_for_an_unknown_transaction_id() {
     assert!(!state.can_undo("does-not-exist"));
 }
 
+// --- clear completed history ---------------------------------------------
+
+/// A rolled-back transaction and one that never actually applied anything
+/// are both safe to clear; a settled `Applied` transaction still awaiting
+/// rollback, and one left interrupted mid-apply, are not - `is_rollbackable`
+/// is `true` for both of those, so `clearable_transaction_ids` must exclude
+/// them (2026-08-22, live-QA Phase 8).
+#[test]
+fn clearable_ids_include_only_transactions_that_are_not_rollbackable() {
+    let dir = TestDir::new("clearable-ids");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+
+    let rolled_back = bare_transaction(
+        "rolled-back",
+        TransactionState::RolledBack,
+        EntryState::RolledBack,
+    );
+    let never_applied = bare_transaction(
+        "never-applied",
+        TransactionState::Applied,
+        EntryState::Planned,
+    );
+    let still_applied = bare_transaction(
+        "still-applied",
+        TransactionState::Applied,
+        EntryState::Applied,
+    );
+    let interrupted = bare_transaction(
+        "interrupted",
+        TransactionState::Applying,
+        EntryState::Applying,
+    );
+    for transaction in [&rolled_back, &never_applied, &still_applied, &interrupted] {
+        archivefs_core::dat::rename_apply::write_journal(&journal_dir, transaction).unwrap();
+    }
+
+    let state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    let mut clearable = state.clearable_transaction_ids();
+    clearable.sort();
+    assert_eq!(clearable, vec!["never-applied", "rolled-back"]);
+}
+
+#[test]
+fn confirming_clear_removes_only_the_frozen_ids_and_leaves_the_rest() {
+    let dir = TestDir::new("confirm-clear");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+
+    let rolled_back = bare_transaction(
+        "rolled-back",
+        TransactionState::RolledBack,
+        EntryState::RolledBack,
+    );
+    let still_applied = bare_transaction(
+        "still-applied",
+        TransactionState::Applied,
+        EntryState::Applied,
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &rolled_back).unwrap();
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &still_applied).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir.clone());
+    state.open_clear_confirmation();
+    assert_eq!(
+        state.clear_confirm.as_deref(),
+        Some(["rolled-back".to_string()].as_slice())
+    );
+    state.confirm_clear();
+
+    assert!(state.clear_confirm.is_none());
+    let outcome = state
+        .clear_outcome
+        .as_ref()
+        .expect("an outcome is recorded");
+    assert_eq!(outcome.removed, 1);
+    assert!(outcome.failed.is_empty());
+
+    // Re-read fresh from disk, not the in-memory state, to prove the file
+    // was actually removed and the other journal was actually left alone.
+    let (remaining, _problems) = archivefs_core::dat::rename_apply::list_journals(&journal_dir);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].transaction_id, "still-applied");
+}
+
+#[test]
+fn opening_the_clear_confirmation_is_a_no_op_when_nothing_is_clearable() {
+    let dir = TestDir::new("clear-noop");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let still_applied = bare_transaction(
+        "still-applied",
+        TransactionState::Applied,
+        EntryState::Applied,
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &still_applied).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    state.open_clear_confirmation();
+    assert!(state.clear_confirm.is_none());
+}
+
+#[test]
+fn cancelling_the_clear_confirmation_never_touches_the_filesystem() {
+    let dir = TestDir::new("clear-cancel");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let rolled_back = bare_transaction(
+        "rolled-back",
+        TransactionState::RolledBack,
+        EntryState::RolledBack,
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &rolled_back).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir.clone());
+    state.open_clear_confirmation();
+    assert!(state.clear_confirm.is_some());
+    state.cancel_clear_confirmation();
+    assert!(state.clear_confirm.is_none());
+    assert!(state.clear_outcome.is_none());
+
+    let (remaining, _problems) = archivefs_core::dat::rename_apply::list_journals(&journal_dir);
+    assert_eq!(remaining.len(), 1, "cancelling must not remove anything");
+}
+
+#[test]
+fn the_clear_history_button_and_dialog_render_with_plain_wording() {
+    let dir = TestDir::new("clear-render");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let rolled_back = bare_transaction(
+        "rolled-back",
+        TransactionState::RolledBack,
+        EntryState::RolledBack,
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &rolled_back).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    let output = render(&mut state);
+    assert!(rendered_text_contains(&output, "Clear completed history"));
+}
+
 /// A minimal, hand-built transaction for enable-rule tests that do not need
 /// a real applied file on disk.
 fn bare_transaction(
@@ -555,6 +697,8 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         undo_running: false,
         undo_outcome: None,
         undo_error: None,
+        clear_confirm: None,
+        clear_outcome: None,
     };
 
     let output = render(&mut state);
@@ -591,6 +735,8 @@ fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
         undo_running: false,
         undo_outcome: None,
         undo_error: None,
+        clear_confirm: None,
+        clear_outcome: None,
     };
     let mut clipboard = NoopClipboard::default();
     render_with_clipboard(&mut state, &mut clipboard);
