@@ -395,8 +395,12 @@ pub fn diagnose_gamecube_cheat_code_format(
                 .to_string()
         }
         GameCubeCodeFormat::Unsupported => {
-            "one or more lines did not match the well-formed 8-hex/8-hex code line shape"
-                .to_string()
+            if cheat.code_lines.is_empty() {
+                "provider record has no code lines and was skipped".to_string()
+            } else {
+                "one or more lines did not match the well-formed 8-hex/8-hex code line shape"
+                    .to_string()
+            }
         }
     };
     GameCubeCheatCodeDiagnostic {

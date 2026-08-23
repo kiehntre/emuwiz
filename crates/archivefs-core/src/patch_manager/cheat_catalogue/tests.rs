@@ -296,14 +296,10 @@ fn retroarch_cht_folder_platform_alias_matches_canonical_catalogue_platform() {
     );
 }
 
-/// A stray line with no `=` alongside an otherwise-valid `cheatN_*` entry
-/// must NOT exclude the whole file (2026-08-23, real-corpus audit: 85 of
-/// 28,308 real files had exactly this shape - hand-edit debris like a bare
-/// `false`, a stray quote, or an orphaned continuation line next to
-/// genuinely usable cheat entries). The stray line is skipped and recorded
-/// as a warning diagnostic on the record instead.
+/// A stray line beside metadata-only `cheatN_*` fields is not a usable
+/// candidate: no non-empty code can be selected or installed safely.
 #[test]
-fn malformed_line_is_skipped_but_file_is_still_indexed() {
+fn malformed_line_with_no_code_is_excluded_from_installable_candidates() {
     let root = temp_root("malformed-cht");
     fs::write(
         root.join("Game.cht"),
@@ -311,21 +307,9 @@ fn malformed_line_is_skipped_but_file_is_still_indexed() {
     )
     .unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
-    assert!(snapshot.complete);
-    assert_eq!(snapshot.index_state, CatalogueIndexState::Complete);
-    assert!(snapshot.excluded_entries.is_empty());
-    assert_eq!(snapshot.games.len(), 1);
-    let game = &snapshot.games[0];
-    assert_eq!(game.source_game_name, "Game");
-    assert_eq!(game.cheat_count, 1);
-    assert!(game.parsing_complete);
-    assert!(
-        game.parsing_diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "catalogue_cht_malformed_line"),
-        "the stray line must still surface as a warning diagnostic: {:?}",
-        game.parsing_diagnostics
-    );
+    assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
+    assert!(snapshot.games.is_empty());
+    assert_eq!(snapshot.excluded_malformed_count(), 1);
 }
 
 /// A `cheats=N` header that disagrees with the actual number of `cheatN_...`
@@ -424,11 +408,10 @@ fn invalid_utf8_content_without_usable_entries_is_excluded_without_poisoning_val
 // P0/P1/P2 real-corpus compatibility fixes (2026-08-23)
 // ---------------------------------------------------------------------
 
-/// An isolated stray line with no `=` is skipped (as a warning), and the
-/// file is still indexed off its real `cheatN_*` entries. Covers the "bare
-/// `false`" / stray-token shape seen in the real corpus.
+/// An isolated stray line is likewise fatal to this incomplete record when
+/// no non-empty `cheatN_code` is present.
 #[test]
-fn stray_line_without_equals_is_skipped_but_file_indexed() {
+fn stray_line_without_code_is_excluded() {
     let root = temp_root("stray-line-without-equals");
     fs::write(
         root.join("Game.cht"),
@@ -436,11 +419,9 @@ fn stray_line_without_equals_is_skipped_but_file_indexed() {
     )
     .unwrap();
     let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
-    assert!(snapshot.complete);
-    assert!(snapshot.excluded_entries.is_empty());
-    assert_eq!(snapshot.games.len(), 1);
-    assert_eq!(snapshot.games[0].cheat_count, 1);
-    assert!(snapshot.games[0].cheats[0].enabled_by_default);
+    assert_eq!(snapshot.index_state, CatalogueIndexState::UsablePartial);
+    assert!(snapshot.games.is_empty());
+    assert_eq!(snapshot.excluded_malformed_count(), 1);
 }
 
 /// A file with only stray/malformed lines and zero real `cheatN_*` entries

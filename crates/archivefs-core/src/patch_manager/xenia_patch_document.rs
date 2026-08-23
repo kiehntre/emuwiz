@@ -195,6 +195,28 @@ impl XeniaPatchDocument {
             .filter(|patch| patch.is_selectable())
             .count()
     }
+
+    /// Re-rendering an existing destination is safe only when the strict
+    /// parser represented every patch-bearing part of it. Warnings that
+    /// mean source patch data was rejected, truncated, ambiguous, or cannot
+    /// be reproduced verbatim block the rewrite; missing optional metadata
+    /// and a deliberately empty patch list do not.
+    #[must_use]
+    pub fn has_rewrite_blocking_warnings(&self) -> bool {
+        self.is_fatally_malformed()
+            || self.warnings.iter().any(|warning| {
+                matches!(
+                    warning.kind,
+                    XeniaDocumentWarningKind::InvalidTitleId
+                        | XeniaDocumentWarningKind::InvalidHash
+                        | XeniaDocumentWarningKind::InvalidMediaId
+                        | XeniaDocumentWarningKind::DuplicatePatchName
+                        | XeniaDocumentWarningKind::ParseError
+                        | XeniaDocumentWarningKind::TooManyPatches
+                )
+            })
+            || self.patches.iter().any(XeniaPatch::has_blocking_warning)
+    }
 }
 
 fn document_warning(
@@ -456,6 +478,11 @@ fn parse_patch_entry(table: &toml::Table) -> XeniaPatch {
                             XeniaPatchWarningKind::DuplicateWrite,
                             format!("duplicate write at address 0x{:08x}", write.address),
                         ));
+                        // A duplicate address is ambiguous: do not retain a
+                        // second write and hope the target applies a
+                        // particular ordering. The patch is blocked by its
+                        // warning, while neighbouring patches remain usable.
+                        continue;
                     }
                     writes.push(write);
                 }
