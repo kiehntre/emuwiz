@@ -52,6 +52,13 @@ pub use inspector::{
 
 pub mod game_identity;
 
+mod library_view_history;
+pub use library_view_history::{
+    LIBRARY_VIEW_HISTORY_SCHEMA_VERSION, LibraryViewHistoryEntry, LibraryViewHistoryOperation,
+    LibraryViewHistoryRecord, default_library_view_history_dir, library_view_history_dir,
+    list_library_view_history_at, list_library_view_history_default,
+    load_library_view_history_record,
+};
 mod library_views;
 pub use library_views::{
     FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,

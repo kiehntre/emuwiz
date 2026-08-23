@@ -1818,6 +1818,15 @@ pub struct LibraryViewApplyReport {
     pub unchanged: usize,
     pub failed: usize,
     pub results: Vec<LibraryViewApplyEntryResult>,
+    /// `Some` only when this operation's symlink/manifest work already
+    /// completed successfully but the separate, best-effort durable
+    /// history record for it (`crate::library_view_history`) could not be
+    /// written. Never turns a successful apply/remove into an error and
+    /// never rolls anything back - the filesystem/manifest changes above
+    /// already happened - this field exists purely so that failure is
+    /// still surfaced honestly instead of silently swallowed.
+    #[serde(default)]
+    pub history_warning: Option<String>,
 }
 
 /// Applies a previously computed `plan` for `view`: creates/repairs managed
@@ -1872,6 +1881,7 @@ pub fn apply_library_view(
         unchanged: 0,
         failed: 0,
         results: Vec::new(),
+        history_warning: None,
     };
     let now = now_utc_string();
 
@@ -2076,8 +2086,48 @@ pub fn apply_library_view(
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
+    record_apply_history(view, data_dir, plan, &mut report);
 
     Ok(report)
+}
+
+/// Records a durable history entry for an apply/repair that has already
+/// completed (the manifest above is already saved) - purely additive,
+/// never able to affect `report`'s created/repaired/removed/unchanged/
+/// failed counts, which already reflect what actually happened to the
+/// filesystem. A history-write failure only ever sets
+/// `report.history_warning`; it never turns a successful apply into an
+/// `Err` and never touches the manifest or symlinks again.
+fn record_apply_history(
+    view: &LibraryViewConfig,
+    data_dir: &Path,
+    plan: &LibraryViewPlan,
+    report: &mut LibraryViewApplyReport,
+) {
+    let manifest_path = library_view_manifest_path(data_dir, &view.id);
+    let context = crate::library_view_history::LibraryViewHistoryContext {
+        view_id: &view.id,
+        view_name: &view.name,
+        profile_kind: view.profile.kind,
+        destination_root: &view.destination_root,
+        manifest_path: &manifest_path,
+        planned_count: plan.entries.len(),
+        skipped_or_collision: Some(plan.counts.skip + plan.counts.collision),
+    };
+    if let Err(error) = crate::library_view_history::record_library_view_operation(
+        data_dir,
+        crate::library_view_history::LibraryViewHistoryOperation::Apply,
+        context,
+        report,
+    ) {
+        let message = format!(
+            "library view '{}' was applied successfully, but its history record could not be \
+             written: {error}",
+            view.id
+        );
+        log::warn!("{message}");
+        report.history_warning = Some(message);
+    }
 }
 
 /// Repairs `view`: identical to `apply_library_view`. Re-running the full
@@ -2118,6 +2168,7 @@ pub fn remove_library_view_symlinks(
         unchanged: 0,
         failed: 0,
         results: Vec::new(),
+        history_warning: None,
     };
     let mut remaining: Vec<LibraryViewManifestEntry> = Vec::new();
 
@@ -2175,8 +2226,45 @@ pub fn remove_library_view_symlinks(
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
+    record_remove_history(view, data_dir, manifest.entries.len(), &mut report);
 
     Ok(report)
+}
+
+/// Records a durable history entry for a removal that has already
+/// completed (the manifest above is already saved) - see
+/// `record_apply_history`'s doc comment for the same failure semantics,
+/// applied here to Remove instead of Apply.
+fn record_remove_history(
+    view: &LibraryViewConfig,
+    data_dir: &Path,
+    planned_count: usize,
+    report: &mut LibraryViewApplyReport,
+) {
+    let manifest_path = library_view_manifest_path(data_dir, &view.id);
+    let context = crate::library_view_history::LibraryViewHistoryContext {
+        view_id: &view.id,
+        view_name: &view.name,
+        profile_kind: view.profile.kind,
+        destination_root: &view.destination_root,
+        manifest_path: &manifest_path,
+        planned_count,
+        skipped_or_collision: None,
+    };
+    if let Err(error) = crate::library_view_history::record_library_view_operation(
+        data_dir,
+        crate::library_view_history::LibraryViewHistoryOperation::Remove,
+        context,
+        report,
+    ) {
+        let message = format!(
+            "library view '{}' was removed successfully, but its history record could not be \
+             written: {error}",
+            view.id
+        );
+        log::warn!("{message}");
+        report.history_warning = Some(message);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -6804,5 +6892,247 @@ mod tests {
             fs::read_dir(&outside_dir).unwrap().next().is_none(),
             "the escape target must remain completely untouched"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Library View apply/removal history.
+    // -------------------------------------------------------------
+
+    mod history_integration {
+        use super::*;
+        use crate::{
+            LibraryViewHistoryEntry, LibraryViewHistoryOperation, library_view_history_dir,
+            list_library_view_history_at,
+        };
+
+        fn history_records(data_dir: &Path) -> Vec<crate::LibraryViewHistoryRecord> {
+            list_library_view_history_at(&library_view_history_dir(data_dir), 100)
+                .into_iter()
+                .map(|entry| match entry {
+                    LibraryViewHistoryEntry::Record { record, .. } => record,
+                    LibraryViewHistoryEntry::Malformed { path, error } => {
+                        panic!("unexpected malformed history record at {path:?}: {error}")
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn successful_apply_writes_a_history_record() {
+            let root = temp_dir("history-apply-writes-record");
+            let source_dir = root.join("source");
+            let archive_path = source_dir.join("Game.zip");
+            write_file(&archive_path, b"original-rom-bytes");
+            let original_bytes = fs::read(&archive_path).unwrap();
+            let destination = root.join("dest");
+            let data_dir = root.join("data");
+
+            let source = make_source(1, &source_dir);
+            let archive = make_archive(1, 1, &archive_path, Some("NES"));
+            let view = make_view("view-1", &destination, vec![], vec![]);
+            let manifest = empty_manifest(&view.id, &destination);
+
+            let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+            let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+            assert_eq!(report.created, 1);
+            assert_eq!(
+                report.history_warning, None,
+                "a healthy history directory must never produce a warning"
+            );
+
+            let records = history_records(&data_dir);
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.operation, LibraryViewHistoryOperation::Apply);
+            assert_eq!(record.view_id, view.id);
+            assert_eq!(record.view_name, view.name);
+            assert_eq!(record.destination_root, destination.display().to_string());
+            assert_eq!(
+                record.manifest_path,
+                library_view_manifest_path(&data_dir, &view.id)
+                    .display()
+                    .to_string()
+            );
+            assert_eq!(record.created, 1);
+            assert_eq!(record.failed, 0);
+            assert!(record.success);
+            assert_eq!(
+                record.schema_version,
+                crate::LIBRARY_VIEW_HISTORY_SCHEMA_VERSION
+            );
+
+            // The manifest itself must be exactly what a plain apply (with
+            // no history involved) would have written - the history hook
+            // must never alter apply/manifest semantics.
+            let reloaded_manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+            assert_eq!(reloaded_manifest.entries.len(), 1);
+
+            // No original ROM file content may ever be touched.
+            assert_eq!(fs::read(&archive_path).unwrap(), original_bytes);
+        }
+
+        #[test]
+        fn successful_remove_writes_a_history_record() {
+            let root = temp_dir("history-remove-writes-record");
+            let source_dir = root.join("source");
+            let archive_path = source_dir.join("Game.zip");
+            write_file(&archive_path, b"original-rom-bytes");
+            let original_bytes = fs::read(&archive_path).unwrap();
+            let destination = root.join("dest");
+            let data_dir = root.join("data");
+
+            let source = make_source(1, &source_dir);
+            let archive = make_archive(1, 1, &archive_path, Some("NES"));
+            let view = make_view("view-1", &destination, vec![], vec![]);
+            let manifest = empty_manifest(&view.id, &destination);
+
+            let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+            apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+            let applied_manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+            let remove_report =
+                remove_library_view_symlinks(&view, &applied_manifest, &data_dir).unwrap();
+            assert_eq!(remove_report.removed, 1);
+            assert_eq!(remove_report.history_warning, None);
+
+            let records = history_records(&data_dir);
+            assert_eq!(
+                records.len(),
+                2,
+                "apply and remove must each append their own record, never replace one another"
+            );
+            let remove_record = records
+                .iter()
+                .find(|record| record.operation == LibraryViewHistoryOperation::Remove)
+                .expect("a Remove record must exist");
+            assert_eq!(remove_record.view_id, view.id);
+            assert_eq!(remove_record.removed, 1);
+            assert_eq!(remove_record.planned_count, 1);
+            assert!(remove_record.success);
+            assert_eq!(
+                remove_record.destination_root,
+                destination.display().to_string()
+            );
+
+            assert_eq!(fs::read(&archive_path).unwrap(), original_bytes);
+        }
+
+        #[test]
+        fn repeated_applies_append_rather_than_replace_history() {
+            let root = temp_dir("history-append-not-replace");
+            let source_dir = root.join("source");
+            let archive_path = source_dir.join("Game.zip");
+            write_file(&archive_path, b"zip-bytes");
+            let destination = root.join("dest");
+            let data_dir = root.join("data");
+
+            let source = make_source(1, &source_dir);
+            let archive = make_archive(1, 1, &archive_path, Some("NES"));
+            let view = make_view("view-1", &destination, vec![], vec![]);
+
+            let mut manifest = empty_manifest(&view.id, &destination);
+            for _ in 0..3 {
+                let plan = plan_library_view(
+                    &view,
+                    std::slice::from_ref(&archive),
+                    std::slice::from_ref(&source),
+                    &manifest,
+                    None,
+                );
+                apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+                manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+            }
+
+            let records = history_records(&data_dir);
+            assert_eq!(
+                records.len(),
+                3,
+                "three separate apply calls must produce three separate records"
+            );
+            for record in &records {
+                assert_eq!(record.operation, LibraryViewHistoryOperation::Apply);
+                assert_eq!(record.view_id, view.id);
+            }
+        }
+
+        #[test]
+        fn malformed_old_history_file_does_not_hide_a_new_valid_record() {
+            let root = temp_dir("history-malformed-tolerant");
+            let source_dir = root.join("source");
+            let archive_path = source_dir.join("Game.zip");
+            write_file(&archive_path, b"zip-bytes");
+            let destination = root.join("dest");
+            let data_dir = root.join("data");
+            let history_dir = library_view_history_dir(&data_dir);
+            fs::create_dir_all(&history_dir).unwrap();
+            fs::write(history_dir.join("0-corrupt.json"), b"not json at all").unwrap();
+
+            let source = make_source(1, &source_dir);
+            let archive = make_archive(1, 1, &archive_path, Some("NES"));
+            let view = make_view("view-1", &destination, vec![], vec![]);
+            let manifest = empty_manifest(&view.id, &destination);
+
+            let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+            let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+            assert_eq!(report.created, 1);
+            assert_eq!(report.history_warning, None);
+
+            let entries = list_library_view_history_at(&history_dir, 100);
+            let valid: Vec<_> = entries
+                .iter()
+                .filter(|entry| matches!(entry, LibraryViewHistoryEntry::Record { .. }))
+                .collect();
+            let malformed: Vec<_> = entries
+                .iter()
+                .filter(|entry| matches!(entry, LibraryViewHistoryEntry::Malformed { .. }))
+                .collect();
+            assert_eq!(
+                valid.len(),
+                1,
+                "the newly written record must still be listed despite the corrupt neighbour"
+            );
+            assert_eq!(malformed.len(), 1);
+        }
+
+        #[test]
+        fn history_write_failure_never_rolls_back_an_already_completed_apply() {
+            let root = temp_dir("history-write-failure-honest");
+            let source_dir = root.join("source");
+            let archive_path = source_dir.join("Game.zip");
+            write_file(&archive_path, b"zip-bytes");
+            let destination = root.join("dest");
+            let data_dir = root.join("data");
+            fs::create_dir_all(&data_dir).unwrap();
+            // Block the history directory with a plain file, so
+            // `write_record_atomically`'s `create_dir_all` fails.
+            let history_dir = library_view_history_dir(&data_dir);
+            write_file(&history_dir, b"not a directory");
+
+            let source = make_source(1, &source_dir);
+            let archive = make_archive(1, 1, &archive_path, Some("NES"));
+            let view = make_view("view-1", &destination, vec![], vec![]);
+            let manifest = empty_manifest(&view.id, &destination);
+
+            let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+            let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+
+            assert_eq!(
+                report.created, 1,
+                "the symlink apply itself must succeed regardless of history failure"
+            );
+            let link_path = destination.join("NES/Game.zip");
+            assert_eq!(fs::read_link(&link_path).unwrap(), archive_path);
+            assert!(
+                report.history_warning.is_some(),
+                "a history write failure must be surfaced honestly, not silently dropped"
+            );
+
+            let reloaded_manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+            assert_eq!(
+                reloaded_manifest.entries.len(),
+                1,
+                "the manifest write must be entirely unaffected by the history failure"
+            );
+        }
     }
 }
