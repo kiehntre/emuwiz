@@ -1086,6 +1086,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         remembered_emulator_profiles: Vec::new(),
         cheat_workflow: None,
         dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+        launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
         cheat_archive_picker: None,
         confirm_cheat_archive_change: None,
         confirm_unmount_all: None,

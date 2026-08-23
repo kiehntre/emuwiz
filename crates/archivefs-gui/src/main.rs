@@ -3737,6 +3737,12 @@ struct ArchiveFsApp {
     /// never reuses state describing a different game or profile. See
     /// `dolphin_texture_mod_page`'s own module doc comment.
     dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState,
+    /// The Launch Readiness panel's "Launch RetroArch" tracker - see
+    /// `launch_readiness_page`'s own module doc comment. Deliberately not
+    /// reset on archive/page navigation: a running or just-exited process
+    /// must still be reaped/shown correctly even after the user selects a
+    /// different game.
+    launch_retroarch: launch_readiness_page::RetroArchLaunchState,
     /// A tentative archive choice is isolated here until the picker is
     /// applied. It never mutates Library focus or multi-selection.
     cheat_archive_picker: Option<CheatArchivePickerState>,
@@ -4271,6 +4277,7 @@ impl ArchiveFsApp {
                 .unwrap_or_default(),
             cheat_workflow: None,
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+            launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
@@ -16001,9 +16008,18 @@ impl ArchiveFsApp {
                     };
                     let launch_readiness_input =
                         self.build_launch_readiness_input(live_for_launch_readiness);
+                    // Drained before the panel renders, and unconditionally
+                    // (not just while a match displays), so a tracked
+                    // launch is still reaped after the user selects a
+                    // different game - see `launch_retroarch`'s own doc
+                    // comment.
+                    if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
+                        ui.ctx().request_repaint();
+                    }
                     launch_readiness_page::show_launch_readiness_panel(
                         ui,
                         &launch_readiness_input,
+                        &mut self.launch_retroarch,
                     );
                     ui.add_space(crate::ui::theme::SECTION_GAP);
                     let identity_sources_action = identity_sources_page::show_identity_sources_panel(
