@@ -44,6 +44,7 @@
 //! module implements the first slice of.
 
 pub mod input_projection;
+pub mod integration;
 pub mod planning;
 pub mod platform_map;
 pub mod readiness;
@@ -57,6 +58,9 @@ pub use input_projection::{
     project_duckstation_launch_input, project_flycast_launch_input, project_hatari_launch_input,
     project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
     project_xemu_launch_input, project_xenia_launch_input,
+};
+pub use integration::{
+    DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,
 };
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
