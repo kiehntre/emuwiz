@@ -979,3 +979,8 @@ pub mod plan_transaction;
 /// full thesis; nothing in it changes existing evidence/identity or
 /// transaction behavior.
 pub mod evidence_lineage;
+
+/// Conservative MAMERedump/Redump CHD evidence bridge. It uses only a CHD
+/// header's combined SHA-1 and an already-indexed MAMERedump disk declaration;
+/// it deliberately has no track-SHA1-to-CHD crosswalk.
+pub mod mame_redump_bridge;

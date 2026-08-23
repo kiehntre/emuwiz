@@ -382,7 +382,7 @@ pub fn group_by_lineage(observations: &[EvidenceObservation]) -> Vec<LineageGrou
             unknown_singles.push(observation);
         } else {
             known
-                .entry(observation.provenance.upstream_source)
+                .entry(lineage_root(observation.provenance.upstream_source))
                 .or_default()
                 .push(observation);
         }
@@ -429,6 +429,22 @@ enum LineageLane {
     LocalStructuralOrigin,
 }
 
+/// Returns the reviewed upstream root for a source family.  The registry is
+/// intentionally finite and reviewed, but the bounded loop still prevents a
+/// future accidental cycle from making evidence grouping non-terminating.
+fn lineage_root(mut family: SourceFamily) -> SourceFamily {
+    // The reviewed registry is currently one edge deep. Keep the guard
+    // comfortably above that so adding a finite chain remains safe, while a
+    // mistaken future cycle cannot loop forever.
+    for _ in 0..16 {
+        let Some(parent) = known_derivation(family) else {
+            break;
+        };
+        family = parent;
+    }
+    family
+}
+
 /// `None` means "excluded from independence accounting" - either a
 /// genuinely `Unknown` external source, or an observation whose
 /// [`LineageRelation`] is itself `Unknown`/non-independent. See
@@ -442,7 +458,9 @@ fn lineage_lane(observation: &EvidenceObservation) -> Option<LineageLane> {
     if observation.provenance.upstream_source == SourceFamily::Unknown {
         return None;
     }
-    Some(LineageLane::Family(observation.provenance.upstream_source))
+    Some(LineageLane::Family(lineage_root(
+        observation.provenance.upstream_source,
+    )))
 }
 
 /// How many *independent, trustworthy evidence lanes* are represented,
@@ -629,6 +647,12 @@ fn classify_group(claim: ClaimType, group: &[EvidenceObservation]) -> AgreementS
     let agree = values.len() <= 1;
 
     if agree {
+        if any_derived {
+            // A derivative agrees with its root, but is not a second
+            // independent preservation vote.  Keep the derived status so
+            // callers can explain that relationship explicitly.
+            return AgreementStatus::DerivedAgreement;
+        }
         if lanes.len() <= 1 {
             // One shared, trustworthy lane (possibly via several
             // channels), or nothing but genuinely-unknown observations
@@ -640,19 +664,19 @@ fn classify_group(claim: ClaimType, group: &[EvidenceObservation]) -> AgreementS
                 AgreementStatus::SameSourceAgreement
             };
         }
-        if any_derived {
-            return AgreementStatus::DerivedAgreement;
-        }
         if cross_representation {
             return AgreementStatus::CrossRepresentationAgreement;
         }
         AgreementStatus::IndependentAgreement
     } else {
+        if any_derived {
+            // Check this before same-root handling: Redump versus its MAME
+            // derivative is still a real, visible conflict, not merely two
+            // revisions of one directly observed delivery.
+            return AgreementStatus::DerivedSourceConflict;
+        }
         if lanes.len() <= 1 && !any_unknown_lineage {
             return AgreementStatus::SameSourceVersionConflict;
-        }
-        if any_derived {
-            return AgreementStatus::DerivedSourceConflict;
         }
         if metadata_only_claim(claim) {
             return AgreementStatus::MetadataConflict;

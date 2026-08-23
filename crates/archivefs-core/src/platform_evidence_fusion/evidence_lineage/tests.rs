@@ -199,9 +199,10 @@ fn test_04_redump_plus_mameredump_plus_romm_bool_retains_lineage_no_double_count
         5,
         "five observations, none dropped"
     );
-    assert!(
-        independent_source_group_count(&summaries[0].observations) <= 2,
-        "Redump + MAMERedump is at most two lineages, never five"
+    assert_eq!(
+        independent_source_group_count(&summaries[0].observations),
+        1,
+        "Redump + MAMERedump share one upstream lineage root (Redump), never two and never five"
     );
     // Agreeing values across a direct source and its known derivative:
     // DerivedAgreement, not five independent votes.
@@ -877,6 +878,90 @@ fn group_by_lineage_groups_known_families_together() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].source_family, SourceFamily::NoIntro);
     assert_eq!(groups[0].observations.len(), 2);
+}
+
+#[test]
+fn group_by_lineage_collapses_mameredump_into_its_redump_root() {
+    let direct_redump = obs(
+        EvidenceChannel::LocalRedump,
+        SourceFamily::Redump,
+        LineageRelation::Independent,
+        Representation::DiscTrack,
+        ClaimType::ExactTrackMatch,
+        Some("t1"),
+    );
+    let derived_mame_redump = obs(
+        EvidenceChannel::LocalMame,
+        SourceFamily::MAMERedump,
+        LineageRelation::DerivedFrom,
+        Representation::LogicalChd,
+        ClaimType::ExactLogicalDiscMatch,
+        Some("chd-1"),
+    );
+    let groups = group_by_lineage(&[direct_redump, derived_mame_redump]);
+    assert_eq!(
+        groups.len(),
+        1,
+        "Redump and its MAMERedump derivative share one upstream lineage root"
+    );
+    assert_eq!(groups[0].source_family, SourceFamily::Redump);
+    assert_eq!(groups[0].observations.len(), 2);
+}
+
+#[test]
+fn single_mameredump_derived_source_agreement_is_derived_agreement_not_same_source_agreement() {
+    // Only one lineage lane is present here (both observations are
+    // MAMERedump, and MAMERedump's `lineage_root` is Redump) - exactly the
+    // shape that `lanes.len() <= 1` would misclassify as `SameSourceAgreement`
+    // if the derived check were not tried first.
+    let local = obs(
+        EvidenceChannel::LocalMame,
+        SourceFamily::MAMERedump,
+        LineageRelation::DerivedFrom,
+        Representation::LogicalChd,
+        ClaimType::ExactLogicalDiscMatch,
+        Some("chd-1"),
+    );
+    let relayed = hasheous_observation(
+        "MAMERedump",
+        Representation::LogicalChd,
+        ClaimType::ExactLogicalDiscMatch,
+        Some("chd-1".to_string()),
+        None,
+    );
+    let summaries = merge_evidence(&[local, relayed]);
+    assert_eq!(
+        summaries[0].status,
+        AgreementStatus::DerivedAgreement,
+        "a single MAMERedump-derived lineage must never read as a same-source vote"
+    );
+}
+
+#[test]
+fn mameredump_derived_observation_conflicting_with_unrelated_strong_source_is_derived_conflict() {
+    let derived = obs(
+        EvidenceChannel::LocalMame,
+        SourceFamily::MAMERedump,
+        LineageRelation::DerivedFrom,
+        Representation::LogicalChd,
+        ClaimType::ExactLogicalDiscMatch,
+        Some("chd-1"),
+    );
+    let unrelated_strong = obs(
+        EvidenceChannel::LocalNoIntro,
+        SourceFamily::NoIntro,
+        LineageRelation::Independent,
+        Representation::LogicalChd,
+        ClaimType::ExactLogicalDiscMatch,
+        Some("chd-2"),
+    );
+    let summaries = merge_evidence(&[derived, unrelated_strong]);
+    assert_eq!(
+        summaries[0].status,
+        AgreementStatus::DerivedSourceConflict,
+        "a derived source disagreeing with an unrelated independent source is still a real \
+         conflict, never silently resolved as independent agreement/conflict"
+    );
 }
 
 #[test]
