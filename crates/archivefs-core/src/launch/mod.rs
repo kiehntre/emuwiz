@@ -41,12 +41,19 @@
 //! - [`es_de_export`] - a read-only ES-DE export/launch-entry plan built
 //!   from an already-resolved canonical identity and content path; never
 //!   writes `es_systems.xml`/`gamelist.xml` and never launches ES-DE.
+//! - [`evidence_bridge`] - the narrow, pure conversion from EmuWiz's
+//!   existing authoritative identity/content evidence
+//!   ([`crate::game_identity::GameIdentityReport`], [`crate::ArchiveRecord`])
+//!   into [`planning::CanonicalIdentityStatus`]/[`input_projection::VerifiedIdentityFact`]/
+//!   [`planning::LaunchContentRef`]; never resolves identity or mounts
+//!   anything itself.
 //!
 //! See `docs/PATCH_CHEAT_MANAGER_DESIGN.md` and `ROADMAP.md`'s
 //! "Launch-preparation workflows" note for the wider design context this
 //! module implements the first slice of.
 
 pub mod es_de_export;
+pub mod evidence_bridge;
 pub mod input_projection;
 pub mod integration;
 pub mod planning;
@@ -61,6 +68,9 @@ pub use es_de_export::{
     ES_DE_SYSTEM_MAP, EsDeEntryBlocker, EsDeEntryBlockerKind, EsDeEntryPlan, EsDeEntryStatus,
     EsDeExportOutcome, EsDeSystemMapping, NoEntryReason, build_es_de_entry_plan,
     es_de_system_for_platform,
+};
+pub use evidence_bridge::{
+    canonical_identity_from_game_report, launch_content_ref_from_archive_record,
 };
 pub use input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
