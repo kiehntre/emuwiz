@@ -1563,6 +1563,12 @@ fn detect_logiqx_ecosystem(
     if contains("tosec") {
         return DatEcosystem::Tosec;
     }
+    // FBNeo has no separate XML root: its ordinary Logiqx `<datafile>`
+    // explicitly brands the publisher in one of these header fields.  Match
+    // only the project's reviewed names, never a filename or a game name.
+    if contains("fbneo") || contains("fb neo") || contains("finalburn neo") {
+        return DatEcosystem::FBNeo;
+    }
 
     DatEcosystem::GenericLogiqx
 }
@@ -1969,6 +1975,15 @@ mod tests {
             Some("989f62a6457bd8c1f32b7bc60ceb6cdf307be855")
         );
         assert_eq!(game.roms[2].size_bytes, Some(37867200));
+    }
+
+    #[test]
+    fn fbneo_ecosystem_detected_by_explicit_header_brand() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile><header><name>FBNeo - Arcade Games</name><author>FBNeo</author></header>
+<game name="test"><rom name="test.bin" size="1" crc="AAAAAAAA"/></game></datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::FBNeo);
     }
 
     // ------------------------------------------------------------------

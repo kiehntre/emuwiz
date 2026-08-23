@@ -66,6 +66,7 @@ pub enum EvidenceChannel {
     LocalDat,
     LocalMame,
     LocalRedump,
+    LocalFBNeo,
     LocalTosec,
     LocalNoIntro,
     LocalWHDLoad,

@@ -1562,6 +1562,7 @@ fn every_channel_variant_round_trips_through_serde() {
         EvidenceChannel::LocalDat,
         EvidenceChannel::LocalMame,
         EvidenceChannel::LocalRedump,
+        EvidenceChannel::LocalFBNeo,
         EvidenceChannel::LocalTosec,
         EvidenceChannel::LocalNoIntro,
         EvidenceChannel::LocalWHDLoad,

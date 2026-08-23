@@ -317,6 +317,14 @@ pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence>
     // namespaces. Keep the evidence for display/audit, but never use it to
     // resolve a platform automatically.
     let is_software_list = dat.source.ecosystem == DatEcosystem::MAMESoftwareList;
+    // An FBNeo catalogue's header/game-shortname text identifies the arcade
+    // preservation project's own branding, not a canonical platform every
+    // contained machine necessarily belongs to (one FBNeo DAT commonly spans
+    // more than one arcade system). Give it the same non-authoritative
+    // treatment as a MAME software-list's own namespace metadata, never used
+    // to resolve a platform automatically.
+    let is_fbneo_catalogue = dat.source.ecosystem == DatEcosystem::FBNeo;
+    let authoritative_header = !is_software_list && !is_fbneo_catalogue;
     let (name_kind, description_kind) = if is_software_list {
         (
             DatPlatformEvidenceKind::SoftwareListName,
@@ -335,7 +343,7 @@ pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence>
             name,
             name_kind,
             is_software_list,
-            !is_software_list,
+            authoritative_header,
         ));
     }
     if let Some(description) = dat.source.description.as_deref() {
@@ -343,13 +351,14 @@ pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence>
             description,
             description_kind,
             false,
-            !is_software_list,
+            authoritative_header,
         ));
     }
     // `<software name>` is a MAME software namespace key, not a machine
     // shortname. Letting it through the machine resolver would make a title
-    // such as `neocd` falsely assert a canonical platform.
-    if !is_software_list {
+    // such as `neocd` falsely assert a canonical platform. The same applies
+    // to an FBNeo arcade game shortname (e.g. `sf2`).
+    if !is_software_list && !is_fbneo_catalogue {
         evidence.extend(machine_shortname_evidence(&dat.games));
     }
     evidence.extend(filename_hint_evidence_from_path(&dat.source.file_path));

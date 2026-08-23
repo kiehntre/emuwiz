@@ -28,6 +28,7 @@
 
 pub mod artwork;
 pub mod cache;
+pub mod fbneo;
 pub mod hasheous;
 pub mod hashing;
 pub mod mame_software_list;
