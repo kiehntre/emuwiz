@@ -106,7 +106,7 @@ fn blank_lines_and_trailing_comments_never_warn() {
 }
 
 #[test]
-fn quoted_values_containing_escaped_quotes_are_decoded_and_flagged() {
+fn quoted_values_containing_escaped_quotes_are_rejected_without_rewriting_them() {
     let text = "cheats = 1\ncheat0_desc = \"Say \\\"hello\\\"\"\ncheat0_code = \"ABCD\"\n";
     let document = parse(text);
     let entry = &document.entries[0];
@@ -119,9 +119,45 @@ fn quoted_values_containing_escaped_quotes_are_decoded_and_flagged() {
         "an interior quote is reported, because rendering substitutes it"
     );
     assert!(
-        entry.is_selectable(),
-        "quote normalization is documented and non-blocking"
+        !entry.is_selectable(),
+        "a value that would be changed during rendering is never installed"
     );
+}
+
+#[test]
+fn malformed_entries_at_every_position_are_skipped_with_their_source_context() {
+    let text = "cheats = 5\n\
+                cheat0_desc = \"missing first code\"\n\
+                cheat1_desc = \"first valid\"\ncheat1_code = \"A\"\n\
+                cheat2_desc = \"missing middle code\"\n\
+                cheat3_desc = \"second valid\"\ncheat3_code = \"B\"\n\
+                cheat4_desc = \"missing final code\"\n";
+    let document = parse(text);
+    assert_eq!(document.selectable_count(), 2);
+    for index in [0, 2, 4] {
+        let entry = document
+            .entry(index)
+            .expect("malformed entry retained for review");
+        assert!(!entry.is_selectable());
+        let warning = entry
+            .warnings
+            .iter()
+            .find(|warning| warning.kind == ChtEntryWarningKind::MissingCode)
+            .expect("missing-code reason is reported");
+        assert!(warning.line.is_some());
+        assert!(
+            warning
+                .raw_source
+                .as_deref()
+                .is_some_and(|raw| raw.contains(&format!("cheat{index}_desc")))
+        );
+    }
+    let rendered = render_cht_file(&install_entries(&document, &[0, 1, 2, 3, 4]), &[]);
+    assert!(rendered.contains("first valid"));
+    assert!(rendered.contains("second valid"));
+    assert!(!rendered.contains("missing first code"));
+    assert!(!rendered.contains("missing middle code"));
+    assert!(!rendered.contains("missing final code"));
 }
 
 #[test]
@@ -460,15 +496,10 @@ fn an_unselectable_entry_can_never_be_turned_into_an_install_entry() {
 }
 
 #[test]
-fn interior_quotes_are_normalized_so_the_written_value_is_not_truncated() {
+fn interior_quotes_are_not_silently_normalized_into_an_installed_entry() {
     let document = parse("cheats = 1\ncheat0_desc = \"Say \\\"hi\\\"\"\ncheat0_code = \"AB\"\n");
     let rendered = render_cht_file(&install_entries(&document, &[0]), &[]);
-    assert!(rendered.contains("cheat0_desc = \"Say 'hi'\""));
-    assert_eq!(
-        rendered.matches('"').count() % 2,
-        0,
-        "every written value stays balanced"
-    );
+    assert_eq!(rendered, "cheats = 0\n");
 }
 
 #[test]

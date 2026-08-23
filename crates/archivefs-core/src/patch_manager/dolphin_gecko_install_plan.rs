@@ -23,8 +23,8 @@ use super::dolphin_gecko_provider::{
 };
 use super::dolphin_local::{DolphinGameIniInventory, DolphinMatchResult, DolphinMatchState};
 use super::gecko_document::{
-    DolphinIniDocument, GeckoCode, merge_external_gecko_codes, parse_dolphin_ini,
-    replace_gecko_enabled_section,
+    DolphinIniDocument, DolphinIniWarningKind, GeckoCode, merge_external_gecko_codes,
+    parse_dolphin_ini, replace_gecko_enabled_section,
 };
 use super::shared_preview::{
     PreviewAdapter, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
@@ -48,6 +48,9 @@ pub enum DolphinInstallPlanErrorKind {
     CandidateMissing,
     CandidateUnreadable,
     CandidateTooLarge,
+    /// The existing INI cannot be decoded without replacing source bytes.
+    /// It is refused rather than lossily decoded and later rewritten.
+    CandidateUnsupportedEncoding,
     DestinationUnsafe,
     /// Nothing was selected, or everything selected was unsafe.
     NoSelectedCodes,
@@ -335,8 +338,28 @@ pub fn load_dolphin_ini(path: &Path) -> Result<LoadedDolphinIni, DolphinInstallP
             format!("GameSettings file could not be read: {failure}"),
         )
     })?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text = std::str::from_utf8(&bytes).map_err(|failure| {
+        error(
+            DolphinInstallPlanErrorKind::CandidateUnsupportedEncoding,
+            Some(path),
+            format!(
+                "GameSettings file is not valid UTF-8 (first invalid byte at offset {}); it will not be rewritten",
+                failure.valid_up_to()
+            ),
+        )
+    })?;
     let document = parse_dolphin_ini(&text);
+    if document
+        .warnings
+        .iter()
+        .any(|warning| warning.kind == DolphinIniWarningKind::TooManyCodes)
+    {
+        return Err(error(
+            DolphinInstallPlanErrorKind::CandidateTooLarge,
+            Some(path),
+            "GameSettings file exceeds the supported Gecko/Action Replay code-count limit and will not be rewritten",
+        ));
+    }
     Ok(LoadedDolphinIni {
         path: path.to_path_buf(),
         digest: hex_sha256(&bytes),
@@ -900,6 +923,7 @@ pub fn stage_dolphin_provider_ini(
 fn provider_entry_as_gecko_code(entry: &GeckoProviderEntry) -> GeckoCode {
     GeckoCode {
         name: entry.name.clone(),
+        source_line: None,
         lines: entry.code_lines.clone(),
         notes: entry.notes.clone(),
         enabled_by_default: false,

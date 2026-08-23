@@ -214,11 +214,13 @@ fn a_malformed_code_line_is_reported_not_silently_dropped_or_repaired() {
         ],
         "the malformed line is excluded from the retained lines"
     );
-    assert!(
-        code.warnings
-            .iter()
-            .any(|warning| warning.kind == GeckoCodeWarningKind::MalformedLine)
-    );
+    let warning = code
+        .warnings
+        .iter()
+        .find(|warning| warning.kind == GeckoCodeWarningKind::MalformedLine)
+        .expect("malformed line warning");
+    assert_eq!(warning.line, Some(4));
+    assert_eq!(warning.raw_source.as_deref(), Some("this is not hex"));
     assert!(
         !code.is_selectable(),
         "a code with a malformed line is blocked"

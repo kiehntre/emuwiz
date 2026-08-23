@@ -26,13 +26,12 @@
 //! - **Never mutates the source.** Parsing is a pure function of bytes.
 //! - **Deterministic rendering.** [`render_cht_file`] is a pure function of
 //!   its input slice: same entries in, byte-identical file out.
-//! - **Documented, deterministic repairs only.** The only content the
-//!   renderer alters is a double quote inside a description or code value
-//!   (RetroArch's own `config_file` reader has no escape syntax, so an
-//!   unescaped quote would truncate the value it is written into). That
-//!   single substitution - `"` becomes `'` - is applied at render time,
-//!   reported as [`ChtEntryWarningKind::QuoteNormalized`] at parse time,
-//!   and never written back to the catalogue.
+//! - **No uncertain code repairs.** A parsed value containing a double
+//!   quote is reported as [`ChtEntryWarningKind::QuoteNormalized`] and the
+//!   whole entry is made unselectable: RetroArch has no escape syntax, so
+//!   changing the value would be a guess. The renderer still defensively
+//!   sanitizes manually-constructed entries, but parser output can never
+//!   reach that path with an altered value.
 
 use std::fmt;
 
@@ -85,8 +84,8 @@ impl fmt::Display for ChtParseError {
 
 impl std::error::Error for ChtParseError {}
 
-/// Why one entry is imperfect. Presence of a warning does not by itself
-/// make an entry unselectable - see [`ChtEntry::is_selectable`].
+/// Why one entry is imperfect. Some warnings make an entry unselectable -
+/// see [`ChtEntry::is_selectable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChtEntryWarningKind {
@@ -107,7 +106,8 @@ pub enum ChtEntryWarningKind {
     /// retained value is not the source value.
     OversizedField,
     /// A double quote inside a value will be written as `'` by
-    /// [`render_cht_file`]. Not blocking; see the module docs.
+    /// [`render_cht_file`]. Blocking: altering a source value is not a
+    /// safe correction for a cheat entry.
     QuoteNormalized,
     /// The value contained a control character (newline, NUL, ...) that
     /// cannot appear in a RetroArch config value. Blocking.
@@ -120,7 +120,14 @@ impl ChtEntryWarningKind {
     pub fn is_blocking(self) -> bool {
         matches!(
             self,
-            Self::MissingCode | Self::EmptyCode | Self::OversizedField | Self::ControlCharacter
+            Self::MissingCode
+                | Self::EmptyCode
+                | Self::OversizedField
+                | Self::ControlCharacter
+                // Rendering a quote as a different character changes the
+                // source value. Never make that uncertain correction to a
+                // cheat entry merely to produce output.
+                | Self::QuoteNormalized
         )
     }
 
@@ -142,6 +149,12 @@ impl ChtEntryWarningKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChtEntryWarning {
     pub kind: ChtEntryWarningKind,
+    /// 1-based source line when the rejected field was present in the
+    /// source. Missing-field warnings use the entry's first known line.
+    pub line: Option<u32>,
+    /// Original source line, bounded by the enclosing file bound. This is
+    /// retained for review; it is never rendered into an installed file.
+    pub raw_source: Option<String>,
     pub detail: String,
 }
 
@@ -300,6 +313,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
     use std::collections::BTreeMap;
 
     struct Draft {
+        first_line: u32,
+        first_raw_source: String,
         description: Option<String>,
         code: Option<String>,
         enable: Option<bool>,
@@ -348,7 +363,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         };
         seen_any_body_line = true;
         let key = raw_key.trim();
-        let (value, value_warnings) = decode_value(raw_value.trim());
+        let (value, mut value_warnings) = decode_value(raw_value.trim());
 
         if key.eq_ignore_ascii_case("cheats") {
             match value.parse::<u32>() {
@@ -425,12 +440,18 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             });
         }
         let draft = drafts.entry(entry_index).or_insert_with(|| Draft {
+            first_line: line_number,
+            first_raw_source: raw_line.to_string(),
             description: None,
             code: None,
             enable: None,
             extra_fields: Vec::new(),
             warnings: Vec::new(),
         });
+        for warning in &mut value_warnings {
+            warning.line = Some(line_number);
+            warning.raw_source = Some(raw_line.to_string());
+        }
         draft.warnings.extend(value_warnings);
 
         match field {
@@ -439,6 +460,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 value,
                 "desc",
                 entry_index,
+                line_number,
+                raw_line,
                 &mut draft.warnings,
             ),
             "code" => set_once(
@@ -446,12 +469,16 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 value,
                 "code",
                 entry_index,
+                line_number,
+                raw_line,
                 &mut draft.warnings,
             ),
             "enable" => {
                 if draft.enable.is_some() {
                     draft.warnings.push(ChtEntryWarning {
                         kind: ChtEntryWarningKind::DuplicateField,
+                        line: Some(line_number),
+                        raw_source: Some(raw_line.to_string()),
                         detail: format!("cheat{entry_index}_enable appeared more than once"),
                     });
                 } else if value.eq_ignore_ascii_case("true") {
@@ -462,6 +489,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                     draft.enable = Some(false);
                     draft.warnings.push(ChtEntryWarning {
                         kind: ChtEntryWarningKind::UnparsableEnableValue,
+                        line: Some(line_number),
+                        raw_source: Some(raw_line.to_string()),
                         detail: format!(
                             "cheat{entry_index}_enable value {value:?} is not true/false; treated as false"
                         ),
@@ -499,10 +528,14 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         match draft.code.as_deref() {
             None => entry_warnings.push(ChtEntryWarning {
                 kind: ChtEntryWarningKind::MissingCode,
+                line: Some(draft.first_line),
+                raw_source: Some(draft.first_raw_source.clone()),
                 detail: format!("cheat{index} has no cheat{index}_code key"),
             }),
             Some("") => entry_warnings.push(ChtEntryWarning {
                 kind: ChtEntryWarningKind::EmptyCode,
+                line: Some(draft.first_line),
+                raw_source: Some(draft.first_raw_source.clone()),
                 detail: format!("cheat{index}_code is empty"),
             }),
             Some(_) => {}
@@ -514,6 +547,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         {
             entry_warnings.push(ChtEntryWarning {
                 kind: ChtEntryWarningKind::MissingDescription,
+                line: Some(draft.first_line),
+                raw_source: Some(draft.first_raw_source.clone()),
                 detail: format!("cheat{index} has no usable cheat{index}_desc key"),
             });
         }
@@ -568,11 +603,15 @@ fn set_once(
     value: String,
     field: &str,
     index: u32,
+    line: u32,
+    raw_source: &str,
     warnings: &mut Vec<ChtEntryWarning>,
 ) {
     if slot.is_some() {
         warnings.push(ChtEntryWarning {
             kind: ChtEntryWarningKind::DuplicateField,
+            line: Some(line),
+            raw_source: Some(raw_source.to_string()),
             detail: format!(
                 "cheat{index}_{field} appeared more than once; the first value is kept"
             ),
@@ -621,6 +660,8 @@ fn decode_value(raw: &str) -> (String, Vec<ChtEntryWarning>) {
     {
         warnings.push(ChtEntryWarning {
             kind: ChtEntryWarningKind::ControlCharacter,
+            line: None,
+            raw_source: None,
             detail:
                 "value contains a control character that cannot appear in a RetroArch config value"
                     .to_string(),
@@ -629,8 +670,10 @@ fn decode_value(raw: &str) -> (String, Vec<ChtEntryWarning>) {
     if decoded.contains('"') {
         warnings.push(ChtEntryWarning {
             kind: ChtEntryWarningKind::QuoteNormalized,
-            detail: "value contains a double quote; it is written as an apostrophe because \
-                     RetroArch config values have no escape syntax"
+            line: None,
+            raw_source: None,
+            detail: "value contains a double quote and is skipped because RetroArch config \
+                     values have no escape syntax"
                 .to_string(),
         });
     }
@@ -642,6 +685,8 @@ fn decode_value(raw: &str) -> (String, Vec<ChtEntryWarning>) {
         decoded.truncate(boundary);
         warnings.push(ChtEntryWarning {
             kind: ChtEntryWarningKind::OversizedField,
+            line: None,
+            raw_source: None,
             detail: format!("value exceeded {MAX_CHT_FIELD_BYTES} bytes and was truncated"),
         });
     }

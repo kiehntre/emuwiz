@@ -216,6 +216,24 @@ fn loading_never_modifies_the_source_file() {
     assert_eq!(fs::read(&ini_path).expect("read"), before);
 }
 
+#[test]
+fn invalid_utf8_ini_is_refused_without_a_lossy_rewrite() {
+    let fixture = Fixture::new("invalid-utf8");
+    let path = fixture.path("dolphin/GameSettings/GAFE01.ini");
+    fs::create_dir_all(path.parent().unwrap()).expect("parent");
+    fs::write(&path, [b'[', 0xff, b']']).expect("write invalid bytes");
+
+    let error = load_dolphin_ini(&path).expect_err("invalid source encoding is unsafe to rewrite");
+    assert_eq!(
+        error.kind,
+        DolphinInstallPlanErrorKind::CandidateUnsupportedEncoding
+    );
+    assert_eq!(
+        fs::read(&path).expect("source remains intact"),
+        [b'[', 0xff, b']']
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_symlinked_matched_file_is_never_followed() {

@@ -688,8 +688,8 @@ fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
 /// widening its visibility is out of scope for this milestone's file-level
 /// boundary (see the module doc comment). Cheat *code* lines
 /// (`cheatN_code`, `cheatN_code_type`, ...) are read only far enough to
-/// confirm the key exists; their values are never stored anywhere in this
-/// module's output.
+/// confirm a non-empty `cheatN_code` exists; their values are never stored
+/// anywhere in this module's output.
 ///
 /// The `cheats = N` header is validated only for being syntactically a
 /// number, never compared against how many `cheatN_...` entries actually
@@ -729,6 +729,7 @@ fn parse_cht_cheats(
     let mut descriptions = BTreeMap::<u32, String>::new();
     let mut enabled = BTreeSet::<u32>::new();
     let mut seen_indices = BTreeSet::<u32>::new();
+    let mut code_indices = BTreeSet::<u32>::new();
     let mut diagnostics = Vec::new();
     let mut saw_malformed_line = false;
 
@@ -781,10 +782,9 @@ fn parse_cht_cheats(
         if field == "enable" && value.eq_ignore_ascii_case("true") {
             enabled.insert(entry_index);
         }
-        // `cheatN_code`, `cheatN_code_type`, `cheatN_memory_search_size`,
-        // and any other field are intentionally not matched above - their
-        // values are read into `value` for the length of this loop
-        // iteration only and then dropped.
+        if field == "code" && !value.is_empty() {
+            code_indices.insert(entry_index);
+        }
     }
 
     let cheats: Vec<CheatDefinition> = seen_indices
@@ -795,7 +795,13 @@ fn parse_cht_cheats(
             declared_index: Some(index),
         })
         .collect();
-    let complete = !cheats.is_empty() || !saw_malformed_line;
+    // Existing broad catalogue indexing intentionally retains metadata-only
+    // `cheatN_*` records; the strict full-fidelity parser is used before
+    // selection and installation. But a malformed file with no non-empty
+    // code at all cannot become an installable candidate merely because it
+    // had a `cheatN_desc` field.
+    let complete = (!cheats.is_empty() || !saw_malformed_line)
+        && !(saw_malformed_line && code_indices.is_empty() && !cheats.is_empty());
     (cheats, complete, diagnostics)
 }
 
