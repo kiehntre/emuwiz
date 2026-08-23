@@ -38,11 +38,15 @@
 //!   facts to each Phase 1 adapter's own launch-input request type (or an
 //!   explicit unavailable result); never executes anything and never
 //!   fuses or promotes identity itself.
+//! - [`es_de_export`] - a read-only ES-DE export/launch-entry plan built
+//!   from an already-resolved canonical identity and content path; never
+//!   writes `es_systems.xml`/`gamelist.xml` and never launches ES-DE.
 //!
 //! See `docs/PATCH_CHEAT_MANAGER_DESIGN.md` and `ROADMAP.md`'s
 //! "Launch-preparation workflows" note for the wider design context this
 //! module implements the first slice of.
 
+pub mod es_de_export;
 pub mod input_projection;
 pub mod integration;
 pub mod planning;
@@ -52,6 +56,11 @@ pub mod readiness;
 #[cfg(test)]
 mod tests;
 
+pub use es_de_export::{
+    ES_DE_SYSTEM_MAP, EsDeEntryBlocker, EsDeEntryBlockerKind, EsDeEntryPlan, EsDeEntryStatus,
+    EsDeExportOutcome, EsDeSystemMapping, NoEntryReason, build_es_de_entry_plan,
+    es_de_system_for_platform,
+};
 pub use input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
     project_dolphin_gamecube_launch_input, project_dolphin_wii_launch_input,
