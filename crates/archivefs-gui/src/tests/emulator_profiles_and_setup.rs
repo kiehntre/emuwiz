@@ -491,6 +491,7 @@ fn the_blocked_state_renders_as_visibly_different_from_a_worker_failure() {
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });
@@ -860,6 +861,7 @@ fn workflow_diagnostics_are_collapsed_so_the_primary_action_is_not_buried() {
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });
@@ -1259,6 +1261,7 @@ fn pcsx2_legacy_migration_strips_legacy_file_and_reports_a_history_entry() {
             destination_root: archivefs_core::patch_manager::SharedTransactionPath::from_path(
                 &directory,
             ),
+            created_root_directories: Vec::new(),
             dry_run: false,
             entries: Vec::new(),
             status: SharedApplyStatus::Success,
@@ -2190,6 +2193,7 @@ fn gamecube_page_renders_dolphin_without_retroarch_content() {
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });
@@ -2221,6 +2225,7 @@ fn cheats_mods_page_renders_the_new_hierarchy_headings() {
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });
@@ -2266,6 +2271,7 @@ fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selec
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });
@@ -2303,6 +2309,7 @@ fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selec
                     &history,
                     false,
                     &mut clipboard,
+                    &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
                 );
             });
         });
@@ -3133,6 +3140,7 @@ fn beginner_primary_control_is_visible_without_scrolling_on_a_small_viewport() {
                         &history,
                         false,
                         &mut clipboard,
+                        &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
                     );
                 });
             });

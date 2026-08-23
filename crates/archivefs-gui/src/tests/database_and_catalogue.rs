@@ -316,6 +316,7 @@ fn unsupported_platform_banner_names_the_recognised_platform_not_generic_text() 
                 &app.history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });

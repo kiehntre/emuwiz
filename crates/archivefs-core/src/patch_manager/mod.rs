@@ -44,6 +44,7 @@ mod dolphin_dedup;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
+mod dolphin_texture_mod;
 mod duckstation_local;
 mod emulator_profile_memory;
 mod emulator_request_bridge;
@@ -321,6 +322,13 @@ pub use dolphin_local::{
     discover_dolphin_local_profiles, discover_dolphin_profiles, dolphin_user_path,
     inspect_dolphin_local_game, inspect_dolphin_profile, match_dolphin_inventory,
     parse_dolphin_version, select_dolphin_profile,
+};
+pub use dolphin_texture_mod::{
+    DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DolphinTextureModError, DolphinTextureModErrorKind,
+    DolphinTextureModIdentity, DolphinTextureModPlan, DolphinTextureModPreviewRequest,
+    DolphinTextureModSource, build_dolphin_texture_mod_preview,
+    dolphin_texture_mod_destination_root, validate_dolphin_texture_source,
+    verified_dolphin_texture_identity,
 };
 pub use duckstation_local::{
     DUCKSTATION_MAX_CHEAT_BYTES, DUCKSTATION_MAX_CONFIG_BYTES, DUCKSTATION_MAX_DIRECTORY_ENTRIES,

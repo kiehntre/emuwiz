@@ -1104,6 +1104,7 @@ pub(crate) fn show_cheats_mods_page(
     history: &OperationHistory,
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
+    dolphin_texture_mod: &mut crate::dolphin_texture_mod_page::DolphinTextureModPageState,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
     let activity_archive = workflow
@@ -1274,6 +1275,42 @@ pub(crate) fn show_cheats_mods_page(
             CheatEmulatorAdapter::Dolphin => {
                 action =
                     show_dolphin_workflow(ui, workflow, dolphin_profiles, clipboard).or(action);
+                // Immediately after the existing Dolphin cheat workflow and
+                // before Workflow diagnostics - its own separate panel, not
+                // a cheat stage (see `dolphin_texture_mod_page`'s own
+                // module doc comment for why it is never folded into
+                // `CheatWorkflowState`).
+                let selected_profile = match dolphin_profiles {
+                    DolphinProfilesState::Ready(discovery) => workflow
+                        .selected_dolphin_profile_id
+                        .as_deref()
+                        .and_then(|id| {
+                            discovery
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.profile_id == id)
+                        }),
+                    _ => None,
+                };
+                ui.add_space(theme::SECTION_GAP);
+                match selected_profile {
+                    Some(profile) => {
+                        let identity_report = crate::ready_game_identity(workflow);
+                        crate::dolphin_texture_mod_page::show_dolphin_texture_mod_panel(
+                            ui,
+                            dolphin_texture_mod,
+                            &workflow.archive_path,
+                            profile,
+                            identity_report,
+                        );
+                    }
+                    None => {
+                        widgets::section_header(ui, "Dolphin texture mod", None);
+                        widgets::card(ui, |ui| {
+                            ui.label("Select a Dolphin profile above first.");
+                        });
+                    }
+                }
             }
             CheatEmulatorAdapter::Xenia => {
                 action = show_xenia_workflow(ui, workflow, xenia_profiles, clipboard).or(action);

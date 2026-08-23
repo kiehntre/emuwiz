@@ -36,6 +36,7 @@ fn cheats_mods_page_has_a_truthful_no_archive_empty_state() {
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });
@@ -84,6 +85,7 @@ fn cheats_mods_page_routes_retroarch_to_shared_preview_without_stale_wording() {
                 &history,
                 false,
                 &mut clipboard,
+                &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             );
         });
     });

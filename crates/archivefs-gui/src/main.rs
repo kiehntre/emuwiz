@@ -146,6 +146,7 @@ pub mod bulk_confirmation;
 pub(crate) mod cheat_sources_page;
 mod collection_discovery_page;
 pub(crate) mod dat_sources_page;
+pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod game_metadata;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
@@ -3730,6 +3731,12 @@ struct ArchiveFsApp {
     /// returning to the same exact archive does not discard a completed
     /// cache inspection or retrieval.
     cheat_workflow: Option<CheatWorkflowState>,
+    /// The Dolphin texture-mod panel's own state - deliberately separate
+    /// from `cheat_workflow` (a texture mod is not a cheat) and keyed by
+    /// `{ archive_path, profile_id, verified_game_id }` internally, so it
+    /// never reuses state describing a different game or profile. See
+    /// `dolphin_texture_mod_page`'s own module doc comment.
+    dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState,
     /// A tentative archive choice is isolated here until the picker is
     /// applied. It never mutates Library focus or multi-selection.
     cheat_archive_picker: Option<CheatArchivePickerState>,
@@ -4263,6 +4270,7 @@ impl ArchiveFsApp {
             remembered_emulator_profiles: load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
             cheat_workflow: None,
+            dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
@@ -15514,6 +15522,13 @@ impl ArchiveFsApp {
                                 ui.add_space(theme::SECTION_GAP);
                                 action
                             }).flatten();
+                            // Drained before the workspace renders, so a
+                            // running install/undo is reflected in this
+                            // same frame's render, not one frame late.
+                            if self.dolphin_texture_mod.poll() || self.dolphin_texture_mod.is_busy()
+                            {
+                                ui.ctx().request_repaint();
+                            }
                             let action = show_cheats_mods_page(
                                 ui,
                                 self.cheat_workflow.as_mut(),
@@ -15526,6 +15541,7 @@ impl ArchiveFsApp {
                                 &self.history,
                                 busy || self.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
+                                &mut self.dolphin_texture_mod,
                             );
                             ui.add_space(theme::SECTION_GAP);
                             let bsfree_action = show_bsfree_game_browser(
@@ -22330,7 +22346,7 @@ fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphin_read_only
     } else if dolphin_read_only {
         (
             widgets::StatusTone::Info,
-            "Individual exact-ID Gecko codes from the external provider can be selected, applied, and rolled back above. Texture packs, Riivolution assets, and other Dolphin mod types remain unavailable.",
+            "Individual exact-ID Gecko codes from the external provider can be selected, applied, and rolled back above, and a single PNG hires-texture file can be installed and undone in the Dolphin texture mod panel above. Texture packs, Riivolution assets, and other Dolphin mod types remain unavailable.",
         )
     } else {
         (widgets::StatusTone::Pending, MODS_UNAVAILABLE_BODY)
@@ -26916,7 +26932,7 @@ fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str, widgets::S
     }
 }
 
-fn ready_game_identity(workflow: &CheatWorkflowState) -> Option<&GameIdentityReport> {
+pub(crate) fn ready_game_identity(workflow: &CheatWorkflowState) -> Option<&GameIdentityReport> {
     match &workflow.identity {
         CheatStepResource::Ready((request, report))
             if request.archive_path == workflow.archive_path
