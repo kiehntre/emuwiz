@@ -14,6 +14,8 @@
 //! Predominant theme observed in this slice: Doctor scan findings and repair review/confirm flows.
 
 use super::*;
+use archivefs_core::diagnostics::environment::{MountMode, WritabilityAssessment};
+use archivefs_core::diagnostics::profiles::{EmulatorKind, ProfileAssessment};
 
 #[test]
 fn cheats_mods_page_has_a_truthful_no_archive_empty_state() {
@@ -2254,6 +2256,100 @@ fn doctor_page_shows_a_healthy_result_rather_than_an_empty_screen() {
         &output,
         "No problems detected by the available read-only checks."
     ));
+}
+
+#[test]
+fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
+    let profile_report = ProfileAssessmentReport {
+        profiles: vec![
+            ProfileAssessment {
+                emulator: EmulatorKind::Ppsspp,
+                profile_id: "ppsspp-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "User".to_string(),
+                discovery_confidence: "documented native path".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/ppsspp")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/ppsspp/PSP/Cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+            ProfileAssessment {
+                emulator: EmulatorKind::DuckStation,
+                profile_id: "duckstation-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "N/A".to_string(),
+                discovery_confidence: "discovered configuration directory".to_string(),
+                eligible: false,
+                blockers: vec!["settings file is not readable".to_string()],
+                root_path: EncodedPath::from_path(Path::new("/profiles/duckstation")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/duckstation/cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+        ],
+        unavailable: Vec::new(),
+        discovery_incomplete: false,
+    };
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.emulator_profiles = Gathered::Ready(&profile_report);
+    let scan = run_doctor_scan(&inputs);
+
+    for (id, emulator, profile, configuration_path, cheat_destination, eligibility, blocker) in [
+        (
+            "emulator_profile.ppsspp_inspected",
+            "PPSSPP",
+            "ppsspp-native",
+            "/profiles/ppsspp",
+            "/profiles/ppsspp/PSP/Cheats",
+            "Adapter considers it usable: true",
+            None,
+        ),
+        (
+            "emulator_profile.duckstation_inspected",
+            "DuckStation",
+            "duckstation-native",
+            "/profiles/duckstation",
+            "/profiles/duckstation/cheats",
+            "Adapter considers it usable: false",
+            Some("Adapter blocker: settings file is not readable"),
+        ),
+    ] {
+        let key = doctor_key_of_kind(&scan, id);
+        let output = render_doctor_page(&doctor_outcome(scan.clone()), &mut Some(key));
+        for expected in [
+            "Emulator profiles (2)",
+            emulator,
+            profile,
+            "Configuration path:",
+            configuration_path,
+            "Cheat destination:",
+            cheat_destination,
+            eligibility,
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "Doctor did not render {expected:?} for {emulator}"
+            );
+        }
+        if let Some(blocker) = blocker {
+            assert!(
+                rendered_text_contains(&output, blocker),
+                "Doctor did not render {blocker:?} for {emulator}"
+            );
+        }
+    }
 }
 
 /// A healthy result must never read as "everything was checked".
