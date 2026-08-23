@@ -52,6 +52,7 @@ pub mod integration;
 pub mod planning;
 pub mod platform_map;
 pub mod readiness;
+pub mod retroarch_command;
 
 #[cfg(test)]
 mod tests;
@@ -86,4 +87,7 @@ pub use readiness::{
     LaunchWarningKind, duckstation_firmware_readiness, flycast_firmware_readiness,
     hatari_firmware_readiness, pcsx2_firmware_readiness, ppsspp_firmware_readiness,
     retroarch_core_firmware_readiness, rpcs3_firmware_readiness, xemu_firmware_readiness,
+};
+pub use retroarch_command::{
+    RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
 };

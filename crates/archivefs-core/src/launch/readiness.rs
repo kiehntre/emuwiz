@@ -65,6 +65,11 @@ pub enum LaunchReadiness {
 /// explanation alongside this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchBlockerKind {
+    /// A command-plan request was given a non-RetroArch launch candidate.
+    RetroArchCandidateRequired,
+    /// A caller supplied a candidate marked blocked without supplying the
+    /// candidate's own blocker detail.
+    CandidateBlocked,
     /// The canonical game identity this plan was built for is
     /// [`crate::launch::planning::CanonicalIdentityStatus::Unknown`].
     IdentityUnresolved,
@@ -88,6 +93,23 @@ pub enum LaunchBlockerKind {
     /// nothing (a caller-supplied preferred core stem) disambiguates them -
     /// automatic selection would be unsafe.
     AmbiguousCore,
+    /// The RetroArch profile selected by a candidate is absent from the
+    /// environment report used to make its command plan.
+    RetroArchProfileMissing,
+    /// More than one environment profile has the candidate's profile
+    /// reference, so selection is not safe.
+    AmbiguousRetroArchProfile,
+    /// The selected core is present but its current `.info` metadata no
+    /// longer resolves to the candidate's canonical platform.
+    RetroArchCoreMismatch,
+    /// No exact RetroArch executable path is available for the selected
+    /// profile in the inspected environment.
+    RetroArchExecutableMissing,
+    /// More than one exact executable path remains for the selected profile.
+    AmbiguousRetroArchExecutable,
+    /// An environment-report path was rendered lossily and therefore cannot
+    /// be reconstructed as the exact path required for an argv plan.
+    RetroArchPathNotExact,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
