@@ -190,9 +190,12 @@ pub struct CheatGameRecord {
     /// asserted).
     pub source_file_hash: Option<String>,
     pub format: CheatCatalogueFormat,
-    /// `false` if any parsing diagnostic was emitted for this record
-    /// (malformed line, declared/parsed count mismatch, entry index past
-    /// [`MAX_CHEATS_PER_GAME`], ...). Mirrors
+    /// `true` for every record that reaches this struct - a file that
+    /// fails to parse at all (zero usable `cheatN_*` entries alongside
+    /// malformed content) never becomes a [`CheatGameRecord`]; see
+    /// [`ChtLoadOutcome::Excluded`]. `parsing_diagnostics` still carries any
+    /// non-fatal warnings (a skipped stray line, a legacy-encoding
+    /// fallback, ...) collected while this record was parsed. Mirrors
     /// `retroarch_inventory::CheatFileSummary::complete`.
     pub parsing_complete: bool,
     pub parsing_diagnostics: Vec<CatalogueDiagnostic>,
@@ -554,16 +557,10 @@ fn load_cht_record(
             });
         }
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return ChtLoadOutcome::Excluded(CatalogueExcludedEntry {
-            kind: CatalogueEntryExclusionKind::UnsupportedContentEncoding,
-            path: EncodedPath::from_path(path),
-            source_game_name,
-            source_platform: platform_hint.map(str::to_string),
-        });
-    };
+    let (text, mut diagnostics) = decode_cht_text(&bytes, path);
     let hash = hex_sha256(&bytes);
-    let (cheats, parsing_complete, _file_diagnostics) = parse_cht_cheats(text, path);
+    let (cheats, parsing_complete, parse_diagnostics) = parse_cht_cheats(&text, path);
+    diagnostics.extend(parse_diagnostics);
 
     if !parsing_complete {
         return ChtLoadOutcome::Excluded(CatalogueExcludedEntry {
@@ -595,8 +592,55 @@ fn load_cht_record(
         source_file_hash: Some(hash),
         format: CheatCatalogueFormat::RetroarchChtDirectory,
         parsing_complete: true,
-        parsing_diagnostics: Vec::new(),
+        parsing_diagnostics: diagnostics,
     }))
+}
+
+/// Decodes a bounded-read `.cht` file's bytes to text, preferring UTF-8 and
+/// falling back to a Windows-1252/Latin-1-compatible decoding for legacy
+/// files that predate `.cht` authors consistently using UTF-8 (2026-08-23,
+/// real-corpus audit: 6 of 28,308 real files carry such bytes, almost
+/// always a single accented character in a `cheatN_desc` value). Every byte
+/// 0x00-0xFF maps to exactly one Unicode scalar under this scheme, so
+/// decoding itself never fails; it does not by itself make garbage content
+/// parse as a valid cheat file; the decoded text still has to pass
+/// [`parse_cht_cheats`] like any other file. Bounded by the same
+/// [`MAX_CATALOGUE_FILE_BYTES`] the caller already read - no unbounded
+/// growth is introduced here.
+fn decode_cht_text(bytes: &[u8], path: &Path) -> (String, Vec<CatalogueDiagnostic>) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), Vec::new()),
+        Err(_) => (
+            bytes.iter().map(|&byte| windows1252_char(byte)).collect(),
+            vec![CatalogueDiagnostic {
+                code: "catalogue_cht_legacy_text_encoding",
+                severity: ArtifactDiagnosticSeverity::Info,
+                path: Some(EncodedPath::from_path(path)),
+            }],
+        ),
+    }
+}
+
+/// Maps one byte to the Unicode scalar it represents under Windows-1252,
+/// which is identical to Latin-1 (ISO-8859-1) outside the 0x80-0x9F C1
+/// control range, where Windows-1252 instead defines printable characters
+/// (curly quotes, em/en dash, etc.) - the common case for legacy `.cht`
+/// text. `0x81`, `0x8D`, `0x8F`, `0x90`, and `0x9D` are undefined in
+/// Windows-1252 proper; they map back to their C1 control code, matching
+/// the standard "best effort" convention other decoders use.
+fn windows1252_char(byte: u8) -> char {
+    const CP1252_C1: [char; 32] = [
+        '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}',
+        '\u{017D}', '\u{008F}', '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+    ];
+    if (0x80..=0x9F).contains(&byte) {
+        CP1252_C1[(byte - 0x80) as usize]
+    } else {
+        byte as char
+    }
 }
 
 fn os_name_has_cht_extension(name: &std::ffi::OsStr) -> bool {
@@ -655,6 +699,27 @@ fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
 /// Treating that mismatch as fatal was excluding genuinely usable files
 /// wholesale under a "MalformedCht" label; every entry actually found and
 /// successfully parsed is returned regardless of what the header claimed.
+///
+/// A stray/malformed line (no `=`, an unrecognised `cheatN_*` shape, a
+/// non-numeric `cheats` value, ...) is likewise never fatal by itself
+/// (2026-08-23, real-corpus audit: 85 of 28,308 real files had exactly this
+/// - a bare `false`, a stray quote, a parenthetical note, an orphaned `_L`
+/// continuation line, or similar hand-edit debris alongside otherwise-valid
+/// `cheatN_*` entries). Each such line is skipped and recorded as a warning
+/// diagnostic; parsing continues. A file is only rejected outright
+/// (`complete = false`) when it ends up with **zero** usable `cheatN_*`
+/// entries *and* contained at least one malformed line - i.e. it looks like
+/// non-RetroArch content rather than a RetroArch cheat file with typos. A
+/// clean file that legitimately declares `cheats = 0` and defines no
+/// entries (and has no malformed lines) remains valid.
+///
+/// A `cheatN_*` entry's numeric index is not capped here: this parser only
+/// ever materialises one [`CheatDefinition`] per *distinct* index actually
+/// present in the file, so memory use tracks the file's line count (already
+/// bounded by [`MAX_CATALOGUE_FILE_BYTES`]), never the index's numeric
+/// value. Rejecting a file solely because a real, valid index happened to
+/// exceed the old `MAX_CHEATS_PER_GAME` cap (2 of 28,308 real files did)
+/// was protecting against nothing this bound doesn't already cover.
 fn parse_cht_cheats(
     text: &str,
     path: &Path,
@@ -665,7 +730,7 @@ fn parse_cht_cheats(
     let mut enabled = BTreeSet::<u32>::new();
     let mut seen_indices = BTreeSet::<u32>::new();
     let mut diagnostics = Vec::new();
-    let mut complete = true;
+    let mut saw_malformed_line = false;
 
     for (index, raw_line) in text.lines().enumerate() {
         let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
@@ -674,7 +739,7 @@ fn parse_cht_cheats(
             continue;
         }
         let Some((raw_key, raw_value)) = line.split_once('=') else {
-            complete = false;
+            saw_malformed_line = true;
             diagnostics.push(malformed_line_diagnostic(path, line_number));
             continue;
         };
@@ -687,7 +752,7 @@ fn parse_cht_cheats(
             // how many `cheatN_...` entries actually follow; see the doc
             // comment below `seen_indices` is finalised for why.
             if value.parse::<u32>().is_err() {
-                complete = false;
+                saw_malformed_line = true;
                 diagnostics.push(malformed_line_diagnostic(path, line_number));
             }
             continue;
@@ -697,19 +762,15 @@ fn parse_cht_cheats(
         };
         let digit_count = remainder.bytes().take_while(u8::is_ascii_digit).count();
         if digit_count == 0 || !remainder[digit_count..].starts_with('_') {
-            complete = false;
+            saw_malformed_line = true;
             diagnostics.push(malformed_line_diagnostic(path, line_number));
             continue;
         }
         let Ok(entry_index) = remainder[..digit_count].parse::<u32>() else {
-            complete = false;
+            saw_malformed_line = true;
             diagnostics.push(malformed_line_diagnostic(path, line_number));
             continue;
         };
-        if entry_index as usize >= MAX_CHEATS_PER_GAME {
-            complete = false;
-            continue;
-        }
         seen_indices.insert(entry_index);
         let field = &remainder[digit_count + 1..];
         if field == "desc" && !value.is_empty() {
@@ -726,7 +787,7 @@ fn parse_cht_cheats(
         // iteration only and then dropped.
     }
 
-    let cheats = seen_indices
+    let cheats: Vec<CheatDefinition> = seen_indices
         .into_iter()
         .map(|index| CheatDefinition {
             description: descriptions.remove(&index),
@@ -734,6 +795,7 @@ fn parse_cht_cheats(
             declared_index: Some(index),
         })
         .collect();
+    let complete = !cheats.is_empty() || !saw_malformed_line;
     (cheats, complete, diagnostics)
 }
 

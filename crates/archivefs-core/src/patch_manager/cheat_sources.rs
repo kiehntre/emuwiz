@@ -3120,6 +3120,12 @@ mod tests {
                 None,
             ),
             (
+                // Invalid UTF-8 with zero usable `cheatN_*` entries: decoded
+                // via the Windows-1252 fallback (`decode_cht_text`) and then
+                // rejected as `MalformedCht`, same as `Broken.cht` above -
+                // not `UnsupportedContentEncoding`, since a legacy-encoded
+                // file is only excluded when its decoded content is also
+                // otherwise unusable (see `cheat_catalogue::parse_cht_cheats`).
                 "libretro-database-1/cht/Nintendo - Super Nintendo Entertainment System/Unsupported.cht",
                 b"cheats = 1\n\xff",
                 None,
@@ -3134,8 +3140,8 @@ mod tests {
         assert!(fetched.manifest.validation_complete);
         assert_eq!(fetched.manifest.catalogue_file_count, 3);
         assert_eq!(fetched.manifest.indexed_file_count, 1);
-        assert_eq!(fetched.manifest.malformed_cheat_count, 1);
-        assert_eq!(fetched.manifest.excluded_unsupported_count, 1);
+        assert_eq!(fetched.manifest.malformed_cheat_count, 2);
+        assert_eq!(fetched.manifest.excluded_unsupported_count, 0);
         assert_eq!(fetched.manifest.exclusion_examples.len(), 2);
         assert!(
             inspect_retroarch_cheat_source("libretro-buildbot-cheats", &temp.0)
