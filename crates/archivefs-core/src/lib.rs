@@ -348,6 +348,15 @@ pub mod patch_manager;
 
 pub mod emulator_environment;
 
+/// Unified Launch Planning, Phase 1: canonical-platform → standalone-
+/// adapter/RetroArch-core downstream compatibility, firmware readiness
+/// projections, and the pure `launch::planning::build_launch_plan`
+/// planner. Identity/evidence decides WHAT the game is; this module only
+/// ever decides HOW it could be played from already-resolved identity —
+/// see [`archivefs_core::launch`]'s own doc comment for the exact
+/// boundary.
+pub mod launch;
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),
