@@ -53,6 +53,7 @@ mod gamehacking_provider;
 mod gamehacking_shared;
 mod gamehacking_wii_provider;
 mod gecko_document;
+mod hatari_local;
 mod import_safety;
 mod matching;
 mod pcsx2;
@@ -393,6 +394,18 @@ pub use gecko_document::{
     MAX_GECKO_CODES, MAX_GECKO_LINE_BYTES, merge_external_action_replay_codes,
     merge_external_gecko_codes, parse_dolphin_ini, remove_named_codes,
     replace_gecko_enabled_section, replace_named_section,
+};
+pub use hatari_local::{
+    HATARI_MAX_CONFIG_BYTES, HATARI_MAX_METADATA_BYTES, HATARI_MAX_PROFILES,
+    HATARI_MAX_SAVE_STATE_CANDIDATES, HATARI_MAX_TOS_BYTES, HatariAudioSettings, HatariConfig,
+    HatariDiscoveryError, HatariExecutable, HatariFloppy, HatariFloppyRepresentation,
+    HatariGameInspection, HatariHealth, HatariIdentityAssociation, HatariIdentityState,
+    HatariInputSettings, HatariInspectionWarning, HatariInstallationType, HatariMachineModel,
+    HatariMachineSettings, HatariPathState, HatariProfile, HatariProfileDiscovery,
+    HatariProfileDiscoveryRoots, HatariSaveStateInventory, HatariSelectedGame,
+    HatariSelectedGameRequest, HatariStorage, HatariStorageMechanism, HatariTosHealth,
+    HatariTosReference, HatariTosRom, HatariVideoSettings, discover_hatari_profiles,
+    inspect_hatari_game, parse_hatari_version,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
