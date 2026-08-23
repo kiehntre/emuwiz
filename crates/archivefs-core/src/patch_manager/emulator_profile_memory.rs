@@ -553,4 +553,50 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].adapter, "xenia");
     }
+
+    #[test]
+    fn ppsspp_and_duckstation_use_the_same_generic_profile_memory() {
+        // The machinery is adapter-agnostic - only the string key differs, so
+        // no second preference system is needed for these two adapters.
+        let dir = test_root("generic-keys");
+        let path = dir.join("emulator_profiles.toml");
+
+        remember_emulator_profile_to(&path, "ppsspp", "ppsspp-native", Path::new("/cfg/ppsspp"))
+            .unwrap();
+        remember_emulator_profile_to(
+            &path,
+            "duckstation",
+            "duckstation-flatpak",
+            Path::new("/var/app/org.duckstation.DuckStation"),
+        )
+        .unwrap();
+
+        let profiles = load_remembered_emulator_profiles_from(&path).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            remembered_profile_for(&profiles, "ppsspp")
+                .unwrap()
+                .profile_id,
+            "ppsspp-native"
+        );
+        assert_eq!(
+            remembered_profile_for(&profiles, "duckstation")
+                .unwrap()
+                .profile_id,
+            "duckstation-flatpak"
+        );
+
+        // Selection reuses the same rules for both keys.
+        let discovered = vec![
+            candidate("ppsspp-native", true, false),
+            candidate("duckstation-flatpak", true, false),
+        ];
+        assert_eq!(
+            select_emulator_profile(&discovered, Some("ppsspp-native"), None),
+            EmulatorProfileSelection::Auto {
+                profile_id: "ppsspp-native".to_string(),
+                reason: EmulatorProfileSelectReason::Remembered,
+            }
+        );
+    }
 }

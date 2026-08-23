@@ -1,9 +1,11 @@
 //! Read-only writability assessment for discovered emulator profiles.
 //!
 //! Doctor already knows which profiles exist: `discover_dolphin_profiles`,
-//! `discover_pcsx2_profiles` and `discover_xenia_profiles` do that, and each
-//! already reports its own blockers. This module answers the one question none
-//! of them answers: **could EmuWiz write an install into that profile?**
+//! `discover_pcsx2_profiles`, `discover_xenia_profiles`,
+//! `discover_ppsspp_profiles` and `discover_duckstation_profiles` do that,
+//! and each already reports its own blockers. This module answers the one
+//! question none of them answers: **could EmuWiz write an install into that
+//! profile?**
 //!
 //! It answers it from metadata only. Nothing here creates a directory, a
 //! `GameSettings` file, a `.pnach`, a `.patch.toml`, a config file or a probe
@@ -13,11 +15,17 @@
 //!
 //! ## Scope
 //!
-//! Only the three adapters EmuWiz already supports, through their existing
+//! Only the adapters EmuWiz already supports, through their existing
 //! discovery abstractions. No emulator gains support here. Flatpak profiles
 //! are assessed exactly like native ones, which is honest but incomplete: a
 //! portal can still refuse a write that the bits allow, so the narrowed
 //! deferred entry in `DEFERRED_CHECKS` says so.
+//!
+//! PPSSPP and DuckStation are assessed the same read-only way as every other
+//! adapter here, but - like Xenia - never become
+//! [`managed_scan_targets`]: neither has an in-file EmuWiz ownership marker
+//! (a managed block/section) to scan for, since neither has install/cheat-
+//! write support yet.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,9 +42,11 @@ use super::{
 };
 use crate::emulator_environment::EncodedPath;
 use crate::patch_manager::{
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, EmulatorProfileSelection,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, discover_dolphin_profiles, discover_pcsx2_profiles,
+    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DuckStationProfileDiscovery,
+    DuckStationProfileDiscoveryRoots, EmulatorProfileSelection, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, PpssppProfileDiscovery, PpssppProfileDiscoveryRoots,
+    XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, discover_dolphin_profiles,
+    discover_duckstation_profiles, discover_pcsx2_profiles, discover_ppsspp_profiles,
     discover_xenia_profiles, select_dolphin_profile,
 };
 
@@ -53,6 +63,8 @@ pub enum EmulatorKind {
     Dolphin,
     Pcsx2,
     Xenia,
+    Ppsspp,
+    DuckStation,
 }
 
 impl EmulatorKind {
@@ -61,6 +73,8 @@ impl EmulatorKind {
             Self::Dolphin => "Dolphin",
             Self::Pcsx2 => "PCSX2",
             Self::Xenia => "Xenia Canary",
+            Self::Ppsspp => "PPSSPP",
+            Self::DuckStation => "DuckStation",
         }
     }
 
@@ -69,6 +83,8 @@ impl EmulatorKind {
             Self::Dolphin => "dolphin",
             Self::Pcsx2 => "pcsx2",
             Self::Xenia => "xenia",
+            Self::Ppsspp => "ppsspp",
+            Self::DuckStation => "duckstation",
         }
     }
 
@@ -80,6 +96,8 @@ impl EmulatorKind {
             Self::Dolphin => "emulator_profile.ambiguous_preferred_dolphin_profile",
             Self::Pcsx2 => "emulator_profile.ambiguous_preferred_pcsx2_profile",
             Self::Xenia => "emulator_profile.ambiguous_preferred_xenia_profile",
+            Self::Ppsspp => "emulator_profile.ambiguous_preferred_ppsspp_profile",
+            Self::DuckStation => "emulator_profile.ambiguous_preferred_duckstation_profile",
         }
     }
 }
@@ -204,10 +222,16 @@ pub struct ProfileDiscoveries<'a> {
     pub pcsx2_error: Option<String>,
     pub xenia: Option<&'a XeniaProfileDiscovery>,
     pub xenia_error: Option<String>,
+    pub ppsspp: Option<&'a PpssppProfileDiscovery>,
+    pub ppsspp_error: Option<String>,
+    pub duckstation: Option<&'a DuckStationProfileDiscovery>,
+    pub duckstation_error: Option<String>,
     /// The profile ids EmuWiz currently prefers, when known.
     pub preferred_dolphin: Option<&'a str>,
     pub preferred_pcsx2: Option<&'a str>,
     pub preferred_xenia: Option<&'a str>,
+    pub preferred_ppsspp: Option<&'a str>,
+    pub preferred_duckstation: Option<&'a str>,
 }
 
 /// Assesses every discovered profile's write destination.
@@ -322,6 +346,58 @@ pub fn assess_emulator_profiles(
         }
     } else if let Some(error) = &discoveries.xenia_error {
         unavailable.push((EmulatorKind::Xenia, error.clone()));
+    }
+
+    if let Some(discovery) = discoveries.ppsspp {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::Ppsspp,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                format!("{:?}", profile.scope),
+                profile.provenance.to_string(),
+                profile.eligible,
+                profile
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
+                    .collect(),
+                &profile.configuration_path,
+                // The directory a per-game PPSSPP cheat file would be
+                // written into once cheat-write support exists.
+                &profile.cheats_path,
+                discoveries.preferred_ppsspp,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.ppsspp_error {
+        unavailable.push((EmulatorKind::Ppsspp, error.clone()));
+    }
+
+    if let Some(discovery) = discoveries.duckstation {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::DuckStation,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                // DuckStation has no separate profile-scope concept - every
+                // discovered profile is either found or explicitly supplied.
+                "N/A".to_string(),
+                "discovered configuration directory".to_string(),
+                profile.eligible,
+                profile.blocker.iter().cloned().collect(),
+                &profile.configuration_path,
+                // The directory a per-game DuckStation cheat file would be
+                // written into once cheat-write support exists.
+                &profile.cheats_path,
+                discoveries.preferred_duckstation,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.duckstation_error {
+        unavailable.push((EmulatorKind::DuckStation, error.clone()));
     }
 
     profiles.sort_by(|left, right| {
@@ -543,6 +619,8 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
         EmulatorKind::Dolphin,
         EmulatorKind::Pcsx2,
         EmulatorKind::Xenia,
+        EmulatorKind::Ppsspp,
+        EmulatorKind::DuckStation,
     ] {
         let candidates: Vec<&ProfileAssessment> = report
             .profiles
@@ -680,11 +758,13 @@ pub struct DiscoveredProfiles {
     /// discovered from roots the user has already pointed EmuWiz at. With
     /// none supplied there is nothing to assess - not a failure.
     pub xenia: Option<XeniaProfileDiscovery>,
+    pub ppsspp: Result<PpssppProfileDiscovery, String>,
+    pub duckstation: Result<DuckStationProfileDiscovery, String>,
 }
 
 impl DiscoveredProfiles {
-    /// Discovers Dolphin and PCSX2 profiles from the documented paths, plus
-    /// Xenia from the supplied explicit roots only.
+    /// Discovers Dolphin, PCSX2, PPSSPP and DuckStation profiles from their
+    /// documented paths, plus Xenia from the supplied explicit roots only.
     ///
     /// Read-only: each adapter's discovery inspects metadata of documented
     /// paths and never creates a directory or a profile.
@@ -708,6 +788,12 @@ impl DiscoveredProfiles {
                 explicit_configuration_roots: explicit_xenia_roots,
             }))
         };
+        let ppsspp = PpssppProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("PPSSPP profiles could not be discovered: {error}"))
+            .map(|roots| discover_ppsspp_profiles(&roots));
+        let duckstation = DuckStationProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("DuckStation profiles could not be discovered: {error}"))
+            .map(|roots| discover_duckstation_profiles(&roots));
         let preferred_dolphin = dolphin.as_ref().ok().and_then(|discovery| {
             match select_dolphin_profile(discovery, None) {
                 EmulatorProfileSelection::Auto { profile_id, .. } => Some(profile_id),
@@ -720,6 +806,8 @@ impl DiscoveredProfiles {
             preferred_dolphin,
             pcsx2,
             xenia,
+            ppsspp,
+            duckstation,
         }
     }
 
@@ -731,9 +819,15 @@ impl DiscoveredProfiles {
             pcsx2_error: self.pcsx2.as_ref().err().cloned(),
             xenia: self.xenia.as_ref(),
             xenia_error: None,
+            ppsspp: self.ppsspp.as_ref().ok(),
+            ppsspp_error: self.ppsspp.as_ref().err().cloned(),
+            duckstation: self.duckstation.as_ref().ok(),
+            duckstation_error: self.duckstation.as_ref().err().cloned(),
             preferred_dolphin: self.preferred_dolphin.as_deref(),
             preferred_pcsx2: None,
             preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
         }
     }
 }
@@ -783,7 +877,9 @@ pub fn managed_scan_targets(report: &ProfileAssessmentReport) -> Vec<ManagedScan
                 format: match profile.emulator {
                     EmulatorKind::Dolphin => ManagedFormat::DolphinGameSettings,
                     EmulatorKind::Pcsx2 => ManagedFormat::Pcsx2Pnach,
-                    EmulatorKind::Xenia => unreachable!("filtered above"),
+                    EmulatorKind::Xenia | EmulatorKind::Ppsspp | EmulatorKind::DuckStation => {
+                        unreachable!("filtered above")
+                    }
                 },
                 destination_root: if profile.destination_is_directory {
                     path
@@ -1105,9 +1201,15 @@ mod tests {
             pcsx2_error: None,
             xenia: None,
             xenia_error: None,
+            ppsspp: None,
+            ppsspp_error: None,
+            duckstation: None,
+            duckstation_error: None,
             preferred_dolphin: None,
             preferred_pcsx2: None,
             preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
         };
         let assessed = assess_emulator_profiles(&discoveries, None);
         assert!(assessed.profiles.is_empty());
@@ -1119,6 +1221,160 @@ mod tests {
                 .iter()
                 .any(|item| item.name.contains("Dolphin") && item.reason.contains("HOME")),
             "a failed discovery must be stated, never presented as a clean result"
+        );
+    }
+
+    #[test]
+    fn doctor_sees_ppsspp() {
+        use crate::patch_manager::{PpssppInstallationType, PpssppProfile, PpssppProfileScope};
+        let tree = TempTree::new("profiles-doctor-sees-ppsspp");
+        let root = tree.path().join("ppsspp");
+        let ppsspp_profile = PpssppProfile {
+            profile_id: "ppsspp-native".to_string(),
+            installation_type: PpssppInstallationType::Native,
+            scope: PpssppProfileScope::User,
+            configuration_path: root.clone(),
+            provenance: "documented native path",
+            eligible: true,
+            blockers: Vec::new(),
+            executable_candidates: Vec::new(),
+            memstick_path: root.join("PSP"),
+            system_path: root.join("PSP/SYSTEM"),
+            global_config_path: root.join("PSP/SYSTEM/ppsspp.ini"),
+            cheats_path: root.join("PSP/Cheats"),
+            textures_path: root.join("PSP/Textures"),
+            savedata_path: root.join("PSP/SAVEDATA"),
+            game_path: root.join("PSP/GAME"),
+            state_path: root.join("PSP/PSP/STATE"),
+        };
+        let discovery = PpssppProfileDiscovery {
+            profiles: vec![ppsspp_profile],
+            warnings: Vec::new(),
+            complete: true,
+        };
+        let discoveries = ProfileDiscoveries {
+            dolphin: None,
+            dolphin_error: None,
+            pcsx2: None,
+            pcsx2_error: None,
+            xenia: None,
+            xenia_error: None,
+            ppsspp: Some(&discovery),
+            ppsspp_error: None,
+            duckstation: None,
+            duckstation_error: None,
+            preferred_dolphin: None,
+            preferred_pcsx2: None,
+            preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
+        };
+        let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
+        assert_eq!(assessed.profiles.len(), 1);
+        let profile = &assessed.profiles[0];
+        assert_eq!(profile.emulator, EmulatorKind::Ppsspp);
+        assert_eq!(profile.emulator.label(), "PPSSPP");
+        assert_eq!(profile.profile_id, "ppsspp-native");
+        assert_eq!(
+            profile.destination_path.display,
+            root.join("PSP/Cheats").display().to_string()
+        );
+    }
+
+    #[test]
+    fn doctor_sees_duckstation() {
+        use crate::patch_manager::{DuckStationInstallationType, DuckStationProfile};
+        let tree = TempTree::new("profiles-doctor-sees-duckstation");
+        let root = tree.path().join("duckstation");
+        let duckstation_profile = DuckStationProfile {
+            profile_id: "duckstation-native".to_string(),
+            installation_type: DuckStationInstallationType::Native,
+            configuration_path: root.clone(),
+            eligible: true,
+            blocker: None,
+            executable_candidates: Vec::new(),
+            global_config_path: root.join("settings.ini"),
+            game_settings_path: root.join("gamesettings.ini"),
+            cheats_path: root.join("cheats"),
+            patches_path: root.join("patches"),
+            textures_path: root.join("textures"),
+            bios_path: root.join("bios"),
+            memory_cards_path: root.join("memcards"),
+            save_states_path: root.join("savestates"),
+        };
+        let discovery = DuckStationProfileDiscovery {
+            profiles: vec![duckstation_profile],
+            complete: true,
+        };
+        let discoveries = ProfileDiscoveries {
+            dolphin: None,
+            dolphin_error: None,
+            pcsx2: None,
+            pcsx2_error: None,
+            xenia: None,
+            xenia_error: None,
+            ppsspp: None,
+            ppsspp_error: None,
+            duckstation: Some(&discovery),
+            duckstation_error: None,
+            preferred_dolphin: None,
+            preferred_pcsx2: None,
+            preferred_xenia: None,
+            preferred_ppsspp: None,
+            preferred_duckstation: None,
+        };
+        let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
+        assert_eq!(assessed.profiles.len(), 1);
+        let profile = &assessed.profiles[0];
+        assert_eq!(profile.emulator, EmulatorKind::DuckStation);
+        assert_eq!(profile.emulator.label(), "DuckStation");
+        assert_eq!(profile.profile_id, "duckstation-native");
+        assert_eq!(
+            profile.destination_path.display,
+            root.join("cheats").display().to_string()
+        );
+    }
+
+    #[test]
+    fn ppsspp_and_duckstation_never_become_managed_scan_targets() {
+        use crate::patch_manager::{
+            DuckStationInstallationType, PpssppInstallationType, PpssppProfileScope,
+        };
+        let tree = TempTree::new("profiles-no-managed-block");
+        let ppsspp_destination = tree.path().join("ppsspp-cheats");
+        let duckstation_destination = tree.path().join("duckstation-cheats");
+        fs::create_dir_all(&ppsspp_destination).expect("fixture");
+        fs::create_dir_all(&duckstation_destination).expect("fixture");
+        let ppsspp_assessed = assess_one(
+            EmulatorKind::Ppsspp,
+            "ppsspp-native".to_string(),
+            format!("{:?}", PpssppInstallationType::Native),
+            format!("{:?}", PpssppProfileScope::User),
+            "documented native path".to_string(),
+            true,
+            Vec::new(),
+            ppsspp_destination.parent().unwrap(),
+            &ppsspp_destination,
+            None,
+            Some(&rw_table()),
+        );
+        let duckstation_assessed = assess_one(
+            EmulatorKind::DuckStation,
+            "duckstation-native".to_string(),
+            format!("{:?}", DuckStationInstallationType::Native),
+            "N/A".to_string(),
+            "discovered configuration directory".to_string(),
+            true,
+            Vec::new(),
+            duckstation_destination.parent().unwrap(),
+            &duckstation_destination,
+            None,
+            Some(&rw_table()),
+        );
+        let targets = managed_scan_targets(&report(vec![ppsspp_assessed, duckstation_assessed]));
+        assert!(
+            targets.is_empty(),
+            "neither adapter has managed-block support yet - see the module doc comment"
         );
     }
 
@@ -1319,5 +1575,107 @@ mod tests {
             ],
             "a live scan merged these into one result when they shared an id"
         );
+    }
+
+    /// Doctor discovers and assesses PPSSPP and DuckStation profiles through
+    /// their existing adapter discovery, with explicit call-supplied roots.
+    #[test]
+    fn doctor_discovers_ppsspp_and_duckstation_profiles() {
+        let tree = TempTree::new("profiles-ppsspp-duckstation");
+        let ppsspp_root = tree.path().join("ppsspp");
+        fs::create_dir_all(ppsspp_root.join("PSP/SYSTEM")).expect("fixture");
+        fs::write(ppsspp_root.join("PSP/SYSTEM/ppsspp.ini"), "").expect("fixture");
+        let duck_root = tree.path().join("duckstation");
+        fs::create_dir_all(&duck_root).expect("fixture");
+        fs::write(duck_root.join("settings.ini"), "").expect("fixture");
+
+        let roots = roots_for_ppsspp_and_duckstation(
+            &tree.path().to_path_buf(),
+            &[ppsspp_root.clone()],
+            &[duck_root.clone()],
+        );
+        let ppsspp = discover_ppsspp_profiles(&roots.ppsspp);
+        let duckstation = discover_duckstation_profiles(&roots.duckstation);
+
+        let discoveries = ProfileDiscoveries {
+            ppsspp: Some(&ppsspp),
+            duckstation: Some(&duckstation),
+            ..ProfileDiscoveries::default()
+        };
+        let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
+
+        let kinds: Vec<EmulatorKind> = assessed
+            .profiles
+            .iter()
+            .map(|profile| profile.emulator)
+            .collect();
+        assert!(kinds.contains(&EmulatorKind::Ppsspp));
+        assert!(kinds.contains(&EmulatorKind::DuckStation));
+
+        // Both profiles are eligible and assessed against their cheat-write
+        // destination directory.
+        let ppsspp_assessed = assessed
+            .profiles
+            .iter()
+            .find(|profile| profile.emulator == EmulatorKind::Ppsspp)
+            .expect("PPSSPP profile assessed");
+        assert!(ppsspp_assessed.eligible);
+        assert_eq!(
+            ppsspp_assessed.destination_path.display,
+            ppsspp_root.join("PSP/CHEATS").display().to_string()
+        );
+        let duck_assessed = assessed
+            .profiles
+            .iter()
+            .find(|profile| profile.emulator == EmulatorKind::DuckStation)
+            .expect("DuckStation profile assessed");
+        assert!(duck_assessed.eligible);
+        assert_eq!(
+            duck_assessed.destination_path.display,
+            duck_root.join("cheats").display().to_string()
+        );
+    }
+
+    /// A small bag of already-built discovery-root structs for Doctor's
+    /// PPSSPP and DuckStation discovery, so the test drives both without
+    /// touching environment variables.
+    struct PpssppDuckstationRoots {
+        ppsspp: PpssppProfileDiscoveryRoots,
+        duckstation: DuckStationProfileDiscoveryRoots,
+    }
+
+    /// Builds explicit-roots discovery for PPSSPP and DuckStation from a
+    /// caller-supplied base directory and separate explicit configuration
+    /// roots for each adapter. It never touches `HOME`/`XDG`.
+    fn roots_for_ppsspp_and_duckstation(
+        base: &PathBuf,
+        ppsspp_explicit: &[PathBuf],
+        duckstation_explicit: &[PathBuf],
+    ) -> PpssppDuckstationRoots {
+        let home = base.join("home");
+        let xdg_config_home = base.join("config");
+        let xdg_data_home = base.join("data");
+        PpssppDuckstationRoots {
+            ppsspp: PpssppProfileDiscoveryRoots {
+                home: home.clone(),
+                xdg_config_home: xdg_config_home.clone(),
+                xdg_data_home: xdg_data_home.clone(),
+                explicit_configuration_roots: ppsspp_explicit.to_vec(),
+                portable_configuration_roots: Vec::new(),
+                explicit_executables: Vec::new(),
+                known_version_outputs: std::collections::BTreeMap::new(),
+                appimage_directory: None,
+            },
+            duckstation: DuckStationProfileDiscoveryRoots {
+                home,
+                xdg_config_home,
+                xdg_data_home,
+                explicit_configuration_roots: duckstation_explicit.to_vec(),
+                portable_configuration_roots: Vec::new(),
+                explicit_executables: Vec::new(),
+                known_version_outputs: std::collections::BTreeMap::new(),
+                appimage_directory: None,
+            },
+        }
     }
 }

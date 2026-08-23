@@ -45,6 +45,7 @@ mod dolphin_gecko_provider;
 mod dolphin_local;
 mod duckstation_local;
 mod emulator_profile_memory;
+mod emulator_request_bridge;
 mod flycast_local;
 mod gamehacking_catalogue;
 mod gamehacking_gamecube_install_plan;
@@ -331,6 +332,10 @@ pub use emulator_profile_memory::{
     forget_emulator_profile_default, load_remembered_emulator_profiles_default,
     load_remembered_emulator_profiles_from, remember_emulator_profile_default,
     remember_emulator_profile_to, remembered_profile_for, select_emulator_profile,
+};
+pub use emulator_request_bridge::{
+    duckstation_request, inspect_duckstation_game_for_verified, inspect_ppsspp_game_for_verified,
+    ppsspp_request,
 };
 pub use flycast_local::{
     FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
