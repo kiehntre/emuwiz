@@ -100,6 +100,50 @@
 //! required by this milestone depends on its content, and parsing it
 //! would be new, unreviewed scope.
 //!
+//! # Installation discovery extension (executable + eligibility)
+//!
+//! In addition to the config/systems discovery above, this module answers
+//! "is ES-DE installed, and is that installation usable" for four kinds of
+//! candidate: [`ProfileKind::Native`] (PATH lookup), [`ProfileKind::Explicit`]
+//! (caller-supplied home directory and/or executable),
+//! [`ProfileKind::AppImage`] (caller-supplied AppImage executable path -
+//! never guessed at, never the bounded evidence search described above),
+//! and [`ProfileKind::Portable`] (caller-supplied executable *and* home
+//! directory together - never inferred from a filename alone). There is
+//! still no `Flatpak` kind: confirmed again against `INSTALL.md`/
+//! `USERGUIDE.md` (same repository, `master`, checked 2026-08-23) - ES-DE's
+//! own officially supported Linux packaging remains AppImage/`.deb`/`.rpm`
+//! only, and RetroDECK (the Flatpak-shipped, ES-DE-bundling product) stays
+//! out of scope; it is still reachable through `ProfileKind::Explicit`.
+//!
+//! - Native executable name and install path: `INSTALL.md` documents
+//!   `/usr/bin/es-de` as the installed binary and shows it invoked as
+//!   `./es-de` from a build directory - the executable this module's
+//!   bounded `$PATH` scan looks for is exactly `es-de`.
+//! - The `--home` flag: `USERGUIDE.md` documents that "If the `--home`
+//!   command line option was used to start ES-DE, the tilde `~` symbol
+//!   will resolve to whatever directory was passed as an argument to this
+//!   option" - so for any profile representing a `--home` override
+//!   (`Explicit`, `Portable`, and an `AppImage` profile whose caller
+//!   supplied its own `config_root`), `~`-relative `<path>` values in
+//!   `es_systems.xml` are resolved against *that profile's own* home
+//!   directory, not the real machine `$HOME`; a bare `AppImage` profile
+//!   with no `config_root` override uses the same undecorated `~/ES-DE`
+//!   as `Native`.
+//! - Portable release: `USERGUIDE.md`/`Windows_Portable_README.txt`
+//!   describe a ZIP that "can be unzipped anywhere" - there is no
+//!   documented default location or filename convention for it, so
+//!   [`DiscoveryEnvironment::explicit_portables`] is the only way a
+//!   `Portable` profile is ever produced; this module never scans for one.
+//!
+//! Every caller-supplied executable path (`Explicit`, `AppImage`,
+//! `Portable`) is probed with the same no-follow [`ReadOnlyHostFilesystem::probe`]
+//! used everywhere else in this module - a symlink there is treated as
+//! unsafe, never followed. Only the `Native` `$PATH` scan follows a final
+//! symlink, mirroring `retroarch::discover_native_executables`'s identical,
+//! narrowly-scoped exception (see the symlink policy note on
+//! [`ReadOnlyHostFilesystem`] in the parent module).
+//!
 //! # Platform identity
 //!
 //! ES-DE system names, platform tags, and theme identifiers are
@@ -108,6 +152,8 @@
 //! identity - see [`EsDeSystemFinding`].
 
 use std::env;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use quick_xml::Reader;
@@ -116,9 +162,21 @@ use quick_xml::events::Event;
 use serde::Serialize;
 
 use super::{
-    BoundedListResult, BoundedReadResult, EncodedPath, FsProbe, HostReadOnlyFilesystem,
-    ReadOnlyHostFilesystem,
+    BoundedListResult, BoundedReadResult, EncodedPath, ExecutableProbe, FsProbe,
+    HostReadOnlyFilesystem, ReadOnlyHostFilesystem,
 };
+
+/// The installed native Linux binary name - source-verified, see the
+/// module doc comment ("Installation discovery extension").
+const NATIVE_EXECUTABLE_NAME: &str = "es-de";
+
+/// Bound on how many `$PATH` entries a native executable lookup walks -
+/// mirrors the defensive intent of this module's other bounded limits;
+/// no real `$PATH` is anywhere near this long.
+const MAX_PATH_ENTRIES: usize = 512;
+
+pub const MAX_EXPLICIT_APPIMAGE_CANDIDATES: usize = 8;
+pub const MAX_EXPLICIT_PORTABLE_CANDIDATES: usize = 8;
 
 /// ES-DE's documented location for user-editable system definitions,
 /// relative to the ES-DE home directory - source-verified, see the
@@ -155,11 +213,24 @@ pub enum ProfileKind {
     /// which officially-supported package format (AppImage, `.deb`,
     /// `.rpm`) put it there - they all share this same layout. See
     /// `appimage_candidates` for AppImage-specific provenance evidence.
+    /// Its executable is located through a bounded `$PATH` scan for
+    /// `es-de` - see "Installation discovery extension" in the module doc
+    /// comment.
     Native,
-    /// A caller-supplied home directory - never auto-discovered. The way
-    /// this adapter reaches a non-standard install (a custom
-    /// `--home-path`, RetroDECK's own layout, ...).
+    /// A caller-supplied home directory and/or executable - never
+    /// auto-discovered. The way this adapter reaches a non-standard
+    /// install (a custom `--home-path`, RetroDECK's own layout, ...).
     Explicit,
+    /// A caller-supplied AppImage executable path (and, optionally, a
+    /// distinct configuration root) - distinct from
+    /// `EsDeProfile::appimage_candidates`, which is only unexecuted,
+    /// unopened evidence. Never auto-discovered from a bare filename.
+    AppImage,
+    /// A caller-supplied executable *and* home directory pair
+    /// representing ES-DE's portable (ZIP) release - never inferred from
+    /// a filename or location alone, since ES-DE documents no fixed
+    /// portable location.
+    Portable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -291,6 +362,72 @@ pub enum PathResolutionState {
     NotConfigured,
 }
 
+/// How a profile's executable search concluded. See "Installation
+/// discovery extension" in the module doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutableSearchOutcome {
+    /// A regular, executable file was found.
+    Found,
+    NotFound,
+    /// Present but not safely usable: a symlink (never followed for a
+    /// caller-supplied path), a directory, or a regular file missing the
+    /// executable permission bit.
+    Unsafe,
+    /// No caller-supplied executable path exists to check (an `Explicit`
+    /// profile the caller gave only a home directory for).
+    NotSearched,
+}
+
+/// How a profile's executable path was determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutableProvenance {
+    /// Found via a bounded `$PATH` scan for `es-de` - follows a final
+    /// symlink, the same narrowly-scoped exception `retroarch` uses for
+    /// its own native executable lookup.
+    PathLookup,
+    /// An exact path supplied directly by the caller - never guessed at,
+    /// never searched for. A symlink here is never followed.
+    CallerSuppliedPath,
+    NotSearched,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutableFinding {
+    pub path: Option<EncodedPath>,
+    pub outcome: ExecutableSearchOutcome,
+    pub provenance: ExecutableProvenance,
+}
+
+/// Why a profile is not [`EsDeProfile::eligible`]. See "Installation
+/// discovery extension" in the module doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EligibilityBlocker {
+    ExecutableMissing,
+    ExecutableUnsafe,
+    ConfigurationRootMissing,
+    ConfigurationRootUnsafe,
+    /// Two or more caller-supplied candidates resolved to the same
+    /// configuration root (or the same home directory, for `Portable`)
+    /// through different executables - this adapter never silently picks
+    /// one, so every profile sharing the conflict is ineligible.
+    ConflictingCandidates,
+}
+
+/// How a profile's home directory/executable pairing was determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileProvenance {
+    /// `~/ES-DE`, ES-DE's own documented default home directory, paired
+    /// with a `$PATH`-discovered executable.
+    DocumentedDefaultHome,
+    /// A home directory and/or executable path supplied directly by the
+    /// caller - never auto-discovered.
+    CallerSupplied,
+}
+
 /// One `<system>` entry read from an `es_systems.xml`-shaped file.
 ///
 /// Every field here is downstream ES-DE frontend metadata, preserved
@@ -332,7 +469,22 @@ pub struct EsDeSystemDataLocations {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EsDeProfile {
+    /// Stable identifier for this profile, unique within one report - e.g.
+    /// `"native"`, `"explicit"`, or `"app_image:<executable path>"`. Never
+    /// reused across a different candidate.
+    pub profile_id: String,
     pub profile_kind: ProfileKind,
+    pub provenance: ProfileProvenance,
+    /// The `es-de` executable this profile would launch - never itself
+    /// executed, launched, or version-probed. See "Installation discovery
+    /// extension" in the module doc comment.
+    pub executable: ExecutableFinding,
+    /// Whether every fail-closed requirement in "Installation discovery
+    /// extension" is satisfied: a `Found` executable and a `PresentDirectory`
+    /// configuration root, with no conflicting candidate. `false` whenever
+    /// `blockers` is non-empty.
+    pub eligible: bool,
+    pub blockers: Vec<EligibilityBlocker>,
     /// `~/ES-DE` (or the explicit equivalent) - the single ES-DE home
     /// directory, source-verified to hold `settings/`, `custom_systems/`,
     /// `gamelists/`, `downloaded_media/`, etc. directly (no separate
@@ -380,6 +532,14 @@ pub struct EsDeEnvironmentReport {
     pub format_version: u32,
     pub profiles: Vec<EsDeProfile>,
     pub diagnostics: Vec<Diagnostic>,
+    /// `false` whenever some part of discovery could not be fully carried
+    /// out - a candidate list hit its bound (see
+    /// [`MAX_EXPLICIT_APPIMAGE_CANDIDATES`]/[`MAX_EXPLICIT_PORTABLE_CANDIDATES`]
+    /// or the AppImage evidence search), or a required path could not be
+    /// read due to a permission/IO error. `true` never implies every
+    /// profile is eligible - only that discovery itself ran to
+    /// completion.
+    pub discovery_complete: bool,
 }
 
 /// Injected discovery inputs - mirrors
@@ -390,6 +550,12 @@ pub struct EsDeEnvironmentReport {
 #[derive(Debug, Clone)]
 pub struct DiscoveryEnvironment {
     pub home: Option<std::ffi::OsString>,
+    /// `$PATH`, used only for the bounded native `es-de` executable
+    /// lookup - see "Installation discovery extension" in the module doc
+    /// comment. Production code uses the real process `$PATH`; tests
+    /// inject their own so discovery never depends on the real machine's
+    /// installed programs.
+    pub path: Option<std::ffi::OsString>,
     /// Caller-supplied paths standing in for ES-DE's bundled/default
     /// `es_systems.xml`, for every profile discovered - never
     /// auto-discovered. See "Bundled vs. custom systems" in the module
@@ -403,16 +569,51 @@ pub struct DiscoveryEnvironment {
     /// An explicit caller-supplied home directory, if any - produces a
     /// [`ProfileKind::Explicit`] profile in addition to `Native`.
     pub explicit_root: Option<ExplicitRoot>,
+    /// Caller-supplied AppImage executable paths - each produces one
+    /// [`ProfileKind::AppImage`] profile. Bounded to
+    /// [`MAX_EXPLICIT_APPIMAGE_CANDIDATES`]; exact duplicates are
+    /// collapsed to a single profile. Never auto-discovered.
+    pub explicit_appimages: Vec<ExplicitAppImage>,
+    /// Caller-supplied portable-release executable/home-directory pairs -
+    /// each produces one [`ProfileKind::Portable`] profile. Bounded to
+    /// [`MAX_EXPLICIT_PORTABLE_CANDIDATES`]; exact duplicates are
+    /// collapsed to a single profile. Never auto-discovered, never
+    /// inferred from a filename.
+    pub explicit_portables: Vec<ExplicitPortableRoot>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExplicitRoot {
+    pub home_directory: PathBuf,
+    /// The `es-de` executable for this explicit install, if the caller
+    /// supplied one. `None` leaves [`EsDeProfile::executable`] at
+    /// [`ExecutableSearchOutcome::NotSearched`] (and therefore
+    /// ineligible - see [`EligibilityBlocker::ExecutableMissing`]).
+    pub executable_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplicitAppImage {
+    pub executable_path: PathBuf,
+    /// The configuration root for this AppImage. AppImage releases use
+    /// the same undecorated `~/ES-DE` home as any other Linux package
+    /// (source-verified, see the module doc comment) unless the caller
+    /// knows this AppImage was actually run with its own `--home`
+    /// override, so `None` defaults to `~/ES-DE` rather than being left
+    /// unresolved.
+    pub config_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplicitPortableRoot {
+    pub executable_path: PathBuf,
     pub home_directory: PathBuf,
 }
 
 impl DiscoveryEnvironment {
     pub fn from_process_environment() -> Self {
         let home = env::var_os("HOME");
+        let path = env::var_os("PATH");
         let appimage_search_roots = home
             .as_ref()
             .map(|home| {
@@ -424,9 +625,12 @@ impl DiscoveryEnvironment {
             .unwrap_or_default();
         Self {
             home,
+            path,
             explicit_bundled_systems_files: Vec::new(),
             appimage_search_roots,
             explicit_root: None,
+            explicit_appimages: Vec::new(),
+            explicit_portables: Vec::new(),
         }
     }
 }
@@ -462,35 +666,306 @@ pub fn discover_es_de_environment(
         .ok_or(DiscoveryError::NoHome)?;
     let home_dir = PathBuf::from(home);
 
+    let mut report_diagnostics = Vec::new();
     let mut profiles = Vec::new();
+
+    let native_executable = environment
+        .path
+        .as_ref()
+        .and_then(|path_value| discover_native_executable(filesystem, path_value));
+    let native_executable_finding = ExecutableFinding {
+        path: native_executable
+            .as_ref()
+            .map(|p| EncodedPath::from_path(p)),
+        outcome: if native_executable.is_some() {
+            ExecutableSearchOutcome::Found
+        } else {
+            ExecutableSearchOutcome::NotFound
+        },
+        provenance: ExecutableProvenance::PathLookup,
+    };
     profiles.push(build_profile(
         filesystem,
+        "native".to_string(),
         ProfileKind::Native,
+        ProfileProvenance::DocumentedDefaultHome,
+        native_executable_finding,
         &home_dir.join("ES-DE"),
         &home_dir,
         environment,
     ));
 
     if let Some(explicit) = &environment.explicit_root {
+        let executable =
+            explicit_executable_finding(filesystem, explicit.executable_path.as_deref());
         profiles.push(build_profile(
             filesystem,
+            "explicit".to_string(),
             ProfileKind::Explicit,
+            ProfileProvenance::CallerSupplied,
+            executable,
             &explicit.home_directory,
-            &home_dir,
+            &explicit.home_directory,
             environment,
         ));
     }
 
+    let (appimage_candidates, appimage_limited) = dedupe_and_bound(
+        &environment.explicit_appimages,
+        |candidate| candidate.executable_path.clone(),
+        MAX_EXPLICIT_APPIMAGE_CANDIDATES,
+    );
+    if appimage_limited {
+        report_diagnostics.push(Diagnostic::new(
+            "explicit_appimage_candidate_limit_reached",
+            DiagnosticSeverity::Warning,
+            DiagnosticCategory::Discovery,
+            Some(ProfileKind::AppImage),
+            None,
+        ));
+    }
+    // Two distinct AppImage executables that resolve to the same
+    // configuration root can never be safely told apart - both stay
+    // ineligible rather than one being silently preferred.
+    let appimage_config_roots: Vec<PathBuf> = appimage_candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .config_root
+                .clone()
+                .unwrap_or_else(|| home_dir.join("ES-DE"))
+        })
+        .collect();
+    for (index, candidate) in appimage_candidates.iter().enumerate() {
+        let conflicts = appimage_config_roots
+            .iter()
+            .enumerate()
+            .any(|(other_index, root)| {
+                other_index != index && root == &appimage_config_roots[index]
+            });
+        let config_root = appimage_config_roots[index].clone();
+        let tilde_home = if candidate.config_root.is_some() {
+            config_root.clone()
+        } else {
+            home_dir.clone()
+        };
+        let executable = explicit_executable_finding(filesystem, Some(&candidate.executable_path));
+        let mut profile = build_profile(
+            filesystem,
+            format!(
+                "app_image:{}",
+                EncodedPath::from_path(&candidate.executable_path).display
+            ),
+            ProfileKind::AppImage,
+            ProfileProvenance::CallerSupplied,
+            executable,
+            &config_root,
+            &tilde_home,
+            environment,
+        );
+        if conflicts
+            && !profile
+                .blockers
+                .contains(&EligibilityBlocker::ConflictingCandidates)
+        {
+            profile
+                .blockers
+                .push(EligibilityBlocker::ConflictingCandidates);
+            profile.eligible = false;
+        }
+        profiles.push(profile);
+    }
+
+    let (portable_candidates, portable_limited) = dedupe_and_bound(
+        &environment.explicit_portables,
+        |candidate| candidate.executable_path.clone(),
+        MAX_EXPLICIT_PORTABLE_CANDIDATES,
+    );
+    if portable_limited {
+        report_diagnostics.push(Diagnostic::new(
+            "explicit_portable_candidate_limit_reached",
+            DiagnosticSeverity::Warning,
+            DiagnosticCategory::Discovery,
+            Some(ProfileKind::Portable),
+            None,
+        ));
+    }
+    let portable_homes: Vec<PathBuf> = portable_candidates
+        .iter()
+        .map(|candidate| candidate.home_directory.clone())
+        .collect();
+    for (index, candidate) in portable_candidates.iter().enumerate() {
+        let conflicts = portable_homes
+            .iter()
+            .enumerate()
+            .any(|(other_index, home)| other_index != index && home == &portable_homes[index]);
+        let executable = explicit_executable_finding(filesystem, Some(&candidate.executable_path));
+        let mut profile = build_profile(
+            filesystem,
+            format!(
+                "portable:{}",
+                EncodedPath::from_path(&candidate.home_directory).display
+            ),
+            ProfileKind::Portable,
+            ProfileProvenance::CallerSupplied,
+            executable,
+            &candidate.home_directory,
+            &candidate.home_directory,
+            environment,
+        );
+        if conflicts
+            && !profile
+                .blockers
+                .contains(&EligibilityBlocker::ConflictingCandidates)
+        {
+            profile
+                .blockers
+                .push(EligibilityBlocker::ConflictingCandidates);
+            profile.eligible = false;
+        }
+        profiles.push(profile);
+    }
+
+    let discovery_complete = compute_discovery_complete(&profiles, &report_diagnostics);
+
     Ok(EsDeEnvironmentReport {
-        format_version: 2,
+        format_version: 3,
         profiles,
-        diagnostics: Vec::new(),
+        diagnostics: report_diagnostics,
+        discovery_complete,
     })
 }
 
+/// Collapses exact-duplicate candidates (by `key`) to a single entry,
+/// preserving first-seen order, then truncates to `limit`. Returns
+/// whether truncation actually discarded anything.
+fn dedupe_and_bound<T: Clone>(
+    candidates: &[T],
+    key: impl Fn(&T) -> PathBuf,
+    limit: usize,
+) -> (Vec<T>, bool) {
+    let mut seen = Vec::new();
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        let candidate_key = key(candidate);
+        if seen.contains(&candidate_key) {
+            continue;
+        }
+        seen.push(candidate_key);
+        deduped.push(candidate.clone());
+    }
+    let limited = deduped.len() > limit;
+    deduped.truncate(limit);
+    (deduped, limited)
+}
+
+fn compute_discovery_complete(profiles: &[EsDeProfile], report_diagnostics: &[Diagnostic]) -> bool {
+    let limiting_codes = [
+        "appimage_search_root_listing_too_large",
+        "explicit_appimage_candidate_limit_reached",
+        "explicit_portable_candidate_limit_reached",
+    ];
+    let has_limiting_diagnostic = report_diagnostics
+        .iter()
+        .chain(
+            profiles
+                .iter()
+                .flat_map(|profile| profile.diagnostics.iter()),
+        )
+        .any(|diagnostic| limiting_codes.contains(&diagnostic.code));
+    let has_unreadable_probe = profiles.iter().any(|profile| {
+        matches!(
+            profile.home_directory.probe,
+            FsProbe::Inaccessible | FsProbe::IoError
+        )
+    });
+    !has_limiting_diagnostic && !has_unreadable_probe
+}
+
+/// Probes a caller-supplied executable path with the module's standard
+/// no-follow policy - never used for the `Native` `$PATH` lookup, which
+/// deliberately follows a final symlink instead (see
+/// [`discover_native_executable`]).
+fn explicit_executable_finding(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    executable_path: Option<&Path>,
+) -> ExecutableFinding {
+    let Some(path) = executable_path else {
+        return ExecutableFinding {
+            path: None,
+            outcome: ExecutableSearchOutcome::NotSearched,
+            provenance: ExecutableProvenance::NotSearched,
+        };
+    };
+    let outcome = match filesystem.probe(path) {
+        FsProbe::PresentFile => match filesystem.probe_regular_file_executable_bit(path) {
+            Some(true) => ExecutableSearchOutcome::Found,
+            _ => ExecutableSearchOutcome::Unsafe,
+        },
+        FsProbe::Missing => ExecutableSearchOutcome::NotFound,
+        _ => ExecutableSearchOutcome::Unsafe,
+    };
+    ExecutableFinding {
+        path: Some(EncodedPath::from_path(path)),
+        outcome,
+        provenance: ExecutableProvenance::CallerSuppliedPath,
+    }
+}
+
+/// Bounded `$PATH` scan for the native `es-de` binary - the one place in
+/// this module that follows a final-component symlink, matching
+/// `retroarch::discover_native_executables`'s identical exception.
+fn discover_native_executable(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    path_value: &OsStr,
+) -> Option<PathBuf> {
+    for (index, directory_bytes) in path_value
+        .as_bytes()
+        .split(|&byte| byte == b':')
+        .enumerate()
+    {
+        if index >= MAX_PATH_ENTRIES {
+            break;
+        }
+        if directory_bytes.is_empty() {
+            continue;
+        }
+        let candidate =
+            PathBuf::from(OsStr::from_bytes(directory_bytes)).join(NATIVE_EXECUTABLE_NAME);
+        if filesystem.probe_executable(&candidate) == ExecutableProbe::RegularExecutable {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn eligibility_for(
+    executable: &ExecutableFinding,
+    home_directory: &DirectoryProbeFinding,
+) -> (bool, Vec<EligibilityBlocker>) {
+    let mut blockers = Vec::new();
+    match executable.outcome {
+        ExecutableSearchOutcome::Found => {}
+        ExecutableSearchOutcome::NotFound | ExecutableSearchOutcome::NotSearched => {
+            blockers.push(EligibilityBlocker::ExecutableMissing);
+        }
+        ExecutableSearchOutcome::Unsafe => blockers.push(EligibilityBlocker::ExecutableUnsafe),
+    }
+    match home_directory.probe {
+        FsProbe::PresentDirectory => {}
+        FsProbe::Missing => blockers.push(EligibilityBlocker::ConfigurationRootMissing),
+        _ => blockers.push(EligibilityBlocker::ConfigurationRootUnsafe),
+    }
+    (blockers.is_empty(), blockers)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_profile(
     filesystem: &dyn ReadOnlyHostFilesystem,
+    profile_id: String,
     profile_kind: ProfileKind,
+    provenance: ProfileProvenance,
+    executable: ExecutableFinding,
     home_directory: &Path,
     tilde_home: &Path,
     environment: &DiscoveryEnvironment,
@@ -565,8 +1040,15 @@ fn build_profile(
         })
         .collect();
 
+    let (eligible, blockers) = eligibility_for(&executable, &home_directory_finding);
+
     EsDeProfile {
+        profile_id,
         profile_kind,
+        provenance,
+        executable,
+        eligible,
+        blockers,
         home_directory: home_directory_finding,
         settings_file,
         gamelists_directory,

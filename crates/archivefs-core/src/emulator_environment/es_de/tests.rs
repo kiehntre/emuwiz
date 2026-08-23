@@ -33,12 +33,17 @@ impl Fixture {
     fn env(&self) -> DiscoveryEnvironment {
         DiscoveryEnvironment {
             home: Some(self.root.clone().into_os_string()),
+            // No native $PATH by default - tests that care about native
+            // executable discovery opt in explicitly.
+            path: None,
             explicit_bundled_systems_files: Vec::new(),
             // No AppImage search roots by default - tests that care about
             // AppImage evidence opt in explicitly, so every other test
             // never depends on (or is broken by) this behavior.
             appimage_search_roots: Vec::new(),
             explicit_root: None,
+            explicit_appimages: Vec::new(),
+            explicit_portables: Vec::new(),
         }
     }
 }
@@ -76,9 +81,12 @@ fn discovery_fails_only_when_home_is_unset() {
     let filesystem = HostReadOnlyFilesystem;
     let env = DiscoveryEnvironment {
         home: None,
+        path: None,
         explicit_bundled_systems_files: Vec::new(),
         appimage_search_roots: Vec::new(),
         explicit_root: None,
+        explicit_appimages: Vec::new(),
+        explicit_portables: Vec::new(),
     };
     assert_eq!(
         discover_es_de_environment(&filesystem, &env).unwrap_err(),
@@ -134,6 +142,7 @@ fn explicit_root_is_only_discovered_when_supplied() {
 
     env.explicit_root = Some(ExplicitRoot {
         home_directory: fixture.path("custom-home"),
+        executable_path: None,
     });
     let report_with = discover_es_de_environment(&HostReadOnlyFilesystem, &env).unwrap();
     let explicit = profile_by_kind(&report_with, ProfileKind::Explicit);
@@ -645,6 +654,453 @@ fn systems_file_symlink_is_not_followed() {
                 .any(|d| d.code == "systems_file_symlink_not_followed")
         );
     }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[test]
+fn native_profile_is_eligible_when_path_lookup_finds_es_de() {
+    let fixture = Fixture::new("native-eligible");
+    fixture.mkdir("ES-DE");
+    fixture.write("bin/es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("bin/es-de"));
+
+    let mut env = fixture.env();
+    env.path = Some(fixture.path("bin").into_os_string());
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let native = profile_by_kind(&report, ProfileKind::Native);
+    assert_eq!(native.profile_id, "native");
+    assert_eq!(native.executable.outcome, ExecutableSearchOutcome::Found);
+    assert_eq!(
+        native.executable.provenance,
+        ExecutableProvenance::PathLookup
+    );
+    assert!(
+        native
+            .executable
+            .path
+            .as_ref()
+            .unwrap()
+            .display
+            .ends_with("bin/es-de")
+    );
+    assert!(native.eligible);
+    assert!(native.blockers.is_empty());
+    assert!(report.discovery_complete);
+}
+
+#[test]
+fn native_profile_is_blocked_when_executable_is_missing_from_path() {
+    let fixture = Fixture::new("native-missing-exe");
+    fixture.mkdir("ES-DE");
+    fixture.mkdir("bin");
+
+    let mut env = fixture.env();
+    env.path = Some(fixture.path("bin").into_os_string());
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let native = profile_by_kind(&report, ProfileKind::Native);
+    assert_eq!(native.executable.outcome, ExecutableSearchOutcome::NotFound);
+    assert!(!native.eligible);
+    assert!(
+        native
+            .blockers
+            .contains(&EligibilityBlocker::ExecutableMissing)
+    );
+}
+
+#[test]
+fn native_profile_is_blocked_when_home_directory_is_missing() {
+    let fixture = Fixture::new("native-missing-home");
+    fixture.write("bin/es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("bin/es-de"));
+
+    let mut env = fixture.env();
+    env.path = Some(fixture.path("bin").into_os_string());
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let native = profile_by_kind(&report, ProfileKind::Native);
+    assert_eq!(native.home_directory.probe, FsProbe::Missing);
+    assert!(!native.eligible);
+    assert!(
+        native
+            .blockers
+            .contains(&EligibilityBlocker::ConfigurationRootMissing)
+    );
+}
+
+#[test]
+fn explicit_profile_is_eligible_with_caller_supplied_executable_and_home() {
+    let fixture = Fixture::new("explicit-eligible");
+    fixture.mkdir("custom-home");
+    fixture.write("custom-home/es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("custom-home/es-de"));
+
+    let mut env = fixture.env();
+    env.explicit_root = Some(ExplicitRoot {
+        home_directory: fixture.path("custom-home"),
+        executable_path: Some(fixture.path("custom-home/es-de")),
+    });
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let explicit = profile_by_kind(&report, ProfileKind::Explicit);
+    assert_eq!(explicit.profile_id, "explicit");
+    assert_eq!(explicit.provenance, ProfileProvenance::CallerSupplied);
+    assert_eq!(explicit.executable.outcome, ExecutableSearchOutcome::Found);
+    assert!(explicit.eligible);
+    assert!(explicit.blockers.is_empty());
+}
+
+#[test]
+fn explicit_appimage_profile_is_eligible_and_uses_default_config_root() {
+    let fixture = Fixture::new("appimage-eligible");
+    fixture.mkdir("ES-DE");
+    fixture.write("Applications/ES-DE_x64.AppImage", "not a real appimage");
+    make_executable(&fixture.path("Applications/ES-DE_x64.AppImage"));
+
+    let mut env = fixture.env();
+    env.explicit_appimages = vec![ExplicitAppImage {
+        executable_path: fixture.path("Applications/ES-DE_x64.AppImage"),
+        config_root: None,
+    }];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let appimage = profile_by_kind(&report, ProfileKind::AppImage);
+    assert_eq!(appimage.executable.outcome, ExecutableSearchOutcome::Found);
+    assert_eq!(
+        appimage.home_directory.path.display,
+        fixture.path("ES-DE").display().to_string()
+    );
+    assert!(appimage.eligible);
+}
+
+#[test]
+fn explicit_appimage_profile_is_blocked_when_executable_is_a_symlink() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("appimage-symlink-unsafe");
+        fixture.mkdir("ES-DE");
+        fixture.write("real/ES-DE.AppImage", "not a real appimage");
+        make_executable(&fixture.path("real/ES-DE.AppImage"));
+        symlink(
+            fixture.path("real/ES-DE.AppImage"),
+            fixture.path("Applications-link.AppImage"),
+        )
+        .unwrap();
+
+        let mut env = fixture.env();
+        env.explicit_appimages = vec![ExplicitAppImage {
+            executable_path: fixture.path("Applications-link.AppImage"),
+            config_root: None,
+        }];
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_es_de_environment(&filesystem, &env).unwrap();
+        let appimage = profile_by_kind(&report, ProfileKind::AppImage);
+        assert_eq!(appimage.executable.outcome, ExecutableSearchOutcome::Unsafe);
+        assert!(!appimage.eligible);
+        assert!(
+            appimage
+                .blockers
+                .contains(&EligibilityBlocker::ExecutableUnsafe)
+        );
+    }
+}
+
+#[test]
+fn explicit_portable_profile_is_eligible_and_resolves_tilde_against_its_own_home() {
+    let fixture = Fixture::new("portable-eligible");
+    fixture.mkdir("portable-root");
+    fixture.write("portable-root/es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("portable-root/es-de"));
+    fixture.write(
+        "portable-root/custom_systems/es_systems.xml",
+        "<systemList><system><name>nes</name><path>~/roms/nes</path></system></systemList>",
+    );
+
+    let mut env = fixture.env();
+    env.explicit_portables = vec![ExplicitPortableRoot {
+        executable_path: fixture.path("portable-root/es-de"),
+        home_directory: fixture.path("portable-root"),
+    }];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let portable = profile_by_kind(&report, ProfileKind::Portable);
+    assert!(portable.profile_id.starts_with("portable:"));
+    assert!(portable.eligible);
+    let system = &portable.systems[0];
+    assert_eq!(
+        system.rom_path_resolved.as_ref().unwrap().display,
+        fixture.path("portable-root/roms/nes").display().to_string()
+    );
+}
+
+#[test]
+fn appimage_candidate_missing_executable_is_ineligible() {
+    let fixture = Fixture::new("appimage-missing");
+    fixture.mkdir("ES-DE");
+
+    let mut env = fixture.env();
+    env.explicit_appimages = vec![ExplicitAppImage {
+        executable_path: fixture.path("does-not-exist.AppImage"),
+        config_root: None,
+    }];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let appimage = profile_by_kind(&report, ProfileKind::AppImage);
+    assert_eq!(
+        appimage.executable.outcome,
+        ExecutableSearchOutcome::NotFound
+    );
+    assert!(!appimage.eligible);
+    assert!(
+        appimage
+            .blockers
+            .contains(&EligibilityBlocker::ExecutableMissing)
+    );
+}
+
+#[test]
+fn explicit_root_without_executable_is_ineligible() {
+    let fixture = Fixture::new("explicit-no-exe");
+    fixture.mkdir("custom-home");
+
+    let mut env = fixture.env();
+    env.explicit_root = Some(ExplicitRoot {
+        home_directory: fixture.path("custom-home"),
+        executable_path: None,
+    });
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let explicit = profile_by_kind(&report, ProfileKind::Explicit);
+    assert_eq!(
+        explicit.executable.outcome,
+        ExecutableSearchOutcome::NotSearched
+    );
+    assert!(!explicit.eligible);
+    assert!(
+        explicit
+            .blockers
+            .contains(&EligibilityBlocker::ExecutableMissing)
+    );
+}
+
+#[test]
+fn duplicate_appimage_candidates_collapse_to_one_profile() {
+    let fixture = Fixture::new("appimage-dedup");
+    fixture.mkdir("ES-DE");
+    fixture.write("Applications/ES-DE.AppImage", "not a real appimage");
+    make_executable(&fixture.path("Applications/ES-DE.AppImage"));
+
+    let mut env = fixture.env();
+    let candidate = ExplicitAppImage {
+        executable_path: fixture.path("Applications/ES-DE.AppImage"),
+        config_root: None,
+    };
+    env.explicit_appimages = vec![candidate.clone(), candidate];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let appimage_profiles: Vec<_> = report
+        .profiles
+        .iter()
+        .filter(|profile| profile.profile_kind == ProfileKind::AppImage)
+        .collect();
+    assert_eq!(appimage_profiles.len(), 1);
+}
+
+#[test]
+fn appimage_candidate_limit_is_enforced_and_marks_discovery_limited() {
+    let fixture = Fixture::new("appimage-limit");
+    fixture.mkdir("ES-DE");
+
+    let mut env = fixture.env();
+    env.explicit_appimages = (0..MAX_EXPLICIT_APPIMAGE_CANDIDATES + 3)
+        .map(|index| {
+            let relative = format!("Applications/ES-DE-{index}.AppImage");
+            fixture.write(&relative, "not a real appimage");
+            ExplicitAppImage {
+                executable_path: fixture.path(&relative),
+                config_root: None,
+            }
+        })
+        .collect();
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let appimage_profiles = report
+        .profiles
+        .iter()
+        .filter(|profile| profile.profile_kind == ProfileKind::AppImage)
+        .count();
+    assert_eq!(appimage_profiles, MAX_EXPLICIT_APPIMAGE_CANDIDATES);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "explicit_appimage_candidate_limit_reached")
+    );
+    assert!(!report.discovery_complete);
+}
+
+#[test]
+fn native_and_explicit_profiles_stay_distinct() {
+    let fixture = Fixture::new("native-explicit-distinct");
+    fixture.mkdir("ES-DE");
+    fixture.mkdir("custom-home");
+    fixture.write("bin/es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("bin/es-de"));
+
+    let mut env = fixture.env();
+    env.path = Some(fixture.path("bin").into_os_string());
+    env.explicit_root = Some(ExplicitRoot {
+        home_directory: fixture.path("custom-home"),
+        executable_path: None,
+    });
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let native = profile_by_kind(&report, ProfileKind::Native);
+    let explicit = profile_by_kind(&report, ProfileKind::Explicit);
+    assert_ne!(native.profile_id, explicit.profile_id);
+    assert_ne!(
+        native.home_directory.path.display,
+        explicit.home_directory.path.display
+    );
+    assert!(native.eligible);
+    assert!(!explicit.eligible);
+}
+
+#[test]
+fn conflicting_appimage_candidates_sharing_a_config_root_are_both_ineligible() {
+    let fixture = Fixture::new("appimage-conflict");
+    fixture.mkdir("shared-config");
+    fixture.write("one/ES-DE.AppImage", "one");
+    make_executable(&fixture.path("one/ES-DE.AppImage"));
+    fixture.write("two/ES-DE.AppImage", "two");
+    make_executable(&fixture.path("two/ES-DE.AppImage"));
+
+    let mut env = fixture.env();
+    env.explicit_appimages = vec![
+        ExplicitAppImage {
+            executable_path: fixture.path("one/ES-DE.AppImage"),
+            config_root: Some(fixture.path("shared-config")),
+        },
+        ExplicitAppImage {
+            executable_path: fixture.path("two/ES-DE.AppImage"),
+            config_root: Some(fixture.path("shared-config")),
+        },
+    ];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let appimage_profiles: Vec<_> = report
+        .profiles
+        .iter()
+        .filter(|profile| profile.profile_kind == ProfileKind::AppImage)
+        .collect();
+    assert_eq!(appimage_profiles.len(), 2);
+    for profile in appimage_profiles {
+        assert!(!profile.eligible);
+        assert!(
+            profile
+                .blockers
+                .contains(&EligibilityBlocker::ConflictingCandidates)
+        );
+    }
+}
+
+#[test]
+fn portable_profile_is_blocked_when_home_directory_is_an_invalid_path() {
+    // The supplied "home directory" is actually a regular file, not a
+    // directory - an invalid/unreadable configuration root, not merely a
+    // missing one.
+    let fixture = Fixture::new("portable-invalid-home");
+    fixture.write("not-a-directory", "surprise");
+    fixture.write("es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("es-de"));
+
+    let mut env = fixture.env();
+    env.explicit_portables = vec![ExplicitPortableRoot {
+        executable_path: fixture.path("es-de"),
+        home_directory: fixture.path("not-a-directory"),
+    }];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let portable = profile_by_kind(&report, ProfileKind::Portable);
+    assert_eq!(portable.home_directory.probe, FsProbe::PresentFile);
+    assert!(!portable.eligible);
+    assert!(
+        portable
+            .blockers
+            .contains(&EligibilityBlocker::ConfigurationRootUnsafe)
+    );
+}
+
+#[test]
+fn native_discovery_never_scans_the_whole_home_directory() {
+    // A `$PATH` entry pointing well outside `$HOME`, and an unrelated
+    // executable named `es-de` sitting directly in `$HOME` (never on
+    // `$PATH`) - discovery must find neither by scanning `$HOME` itself,
+    // only by walking the exact `$PATH` entries it was given.
+    let fixture = Fixture::new("no-home-scan");
+    fixture.mkdir("ES-DE");
+    fixture.write("es-de", "#!/bin/sh\n");
+    make_executable(&fixture.path("es-de"));
+
+    let mut env = fixture.env();
+    env.path = Some(std::ffi::OsString::from("/nonexistent-path-dir"));
+
+    let filesystem = HostReadOnlyFilesystem;
+    let report = discover_es_de_environment(&filesystem, &env).unwrap();
+    let native = profile_by_kind(&report, ProfileKind::Native);
+    assert_eq!(native.executable.outcome, ExecutableSearchOutcome::NotFound);
+}
+
+#[test]
+fn installation_discovery_makes_no_filesystem_writes() {
+    let fixture = Fixture::new("install-discovery-no-writes");
+    fixture.mkdir("ES-DE");
+    fixture.write("Applications/ES-DE.AppImage", "not a real appimage");
+    make_executable(&fixture.path("Applications/ES-DE.AppImage"));
+    let before: Vec<_> = walk(&fixture.root);
+
+    let mut env = fixture.env();
+    env.path = Some(fixture.path("Applications").into_os_string());
+    env.explicit_appimages = vec![ExplicitAppImage {
+        executable_path: fixture.path("Applications/ES-DE.AppImage"),
+        config_root: None,
+    }];
+    env.explicit_portables = vec![ExplicitPortableRoot {
+        executable_path: fixture.path("Applications/ES-DE.AppImage"),
+        home_directory: fixture.path("ES-DE"),
+    }];
+
+    let filesystem = HostReadOnlyFilesystem;
+    let _ = discover_es_de_environment(&filesystem, &env).unwrap();
+
+    let after: Vec<_> = walk(&fixture.root);
+    assert_eq!(
+        before, after,
+        "installation discovery must never create or modify a file"
+    );
 }
 
 fn walk(root: &std::path::Path) -> Vec<(PathBuf, bool)> {
