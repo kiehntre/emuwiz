@@ -151,6 +151,7 @@ pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
 pub(crate) mod identity_sources_page;
+pub(crate) mod library_view_history_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
 pub(crate) mod repair_history_page;
@@ -3165,6 +3166,13 @@ enum MainView {
     /// directory), with reverify status and safe undo when the core proves
     /// a transaction is reversible.
     RepairHistory,
+    /// Library View History: a read-only view of the durable, append-only
+    /// Library View apply/remove history
+    /// (`archivefs_core::library_view_history`), re-read from disk on every
+    /// visit/refresh. Deliberately distinct from `HistoryLogs`, which shows
+    /// the in-memory `OperationHistory` recent-activity log that does not
+    /// survive a restart - this page never touches that log.
+    LibraryViewHistory,
     /// The registered DAT catalogues: which local DAT files and folders
     /// EmuWiz can check a library against. Its own destination for the
     /// same reason Cheat Sources is: it is configuration that outlives any
@@ -3435,6 +3443,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::CanonicalOrganisation => "Library organisation",
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
+        MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
@@ -3458,7 +3467,8 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Sources
         | MainView::LibraryViews
         | MainView::HistoryLogs
-        | MainView::RepairHistory => ui_layout::ContentWidth::Wide,
+        | MainView::RepairHistory
+        | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
         | MainView::RepairReview
@@ -3513,6 +3523,10 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             // page scroll or content past the viewport is simply clipped
             // with no way to reach it.
             | MainView::RepairHistory
+            // Library View History renders the same shape of plain
+            // top-down record-card list as Repair History, with no
+            // internal `ScrollArea` of its own.
+            | MainView::LibraryViewHistory
             // Library Organisation's plan/preview results list has the same
             // shape as Repair History: a plain top-down list of entry rows
             // with no `ScrollArea` of its own. Without the shared page
@@ -3784,6 +3798,11 @@ struct ArchiveFsApp {
     /// transactions journaled through the Repair Center, re-read from disk
     /// on every refresh.
     repair_history_page: Option<repair_history_page::RepairHistoryPageState>,
+    /// The Library View History page, loaded lazily on first visit:
+    /// durable Library View apply/remove records, re-read from disk on
+    /// every refresh. Distinct from `history` (`OperationHistory`) below,
+    /// which is in-memory only.
+    library_view_history_page: Option<library_view_history_page::LibraryViewHistoryPageState>,
     /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy - see
     /// `CheatSourcesPageUi`.
@@ -4213,6 +4232,7 @@ impl ArchiveFsApp {
             rom_organisation_page: None,
             repair_review_page: None,
             repair_history_page: None,
+            library_view_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
@@ -5343,6 +5363,13 @@ impl ArchiveFsApp {
             ui.ctx().request_repaint();
         }
         repair_history_page::show_repair_history_page(ui, page, &mut self.clipboard);
+    }
+
+    fn show_library_view_history_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .library_view_history_page
+            .get_or_insert_with(library_view_history_page::LibraryViewHistoryPageState::load);
+        library_view_history_page::show_library_view_history_page(ui, page);
     }
 
     fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
@@ -15313,6 +15340,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::RepairHistory {
                     self.show_repair_history_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::LibraryViewHistory {
+                    self.show_library_view_history_page(ui);
                     return;
                 }
 

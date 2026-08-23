@@ -1049,6 +1049,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         rom_organisation_page: None,
         repair_review_page: None,
         repair_history_page: None,
+        library_view_history_page: None,
         cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
         dat_sources_page: None,
         dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),

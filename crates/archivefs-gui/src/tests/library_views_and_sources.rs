@@ -1199,6 +1199,7 @@ fn library_view_apply_summary_message_reports_skip_count_and_partial_state() {
         unchanged: 340,
         failed: 0,
         results: Vec::new(),
+        history_warning: None,
     };
 
     let full = library_view_apply_summary_message("Applied", "retrodeck", &report, Some(0));
