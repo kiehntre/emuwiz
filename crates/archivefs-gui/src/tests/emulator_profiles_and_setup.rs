@@ -1294,6 +1294,418 @@ fn pcsx2_legacy_migration_strips_legacy_file_and_reports_a_history_entry() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Builds a PCSX2 workflow whose preview has already run and landed in
+/// `CheatTransactionState::Review` - the exact point the GUI reaches after
+/// "Install selected" and before "Install" is confirmed - using a real,
+/// disposable profile directory so the returned plan can be handed to the
+/// real `execute_shared_apply`/`execute_shared_rollback` engine, exactly
+/// as `start_cheat_apply`/`start_cheat_install_rollback` do.
+fn pcsx2_workflow_reviewed_for_apply(directory: &Path) -> ArchiveFsApp {
+    let cheats_directory = directory.join("cheats");
+    let mut profile = pcsx2_profile_fixture();
+    profile.configuration_path = directory.to_path_buf();
+    profile.patch_directories = vec![Pcsx2PatchDirectory {
+        path: cheats_directory,
+        category: Pcsx2PatchCategory::Cheats,
+        state: Pcsx2PatchDirectoryState::Missing,
+        warning: None,
+        identity: None,
+    }];
+    let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+    app.start_pcsx2_install_preview();
+    assert!(matches!(
+        app.cheat_workflow.as_ref().unwrap().transaction,
+        CheatTransactionState::Review { .. }
+    ));
+    app
+}
+
+/// Sibling roots, deliberately outside `directory` (the destination scope
+/// itself): the shared engine's safety checks reject a history/backup
+/// root that overlaps the source or destination it is managing.
+fn shared_history_and_backup_roots(directory: &Path) -> (PathBuf, PathBuf) {
+    let name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pcsx2-gui-test");
+    let parent = directory.parent().unwrap_or(directory);
+    (
+        parent.join(format!("{name}-history")),
+        parent.join(format!("{name}-backups")),
+    )
+}
+
+fn shared_apply_options_with_temp_roots(
+    plan: &archivefs_core::patch_manager::SharedTransactionPlan,
+    directory: &Path,
+    operation_id: &str,
+    replacement_approved: bool,
+) -> SharedApplyOptions {
+    let (history_root, backup_root) = shared_history_and_backup_roots(directory);
+    SharedApplyOptions {
+        dry_run: false,
+        confirmation: Some(SharedApplyConfirmation {
+            plan_id: plan.plan_id.clone(),
+            general_approved: true,
+            replacement_approved,
+        }),
+        operation_id: operation_id.to_string(),
+        timestamp_unix_seconds: 1_700_000_000,
+        current_context: plan.context.clone(),
+        history_root,
+        backup_root,
+    }
+}
+
+/// Preview -> Review -> Confirm -> Apply -> Verify -> Result -> History ->
+/// Rollback, driven through the real PCSX2 GUI workflow's own generated
+/// plan (not a synthetic fixture), proving the existing tested shared
+/// transaction engine is actually reachable end to end for PCSX2 the same
+/// way it already is for Dolphin/Xenia/RetroArch.
+#[test]
+fn pcsx2_confirmed_apply_writes_through_the_shared_transaction_result_exposes_the_real_journal_and_history_discovers_it()
+ {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-apply-round-trip-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut app = pcsx2_workflow_reviewed_for_apply(&directory);
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+
+    // Preview must remain write-free: nothing has touched the real
+    // destination yet, only the private staging root.
+    let destination = directory.join("cheats/SLUS-20312_A1B2C3D4.pnach");
+    assert!(!destination.exists(), "preview must not write to disk");
+
+    let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+    let options =
+        shared_apply_options_with_temp_roots(plan, &directory, "pcsx2-gui-e2e-apply", false);
+    let result = execute_shared_apply(plan, &options);
+
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "entries: {:#?}",
+        result.journal.entries
+    );
+    assert!(destination.exists(), "apply must write the real PNACH");
+    let written = std::fs::read_to_string(&destination).unwrap();
+    assert!(written.contains("patch=1,EE,20123456,word,00000001"));
+    let journal_path = result
+        .journal_path
+        .clone()
+        .expect("a successful apply writes a journal");
+    assert!(journal_path.exists());
+
+    // Result state exposes the real journal/transaction - not a stand-in.
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    let key = cheat_preview_key(workflow);
+    workflow.transaction = CheatTransactionState::Result { key, result };
+    let output = ctx_run_pcsx2_gamehacking(workflow, None);
+    assert!(rendered_text_contains(&output, "Installed successfully"));
+    assert!(rendered_text_contains(&output, "Undo installation"));
+
+    let (history_root, backup_root) = shared_history_and_backup_roots(&directory);
+
+    // History discovers the completed apply.
+    let discovered = discover_shared_apply_history(&history_root);
+    assert!(
+        discovered
+            .journals
+            .iter()
+            .any(|(_, journal)| journal.operation_id == "pcsx2-gui-e2e-apply"),
+        "the completed PCSX2 apply must be discoverable in shared history"
+    );
+
+    // Rollback restores exact previous bytes (no destination existed
+    // before, so rollback must remove exactly what was created).
+    let rollback = preview_shared_rollback(&journal_path, &directory, &backup_root);
+    assert!(rollback.available);
+    let rolled_back = execute_shared_rollback(
+        &rollback,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: rollback.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "pcsx2-gui-e2e-undo".to_string(),
+            timestamp_unix_seconds: 1_700_000_001,
+            history_root: history_root.clone(),
+            backup_root: backup_root.clone(),
+        },
+    );
+    assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+    assert!(
+        !destination.exists(),
+        "rollback must restore the exact prior (absent) state"
+    );
+
+    // Repeated rollback stays safe: the same journal can no longer be
+    // rolled back a second time, and nothing is corrupted by trying.
+    let repeated = preview_shared_rollback(&journal_path, &directory, &backup_root);
+    assert!(!repeated.available);
+    assert!(!destination.exists());
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Existing content is never lost: installing into a real pre-existing
+/// user PNACH keeps its bytes as a prefix, and rollback restores the file
+/// to those exact original bytes (not deletion, since it existed before).
+#[test]
+fn pcsx2_rollback_restores_exact_previous_bytes_of_a_pre_existing_pnach() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-rollback-exact-bytes-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cheats_directory = directory.join("cheats");
+    std::fs::create_dir_all(&cheats_directory).unwrap();
+    let destination = cheats_directory.join("SLUS-20312_A1B2C3D4.pnach");
+    let original = b"// a user's own hand-written notes\r\npatch=0,EE,00100000,word,0\r\n";
+    std::fs::write(&destination, original).unwrap();
+
+    let mut profile = pcsx2_profile_fixture();
+    profile.configuration_path = directory.clone();
+    profile.patch_directories = vec![Pcsx2PatchDirectory {
+        path: cheats_directory,
+        category: Pcsx2PatchCategory::Cheats,
+        state: Pcsx2PatchDirectoryState::Available,
+        warning: None,
+        identity: None,
+    }];
+    let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+    app.start_pcsx2_install_preview();
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+    let options =
+        shared_apply_options_with_temp_roots(plan, &directory, "pcsx2-gui-preserve-user", true);
+    let result = execute_shared_apply(plan, &options);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+
+    let installed = std::fs::read(&destination).unwrap();
+    assert!(
+        installed.starts_with(original),
+        "the user's original PNACH content must be preserved, not overwritten"
+    );
+    assert_ne!(installed, original);
+
+    let journal_path = result.journal_path.unwrap();
+    let (history_root, backup_root) = shared_history_and_backup_roots(&directory);
+    let rollback = preview_shared_rollback(&journal_path, &directory, &backup_root);
+    assert!(rollback.available);
+    let rolled_back = execute_shared_rollback(
+        &rollback,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: rollback.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "pcsx2-gui-preserve-user-undo".to_string(),
+            timestamp_unix_seconds: 1_700_000_001,
+            history_root,
+            backup_root,
+        },
+    );
+    assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        original,
+        "rollback must restore the exact previous bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A destination that changes between preview and apply (e.g. another
+/// process wrote to it after EmuWiz inspected it as absent) must block
+/// the apply, and the write it detected must be left untouched - never
+/// silently overwritten and never partially applied.
+#[test]
+fn pcsx2_stale_destination_between_preview_and_apply_blocks_apply_without_partial_changes() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-stale-destination-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = pcsx2_workflow_reviewed_for_apply(&directory);
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+
+    // The preview inspected this destination as missing. Something else
+    // creates it for real before the (still separately confirmed) apply
+    // actually runs.
+    let destination = directory.join("cheats/SLUS-20312_A1B2C3D4.pnach");
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let raced_content = b"// written by something else after preview\n";
+    std::fs::write(&destination, raced_content).unwrap();
+
+    let options =
+        shared_apply_options_with_temp_roots(plan, &directory, "pcsx2-gui-stale-dest", false);
+    let result = execute_shared_apply(plan, &options);
+
+    assert_ne!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "a destination that changed since preview must not be silently applied over"
+    );
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        raced_content,
+        "the racing write must be left exactly as it was, not overwritten or partially applied"
+    );
+    // No leftover temp/partial files were created alongside it.
+    let leftovers: Vec<_> = std::fs::read_dir(destination.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().contains(".partial"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A PCSX2 apply and its subsequent rollback must never touch unrelated
+/// RetroArch, Dolphin, or Xenia profile-scan state carried on the same
+/// `ArchiveFsApp` - each adapter's workflow is independent.
+#[test]
+fn pcsx2_apply_and_rollback_leave_other_emulator_profile_state_untouched() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-isolation-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut app = pcsx2_workflow_reviewed_for_apply(&directory);
+    app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+        profiles: vec![dolphin_profile_fixture()],
+        warnings: Vec::new(),
+        complete: true,
+    });
+    app.xenia_profiles = XeniaProfilesState::NotScanned;
+    app.retroarch_profiles = RetroArchProfilesState::NotScanned;
+
+    let workflow = app.cheat_workflow.as_ref().unwrap();
+    let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+    let options =
+        shared_apply_options_with_temp_roots(plan, &directory, "pcsx2-gui-isolation", false);
+    let result = execute_shared_apply(plan, &options);
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "entries: {:#?}",
+        result.journal.entries
+    );
+
+    if let Some(journal_path) = &result.journal_path {
+        let (history_root, backup_root) = shared_history_and_backup_roots(&directory);
+        let rollback = preview_shared_rollback(journal_path, &directory, &backup_root);
+        let _ = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "pcsx2-gui-isolation-undo".to_string(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root,
+                backup_root,
+            },
+        );
+    }
+
+    match &app.dolphin_profiles {
+        DolphinProfilesState::Ready(discovery) => {
+            assert_eq!(discovery.profiles.len(), 1);
+            assert_eq!(discovery.profiles[0].profile_id, "dolphin-native-test");
+        }
+        _ => panic!("unrelated Dolphin profile state must be untouched by a PCSX2 apply"),
+    }
+    assert!(matches!(app.xenia_profiles, XeniaProfilesState::NotScanned));
+    assert!(matches!(
+        app.retroarch_profiles,
+        RetroArchProfilesState::NotScanned
+    ));
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Gamer View's "Undo" for a completed PCSX2 install routes to the same
+/// History & Logs screen the shared rollback flow already uses for every
+/// other adapter - no separate PCSX2-only Undo mechanism exists.
+#[test]
+fn pcsx2_undo_from_gamer_view_switches_to_the_history_screen() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-pcsx2-gamer-undo-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut app = pcsx2_workflow_reviewed_for_apply(&directory);
+    app.ui_mode = GuiMode::GamerView;
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    let CheatTransactionState::Review { key, plan, .. } = &workflow.transaction else {
+        panic!("expected a reviewed plan awaiting confirmation");
+    };
+    let key = key.clone();
+    let plan = plan.clone();
+    let options =
+        shared_apply_options_with_temp_roots(&plan, &directory, "pcsx2-gui-gamer-undo", false);
+    let result = execute_shared_apply(&plan, &options);
+    assert_eq!(result.journal.status, SharedApplyStatus::Success);
+    workflow.transaction = CheatTransactionState::Result { key, result };
+
+    app.start_cheat_install_rollback(egui::Context::default());
+
+    assert_eq!(
+        app.ui_mode,
+        GuiMode::AdvancedView,
+        "undo must switch to the mode that can actually show the review screen"
+    );
+    assert_eq!(app.view, MainView::HistoryLogs);
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+fn ctx_run_pcsx2_gamehacking(
+    workflow: &mut CheatWorkflowState,
+    cheats_directory: Option<&Path>,
+) -> egui::FullOutput {
+    let ctx = egui::Context::default();
+    ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_pcsx2_gamehacking(ui, workflow, cheats_directory);
+        });
+    })
+}
+
 fn empty_dolphin_inventory() -> DolphinGameIniInventory {
     DolphinGameIniInventory {
         profile_id: "dolphin-native-test".to_string(),
