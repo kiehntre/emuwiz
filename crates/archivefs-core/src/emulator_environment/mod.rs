@@ -20,12 +20,17 @@
 //! component) rather than sharing code with it - only a second
 //! environment-discovery target would justify extracting a shared trait.
 //!
-//! Only one emulator (RetroArch, in [`retroarch`]) is implemented. No
-//! generic `EmulatorEnvironmentAdapter` trait exists yet - see the module
-//! doc comment on `patch_manager::adapter` for why guessing a second
-//! implementation's shape ahead of time is exactly the mistake this
-//! project avoids repeating.
+//! Two frontends are implemented: RetroArch (in [`retroarch`]) and ES-DE
+//! (in [`es_de`]). No generic `EmulatorEnvironmentAdapter` trait exists
+//! yet - each module still defines its own local `Diagnostic`/severity/
+//! category vocabulary rather than sharing one, since a shared trait was
+//! deliberately deferred until a second implementation actually existed
+//! to prove its shape - see the module doc comment on
+//! `patch_manager::adapter`. [`es_de`] only reuses this module's
+//! [`ReadOnlyHostFilesystem`]/[`EncodedPath`]/[`FsProbe`] primitives; it
+//! does not import from, or get imported by, [`retroarch`].
 
+pub mod es_de;
 pub mod retroarch;
 
 use std::ffi::OsString;
