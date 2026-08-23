@@ -2352,6 +2352,196 @@ fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
     }
 }
 
+#[test]
+fn doctor_page_leaves_an_existing_dolphin_profile_row_unchanged_alongside_ppsspp_and_duckstation() {
+    let profile_report = ProfileAssessmentReport {
+        profiles: vec![
+            ProfileAssessment {
+                emulator: EmulatorKind::Dolphin,
+                profile_id: "dolphin-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "User".to_string(),
+                discovery_confidence: "documented native path".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/dolphin")),
+                destination_path: EncodedPath::from_path(Path::new(
+                    "/profiles/dolphin/GameSettings",
+                )),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::PermissionDenied,
+                preferred: None,
+            },
+            ProfileAssessment {
+                emulator: EmulatorKind::Ppsspp,
+                profile_id: "ppsspp-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "User".to_string(),
+                discovery_confidence: "documented native path".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/ppsspp")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/ppsspp/PSP/Cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+            ProfileAssessment {
+                emulator: EmulatorKind::DuckStation,
+                profile_id: "duckstation-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "N/A".to_string(),
+                discovery_confidence: "discovered configuration directory".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/duckstation")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/duckstation/cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+        ],
+        unavailable: Vec::new(),
+        discovery_incomplete: false,
+    };
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.emulator_profiles = Gathered::Ready(&profile_report);
+    let scan = run_doctor_scan(&inputs);
+
+    // Dolphin keeps its pre-existing finding id and its original
+    // "Destination:" evidence label - it never picks up the PPSSPP/
+    // DuckStation-only "Cheat destination:" wording or an `_inspected` id.
+    let dolphin_key = doctor_key_of_kind(&scan, "emulator_profile.permission_denied");
+    let dolphin_finding = scan
+        .findings
+        .iter()
+        .find(|finding| finding.id == "emulator_profile.permission_denied")
+        .expect("dolphin finding");
+    assert!(
+        dolphin_finding
+            .evidence
+            .iter()
+            .any(|line| line.starts_with("Destination: ")),
+        "dolphin evidence should keep the original 'Destination:' label: {:?}",
+        dolphin_finding.evidence
+    );
+    assert!(
+        dolphin_finding
+            .evidence
+            .iter()
+            .all(|line| !line.starts_with("Cheat destination:")),
+        "dolphin evidence must not gain the PPSSPP/DuckStation-only 'Cheat destination:' label"
+    );
+    let output = render_doctor_page(&doctor_outcome(scan.clone()), &mut Some(dolphin_key));
+    assert!(rendered_text_contains(&output, "Dolphin"));
+    assert!(rendered_text_contains(
+        &output,
+        "/profiles/dolphin/GameSettings"
+    ));
+
+    // PPSSPP and DuckStation are still reported alongside it.
+    assert!(
+        scan.findings
+            .iter()
+            .any(|finding| finding.id == "emulator_profile.ppsspp_inspected")
+    );
+    assert!(
+        scan.findings
+            .iter()
+            .any(|finding| finding.id == "emulator_profile.duckstation_inspected")
+    );
+}
+
+#[test]
+fn ppsspp_and_duckstation_profiles_never_become_managed_scan_targets_in_the_gui_pipeline() {
+    let profile_report = ProfileAssessmentReport {
+        profiles: vec![
+            ProfileAssessment {
+                emulator: EmulatorKind::Ppsspp,
+                profile_id: "ppsspp-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "User".to_string(),
+                discovery_confidence: "documented native path".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/ppsspp")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/ppsspp/PSP/Cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+            ProfileAssessment {
+                emulator: EmulatorKind::DuckStation,
+                profile_id: "duckstation-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "N/A".to_string(),
+                discovery_confidence: "discovered configuration directory".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/duckstation")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/duckstation/cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+            ProfileAssessment {
+                emulator: EmulatorKind::Pcsx2,
+                profile_id: "pcsx2-native".to_string(),
+                profile_kind: "Native".to_string(),
+                scope: "User".to_string(),
+                discovery_confidence: "documented native path".to_string(),
+                eligible: true,
+                blockers: Vec::new(),
+                root_path: EncodedPath::from_path(Path::new("/profiles/pcsx2")),
+                destination_path: EncodedPath::from_path(Path::new("/profiles/pcsx2/cheats")),
+                destination_exists: true,
+                destination_is_directory: true,
+                destination_is_symlink: false,
+                mount_mode: MountMode::ReadWrite,
+                permissions: None,
+                writability: WritabilityAssessment::AppearsWritable,
+                preferred: None,
+            },
+        ],
+        unavailable: Vec::new(),
+        discovery_incomplete: false,
+    };
+
+    // This is the exact call `gather_doctor_inputs` makes to build the
+    // managed-entries scan the GUI feeds into Doctor - see main.rs.
+    let targets = managed_scan_targets(&profile_report);
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "only the PCSX2 profile should become a managed scan target: {targets:?}"
+    );
+    assert_eq!(
+        targets[0].destination_root,
+        Path::new("/profiles/pcsx2/cheats")
+    );
+}
+
 /// A healthy result must never read as "everything was checked".
 #[test]
 fn doctor_page_lists_unchecked_and_deferred_checks_alongside_a_healthy_result() {
