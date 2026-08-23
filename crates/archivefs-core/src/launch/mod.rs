@@ -8,9 +8,12 @@
 //!
 //! # What this module is not
 //!
-//! - It never starts a process. Nothing here reaches `std::process::Command`
-//!   for an emulator - [`planning::build_launch_plan`] is a pure function
-//!   and never spawns anything.
+//! - Every submodule except [`execution`] never starts a process.
+//!   [`planning::build_launch_plan`] is a pure function and never spawns
+//!   anything; [`execution`] is the one deliberate, narrowly-scoped
+//!   exception - see its own module doc comment for exactly what it does
+//!   and does not launch (Phase 1: one native RetroArch process, one direct
+//!   loose regular content file, nothing else).
 //! - It never mutates an emulator's configuration, mounts an archive,
 //!   downloads firmware, or writes anything to disk.
 //! - It does not replace any adapter's own BIOS/firmware state enum (see
@@ -47,6 +50,13 @@
 //!   into [`planning::CanonicalIdentityStatus`]/[`input_projection::VerifiedIdentityFact`]/
 //!   [`planning::LaunchContentRef`]; never resolves identity or mounts
 //!   anything itself.
+//! - [`execution`] - the first supported slice of real launch execution:
+//!   live-revalidates a user-authorized launch request from scratch
+//!   (fresh identity re-inspection, fresh RetroArch environment discovery,
+//!   a freshly rebuilt plan/command) and, only if every check still holds,
+//!   spawns exactly one native RetroArch process via
+//!   `std::process::Command` - never a shell. Nothing else in this module
+//!   spawns anything; see its own module doc comment for the exact scope.
 //!
 //! See `docs/PATCH_CHEAT_MANAGER_DESIGN.md` and `ROADMAP.md`'s
 //! "Launch-preparation workflows" note for the wider design context this
@@ -54,6 +64,7 @@
 
 pub mod es_de_export;
 pub mod evidence_bridge;
+pub mod execution;
 pub mod input_projection;
 pub mod integration;
 pub mod planning;
@@ -71,6 +82,12 @@ pub use es_de_export::{
 };
 pub use evidence_bridge::{
     canonical_identity_from_game_report, launch_content_ref_from_archive_record,
+};
+pub use execution::{
+    LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
+    LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
+    LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
+    preflight_retroarch_launch, spawn_retroarch,
 };
 pub use input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
