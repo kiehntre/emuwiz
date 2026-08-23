@@ -324,7 +324,13 @@ pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence>
     // treatment as a MAME software-list's own namespace metadata, never used
     // to resolve a platform automatically.
     let is_fbneo_catalogue = dat.source.ecosystem == DatEcosystem::FBNeo;
-    let authoritative_header = !is_software_list && !is_fbneo_catalogue;
+    // A MAME `-listxml` root identifies the MAME build/catalogue, not the
+    // canonical platform of every machine it contains (one listxml dump
+    // spans every arcade board MAME emulates). Same non-authoritative
+    // treatment as a software-list root or an FBNeo catalogue header.
+    let is_mame_arcade_catalogue = dat.source.ecosystem == DatEcosystem::MAMEArcade;
+    let authoritative_header =
+        !is_software_list && !is_fbneo_catalogue && !is_mame_arcade_catalogue;
     let (name_kind, description_kind) = if is_software_list {
         (
             DatPlatformEvidenceKind::SoftwareListName,
@@ -357,8 +363,10 @@ pub fn gather_dat_platform_evidence(dat: &ParsedDat) -> Vec<DatPlatformEvidence>
     // `<software name>` is a MAME software namespace key, not a machine
     // shortname. Letting it through the machine resolver would make a title
     // such as `neocd` falsely assert a canonical platform. The same applies
-    // to an FBNeo arcade game shortname (e.g. `sf2`).
-    if !is_software_list && !is_fbneo_catalogue {
+    // to an FBNeo arcade game shortname (e.g. `sf2`) and a MAME listxml
+    // machine shortname (e.g. `neocd`, `pacman`) - MAME's own shortname
+    // namespace names arcade *boards*, never a canonical platform ID.
+    if !is_software_list && !is_fbneo_catalogue && !is_mame_arcade_catalogue {
         evidence.extend(machine_shortname_evidence(&dat.games));
     }
     evidence.extend(filename_hint_evidence_from_path(&dat.source.file_path));

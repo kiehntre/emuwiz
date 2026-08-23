@@ -25,6 +25,7 @@ pub enum DatEcosystem {
     Redump,
     FBNeo,
     MAMESoftwareList,
+    MAMEArcade,
     GenericClrMamePro,
     Tosec,
 }
@@ -37,6 +38,7 @@ impl DatEcosystem {
             Self::Redump => "Redump",
             Self::FBNeo => "FinalBurn Neo",
             Self::MAMESoftwareList => "MAME software list",
+            Self::MAMEArcade => "MAME listxml",
             Self::GenericClrMamePro => "Generic ClrMamePro",
             Self::Tosec => "TOSEC",
         }

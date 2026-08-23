@@ -31,6 +31,7 @@ pub mod cache;
 pub mod fbneo;
 pub mod hasheous;
 pub mod hashing;
+pub mod mame_listxml;
 pub mod mame_software_list;
 pub mod matching;
 pub mod model;

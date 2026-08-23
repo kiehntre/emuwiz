@@ -29,9 +29,11 @@ use super::parser::{ParseError, ParseOutcome};
 
 pub mod clrmamepro;
 pub mod logiqx;
+pub mod mame_listxml;
 
 use clrmamepro::parse_clrmamepro;
 use logiqx::parse_logiqx;
+use mame_listxml::parse_mame_listxml;
 
 /// Sniffs the given file path and parses it with the appropriate parser.
 pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
@@ -62,11 +64,53 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
 
     let detected = detect_format(path)?;
     let mut outcome = match detected {
+        DatFormat::Logiqx if is_mame_listxml_root(path)? => parse_mame_listxml(path, limits),
         DatFormat::Logiqx => parse_logiqx(path, limits),
         DatFormat::ClrMamePro => parse_clrmamepro(path, limits),
     }?;
     super::classification::classify_catalogue(&mut outcome.dat);
     Ok(outcome)
+}
+
+/// Decides whether a Logiqx-shaped XML file is actually `mame -listxml`
+/// output, whose `<mame>` root uses a different element vocabulary
+/// (`<machine>`, not `<game>`) than a Logiqx `<datafile>`.
+///
+/// This inspects the parsed *root element's tag name* only - never a raw
+/// substring search - so a document that merely mentions "mame" in a
+/// comment, attribute value, or an unrelated tag (`<mameinfo>`) is never
+/// misdetected. Only the bounded first-4KB prefix already read for format
+/// sniffing is inspected; a truncated/malformed prefix is treated as "not
+/// conclusively MAME listxml" rather than an error, since the real parser
+/// (or `parse_logiqx`) still validates the full document afterward.
+fn is_mame_listxml_root(path: &Path) -> Result<bool, ParseError> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|error| ParseError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let mut buf = vec![0u8; 4096];
+    let n = file.read(&mut buf).map_err(|error| ParseError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    buf.truncate(n);
+
+    let mut reader = quick_xml::Reader::from_reader(buf.as_slice());
+    let mut scan_buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut scan_buf) {
+            Ok(quick_xml::events::Event::Start(start))
+            | Ok(quick_xml::events::Event::Empty(start)) => {
+                return Ok(start.name().as_ref().eq_ignore_ascii_case(b"mame"));
+            }
+            Ok(quick_xml::events::Event::Eof) => return Ok(false),
+            Ok(_) => {}
+            Err(_) => return Ok(false),
+        }
+        scan_buf.clear();
+    }
 }
 
 /// Reads the first few KB of a file and decides its DAT format.

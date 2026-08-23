@@ -234,6 +234,45 @@ fn classify_entry(
     source_name: Option<&str>,
     game: &DatGameEntry,
 ) -> DatContentClassification {
+    // MAME's `<machine isbios="yes">`/`<machine isdevice="yes">` are
+    // structural declarations from the DAT itself, not a heuristic - a BIOS
+    // or device machine is never a playable arcade title and must not be
+    // presented as one just because it has a `<rom>`/`<disk>` list like any
+    // other machine.
+    if ecosystem == DatEcosystem::MAMEArcade {
+        if game
+            .is_bios
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+        {
+            return classification(
+                DatContentClass::NonGame,
+                ClassifierConfidence::High,
+                vec![evidence(
+                    ClassificationEvidenceKind::StructuredEntryMetadata,
+                    Some("isbios"),
+                    game.is_bios.clone(),
+                    "mame_arcade.bios",
+                )],
+            );
+        }
+        if game
+            .is_device
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+        {
+            return classification(
+                DatContentClass::NonGame,
+                ClassifierConfidence::High,
+                vec![evidence(
+                    ClassificationEvidenceKind::StructuredEntryMetadata,
+                    Some("isdevice"),
+                    game.is_device.clone(),
+                    "mame_arcade.device",
+                )],
+            );
+        }
+    }
     // A structured field's meaning is not universal: the same attribute name
     // (`category`, `type`, `content_type`) is used by different real-world DAT
     // generators/curation tools for genuinely different things - No-Intro's
