@@ -2002,7 +2002,13 @@ pub fn apply_library_view(
                     &destination_path,
                     &recorded.target_path,
                 ) {
-                    Ok(true) => {
+                    Ok(ManagedSymlinkRemoval::Removed | ManagedSymlinkRemoval::AlreadyAbsent) => {
+                        // Both outcomes leave nothing at `destination_path`
+                        // that this view still owns - `AlreadyAbsent` is
+                        // provably safe to reconcile the same way (see
+                        // `ManagedSymlinkRemoval`'s doc comment), never
+                        // just "left unchanged" and kept as a phantom
+                        // manifest entry.
                         entries_by_path.remove(&relative_link_path);
                         report.removed += 1;
                         report.results.push(LibraryViewApplyEntryResult {
@@ -2011,7 +2017,7 @@ pub fn apply_library_view(
                             error: None,
                         });
                     }
-                    Ok(false) => {
+                    Ok(ManagedSymlinkRemoval::LeftUnchanged) => {
                         report.results.push(LibraryViewApplyEntryResult {
                             relative_link_path,
                             outcome: LibraryViewApplyOutcome::LeftUnchanged,
@@ -2118,7 +2124,12 @@ pub fn remove_library_view_symlinks(
     for entry in &manifest.entries {
         let destination = view.destination_root.join(&entry.relative_link_path);
         match remove_managed_symlink(&view.destination_root, &destination, &entry.target_path) {
-            Ok(true) => {
+            Ok(ManagedSymlinkRemoval::Removed | ManagedSymlinkRemoval::AlreadyAbsent) => {
+                // Not pushed into `remaining`: both outcomes mean this
+                // entry is provably safe to drop from the manifest (see
+                // `ManagedSymlinkRemoval`'s doc comment) - an already-gone
+                // symlink (e.g. a prior run removed it but crashed before
+                // this manifest was re-saved) must not be kept forever.
                 report.removed += 1;
                 report.results.push(LibraryViewApplyEntryResult {
                     relative_link_path: entry.relative_link_path.clone(),
@@ -2126,7 +2137,7 @@ pub fn remove_library_view_symlinks(
                     error: None,
                 });
             }
-            Ok(false) => {
+            Ok(ManagedSymlinkRemoval::LeftUnchanged) => {
                 remaining.push(entry.clone());
                 report.results.push(LibraryViewApplyEntryResult {
                     relative_link_path: entry.relative_link_path.clone(),
@@ -2591,26 +2602,48 @@ fn create_or_repair_symlink(
     })
 }
 
+/// What happened when [`remove_managed_symlink`] was asked to remove a
+/// manifest-recorded symlink at a given destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedSymlinkRemoval {
+    /// The recorded symlink was found exactly as expected and removed.
+    Removed,
+    /// Nothing at all exists at `destination` any more. This is provably
+    /// safe to forget: there is nothing left to protect, so the caller may
+    /// drop the manifest entry exactly as if this call had removed it. The
+    /// case this exists for is a prior removal that mutated the filesystem
+    /// but crashed before the manifest describing that removal was
+    /// re-saved - without this, the stale entry would be reported as
+    /// removed "again" and kept in the manifest forever, even though the
+    /// symlink is provably, permanently gone.
+    AlreadyAbsent,
+    /// Something exists at `destination`, but it no longer matches what the
+    /// manifest recorded (replaced by a real file, or repointed by
+    /// something else since the manifest was last saved) - left untouched,
+    /// and the caller must keep the manifest entry: this is the genuinely
+    /// ambiguous case, and ambiguous filesystem state fails closed rather
+    /// than being silently forgotten or repaired.
+    LeftUnchanged,
+}
+
 /// Removes the symlink at `destination` - but only if it is still *exactly*
 /// what the manifest recorded: a symlink (never a real file or directory)
-/// pointing at `recorded_target`. Returns `Ok(true)` if it was removed,
-/// `Ok(false)` if `destination` no longer matches (already gone, replaced
-/// by a real file, or repointed by something else) - in the `Ok(false)`
-/// case nothing is touched at all, satisfying "never remove anything
-/// EmuWiz did not record as managed" even when the manifest is stale
-/// relative to the filesystem.
+/// pointing at `recorded_target`. See [`ManagedSymlinkRemoval`] for the
+/// three possible outcomes; in neither non-`Removed` case is anything on
+/// disk touched, satisfying "never remove anything EmuWiz did not record as
+/// managed" even when the manifest is stale relative to the filesystem -
+/// only whether the *manifest entry* may be dropped differs between them.
 ///
 /// Checks destination containment (`verify_destination_containment`)
-/// first and returns `Err` - never `Ok(false)` - if `destination` cannot be
-/// proven to stay inside `destination_root`: a stale-manifest mismatch is
-/// an expected, quiet no-op, but a containment escape is a real, distinct
-/// failure that must be reported, not silently swallowed as "left
-/// unchanged".
+/// first and returns `Err` - never an `Ok` variant - if `destination`
+/// cannot be proven to stay inside `destination_root`: a stale-manifest
+/// mismatch is an expected, quiet no-op, but a containment escape is a
+/// real, distinct failure that must be reported, not silently swallowed.
 fn remove_managed_symlink(
     destination_root: &Path,
     destination: &Path,
     recorded_target: &Path,
-) -> Result<bool> {
+) -> Result<ManagedSymlinkRemoval> {
     // Checked against `destination`'s parent, not `destination` itself, for
     // the same reason `create_or_repair_symlink` does: `destination` is
     // expected to already be a symlink, and resolving it directly would
@@ -2622,19 +2655,21 @@ fn remove_managed_symlink(
     verify_destination_containment(destination_root, parent)?;
     let metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManagedSymlinkRemoval::AlreadyAbsent);
+        }
         Err(error) => return Err(ArchiveFsError::io(destination.to_path_buf(), error)),
     };
     if !metadata.file_type().is_symlink() {
-        return Ok(false);
+        return Ok(ManagedSymlinkRemoval::LeftUnchanged);
     }
     match fs::read_link(destination) {
         Ok(actual_target) if actual_target == recorded_target => {
             fs::remove_file(destination)
                 .map_err(|source| ArchiveFsError::io(destination.to_path_buf(), source))?;
-            Ok(true)
+            Ok(ManagedSymlinkRemoval::Removed)
         }
-        _ => Ok(false),
+        _ => Ok(ManagedSymlinkRemoval::LeftUnchanged),
     }
 }
 
@@ -3254,7 +3289,7 @@ mod tests {
         write_file(&link_path, b"a real file now sits here");
 
         let removed = remove_managed_symlink(&destination, &link_path, &archive_path).unwrap();
-        assert!(!removed);
+        assert_eq!(removed, ManagedSymlinkRemoval::LeftUnchanged);
         assert_eq!(fs::read(&link_path).unwrap(), b"a real file now sits here");
 
         let report = remove_library_view_symlinks(&view, &manifest, &data_dir).unwrap();
@@ -3522,6 +3557,262 @@ mod tests {
         assert!(archive_path.exists());
         assert_eq!(fs::read(&archive_path).unwrap(), b"original-bytes");
         assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// A manifest entry pointing at a path that is never actually created on
+    /// disk in these tests - stands in for "the symlink this entry
+    /// describes is already gone" without needing a prior successful apply.
+    fn phantom_manifest_entry() -> LibraryViewManifestEntry {
+        LibraryViewManifestEntry {
+            relative_link_path: PathBuf::from("NES/Game.zip"),
+            target_path: PathBuf::from("/somewhere/Game.zip"),
+            archive_identity: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            platform: "NES".to_string(),
+            source_folder_path: PathBuf::from("/somewhere"),
+            object_kind: LibraryViewObjectKind::Symlink,
+            content_hash: None,
+            rendering_version: None,
+        }
+    }
+
+    #[test]
+    fn removing_an_already_absent_managed_symlink_drops_it_from_the_manifest() {
+        // Reproduces the gap found in this audit: a prior `remove_library_
+        // view_symlinks` run could delete the symlink from disk and then
+        // crash before its atomic manifest re-save landed, leaving the
+        // manifest still listing an entry for a symlink that is provably,
+        // permanently gone. Nothing exists on disk at this path at all.
+        let root = temp_dir("remove-already-absent");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = LibraryViewManifest {
+            view_id: view.id.clone(),
+            destination_root: destination.clone(),
+            entries: vec![phantom_manifest_entry()],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        let report = remove_library_view_symlinks(&view, &manifest, &data_dir).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failed, 0);
+
+        let reloaded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        assert!(
+            reloaded.entries.is_empty(),
+            "an already-absent managed symlink must not remain recorded forever, got {:?}",
+            reloaded.entries
+        );
+    }
+
+    #[test]
+    fn removal_of_an_already_absent_managed_symlink_is_idempotent() {
+        let root = temp_dir("remove-already-absent-idempotent");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = LibraryViewManifest {
+            view_id: view.id.clone(),
+            destination_root: destination.clone(),
+            entries: vec![phantom_manifest_entry()],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        let first = remove_library_view_symlinks(&view, &manifest, &data_dir).unwrap();
+        let after_first = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let second = remove_library_view_symlinks(&view, &after_first, &data_dir).unwrap();
+        let after_second = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+        assert_eq!(first.removed, 1);
+        assert_eq!(second.removed, 0);
+        assert_eq!(second.failed, 0);
+        assert!(after_first.entries.is_empty());
+        assert!(after_second.entries.is_empty());
+        assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn remove_stale_reconciles_an_already_absent_leftover_during_apply() {
+        // Same gap as `removing_an_already_absent_managed_symlink_drops_it_
+        // from_the_manifest`, but exercised through `apply_library_view`'s
+        // own `RemoveStale` path (a view whose config still filters the
+        // archive out) rather than the standalone `remove_library_view_
+        // symlinks` entry point - the two call sites share the same
+        // underlying bug and must both be fixed.
+        let root = temp_dir("apply-remove-stale-already-absent");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        // The view's platform filter excludes NES, so the plan will mark
+        // any existing NES manifest entry as `RemoveStale`.
+        let view = make_view("view-1", &destination, vec![], vec!["SNES".to_string()]);
+        let manifest = LibraryViewManifest {
+            view_id: view.id.clone(),
+            destination_root: destination.clone(),
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("NES/Game.zip"),
+                target_path: archive_path.clone(),
+                archive_identity: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                platform: "NES".to_string(),
+                source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+        // No symlink actually exists at `dest/NES/Game.zip` - simulates a
+        // prior apply that removed it but crashed before the manifest
+        // reflecting that removal was saved.
+
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::RemoveStale,
+            "the platform filter must still mark the manifest's NES entry stale"
+        );
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failed, 0);
+
+        let reloaded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        assert!(
+            reloaded.entries.is_empty(),
+            "an already-absent stale entry must not remain recorded forever, got {:?}",
+            reloaded.entries
+        );
+    }
+
+    #[test]
+    fn remove_stale_still_fails_closed_on_a_genuinely_conflicting_leftover() {
+        // The mirror image of the previous test: something *does* exist at
+        // the stale entry's path, but it no longer matches what the
+        // manifest recorded (repointed by something else since the last
+        // apply) - this must stay `LeftUnchanged` and the manifest entry
+        // must be kept, never silently dropped like the provably-absent
+        // case above.
+        let root = temp_dir("apply-remove-stale-conflicting");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        let elsewhere = root.join("elsewhere.zip");
+        write_file(&archive_path, b"zip-bytes");
+        write_file(&elsewhere, b"elsewhere-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let link_path = destination.join("NES").join("Game.zip");
+        fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        symlink(&elsewhere, &link_path).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec!["SNES".to_string()]);
+        let manifest = LibraryViewManifest {
+            view_id: view.id.clone(),
+            destination_root: destination.clone(),
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("NES/Game.zip"),
+                target_path: archive_path.clone(),
+                archive_identity: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                platform: "NES".to_string(),
+                source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(
+            report.results[0].outcome,
+            LibraryViewApplyOutcome::LeftUnchanged
+        );
+
+        let reloaded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        assert_eq!(
+            reloaded.entries.len(),
+            1,
+            "a genuinely conflicting leftover must fail closed and keep its manifest entry"
+        );
+        // And the foreign symlink itself was never touched.
+        assert_eq!(fs::read_link(&link_path).unwrap(), elsewhere);
+    }
+
+    #[test]
+    fn crash_between_symlink_creation_and_manifest_publication_self_heals_on_reapply() {
+        // Simulates the crash window this audit was asked to check for: a
+        // symlink was fully, correctly created on disk (exactly what
+        // `create_or_repair_symlink`'s own temp-file-then-rename would have
+        // produced) but the process crashed before `apply_library_view`
+        // ever reached its single end-of-loop `save_library_view_manifest_
+        // at` call, so the manifest on disk is still empty and does not
+        // record it. Proves that re-running plan+apply against that empty
+        // manifest reconciles the leftover into the manifest instead of
+        // either recreating/breaking it or refusing to proceed.
+        let root = temp_dir("crash-before-manifest-publish");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let link_path = destination.join("NES").join("Game.zip");
+        fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        symlink(&archive_path, &link_path).unwrap();
+        let inode_before = fs::symlink_metadata(&link_path).unwrap().ino();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination); // crash: never published
+
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::AlreadyCorrect
+        );
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 0);
+
+        // The pre-existing symlink was adopted, not recreated.
+        let inode_after = fs::symlink_metadata(&link_path).unwrap().ino();
+        assert_eq!(inode_before, inode_after);
+
+        let reloaded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(
+            reloaded.entries[0].relative_link_path,
+            PathBuf::from("NES/Game.zip")
+        );
     }
 
     #[test]
