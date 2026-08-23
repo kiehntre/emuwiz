@@ -16,7 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::destination_safety::{DestinationState, assess_destination, validate_destination_root};
+use super::destination_safety::{
+    DestinationRootState, DestinationState, assess_destination, validate_destination_root,
+};
 use super::shared_preview::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewProposedAction,
     SharedPreviewReport,
@@ -344,6 +346,32 @@ pub enum SharedApplyStatus {
     Failed,
 }
 
+/// The stable filesystem identity of one directory, captured via `fstat` on
+/// an already-open, no-follow-opened descriptor at the moment
+/// [`bootstrap_missing_destination_root`] created it - never re-derived
+/// from a pathname later. This is the proof rollback checks before it will
+/// ever remove a bootstrap-created directory: a directory that now exists
+/// at the same *path* but has a different `(device, inode)` pair is a
+/// replacement, never the one this transaction made, and is never touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// One destination-root directory level [`bootstrap_missing_destination_root`]
+/// created. `identity` is `Option` only so that a malformed/tampered
+/// journal entry that omits it deserializes instead of poisoning the whole
+/// journal - [`validate_created_root_chain`] treats a missing identity as
+/// unprovable ownership and refuses to act on it, and no code path this
+/// module controls ever writes an entry without one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedCreatedRootDirectory {
+    pub path: SharedTransactionPath,
+    #[serde(default)]
+    pub identity: Option<SharedDirectoryIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedApplyJournal {
     pub schema_version: u32,
@@ -353,6 +381,33 @@ pub struct SharedApplyJournal {
     pub context: SharedApplyContext,
     pub approved_source_root: SharedTransactionPath,
     pub destination_root: SharedTransactionPath,
+    /// Destination-root directory levels this transaction itself created
+    /// because `destination_root` (or one of its ancestors up to the
+    /// nearest already-existing directory) did not exist yet - see
+    /// `bootstrap_missing_destination_root`. Ordered outermost-created
+    /// first, so `destination_root` itself (when created) is always last.
+    ///
+    /// Deliberately separate from each [`SharedApplyEntry::created_directories`]
+    /// (ordinary child directories, e.g. a platform folder, created *below*
+    /// an already-existing or already-bootstrapped root): this field alone
+    /// is how rollback tells "the root existed before EmuWiz" from "this
+    /// transaction created the root," which an ordinary child-directory
+    /// entry can never express.
+    ///
+    /// Untrusted, persisted input by the time rollback reads it back -
+    /// never acted on directly. See [`validate_created_root_chain`] for the
+    /// full set of structural checks a claimed chain must pass before
+    /// anything here is even opened, let alone removed.
+    ///
+    /// `#[serde(default)]` so a journal written before this field existed
+    /// deserializes with an empty list - meaning nothing here for it, since
+    /// no journal written by older code could ever have bootstrapped a
+    /// root. Its rollback behaviour is therefore unchanged for every old
+    /// journal: an empty list carries no root-cleanup authority at all, and
+    /// there is no way to reinterpret an absent field into one - see
+    /// [`cleanup_transaction_created_root_directories`].
+    #[serde(default)]
+    pub created_root_directories: Vec<SharedCreatedRootDirectory>,
     pub dry_run: bool,
     pub entries: Vec<SharedApplyEntry>,
     pub status: SharedApplyStatus,
@@ -631,6 +686,7 @@ pub fn execute_shared_apply(
         context: plan.context.clone(),
         approved_source_root: plan.approved_source_root.clone(),
         destination_root: plan.destination_root.clone(),
+        created_root_directories: Vec::new(),
         dry_run: effective_dry_run,
         entries: Vec::new(),
         status: SharedApplyStatus::DryRun,
@@ -720,10 +776,52 @@ pub fn execute_shared_apply(
         }
     }
     let mut lock = None;
+    let mut created_root_directories: Vec<CreatedRootDirectory> = Vec::new();
     if !effective_dry_run {
+        // Bootstrap is only ever attempted for a plan the preview step
+        // already flagged as needing parent creation (`DestinationParentsMissing`,
+        // surfaced through `SharedPlanEntry::parent_creation_approved`) -
+        // the exact same consent an ordinary missing child directory
+        // already requires under `apply_one`. A missing root the user was
+        // never shown falls straight through to `RootLock::acquire` below,
+        // unchanged from before this existed.
+        let root_creation_approved = plan
+            .entries
+            .iter()
+            .any(|entry| entry.parent_creation_approved);
+        if root_creation_approved {
+            match bootstrap_missing_destination_root(&destination_root) {
+                Ok(created) => created_root_directories = created,
+                Err(kind) => {
+                    journal.entries = plan
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            failed_entry(
+                                entry,
+                                kind,
+                                "destination root could not be safely created",
+                            )
+                        })
+                        .collect();
+                    journal.status = SharedApplyStatus::Failed;
+                    return SharedApplyResult {
+                        journal,
+                        journal_path: None,
+                        journal_failure: None,
+                    };
+                }
+            }
+        }
         match RootLock::acquire(&destination_root, LOCK_TIMEOUT) {
             Ok(guard) => lock = Some(guard),
             Err(kind) => {
+                // Nothing was journaled yet, so an empty root this call
+                // itself just created would otherwise be orphaned with no
+                // journal ever able to clean it up later. Descriptor-
+                // anchored and identity-verified, exactly like real
+                // rollback - see `remove_verified_root_chain`.
+                remove_verified_root_chain(&created_root_directories);
                 journal.entries = plan
                     .entries
                     .iter()
@@ -754,7 +852,36 @@ pub fn execute_shared_apply(
             &mut backup_bytes,
         ));
     }
+    if !effective_dry_run && !created_root_directories.is_empty() {
+        let any_write = journal.entries.iter().any(|entry| {
+            matches!(
+                entry.outcome,
+                SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+            )
+        });
+        if !any_write {
+            // Nothing was actually installed under the bootstrap-created
+            // root: clean it up immediately, in this same call (the lock
+            // is still held), rather than leaving an empty root a journal
+            // would otherwise claim ownership of that normal rollback can
+            // never reach - rollback requires at least one installed,
+            // `Available` per-file entry, which an all-failed apply never
+            // has. Truncated to whatever `remove_verified_root_chain`
+            // actually removed (deepest-first, stopping at the first
+            // unremovable level), so the journal below never claims
+            // ownership of something already gone from disk.
+            let removed = remove_verified_root_chain(&created_root_directories);
+            created_root_directories.truncate(created_root_directories.len() - removed);
+        }
+    }
     drop(lock);
+    journal.created_root_directories = created_root_directories
+        .iter()
+        .map(|entry| SharedCreatedRootDirectory {
+            path: SharedTransactionPath::from_path(&entry.path),
+            identity: Some(entry.identity),
+        })
+        .collect();
     journal.status = derive_status(&journal.entries, effective_dry_run);
     log::info!(
         "shared apply {}: {:?}, {} entr(y/ies), {} byte(s) written",
@@ -1452,6 +1579,13 @@ pub fn execute_shared_rollback(
             _ => rollback.outcome = SharedRollbackOutcome::NoChangeRequired,
         }
     }
+    // Every per-entry installed file/child directory above has already
+    // been removed (or left in place on failure) - only now can a
+    // transaction-created root directory possibly be empty, so this always
+    // runs last, and is a no-op for a journal that never bootstrapped a
+    // root at all (including every journal written before that field
+    // existed).
+    cleanup_transaction_created_root_directories(&original, &root);
     let success = applied.entries.iter().all(|entry| {
         matches!(
             entry.outcome,
@@ -1925,6 +2059,472 @@ fn create_one_parent(root: &Path, parent: &Path) -> Result<(), SharedApplyFailur
         return Err(SharedApplyFailureKind::ParentCreationFailed);
     }
     Ok(())
+}
+
+/// One directory level [`bootstrap_missing_destination_root`] itself
+/// created and opened, in memory. `path` is display/journal-only from this
+/// point on - every filesystem decision this module makes about a
+/// bootstrap-created directory goes through `identity` (an `fstat`-derived
+/// `(device, inode)` pair) and an open descriptor, never a re-resolved
+/// pathname. See the `# Safety` section on [`bootstrap_missing_destination_root`].
+#[derive(Debug, Clone)]
+struct CreatedRootDirectory {
+    path: PathBuf,
+    identity: SharedDirectoryIdentity,
+}
+
+/// Minimal, narrowly-scoped `unsafe` wrappers around the POSIX fd-relative
+/// primitives (`openat`/`mkdirat`/`unlinkat`/`fstat`) this module's
+/// descriptor-anchored root bootstrap/cleanup is built on. Nothing outside
+/// this inner module ever touches `libc` directly for this feature.
+#[cfg(unix)]
+mod fd_relative {
+    use std::ffi::{CString, OsStr};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    fn component_cstring(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+    }
+
+    /// Opens `path` as a directory, refusing to follow a symlink at its
+    /// final component (`O_NOFOLLOW`). The *only* plain-pathname open in
+    /// this whole feature - used exclusively for the one trusted starting
+    /// ancestor a caller has already re-validated; every directory this
+    /// module creates, opens, or removes after this point is resolved
+    /// strictly relative to an already-open descriptor (`openat`/`mkdirat`/
+    /// `unlinkat`), so nothing above this ancestor - or any sibling of it -
+    /// can ever redirect where a later step lands, no matter what gets
+    /// swapped into the path string afterward.
+    pub(super) fn open_dir_no_follow(path: &Path) -> io::Result<OwnedFd> {
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        // SAFETY: `c_path` is a valid, NUL-terminated C string for the
+        // duration of this call; `open` either returns a valid owned fd
+        // (>= 0, taken over by `OwnedFd`) or a negative value with `errno`
+        // set, both handled below.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by `open` as a fresh, valid,
+        // uniquely-owned descriptor (checked `>= 0` above).
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Opens `name` (a single path component - never validated as such
+    /// here; every caller in this module already only ever passes one) as
+    /// a directory directly beneath the already-open `parent` descriptor,
+    /// refusing to follow a symlink. Resolution is entirely relative to
+    /// `parent`'s own descriptor, never the filesystem root.
+    pub(super) fn openat_dir_no_follow(parent: RawFd, name: &OsStr) -> io::Result<OwnedFd> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `parent` is a live, caller-owned directory descriptor for
+        // the duration of this call; `c_name` is a valid NUL-terminated C
+        // string. `openat` either returns a valid owned fd or a negative
+        // value with `errno` set.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                c_name.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by `openat` as a fresh, valid,
+        // uniquely-owned descriptor (checked `>= 0` above).
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Creates directory `name` directly beneath the already-open `parent`
+    /// descriptor. There is no path string involved beyond the single
+    /// component `name`, so there is nothing above `parent` left to swap.
+    pub(super) fn mkdirat_here(parent: RawFd, name: &OsStr) -> io::Result<()> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `parent` is a live directory descriptor; `c_name` is a
+        // valid NUL-terminated C string. `mkdirat` returns `0` on success
+        // or `-1` with `errno` set.
+        let result = unsafe { libc::mkdirat(parent, c_name.as_ptr(), 0o777) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Removes directory `name` directly beneath the already-open `parent`
+    /// descriptor - `unlinkat` with `AT_REMOVEDIR`, equivalent to `rmdir`.
+    /// This is the *only* emptiness check this module ever performs: POSIX
+    /// requires `rmdir`/`AT_REMOVEDIR` to both fail closed on a symlink
+    /// (`ENOTDIR`, never dereferenced) and fail on a non-empty directory
+    /// (`ENOTEMPTY`) atomically with the removal itself - there is
+    /// deliberately no separate `read_dir`-then-`remove_dir` anywhere in
+    /// this module, which would open a window between checking and acting
+    /// that a path-based check alone could never close.
+    pub(super) fn unlinkat_rmdir(parent: RawFd, name: &OsStr) -> io::Result<()> {
+        let c_name = component_cstring(name)?;
+        // SAFETY: `parent` is a live directory descriptor; `c_name` is a
+        // valid NUL-terminated C string. `unlinkat` returns `0` on success
+        // or `-1` with `errno` set.
+        let result = unsafe { libc::unlinkat(parent, c_name.as_ptr(), libc::AT_REMOVEDIR) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The `(device, inode, is_directory)` triple for an already-open
+    /// descriptor, read via `fstat` on the descriptor itself - never by
+    /// re-resolving a pathname, so nothing that happens to a name
+    /// afterward can change what this reports.
+    pub(super) fn fstat_identity(fd: RawFd) -> io::Result<(u64, u64, bool)> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is a live descriptor; `&mut stat` is a valid,
+        // properly-sized out-parameter for the duration of this call.
+        let result = unsafe { libc::fstat(fd, &mut stat) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        Ok((stat.st_dev as u64, stat.st_ino as u64, is_dir))
+    }
+
+    pub(super) fn as_raw(fd: &OwnedFd) -> RawFd {
+        fd.as_raw_fd()
+    }
+}
+
+/// Safely creates `root` and any missing ancestors up to (but never above)
+/// the nearest already-existing directory, when `root` itself does not
+/// exist yet. A no-op returning an empty list when `root` already exists -
+/// existing-root transactions are completely unaffected by this function
+/// ever having been called.
+///
+/// # Why this exists
+///
+/// [`RootLock::acquire`] (and every other destination write in this module)
+/// requires `root` to already exist. A fresh adapter destination - the
+/// motivating case is a Dolphin profile's `Load/Textures`, which does not
+/// exist until a texture pack is first installed - never has that. This is
+/// the one place that gap is closed, narrowly: only the exact missing
+/// `root` chain a caller already validated and approved is ever created,
+/// never anything wider.
+///
+/// # Safety
+///
+/// [`validate_destination_root`] is used only to find a *plausible*
+/// starting ancestor and to fail closed early on an obviously unsafe
+/// `root` - it is never, by itself, treated as proof that stays true by
+/// the time a directory is actually created. The real authority is
+/// descriptor-anchored, no-follow traversal (see [`fd_relative`]): the
+/// starting ancestor is (re)opened with `O_NOFOLLOW`, and every directory
+/// below it is created with `mkdirat` and then immediately reopened with
+/// `openat`+`O_NOFOLLOW` *relative to that already-open parent descriptor*
+/// - never a fresh top-level pathname lookup. If an ancestor is swapped to
+/// a symlink at any point after it was opened, there is no path string left
+/// for that swap to redirect: every subsequent `openat`/`mkdirat` resolves
+/// strictly against the open descriptor chain already established, not
+/// against `/`. A swap of the *exact* newly created entry, in the narrow
+/// window between `mkdirat` and the immediately following `openat`+
+/// `O_NOFOLLOW`, is the one gap POSIX itself does not offer an atomic
+/// primitive to close (there is no `O_CREAT|O_DIRECTORY`); it fails closed
+/// at that `openat` (`ENOTDIR`/`ELOOP`) rather than silently proceeding.
+///
+/// A failure partway through removes whatever prefix of the chain this
+/// call already created, deepest first, through the same descriptor chain
+/// (see [`remove_verified_root_chain`]) rather than leaving a partial,
+/// orphaned chain behind.
+///
+/// This function itself never decides whether creating a missing root was
+/// *approved* - see `execute_shared_apply`'s own `parent_creation_approved`
+/// gate, which is checked before this is ever called.
+#[cfg(unix)]
+fn bootstrap_missing_destination_root(
+    root: &Path,
+) -> Result<Vec<CreatedRootDirectory>, SharedApplyFailureKind> {
+    let validated_root =
+        validate_destination_root(root).map_err(|_| SharedApplyFailureKind::DestinationUnsafe)?;
+    if validated_root.state() == DestinationRootState::ExistingDirectory {
+        return Ok(Vec::new());
+    }
+    // The normalized, absolute form `validate_destination_root` itself
+    // already proved has no `..`/empty components - never the raw
+    // caller-supplied `root` from here on.
+    let root = validated_root.path().to_path_buf();
+
+    // Find a *plausible* starting ancestor - see this function's own
+    // `# Safety` section for why this walk is only ever a starting point,
+    // never the actual safety guarantee.
+    let mut existing_ancestor: Option<PathBuf> = None;
+    for ancestor in root.ancestors().skip(1) {
+        match validate_destination_root(ancestor) {
+            Ok(validated) if validated.state() == DestinationRootState::ExistingDirectory => {
+                existing_ancestor = Some(ancestor.to_path_buf());
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => return Err(SharedApplyFailureKind::DestinationUnsafe),
+        }
+    }
+    let Some(existing_ancestor) = existing_ancestor else {
+        return Err(SharedApplyFailureKind::DestinationUnsafe);
+    };
+
+    let missing_suffix = root
+        .strip_prefix(&existing_ancestor)
+        .map_err(|_| SharedApplyFailureKind::DestinationUnsafe)?;
+    let mut missing_names = Vec::new();
+    for component in missing_suffix.components() {
+        match component {
+            Component::Normal(name) => missing_names.push(name.to_os_string()),
+            // A validated, normalized path can only ever have `Normal`
+            // components below an existing prefix; anything else here
+            // means the two walks above somehow disagreed - fail closed
+            // rather than guess.
+            _ => return Err(SharedApplyFailureKind::DestinationUnsafe),
+        }
+    }
+    if missing_names.is_empty() {
+        // `root` validated `Absent` above but now has an existing ancestor
+        // equal to itself - it was recreated between the two checks.
+        return Err(SharedApplyFailureKind::RootChanged);
+    }
+    if missing_names.len() > SHARED_MAX_CREATED_DIRECTORIES {
+        return Err(SharedApplyFailureKind::ResourceLimitReached);
+    }
+
+    // The one and only plain-pathname open in this whole function - see
+    // `fd_relative::open_dir_no_follow`'s own doc comment.
+    let anchor_fd = fd_relative::open_dir_no_follow(&existing_ancestor)
+        .map_err(|_| SharedApplyFailureKind::RootChanged)?;
+
+    let mut open_chain = vec![anchor_fd];
+    let mut created: Vec<CreatedRootDirectory> = Vec::new();
+    let mut path_so_far = existing_ancestor;
+    for name in missing_names {
+        path_so_far.push(&name);
+        let parent_fd = fd_relative::as_raw(open_chain.last().expect("anchor always present"));
+
+        if should_inject(FaultPoint::ParentCreationRace)
+            || fd_relative::mkdirat_here(parent_fd, &name).is_err()
+        {
+            remove_verified_root_chain(&created);
+            return Err(SharedApplyFailureKind::ParentCreationFailed);
+        }
+        let child_fd = match fd_relative::openat_dir_no_follow(parent_fd, &name) {
+            Ok(fd) => fd,
+            Err(_) => {
+                // The narrow post-`mkdirat` window this function's own
+                // `# Safety` section documents - fail closed, and clean up
+                // only what was verified before this point.
+                remove_verified_root_chain(&created);
+                return Err(SharedApplyFailureKind::ParentCreationFailed);
+            }
+        };
+        let identity = match fd_relative::fstat_identity(fd_relative::as_raw(&child_fd)) {
+            Ok((device, inode, true)) => SharedDirectoryIdentity { device, inode },
+            Ok((_, _, false)) | Err(_) => {
+                remove_verified_root_chain(&created);
+                return Err(SharedApplyFailureKind::ParentCreationFailed);
+            }
+        };
+        created.push(CreatedRootDirectory {
+            path: path_so_far.clone(),
+            identity,
+        });
+        open_chain.push(child_fd);
+    }
+    Ok(created)
+}
+
+#[cfg(not(unix))]
+fn bootstrap_missing_destination_root(
+    _root: &Path,
+) -> Result<Vec<CreatedRootDirectory>, SharedApplyFailureKind> {
+    // The descriptor-relative primitives this feature depends on
+    // (`openat`/`mkdirat`/`unlinkat`/`O_NOFOLLOW`) are POSIX-only, exactly
+    // like `RootLock::acquire`'s own non-unix fallback - fails closed
+    // rather than falling back to a weaker, path-based strategy.
+    Err(SharedApplyFailureKind::LockUnsupported)
+}
+
+/// Descriptor-anchored, identity-verified removal of a bootstrap-created
+/// destination-root chain, deepest first. Shared by every cleanup call
+/// site in this module - a same-call abort partway through
+/// [`bootstrap_missing_destination_root`], a `RootLock` failure
+/// immediately after a successful bootstrap, an all-failed apply cleaning
+/// up its own just-created empty root, and real rollback reading a
+/// validated chain back from a persisted journal (see
+/// [`validate_created_root_chain`]) - the exact same safety discipline
+/// every time.
+///
+/// For each entry, outermost first: opens it relative to the previous
+/// level's own already-open descriptor (`openat`+`O_NOFOLLOW` - the first
+/// entry's parent, the "anchor", is opened once via
+/// [`fd_relative::open_dir_no_follow`], the one plain-pathname open in this
+/// call), reads its `(device, inode)` identity via `fstat` on that
+/// descriptor, and compares it against the identity `entry` itself already
+/// carries. The walk stops - without opening anything further - at the
+/// first level that fails to open or whose identity disagrees: a directory
+/// that no longer matches is never assumed to be "close enough," and
+/// nothing deeper than an already-stopped level is ever reachable to be
+/// removed by mistake.
+///
+/// Only entries that matched are then removed, deepest first, each via
+/// `unlinkat`+`AT_REMOVEDIR` against the parent descriptor already opened
+/// above - the one atomic operation that both proves emptiness and
+/// performs the removal (see [`fd_relative::unlinkat_rmdir`]'s own doc
+/// comment). Stops at the first removal failure (non-empty, or anything
+/// else) and never continues to a shallower level after that.
+///
+/// Returns how many entries (counted from the deepest/last) were actually
+/// removed, so a caller updating a journal can `truncate` to exactly what
+/// remains true on disk rather than continuing to claim ownership of
+/// something already gone.
+#[cfg(unix)]
+fn remove_verified_root_chain(chain: &[CreatedRootDirectory]) -> usize {
+    let Some(first) = chain.first() else {
+        return 0;
+    };
+    let Some(anchor_path) = first.path.parent() else {
+        return 0;
+    };
+    let Ok(anchor_fd) = fd_relative::open_dir_no_follow(anchor_path) else {
+        return 0;
+    };
+
+    let mut open_chain = vec![anchor_fd];
+    let mut matched = 0usize;
+    for entry in chain {
+        let Some(name) = entry.path.file_name() else {
+            break;
+        };
+        let parent_fd = fd_relative::as_raw(open_chain.last().expect("anchor always present"));
+        let Ok(child_fd) = fd_relative::openat_dir_no_follow(parent_fd, name) else {
+            break;
+        };
+        let Ok((device, inode, is_dir)) =
+            fd_relative::fstat_identity(fd_relative::as_raw(&child_fd))
+        else {
+            break;
+        };
+        if !is_dir || device != entry.identity.device || inode != entry.identity.inode {
+            break;
+        }
+        open_chain.push(child_fd);
+        matched += 1;
+    }
+
+    let mut removed = 0usize;
+    for index in (0..matched).rev() {
+        let Some(name) = chain[index].path.file_name() else {
+            break;
+        };
+        let parent_fd = fd_relative::as_raw(&open_chain[index]);
+        if fd_relative::unlinkat_rmdir(parent_fd, name).is_err() {
+            break;
+        }
+        removed += 1;
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+fn remove_verified_root_chain(_chain: &[CreatedRootDirectory]) -> usize {
+    0
+}
+
+/// Validates `journal.created_root_directories` as untrusted, persisted
+/// input before anything in it is ever opened, let alone removed. A
+/// tampered or corrupted claim is rejected as a whole - never trimmed to
+/// "the parts that look fine" - by returning an empty `Vec`:
+///
+/// - bounded by [`SHARED_MAX_CREATED_DIRECTORIES`], the same limit
+///   creation itself enforces;
+/// - `journal.destination_root` must equal `root` (defense in depth
+///   alongside the `root_matches` check already performed before
+///   [`execute_shared_rollback`] is ever reachable);
+/// - every path must be absolute with only `Normal` components (no `..`,
+///   no empty component);
+/// - entries must form one exact, contiguous parent/child chain - each
+///   entry after the first must be a direct child of the previous one, so
+///   there is no gap, no repeat, and no out-of-order entry; this also
+///   structurally guarantees no entry can equal the chain's own implied
+///   anchor (a path is never its own parent), which is what keeps "the
+///   destination root's pre-existing ancestor" out of the chain a tampered
+///   journal could otherwise try to claim;
+/// - the *last* entry must equal `root` itself - a chain that does not
+///   actually terminate at this rollback's destination is rejected;
+/// - every entry must carry an `identity` - one without it is unprovable
+///   ownership, not proof of anything (see [`SharedCreatedRootDirectory`]'s
+///   own doc comment).
+fn validate_created_root_chain(
+    journal: &SharedApplyJournal,
+    root: &Path,
+) -> Vec<CreatedRootDirectory> {
+    let claimed = &journal.created_root_directories;
+    if claimed.is_empty() || claimed.len() > SHARED_MAX_CREATED_DIRECTORIES {
+        return Vec::new();
+    }
+    if journal.destination_root.to_path_buf().ok().as_deref() != Some(root) {
+        return Vec::new();
+    }
+
+    let mut resolved: Vec<CreatedRootDirectory> = Vec::with_capacity(claimed.len());
+    let mut previous: Option<PathBuf> = None;
+    for (index, entry) in claimed.iter().enumerate() {
+        let Ok(path) = entry.path.to_path_buf() else {
+            return Vec::new();
+        };
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+        {
+            return Vec::new();
+        }
+        if let Some(previous_path) = &previous
+            && path.parent() != Some(previous_path.as_path())
+        {
+            return Vec::new();
+        }
+        if index + 1 == claimed.len() && path != root {
+            return Vec::new();
+        }
+        let Some(identity) = entry.identity else {
+            return Vec::new();
+        };
+        previous = Some(path.clone());
+        resolved.push(CreatedRootDirectory { path, identity });
+    }
+    resolved
+}
+
+/// Rollback-time removal of a transaction's own bootstrap-created
+/// destination-root directory chain. Validates the persisted, untrusted
+/// journal chain first (see [`validate_created_root_chain`]) and, only for
+/// whatever survives that validation, removes it through the same
+/// descriptor-anchored, identity-verified path every other cleanup in this
+/// module uses (see [`remove_verified_root_chain`]).
+///
+/// A no-op for a journal with no `created_root_directories` at all -
+/// including every journal written before this field existed (see its own
+/// `#[serde(default)]`) - so rollback of an old journal is byte-for-byte
+/// unchanged from before this function existed: an absent field carries no
+/// root-cleanup authority, and there is no path by which it is
+/// reinterpreted into any.
+fn cleanup_transaction_created_root_directories(journal: &SharedApplyJournal, root: &Path) {
+    let chain = validate_created_root_chain(journal, root);
+    remove_verified_root_chain(&chain);
 }
 
 fn strict_absolute_root(root: &Path) -> Result<(), SharedApplyFailure> {
@@ -2778,5 +3378,766 @@ mod tests {
             build_shared_transaction_plan(&report, "profile", "trusted", &fixture.source_root())
                 .is_err()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Missing destination-root bootstrap (descriptor-anchored)
+    // -----------------------------------------------------------------
+    //
+    // Every test below drives the real entry points
+    // (`execute_shared_apply`/`execute_shared_rollback`) rather than
+    // calling `bootstrap_missing_destination_root`/`remove_verified_root_chain`
+    // directly, except where a test is specifically about rejecting a
+    // hand-crafted, tampered journal - the one place going through
+    // `execute_shared_rollback` and going around it via `read_journal` on a
+    // hand-edited file both exercise the real, persisted-input code path.
+
+    /// Like [`preview`], but never pre-creates `destination_root` (or
+    /// anything below it) - callers decide exactly how much of the chain
+    /// exists before building the preview/plan, so these tests can exercise
+    /// a completely missing root, a partially missing chain, or (by
+    /// pre-creating everything themselves) an already-existing root.
+    fn preview_at_root(
+        fixture: &Fixture,
+        destination_root: PathBuf,
+        source_bytes: &[u8],
+    ) -> SharedPreviewReport {
+        fs::create_dir(fixture.source_root()).unwrap();
+        let source = fixture.source_root().join("game.cht");
+        fs::write(&source, source_bytes).unwrap();
+        build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join("selected.zip"),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join("selected.zip"),
+                revision: None,
+            },
+            destination_root,
+            source_items: vec![PreviewSourceItem {
+                adapter: PreviewAdapter::RetroArch,
+                source_path: source,
+                expected_source_digest: Some(digest_bytes(source_bytes)),
+                destination_relative_paths: vec![PathBuf::from("Nintendo - NES/game.cht")],
+                match_strength: PreviewMatchStrength::VerifiedExact,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn created_root_paths(journal: &SharedApplyJournal) -> Vec<PathBuf> {
+        journal
+            .created_root_directories
+            .iter()
+            .map(|entry| entry.path.to_path_buf().unwrap())
+            .collect()
+    }
+
+    // --- existing-root transaction unchanged ------------------------------
+
+    #[test]
+    fn existing_destination_root_bootstraps_nothing() {
+        let fixture = Fixture::new("bootstrap-existing-root");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "existing-root", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(result.journal.created_root_directories.is_empty());
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .is_file()
+        );
+    }
+
+    // --- full missing-root create/apply/journal/rollback -------------------
+
+    #[test]
+    fn completely_missing_destination_root_is_safely_created_applied_and_rolled_back() {
+        let fixture = Fixture::new("bootstrap-fully-missing");
+        // Mirrors the motivating Dolphin case: `<profile>/Load/Textures`,
+        // none of which exists yet.
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        assert!(!root.exists());
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "fully-missing", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(root.is_dir());
+        assert!(root.join("Nintendo - NES/game.cht").is_file());
+        assert_eq!(
+            fs::read(root.join("Nintendo - NES/game.cht")).unwrap(),
+            b"new"
+        );
+
+        // Recorded outermost-first, each with a real identity, and
+        // persisted to disk (not only held in memory).
+        assert_eq!(
+            created_root_paths(&result.journal),
+            vec![
+                fixture.0.join("dolphin"),
+                fixture.0.join("dolphin").join("Load"),
+                root.clone(),
+            ]
+        );
+        assert!(
+            result
+                .journal
+                .created_root_directories
+                .iter()
+                .all(|entry| entry.identity.is_some())
+        );
+        let journal_path = result.journal_path.unwrap();
+        let persisted = read_journal(&journal_path).unwrap();
+        assert_eq!(persisted.created_root_directories.len(), 3);
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        assert!(rollback.available);
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rollback-removes-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(!root.exists());
+        assert!(!fixture.0.join("dolphin").join("Load").exists());
+        assert!(!fixture.0.join("dolphin").exists());
+    }
+
+    #[test]
+    fn partially_missing_root_chain_creates_only_the_missing_levels() {
+        let fixture = Fixture::new("bootstrap-partial");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        let root = dolphin.join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "partial-missing", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(root.is_dir());
+        assert_eq!(
+            created_root_paths(&result.journal),
+            vec![dolphin.join("Load"), root.clone()]
+        );
+    }
+
+    #[test]
+    fn rollback_leaves_a_pre_existing_root_untouched() {
+        let fixture = Fixture::new("bootstrap-rollback-preserves-preexisting");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        let root = dolphin.join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "rollback-preserves", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rollback-preserves-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(!root.exists(), "the bootstrap-created leaf must be removed");
+        assert!(
+            !dolphin.join("Load").exists(),
+            "the bootstrap-created intermediate level must be removed"
+        );
+        assert!(
+            dolphin.is_dir(),
+            "a directory that existed before the transaction must never be removed by rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_stops_at_a_non_empty_transaction_created_directory() {
+        let fixture = Fixture::new("bootstrap-rollback-stop-nonempty");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(
+                &fixture,
+                &plan,
+                "rollback-stop-nonempty",
+                false,
+                true,
+                false,
+            ),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+
+        // The installed file's own removal reports failure and leaves the
+        // file (and so its "Nintendo - NES" parent directory) genuinely
+        // present - the bootstrap-created `Textures` root is therefore
+        // non-empty by the time root cleanup would run.
+        inject_fault(Some(FaultPoint::RollbackRemovalVerification));
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rollback-stop-nonempty-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_eq!(rolled_back.status, SharedApplyStatus::Failed);
+        assert!(
+            root.join("Nintendo - NES/game.cht").is_file(),
+            "the file itself was never actually removed"
+        );
+        assert!(root.is_dir(), "a non-empty root must never be removed");
+        assert!(
+            fixture.0.join("dolphin").join("Load").is_dir(),
+            "a shallower level must never be removed once a deeper one stopped cleanup"
+        );
+    }
+
+    // --- created root replaced by a user-created directory before rollback -
+
+    #[test]
+    fn a_created_root_replaced_by_a_user_created_directory_is_not_deleted() {
+        let fixture = Fixture::new("bootstrap-user-replaced-directory");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "user-replaced-dir", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+
+        // The user wipes and recreates `Textures` themselves (their own
+        // new, empty directory - same path, different inode) before
+        // rollback ever runs. This also removes the installed file, so the
+        // per-file rollback step itself cannot succeed either - the point
+        // of this test is specifically that root cleanup, which runs
+        // regardless of the per-file outcome, still refuses to touch the
+        // replacement.
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("user-file.txt"), b"do not touch").unwrap();
+
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "user-replaced-dir-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        let _ = rolled_back;
+        assert!(
+            root.is_dir(),
+            "the user's replacement directory must never be removed"
+        );
+        assert!(
+            root.join("user-file.txt").is_file(),
+            "its contents must be completely untouched"
+        );
+    }
+
+    // --- created root replaced by a file -----------------------------------
+
+    #[test]
+    fn a_created_root_replaced_by_a_file_is_blocked() {
+        let fixture = Fixture::new("bootstrap-user-replaced-file");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "user-replaced-file", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::write(&root, b"now a plain file").unwrap();
+
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "user-replaced-file-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        let _ = rolled_back;
+        assert!(root.is_file(), "the replacement file must never be removed");
+        assert_eq!(fs::read(&root).unwrap(), b"now a plain file");
+    }
+
+    // --- malformed journal claiming the pre-existing ancestor --------------
+
+    #[test]
+    fn a_journal_claiming_the_pre_existing_ancestor_is_rejected() {
+        let fixture = Fixture::new("bootstrap-malformed-claims-ancestor");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        let root = dolphin.join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "malformed-ancestor", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+
+        // Tamper the persisted journal: prepend the pre-existing `dolphin`
+        // ancestor to the claimed chain, as if this transaction had
+        // created it too.
+        let mut tampered = read_journal(&journal_path).unwrap();
+        let mut identity = tampered.created_root_directories[0].identity;
+        // A plausible-looking (but fabricated) identity - the chain must
+        // still be rejected on structure alone before identity is ever
+        // consulted for the injected entry.
+        if let Some(value) = &mut identity {
+            value.inode = value.inode.wrapping_add(1);
+        }
+        tampered.created_root_directories.insert(
+            0,
+            SharedCreatedRootDirectory {
+                path: SharedTransactionPath::from_path(&dolphin),
+                identity,
+            },
+        );
+        fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        assert!(rollback.available);
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "malformed-ancestor-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        // The whole claimed chain is rejected as malformed (an entry whose
+        // parent/child relationship to its neighbour does not hold), so
+        // *nothing* in it is acted on - the pre-existing ancestor
+        // survives, but so does the genuinely transaction-created leaf.
+        assert!(
+            dolphin.is_dir(),
+            "the pre-existing ancestor must never be removed"
+        );
+        assert!(
+            root.exists(),
+            "a malformed chain must not be partially honoured either"
+        );
+    }
+
+    // --- malformed / out-of-order / out-of-root created-root chain ---------
+
+    #[test]
+    fn an_out_of_order_created_root_chain_is_rejected() {
+        let fixture = Fixture::new("bootstrap-malformed-out-of-order");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "malformed-order", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+
+        let mut tampered = read_journal(&journal_path).unwrap();
+        tampered.created_root_directories.reverse();
+        fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "malformed-order-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(
+            root.exists(),
+            "a reordered chain must be rejected wholesale"
+        );
+    }
+
+    #[test]
+    fn a_created_root_chain_pointing_outside_the_destination_root_is_rejected() {
+        let fixture = Fixture::new("bootstrap-malformed-out-of-root");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "malformed-out-of-root", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.unwrap();
+
+        let outside = fixture.0.join("somewhere-else");
+        fs::create_dir(&outside).unwrap();
+        let mut tampered = read_journal(&journal_path).unwrap();
+        // Point the final (leaf) entry at a directory entirely outside the
+        // real chain, while still (dishonestly) claiming to be the
+        // transaction's own destination root.
+        let last = tampered.created_root_directories.last_mut().unwrap();
+        last.path = SharedTransactionPath::from_path(&outside);
+        fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let rollback = preview_shared_rollback(&journal_path, &root, &fixture.backup_root());
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "malformed-out-of-root-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(
+            outside.is_dir(),
+            "a chain that does not terminate at the real destination root must never be acted on"
+        );
+    }
+
+    // --- symlink ancestor swapped in before creation ------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_swapped_to_a_symlink_before_creation_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("bootstrap-symlink-ancestor");
+        let dolphin = fixture.0.join("dolphin");
+        let root = dolphin.join("Load").join("Textures");
+        // Preview/plan are built while `dolphin` genuinely does not exist
+        // yet - a real, honest approval. Only *after* that (the real
+        // caller's own earlier check) does `dolphin` get swapped to a
+        // symlink, simulating a race that lands squarely between that
+        // earlier check and `execute_shared_apply`'s own bootstrap.
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        let real_target = fixture.0.join("real-target");
+        fs::create_dir(&real_target).unwrap();
+        symlink(&real_target, &dolphin).unwrap();
+
+        let link = dolphin;
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "symlink-ancestor", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            !real_target.join("Load").exists(),
+            "nothing may be created through a symlinked ancestor, even one whose target is safe"
+        );
+        assert!(link.is_symlink(), "the symlink itself must be untouched");
+    }
+
+    // --- creation cannot escape through a swapped ancestor ------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_cannot_escape_through_an_intermediate_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("bootstrap-escape-attempt");
+        // A directory well outside the destination root's own lineage -
+        // proves creation never lands here even though the symlink below
+        // (introduced after preview/plan approval) points straight at it.
+        let escape_target = fixture.0.join("escape-target");
+        fs::create_dir(&escape_target).unwrap();
+        let dolphin = fixture.0.join("dolphin");
+        let load_link = dolphin.join("Load");
+        let root = load_link.join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        // Only now does `Load` become a symlink pointing outside `dolphin`
+        // entirely - after the real approval, before the real apply. A
+        // pathname-only re-check between validation and creation would
+        // have happily walked straight through it.
+        fs::create_dir(&dolphin).unwrap();
+        symlink(&escape_target, &load_link).unwrap();
+
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "escape-attempt", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            !escape_target.join("Textures").exists(),
+            "creation must never be redirected through a symlinked intermediate ancestor"
+        );
+        assert!(
+            load_link.is_symlink(),
+            "the symlink itself must be untouched"
+        );
+    }
+
+    // --- partial-chain failure cleans only this attempt's own directories --
+
+    #[test]
+    fn a_parent_creation_race_cleans_up_only_the_partial_chain_this_attempt_made() {
+        let fixture = Fixture::new("bootstrap-race-cleanup");
+        // A directory that already existed before this transaction, right
+        // next to where the transaction's own chain will be created -
+        // proves cleanup never reaches sideways into it.
+        let sibling = fixture.0.join("sibling-pre-existing");
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("keep.txt"), b"unrelated").unwrap();
+
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::ParentCreationRace));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "race-cleanup", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            !fixture.0.join("dolphin").exists(),
+            "a chain that failed partway through must leave nothing behind, not even the first \
+             level"
+        );
+        assert!(
+            sibling.is_dir(),
+            "an unrelated pre-existing directory must be untouched"
+        );
+        assert!(sibling.join("keep.txt").is_file());
+    }
+
+    // --- all entries fail after bootstrap -----------------------------------
+
+    #[test]
+    fn all_entries_failing_after_bootstrap_leaves_no_unreachable_empty_root() {
+        let fixture = Fixture::new("bootstrap-all-fail-cleanup");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::SourceMutation));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "all-fail-cleanup", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert_eq!(
+            result.journal.entries[0].outcome,
+            SharedApplyOutcome::SourceChanged
+        );
+        // A journal was still written (the lock was held, entries were
+        // attempted) - but since nothing was actually installed, the
+        // freshly bootstrapped, still-empty root was cleaned up in the
+        // same call rather than left as an empty directory a journal
+        // claims but normal rollback (which requires at least one
+        // `Available` per-file entry) could never reach.
+        assert!(result.journal_path.is_some());
+        assert!(!root.exists());
+        assert!(!fixture.0.join("dolphin").join("Load").exists());
+        assert!(!fixture.0.join("dolphin").exists());
+        assert!(result.journal.created_root_directories.is_empty());
+    }
+
+    // --- journal-write failure with zero successful installs ---------------
+
+    #[test]
+    fn journal_write_failure_with_zero_successful_installs_still_cleans_up_safely() {
+        let fixture = Fixture::new("bootstrap-journal-fail-zero-writes");
+        let root = fixture.0.join("dolphin").join("Load").join("Textures");
+        let report = preview_at_root(&fixture, root.clone(), b"new");
+        let plan = make_plan(&fixture, &report);
+        // A real (non-injected) reason for zero successful writes: the
+        // source no longer matches what the plan approved.
+        fs::write(fixture.source_root().join("game.cht"), b"tampered").unwrap();
+        inject_fault(Some(FaultPoint::JournalWrite));
+        let result = execute_shared_apply(
+            &plan,
+            &options(
+                &fixture,
+                &plan,
+                "journal-fail-zero-writes",
+                false,
+                true,
+                false,
+            ),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(
+            result.journal_path.is_none(),
+            "the journal write itself failed"
+        );
+        assert!(
+            !root.exists(),
+            "zero installs means the bootstrap-created root is safely removable even though the \
+             journal recording that never made it to disk"
+        );
+        assert!(!fixture.0.join("dolphin").exists());
+    }
+
+    #[test]
+    fn a_parent_creation_race_is_rejected_and_the_partial_chain_is_cleaned_up() {
+        let fixture = Fixture::new("bootstrap-helper-race-cleanup");
+        let root = fixture.0.join("a").join("b").join("c");
+        inject_fault(Some(FaultPoint::ParentCreationRace));
+        let result = bootstrap_missing_destination_root(&root);
+        inject_fault(None);
+        assert!(matches!(
+            result,
+            Err(SharedApplyFailureKind::ParentCreationFailed)
+        ));
+        assert!(
+            !fixture.0.join("a").exists(),
+            "a chain that failed partway through must leave nothing behind, not even the first \
+             level"
+        );
+    }
+
+    #[test]
+    fn target_becomes_a_file_before_locking_is_rejected() {
+        let fixture = Fixture::new("bootstrap-target-becomes-file");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        // The exact destination root path is a regular file, not a
+        // directory - the same shape a symlink-replacement race would
+        // leave behind at the instant this is (re)validated.
+        let root = dolphin.join("Load");
+        fs::write(&root, b"not a directory").unwrap();
+        let result = bootstrap_missing_destination_root(&root);
+        assert!(matches!(
+            result,
+            Err(SharedApplyFailureKind::DestinationUnsafe)
+        ));
+        assert!(root.is_file(), "the existing file must be left untouched");
+    }
+
+    #[test]
+    fn old_journal_without_the_new_field_still_loads_and_never_gains_root_cleanup_authority() {
+        let fixture = Fixture::new("bootstrap-old-journal-compat");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "old-journal", false, true, false),
+        );
+        let journal_path = result.journal_path.unwrap();
+
+        // Simulate a journal written before `created_root_directories`
+        // existed: strip the field out of the persisted JSON entirely.
+        let bytes = fs::read(&journal_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("created_root_directories");
+        fs::write(&journal_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = read_journal(&journal_path).unwrap();
+        assert!(loaded.created_root_directories.is_empty());
+
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(rollback.available);
+        let rolled_back = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "old-journal-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert!(
+            !fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .exists()
+        );
+        // The pre-existing destination root itself (never created by this
+        // transaction, and absent from the old journal by construction)
+        // must never be removed - identical to `install_new_is_atomic_
+        // journaled_and_rollback_is_bound_and_idempotent`'s own assertion.
+        assert!(fixture.destination_root().is_dir());
     }
 }

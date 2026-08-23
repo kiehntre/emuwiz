@@ -238,6 +238,7 @@ fn transaction_history(status: SharedApplyStatus) -> SharedHistoryReport {
                 },
                 approved_source_root: SharedTransactionPath::from_path(Path::new("/staging")),
                 destination_root: SharedTransactionPath::from_path(Path::new("/dolphin")),
+                created_root_directories: Vec::new(),
                 dry_run: false,
                 entries: Vec::new(),
                 status,

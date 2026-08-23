@@ -924,6 +924,7 @@ mod tests {
             },
             approved_source_root: SharedTransactionPath::from_path(Path::new("/tmp")),
             destination_root: SharedTransactionPath::from_path(Path::new("/tmp")),
+            created_root_directories: Vec::new(),
             dry_run: false,
             entries,
             status,
