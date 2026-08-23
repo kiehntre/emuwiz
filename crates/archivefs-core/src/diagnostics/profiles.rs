@@ -160,14 +160,48 @@ impl ProfileAssessment {
         }
     }
 
+    /// PPSSPP and DuckStation presently contribute profile inspection only:
+    /// EmuWiz knows their cheat directories, but has no install or managed
+    /// block support for either adapter. Keep their discovered, healthy
+    /// profiles visible in Doctor instead of treating them as a silent pass.
+    fn is_inspection_only_profile(&self) -> bool {
+        matches!(
+            self.emulator,
+            EmulatorKind::Ppsspp | EmulatorKind::DuckStation
+        )
+    }
+
+    fn inspection_finding_id(&self) -> &'static str {
+        match self.emulator {
+            EmulatorKind::Ppsspp => "emulator_profile.ppsspp_inspected",
+            EmulatorKind::DuckStation => "emulator_profile.duckstation_inspected",
+            EmulatorKind::Dolphin | EmulatorKind::Pcsx2 | EmulatorKind::Xenia => {
+                unreachable!("only inspection-only profiles have inspection finding ids")
+            }
+        }
+    }
+
+    fn destination_label(&self) -> &'static str {
+        if self.is_inspection_only_profile() {
+            "Cheat destination"
+        } else {
+            "Destination"
+        }
+    }
+
     fn evidence(&self) -> Vec<String> {
         let mut evidence = vec![
             format!("Emulator: {}", self.emulator.label()),
+            format!("Profile: {}", self.profile_id),
             format!("Profile type: {}", self.profile_kind),
             format!("Scope: {}", self.scope),
             format!("How it was found: {}", self.discovery_confidence),
-            format!("Profile root: {}", self.root_path.display),
-            format!("Destination: {}", self.destination_path.display),
+            format!("Configuration path: {}", self.root_path.display),
+            format!(
+                "{}: {}",
+                self.destination_label(),
+                self.destination_path.display
+            ),
             format!("Destination exists: {}", self.destination_exists),
             format!("Mount state: {}", self.mount_mode.label()),
             format!("Assessment: {}", self.writability.label()),
@@ -199,6 +233,114 @@ impl ProfileAssessment {
         }
         evidence
     }
+}
+
+fn profile_finding(profile: &ProfileAssessment, severity: DoctorSeverity) -> Finding {
+    let inspection_only = profile.is_inspection_only_profile();
+    let (id, title, explanation) = if inspection_only {
+        (
+            profile.inspection_finding_id(),
+            format!(
+                "{} profile inspected: {}",
+                profile.emulator.label(),
+                profile.writability.label()
+            ),
+            format!(
+                "{} profile {} uses {} as its cheat destination. {}",
+                profile.emulator.label(),
+                profile.profile_id,
+                profile.destination_path.display,
+                profile.writability.label(),
+            ),
+        )
+    } else {
+        (
+            profile.finding_id(),
+            format!(
+                "{} profile: {}",
+                profile.emulator.label(),
+                profile.writability.label()
+            ),
+            format!(
+                "{} ({}) would install into {}. {}",
+                profile.emulator.label(),
+                profile.profile_kind,
+                profile.destination_path.display,
+                profile.writability.label()
+            ),
+        )
+    };
+    let (why_it_matters, next_step) = if inspection_only {
+        (
+            "EmuWiz currently inspects this profile and its cheat destination only; it does not install PPSSPP or DuckStation cheats or manage a block in either emulator's files.",
+            "No action is available in EmuWiz for this profile yet. The assessment is read-only and reports the destination metadata without writing a probe file.",
+        )
+    } else {
+        match profile.writability {
+            WritabilityAssessment::ReadOnlyFilesystem => (
+                "Installing a cheat or patch into this profile would fail, because the filesystem itself is read-only.",
+                "Remount that filesystem read-write, or pick a different profile before installing.",
+            ),
+            WritabilityAssessment::PermissionDenied => (
+                "Installing a cheat or patch into this profile would fail with a permission error.",
+                "Give the current user write access to that directory, or pick a different profile.",
+            ),
+            WritabilityAssessment::MissingDestination => (
+                "EmuWiz creates this directory during an install, so this is only worth knowing about in advance.",
+                "Nothing to do now. Launch the emulator once, or let EmuWiz create it during an install.",
+            ),
+            WritabilityAssessment::UnsafeDestination => (
+                "EmuWiz refuses to write through a symlink or into a non-directory, so this profile cannot be used as-is.",
+                "Replace the symlink with a real directory, or point EmuWiz at a different profile.",
+            ),
+            WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable => (
+                "EmuWiz cannot confirm from metadata alone whether a write here would succeed, and will not write a test file to find out.",
+                "No action needed. An install will report the real outcome.",
+            ),
+        }
+    };
+
+    Finding::new(
+        id,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorProfiles,
+        severity,
+        title,
+        explanation,
+    )
+    .with_affected(profile.destination_path.clone())
+    .with_evidence(profile.evidence())
+    .with_measurements([
+        ("emulator", Measurement::text(profile.emulator.label())),
+        ("profile", Measurement::text(&profile.profile_id)),
+        ("profile_kind", Measurement::text(&profile.profile_kind)),
+        (
+            "configuration_path",
+            Measurement::text(&profile.root_path.display),
+        ),
+        (
+            "cheat_destination",
+            Measurement::text(&profile.destination_path.display),
+        ),
+        (
+            "discovery_confidence",
+            Measurement::text(&profile.discovery_confidence),
+        ),
+        (
+            "writability_assessment",
+            Measurement::text(profile.writability.label()),
+        ),
+        (
+            "filesystem_read_only",
+            Measurement::Flag(profile.writability == WritabilityAssessment::ReadOnlyFilesystem),
+        ),
+        (
+            "destination_exists",
+            Measurement::Flag(profile.destination_exists),
+        ),
+        ("eligible", Measurement::Flag(profile.eligible)),
+    ])
+    .with_guidance(why_it_matters, next_step)
 }
 
 /// Everything Doctor could work out about emulator profiles.
@@ -477,89 +619,25 @@ fn assess_one(
 }
 
 /// Profile findings: one per profile that has something to report, plus a
-/// summary when there are too many, plus an ambiguity finding when several
-/// eligible profiles compete and none is selected.
+/// summary when there are too many, an inspection result for every discovered
+/// PPSSPP/DuckStation profile, and an ambiguity finding when several eligible
+/// profiles compete and none is selected.
 ///
-/// A profile that appears writable produces no finding at all - Doctor reports
-/// problems, not an inventory.
+/// A profile that appears writable produces no finding at all except for
+/// PPSSPP and DuckStation. Those adapters are inspection-only, so their
+/// discovered profile metadata belongs in Doctor even when healthy.
 pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
     let notable: Vec<&ProfileAssessment> = report
         .profiles
         .iter()
-        .filter(|profile| profile.severity().is_some())
+        .filter(|profile| profile.severity().is_some() && !profile.is_inspection_only_profile())
         .collect();
 
     if notable.len() <= MAX_INDIVIDUAL_PROFILE_FINDINGS {
         for profile in &notable {
             let severity = profile.severity().expect("filtered above");
-            findings.push(
-                Finding::new(
-                    profile.finding_id(),
-                    DoctorCategory::EmulatorProfiles,
-                    DoctorSubsystem::EmulatorProfiles,
-                    severity,
-                    format!("{} profile: {}", profile.emulator.label(), profile.writability.label()),
-                    format!(
-                        "{} ({}) would install into {}. {}",
-                        profile.emulator.label(),
-                        profile.profile_kind,
-                        profile.destination_path.display,
-                        profile.writability.label()
-                    ),
-                )
-                .with_affected(profile.destination_path.clone())
-                .with_evidence(profile.evidence())
-                .with_measurements([
-                    ("emulator", Measurement::text(profile.emulator.label())),
-                    ("profile_kind", Measurement::text(&profile.profile_kind)),
-                    (
-                        "discovery_confidence",
-                        Measurement::text(&profile.discovery_confidence),
-                    ),
-                    (
-                        "writability_assessment",
-                        Measurement::text(profile.writability.label()),
-                    ),
-                    (
-                        "filesystem_read_only",
-                        Measurement::Flag(
-                            profile.writability == WritabilityAssessment::ReadOnlyFilesystem,
-                        ),
-                    ),
-                    (
-                        "destination_exists",
-                        Measurement::Flag(profile.destination_exists),
-                    ),
-                    ("eligible", Measurement::Flag(profile.eligible)),
-                ])
-                .with_guidance(
-                    match profile.writability {
-                        WritabilityAssessment::ReadOnlyFilesystem =>
-                            "Installing a cheat or patch into this profile would fail, because the filesystem itself is read-only.",
-                        WritabilityAssessment::PermissionDenied =>
-                            "Installing a cheat or patch into this profile would fail with a permission error.",
-                        WritabilityAssessment::MissingDestination =>
-                            "EmuWiz creates this directory during an install, so this is only worth knowing about in advance.",
-                        WritabilityAssessment::UnsafeDestination =>
-                            "EmuWiz refuses to write through a symlink or into a non-directory, so this profile cannot be used as-is.",
-                        WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable =>
-                            "EmuWiz cannot confirm from metadata alone whether a write here would succeed, and will not write a test file to find out.",
-                    },
-                    match profile.writability {
-                        WritabilityAssessment::ReadOnlyFilesystem =>
-                            "Remount that filesystem read-write, or pick a different profile before installing.",
-                        WritabilityAssessment::PermissionDenied =>
-                            "Give the current user write access to that directory, or pick a different profile.",
-                        WritabilityAssessment::MissingDestination =>
-                            "Nothing to do now. Launch the emulator once, or let EmuWiz create it during an install.",
-                        WritabilityAssessment::UnsafeDestination =>
-                            "Replace the symlink with a real directory, or point EmuWiz at a different profile.",
-                        WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable =>
-                            "No action needed. An install will report the real outcome.",
-                    },
-                ),
-            );
+            findings.push(profile_finding(profile, severity));
         }
     } else {
         let mut evidence: Vec<String> = notable
@@ -611,6 +689,17 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
                 ),
             ]),
         );
+    }
+
+    for profile in report
+        .profiles
+        .iter()
+        .filter(|profile| profile.is_inspection_only_profile())
+    {
+        findings.push(profile_finding(
+            profile,
+            profile.severity().unwrap_or(DoctorSeverity::Info),
+        ));
     }
 
     // Several eligible, apparently writable profiles with none selected is
@@ -1333,6 +1422,85 @@ mod tests {
             profile.destination_path.display,
             root.join("cheats").display().to_string()
         );
+    }
+
+    #[test]
+    fn doctor_projects_writable_ppsspp_and_duckstation_profiles_for_inspection() {
+        let tree = TempTree::new("profiles-inspection-projection");
+        let ppsspp_root = tree.path().join("ppsspp");
+        let ppsspp_cheats = ppsspp_root.join("PSP/Cheats");
+        let duckstation_root = tree.path().join("duckstation");
+        let duckstation_cheats = duckstation_root.join("cheats");
+        fs::create_dir_all(&ppsspp_cheats).expect("fixture");
+        fs::create_dir_all(&duckstation_cheats).expect("fixture");
+
+        let ppsspp = assess_one(
+            EmulatorKind::Ppsspp,
+            "ppsspp-native".to_string(),
+            "Native".to_string(),
+            "User".to_string(),
+            "documented native path".to_string(),
+            true,
+            Vec::new(),
+            &ppsspp_root,
+            &ppsspp_cheats,
+            None,
+            Some(&rw_table()),
+        );
+        let duckstation = assess_one(
+            EmulatorKind::DuckStation,
+            "duckstation-native".to_string(),
+            "Native".to_string(),
+            "N/A".to_string(),
+            "discovered configuration directory".to_string(),
+            true,
+            Vec::new(),
+            &duckstation_root,
+            &duckstation_cheats,
+            None,
+            Some(&rw_table()),
+        );
+
+        let findings = findings_from_emulator_profiles(&report(vec![ppsspp, duckstation]));
+        assert_eq!(findings.len(), 2);
+        for (id, emulator, profile, configuration_path, cheat_destination) in [
+            (
+                "emulator_profile.ppsspp_inspected",
+                "PPSSPP",
+                "ppsspp-native",
+                ppsspp_root.display().to_string(),
+                ppsspp_cheats.display().to_string(),
+            ),
+            (
+                "emulator_profile.duckstation_inspected",
+                "DuckStation",
+                "duckstation-native",
+                duckstation_root.display().to_string(),
+                duckstation_cheats.display().to_string(),
+            ),
+        ] {
+            let finding = findings
+                .iter()
+                .find(|finding| finding.id == id)
+                .expect("finding");
+            assert_eq!(finding.severity, DoctorSeverity::Info);
+            assert!(finding.evidence.contains(&format!("Emulator: {emulator}")));
+            assert!(finding.evidence.contains(&format!("Profile: {profile}")));
+            assert!(
+                finding
+                    .evidence
+                    .contains(&format!("Configuration path: {configuration_path}"))
+            );
+            assert!(
+                finding
+                    .evidence
+                    .contains(&format!("Cheat destination: {cheat_destination}"))
+            );
+            assert_eq!(
+                finding.measurements.get("eligible"),
+                Some(&Measurement::Flag(true))
+            );
+        }
     }
 
     #[test]
