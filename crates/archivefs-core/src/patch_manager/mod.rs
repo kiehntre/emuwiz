@@ -30,6 +30,7 @@ mod cheat_history;
 mod cheat_install_plan;
 mod cheat_install_result;
 mod cheat_installer;
+mod cheat_journey;
 mod cheat_provider;
 mod cheat_rollback;
 mod cheat_rollback_result;
@@ -193,6 +194,16 @@ pub use cheat_install_result::{
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
     CheatInstallRunOutcome, execute_cheat_install_run,
+};
+pub use cheat_journey::{
+    CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
+    CheatJourneyCandidate, CheatJourneyCandidateList, CheatJourneyDestinationFingerprint,
+    CheatJourneyDiscovery, CheatJourneyError, CheatJourneyErrorKind, CheatJourneyGameIdentity,
+    CheatJourneyIdentityEvidence, CheatJourneyIdentityEvidenceKind, CheatJourneyIdentityState,
+    CheatJourneyPreview, CheatJourneyPreviewAction, CheatJourneySelection,
+    CheatJourneyUndoConfirmation, CheatJourneyUndoOptions, CheatJourneyUndoPreview,
+    apply_cheat_journey, discover_cheat_journey, preview_cheat_journey, preview_cheat_journey_undo,
+    select_cheat_journey_candidate, undo_cheat_journey,
 };
 pub use cheat_provider::{
     CheatProviderIdentity, CheatProviderLicence, CheatProviderLicenceStatus,
