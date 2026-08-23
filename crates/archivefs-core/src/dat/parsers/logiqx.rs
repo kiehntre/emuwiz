@@ -1560,6 +1560,9 @@ fn detect_logiqx_ecosystem(
     if contains("redump") {
         return DatEcosystem::Redump;
     }
+    if contains("tosec") {
+        return DatEcosystem::Tosec;
+    }
 
     DatEcosystem::GenericLogiqx
 }
