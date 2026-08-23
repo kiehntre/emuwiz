@@ -151,6 +151,7 @@ pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
 pub(crate) mod identity_sources_page;
+pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
@@ -5370,6 +5371,108 @@ impl ArchiveFsApp {
             .library_view_history_page
             .get_or_insert_with(library_view_history_page::LibraryViewHistoryPageState::load);
         library_view_history_page::show_library_view_history_page(ui, page);
+    }
+
+    /// Gathers exactly what [`launch_readiness_page::show_launch_readiness_panel`]
+    /// needs from state this app already has - never adds any new
+    /// app-level state, and never calls the planner unless both real
+    /// prerequisites (evidence loaded, RetroArch scanned) already hold.
+    ///
+    /// The `GameIdentityReport` this reads is the one already loaded for
+    /// the Cheats & Mods workflow (`self.cheat_workflow`) - the only place
+    /// this app currently holds one. It is only ever trusted when that
+    /// workflow's own `archive_path` matches the focused Selected archive;
+    /// a `GameIdentityReport` left over from a previously opened, different
+    /// archive is never reused here. When none is available for the
+    /// focused archive, this reads as `CanonicalIdentityStatus::Unknown` -
+    /// the same honest state as identity that was never resolved at all,
+    /// never a fabricated third state.
+    fn build_launch_readiness_input(
+        &self,
+        live: Option<&LoadedData>,
+    ) -> launch_readiness_page::LaunchReadinessInput {
+        use launch_readiness_page::LaunchReadinessInput;
+
+        if !matches!(
+            self.selected_evidence,
+            selected_evidence_page::SelectedEvidenceState::Ready { .. }
+        ) {
+            return LaunchReadinessInput::EvidenceNotLoaded;
+        }
+        let RetroArchProfilesState::Ready(discovery) = &self.retroarch_profiles else {
+            return LaunchReadinessInput::RetroArchNotScanned;
+        };
+
+        let focused = self.archive_context.focused.as_deref();
+        let game_identity_report = focused
+            .and_then(|focused| {
+                self.cheat_workflow
+                    .as_ref()
+                    .filter(|workflow| workflow.archive_path == focused)
+            })
+            .and_then(ready_game_identity);
+
+        // `VerifiedIdentityFact`s feed standalone-adapter input projection
+        // only (`launch::input_projection`) - this RetroArch-only slice has
+        // no use for them yet, so they are deliberately discarded here.
+        let (identity_status, _verified_facts) = match game_identity_report {
+            Some(report) => archivefs_core::launch::canonical_identity_from_game_report(report),
+            None => (
+                archivefs_core::launch::CanonicalIdentityStatus::Unknown,
+                Vec::new(),
+            ),
+        };
+
+        match identity_status {
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
+                return LaunchReadinessInput::IdentityUnknown;
+            }
+            archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
+                return LaunchReadinessInput::IdentityConflicting;
+            }
+            archivefs_core::launch::CanonicalIdentityStatus::Resolved(_) => {}
+        }
+
+        let focused_record = live.and_then(|data| {
+            focused.and_then(|path| {
+                data.records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == path)
+            })
+        });
+        // Archive safety: this first slice never tracks a specific resolved
+        // inner archive member, so a mounted container archive always
+        // stays honestly unresolved/blocked here - see
+        // `evidence_bridge::launch_content_ref_from_archive_record`'s own
+        // doc comment. Never the outer archive path, never guessed.
+        let content = match focused_record {
+            Some(record) => {
+                archivefs_core::launch::launch_content_ref_from_archive_record(record, None)
+            }
+            // Live library data isn't loaded, so content cannot be honestly
+            // classified either way - this reads exactly like an
+            // unresolved bridge result, never a fabricated "found" or a
+            // misleading reuse of the evidence-not-loaded message (evidence
+            // genuinely was loaded; only the live library data was not).
+            None => archivefs_core::launch::LaunchContentRef {
+                kind: None,
+                container: None,
+                resolved_path: None,
+                requires_mount: false,
+                provenance: "live library data is not loaded; content readiness cannot be \
+                             checked"
+                    .to_string(),
+            },
+        };
+
+        let plan = archivefs_core::launch::build_launch_plan(
+            &identity_status,
+            &content,
+            &[],
+            &discovery.environment,
+            &[],
+        );
+        LaunchReadinessInput::Plan(plan)
     }
 
     fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
@@ -15875,6 +15978,17 @@ impl ArchiveFsApp {
                         &self.selected_evidence,
                     );
                     self.handle_selected_evidence_action(context, evidence_action);
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    let live_for_launch_readiness = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        _ => None,
+                    };
+                    let launch_readiness_input =
+                        self.build_launch_readiness_input(live_for_launch_readiness);
+                    launch_readiness_page::show_launch_readiness_panel(
+                        ui,
+                        &launch_readiness_input,
+                    );
                     ui.add_space(crate::ui::theme::SECTION_GAP);
                     let identity_sources_action = identity_sources_page::show_identity_sources_panel(
                         ui,
