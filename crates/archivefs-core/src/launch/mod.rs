@@ -34,11 +34,16 @@
 //!   an adapter in this build.
 //! - [`planning`] - the content/target/candidate/plan data model and the
 //!   pure [`planning::build_launch_plan`] planner.
+//! - [`input_projection`] - pure projection from already-verified identity
+//!   facts to each Phase 1 adapter's own launch-input request type (or an
+//!   explicit unavailable result); never executes anything and never
+//!   fuses or promotes identity itself.
 //!
 //! See `docs/PATCH_CHEAT_MANAGER_DESIGN.md` and `ROADMAP.md`'s
 //! "Launch-preparation workflows" note for the wider design context this
 //! module implements the first slice of.
 
+pub mod input_projection;
 pub mod planning;
 pub mod platform_map;
 pub mod readiness;
@@ -46,6 +51,13 @@ pub mod readiness;
 #[cfg(test)]
 mod tests;
 
+pub use input_projection::{
+    LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
+    project_dolphin_gamecube_launch_input, project_dolphin_wii_launch_input,
+    project_duckstation_launch_input, project_flycast_launch_input, project_hatari_launch_input,
+    project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
+    project_xemu_launch_input, project_xenia_launch_input,
+};
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchPlan, LaunchPlanSummary, LaunchTarget,
