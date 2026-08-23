@@ -108,12 +108,22 @@ fn path_purpose_keys() -> [&'static str; 12] {
     keys
 }
 
-const INFO_KEYS: [&str; 4] = [
+const INFO_KEYS: [&str; 8] = [
     "display_name",
     "display_version",
     "systemname",
     "supported_extensions",
+    "corename",
+    "manufacturer",
+    "categories",
+    "database",
 ];
+
+/// Sensible explicit cap on `firmwareN_*` entries read from one `.info`
+/// file - real libretro cores declare at most a handful; this only exists
+/// to make a malformed or hostile `firmware_count` value a diagnosed
+/// refusal rather than a large/unbounded allocation.
+pub const MAX_FIRMWARE_ENTRIES: u32 = 64;
 
 /// Declaration order is deliberately `Native`, `AppImage`, `Flatpak`: this
 /// is also the derived `Ord` used to sort `profiles[]`, and matches the
@@ -341,6 +351,26 @@ pub struct CoreFinding {
     pub info: CoreInfoFinding,
 }
 
+/// One declared `firmwareN_*` requirement from a core's `.info` file.
+/// `index` is the exact `N` from the declaring keys - never re-derived or
+/// re-ordered, so a caller can always trace an entry back to its source
+/// keys. `path`/`description` are `None` when the corresponding
+/// `firmwareN_path`/`firmwareN_desc` key was itself absent for that index
+/// (a declared-but-sparse entry is still reported, never silently
+/// dropped). This is metadata only - EmuWiz never checks whether the file
+/// actually exists, downloads it, or treats it as platform identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FirmwareRequirement {
+    pub index: u32,
+    pub path: Option<String>,
+    pub description: Option<String>,
+    /// From `firmwareN_opt` (`"true"`/`"false"`, case-insensitive).
+    /// Absent defaults to `false` (required) - matching the convention
+    /// that an unmarked firmware entry is required unless a core's
+    /// `.info` explicitly says otherwise.
+    pub optional: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreInfoFinding {
@@ -349,6 +379,20 @@ pub enum CoreInfoFinding {
         display_version: Option<String>,
         system_name: Option<String>,
         supported_extensions: Vec<String>,
+        /// From `.info`'s own `corename` key - a libretro-internal core
+        /// identifier, never a canonical EmuWiz platform id.
+        core_name: Option<String>,
+        manufacturer: Option<String>,
+        categories: Option<String>,
+        /// From `.info`'s own `database` key - the RetroArch RDB name
+        /// this core's content is typically catalogued under. Free-form
+        /// downstream metadata only, never resolved or validated against
+        /// anything.
+        database: Option<String>,
+        /// Empty when the `.info` file declares no `firmware_count` key
+        /// at all (the normal case for most cores) - not itself a
+        /// diagnostic condition.
+        firmware: Vec<FirmwareRequirement>,
     },
     Missing,
     DirectoryUnavailable,
@@ -1306,6 +1350,125 @@ fn parse_config(text: &str, recognized_keys: &[&'static str]) -> ParsedConfig {
     }
 }
 
+/// Which sub-field a `firmwareN_*` key names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirmwareField {
+    Path,
+    Description,
+    Optional,
+}
+
+/// Parses a `firmwareN_path`/`firmwareN_desc`/`firmwareN_opt` key into its
+/// index and field, or `None` for anything else (including the literal
+/// `firmware_count` key itself, and a bare `firmwareN` with no recognized
+/// suffix). Never guesses: an index that fails to parse as `u32` (too
+/// large, or not digits at all) is `None`, not truncated or wrapped.
+fn parse_firmware_key(key: &str) -> Option<(u32, FirmwareField)> {
+    let rest = key.strip_prefix("firmware")?;
+    let digit_end = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digit_end == 0 {
+        return None;
+    }
+    let (digits, suffix) = rest.split_at(digit_end);
+    let index = digits.parse::<u32>().ok()?;
+    let field = match suffix {
+        "_path" => FirmwareField::Path,
+        "_desc" => FirmwareField::Description,
+        "_opt" => FirmwareField::Optional,
+        _ => return None,
+    };
+    Some((index, field))
+}
+
+/// Parses every `firmwareN_*` requirement declared in one already-decoded
+/// `.info` file's text. Returns an empty `Vec` - not a diagnostic - when
+/// no `firmware_count` key is present at all, since most cores declare no
+/// firmware. A `firmware_count` that fails to parse as a non-negative
+/// integer, or exceeds [`MAX_FIRMWARE_ENTRIES`], is reported as a
+/// diagnostic and yields no entries rather than an unbounded or
+/// best-guess read; an individual `firmwareN_*` key whose index is `>=
+/// MAX_FIRMWARE_ENTRIES` is diagnosed and skipped without affecting any
+/// other entry. This never checks whether a declared firmware file
+/// actually exists - see the module-level "no verification" scope note.
+fn parse_firmware_requirements(
+    text: &str,
+    info_path: &Path,
+    profile: ProfileRef,
+    diagnostics: &mut Vec<RawDiagnostic>,
+) -> Vec<FirmwareRequirement> {
+    let mut declared_count: Option<u32> = None;
+    let mut paths: BTreeMap<u32, String> = BTreeMap::new();
+    let mut descriptions: BTreeMap<u32, String> = BTreeMap::new();
+    let mut optional_raw: BTreeMap<u32, String> = BTreeMap::new();
+
+    for raw_line in text.split('\n') {
+        let LineKind::KeyValue { key, value_region } = classify_line(raw_line) else {
+            continue;
+        };
+        if key == "firmware_count" {
+            let value = extract_value(value_region);
+            match value.parse::<u32>() {
+                Ok(count) if count <= MAX_FIRMWARE_ENTRIES => {
+                    declared_count.get_or_insert(count);
+                }
+                _ => {
+                    diagnostics.push(RawDiagnostic::new(
+                        "firmware_count_malformed_or_too_large",
+                        DiagnosticSeverity::Warning,
+                        DiagnosticCategory::CoreInventory,
+                        Some(profile),
+                        None,
+                        Some(info_path.to_path_buf()),
+                    ));
+                }
+            }
+            continue;
+        }
+        let Some((index, field)) = parse_firmware_key(key) else {
+            continue;
+        };
+        if index >= MAX_FIRMWARE_ENTRIES {
+            diagnostics.push(RawDiagnostic::new(
+                "firmware_index_exceeds_limit",
+                DiagnosticSeverity::Warning,
+                DiagnosticCategory::CoreInventory,
+                Some(profile),
+                None,
+                Some(info_path.to_path_buf()),
+            ));
+            continue;
+        }
+        let value = extract_value(value_region);
+        match field {
+            FirmwareField::Path => {
+                paths.entry(index).or_insert(value);
+            }
+            FirmwareField::Description => {
+                descriptions.entry(index).or_insert(value);
+            }
+            FirmwareField::Optional => {
+                optional_raw.entry(index).or_insert(value);
+            }
+        }
+    }
+
+    let Some(declared_count) = declared_count else {
+        return Vec::new();
+    };
+    (0..declared_count)
+        .map(|index| FirmwareRequirement {
+            index,
+            path: paths.remove(&index),
+            description: descriptions.remove(&index),
+            optional: optional_raw
+                .remove(&index)
+                .is_some_and(|raw| raw.eq_ignore_ascii_case("true")),
+        })
+        .collect()
+}
+
 /// Resolves a non-empty configured value to a real path, or `None` if
 /// EmuWiz declines to resolve it (colon alias, or a plain relative
 /// value with no config-relative anchor RetroArch itself would use -
@@ -1478,7 +1641,9 @@ fn discover_cores(
         let full_path = cores_dir.join(&entry.file_name);
         let info = match core_info_dir {
             None => CoreInfoFinding::DirectoryUnavailable,
-            Some(directory) => resolve_core_info(filesystem, directory, &stem),
+            Some(directory) => {
+                resolve_core_info(filesystem, directory, &stem, profile, diagnostics)
+            }
         };
         let core = CoreFinding {
             file_name: EncodedPath::from_os_string(&entry.file_name),
@@ -1497,6 +1662,8 @@ fn resolve_core_info(
     filesystem: &dyn ReadOnlyHostFilesystem,
     info_dir: &Path,
     stem: &str,
+    profile: ProfileRef,
+    diagnostics: &mut Vec<RawDiagnostic>,
 ) -> CoreInfoFinding {
     let info_path = info_dir.join(format!("{stem}.info"));
     match filesystem.probe(&info_path) {
@@ -1511,6 +1678,8 @@ fn resolve_core_info(
                 match std::str::from_utf8(bytes) {
                     Ok(text) => {
                         let parsed = parse_config(text, &INFO_KEYS);
+                        let firmware =
+                            parse_firmware_requirements(text, &info_path, profile, diagnostics);
                         CoreInfoFinding::Found {
                             display_name: parsed.values.get("display_name").cloned(),
                             display_version: parsed.values.get("display_version").cloned(),
@@ -1520,6 +1689,11 @@ fn resolve_core_info(
                                 .get("supported_extensions")
                                 .map(|value| split_supported_extensions(value))
                                 .unwrap_or_default(),
+                            core_name: parsed.values.get("corename").cloned(),
+                            manufacturer: parsed.values.get("manufacturer").cloned(),
+                            categories: parsed.values.get("categories").cloned(),
+                            database: parsed.values.get("database").cloned(),
+                            firmware,
                         }
                     }
                     Err(_) => CoreInfoFinding::InvalidUtf8,
@@ -3322,6 +3496,11 @@ mod tests {
                 display_version,
                 system_name,
                 supported_extensions,
+                core_name,
+                manufacturer,
+                categories,
+                database,
+                firmware,
             } => {
                 assert_eq!(
                     display_name.as_deref(),
@@ -3330,9 +3509,372 @@ mod tests {
                 assert_eq!(display_version.as_deref(), Some("1.62.3"));
                 assert_eq!(system_name.as_deref(), Some("Nintendo - SNES / SFC"));
                 assert_eq!(supported_extensions, &vec!["smc", "sfc", "swc", "fig"]);
+                assert_eq!(core_name, &None);
+                assert_eq!(manufacturer, &None);
+                assert_eq!(categories, &None);
+                assert_eq!(database, &None);
+                assert!(firmware.is_empty());
             }
             other => panic!("expected Found, got {other:?}"),
         }
+        assert!(
+            report.profiles[0]
+                .diagnostics
+                .iter()
+                .all(|d| d.detail_kind != DiagnosticCategory::CoreInventory
+                    || !d.code.starts_with("firmware")),
+            "a core with no firmware metadata must never raise a firmware diagnostic"
+        );
+    }
+
+    #[test]
+    fn extended_info_metadata_fields_are_parsed() {
+        let fixture = Fixture::new("core-info-extended-metadata");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/nestopia_libretro.so", "stub");
+        fixture.write(
+            "info/nestopia.info",
+            "corename = \"Nestopia\"\n\
+             manufacturer = \"Nintendo\"\n\
+             categories = \"Emulator\"\n\
+             database = \"Nintendo - Nintendo Entertainment System\"\n",
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let core = &report.profiles[0].cores[0];
+        match &core.info {
+            CoreInfoFinding::Found {
+                core_name,
+                manufacturer,
+                categories,
+                database,
+                ..
+            } => {
+                assert_eq!(core_name.as_deref(), Some("Nestopia"));
+                assert_eq!(manufacturer.as_deref(), Some("Nintendo"));
+                assert_eq!(categories.as_deref(), Some("Emulator"));
+                assert_eq!(
+                    database.as_deref(),
+                    Some("Nintendo - Nintendo Entertainment System")
+                );
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn firmware_requirements_are_parsed_with_required_and_optional_distinct() {
+        let fixture = Fixture::new("core-info-firmware");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/mednafen_psx_libretro.so", "stub");
+        fixture.write(
+            "info/mednafen_psx.info",
+            "firmware_count = \"2\"\n\
+             firmware0_desc = \"PlayStation (USA) BIOS\"\n\
+             firmware0_path = \"scph5501.bin\"\n\
+             firmware0_opt = \"false\"\n\
+             firmware1_desc = \"PlayStation (Japan) BIOS\"\n\
+             firmware1_path = \"scph5500.bin\"\n\
+             firmware1_opt = \"true\"\n",
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let core = &report.profiles[0].cores[0];
+        match &core.info {
+            CoreInfoFinding::Found { firmware, .. } => {
+                assert_eq!(firmware.len(), 2);
+                assert_eq!(firmware[0].index, 0);
+                assert_eq!(firmware[0].path.as_deref(), Some("scph5501.bin"));
+                assert_eq!(
+                    firmware[0].description.as_deref(),
+                    Some("PlayStation (USA) BIOS")
+                );
+                assert!(
+                    !firmware[0].optional,
+                    "firmware0_opt = \"false\" must be required, not optional"
+                );
+                assert_eq!(firmware[1].index, 1);
+                assert_eq!(firmware[1].path.as_deref(), Some("scph5500.bin"));
+                assert!(
+                    firmware[1].optional,
+                    "firmware1_opt = \"true\" must be represented distinctly as optional"
+                );
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn firmware_with_no_opt_key_defaults_to_required() {
+        let fixture = Fixture::new("core-info-firmware-no-opt");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/test_libretro.so", "stub");
+        fixture.write(
+            "info/test.info",
+            "firmware_count = \"1\"\nfirmware0_path = \"bios.bin\"\n",
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        match &report.profiles[0].cores[0].info {
+            CoreInfoFinding::Found { firmware, .. } => {
+                assert_eq!(firmware.len(), 1);
+                assert!(!firmware[0].optional);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_firmware_count_is_diagnosed_and_yields_no_firmware_entries() {
+        let fixture = Fixture::new("core-info-firmware-malformed-count");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/test_libretro.so", "stub");
+        fixture.write(
+            "info/test.info",
+            "firmware_count = \"not-a-number\"\nfirmware0_path = \"bios.bin\"\n",
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        match &report.profiles[0].cores[0].info {
+            CoreInfoFinding::Found { firmware, .. } => assert!(firmware.is_empty()),
+            other => panic!("expected Found, got {other:?}"),
+        }
+        assert!(
+            report.profiles[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "firmware_count_malformed_or_too_large"),
+            "a malformed firmware_count must be diagnosed, never panic or be guessed"
+        );
+    }
+
+    #[test]
+    fn firmware_count_over_the_limit_is_diagnosed_and_yields_no_firmware_entries() {
+        let fixture = Fixture::new("core-info-firmware-over-limit");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/test_libretro.so", "stub");
+        fixture.write(
+            "info/test.info",
+            &format!("firmware_count = \"{}\"\n", MAX_FIRMWARE_ENTRIES + 1),
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        match &report.profiles[0].cores[0].info {
+            CoreInfoFinding::Found { firmware, .. } => assert!(firmware.is_empty()),
+            other => panic!("expected Found, got {other:?}"),
+        }
+        assert!(
+            report.profiles[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "firmware_count_malformed_or_too_large")
+        );
+    }
+
+    #[test]
+    fn firmware_index_beyond_the_limit_is_diagnosed_and_skipped_without_dropping_others() {
+        let fixture = Fixture::new("core-info-firmware-bad-index");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/test_libretro.so", "stub");
+        // `firmware_count` only declares one real entry (index 0); the
+        // out-of-range `firmware99_path` line must be diagnosed and
+        // ignored, never panic, and never affect index 0's own entry.
+        fixture.write(
+            "info/test.info",
+            &format!(
+                "firmware_count = \"1\"\nfirmware0_path = \"bios.bin\"\nfirmware{}_path = \"unreachable.bin\"\n",
+                MAX_FIRMWARE_ENTRIES
+            ),
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        match &report.profiles[0].cores[0].info {
+            CoreInfoFinding::Found { firmware, .. } => {
+                assert_eq!(firmware.len(), 1);
+                assert_eq!(firmware[0].path.as_deref(), Some("bios.bin"));
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        assert!(
+            report.profiles[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "firmware_index_exceeds_limit")
+        );
+    }
+
+    #[test]
+    fn database_directory_key_is_not_recognized_as_a_content_database_path_alias() {
+        // `database_directory` is not a genuine RetroArch config key - the
+        // real, source-verified key is `content_database_path` (see
+        // `PATH_PURPOSE_SPECS`). This test locks in that deliberate
+        // decision: a config that sets only `database_directory` must
+        // leave the Database path purpose unconfigured, never silently
+        // treated as an alias.
+        let fixture = Fixture::new("database-directory-not-an-alias");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "{}database_directory = \"{}\"\n",
+                fixture.native_config_body(),
+                fixture.path("not-the-real-database-path").display()
+            ),
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let database_finding = report.profiles[0]
+            .paths
+            .iter()
+            .find(|finding| finding.purpose == PathPurpose::Database)
+            .unwrap();
+        assert_eq!(database_finding.config_key, "content_database_path");
+        assert_eq!(
+            database_finding.resolution,
+            ResolutionState::RuntimeDefaultUnknown,
+            "database_directory must never be silently accepted as the content_database_path value"
+        );
+        assert!(database_finding.configured_value.is_none());
+    }
+
+    #[test]
+    fn retroarch_core_and_system_metadata_never_becomes_canonical_platform_identity() {
+        // Every string field a core's `.info` can populate is set to a
+        // real, canonical-looking EmuWiz platform name on purpose. This
+        // module must still only ever expose them as opaque downstream
+        // strings on `CoreInfoFinding` - there is no platform-resolution
+        // step anywhere in this module for them to silently feed.
+        let fixture = Fixture::new("core-metadata-not-platform-authority");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+        fixture.write("cores/nestopia_libretro.so", "stub");
+        fixture.write(
+            "info/nestopia.info",
+            "display_name = \"Nintendo Entertainment System\"\n\
+             systemname = \"Nintendo Entertainment System\"\n\
+             corename = \"Nintendo Entertainment System\"\n\
+             manufacturer = \"Nintendo Entertainment System\"\n\
+             categories = \"Nintendo Entertainment System\"\n\
+             database = \"Nintendo Entertainment System\"\n",
+        );
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let core = &report.profiles[0].cores[0];
+        match &core.info {
+            CoreInfoFinding::Found {
+                display_name,
+                system_name,
+                core_name,
+                manufacturer,
+                categories,
+                database,
+                ..
+            } => {
+                for value in [
+                    display_name,
+                    system_name,
+                    core_name,
+                    manufacturer,
+                    categories,
+                    database,
+                ] {
+                    assert_eq!(value.as_deref(), Some("Nintendo Entertainment System"));
+                }
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        // Structural guarantee: neither the per-core finding nor the
+        // whole report ever grows a "platform"-named *field*, checked by
+        // walking the JSON object keys themselves - never the serialized
+        // text, which would also (harmlessly, but confusingly) match
+        // incidental substrings such as a test fixture's own tempdir name.
+        fn assert_no_platform_keys(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, nested) in map {
+                        assert!(
+                            !key.to_ascii_lowercase().contains("platform"),
+                            "no field in this module's output may ever be named/reference \
+                             \"platform\": found key {key:?}"
+                        );
+                        assert_no_platform_keys(nested);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(assert_no_platform_keys),
+                _ => {}
+            }
+        }
+        assert_no_platform_keys(&serde_json::to_value(core).unwrap());
+        assert_no_platform_keys(&serde_json::to_value(&report).unwrap());
     }
 
     #[test]

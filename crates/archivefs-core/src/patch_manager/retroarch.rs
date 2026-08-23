@@ -1528,6 +1528,11 @@ mod tests {
                 display_version: None,
                 system_name: None,
                 supported_extensions: extensions.iter().map(|value| value.to_string()).collect(),
+                core_name: None,
+                manufacturer: None,
+                categories: None,
+                database: None,
+                firmware: Vec::new(),
             },
         }
     }
@@ -2410,6 +2415,11 @@ mod tests {
             display_version: None,
             system_name: None,
             supported_extensions: vec!["zip".to_string()],
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: Vec::new(),
         };
         let core = associate_core(
             &playlist_entry(
