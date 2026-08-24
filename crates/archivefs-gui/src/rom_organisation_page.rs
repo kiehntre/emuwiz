@@ -17,6 +17,7 @@ use archivefs_core::dat::rom_organisation::*;
 use archivefs_core::identity_source::cache::{IdentityCacheLocation, load_cache};
 use archivefs_core::identity_source::model::IdentityProvider;
 use archivefs_core::identity_source::settings::default_identity_root;
+use archivefs_core::ingestion::is_known_non_game_extension;
 use archivefs_core::platform::identity::{PlatformIdentityResolution, resolve_platform_identity};
 use archivefs_core::{
     Config, Database, app_dirs, clear_master_rom_root_default, default_database_path,
@@ -592,6 +593,22 @@ fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
+                // A library-organisation plan is intentionally a games-only
+                // operation. Cover art, manuals, metadata, and other
+                // supporting media remain in place for their own workflows;
+                // treating a `boxart/Game.png` as an unknown game creates a
+                // misleading blocked entry and risks a later destructive
+                // operation being approved against it. Reuse discovery's
+                // conservative shared classification rather than guessing
+                // from directory names such as `boxart`.
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|extension| is_known_non_game_extension(&extension))
+                {
+                    continue;
+                }
                 let file_type = metadata.file_type();
                 if file_type.is_symlink() {
                     // The link object itself is a candidate; its target is
@@ -1155,6 +1172,26 @@ mod tests {
             files.len() <= 10,
             "the symlink loop must not recurse: {}",
             files.len()
+        );
+    }
+
+    #[test]
+    fn artwork_files_are_excluded_from_games_ready_to_organise() {
+        let root = test_root("rom-org-artwork");
+        std::fs::create_dir_all(root.join("boxart")).unwrap();
+        std::fs::write(root.join("Game.iso"), b"game").unwrap();
+        std::fs::write(root.join("boxart/Game.png"), b"artwork").unwrap();
+        std::fs::write(root.join("boxart/Game.jpg"), b"artwork").unwrap();
+
+        let files = collected(std::slice::from_ref(&root));
+        assert!(files.iter().any(|path| path.ends_with("Game.iso")));
+        assert!(
+            !files.iter().any(|path| path.ends_with("Game.png")),
+            "box art must not become a game-organisation candidate: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("Game.jpg")),
+            "artwork must not become a game-organisation candidate: {files:?}"
         );
     }
 
