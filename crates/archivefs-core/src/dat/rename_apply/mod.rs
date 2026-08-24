@@ -54,7 +54,7 @@ pub use journal::{
 };
 pub use model::{
     EntryState, ObjectIdentity, ObjectKind, RenameTransaction, RollbackResult, RollbackStatus,
-    TransactionEntry, TransactionState, TransactionSummary,
+    TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
-use super::model::{EntryState, RenameTransaction, RollbackResult, TransactionState};
+use super::model::{
+    EntryState, RenameTransaction, RollbackResult, TransactionOperation, TransactionState,
+};
 use super::noclobber::{NoClobberError, rename_noreplace};
 use crate::safe_read::TrustedRoots;
 
@@ -234,6 +236,32 @@ fn rollback_mutation(
     entry: &super::model::TransactionEntry,
     trusted: Option<&TrustedRoots>,
 ) -> Result<(), String> {
+    if let TransactionOperation::CreateSymlink {
+        expected_target,
+        destination_root,
+    } = &entry.operation
+    {
+        if !expected_target.is_absolute()
+            || expected_target != &entry.source_path
+            || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+        {
+            return Err("rollback refused: invalid journalled symlink target".to_string());
+        }
+        let metadata = std::fs::symlink_metadata(&entry.destination_path)
+            .map_err(|_| "rollback refused: the link destination no longer exists".to_string())?;
+        if !metadata.file_type().is_symlink() {
+            return Err(
+                "rollback refused: destination is no longer the recorded symlink".to_string(),
+            );
+        }
+        if std::fs::read_link(&entry.destination_path).ok().as_deref() != Some(expected_target) {
+            return Err("rollback refused: destination symlink target changed".to_string());
+        }
+        std::fs::remove_file(&entry.destination_path).map_err(|error| {
+            format!("rollback refused: could not remove recorded symlink: {error}")
+        })?;
+        return Ok(());
+    }
     // Destination must still exist and still be the recorded object.
     match capture_identity(&entry.destination_path) {
         Err(_) => {

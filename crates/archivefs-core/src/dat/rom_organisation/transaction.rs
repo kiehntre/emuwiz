@@ -85,6 +85,7 @@ pub fn build_organisation_transaction(
             original_basename,
             proposed_basename: proposed_basename.to_string_lossy().into_owned(),
             identity,
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,

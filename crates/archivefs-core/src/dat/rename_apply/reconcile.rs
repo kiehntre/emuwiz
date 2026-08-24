@@ -22,7 +22,9 @@ use std::path::Path;
 
 use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
-use super::model::{EntryState, RenameTransaction, TransactionEntry, TransactionState};
+use super::model::{
+    EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
+};
 
 /// Why an in-flight entry could not be cleanly classified, or what it was
 /// reconciled to.
@@ -167,6 +169,58 @@ fn reconcile_transaction_level_state(transaction: &mut RenameTransaction) -> boo
 
 /// Classifies one in-flight entry against the live filesystem.
 fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
+    if let TransactionOperation::CreateSymlink {
+        expected_target,
+        destination_root,
+    } = &entry.operation
+    {
+        if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+            || !expected_target.is_absolute()
+            || expected_target != &entry.source_path
+        {
+            return RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail:
+                    "journalled link destination authority is invalid; manual review is required"
+                        .to_string(),
+            };
+        }
+        let source_matches = capture_identity(&entry.source_path)
+            .ok()
+            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
+        let exact_link = std::fs::symlink_metadata(&entry.destination_path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+            && std::fs::read_link(&entry.destination_path).ok().as_deref() == Some(expected_target);
+        return if !source_matches {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::SourceIdentityChanged,
+                detail: "link source changed or disappeared; manual review is required".to_string(),
+            }
+        } else if exact_link {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameConfirmed,
+                detail: "link creation confirmed; source intentionally remains present".to_string(),
+            }
+        } else if std::fs::symlink_metadata(&entry.destination_path).is_err() {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameDidNotHappen,
+                detail: "link destination is absent; link creation did not happen".to_string(),
+            }
+        } else {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail:
+                    "link destination differs from the journalled target; manual review is required"
+                        .to_string(),
+            }
+        };
+    }
     let source_present = std::fs::symlink_metadata(&entry.source_path).is_ok();
     let destination_present = std::fs::symlink_metadata(&entry.destination_path).is_ok();
     let source_matches = source_present
@@ -242,6 +296,7 @@ mod tests {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             identity: capture_identity(source).unwrap(),
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state,

@@ -708,6 +708,7 @@ fn quarantine_shaped_entry(
             .to_string_lossy()
             .into_owned(),
         identity,
+        operation: Default::default(),
         preflight_passed: false,
         preflight_failures: Vec::new(),
         state,

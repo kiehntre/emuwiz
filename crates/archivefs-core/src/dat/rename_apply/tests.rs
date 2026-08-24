@@ -1068,6 +1068,7 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
                 #[cfg(unix)]
                 dev: 1,
             },
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,
@@ -1121,6 +1122,7 @@ fn crash_after_first_of_n_renames_is_recoverable() {
             #[cfg(unix)]
             dev: 1,
         },
+        operation: Default::default(),
         preflight_passed: false,
         preflight_failures: Vec::new(),
         state,
@@ -2097,6 +2099,7 @@ fn stress_crash_recovery_fixtures_are_detected() {
                 #[cfg(unix)]
                 dev: 1,
             },
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Applied,

@@ -263,6 +263,7 @@ pub fn build_repair_transaction(
             original_basename: source_basename,
             proposed_basename: destination_basename,
             identity: expected_identity.clone(),
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,

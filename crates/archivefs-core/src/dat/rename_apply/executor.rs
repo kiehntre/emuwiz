@@ -26,7 +26,8 @@ use crate::safe_read::TrustedRoots;
 use super::identity::capture_identity;
 use super::journal::{new_transaction_id, write_journal};
 use super::model::{
-    EntryState, RenameTransaction, TransactionEntry, TransactionState, TransactionSummary,
+    EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
+    TransactionSummary,
 };
 use super::noclobber::{NoClobberError, rename_noreplace};
 use super::preflight::{PreflightOptions, batch_destinations, run_preflight};
@@ -193,6 +194,7 @@ pub fn build_transaction_entries(
             original_basename: proposal.current_basename.clone(),
             proposed_basename: proposed.clone(),
             identity,
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,
@@ -427,6 +429,13 @@ pub(crate) fn validate_classifier_version(plan_version: Option<&str>) -> Result<
 /// delegate the whole batch to [`apply_transaction`]. Semantics here are not
 /// altered by that reuse.
 pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState, String)> {
+    if let TransactionOperation::CreateSymlink {
+        expected_target,
+        destination_root,
+    } = &entry.operation
+    {
+        return apply_symlink_mutation(entry, expected_target, destination_root);
+    }
     match rename_noreplace(&entry.source_path, &entry.destination_path) {
         Ok(()) => {
             // The filesystem must confirm the rename before Applied.
@@ -440,6 +449,90 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
             "the destination appeared during apply and was never overwritten".to_string(),
         )),
         Err(error) => Err((EntryState::ApplyFailed, error.to_string())),
+    }
+}
+
+fn apply_symlink_mutation(
+    entry: &TransactionEntry,
+    expected_target: &std::path::Path,
+    destination_root: &std::path::Path,
+) -> Result<(), (EntryState, String)> {
+    if !expected_target.is_absolute() || expected_target != entry.source_path {
+        return Err((
+            EntryState::ApplyFailed,
+            "invalid journalled symlink target".to_string(),
+        ));
+    }
+    if !super::preflight::destination_is_confined(&entry.destination_path, destination_root) {
+        return Err((
+            EntryState::ApplyFailed,
+            "link destination is outside its approved root".to_string(),
+        ));
+    }
+    let source = capture_identity(&entry.source_path).map_err(|_| {
+        (
+            EntryState::ApplyFailed,
+            "link source no longer exists".to_string(),
+        )
+    })?;
+    if source.kind != super::model::ObjectKind::RegularFile
+        || !super::identity::identity_matches(&entry.identity, &source)
+    {
+        return Err((
+            EntryState::ApplyFailed,
+            "link source changed since review".to_string(),
+        ));
+    }
+    match std::fs::symlink_metadata(&entry.destination_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            match std::fs::read_link(&entry.destination_path) {
+                Ok(target) if target == expected_target => return Ok(()),
+                _ => {
+                    return Err((
+                        EntryState::ApplyFailed,
+                        "destination symlink points elsewhere".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(_) => {
+            return Err((
+                EntryState::ApplyFailed,
+                "destination already exists and was not replaced".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err((EntryState::ApplyFailed, error.to_string())),
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(expected_target, &entry.destination_path)
+        .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
+    #[cfg(not(unix))]
+    return Err((
+        EntryState::ApplyFailed,
+        "symlink creation is unsupported on this platform".to_string(),
+    ));
+    let source_after = capture_identity(&entry.source_path).map_err(|_| {
+        (
+            EntryState::ApplyFailed,
+            "link source disappeared".to_string(),
+        )
+    })?;
+    match std::fs::read_link(&entry.destination_path) {
+        Ok(target)
+            if target == expected_target
+                && super::preflight::destination_is_confined(
+                    &entry.destination_path,
+                    destination_root,
+                )
+                && super::identity::identity_matches(&entry.identity, &source_after) =>
+        {
+            Ok(())
+        }
+        _ => Err((
+            EntryState::ApplyFailed,
+            "created link failed verification".to_string(),
+        )),
     }
 }
 

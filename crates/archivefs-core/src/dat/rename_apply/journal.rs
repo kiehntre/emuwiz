@@ -298,6 +298,7 @@ mod tests {
                 #[cfg(unix)]
                 dev: 8,
             },
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,

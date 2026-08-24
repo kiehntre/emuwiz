@@ -482,6 +482,7 @@ pub fn build_quarantine_transaction(
             original_basename,
             proposed_basename,
             identity: proof.identity_a,
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,

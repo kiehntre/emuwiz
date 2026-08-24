@@ -9,12 +9,12 @@
 //! rather than continuing blindly.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::safe_read::TrustedRoots;
 
 use super::identity::{capture_identity, identity_matches};
-use super::model::TransactionEntry;
+use super::model::{TransactionEntry, TransactionOperation};
 
 /// A named reason a preflight check failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +142,22 @@ pub fn run_preflight(
 ) -> Result<(), Vec<PreflightFailure>> {
     let mut failures = Vec::new();
 
+    let link_operation = match &entry.operation {
+        TransactionOperation::RenameMove => None,
+        TransactionOperation::CreateSymlink {
+            expected_target,
+            destination_root,
+        } => {
+            if expected_target != &entry.source_path
+                || !expected_target.is_absolute()
+                || !destination_is_confined(&entry.destination_path, destination_root)
+            {
+                failures.push(PreflightFailure::OutsideTrustedRoot);
+            }
+            Some(expected_target)
+        }
+    };
+
     if options.plan_generation != options.current_generation {
         failures.push(PreflightFailure::GenerationMismatch {
             current: options.current_generation,
@@ -161,20 +177,23 @@ pub fn run_preflight(
         failures.push(PreflightFailure::DestinationUnsafe);
     }
 
-    // Directory placement. Same-directory (rename-apply) requires the exact
-    // same parent; same-filesystem (master-ROM-root move) allows a different
-    // directory on the same device and rejects a genuine cross-filesystem move.
+    // Directory placement is a rename/move-only rule. A symlink retains its
+    // source, so a linked library may deliberately cross directories and
+    // filesystems; its destination authority is instead the persisted
+    // `destination_root` checked above and again at mutation time.
     let source_parent = entry.source_path.parent();
     let destination_parent = entry.destination_path.parent();
-    match options.directory_policy {
-        DirectoryPolicy::SameDirectory => {
-            if source_parent != destination_parent {
-                failures.push(PreflightFailure::CrossFilesystemUnsupported);
+    if link_operation.is_none() {
+        match options.directory_policy {
+            DirectoryPolicy::SameDirectory => {
+                if source_parent != destination_parent {
+                    failures.push(PreflightFailure::CrossFilesystemUnsupported);
+                }
             }
-        }
-        DirectoryPolicy::SameFilesystem => {
-            if !same_filesystem(source_parent, destination_parent) {
-                failures.push(PreflightFailure::DestinationOnDifferentFilesystem);
+            DirectoryPolicy::SameFilesystem => {
+                if !same_filesystem(source_parent, destination_parent) {
+                    failures.push(PreflightFailure::DestinationOnDifferentFilesystem);
+                }
             }
         }
     }
@@ -189,10 +208,11 @@ pub fn run_preflight(
         let inside = canonical_parent
             .as_deref()
             .is_some_and(|parent| options.trusted.contains_canonical(parent));
-        let destination_parent_ok = destination_parent
-            .and_then(|parent| std::fs::canonicalize(parent).ok())
-            .as_deref()
-            .is_some_and(|parent| options.trusted.contains_canonical(parent));
+        let destination_parent_ok = link_operation.is_some()
+            || destination_parent
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .as_deref()
+                .is_some_and(|parent| options.trusted.contains_canonical(parent));
         if !inside || !destination_parent_ok {
             failures.push(PreflightFailure::OutsideTrustedRoot);
         }
@@ -227,8 +247,17 @@ pub fn run_preflight(
     }
 
     // Destination must not exist.
-    if std::fs::symlink_metadata(&entry.destination_path).is_ok() {
-        failures.push(PreflightFailure::DestinationExists);
+    if let Ok(metadata) = std::fs::symlink_metadata(&entry.destination_path) {
+        if let Some(expected_target) = link_operation {
+            if !metadata.file_type().is_symlink()
+                || std::fs::read_link(&entry.destination_path).ok().as_deref()
+                    != Some(expected_target)
+            {
+                failures.push(PreflightFailure::DestinationExists);
+            }
+        } else {
+            failures.push(PreflightFailure::DestinationExists);
+        }
     } else {
         // Case-only collision re-checked against the live destination
         // directory: a file whose name differs from the destination only by
@@ -262,6 +291,51 @@ pub fn run_preflight(
         Ok(())
     } else {
         Err(failures)
+    }
+}
+
+/// Proves a mutation destination is beneath a single persisted library root,
+/// with no `.`/`..` components and no symlinked ancestor between root and leaf.
+pub(crate) fn destination_is_confined(destination: &Path, root: &Path) -> bool {
+    if !root.is_absolute() || !destination.is_absolute() || !destination.starts_with(root) {
+        return false;
+    }
+    if root
+        .components()
+        .chain(destination.components())
+        .any(|component| {
+            matches!(
+                component,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        })
+    {
+        return false;
+    }
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !root_meta.file_type().is_dir() {
+        return false;
+    }
+    let Some(parent) = destination.parent() else {
+        return false;
+    };
+    let mut current = parent;
+    loop {
+        let Ok(meta) = std::fs::symlink_metadata(current) else {
+            return false;
+        };
+        if !meta.file_type().is_dir() {
+            return false;
+        }
+        if current == root {
+            return true;
+        }
+        let Some(next) = current.parent() else {
+            return false;
+        };
+        current = next;
     }
 }
 
@@ -332,6 +406,7 @@ mod tests {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             identity: super::super::identity::capture_identity(source).unwrap(),
+            operation: Default::default(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: super::super::model::EntryState::Planned,
@@ -371,6 +446,68 @@ mod tests {
         // No destination is duplicated in the batch.
         let destinations = BTreeSet::new();
         let result = run_preflight(&entry, &options(&approved, &trusted, &destinations, 1));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn create_symlink_allows_a_source_outside_its_destination_root() {
+        let source_root = tempfile::tempdir().unwrap();
+        let library_root = tempfile::tempdir().unwrap();
+        let source = source_root.path().join("Game.iso");
+        std::fs::write(&source, b"game").unwrap();
+        let destination = library_root.path().join("PlayStation/Game.iso");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let mut entry = entry(&source, &destination);
+        entry.operation = TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: library_root.path().to_path_buf(),
+        };
+        let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
+        // The library root is deliberately absent: it is mutation authority,
+        // not source trust.
+        let trusted = TrustedRoots::from_paths([source_root.path()]);
+        let result = run_preflight(&entry, &options(&approved, &trusted, &BTreeSet::new(), 1));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn create_symlink_rejects_destinations_outside_its_persisted_root() {
+        let source_root = tempfile::tempdir().unwrap();
+        let library_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = source_root.path().join("Game.iso");
+        std::fs::write(&source, b"game").unwrap();
+        let destination = outside.path().join("Game.iso");
+        let mut entry = entry(&source, &destination);
+        entry.operation = TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: library_root.path().to_path_buf(),
+        };
+        let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
+        let trusted = TrustedRoots::from_paths([source_root.path()]);
+        let result = run_preflight(&entry, &options(&approved, &trusted, &BTreeSet::new(), 1));
+        assert!(
+            matches!(result, Err(ref failures) if failures.contains(&PreflightFailure::OutsideTrustedRoot))
+        );
+    }
+
+    #[test]
+    fn create_symlink_accepts_an_exact_existing_link_without_rename_placement() {
+        let source_root = tempfile::tempdir().unwrap();
+        let library_root = tempfile::tempdir().unwrap();
+        let source = source_root.path().join("Game.iso");
+        std::fs::write(&source, b"game").unwrap();
+        let destination = library_root.path().join("Game.iso");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &destination).unwrap();
+        let mut entry = entry(&source, &destination);
+        entry.operation = TransactionOperation::CreateSymlink {
+            expected_target: source.clone(),
+            destination_root: library_root.path().to_path_buf(),
+        };
+        let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
+        let trusted = TrustedRoots::from_paths([source_root.path()]);
+        let result = run_preflight(&entry, &options(&approved, &trusted, &BTreeSet::new(), 1));
         assert!(result.is_ok(), "{result:?}");
     }
 

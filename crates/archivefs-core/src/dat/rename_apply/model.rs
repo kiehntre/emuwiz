@@ -152,6 +152,21 @@ pub struct ObjectIdentity {
     pub dev: u64,
 }
 
+/// The filesystem operation explicitly authorised for one journal entry.
+/// Older journals omit this field and therefore retain rename/move behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransactionOperation {
+    #[default]
+    RenameMove,
+    CreateSymlink {
+        expected_target: PathBuf,
+        /// The sole root beneath which this transaction may create or remove
+        /// its destination link. It is journalled for restart-safe rollback.
+        destination_root: PathBuf,
+    },
+}
+
 /// One step of a rename transaction: one approved proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionEntry {
@@ -163,6 +178,8 @@ pub struct TransactionEntry {
     pub proposed_basename: String,
     /// The source identity captured when the transaction was built.
     pub identity: ObjectIdentity,
+    #[serde(default)]
+    pub operation: TransactionOperation,
     /// The last preflight result for this entry, when one ran.
     #[serde(default)]
     pub preflight_passed: bool,
