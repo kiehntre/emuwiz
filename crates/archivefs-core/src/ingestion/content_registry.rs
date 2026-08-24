@@ -29,6 +29,10 @@ pub enum ContentKind {
     /// A non-Amiga computer floppy/disk image already supported elsewhere
     /// in EmuWiz (Atari ST, Amstrad, and similar).
     ComputerDisk,
+    /// A cassette/tape image. This deliberately says nothing about the
+    /// platform: `.tap` and `.tzx` are shared by several 8-bit families and
+    /// `.cdt` needs separate platform evidence too.
+    TapeImage,
     /// A folder that is itself a WHDLoad installation (contains a
     /// `.slave` file), not a folder to recurse into.
     WhdloadInstall,
@@ -47,6 +51,7 @@ impl ContentKind {
             Self::DiscImage => "Disc image",
             Self::AmigaImage => "Amiga image",
             Self::ComputerDisk => "Computer disk image",
+            Self::TapeImage => "Cassette/tape image",
             Self::WhdloadInstall => "WHDLoad install",
             Self::ExtractedGameFolder => "Game folder",
         }
@@ -109,6 +114,13 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("msa", ContentKind::ComputerDisk),
     cf("ipf", ContentKind::ComputerDisk),
     cf("hdi", ContentKind::ComputerDisk),
+    cf("ima", ContentKind::ComputerDisk),
+    cf("img", ContentKind::ComputerDisk),
+    // These extensions identify a media family, not a system. Keep them out
+    // of platform extension evidence unless another source can prove it.
+    cf("cdt", ContentKind::TapeImage),
+    cf("tap", ContentKind::TapeImage),
+    cf("tzx", ContentKind::TapeImage),
 ];
 
 const fn cf(extension: &'static str, kind: ContentKind) -> ContentFormat {

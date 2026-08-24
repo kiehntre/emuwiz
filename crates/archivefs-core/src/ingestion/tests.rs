@@ -183,6 +183,29 @@ fn chd_is_discovered_as_a_disc_image_candidate() {
 }
 
 #[test]
+fn dsk_and_cdt_are_recognised_media_without_platform_guessing() {
+    for (name, expected) in [
+        ("unknown-platform.dsk", ContentKind::ComputerDisk),
+        ("unknown-platform.cdt", ContentKind::TapeImage),
+    ] {
+        let dir = source_dir(name);
+        std::fs::write(dir.path().join(name), b"fixture bytes").unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        assert_eq!(report.items.len(), 1);
+        let item = &report.items[0];
+        assert_eq!(item.content, Some(expected));
+        assert!(
+            item.platform_hint.is_none(),
+            "{name} must not infer a platform"
+        );
+        assert_eq!(
+            item.skip_reason,
+            Some(SkipReason::RecognizedContentNoIdentityMatch)
+        );
+    }
+}
+
+#[test]
 fn amiga_hdf_is_discovered_and_validated() {
     let dir = source_dir("hdf");
     std::fs::write(dir.path().join("Workbench.hdf"), minimal_amiga_hdf()).unwrap();

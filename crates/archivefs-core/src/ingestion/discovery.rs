@@ -52,7 +52,11 @@ const KNOWN_NON_GAME_EXTENSIONS: &[&str] = &[
     "mp4", "webm", "mp3", "ogg",
 ];
 
-fn is_known_non_game_extension(extension: &str) -> bool {
+/// Whether an extension is a known ancillary/supporting-media type rather
+/// than game content. Callers which build a *games-only* view should use this
+/// same conservative classification instead of treating cover art or manuals
+/// as unidentified games.
+pub fn is_known_non_game_extension(extension: &str) -> bool {
     KNOWN_NON_GAME_EXTENSIONS.contains(&extension)
 }
 
@@ -205,7 +209,9 @@ impl DiscoveryStats {
             Some(ContentKind::RomCartridge) => self.loose_roms += 1,
             Some(ContentKind::DiscImage) => self.disc_images += 1,
             Some(ContentKind::AmigaImage) => self.amiga_images += 1,
-            Some(ContentKind::ComputerDisk) => self.computer_disks += 1,
+            Some(ContentKind::ComputerDisk) | Some(ContentKind::TapeImage) => {
+                self.computer_disks += 1
+            }
             Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
                 self.game_folders += 1
             }

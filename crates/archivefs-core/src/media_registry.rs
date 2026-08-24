@@ -115,6 +115,38 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "g64",
         kind: ArchiveKind::DirectGameImage,
     },
+    // Computer disks and cassette images are recognised media families, but
+    // their extensions are deliberately not platform authority. A `.dsk`,
+    // `.img`, `.tap`, or `.cdt` remains platform-unresolved until evidence
+    // elsewhere proves it.
+    MediaFormat {
+        extension: "dsk",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "adf",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "ima",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "img",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "cdt",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "tap",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "tzx",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // CHD (MAME Compressed Hunks of Data). Shared by many disc-based
     // platforms (Neo Geo CD, Sega CD, arcade sets, redump CD/DVD sets...);
     // resolving *which* platform a `.chd` belongs to is, again, the

@@ -48,5 +48,5 @@ pub use container::{ArchiveFormat, ContainerKind, FolderRole};
 pub use content_registry::ContentKind;
 pub use discovery::{
     DiscoveryError, DiscoveryStats, GameDiscovery, IdentitySummary, SkipReason, SkipReasonCounts,
-    SourceDiscoveryReport, ValidationState, discover_source,
+    SourceDiscoveryReport, ValidationState, discover_source, is_known_non_game_extension,
 };
