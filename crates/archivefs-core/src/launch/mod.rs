@@ -62,6 +62,8 @@
 //! "Launch-preparation workflows" note for the wider design context this
 //! module implements the first slice of.
 
+pub mod dolphin_command;
+pub mod dolphin_execution;
 pub mod es_de_export;
 pub mod evidence_bridge;
 pub mod execution;
@@ -69,12 +71,23 @@ pub mod input_projection;
 pub mod integration;
 pub mod planning;
 pub mod platform_map;
+pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
 
 #[cfg(test)]
 mod tests;
 
+pub use dolphin_command::{
+    DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, DolphinCommandPlan, DolphinCommandSelection,
+    build_dolphin_command_plan,
+};
+pub use dolphin_execution::{
+    DolphinLaunchCommandFacts, DolphinLaunchExecutionError, DolphinLaunchExitReport,
+    DolphinLaunchPreflightError, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
+    DolphinLaunchSpawnError, LaunchedDolphinProcess, preflight_and_launch_dolphin,
+    preflight_dolphin_launch, spawn_dolphin,
+};
 pub use es_de_export::{
     ES_DE_SYSTEM_MAP, EsDeEntryBlocker, EsDeEntryBlockerKind, EsDeEntryPlan, EsDeEntryStatus,
     EsDeExportOutcome, EsDeSystemMapping, NoEntryReason, build_es_de_entry_plan,

@@ -37,12 +37,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::SystemTime;
 
 use crate::emulator_environment::ReadOnlyHostFilesystem;
 use crate::emulator_environment::retroarch::{
@@ -53,15 +48,15 @@ use crate::launch::evidence_bridge::canonical_identity_from_game_report;
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget, build_launch_plan,
 };
+use crate::launch::process_spawn::{self, PreparedProcessCommand, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::retroarch_command::{RetroArchCommand, build_retroarch_command_plan};
 
 /// Caps how much of a launched process's stderr this module ever retains
 /// in memory - a diagnostic aid for a failed/crashed launch, never a full
-/// log. Matches the existing `64 KiB` bound this crate already uses for
-/// subprocess output elsewhere (`dat::archive::external_process`,
-/// `run_command_os_with_timeout`).
-pub const LAUNCH_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+/// log. Re-exports [`process_spawn::PROCESS_STDERR_CAPTURE_LIMIT`] under
+/// this module's existing name.
+pub const LAUNCH_STDERR_CAPTURE_LIMIT: usize = process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
 
 // ---------------------------------------------------------------------------
 // Request
@@ -113,31 +108,7 @@ pub struct RetroArchLaunchRequest {
 /// `DolphinDirectoryIdentity`) - device/inode are the *only* platform-
 /// specific part (`0` on non-Unix, where they carry no comparable meaning),
 /// size and modification time are always real.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaunchContentIdentity {
-    pub device: u64,
-    pub inode: u64,
-    pub size: u64,
-    pub modified: Option<SystemTime>,
-}
-
-impl LaunchContentIdentity {
-    fn capture(metadata: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        let (device, inode) = {
-            use std::os::unix::fs::MetadataExt;
-            (metadata.dev(), metadata.ino())
-        };
-        #[cfg(not(unix))]
-        let (device, inode) = (0u64, 0u64);
-        Self {
-            device,
-            inode,
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
-        }
-    }
-}
+pub use crate::launch::process_spawn::CapturedFileIdentity as LaunchContentIdentity;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -570,29 +541,21 @@ fn command_facts(command: &RetroArchCommand) -> LaunchCommandFacts {
 }
 
 /// What the background reaper thread reports once the process has exited.
-#[derive(Debug)]
-pub struct LaunchExitReport {
-    /// `Err` only when `wait()` on the child itself failed (not when the
-    /// process exited non-zero - that is a normal, successful `Ok(status)`
-    /// with `status.success() == false`).
-    pub status: std::io::Result<ExitStatus>,
-    /// Bounded (see [`LAUNCH_STDERR_CAPTURE_LIMIT`]) capture of the
-    /// process's stderr, for diagnosing a failed/crashed launch. Never a
-    /// full, unbounded log.
-    pub stderr: Vec<u8>,
-}
+/// Re-exports [`process_spawn::ProcessExitReport`] under this module's
+/// existing name.
+pub use crate::launch::process_spawn::ProcessExitReport as LaunchExitReport;
 
 /// A spawned, still-owned RetroArch process. Never automatically killed,
 /// timed out, or relaunched by this module - RetroArch is a long-running,
 /// user-facing program the caller (a future GUI) owns for as long as the
 /// user wants it running. [`Self::poll`] is the narrow, non-blocking way to
-/// notice it has exited, backed by a background thread that only ever
-/// drains stderr and waits - it never sends a signal.
+/// notice it has exited, backed by a background thread (see
+/// [`process_spawn::spawn_watched_process`]) that only ever drains stderr
+/// and waits - it never sends a signal.
 pub struct LaunchedRetroArchProcess {
     pub pid: u32,
     pub command_facts: LaunchCommandFacts,
-    receiver: Receiver<LaunchExitReport>,
-    exit_report: Option<LaunchExitReport>,
+    watched: WatchedProcess,
 }
 
 impl LaunchedRetroArchProcess {
@@ -600,18 +563,11 @@ impl LaunchedRetroArchProcess {
     /// thread has observed the process exit, `None` while it is still
     /// running. Safe to call every GUI frame.
     pub fn poll(&mut self) -> Option<&LaunchExitReport> {
-        if self.exit_report.is_none() {
-            match self.receiver.try_recv() {
-                Ok(report) => self.exit_report = Some(report),
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {}
-            }
-        }
-        self.exit_report.as_ref()
+        self.watched.poll()
     }
 
     pub fn is_running(&self) -> bool {
-        self.exit_report.is_none()
+        self.watched.is_running()
     }
 }
 
@@ -646,53 +602,18 @@ pub fn spawn_retroarch(
     command: RetroArchCommand,
 ) -> Result<LaunchedRetroArchProcess, LaunchSpawnError> {
     let facts = command_facts(&command);
-    let mut process = Command::new(&command.executable);
-    process.args(&command.arguments);
-    process.stdin(Stdio::null());
-    process.stdout(Stdio::null());
-    process.stderr(Stdio::piped());
-    if let Some(working_directory) = &command.working_directory {
-        process.current_dir(working_directory);
-    }
-    let mut child: Child = process.spawn().map_err(LaunchSpawnError::Spawn)?;
-    let pid = child.id();
-    let stderr = child.stderr.take();
-
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let stderr_bytes = stderr.map(read_bounded_stderr).unwrap_or_default();
-        let status = child.wait();
-        let _ = sender.send(LaunchExitReport {
-            status,
-            stderr: stderr_bytes,
-        });
-    });
-
+    let prepared = PreparedProcessCommand {
+        executable: command.executable,
+        arguments: command.arguments,
+        working_directory: command.working_directory,
+    };
+    let watched =
+        process_spawn::spawn_watched_process(&prepared).map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {
-        pid,
+        pid: watched.pid,
         command_facts: facts,
-        receiver,
-        exit_report: None,
+        watched,
     })
-}
-
-fn read_bounded_stderr(mut stderr: impl Read) -> Vec<u8> {
-    let mut buffer = vec![0u8; LAUNCH_STDERR_CAPTURE_LIMIT];
-    let mut filled = 0usize;
-    while filled < buffer.len() {
-        match stderr.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(_) => break,
-        }
-    }
-    buffer.truncate(filled);
-    // Drain and discard anything past the cap, so a chatty process still
-    // exits cleanly (an unread, full pipe can otherwise block the child on
-    // write) without this module ever retaining more than the bound.
-    let mut discard = [0u8; 4096];
-    while matches!(stderr.read(&mut discard), Ok(read) if read > 0) {}
-    buffer
 }
 
 // ---------------------------------------------------------------------------

@@ -110,6 +110,21 @@ pub enum LaunchBlockerKind {
     /// An environment-report path was rendered lossily and therefore cannot
     /// be reconstructed as the exact path required for an argv plan.
     RetroArchPathNotExact,
+    /// A Dolphin command-plan request was given a non-Dolphin-standalone
+    /// launch candidate.
+    DolphinCandidateRequired,
+    /// The canonical identity this Dolphin plan was built for does not
+    /// target `GameCube` - the only platform this native launch slice
+    /// supports.
+    DolphinPlatformMismatch,
+    /// The content is not a direct, non-mounted `.iso`/`.gcm` file - no
+    /// archive member, no RVZ/CISO/WBFS, no mount-input container.
+    DolphinContentFormatUnsupported,
+    /// [`crate::patch_manager::resolve_dolphin_native_launch_binding`]
+    /// itself refused to produce a launch binding for the candidate's
+    /// profile - see the blocker detail for the underlying
+    /// [`crate::patch_manager::DolphinLaunchBlockerKind`].
+    DolphinBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
