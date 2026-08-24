@@ -465,3 +465,55 @@ fn unknown_ambiguous_and_unsafe_never_project_to_verified() {
         Pcsx2BiosVerification::Verified
     );
 }
+
+/// Proves the managed Redump provider bridge end to end: a synthetic
+/// "downloaded" Redump PS2 BIOS DAT is parsed with the real DAT parser and
+/// turned into [`FirmwareIdentityRecord`]s via
+/// `crate::dat::firmware_evidence::redump_bios_evidence_from_dat` - the
+/// exact function `update_redump_bios` (in `crate::dat::updates`) calls
+/// before promoting a managed snapshot - and that evidence genuinely
+/// verifies a real on-disk BIOS file through the unchanged
+/// [`resolve_pcsx2_bios`] entry point. No network, no embedded real Redump
+/// hash, no PCSX2-specific code touched to make this work: the existing
+/// generic `&[FirmwareIdentityRecord]` parameter is all that was ever
+/// needed.
+#[test]
+fn managed_redump_ps2_evidence_satisfies_the_existing_pcsx2_bios_matcher() {
+    use crate::dat::firmware_evidence::redump_bios_evidence_from_dat;
+    use crate::dat::parsers::parse_dat_file;
+
+    let bios_bytes = b"synthetic managed-provider BIOS bytes for this test only";
+    let (crc32, md5, sha1) = digests_of(bios_bytes);
+    let dat_dir = tempfile::tempdir().unwrap();
+    let dat_path = dat_dir.path().join("ps2-bios.dat");
+    fs::write(
+        &dat_path,
+        format!(
+            r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Sony - PlayStation 2 - BIOS Images</name>
+        <description>Sony - PlayStation 2 - BIOS Images</description>
+        <version>20240101</version>
+        <author>Redump.org</author>
+    </header>
+    <game name="Sony PlayStation 2 BIOS v02.20 Console">
+        <description>Sony PlayStation 2 BIOS v02.20 Console</description>
+        <rom name="scph-70012.bin" size="{}" crc="{crc32}" md5="{md5}" sha1="{sha1}"/>
+    </game>
+</datafile>"#,
+            bios_bytes.len()
+        ),
+    )
+    .unwrap();
+    let parsed = parse_dat_file(&dat_path, crate::dat::limits::DatLimits::default())
+        .unwrap()
+        .dat;
+    let evidence = redump_bios_evidence_from_dat(&parsed, FirmwareSystem::PlayStation2).unwrap();
+    assert_eq!(evidence.len(), 1);
+
+    let root = fixture_root("managed-bridge");
+    write_bios(&root, "scph-70012.bin", bios_bytes);
+    let outcome = resolve_pcsx2_bios(&root, &empty_global_config(), &evidence);
+    assert!(matches!(outcome, Pcsx2BiosVerificationOutcome::Verified(_)));
+}

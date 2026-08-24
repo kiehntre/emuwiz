@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::dat::firmware_evidence::FirmwareSystem;
 use crate::dat::limits::DEFAULT_MAX_FILE_SIZE;
 use crate::dat::model::DatEcosystem;
 use crate::dat::sources::DatSourceOwnership;
@@ -31,23 +32,87 @@ const MAME_REPOSITORY: &str = "mamedev/mame";
 const STAGING_DIRECTORY: &str = "staging";
 const GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_RAW_HOST: &str = "raw.githubusercontent.com";
+const REDUMP_HOST: &str = "redump.org";
+/// Redump BIOS DATs are a handful of records at most - a few KiB. This cap
+/// is generous while still being a real, enforced bound rather than reusing
+/// the multi-hundred-MiB general DAT ceiling MAME software lists need.
+const REDUMP_BIOS_MAX_PAYLOAD: u64 = 1024 * 1024;
 const MANAGED_DAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGED_DAT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGED_DAT_OVERALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MANAGED_DAT_HEADER_LIMIT: usize = 32 * 1024;
 const MANAGED_DAT_NETWORK_CHUNK: usize = 64 * 1024;
 
-/// The sole built-in managed-DAT provider initially supported by this model.
+/// The built-in managed-DAT providers this model supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedDatProvider {
     MameSoftwareList,
+    /// Redump's dedicated machine-readable BIOS DATs - see
+    /// [`RedumpBiosSystem`] for the fixed, closed set of systems this
+    /// provider may name.
+    RedumpBios,
 }
 
 impl ManagedDatProvider {
     fn storage_component(self) -> &'static str {
         match self {
             Self::MameSoftwareList => "mame-software-list",
+            Self::RedumpBios => "redump-bios",
+        }
+    }
+}
+
+/// The fixed, closed set of systems Redump publishes a dedicated
+/// machine-readable BIOS DAT for. There is intentionally no way to
+/// construct a [`ManagedDatSourceDescriptor`] naming any other Redump
+/// dataset, host, or path - see [`ManagedDatSourceDescriptor::redump_bios`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedumpBiosSystem {
+    PlayStation,
+    PlayStation2,
+    Xbox,
+}
+
+impl RedumpBiosSystem {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::PlayStation => "playstation",
+            Self::PlayStation2 => "playstation2",
+            Self::Xbox => "xbox",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "playstation" => Some(Self::PlayStation),
+            "playstation2" => Some(Self::PlayStation2),
+            "xbox" => Some(Self::Xbox),
+            _ => None,
+        }
+    }
+
+    /// The one fixed, approved HTTPS URL for this system's Redump BIOS DAT.
+    /// Never caller-supplied, never inferred from a URL a caller passed in
+    /// - this is the entire "approved endpoint" surface for this provider.
+    fn fixed_url(self) -> &'static str {
+        match self {
+            Self::PlayStation => "https://redump.org/datfile/psx-bios/",
+            Self::PlayStation2 => "https://redump.org/datfile/ps2-bios/",
+            Self::Xbox => "https://redump.org/datfile/xbox-bios/",
+        }
+    }
+
+    /// Which [`FirmwareSystem`] this Redump dataset produces
+    /// [`crate::dat::firmware_evidence::FirmwareIdentityRecord`] evidence
+    /// for - see [`FirmwareSystem::Xbox`]'s own doc comment for why the
+    /// Xbox mapping in particular names only the BIOS/flash component.
+    pub fn firmware_system(self) -> FirmwareSystem {
+        match self {
+            Self::PlayStation => FirmwareSystem::PlayStation,
+            Self::PlayStation2 => FirmwareSystem::PlayStation2,
+            Self::Xbox => FirmwareSystem::Xbox,
         }
     }
 }
@@ -70,10 +135,28 @@ impl ManagedDatSourceId {
         })
     }
 
+    /// Creates the stable ID for one of the fixed Redump BIOS systems.
+    /// Infallible: `system` is a closed enum, so there is no free-text
+    /// input to validate.
+    pub fn redump_bios(system: RedumpBiosSystem) -> Self {
+        Self {
+            provider: ManagedDatProvider::RedumpBios,
+            source_key: system.slug().to_string(),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         match self.provider {
             ManagedDatProvider::MameSoftwareList => {
                 validate_mame_software_list_name(&self.source_key)
+            }
+            ManagedDatProvider::RedumpBios => {
+                if RedumpBiosSystem::from_slug(&self.source_key).is_none() {
+                    return Err(config_error(
+                        "Redump BIOS source key must name one of the fixed supported systems",
+                    ));
+                }
+                Ok(())
             }
         }
     }
@@ -105,18 +188,50 @@ pub enum ManagedDatUpdatePolicy {
     Manual,
 }
 
+/// How a descriptor's bytes are actually fetched. Private: a caller can
+/// only ever get one of these values through
+/// [`ManagedDatSourceDescriptor::mame_software_list`] or
+/// [`ManagedDatSourceDescriptor::redump_bios`], never by constructing a URL
+/// or hostname themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedDatRemote {
+    /// MAME's model: an immutable commit SHA is resolved first (via the
+    /// GitHub API), then the file is downloaded from GitHub raw content
+    /// pinned to that exact commit.
+    GithubCommitPinned {
+        repository: &'static str,
+        repository_relative_path: PathBuf,
+    },
+    /// Redump's model: one fixed HTTPS URL serves the current DAT directly.
+    /// There is no separate "resolve a revision" step - see
+    /// [`check_redump_bios_update`]/[`update_redump_bios`].
+    DirectHttps { url: &'static str },
+}
+
+/// Which authoritative dataset a downloaded DAT's parsed header must
+/// identify itself as, before its bytes are trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedDataset {
+    /// MAME: exact `<softwarelist name="...">` match.
+    MameSoftwareList(String),
+    /// Redump: the fixed system's BIOS Images dataset, matched via
+    /// [`crate::dat::firmware_evidence::header_identifies_redump_bios_dataset`]
+    /// rather than exact string equality (see that function's own doc
+    /// comment for why).
+    RedumpBios(RedumpBiosSystem),
+}
+
 /// A built-in, validated future source contract.
 ///
-/// Construction is intentionally limited to MAME software lists.  This keeps
-/// an arbitrary URL or a provider-looking local DAT from becoming updater
-/// authority by accident.
+/// Construction is intentionally limited to MAME software lists and
+/// Redump's fixed BIOS datasets.  This keeps an arbitrary URL, hostname, or
+/// provider-looking local DAT from becoming updater authority by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedDatSourceDescriptor {
     source_id: ManagedDatSourceId,
-    repository: &'static str,
-    repository_relative_path: PathBuf,
+    remote: ManagedDatRemote,
     expected_ecosystem: DatEcosystem,
-    expected_softwarelist_name: String,
+    expected_dataset: ExpectedDataset,
     max_payload_size: u64,
     update_policy: ManagedDatUpdatePolicy,
 }
@@ -131,11 +246,33 @@ impl ManagedDatSourceDescriptor {
         let source_key = source_id.source_key.clone();
         let descriptor = Self {
             source_id,
-            repository: MAME_REPOSITORY,
-            repository_relative_path: PathBuf::from("hash").join(format!("{source_key}.xml")),
+            remote: ManagedDatRemote::GithubCommitPinned {
+                repository: MAME_REPOSITORY,
+                repository_relative_path: PathBuf::from("hash").join(format!("{source_key}.xml")),
+            },
             expected_ecosystem: DatEcosystem::MAMESoftwareList,
-            expected_softwarelist_name: source_key,
+            expected_dataset: ExpectedDataset::MameSoftwareList(source_key),
             max_payload_size: DEFAULT_MAX_FILE_SIZE,
+            update_policy: ManagedDatUpdatePolicy::Disabled,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    /// Constructs the fixed contract for one of Redump's dedicated BIOS
+    /// DATs. The caller supplies only a closed [`RedumpBiosSystem`] enum
+    /// value - never a URL, hostname, or free-text dataset name - and each
+    /// variant maps internally to exactly one approved endpoint (see
+    /// [`RedumpBiosSystem::fixed_url`]).
+    pub fn redump_bios(system: RedumpBiosSystem) -> Result<Self> {
+        let descriptor = Self {
+            source_id: ManagedDatSourceId::redump_bios(system),
+            remote: ManagedDatRemote::DirectHttps {
+                url: system.fixed_url(),
+            },
+            expected_ecosystem: DatEcosystem::Redump,
+            expected_dataset: ExpectedDataset::RedumpBios(system),
+            max_payload_size: REDUMP_BIOS_MAX_PAYLOAD,
             update_policy: ManagedDatUpdatePolicy::Disabled,
         };
         descriptor.validate()?;
@@ -146,20 +283,63 @@ impl ManagedDatSourceDescriptor {
         &self.source_id
     }
 
-    pub fn repository(&self) -> &'static str {
-        self.repository
+    /// The GitHub repository this descriptor downloads from, for the MAME
+    /// contract only. `None` for a Redump descriptor.
+    pub fn repository(&self) -> Option<&'static str> {
+        match &self.remote {
+            ManagedDatRemote::GithubCommitPinned { repository, .. } => Some(repository),
+            ManagedDatRemote::DirectHttps { .. } => None,
+        }
     }
 
-    pub fn repository_relative_path(&self) -> &Path {
-        &self.repository_relative_path
+    /// The repository-relative path this descriptor downloads, for the MAME
+    /// contract only. `None` for a Redump descriptor.
+    pub fn repository_relative_path(&self) -> Option<&Path> {
+        match &self.remote {
+            ManagedDatRemote::GithubCommitPinned {
+                repository_relative_path,
+                ..
+            } => Some(repository_relative_path),
+            ManagedDatRemote::DirectHttps { .. } => None,
+        }
     }
 
     pub fn expected_ecosystem(&self) -> DatEcosystem {
         self.expected_ecosystem
     }
 
+    /// The exact expected `<softwarelist name="...">`, for the MAME
+    /// contract only. Empty for a Redump descriptor - use
+    /// [`Self::redump_bios_system`] there instead.
     pub fn expected_softwarelist_name(&self) -> &str {
-        &self.expected_softwarelist_name
+        match &self.expected_dataset {
+            ExpectedDataset::MameSoftwareList(name) => name,
+            ExpectedDataset::RedumpBios(_) => "",
+        }
+    }
+
+    /// The fixed Redump BIOS system this descriptor represents, for the
+    /// Redump contract only. `None` for a MAME descriptor.
+    pub fn redump_bios_system(&self) -> Option<RedumpBiosSystem> {
+        match &self.expected_dataset {
+            ExpectedDataset::RedumpBios(system) => Some(*system),
+            ExpectedDataset::MameSoftwareList(_) => None,
+        }
+    }
+
+    /// A meaningful authoritative-dataset label for [`ManagedDatState`]
+    /// provenance, for either provider - MAME's exact software-list name,
+    /// or Redump's human-readable dataset label (e.g.
+    /// `"Sony - PlayStation 2 - BIOS Images"`), never the empty string
+    /// [`Self::expected_softwarelist_name`] returns for a Redump
+    /// descriptor.
+    fn expected_authoritative_name(&self) -> String {
+        match &self.expected_dataset {
+            ExpectedDataset::MameSoftwareList(name) => name.clone(),
+            ExpectedDataset::RedumpBios(system) => {
+                system.firmware_system().redump_dataset_label().to_string()
+            }
+        }
     }
 
     pub fn max_payload_size(&self) -> u64 {
@@ -176,25 +356,58 @@ impl ManagedDatSourceDescriptor {
         self
     }
 
-    /// Validates that this still represents the one built-in contract.
+    /// Validates that this still represents one of the built-in contracts.
     pub fn validate(&self) -> Result<()> {
         self.source_id.validate()?;
-        if self.source_id.provider != ManagedDatProvider::MameSoftwareList
-            || self.repository != MAME_REPOSITORY
-            || self.expected_ecosystem != DatEcosystem::MAMESoftwareList
-            || self.expected_softwarelist_name != self.source_id.source_key
-        {
-            return Err(config_error(
-                "managed DAT descriptor is not the fixed MAME software-list contract",
-            ));
-        }
-        validate_repository_relative_path(&self.repository_relative_path)?;
-        let expected_path =
-            PathBuf::from("hash").join(format!("{}.xml", self.source_id.source_key));
-        if self.repository_relative_path != expected_path {
-            return Err(config_error(
-                "managed MAME software-list path does not match its typed source ID",
-            ));
+        match (
+            &self.source_id.provider,
+            &self.remote,
+            &self.expected_dataset,
+        ) {
+            (
+                ManagedDatProvider::MameSoftwareList,
+                ManagedDatRemote::GithubCommitPinned {
+                    repository,
+                    repository_relative_path,
+                },
+                ExpectedDataset::MameSoftwareList(name),
+            ) => {
+                if *repository != MAME_REPOSITORY
+                    || self.expected_ecosystem != DatEcosystem::MAMESoftwareList
+                    || name != &self.source_id.source_key
+                {
+                    return Err(config_error(
+                        "managed DAT descriptor is not the fixed MAME software-list contract",
+                    ));
+                }
+                validate_repository_relative_path(repository_relative_path)?;
+                let expected_path =
+                    PathBuf::from("hash").join(format!("{}.xml", self.source_id.source_key));
+                if repository_relative_path != &expected_path {
+                    return Err(config_error(
+                        "managed MAME software-list path does not match its typed source ID",
+                    ));
+                }
+            }
+            (
+                ManagedDatProvider::RedumpBios,
+                ManagedDatRemote::DirectHttps { url },
+                ExpectedDataset::RedumpBios(system),
+            ) => {
+                if system.slug() != self.source_id.source_key
+                    || self.expected_ecosystem != DatEcosystem::Redump
+                    || *url != system.fixed_url()
+                {
+                    return Err(config_error(
+                        "managed DAT descriptor is not a fixed Redump BIOS contract",
+                    ));
+                }
+            }
+            _ => {
+                return Err(config_error(
+                    "managed DAT descriptor fields do not match a known provider contract",
+                ));
+            }
         }
         if self.max_payload_size == 0 || self.max_payload_size > DEFAULT_MAX_FILE_SIZE {
             return Err(config_error(
@@ -292,7 +505,7 @@ impl ManagedDatState {
             retrieved_at_unix_seconds: None,
             last_checked_at_unix_seconds: None,
             parsed_ecosystem: descriptor.expected_ecosystem,
-            authoritative_name: descriptor.expected_softwarelist_name.clone(),
+            authoritative_name: descriptor.expected_authoritative_name(),
             validation_summary: None,
             last_failure: None,
         };
@@ -322,7 +535,7 @@ impl ManagedDatState {
         }
         if self.source_id != descriptor.source_id
             || self.parsed_ecosystem != descriptor.expected_ecosystem
-            || self.authoritative_name != descriptor.expected_softwarelist_name
+            || self.authoritative_name != descriptor.expected_authoritative_name()
         {
             return Err(config_error(
                 "managed DAT state does not match its typed descriptor",
@@ -406,11 +619,30 @@ pub fn load_managed_dat_state(
     Ok(state)
 }
 
+/// Reconstructs the fixed built-in descriptor a source ID names, regardless
+/// of which provider it belongs to. This is how [`save_managed_dat_state`]/
+/// [`validate_managed_snapshot_ownership`] can revalidate a state record
+/// without knowing in advance whether it is MAME or Redump - the exact
+/// provider is read from `source_id.provider`, never guessed or accepted
+/// from unrelated caller input.
+fn descriptor_from_source_id(source_id: &ManagedDatSourceId) -> Result<ManagedDatSourceDescriptor> {
+    match source_id.provider {
+        ManagedDatProvider::MameSoftwareList => {
+            ManagedDatSourceDescriptor::mame_software_list(source_id.source_key.clone())
+        }
+        ManagedDatProvider::RedumpBios => {
+            let system = RedumpBiosSystem::from_slug(&source_id.source_key).ok_or_else(|| {
+                config_error("managed DAT state names an unknown Redump BIOS system")
+            })?;
+            ManagedDatSourceDescriptor::redump_bios(system)
+        }
+    }
+}
+
 /// Atomically saves a state record below the managed root.  It never accepts a
 /// state-file destination outside the typed source's storage directory.
 pub fn save_managed_dat_state(managed_root: &Path, state: &ManagedDatState) -> Result<()> {
-    let descriptor =
-        ManagedDatSourceDescriptor::mame_software_list(state.source_id.source_key.clone())?;
+    let descriptor = descriptor_from_source_id(&state.source_id)?;
     state.validate_for(&descriptor)?;
     create_managed_source_dir(managed_root, &state.source_id)?;
     let path = managed_dat_state_path(managed_root, &state.source_id)?;
@@ -428,8 +660,7 @@ pub fn validate_managed_snapshot_ownership(
     state: &ManagedDatState,
     snapshot: &ManagedDatSnapshot,
 ) -> Result<PathBuf> {
-    let descriptor =
-        ManagedDatSourceDescriptor::mame_software_list(state.source_id.source_key.clone())?;
+    let descriptor = descriptor_from_source_id(&state.source_id)?;
     state.validate_for(&descriptor)?;
     let known = snapshot == &state.current_snapshot
         || state
@@ -944,8 +1175,11 @@ impl ManagedDatUpdateOptions {
     }
 }
 
-/// Checks the current immutable MAME revision.  It never downloads XML or
-/// changes a current/previous snapshot; it only persists check metadata for an
+/// Checks whether an update is available for `descriptor`, dispatching by
+/// provider - see [`check_mame_update`] for MAME's immutable-commit model
+/// and [`check_redump_bios_update`] for Redump's single-URL model. Neither
+/// branch downloads a full XML/DAT into the managed object store or changes
+/// a current/previous snapshot; each only persists check metadata for an
 /// already installed state.
 pub fn check_managed_dat_update(
     descriptor: &ManagedDatSourceDescriptor,
@@ -959,6 +1193,17 @@ pub fn check_managed_dat_update(
     if options.offline {
         return Ok(ManagedDatUpdateOutcome::Offline);
     }
+    match descriptor.source_id().provider {
+        ManagedDatProvider::MameSoftwareList => check_mame_update(descriptor, options, transport),
+        ManagedDatProvider::RedumpBios => check_redump_bios_update(descriptor, options, transport),
+    }
+}
+
+fn check_mame_update(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    transport: &dyn ManagedDatTransport,
+) -> Result<ManagedDatUpdateOutcome> {
     let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
     let revision = match resolve_mame_revision(descriptor, existing.as_ref(), transport) {
         Ok(revision) => revision,
@@ -966,7 +1211,7 @@ pub fn check_managed_dat_update(
     };
     if revision.not_modified
         || existing.as_ref().is_some_and(|state| {
-            state.upstream_revision.as_deref() == Some(revision.commit.as_str())
+            state.upstream_revision.as_deref() == Some(revision.label.as_str())
         })
     {
         if let Some(mut state) = existing {
@@ -985,13 +1230,14 @@ pub fn check_managed_dat_update(
         });
     }
     Ok(ManagedDatUpdateOutcome::UpdateAvailable {
-        upstream_revision: revision.commit,
+        upstream_revision: revision.label,
     })
 }
 
-/// Downloads and validates the XML at a revision resolved during this call.
-/// No bytes become current until they are parsed, content-addressed, and the
-/// next state record has been atomically written.
+/// Downloads and validates the XML at a revision resolved during this call,
+/// dispatching by provider - see [`update_mame_dat`]/[`update_redump_bios`].
+/// No bytes become current until they are parsed, validated, content-
+/// addressed, and the next state record has been atomically written.
 pub fn update_managed_dat(
     descriptor: &ManagedDatSourceDescriptor,
     options: &ManagedDatUpdateOptions,
@@ -1004,6 +1250,17 @@ pub fn update_managed_dat(
     if options.offline {
         return Ok(ManagedDatUpdateOutcome::Offline);
     }
+    match descriptor.source_id().provider {
+        ManagedDatProvider::MameSoftwareList => update_mame_dat(descriptor, options, transport),
+        ManagedDatProvider::RedumpBios => update_redump_bios(descriptor, options, transport),
+    }
+}
+
+fn update_mame_dat(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    transport: &dyn ManagedDatTransport,
+) -> Result<ManagedDatUpdateOutcome> {
     let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
     let revision = match resolve_mame_revision(descriptor, existing.as_ref(), transport) {
         Ok(revision) => revision,
@@ -1014,7 +1271,7 @@ pub fn update_managed_dat(
     }
     if existing
         .as_ref()
-        .is_some_and(|state| state.upstream_revision.as_deref() == Some(revision.commit.as_str()))
+        .is_some_and(|state| state.upstream_revision.as_deref() == Some(revision.label.as_str()))
     {
         return mark_up_to_date(existing, options, revision);
     }
@@ -1029,11 +1286,10 @@ pub fn update_managed_dat(
         Err(error) => return Ok(storage_failure(error)),
     };
     let _cleanup = ManagedDatStagingCleanup(staging.path.clone());
-    let (response, sha256) =
-        match download_mame_xml(descriptor, &revision.commit, &staging.path, transport) {
-            Ok(download) => download,
-            Err(outcome) => return Ok(outcome),
-        };
+    let sha256 = match download_mame_xml(descriptor, &revision.label, &staging.path, transport) {
+        Ok(sha256) => sha256,
+        Err(outcome) => return Ok(outcome),
+    };
     let parsed = match crate::dat::parsers::parse_dat_file(
         &staging.path,
         crate::dat::limits::DatLimits::default(),
@@ -1073,16 +1329,24 @@ pub fn update_managed_dat(
         options,
         existing,
         revision,
-        response,
         sha256,
         staging.path,
-        parsed.source.entry_count as u64,
+        format!(
+            "validated MAME software-list with {} records",
+            parsed.source.entry_count
+        ),
     )
 }
 
+/// Resolved provenance metadata for one check/update pass - MAME's
+/// immutable commit SHA, or Redump's parsed DAT header version (or, absent
+/// that, a digest-derived label - see [`update_redump_bios`]'s own doc
+/// comment). Despite the field name, `label` is never treated as itself
+/// proving bytes changed - see [`ManagedDatState::sha256`]'s own doc
+/// comment: the content digest is always the authority for that.
 #[derive(Debug)]
-struct ResolvedMameRevision {
-    commit: String,
+struct ResolvedRevisionMeta {
+    label: String,
     etag: Option<String>,
     last_modified: Option<String>,
     not_modified: bool,
@@ -1092,7 +1356,7 @@ fn resolve_mame_revision(
     descriptor: &ManagedDatSourceDescriptor,
     existing: Option<&ManagedDatState>,
     transport: &dyn ManagedDatTransport,
-) -> std::result::Result<ResolvedMameRevision, ManagedDatUpdateOutcome> {
+) -> std::result::Result<ResolvedRevisionMeta, ManagedDatUpdateOutcome> {
     let mut headers = vec![(
         "Accept".to_string(),
         "application/vnd.github+json".to_string(),
@@ -1105,11 +1369,11 @@ fn resolve_mame_revision(
             headers.push(("If-Modified-Since".to_string(), last_modified.clone()));
         }
     }
+    let repository = descriptor
+        .repository()
+        .expect("resolve_mame_revision is only ever called with a MAME descriptor");
     let request = ManagedDatHttpRequest {
-        url: format!(
-            "https://{GITHUB_API_HOST}/repos/{}/commits/master",
-            descriptor.repository()
-        ),
+        url: format!("https://{GITHUB_API_HOST}/repos/{repository}/commits/master"),
         headers,
     };
     let mut bytes = Vec::new();
@@ -1117,8 +1381,8 @@ fn resolve_mame_revision(
         .get(&request, 64 * 1024, &mut bytes)
         .map_err(transport_failure)?;
     match response.status {
-        304 => Ok(ResolvedMameRevision {
-            commit: existing
+        304 => Ok(ResolvedRevisionMeta {
+            label: existing
                 .and_then(|state| state.upstream_revision.clone())
                 .unwrap_or_default(),
             etag: response.etag,
@@ -1149,8 +1413,8 @@ fn resolve_mame_revision(
                     kind: ManagedDatUpdateFailureKind::InvalidResponse,
                     detail: "GitHub revision response did not contain a commit SHA".to_string(),
                 })?;
-            Ok(ResolvedMameRevision {
-                commit,
+            Ok(ResolvedRevisionMeta {
+                label: commit,
                 etag: response.etag,
                 last_modified: response.last_modified,
                 not_modified: false,
@@ -1165,22 +1429,53 @@ fn download_mame_xml(
     commit: &str,
     staging_path: &Path,
     transport: &dyn ManagedDatTransport,
-) -> std::result::Result<(ManagedDatHttpResponse, String), ManagedDatUpdateOutcome> {
+) -> std::result::Result<String, ManagedDatUpdateOutcome> {
     if !is_git_commit_sha(commit) {
         return Err(ManagedDatUpdateOutcome::Failed {
             kind: ManagedDatUpdateFailureKind::InvalidResponse,
             detail: "resolved revision is not a commit SHA".to_string(),
         });
     }
+    let repository = descriptor
+        .repository()
+        .expect("download_mame_xml is only ever called with a MAME descriptor");
+    let repository_relative_path = descriptor
+        .repository_relative_path()
+        .expect("download_mame_xml is only ever called with a MAME descriptor");
     let request = ManagedDatHttpRequest {
         url: format!(
-            "https://{GITHUB_RAW_HOST}/{}/{}/{}",
-            descriptor.repository(),
-            commit,
-            descriptor.repository_relative_path().to_string_lossy()
+            "https://{GITHUB_RAW_HOST}/{repository}/{commit}/{}",
+            repository_relative_path.to_string_lossy()
         ),
         headers: Vec::new(),
     };
+    let (response, sha256) = download_to_staging(
+        &request,
+        staging_path,
+        descriptor.max_payload_size(),
+        "MAME software-list",
+        transport,
+    )?;
+    match response.status {
+        200 => {}
+        status => return Err(http_failure(status, response.retry_after_seconds)),
+    }
+    Ok(sha256)
+}
+
+/// Downloads `request` into `staging_path` through a SHA-256-hashing
+/// writer, then validates it is non-empty, within `max_payload_size`, and
+/// not truncated relative to any declared `Content-Length`. Shared by both
+/// [`download_mame_xml`] and [`update_redump_bios`]/
+/// [`check_redump_bios_update`] - the only provider-specific behavior is
+/// the resource label used in error details.
+fn download_to_staging(
+    request: &ManagedDatHttpRequest,
+    staging_path: &Path,
+    max_payload_size: u64,
+    resource_label: &str,
+    transport: &dyn ManagedDatTransport,
+) -> std::result::Result<(ManagedDatHttpResponse, String), ManagedDatUpdateOutcome> {
     let file = fs::OpenOptions::new()
         .write(true)
         .truncate(true)
@@ -1188,7 +1483,7 @@ fn download_mame_xml(
         .map_err(|error| storage_failure(ArchiveFsError::io(staging_path.to_path_buf(), error)))?;
     let mut writer = HashingWriter::new(file);
     let response = transport
-        .get(&request, descriptor.max_payload_size(), &mut writer)
+        .get(request, max_payload_size, &mut writer)
         .map_err(transport_failure)?;
     writer
         .flush()
@@ -1197,32 +1492,39 @@ fn download_mame_xml(
     let actual = fs::metadata(staging_path)
         .map_err(|error| storage_failure(ArchiveFsError::io(staging_path.to_path_buf(), error)))?
         .len();
-    match response.status {
-        200 => {}
-        status => return Err(http_failure(status, response.retry_after_seconds)),
+    // Status is classified before any body-size validation, exactly the
+    // order the original MAME-only download function used - a 403/404/429
+    // error page body must never be misreported as an empty/oversized/
+    // truncated *successful* download. 304 (conditional GET, Redump only)
+    // carries no body to validate and is returned as-is for the caller to
+    // interpret; every other non-200 status is a hard transport failure.
+    if response.status != 200 && response.status != 304 {
+        return Err(http_failure(response.status, response.retry_after_seconds));
+    }
+    if response.status == 304 {
+        return Ok((response, sha256));
     }
     if actual == 0 || response.downloaded_bytes == 0 {
         return Err(ManagedDatUpdateOutcome::Failed {
             kind: ManagedDatUpdateFailureKind::EmptyDownload,
-            detail: "MAME software-list response was empty".to_string(),
+            detail: format!("{resource_label} response was empty"),
         });
     }
     if response
         .content_length
-        .is_some_and(|length| length > descriptor.max_payload_size())
+        .is_some_and(|length| length > max_payload_size)
     {
         return Err(ManagedDatUpdateOutcome::Failed {
             kind: ManagedDatUpdateFailureKind::DownloadTooLarge,
-            detail: "MAME software-list declared Content-Length exceeds the configured limit"
-                .to_string(),
+            detail: format!(
+                "{resource_label} declared Content-Length exceeds the configured limit"
+            ),
         });
     }
-    if actual > descriptor.max_payload_size()
-        || response.downloaded_bytes > descriptor.max_payload_size()
-    {
+    if actual > max_payload_size || response.downloaded_bytes > max_payload_size {
         return Err(ManagedDatUpdateOutcome::Failed {
             kind: ManagedDatUpdateFailureKind::DownloadTooLarge,
-            detail: "MAME software-list response exceeded the configured limit".to_string(),
+            detail: format!("{resource_label} response exceeded the configured limit"),
         });
     }
     if response
@@ -1232,21 +1534,26 @@ fn download_mame_xml(
     {
         return Err(ManagedDatUpdateOutcome::Failed {
             kind: ManagedDatUpdateFailureKind::TruncatedDownload,
-            detail: "MAME software-list response length did not match bytes received".to_string(),
+            detail: format!("{resource_label} response length did not match bytes received"),
         });
     }
     Ok((response, sha256))
 }
 
+/// Writes a validated DAT's bytes into the managed object store and
+/// atomically updates state to name it as current, retaining the prior
+/// current snapshot as previous. Shared by MAME and Redump - the caller has
+/// already parsed and fully validated the DAT before this is called; this
+/// function only ever performs content-addressed storage and state
+/// bookkeeping, never parsing or dataset-identity validation itself.
 fn publish_validated_snapshot(
     descriptor: &ManagedDatSourceDescriptor,
     options: &ManagedDatUpdateOptions,
     existing: Option<ManagedDatState>,
-    revision: ResolvedMameRevision,
-    _response: ManagedDatHttpResponse,
+    revision: ResolvedRevisionMeta,
     sha256: String,
     staging_path: PathBuf,
-    entry_count: u64,
+    validation_summary: String,
 ) -> Result<ManagedDatUpdateOutcome> {
     let snapshot = ManagedDatSnapshot::new(sha256.clone())?;
     let source_dir = managed_source_dir(&options.managed_root, descriptor.source_id())?;
@@ -1282,16 +1589,14 @@ fn publish_validated_snapshot(
         state.current_snapshot = snapshot.clone();
         state.sha256 = sha256.clone();
     }
-    state.upstream_revision = Some(revision.commit.clone());
+    state.upstream_revision = Some(revision.label.clone());
     state.etag = revision.etag;
     state.last_modified = revision.last_modified;
     state.retrieved_at_unix_seconds = Some(options.now_unix_seconds);
     state.last_checked_at_unix_seconds = Some(options.now_unix_seconds);
     state.parsed_ecosystem = descriptor.expected_ecosystem();
-    state.authoritative_name = descriptor.expected_softwarelist_name().to_string();
-    state.validation_summary = Some(format!(
-        "validated MAME software-list with {entry_count} records"
-    ));
+    state.authoritative_name = descriptor.expected_authoritative_name();
+    state.validation_summary = Some(validation_summary);
     state.last_failure = None;
     if let Err(error) = save_managed_dat_state(&options.managed_root, &state) {
         return Ok(storage_failure(error));
@@ -1306,7 +1611,7 @@ fn publish_validated_snapshot(
         }
     }
     Ok(ManagedDatUpdateOutcome::Updated {
-        upstream_revision: revision.commit,
+        upstream_revision: revision.label,
         sha256,
     })
 }
@@ -1314,7 +1619,7 @@ fn publish_validated_snapshot(
 fn mark_up_to_date(
     existing: Option<ManagedDatState>,
     options: &ManagedDatUpdateOptions,
-    revision: ResolvedMameRevision,
+    revision: ResolvedRevisionMeta,
 ) -> Result<ManagedDatUpdateOutcome> {
     let Some(mut state) = existing else {
         return Ok(ManagedDatUpdateOutcome::UpToDate {
@@ -1330,6 +1635,258 @@ fn mark_up_to_date(
     Ok(ManagedDatUpdateOutcome::UpToDate {
         upstream_revision: state.upstream_revision,
     })
+}
+
+/// The validated result of [`fetch_and_validate_redump_bios`].
+struct FetchedRedumpBios {
+    response: ManagedDatHttpResponse,
+    sha256: String,
+    upstream_version: Option<String>,
+    entry_count: usize,
+}
+
+/// Downloads `descriptor`'s fixed Redump BIOS URL into a private staging
+/// file and fully validates it (parse, ecosystem, dataset identity,
+/// non-empty usable evidence) - but never renames it into the managed
+/// object store or touches `objects/`. Returns `Ok(None)` for a `304 Not
+/// Modified` conditional response (no body to validate). Used by both
+/// [`check_redump_bios_update`] (which only ever wants the resulting digest
+/// and header version to decide `UpToDate`/`UpdateAvailable`) and
+/// [`update_redump_bios`] (which additionally promotes the validated
+/// staging file on success). The caller's [`ManagedDatStagingCleanup`]
+/// guard is what actually deletes the staging file in either case.
+
+fn fetch_and_validate_redump_bios(
+    descriptor: &ManagedDatSourceDescriptor,
+    system: RedumpBiosSystem,
+    existing: Option<&ManagedDatState>,
+    staging_path: &Path,
+    transport: &dyn ManagedDatTransport,
+) -> std::result::Result<Option<FetchedRedumpBios>, ManagedDatUpdateOutcome> {
+    let mut headers = Vec::new();
+    if let Some(state) = existing {
+        if let Some(etag) = &state.etag {
+            headers.push(("If-None-Match".to_string(), etag.clone()));
+        }
+        if let Some(last_modified) = &state.last_modified {
+            headers.push(("If-Modified-Since".to_string(), last_modified.clone()));
+        }
+    }
+    let request = ManagedDatHttpRequest {
+        url: system.fixed_url().to_string(),
+        headers,
+    };
+    let (response, sha256) = download_to_staging(
+        &request,
+        staging_path,
+        descriptor.max_payload_size(),
+        "Redump BIOS DAT",
+        transport,
+    )?;
+    if response.status == 304 {
+        return Ok(None);
+    }
+    if response.status != 200 {
+        return Err(http_failure(response.status, response.retry_after_seconds));
+    }
+    let parsed =
+        crate::dat::parsers::parse_dat_file(staging_path, crate::dat::limits::DatLimits::default())
+            .map_err(|error| ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::Parser,
+                detail: error.to_string(),
+            })?
+            .dat;
+    if parsed.source.ecosystem != descriptor.expected_ecosystem() {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::WrongEcosystem,
+            detail: format!(
+                "expected {}, received {}",
+                descriptor.expected_ecosystem().label(),
+                parsed.source.ecosystem.label()
+            ),
+        });
+    }
+    if !crate::dat::firmware_evidence::header_identifies_redump_bios_dataset(
+        &parsed.source,
+        system.firmware_system(),
+    ) {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+            detail: format!(
+                "downloaded DAT does not identify itself as the {} dataset",
+                system.firmware_system().redump_dataset_label()
+            ),
+        });
+    }
+    let evidence = crate::dat::firmware_evidence::redump_bios_evidence_from_dat(
+        &parsed,
+        system.firmware_system(),
+    )
+    .map_err(|error| ManagedDatUpdateOutcome::Failed {
+        kind: ManagedDatUpdateFailureKind::EmptyCatalogue,
+        detail: error.to_string(),
+    })?;
+    Ok(Some(FetchedRedumpBios {
+        response,
+        sha256,
+        upstream_version: parsed.source.version.clone(),
+        entry_count: evidence.len(),
+    }))
+}
+
+/// Checks Redump's fixed BIOS URL for `descriptor`. Redump exposes no
+/// separate cheap version endpoint, so this genuinely downloads the (small,
+/// bounded) DAT into private staging and fully validates it exactly like
+/// [`update_redump_bios`] does - the only difference is that it never
+/// renames the staging file into the managed object store and never
+/// updates `current_snapshot`/`previous_snapshot`; only check-timestamp/
+/// conditional-header metadata on an already-installed state may be
+/// persisted. See [`ManagedDatState::sha256`]'s own doc comment: the
+/// content digest, not the parsed header version, is what actually decides
+/// `UpToDate` vs. `UpdateAvailable` here.
+fn check_redump_bios_update(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    transport: &dyn ManagedDatTransport,
+) -> Result<ManagedDatUpdateOutcome> {
+    let system = descriptor
+        .redump_bios_system()
+        .expect("check_redump_bios_update is only ever called with a Redump descriptor");
+    let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
+    let source_dir = match create_managed_source_dir(&options.managed_root, descriptor.source_id())
+    {
+        Ok(()) => managed_source_dir(&options.managed_root, descriptor.source_id())?,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let staging = match create_private_staging_file(&options.managed_root, &source_dir) {
+        Ok(file) => file,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let _cleanup = ManagedDatStagingCleanup(staging.path.clone());
+    let fetched = match fetch_and_validate_redump_bios(
+        descriptor,
+        system,
+        existing.as_ref(),
+        &staging.path,
+        transport,
+    ) {
+        Ok(fetched) => fetched,
+        Err(outcome) => return Ok(outcome),
+    };
+    let Some(fetched) = fetched else {
+        // 304 Not Modified: bytes are provably unchanged without a body.
+        let revision = ResolvedRevisionMeta {
+            label: existing
+                .as_ref()
+                .and_then(|state| state.upstream_revision.clone())
+                .unwrap_or_default(),
+            etag: None,
+            last_modified: None,
+            not_modified: true,
+        };
+        return mark_up_to_date(existing, options, revision);
+    };
+    let up_to_date = existing
+        .as_ref()
+        .is_some_and(|state| state.sha256 == fetched.sha256);
+    if up_to_date {
+        let revision = ResolvedRevisionMeta {
+            label: fetched
+                .upstream_version
+                .unwrap_or_else(|| fetched.sha256[..12].to_string()),
+            etag: fetched.response.etag,
+            last_modified: fetched.response.last_modified,
+            not_modified: false,
+        };
+        return mark_up_to_date(existing, options, revision);
+    }
+    Ok(ManagedDatUpdateOutcome::UpdateAvailable {
+        upstream_revision: fetched
+            .upstream_version
+            .unwrap_or_else(|| fetched.sha256[..12].to_string()),
+    })
+}
+
+/// Downloads, validates, and (only on a genuine content change) promotes
+/// Redump's fixed BIOS DAT for `descriptor`'s system. If the downloaded
+/// bytes' SHA-256 matches the already-current snapshot, this leaves
+/// `current`/`previous` untouched even when the parsed header version
+/// differs from what is recorded - see [`ManagedDatState::sha256`]'s own
+/// doc comment on why the digest, not the header, is authoritative for
+/// whether bytes changed, and the module doc comment on why an upstream
+/// header/version change is never treated as forcing a new snapshot.
+fn update_redump_bios(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    transport: &dyn ManagedDatTransport,
+) -> Result<ManagedDatUpdateOutcome> {
+    let system = descriptor
+        .redump_bios_system()
+        .expect("update_redump_bios is only ever called with a Redump descriptor");
+    let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
+    let source_dir = match create_managed_source_dir(&options.managed_root, descriptor.source_id())
+    {
+        Ok(()) => managed_source_dir(&options.managed_root, descriptor.source_id())?,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let staging = match create_private_staging_file(&options.managed_root, &source_dir) {
+        Ok(file) => file,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let _cleanup = ManagedDatStagingCleanup(staging.path.clone());
+    let fetched = match fetch_and_validate_redump_bios(
+        descriptor,
+        system,
+        existing.as_ref(),
+        &staging.path,
+        transport,
+    ) {
+        Ok(fetched) => fetched,
+        Err(outcome) => return Ok(outcome),
+    };
+    let Some(fetched) = fetched else {
+        let revision = ResolvedRevisionMeta {
+            label: existing
+                .as_ref()
+                .and_then(|state| state.upstream_revision.clone())
+                .unwrap_or_default(),
+            etag: None,
+            last_modified: None,
+            not_modified: true,
+        };
+        return mark_up_to_date(existing, options, revision);
+    };
+    let revision = ResolvedRevisionMeta {
+        label: fetched
+            .upstream_version
+            .clone()
+            .unwrap_or_else(|| fetched.sha256[..12].to_string()),
+        etag: fetched.response.etag,
+        last_modified: fetched.response.last_modified,
+        not_modified: false,
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|state| state.sha256 == fetched.sha256)
+    {
+        // Bytes are byte-for-byte identical to the current snapshot - never
+        // churn a new object/snapshot just because the upstream header
+        // version text changed.
+        return mark_up_to_date(existing, options, revision);
+    }
+    publish_validated_snapshot(
+        descriptor,
+        options,
+        existing,
+        revision,
+        fetched.sha256,
+        staging.path,
+        format!(
+            "validated Redump {} BIOS DAT with {} usable record(s)",
+            system.firmware_system().redump_dataset_label(),
+            fetched.entry_count
+        ),
+    )
 }
 
 fn load_optional_managed_dat_state(
@@ -1438,7 +1995,11 @@ fn validate_managed_dat_http_url(value: &str) -> std::result::Result<(), Managed
             error.to_string(),
         )
     })?;
-    if url.scheme() != "https" || !matches!(url.host_str(), Some(GITHUB_API_HOST | GITHUB_RAW_HOST))
+    if url.scheme() != "https"
+        || !matches!(
+            url.host_str(),
+            Some(GITHUB_API_HOST | GITHUB_RAW_HOST | REDUMP_HOST)
+        )
     {
         return Err(ManagedDatTransportError::new(
             ManagedDatTransportFailureKind::InvalidResponse,
@@ -1661,6 +2222,469 @@ mod tests {
         load_managed_dat_state(&root, &descriptor()).unwrap()
     }
 
+    // -----------------------------------------------------------------
+    // Redump BIOS provider
+    // -----------------------------------------------------------------
+
+    fn redump_descriptor(system: RedumpBiosSystem) -> ManagedDatSourceDescriptor {
+        ManagedDatSourceDescriptor::redump_bios(system)
+            .unwrap()
+            .with_update_policy(ManagedDatUpdatePolicy::Manual)
+    }
+
+    fn redump_header(system: RedumpBiosSystem) -> &'static str {
+        match system {
+            RedumpBiosSystem::PlayStation => "Sony - PlayStation - BIOS Images",
+            RedumpBiosSystem::PlayStation2 => "Sony - PlayStation 2 - BIOS Images",
+            RedumpBiosSystem::Xbox => "Microsoft - Xbox - BIOS Images",
+        }
+    }
+
+    /// A synthetic, self-hashing Redump BIOS DAT body - never a real Redump
+    /// hash or a real BIOS dump.
+    fn redump_bios_dat(system: RedumpBiosSystem, game: &str, bytes: &[u8]) -> Vec<u8> {
+        let crc32 = crate::identity_source::hashing::Crc32::of(bytes);
+        let md5 = {
+            use md5::{Digest as _, Md5};
+            let digest = Md5::digest(bytes);
+            digest_hex(digest)
+        };
+        let sha1 = {
+            use sha1::{Digest as _, Sha1};
+            let digest = Sha1::digest(bytes);
+            digest_hex(digest)
+        };
+        let header = redump_header(system);
+        format!(
+            r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>{header}</name>
+        <description>{header}</description>
+        <version>20240115</version>
+        <author>Redump.org</author>
+    </header>
+    <game name="{game}">
+        <description>{game}</description>
+        <rom name="bios.bin" size="{}" crc="{crc32}" md5="{md5}" sha1="{sha1}"/>
+    </game>
+</datafile>"#,
+            bytes.len()
+        )
+        .into_bytes()
+    }
+
+    fn redump_bios_bytes(seed: &str) -> Vec<u8> {
+        format!("synthetic managed redump bios bytes - {seed}").into_bytes()
+    }
+
+    /// A single-request Redump update: unlike MAME's two-phase resolve/
+    /// download, Redump's fixed URL serves the whole DAT in one GET.
+    fn install_redump(
+        system: RedumpBiosSystem,
+        root: PathBuf,
+        body: Vec<u8>,
+    ) -> ManagedDatUpdateOutcome {
+        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(body))]);
+        update_redump_dat(system, root, &transport)
+    }
+
+    fn update_redump_dat(
+        system: RedumpBiosSystem,
+        root: PathBuf,
+        transport: &FakeTransport,
+    ) -> ManagedDatUpdateOutcome {
+        update_managed_dat(&redump_descriptor(system), &update_options(root), transport).unwrap()
+    }
+
+    #[test]
+    fn typed_descriptor_builds_the_correct_internal_provider_for_all_three_systems() {
+        for (system, slug, label) in [
+            (
+                RedumpBiosSystem::PlayStation,
+                "playstation",
+                "Sony - PlayStation - BIOS Images",
+            ),
+            (
+                RedumpBiosSystem::PlayStation2,
+                "playstation2",
+                "Sony - PlayStation 2 - BIOS Images",
+            ),
+            (
+                RedumpBiosSystem::Xbox,
+                "xbox",
+                "Microsoft - Xbox - BIOS Images",
+            ),
+        ] {
+            let descriptor = ManagedDatSourceDescriptor::redump_bios(system).unwrap();
+            assert_eq!(
+                descriptor.source_id().provider,
+                ManagedDatProvider::RedumpBios
+            );
+            assert_eq!(descriptor.source_id().source_key, slug);
+            assert_eq!(descriptor.expected_ecosystem(), DatEcosystem::Redump);
+            assert_eq!(descriptor.redump_bios_system(), Some(system));
+            assert_eq!(
+                descriptor.source_id().to_string(),
+                format!("redump-bios/{slug}")
+            );
+            assert_eq!(system.firmware_system().redump_dataset_label(), label);
+            descriptor.validate().unwrap();
+        }
+    }
+
+    /// Compile-time proof: the only way to build a Redump BIOS descriptor
+    /// is through this closed enum - there is no overload or parameter
+    /// that accepts a URL, hostname, or free-text dataset name.
+    #[test]
+    fn redump_bios_constructor_takes_only_the_closed_system_enum() {
+        fn assert_signature(_: fn(RedumpBiosSystem) -> Result<ManagedDatSourceDescriptor>) {}
+        assert_signature(ManagedDatSourceDescriptor::redump_bios);
+    }
+
+    #[test]
+    fn arbitrary_redump_source_key_fails_validation() {
+        let bogus = ManagedDatSourceId {
+            provider: ManagedDatProvider::RedumpBios,
+            source_key: "gamecube-bios".to_string(),
+        };
+        assert!(bogus.validate().is_err());
+    }
+
+    #[test]
+    fn manual_and_disabled_policy_persist_for_all_three_systems() {
+        for system in [
+            RedumpBiosSystem::PlayStation,
+            RedumpBiosSystem::PlayStation2,
+            RedumpBiosSystem::Xbox,
+        ] {
+            for policy in [
+                ManagedDatUpdatePolicy::Manual,
+                ManagedDatUpdatePolicy::Disabled,
+            ] {
+                let descriptor = ManagedDatSourceDescriptor::redump_bios(system)
+                    .unwrap()
+                    .with_update_policy(policy);
+                assert_eq!(descriptor.update_policy(), policy);
+                descriptor.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn valid_synthetic_dat_is_accepted_for_each_system() {
+        for system in [
+            RedumpBiosSystem::PlayStation,
+            RedumpBiosSystem::PlayStation2,
+            RedumpBiosSystem::Xbox,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+            let body = redump_bios_dat(system, "BIOS", &redump_bios_bytes("valid"));
+            let outcome = install_redump(system, root, body);
+            assert!(
+                matches!(outcome, ManagedDatUpdateOutcome::Updated { .. }),
+                "{system:?}: expected Updated, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ps1_descriptor_rejects_a_ps2_bios_dat_at_update_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let body = redump_bios_dat(
+            RedumpBiosSystem::PlayStation2,
+            "PS2 BIOS",
+            &redump_bios_bytes("cross-system"),
+        );
+        let outcome = install_redump(RedumpBiosSystem::PlayStation, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn arbitrary_redump_game_dat_is_rejected_at_update_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let body = br#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Sony - PlayStation 2</name>
+        <description>Sony - PlayStation 2 Datfile (full game discs)</description>
+        <author>Redump.org</author>
+    </header>
+    <game name="Some Game">
+        <rom name="game.bin" size="1" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/>
+    </game>
+</datafile>"#
+            .to_vec();
+        let outcome = install_redump(RedumpBiosSystem::PlayStation2, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_hashes_are_rejected_as_authoritative_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let header = redump_header(RedumpBiosSystem::PlayStation2);
+        let body = format!(
+            r#"<?xml version="1.0"?>
+<datafile>
+    <header><name>{header}</name><description>{header}</description><author>Redump.org</author></header>
+    <game name="incomplete"><rom name="bios.bin" size="4" crc="aabbccdd"/></game>
+</datafile>"#
+        )
+        .into_bytes();
+        let outcome = install_redump(RedumpBiosSystem::PlayStation2, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::EmptyCatalogue,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_dataset_is_rejected_at_update_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let header = redump_header(RedumpBiosSystem::Xbox);
+        let body = format!(
+            r#"<?xml version="1.0"?>
+<datafile><header><name>{header}</name><description>{header}</description><author>Redump.org</author></header></datafile>"#
+        )
+        .into_bytes();
+        let outcome = install_redump(RedumpBiosSystem::Xbox, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::EmptyCatalogue,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_dat_is_rejected_at_update_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        // A `<?xml`/`<datafile` prefix commits the sniffer to the Logiqx
+        // path (plain unrecognised text is instead accepted as an empty
+        // ClrMamePro catalogue - a different, already-covered rejection
+        // reason, and the streaming parser tolerates a body simply cut
+        // short). A mismatched closing tag is what genuinely trips the
+        // streaming XML parser's own `MalformedXml` error path.
+        let outcome = install_redump(
+            RedumpBiosSystem::PlayStation,
+            root,
+            b"<?xml version=\"1.0\"?><datafile><header></wrong></datafile>".to_vec(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                ManagedDatUpdateOutcome::Failed {
+                    kind: ManagedDatUpdateFailureKind::Parser,
+                    ..
+                }
+            ),
+            "expected Parser failure, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn redump_first_install_up_to_date_changed_bytes_and_no_churn_on_header_only_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpBiosSystem::PlayStation2;
+        let descriptor = redump_descriptor(system);
+        let bytes_v1 = redump_bios_bytes("v1");
+
+        // 20: first install.
+        let body_v1 = redump_bios_dat(system, "PS2 BIOS v1", &bytes_v1);
+        let outcome = install_redump(system, root.clone(), body_v1.clone());
+        let (first_sha256, first_upstream) = match outcome {
+            ManagedDatUpdateOutcome::Updated {
+                sha256,
+                upstream_revision,
+            } => (sha256, upstream_revision),
+            other => panic!("expected Updated, got {other:?}"),
+        };
+        let state_after_install = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state_after_install.current_snapshot.sha256, first_sha256);
+        assert!(state_after_install.previous_snapshot.is_none());
+        assert_eq!(state_after_install.parsed_ecosystem, DatEcosystem::Redump);
+
+        // 21: identical bytes -> UpToDate, no state churn.
+        let outcome = install_redump(system, root.clone(), body_v1.clone());
+        assert!(matches!(outcome, ManagedDatUpdateOutcome::UpToDate { .. }));
+        let state_unchanged = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state_unchanged.current_snapshot.sha256, first_sha256);
+        assert!(state_unchanged.previous_snapshot.is_none());
+
+        // 24: the recorded state's `upstream_revision` label is mutated to
+        // look like a different header version was seen last time (as if a
+        // prior check had observed a header/version change), but the
+        // actual downloaded bytes handed to this update are byte-for-byte
+        // identical to what is already current. The content digest, not
+        // the stale label, must still decide - this must not churn a new
+        // object/snapshot, proving the digest is genuinely authoritative
+        // rather than the header text.
+        let mut mutated_label_state = load_managed_dat_state(&root, &descriptor).unwrap();
+        mutated_label_state.upstream_revision = Some("99999999".to_string());
+        save_managed_dat_state(&root, &mutated_label_state).unwrap();
+        let outcome = install_redump(system, root.clone(), body_v1.clone());
+        assert!(
+            matches!(outcome, ManagedDatUpdateOutcome::UpToDate { .. }),
+            "identical downloaded bytes must never churn a snapshot, regardless of the \
+             previously recorded header/version label"
+        );
+        let state_still_unchanged = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state_still_unchanged.current_snapshot.sha256, first_sha256);
+        assert!(state_still_unchanged.previous_snapshot.is_none());
+
+        // 22 + 23: genuinely different bytes -> promotes current, retains
+        // the old current as previous.
+        let bytes_v2 = redump_bios_bytes("v2 - genuinely different content");
+        let body_v2 = redump_bios_dat(system, "PS2 BIOS v2", &bytes_v2);
+        let outcome = install_redump(system, root.clone(), body_v2);
+        let second_sha256 = match outcome {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+        assert_ne!(second_sha256, first_sha256);
+        let state_after_v2 = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state_after_v2.current_snapshot.sha256, second_sha256);
+        assert_eq!(
+            state_after_v2.previous_snapshot.as_ref().unwrap().sha256,
+            first_sha256
+        );
+        assert_eq!(
+            first_upstream, "20240115",
+            "the recorded upstream revision is the DAT's own parsed header version"
+        );
+    }
+
+    #[test]
+    fn redump_403_404_429_and_offline_are_structured_and_do_not_create_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpBiosSystem::Xbox;
+        let descriptor = redump_descriptor(system);
+
+        for (reply, expected) in [
+            (
+                FakeReply::status(403),
+                ManagedDatUpdateFailureKind::Forbidden,
+            ),
+            (
+                FakeReply::status(404),
+                ManagedDatUpdateFailureKind::NotFound,
+            ),
+        ] {
+            let transport = FakeTransport::new(vec![Ok(reply)]);
+            let outcome =
+                update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
+            assert!(matches!(
+                outcome,
+                ManagedDatUpdateOutcome::Failed { kind, .. } if kind == expected
+            ));
+            assert!(
+                load_optional_managed_dat_state(&root, &descriptor)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut rate_limited = FakeReply::status(429);
+        rate_limited.retry_after_seconds = Some(120);
+        let transport = FakeTransport::new(vec![Ok(rate_limited)]);
+        let outcome =
+            update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::RateLimited {
+                retry_after_seconds: Some(120)
+            }
+        ));
+
+        // Offline: zero transport calls, regardless of provider.
+        let transport = FakeTransport::new(Vec::new());
+        let mut options = update_options(root.clone());
+        options.offline = true;
+        let outcome = update_managed_dat(&descriptor, &options, &transport).unwrap();
+        assert!(matches!(outcome, ManagedDatUpdateOutcome::Offline));
+        assert!(transport.calls.borrow().is_empty());
+        assert!(
+            load_optional_managed_dat_state(&root, &descriptor)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn redump_validation_failure_preserves_the_existing_current_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpBiosSystem::PlayStation;
+        let descriptor = redump_descriptor(system);
+        let good_bytes = redump_bios_bytes("known-good");
+        let good_body = redump_bios_dat(system, "PS1 BIOS", &good_bytes);
+        let outcome = install_redump(system, root.clone(), good_body);
+        let good_sha256 = match outcome {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        // A wrong-dataset DAT must never replace the known-good current
+        // snapshot, even though it is bytewise well-formed XML.
+        let bad_body = redump_bios_dat(RedumpBiosSystem::Xbox, "Xbox BIOS", b"unrelated bytes");
+        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(bad_body))]);
+        let outcome =
+            update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+                ..
+            }
+        ));
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state.current_snapshot.sha256, good_sha256);
+    }
+
+    #[test]
+    fn user_local_dat_source_entry_cannot_be_passed_to_the_updater() {
+        // `check_managed_dat_update`/`update_managed_dat` accept only a
+        // `&ManagedDatSourceDescriptor` - there is no overload or code path
+        // that accepts a `DatSourceEntry`/local path and treats it as
+        // managed-updater authority. Compile-time proof, not a runtime
+        // check: this would fail to compile if such a code path existed
+        // with a different signature shape.
+        fn assert_signature(
+            _: fn(
+                &ManagedDatSourceDescriptor,
+                &ManagedDatUpdateOptions,
+                &dyn ManagedDatTransport,
+            ) -> Result<ManagedDatUpdateOutcome>,
+        ) {
+        }
+        assert_signature(check_managed_dat_update);
+        assert_signature(update_managed_dat);
+    }
+
     #[test]
     fn old_toml_entries_are_user_local() {
         let config: crate::dat::sources::DatSourcesConfig = toml::from_str(
@@ -1717,10 +2741,10 @@ kind = "file"
             descriptor.source_id().to_string(),
             "mame-software-list/gamecom"
         );
-        assert_eq!(descriptor.repository(), MAME_REPOSITORY);
+        assert_eq!(descriptor.repository(), Some(MAME_REPOSITORY));
         assert_eq!(
             descriptor.repository_relative_path(),
-            Path::new("hash/gamecom.xml")
+            Some(Path::new("hash/gamecom.xml"))
         );
         assert_eq!(
             descriptor.expected_ecosystem(),

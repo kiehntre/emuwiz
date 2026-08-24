@@ -20,21 +20,52 @@
 //! # Generic shape, narrow implementation
 //!
 //! [`FirmwareIdentityRecord`]/[`FirmwareSystem`] are deliberately shaped so
-//! a later PS1/Saturn/Dreamcast/Xbox firmware verifier could reuse the same
-//! record type. Only [`ps2_bios_evidence_from_dat`] exists today - no
-//! generic "any system" extraction framework, per this stage's own scope.
+//! a later Saturn/Dreamcast firmware verifier could reuse the same record
+//! type. [`redump_bios_evidence_from_dat`] extracts evidence for any of the
+//! three systems Redump publishes a dedicated BIOS DAT for
+//! ([`FirmwareSystem::PlayStation`], [`FirmwareSystem::PlayStation2`],
+//! [`FirmwareSystem::Xbox`]); [`ps2_bios_evidence_from_dat`] is kept as a
+//! thin, unchanged PS2-only wrapper so existing callers (PCSX2 BIOS
+//! verification) never need to change. No generic "any system" extraction
+//! framework beyond this exists - per this stage's own scope, only
+//! *evidence extraction* for PS1/Xbox is implemented; no emulator
+//! consumes it yet (see [`FirmwareSystem::Xbox`]'s own doc comment for the
+//! Xbox-specific caveat).
 
-use super::model::{DatEcosystem, DatGameEntry, ParsedDat};
+use super::model::{DatEcosystem, DatGameEntry, DatSource, ParsedDat};
 
-/// A system whose firmware/BIOS this record describes. Only [`PlayStation2`]
-/// is produced anywhere in this codebase today; the enum exists so a later
-/// PS1/Saturn/Dreamcast/Xbox firmware verifier can add its own variant
-/// without reshaping [`FirmwareIdentityRecord`].
+/// A system whose firmware/BIOS this record describes.
 ///
-/// [`PlayStation2`]: FirmwareSystem::PlayStation2
+/// [`Xbox`] deliberately names only the flash/kernel BIOS component: Redump
+/// publishes a dedicated "Microsoft - Xbox - BIOS Images" DAT, but that
+/// dataset covers the Xbox BIOS/flash image only. It says nothing about,
+/// and must never be read as verifying, the MCPX boot ROM or EEPROM -
+/// xemu's other two firmware components - which Redump does not publish
+/// hashes for at all. A caller matching [`FirmwareSystem::Xbox`] evidence
+/// must treat a match as "the BIOS/flash component is verified", never as
+/// "xemu firmware is verified".
+///
+/// [`Xbox`]: FirmwareSystem::Xbox
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FirmwareSystem {
+    PlayStation,
     PlayStation2,
+    Xbox,
+}
+
+impl FirmwareSystem {
+    /// The Redump BIOS dataset header text this system's DAT is expected to
+    /// identify itself with, e.g. `"Sony - PlayStation - BIOS Images"` -
+    /// used only for error messages and doc purposes; the actual match in
+    /// [`header_identifies_redump_bios_dataset`] is a tolerant substring
+    /// check, not an exact-string comparison.
+    pub fn redump_dataset_label(self) -> &'static str {
+        match self {
+            Self::PlayStation => "Sony - PlayStation - BIOS Images",
+            Self::PlayStation2 => "Sony - PlayStation 2 - BIOS Images",
+            Self::Xbox => "Microsoft - Xbox - BIOS Images",
+        }
+    }
 }
 
 /// One authoritative firmware/BIOS dump record, as published by a DAT
@@ -64,8 +95,8 @@ pub struct FirmwareIdentityRecord {
     pub dat_version: Option<String>,
 }
 
-/// Why a [`ParsedDat`] could not be treated as authoritative PS2 BIOS
-/// evidence.
+/// Why a [`ParsedDat`] could not be treated as authoritative Redump BIOS
+/// evidence for a given [`FirmwareSystem`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirmwareEvidenceError {
     /// The DAT's own detected ecosystem is not [`DatEcosystem::Redump`] -
@@ -73,9 +104,10 @@ pub enum FirmwareEvidenceError {
     /// hashes is never treated as authoritative.
     NotRedump,
     /// The DAT is a genuine Redump catalogue, but its header text does not
-    /// identify it as the PS2 BIOS Images dataset specifically (e.g. it is
-    /// Redump's PS2 *games* DAT, or a different system's BIOS DAT).
-    NotPs2BiosDataset,
+    /// identify it as the requested system's BIOS Images dataset
+    /// specifically (e.g. it is that system's *games* DAT, or a different
+    /// system's BIOS DAT).
+    NotBiosDataset,
     /// The DAT matched every check above, but contained no game entry with
     /// a complete, usable ROM record (size plus all three of CRC32/MD5/
     /// SHA-1) - so there is nothing to verify against.
@@ -87,11 +119,11 @@ impl std::fmt::Display for FirmwareEvidenceError {
         match self {
             Self::NotRedump => formatter.write_str(
                 "the supplied DAT's detected ecosystem is not Redump, so it cannot authorize \
-                 PS2 BIOS verification",
+                 firmware/BIOS verification",
             ),
-            Self::NotPs2BiosDataset => formatter.write_str(
-                "the supplied Redump DAT does not identify itself as the PlayStation 2 BIOS \
-                 Images dataset",
+            Self::NotBiosDataset => formatter.write_str(
+                "the supplied Redump DAT does not identify itself as the expected system's \
+                 BIOS Images dataset",
             ),
             Self::NoUsableEntries => formatter.write_str(
                 "the supplied DAT contained no game entry with a complete size/CRC32/MD5/SHA-1 \
@@ -104,15 +136,22 @@ impl std::fmt::Display for FirmwareEvidenceError {
 impl std::error::Error for FirmwareEvidenceError {}
 
 /// Whether `parsed`'s header text identifies it as Redump's own
-/// "Sony - PlayStation 2 - BIOS Images" dataset - checked across every
-/// header field this crate's own DAT model preserves, exactly the way
+/// `<system>` BIOS Images dataset - checked across every header field this
+/// crate's own DAT model preserves, exactly the way
 /// [`crate::dat::parsers::logiqx`]'s own ecosystem detection already
 /// checks name/author/description/version rather than just one field.
-/// Requires both "playstation 2" and "bios" to appear (case-insensitively,
-/// each anywhere across those fields) so Redump's separate PS2 *games* DAT
-/// - which mentions "playstation 2" but never "bios" - is never mistaken
-/// for this dataset.
-fn header_identifies_ps2_bios_dataset(source: &super::model::DatSource) -> bool {
+///
+/// Each system requires its own distinguishing substring plus "bios"
+/// (case-insensitively, anywhere across those fields):
+/// - [`FirmwareSystem::PlayStation2`] requires "playstation 2"/"playstation2"/"ps2".
+/// - [`FirmwareSystem::PlayStation`] requires "playstation" but *not* also
+///   "playstation 2"/"playstation2"/"ps2" - Redump's PS2 BIOS DAT header
+///   text also contains the substring "playstation", so this exclusion is
+///   what keeps a PS2 BIOS DAT from being misidentified as PS1 evidence.
+/// - [`FirmwareSystem::Xbox`] requires "xbox" but *not* "360" - there is no
+///   Redump Xbox 360 BIOS dataset, but this guards against ever accepting
+///   one as if it were the original Xbox's.
+pub fn header_identifies_redump_bios_dataset(source: &DatSource, system: FirmwareSystem) -> bool {
     let fields = [
         &source.name,
         &source.description,
@@ -125,10 +164,17 @@ fn header_identifies_ps2_bios_dataset(source: &super::model::DatSource) -> bool 
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
+    if !joined.contains("bios") {
+        return false;
+    }
     let mentions_ps2 = joined.contains("playstation 2")
         || joined.contains("playstation2")
         || joined.contains("ps2");
-    mentions_ps2 && joined.contains("bios")
+    match system {
+        FirmwareSystem::PlayStation2 => mentions_ps2,
+        FirmwareSystem::PlayStation => joined.contains("playstation") && !mentions_ps2,
+        FirmwareSystem::Xbox => joined.contains("xbox") && !joined.contains("360"),
+    }
 }
 
 /// A game entry's ROM records, kept only when every field this module
@@ -138,6 +184,7 @@ fn header_identifies_ps2_bios_dataset(source: &super::model::DatSource) -> bool 
 fn firmware_records_from_game(
     game: &DatGameEntry,
     provider: DatEcosystem,
+    system: FirmwareSystem,
     dat_version: Option<&str>,
 ) -> Vec<FirmwareIdentityRecord> {
     game.roms
@@ -148,7 +195,7 @@ fn firmware_records_from_game(
             let md5 = rom.md5.clone()?;
             let sha1 = rom.sha1.clone()?;
             Some(FirmwareIdentityRecord {
-                system: FirmwareSystem::PlayStation2,
+                system,
                 provider,
                 name: game.name.clone(),
                 description: game.description.clone(),
@@ -162,28 +209,31 @@ fn firmware_records_from_game(
         .collect()
 }
 
-/// Extracts authoritative PS2 BIOS firmware evidence from an already-parsed
-/// DAT catalogue.
+/// Extracts authoritative Redump BIOS firmware evidence for `system` from an
+/// already-parsed DAT catalogue.
 ///
 /// Requires, in order:
 /// 1. [`ParsedDat::source`]'s detected ecosystem is [`DatEcosystem::Redump`]
 ///    (never an arbitrary DAT that merely contains matching-looking
 ///    hashes).
-/// 2. The header text identifies the PS2 BIOS Images dataset specifically
-///    - see [`header_identifies_ps2_bios_dataset`].
+/// 2. The header text identifies `system`'s BIOS Images dataset
+///    specifically - see [`header_identifies_redump_bios_dataset`].
 /// 3. At least one game entry contributes a complete (size + CRC32 + MD5 +
 ///    SHA-1) ROM record.
 ///
 /// Never opens, hashes, or reads any BIOS file itself - this is DAT-text
-/// interpretation only.
-pub fn ps2_bios_evidence_from_dat(
+/// interpretation only. For [`FirmwareSystem::Xbox`], a record produced
+/// here describes only the BIOS/flash component - see that variant's own
+/// doc comment for why it must never be read as verifying MCPX/EEPROM.
+pub fn redump_bios_evidence_from_dat(
     parsed: &ParsedDat,
+    system: FirmwareSystem,
 ) -> Result<Vec<FirmwareIdentityRecord>, FirmwareEvidenceError> {
     if parsed.source.ecosystem != DatEcosystem::Redump {
         return Err(FirmwareEvidenceError::NotRedump);
     }
-    if !header_identifies_ps2_bios_dataset(&parsed.source) {
-        return Err(FirmwareEvidenceError::NotPs2BiosDataset);
+    if !header_identifies_redump_bios_dataset(&parsed.source, system) {
+        return Err(FirmwareEvidenceError::NotBiosDataset);
     }
     let records: Vec<FirmwareIdentityRecord> = parsed
         .games
@@ -192,6 +242,7 @@ pub fn ps2_bios_evidence_from_dat(
             firmware_records_from_game(
                 game,
                 parsed.source.ecosystem,
+                system,
                 parsed.source.version.as_deref(),
             )
         })
@@ -200,6 +251,17 @@ pub fn ps2_bios_evidence_from_dat(
         return Err(FirmwareEvidenceError::NoUsableEntries);
     }
     Ok(records)
+}
+
+/// Extracts authoritative PS2 BIOS firmware evidence from an already-parsed
+/// DAT catalogue. A thin, behavior-preserving wrapper over
+/// [`redump_bios_evidence_from_dat`] fixed to [`FirmwareSystem::PlayStation2`]
+/// - kept so existing callers (PCSX2 BIOS verification) never need to
+/// change.
+pub fn ps2_bios_evidence_from_dat(
+    parsed: &ParsedDat,
+) -> Result<Vec<FirmwareIdentityRecord>, FirmwareEvidenceError> {
+    redump_bios_evidence_from_dat(parsed, FirmwareSystem::PlayStation2)
 }
 
 #[cfg(test)]
