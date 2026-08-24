@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1689,6 +1689,10 @@ pub struct DolphinLocalDiscoveryRoots {
     pub explicit_executables: Vec<PathBuf>,
     pub known_version_outputs: BTreeMap<PathBuf, String>,
     pub appimage_directory: Option<PathBuf>,
+    /// Present whenever `DOLPHIN_EMU_USERPATH` is set in the environment.
+    /// Any value overrides Dolphin's default directory resolution, so its
+    /// mere presence - not its content - is what launch-binding cares about.
+    pub dolphin_emu_userpath_override: Option<PathBuf>,
 }
 
 impl DolphinLocalDiscoveryRoots {
@@ -1714,6 +1718,7 @@ impl DolphinLocalDiscoveryRoots {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
+            dolphin_emu_userpath_override: env::var_os("DOLPHIN_EMU_USERPATH").map(PathBuf::from),
         })
     }
 }
@@ -2081,6 +2086,323 @@ fn discover_dolphin_local_executables(
             path,
         })
         .collect()
+}
+
+// --- Native launch binding -------------------------------------------------
+//
+// A profile's `executable_candidates` alone do not authorize a launch: the
+// list is populated once for every discovered profile regardless of which
+// installation it actually belongs to, and `data_root` is never a valid
+// Dolphin `-u` argument on its own (Dolphin derives `Config/` beneath
+// whatever `-u` receives, which would silently relocate a split XDG
+// configuration root). This section proves, freshly and read-only, exactly
+// which executable belongs to a profile and whether the profile's roots
+// correspond to Dolphin's *default* directory resolution (no `-u`) or to a
+// single genuine Dolphin user root (`-u <root>`). It never launches Dolphin,
+// writes configuration, or creates directories.
+
+/// How the eventual launch command should select Dolphin's user directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinUserDirectoryMode {
+    /// No `-u` argument; Dolphin resolves its own default directories.
+    DefaultNative,
+    /// `-u <root>`; Dolphin derives `Config/`, `GameSettings/`, `GC/`,
+    /// `Wii/`, etc. beneath this single verified root.
+    ExplicitRoot(PathBuf),
+}
+
+/// A freshly proven executable/profile pairing, safe to use as the first two
+/// (or three) tokens of a Dolphin native launch command. Callers must treat
+/// this as re-derivable state, not a cache: call
+/// [`resolve_dolphin_native_launch_binding`] again at the moment of launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinNativeLaunchBinding {
+    pub executable: PathBuf,
+    pub user_directory_mode: DolphinUserDirectoryMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DolphinLaunchBlockerKind {
+    /// Flatpak, or a portable/AppImage profile that cannot be proven
+    /// native-equivalent by this adapter.
+    UnsupportedInstallationType,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// No candidate executable exists on disk.
+    ExecutableMissing,
+    /// A candidate executable exists but is a symlink or not a regular file.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+    /// The profile's configuration/data roots (or Dolphin.ini) no longer
+    /// match what discovery originally observed.
+    ProfileRootMismatch,
+    /// The profile's roots do not match Dolphin's current default XDG
+    /// resolution, so `DefaultNative` cannot be proven.
+    DefaultResolutionMismatch,
+    /// The candidate explicit root is not an absolute, existing,
+    /// non-symlinked directory with `Config/Dolphin.ini` beneath it.
+    ExplicitRootInvalid,
+    /// An environment variable (`DOLPHIN_EMU_USERPATH`) would override
+    /// Dolphin's default directory resolution.
+    EnvironmentOverridePresent,
+    /// A `portable.txt` marker or legacy `~/.dolphin-emu` directory would
+    /// change which directories Dolphin actually resolves to.
+    PortableOrLegacyLayoutConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinLaunchBlocker {
+    pub kind: DolphinLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(
+    kind: DolphinLaunchBlockerKind,
+    detail: impl Into<String>,
+) -> DolphinLaunchBlocker {
+    DolphinLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` against `roots` and either proves a launch
+/// binding or returns a structured blocker. Pure and read-only: it inspects
+/// filesystem metadata and the supplied environment-derived roots only, and
+/// never spawns a process, writes Dolphin configuration, or creates
+/// directories. Safe - and intended - to call again at future launch time.
+pub fn resolve_dolphin_native_launch_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "profile is not eligible",
+        ));
+    }
+    match profile.installation_type {
+        DolphinLocalInstallationType::Native => resolve_default_native_binding(profile, roots),
+        DolphinLocalInstallationType::Explicit => resolve_explicit_root_binding(profile),
+        DolphinLocalInstallationType::FlatpakUser => Err(launch_blocker(
+            DolphinLaunchBlockerKind::UnsupportedInstallationType,
+            "Flatpak Dolphin installations are not supported by this native launch binding",
+        )),
+        DolphinLocalInstallationType::Portable => Err(launch_blocker(
+            DolphinLaunchBlockerKind::UnsupportedInstallationType,
+            "portable/AppImage Dolphin profiles cannot be proven native-equivalent; failing closed",
+        )),
+    }
+}
+
+fn resolve_default_native_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    let expected_config = roots.xdg_config_home.join("dolphin-emu");
+    let expected_data = roots.xdg_data_home.join("dolphin-emu");
+    if profile.configuration_root != expected_config || profile.data_root != expected_data {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::DefaultResolutionMismatch,
+            format!(
+                "profile roots {} / {} do not match the current default XDG resolution {} / {}",
+                profile.configuration_root.display(),
+                profile.data_root.display(),
+                expected_config.display(),
+                expected_data.display(),
+            ),
+        ));
+    }
+    if let Some(userpath) = &roots.dolphin_emu_userpath_override {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::EnvironmentOverridePresent,
+            format!(
+                "DOLPHIN_EMU_USERPATH is set to {} and would override the default directory resolution",
+                userpath.display()
+            ),
+        ));
+    }
+    let legacy_root = roots.home.join(".dolphin-emu");
+    if is_real_directory_local(&legacy_root) {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict,
+            format!(
+                "legacy Dolphin user directory {} exists and takes precedence over the XDG default",
+                legacy_root.display()
+            ),
+        ));
+    }
+    if !is_real_directory_local(&profile.configuration_root)
+        || !is_real_directory_local(&profile.data_root)
+        || !is_regular_file_local(&profile.dolphin_ini_path)
+    {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "configuration root, data root, or Dolphin.ini no longer match the discovered profile",
+        ));
+    }
+    let executable = resolve_native_executable(profile)?;
+    if let Some(blocker) = portable_txt_conflict(&executable) {
+        return Err(blocker);
+    }
+    Ok(DolphinNativeLaunchBinding {
+        executable,
+        user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
+    })
+}
+
+fn resolve_explicit_root_binding(
+    profile: &DolphinLocalProfile,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    if profile.configuration_root != profile.data_root {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            "configuration and data roots differ; a single Dolphin user root could not be proven",
+        ));
+    }
+    let root = profile.configuration_root.clone();
+    if !root.is_absolute() || root.parent().is_none() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            "root is not an absolute, non-filesystem-root path",
+        ));
+    }
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(launch_blocker(
+                DolphinLaunchBlockerKind::ExplicitRootInvalid,
+                format!("{} is a symlink", root.display()),
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(launch_blocker(
+                DolphinLaunchBlockerKind::ExplicitRootInvalid,
+                format!("{} is not a directory", root.display()),
+            ));
+        }
+        Err(_) => {
+            return Err(launch_blocker(
+                DolphinLaunchBlockerKind::ExplicitRootInvalid,
+                format!("{} does not exist", root.display()),
+            ));
+        }
+    }
+    // Never infer a single-root layout from `data_root`/`GameSettings`
+    // evidence alone: a genuine `-u <root>` layout must show Dolphin's own
+    // `Config/Dolphin.ini` beneath the candidate root.
+    let config_dir = root.join("Config");
+    if !is_real_directory_local(&config_dir) {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            format!(
+                "{} does not exist; a single Dolphin user root layout could not be proven",
+                config_dir.display()
+            ),
+        ));
+    }
+    if !is_regular_file_local(&config_dir.join("Dolphin.ini")) {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExplicitRootInvalid,
+            format!(
+                "{} was not found as a regular file",
+                config_dir.join("Dolphin.ini").display()
+            ),
+        ));
+    }
+    let executable = resolve_native_executable(profile)?;
+    Ok(DolphinNativeLaunchBinding {
+        executable,
+        user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(root),
+    })
+}
+
+/// `portable.txt` next to the executable forces Dolphin into portable mode,
+/// which redirects directory resolution away from the profile just proven.
+fn portable_txt_conflict(executable: &Path) -> Option<DolphinLaunchBlocker> {
+    let marker = executable.parent()?.join("portable.txt");
+    is_regular_file_local(&marker).then(|| {
+        launch_blocker(
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                marker.display()
+            ),
+        )
+    })
+}
+
+/// Binds exactly one executable to `profile`, matching candidates only by
+/// the profile's own installation type - `executable_candidates` is shared
+/// across every discovered profile and is not otherwise scoped per-profile.
+/// Never falls back to a hard-coded name: a profile with no matching,
+/// verified-safe candidate is always blocked.
+fn resolve_native_executable(
+    profile: &DolphinLocalProfile,
+) -> Result<PathBuf, DolphinLaunchBlocker> {
+    let matching: Vec<&DolphinExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == profile.installation_type)
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableMissing,
+            "no discovered executable is associated with this profile's installation type",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(valid.into_iter().next().expect("length checked above")),
+        count => Err(launch_blocker(
+            DolphinLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable executables match this profile and none is distinguished as authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_executable(path: &Path) -> Result<(), DolphinLaunchBlocker> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn dolphin_local_game_id(
@@ -3091,6 +3413,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            dolphin_emu_userpath_override: None,
         }
     }
 
@@ -3369,5 +3692,385 @@ mod tests {
         assert_ne!(DolphinDiscFormat::Iso, DolphinDiscFormat::Gcm);
         assert_ne!(DolphinDiscFormat::Wbfs, DolphinDiscFormat::Rvz);
         assert_ne!(DolphinDiscFormat::Wia, DolphinDiscFormat::Chd);
+    }
+
+    // --- Native launch binding ---------------------------------------------
+
+    fn make_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not executed").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn executable(
+        path: PathBuf,
+        installation_type: DolphinLocalInstallationType,
+    ) -> DolphinExecutable {
+        DolphinExecutable {
+            path,
+            installation_type,
+            version: None,
+        }
+    }
+
+    fn native_profile(
+        roots: &DolphinLocalDiscoveryRoots,
+        executable_candidates: Vec<DolphinExecutable>,
+    ) -> DolphinLocalProfile {
+        let config = roots.xdg_config_home.join("dolphin-emu");
+        let data = roots.xdg_data_home.join("dolphin-emu");
+        make_local_profile(&config, &data);
+        DolphinLocalProfile {
+            profile_id: "test-native".into(),
+            installation_type: DolphinLocalInstallationType::Native,
+            configuration_root: config.clone(),
+            data_root: data.clone(),
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            dolphin_ini_path: config.join("Dolphin.ini"),
+            graphics_ini_path: config.join("GFX.ini"),
+            game_settings_path: data.join("GameSettings"),
+            textures_path: data.join("Load/Textures"),
+            memory_cards_path: data.join("GC"),
+            wii_data_path: data.join("Wii"),
+            save_states_path: data.join("StateSaves"),
+        }
+    }
+
+    fn explicit_profile(
+        root: &Path,
+        executable_candidates: Vec<DolphinExecutable>,
+    ) -> DolphinLocalProfile {
+        DolphinLocalProfile {
+            profile_id: "test-explicit".into(),
+            installation_type: DolphinLocalInstallationType::Explicit,
+            configuration_root: root.to_path_buf(),
+            data_root: root.to_path_buf(),
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            dolphin_ini_path: root.join("Dolphin.ini"),
+            graphics_ini_path: root.join("GFX.ini"),
+            game_settings_path: root.join("GameSettings"),
+            textures_path: root.join("Load/Textures"),
+            memory_cards_path: root.join("GC"),
+            wii_data_path: root.join("Wii"),
+            save_states_path: root.join("StateSaves"),
+        }
+    }
+
+    #[test]
+    fn standard_native_xdg_profile_produces_default_native() {
+        let root = fixture("launch-native-default");
+        let roots = local_roots(&root);
+        let dolphin = roots
+            .xdg_data_home
+            .parent()
+            .unwrap()
+            .join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(
+                dolphin.clone(),
+                DolphinLocalInstallationType::Native,
+            )],
+        );
+        let binding = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, dolphin);
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn genuine_single_user_root_produces_explicit_root() {
+        let root = fixture("launch-explicit-root");
+        let profile_root = root.join("portable");
+        fs::create_dir_all(profile_root.join("Config")).unwrap();
+        fs::write(profile_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = explicit_profile(
+            &profile_root,
+            vec![executable(
+                dolphin.clone(),
+                DolphinLocalInstallationType::Explicit,
+            )],
+        );
+        let binding = resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap();
+        assert_eq!(binding.executable, dolphin);
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::ExplicitRoot(profile_root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn data_root_alone_never_becomes_explicit_root() {
+        let root = fixture("launch-data-root-only");
+        let profile_root = root.join("portable");
+        fs::create_dir_all(profile_root.join("GameSettings")).unwrap();
+        // No Config/ beneath the root: only data-shaped evidence exists.
+        let profile = explicit_profile(&profile_root, Vec::new());
+        let blocker =
+            resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExplicitRootInvalid);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_unambiguous_executable_binds() {
+        let root = fixture("launch-single-executable");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(
+                dolphin.clone(),
+                DolphinLocalInstallationType::Native,
+            )],
+        );
+        assert_eq!(resolve_native_executable(&profile).unwrap(), dolphin);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multiple_indistinguishable_executables_are_blocked() {
+        let root = fixture("launch-ambiguous-executable");
+        let roots = local_roots(&root);
+        let first = root.join("bin/dolphin-emu");
+        let second = root.join("alt-bin/dolphin-emu");
+        make_executable(&first);
+        make_executable(&second);
+        let profile = native_profile(
+            &roots,
+            vec![
+                executable(first, DolphinLocalInstallationType::Native),
+                executable(second, DolphinLocalInstallationType::Native),
+            ],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::AmbiguousExecutable);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_executable_is_blocked() {
+        let root = fixture("launch-missing-executable");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableMissing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_executable_is_blocked() {
+        let root = fixture("launch-symlink-executable");
+        let roots = local_roots(&root);
+        let real = root.join("bin/dolphin-emu-real");
+        make_executable(&real);
+        let link = root.join("bin/dolphin-emu");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(link, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_regular_executable_is_blocked() {
+        let root = fixture("launch-non-regular-executable");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        fs::create_dir_all(&dolphin).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_permission_is_blocked() {
+        let root = fixture("launch-non-executable-permission");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        fs::create_dir_all(dolphin.parent().unwrap()).unwrap();
+        fs::write(&dolphin, b"not executed").unwrap();
+        let mut perms = fs::metadata(&dolphin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&dolphin, perms).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_native_executable(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::ExecutableNotExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flatpak_profile_is_blocked_for_native_launch_binding() {
+        let root = fixture("launch-flatpak-blocked");
+        let roots = local_roots(&root);
+        let mut profile = native_profile(&roots, Vec::new());
+        profile.installation_type = DolphinLocalInstallationType::FlatpakUser;
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_profile_is_blocked_for_native_launch_binding() {
+        let root = fixture("launch-portable-blocked");
+        let profile_root = root.join("AppImage/User");
+        fs::create_dir_all(profile_root.join("Config")).unwrap();
+        fs::write(profile_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let mut profile = explicit_profile(&profile_root, Vec::new());
+        profile.installation_type = DolphinLocalInstallationType::Portable;
+        let blocker =
+            resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dolphin_emu_userpath_override_rejects_default_native() {
+        let root = fixture("launch-userpath-override");
+        let mut roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        roots.dolphin_emu_userpath_override = Some(root.join("override"));
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::EnvironmentOverridePresent
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_txt_marker_rejects_default_native() {
+        let root = fixture("launch-portable-txt");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        fs::write(dolphin.parent().unwrap().join("portable.txt"), b"").unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_dolphin_emu_directory_rejects_default_native() {
+        let root = fixture("launch-legacy-precedence");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        fs::create_dir_all(roots.home.join(".dolphin-emu")).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::PortableOrLegacyLayoutConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drifted_roots_reject_default_native() {
+        let root = fixture("launch-drifted-roots");
+        let roots = local_roots(&root);
+        let dolphin = root.join("bin/dolphin-emu");
+        make_executable(&dolphin);
+        let mut profile = native_profile(
+            &roots,
+            vec![executable(dolphin, DolphinLocalInstallationType::Native)],
+        );
+        // Simulate a profile snapshot that no longer matches the fresh
+        // default XDG resolution (e.g. XDG_CONFIG_HOME changed since
+        // discovery ran).
+        profile.configuration_root = root.join("stale-config/dolphin-emu");
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DolphinLaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_explicit_root_is_rejected() {
+        let root = fixture("launch-symlinked-root");
+        let real_root = root.join("real-portable");
+        fs::create_dir_all(real_root.join("Config")).unwrap();
+        fs::write(real_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let linked_root = root.join("portable");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let profile = explicit_profile(&linked_root, Vec::new());
+        let blocker =
+            resolve_dolphin_native_launch_binding(&profile, &local_roots(&root)).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExplicitRootInvalid);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_hard_coded_executable_fallback() {
+        let root = fixture("launch-no-fallback");
+        let roots = local_roots(&root);
+        // No executable candidates supplied at all; a well-known name like
+        // "dolphin-emu" must never be assumed even though the profile is
+        // otherwise eligible and native.
+        let profile = native_profile(&roots, Vec::new());
+        let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ExecutableMissing);
+        fs::remove_dir_all(root).unwrap();
     }
 }
