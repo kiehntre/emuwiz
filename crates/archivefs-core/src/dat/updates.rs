@@ -440,7 +440,18 @@ pub fn resolve_current_managed_dat_source(
     managed_root: &Path,
     state: &ManagedDatState,
 ) -> Result<ManagedDatReadOnlySource> {
-    let path = validate_managed_snapshot_ownership(managed_root, state, &state.current_snapshot)?;
+    resolve_managed_dat_snapshot_source(managed_root, state, &state.current_snapshot)
+}
+
+/// Resolves either the current or retained previous snapshot as a normal
+/// read-only DAT input.  Callers cannot supply an arbitrary filesystem path:
+/// the snapshot must be named by the validated managed state.
+pub fn resolve_managed_dat_snapshot_source(
+    managed_root: &Path,
+    state: &ManagedDatState,
+    snapshot: &ManagedDatSnapshot,
+) -> Result<ManagedDatReadOnlySource> {
+    let path = validate_managed_snapshot_ownership(managed_root, state, snapshot)?;
     Ok(ManagedDatReadOnlySource {
         source_id: state.source_id.clone(),
         path,
