@@ -126,6 +126,29 @@ fn deferred_catalogue_kind(dat: &ParsedDat) -> Option<&'static str> {
     }
 }
 
+/// The parser's ecosystem classifier intentionally uses broad metadata
+/// detection so ordinary DAT browsing can describe likely TOSEC files. An
+/// imported TOSEC authority needs a narrower proof: either an explicit
+/// TOSEC author, or a header field whose value itself begins with TOSEC.
+/// This rejects incidental text such as `"Not TOSEC"` without trusting a
+/// filename or release-pack directory name.
+fn header_identifies_tosec_dataset(dat: &ParsedDat) -> bool {
+    let author_is_tosec = dat
+        .source
+        .author
+        .as_deref()
+        .is_some_and(|author| author.trim().eq_ignore_ascii_case("tosec"));
+    let header_leads_with_tosec = [
+        dat.source.name.as_deref(),
+        dat.source.description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.trim_start().to_ascii_lowercase().starts_with("tosec"));
+
+    author_is_tosec || header_leads_with_tosec
+}
+
 /// Imports one local classic TOSEC DAT. Parsing remains entirely in
 /// [`parse_dat_file`] with [`DatLimits::default`]; this adapter only rejects
 /// non-TOSEC internal metadata, records the local artifact, and builds the
@@ -138,7 +161,7 @@ pub fn import_tosec_dat(path: &Path) -> Result<ImportedTosecSource, TosecImportE
     let outcome = parse_dat_file(path, DatLimits::default()).map_err(TosecImportError::Parse)?;
     let dat = outcome.dat;
 
-    if dat.source.ecosystem != DatEcosystem::Tosec {
+    if dat.source.ecosystem != DatEcosystem::Tosec || !header_identifies_tosec_dataset(&dat) {
         return Err(TosecImportError::NotTosec {
             path: path.to_path_buf(),
             detected_ecosystem: dat.source.ecosystem,

@@ -1173,6 +1173,7 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         display_name: id.to_string(),
         path: path.to_string(),
         kind: DatSourceKind::File,
+        ownership: DatSourceOwnership::UserLocal,
         enabled: None,
         priority: None,
         platform: None,

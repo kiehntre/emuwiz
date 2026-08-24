@@ -32,7 +32,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, MIN_DAT_PRIORITY};
+use super::{
+    DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, DatSourceOwnership,
+    MIN_DAT_PRIORITY,
+};
 use crate::ArchiveFsError;
 use crate::dat::policy::config::DatPolicyConfig;
 
@@ -70,6 +73,11 @@ pub struct DatSourceConfigEntry {
     pub display_name: String,
     pub path: String,
     pub kind: DatSourceKind,
+
+    /// Typed provenance for entries created by EmuWiz workflows. Missing in
+    /// old configs means UserLocal; origin text never influences this field.
+    #[serde(default, skip_serializing_if = "DatSourceOwnership::is_user_local")]
+    pub ownership: DatSourceOwnership,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -135,6 +143,7 @@ impl DatSourceConfigEntry {
             display_name: self.display_name,
             path: PathBuf::from(self.path),
             kind: self.kind,
+            ownership: self.ownership,
             enabled: self.enabled.unwrap_or(true),
             priority: self
                 .priority
@@ -164,6 +173,7 @@ impl DatSourceConfigEntry {
             display_name: entry.display_name.clone(),
             path: entry.path.to_string_lossy().into_owned(),
             kind: entry.kind,
+            ownership: entry.ownership.clone(),
             enabled: Some(entry.enabled),
             priority: Some(entry.priority),
             platform: entry.platform.clone(),

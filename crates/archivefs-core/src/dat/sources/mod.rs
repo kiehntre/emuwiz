@@ -82,7 +82,7 @@ impl DatSourceKind {
 /// additionally prove that a managed entry's snapshot is represented by the
 /// typed state in [`crate::dat::updates`]; this enum alone is not replacement
 /// authority.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatSourceOwnership {
     /// A path selected or registered by the user.  It is never updateable by
@@ -92,15 +92,32 @@ pub enum DatSourceOwnership {
     /// A read-only projection of a snapshot held below EmuWiz's managed DAT
     /// root and bound to typed managed-source state.
     EmuWizManaged,
+    /// A local DAT registered by the TOSEC release-pack selection workflow.
+    /// This is separate from a manually added local TOSEC DAT so later
+    /// selection reconciliation can remove only entries it explicitly owns.
+    ImportedTosecReleasePack {
+        pack_id: String,
+        relative_path: PathBuf,
+    },
 }
 
 impl DatSourceOwnership {
-    pub fn is_user_local(self) -> bool {
+    pub fn is_user_local(&self) -> bool {
         matches!(self, Self::UserLocal)
     }
 
-    pub fn is_emuwiz_managed(self) -> bool {
+    pub fn is_emuwiz_managed(&self) -> bool {
         matches!(self, Self::EmuWizManaged)
+    }
+
+    pub fn imported_tosec_release_pack(&self) -> Option<(&str, &Path)> {
+        match self {
+            Self::ImportedTosecReleasePack {
+                pack_id,
+                relative_path,
+            } => Some((pack_id, relative_path)),
+            _ => None,
+        }
     }
 }
 
@@ -237,6 +254,8 @@ pub struct DatSourceEntry {
     pub display_name: String,
     pub path: PathBuf,
     pub kind: DatSourceKind,
+    /// Explicit provenance/ownership, never inferred from presentation text.
+    pub ownership: DatSourceOwnership,
     pub enabled: bool,
     pub priority: u32,
     pub platform: Option<String>,
@@ -265,6 +284,7 @@ impl DatSourceEntry {
             display_name,
             path,
             kind,
+            ownership: DatSourceOwnership::UserLocal,
             enabled: true,
             priority: DEFAULT_DAT_PRIORITY,
             platform: None,
@@ -295,13 +315,12 @@ impl DatSourceEntry {
             .is_none_or(|id| crate::canonical_platform_for_alias(id).is_some())
     }
 
-    /// All entries in the user-editable DAT registry are user-local sources.
-    ///
     /// Managed snapshots are kept in separate typed state and exposed through
-    /// [`crate::dat::updates::ManagedDatReadOnlySource`], rather than granting
-    /// special authority to a hand-editable registry entry.
-    pub fn ownership(&self) -> DatSourceOwnership {
-        DatSourceOwnership::UserLocal
+    /// [`crate::dat::updates::ManagedDatReadOnlySource`]. The only non-user
+    /// local registry ownership is an explicitly tagged TOSEC release-pack
+    /// entry, used solely for safe selection reconciliation.
+    pub fn ownership(&self) -> &DatSourceOwnership {
+        &self.ownership
     }
 
     pub fn is_user_local(&self) -> bool {

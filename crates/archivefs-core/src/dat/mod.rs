@@ -54,5 +54,6 @@ pub mod rename_plan;
 pub mod rom_organisation;
 pub mod set;
 pub mod sources;
+pub mod tosec_release_pack;
 pub mod trusted_dtd;
 pub mod updates;
