@@ -48,6 +48,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::dat::firmware_evidence::FirmwareIdentityRecord;
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::game_identity::inspect_catalogued_game_identity;
 use crate::launch::evidence_bridge::canonical_identity_from_game_report;
@@ -67,7 +68,7 @@ use crate::launch::process_spawn::{
 use crate::launch::readiness::LaunchReadiness;
 use crate::patch_manager::{
     Pcsx2GameRequest, Pcsx2ProfileDiscoveryRoots, Pcsx2UserDirectoryMode, discover_pcsx2_profiles,
-    inspect_pcsx2_game, resolve_pcsx2_native_launch_binding,
+    inspect_pcsx2_game_with_firmware_evidence, resolve_pcsx2_native_launch_binding,
 };
 
 // ---------------------------------------------------------------------------
@@ -273,8 +274,11 @@ impl From<Pcsx2LaunchSpawnError> for Pcsx2LaunchExecutionError {
 /// 8. The standalone launch plan is rebuilt via the existing
 ///    [`build_launch_plan_from_results`] integration entry point (a single
 ///    [`DiscoveredStandaloneProfile::pcsx2`] projected from the matched
-///    profile and a fresh [`inspect_pcsx2_game`] call, so BIOS readiness is
-///    the same real projection every other PCSX2 surface already uses).
+///    profile and a fresh
+///    [`inspect_pcsx2_game_with_firmware_evidence`] call, so BIOS readiness
+///    is genuinely `Verified` whenever the selected BIOS matches
+///    `firmware_evidence`, not merely present - see
+///    `crate::patch_manager::pcsx2_firmware`'s own module doc comment).
 ///    The resulting candidate must be exactly [`LaunchReadiness::Ready`]
 ///    and still the narrow direct-plain-file shape this phase supports.
 /// 9. [`build_pcsx2_command_plan`] is rebuilt from the fresh identity/
@@ -288,6 +292,7 @@ impl From<Pcsx2LaunchSpawnError> for Pcsx2LaunchExecutionError {
 pub fn preflight_pcsx2_launch(
     request: &Pcsx2LaunchRequest,
     roots: &Pcsx2ProfileDiscoveryRoots,
+    firmware_evidence: &[FirmwareIdentityRecord],
 ) -> Result<Pcsx2Command, Pcsx2LaunchPreflightError> {
     // --- 1-3: content path facts + identity capture ---
     let content_path = &request.selected_content_path;
@@ -350,15 +355,19 @@ pub fn preflight_pcsx2_launch(
         VerifiedIdentityFact::Ps2ExecutableCrc(value) => Some(value.clone()),
         _ => None,
     });
-    let inspection = inspect_pcsx2_game(
+    let inspection_with_firmware = inspect_pcsx2_game_with_firmware_evidence(
         profile,
         &Pcsx2GameRequest {
             verified_ps2_serial: Some(verified_serial.clone()),
             verified_executable_crc: crc,
             emulator_serial: None,
         },
+        firmware_evidence,
     );
-    let standalone_profiles = [DiscoveredStandaloneProfile::pcsx2(profile, &inspection)];
+    let standalone_profiles = [DiscoveredStandaloneProfile::pcsx2(
+        profile,
+        &inspection_with_firmware.inspection,
+    )];
     let empty_retroarch = RetroArchEnvironmentReport {
         format_version: 1,
         profiles: Vec::new(),
@@ -680,8 +689,9 @@ pub fn spawn_pcsx2(command: Pcsx2Command) -> Result<LaunchedPcsx2Process, Pcsx2L
 pub fn preflight_and_launch_pcsx2(
     request: &Pcsx2LaunchRequest,
     roots: &Pcsx2ProfileDiscoveryRoots,
+    firmware_evidence: &[FirmwareIdentityRecord],
 ) -> Result<LaunchedPcsx2Process, Pcsx2LaunchExecutionError> {
-    let command = preflight_pcsx2_launch(request, roots)?;
+    let command = preflight_pcsx2_launch(request, roots, firmware_evidence)?;
     Ok(spawn_pcsx2(command)?)
 }
 

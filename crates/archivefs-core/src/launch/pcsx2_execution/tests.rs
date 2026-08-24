@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::*;
+use crate::dat::firmware_evidence::{FirmwareIdentityRecord, FirmwareSystem};
+use crate::dat::model::DatEcosystem;
+use crate::identity_source::hashing::Crc32;
 use crate::launch::process_spawn::CapturedFileIdentity;
 use crate::patch_manager::Pcsx2ProfileDiscoveryRoots;
 
@@ -134,32 +137,49 @@ fn base_roots(fixture: &Fixture) -> Pcsx2ProfileDiscoveryRoots {
 
 /// A fully wired, genuinely `Ready` native PCSX2 fixture: a fake executable
 /// script whitelisted via `roots.explicit_executables`, a real `PCSX2.ini`
-/// at PCSX2's own default XDG root, and a loose PS2 ISO whose verified
-/// serial becomes the request's expected serial/game key - computed via the
-/// same `inspect_catalogued_game_identity` the module itself uses, never
-/// hand-typed.
+/// at PCSX2's own default XDG root, a loose PS2 ISO whose verified serial
+/// becomes the request's expected serial/game key - computed via the same
+/// `inspect_catalogued_game_identity` the module itself uses, never
+/// hand-typed - and a real BIOS file whose bytes genuinely match one
+/// [`FirmwareIdentityRecord`] in `firmware_evidence`, so
+/// `Pcsx2BiosVerification::Verified` is reached honestly rather than
+/// through an unrelated "uncertain" branch.
 struct ReadyFixture {
     fixture: Fixture,
     roots: Pcsx2ProfileDiscoveryRoots,
     profile_root: PathBuf,
     request: Pcsx2LaunchRequest,
+    firmware_evidence: Vec<FirmwareIdentityRecord>,
 }
 
-/// `Pcsx2BiosVerification::Verified` is never produced anywhere in this
-/// codebase (no trusted BIOS hash database exists yet - see that variant's
-/// own doc comment), so a genuinely strict-`Ready` PCSX2 candidate cannot
-/// be reached through `PresentUnverified` (a warning) or `Missing` (a
-/// blocker). The one legitimate way `firmware_condition` already treats as
-/// neither a blocker nor a warning is `FirmwareReadiness::Unknown` -
-/// "honest uncertainty, not a proven absence" - which `pcsx2_firmware_readiness`
-/// produces from `Pcsx2BiosVerification::Unreadable`. A *regular file*
-/// (not a directory) at the profile's `bios` path makes `inspect_pcsx2_bios`
-/// hit exactly that real, already-existing branch: `fs::read_dir` fails
-/// with a "not a directory" error, not "not found". This is not a
-/// fabricated verified state - it is the one real system state the
-/// existing BIOS model already treats as non-blocking.
-fn make_bios_path_unreadable(profile_root: &std::path::Path) {
-    fs::write(profile_root.join("bios"), b"not a directory").unwrap();
+/// Synthetic BIOS bytes for this suite only - never a real PS2 BIOS dump,
+/// never a real Redump-published hash. `record_for_bios_bytes` computes its
+/// own record hashes from these bytes with the exact same algorithms
+/// `resolve_pcsx2_bios` uses, so the fixture is self-consistent without any
+/// hand-typed digest.
+const BIOS_BYTES: &[u8] = b"synthetic test BIOS bytes for pcsx2_execution fixtures only";
+
+fn record_for_bios_bytes(name: &str) -> FirmwareIdentityRecord {
+    use md5::Md5;
+    use sha1::Sha1;
+    use sha1::digest::Digest;
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    FirmwareIdentityRecord {
+        system: FirmwareSystem::PlayStation2,
+        provider: DatEcosystem::Redump,
+        name: name.to_string(),
+        description: Some(format!("{name} description")),
+        size_bytes: BIOS_BYTES.len() as u64,
+        crc32: Crc32::of(BIOS_BYTES),
+        md5: hex(&Md5::digest(BIOS_BYTES)),
+        sha1: hex(&Sha1::digest(BIOS_BYTES)),
+        dat_version: Some("20240101".to_string()),
+    }
+}
+
+fn write_verified_bios(profile_root: &std::path::Path) {
+    fs::create_dir_all(profile_root.join("bios")).unwrap();
+    fs::write(profile_root.join("bios/scph-70012.bin"), BIOS_BYTES).unwrap();
 }
 
 fn build_ready_fixture(label: &str) -> ReadyFixture {
@@ -168,7 +188,7 @@ fn build_ready_fixture(label: &str) -> ReadyFixture {
     let profile_root = roots.xdg_config_home.join("PCSX2");
     fs::create_dir_all(&profile_root).unwrap();
     fs::write(profile_root.join("PCSX2.ini"), b"[Filenames]\n").unwrap();
-    make_bios_path_unreadable(&profile_root);
+    write_verified_bios(&profile_root);
     let executable = fixture.write_executable("bin/pcsx2-qt", b"#!/bin/sh\nexit 0\n");
     roots.explicit_executables.push(executable.clone());
     let content = fixture.write("games/game.iso", &ps2_iso_bytes());
@@ -199,11 +219,12 @@ fn build_ready_fixture(label: &str) -> ReadyFixture {
         roots,
         profile_root,
         request,
+        firmware_evidence: vec![record_for_bios_bytes("Sony PlayStation 2 BIOS fixture")],
     }
 }
 
 fn preflight(ready: &ReadyFixture) -> Result<Pcsx2Command, Pcsx2LaunchPreflightError> {
-    preflight_pcsx2_launch(&ready.request, &ready.roots)
+    preflight_pcsx2_launch(&ready.request, &ready.roots, &ready.firmware_evidence)
 }
 
 // --- native direct-content Ready candidate passes preflight -----------------
@@ -251,7 +272,8 @@ fn symlink_content_is_rejected() {
     symlink(&ready.request.selected_content_path, &link).unwrap();
     let mut request = ready.request.clone();
     request.selected_content_path = link;
-    let error = preflight_pcsx2_launch(&request, &ready.roots).unwrap_err();
+    let error =
+        preflight_pcsx2_launch(&request, &ready.roots, &ready.firmware_evidence).unwrap_err();
     assert_eq!(error.kind, Pcsx2LaunchPreflightErrorKind::ContentIsSymlink);
 }
 
@@ -263,7 +285,8 @@ fn non_iso_extension_is_rejected() {
     let chd = ready.fixture.write("games/game.chd", &ps2_iso_bytes());
     let mut request = ready.request.clone();
     request.selected_content_path = chd;
-    let error = preflight_pcsx2_launch(&request, &ready.roots).unwrap_err();
+    let error =
+        preflight_pcsx2_launch(&request, &ready.roots, &ready.firmware_evidence).unwrap_err();
     assert_eq!(
         error.kind,
         Pcsx2LaunchPreflightErrorKind::ContentFormatUnsupported
@@ -276,7 +299,8 @@ fn mount_input_archive_content_is_rejected() {
     let zip = ready.fixture.write("games/game.zip", b"pk not a real zip");
     let mut request = ready.request.clone();
     request.selected_content_path = zip;
-    let error = preflight_pcsx2_launch(&request, &ready.roots).unwrap_err();
+    let error =
+        preflight_pcsx2_launch(&request, &ready.roots, &ready.firmware_evidence).unwrap_err();
     assert_eq!(
         error.kind,
         Pcsx2LaunchPreflightErrorKind::ContentRequiresMount
@@ -378,7 +402,8 @@ fn profile_root_drift_is_rejected() {
         "pcsx2:{}",
         ready.fixture.path("stale-config/PCSX2").display()
     );
-    let error = preflight_pcsx2_launch(&request, &ready.roots).unwrap_err();
+    let error =
+        preflight_pcsx2_launch(&request, &ready.roots, &ready.firmware_evidence).unwrap_err();
     assert_eq!(error.kind, Pcsx2LaunchPreflightErrorKind::ProfileNotFound);
 }
 
@@ -416,7 +441,7 @@ fn unsupported_install_type_is_rejected() {
         expected_executable: executable,
         expected_user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
     };
-    let error = preflight_pcsx2_launch(&request, &roots).unwrap_err();
+    let error = preflight_pcsx2_launch(&request, &roots, &[]).unwrap_err();
     assert_eq!(
         error.kind,
         Pcsx2LaunchPreflightErrorKind::BindingUnavailable
@@ -428,15 +453,17 @@ fn unsupported_install_type_is_rejected() {
 #[test]
 fn ready_with_warnings_candidate_is_rejected() {
     let ready = build_ready_fixture("ready-with-warnings");
-    // Override the base fixture's "unreadable bios path" trick: a real
-    // `bios/` directory with a plausibly named `.bin` file inside is
-    // `Pcsx2BiosVerification::PresentUnverified`, which is a warning, not a
-    // blocker - `ReadyWithWarnings`, not strict `Ready`.
-    fs::remove_file(ready.profile_root.join("bios")).unwrap();
+    // Replace the base fixture's genuinely-matching BIOS bytes with content
+    // that does not match any record in `firmware_evidence`: a real, safely
+    // readable `bios/` directory whose single `.bin` candidate resolves
+    // unambiguously but hashes to nothing in evidence is
+    // `Pcsx2BiosVerification::Unknown`, which is a warning, not a blocker -
+    // `ReadyWithWarnings`, not strict `Ready`.
+    fs::remove_dir_all(ready.profile_root.join("bios")).unwrap();
     fs::create_dir_all(ready.profile_root.join("bios")).unwrap();
     fs::write(
-        ready.profile_root.join("bios/SCPH10000.bin"),
-        b"not a real bios",
+        ready.profile_root.join("bios/scph-70012.bin"),
+        b"not a real bios - does not match any evidence record",
     )
     .unwrap();
     let error = preflight(&ready).unwrap_err();
@@ -446,10 +473,23 @@ fn ready_with_warnings_candidate_is_rejected() {
 #[test]
 fn blocked_candidate_is_rejected() {
     let ready = build_ready_fixture("blocked-missing-bios");
-    // Override the base fixture's "unreadable bios path" trick: no `bios`
-    // entry at all is `Pcsx2BiosVerification::Missing`, which blocks the
-    // candidate outright (required firmware missing).
-    fs::remove_file(ready.profile_root.join("bios")).unwrap();
+    // No `bios` entry at all is `Pcsx2BiosVerification::Missing`, which
+    // blocks the candidate outright (required firmware missing).
+    fs::remove_dir_all(ready.profile_root.join("bios")).unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, Pcsx2LaunchPreflightErrorKind::CandidateNotReady);
+}
+
+#[test]
+fn empty_firmware_evidence_never_reaches_strict_ready() {
+    // Same genuinely-matching BIOS bytes on disk as `valid_native_ps2_iso_succeeds`,
+    // but preflight is given zero firmware evidence records to match
+    // against. `Pcsx2BiosVerification::Verified` must only ever be reached
+    // when a real evidence record actually matches - it must never be
+    // promoted from an absence of evidence - so this must fail the same way
+    // as an unverified BIOS, not silently pass.
+    let mut ready = build_ready_fixture("empty-evidence");
+    ready.firmware_evidence.clear();
     let error = preflight(&ready).unwrap_err();
     assert_eq!(error.kind, Pcsx2LaunchPreflightErrorKind::CandidateNotReady);
 }
@@ -555,7 +595,7 @@ fn shell_metacharacters_in_content_path_are_never_interpreted() {
         .write(&format!("games/{dangerous_name}"), &ps2_iso_bytes());
     let mut request = ready.request.clone();
     request.selected_content_path = dangerous_path;
-    let command = preflight_pcsx2_launch(&request, &ready.roots).unwrap();
+    let command = preflight_pcsx2_launch(&request, &ready.roots, &ready.firmware_evidence).unwrap();
     let mut process = spawn_pcsx2(command).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {

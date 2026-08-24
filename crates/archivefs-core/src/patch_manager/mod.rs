@@ -60,6 +60,7 @@ mod hatari_local;
 mod import_safety;
 mod matching;
 mod pcsx2;
+mod pcsx2_firmware;
 mod pcsx2_identity;
 mod pcsx2_install_plan;
 mod pcsx2_local;
@@ -441,6 +442,10 @@ pub use import_safety::{
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,
     Pcsx2InstallationCandidate, ReadOnlyFilesystem, ReadOnlyPcsx2Adapter,
+};
+pub use pcsx2_firmware::{
+    Pcsx2BiosVerificationOutcome, Pcsx2GameInspectionWithFirmware, Pcsx2VerifiedBios,
+    inspect_pcsx2_game_with_firmware_evidence, resolve_pcsx2_bios,
 };
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
