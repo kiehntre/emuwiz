@@ -56,7 +56,7 @@ pub enum ManagedDatProvider {
     /// [`RedumpGameSystem`] for the fixed, closed set of systems this
     /// provider may name. A deliberately narrower set than
     /// [`RedumpBiosSystem`]'s three systems is not required - both draw
-    /// from the same proven `redump.info` host and `/datfile/<slug>/` path
+    /// from the same proven `redump.info` host and `/datfile/<slug>` path
     /// family (see [`RedumpGameSystem::fixed_url`]'s own doc comment) - but
     /// only systems this codebase has actual evidence for are ever added.
     RedumpGames,
@@ -107,9 +107,9 @@ impl RedumpBiosSystem {
     /// - this is the entire "approved endpoint" surface for this provider.
     fn fixed_url(self) -> &'static str {
         match self {
-            Self::PlayStation => "https://redump.info/datfile/psx-bios/",
-            Self::PlayStation2 => "https://redump.info/datfile/ps2-bios/",
-            Self::Xbox => "https://redump.info/datfile/xbox-bios/",
+            Self::PlayStation => "https://redump.info/datfile/psx-bios",
+            Self::PlayStation2 => "https://redump.info/datfile/ps2-bios",
+            Self::Xbox => "https://redump.info/datfile/xbox-bios",
         }
     }
 
@@ -133,8 +133,8 @@ impl RedumpBiosSystem {
 /// already proves a working `redump.info` contract for - not because other
 /// Redump systems (Saturn, Dreamcast, GameCube, Wii, ...) lack a game DAT,
 /// but because this codebase has no proven slug for any of them: Redump's
-/// own BIOS URLs (`.../datfile/psx-bios/`, `.../datfile/ps2-bios/`,
-/// `.../datfile/xbox-bios/`) are the only place a `/datfile/<slug>/`-shaped
+/// own BIOS URLs (`.../datfile/psx-bios`, `.../datfile/ps2-bios`,
+/// `.../datfile/xbox-bios`) are the only place a `/datfile/<slug>`-shaped
 /// path has ever been confirmed correct in this repository, and the
 /// ordinary-dataset slug for each is exactly that BIOS slug with the
 /// `-bios` suffix removed - not a separately invented guess. A system whose
@@ -173,9 +173,9 @@ impl RedumpGameSystem {
     /// guessed slug (see this enum's own doc comment).
     fn fixed_url(self) -> &'static str {
         match self {
-            Self::PlayStation => "https://redump.info/datfile/psx/",
-            Self::PlayStation2 => "https://redump.info/datfile/ps2/",
-            Self::Xbox => "https://redump.info/datfile/xbox/",
+            Self::PlayStation => "https://redump.info/datfile/psx",
+            Self::PlayStation2 => "https://redump.info/datfile/ps2",
+            Self::Xbox => "https://redump.info/datfile/xbox",
         }
     }
 
@@ -3262,15 +3262,15 @@ mod tests {
         for (system, expected) in [
             (
                 RedumpBiosSystem::PlayStation,
-                "https://redump.info/datfile/psx-bios/",
+                "https://redump.info/datfile/psx-bios",
             ),
             (
                 RedumpBiosSystem::PlayStation2,
-                "https://redump.info/datfile/ps2-bios/",
+                "https://redump.info/datfile/ps2-bios",
             ),
             (
                 RedumpBiosSystem::Xbox,
-                "https://redump.info/datfile/xbox-bios/",
+                "https://redump.info/datfile/xbox-bios",
             ),
         ] {
             assert_eq!(system.fixed_url(), expected);
@@ -3279,17 +3279,18 @@ mod tests {
         for (system, expected) in [
             (
                 RedumpGameSystem::PlayStation,
-                "https://redump.info/datfile/psx/",
+                "https://redump.info/datfile/psx",
             ),
             (
                 RedumpGameSystem::PlayStation2,
-                "https://redump.info/datfile/ps2/",
+                "https://redump.info/datfile/ps2",
             ),
-            (RedumpGameSystem::Xbox, "https://redump.info/datfile/xbox/"),
+            (RedumpGameSystem::Xbox, "https://redump.info/datfile/xbox"),
         ] {
             assert_eq!(system.fixed_url(), expected);
             validate_managed_dat_http_url(system.fixed_url()).unwrap();
         }
+        assert!(validate_managed_dat_http_url("https://redump.org/datfile/psx").is_err());
     }
 
     /// Compile-time proof: the only way to build a Redump game-DAT
