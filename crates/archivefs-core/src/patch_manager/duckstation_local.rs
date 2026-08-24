@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 
@@ -83,6 +85,14 @@ pub struct DuckStationProfile {
     pub profile_id: String,
     pub installation_type: DuckStationInstallationType,
     pub configuration_path: PathBuf,
+    /// Where this candidate directory came from - e.g. `"XDG_CONFIG_HOME
+    /// DuckStation directory"` vs. `"AppImage-adjacent directory (from
+    /// $APPIMAGE)"`. Both currently report [`DuckStationInstallationType::Portable`],
+    /// so this is the only way to tell a genuine caller-confirmed portable
+    /// root apart from an AppImage-derived one - see
+    /// `resolve_duckstation_native_launch_binding`'s own doc comment for
+    /// why that distinction currently still leads both to being blocked.
+    pub provenance: &'static str,
     pub eligible: bool,
     pub blocker: Option<String>,
     pub executable_candidates: Vec<DuckStationExecutable>,
@@ -107,6 +117,20 @@ pub struct DuckStationProfileDiscoveryRoots {
     pub home: PathBuf,
     pub xdg_config_home: PathBuf,
     pub xdg_data_home: PathBuf,
+    /// Whether `$XDG_CONFIG_HOME` was actually present in the environment
+    /// (and absolute) - not merely whether [`Self::xdg_config_home`] holds
+    /// a value, since that field always holds one (defaulting to
+    /// `~/.config`). This distinction matters because DuckStation's own
+    /// `Core::SetDataRoot()` (see `resolve_duckstation_native_launch_binding`'s
+    /// own doc comment for the exact proven upstream logic this mirrors)
+    /// only consults `$XDG_CONFIG_HOME` when the *environment variable
+    /// itself* is set; when it is absent, DuckStation does not fall back
+    /// to `~/.config` at all - it falls back to a hardcoded
+    /// `~/.local/share` (never `$XDG_DATA_HOME`, even if set). Native
+    /// launch binding needs to reproduce that exact branch, which the
+    /// already-defaulted [`Self::xdg_config_home`] field alone cannot
+    /// distinguish.
+    pub xdg_config_home_explicit: bool,
     /// Exact roots deliberately supplied by the caller.  They are not found
     /// by a broad filesystem walk.
     pub explicit_configuration_roots: Vec<PathBuf>,
@@ -121,9 +145,13 @@ impl DuckStationProfileDiscoveryRoots {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or(DuckStationDiscoveryError::HomeUnavailable)?;
-        let xdg_config_home = env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
+        let xdg_config_home_var = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        // Mirrors DuckStation's own `getenv("XDG_CONFIG_HOME") && Path::IsAbsolute(...)`
+        // check exactly - present but relative is treated the same as absent.
+        let xdg_config_home_explicit = xdg_config_home_var
+            .as_deref()
+            .is_some_and(Path::is_absolute);
+        let xdg_config_home = xdg_config_home_var.unwrap_or_else(|| home.join(".config"));
         let xdg_data_home = env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
@@ -134,6 +162,7 @@ impl DuckStationProfileDiscoveryRoots {
             home,
             xdg_config_home,
             xdg_data_home,
+            xdg_config_home_explicit,
             explicit_configuration_roots: Vec::new(),
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
@@ -333,6 +362,7 @@ pub struct DuckStationGameInspection {
 struct ProfileCandidate {
     installation_type: DuckStationInstallationType,
     path: PathBuf,
+    provenance: &'static str,
 }
 
 /// Discover documented native and Flatpak roots plus exact caller-provided
@@ -345,10 +375,12 @@ pub fn discover_duckstation_profiles(
         ProfileCandidate {
             installation_type: DuckStationInstallationType::Native,
             path: roots.xdg_config_home.join("duckstation"),
+            provenance: "XDG_CONFIG_HOME DuckStation directory",
         },
         ProfileCandidate {
             installation_type: DuckStationInstallationType::Native,
             path: roots.xdg_data_home.join("duckstation"),
+            provenance: "XDG_DATA_HOME fallback DuckStation directory",
         },
         ProfileCandidate {
             installation_type: DuckStationInstallationType::FlatpakUser,
@@ -357,6 +389,7 @@ pub fn discover_duckstation_profiles(
                 .join(".var/app")
                 .join(FLATPAK_APP_ID)
                 .join("config/duckstation"),
+            provenance: "Flatpak org.duckstation.DuckStation user configuration directory",
         },
         ProfileCandidate {
             installation_type: DuckStationInstallationType::FlatpakUser,
@@ -365,6 +398,7 @@ pub fn discover_duckstation_profiles(
                 .join(".var/app")
                 .join(FLATPAK_APP_ID)
                 .join("data/duckstation"),
+            provenance: "Flatpak user data directory",
         },
     ];
     candidates.extend(
@@ -375,12 +409,14 @@ pub fn discover_duckstation_profiles(
             .map(|path| ProfileCandidate {
                 installation_type: DuckStationInstallationType::Portable,
                 path,
+                provenance: "caller-confirmed portable configuration root",
             }),
     );
     if let Some(directory) = &roots.appimage_directory {
         candidates.push(ProfileCandidate {
             installation_type: DuckStationInstallationType::Portable,
             path: directory.join("duckstation"),
+            provenance: "AppImage-adjacent directory (from $APPIMAGE)",
         });
     }
     candidates.extend(
@@ -391,6 +427,7 @@ pub fn discover_duckstation_profiles(
             .map(|path| ProfileCandidate {
                 installation_type: DuckStationInstallationType::Explicit,
                 path,
+                provenance: "explicit caller-confirmed configuration root",
             }),
     );
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
@@ -546,6 +583,7 @@ fn validate_profile(
         profile_id: format!("duckstation:{}", candidate.path.display()),
         installation_type: candidate.installation_type,
         configuration_path: candidate.path.clone(),
+        provenance: candidate.provenance,
         eligible: blocker.is_none(),
         blocker,
         executable_candidates: executables.to_vec(),
@@ -1284,6 +1322,352 @@ fn is_real_directory(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Native launch binding
+// ---------------------------------------------------------------------------
+//
+// Everything below binds a discovered [`DuckStationProfile`] to a concrete,
+// safe, spawnable native executable - facts only, never a command line or a
+// spawn. It never starts DuckStation.
+//
+// # Authoritative current DuckStation Linux CLI/directory contract
+//
+// Proven directly from `stenzek/duckstation` upstream source
+// (`src/duckstation-qt/qthost.cpp`'s `ParseCommandLineParametersAndInitializeConfig`,
+// and `src/core/core.cpp`'s `Core::SetDataRoot`), not stale docs:
+//
+// - The Qt frontend's CMake build target - and therefore its on-disk binary
+//   name on Linux - is `duckstation-qt` (`add_executable(duckstation-qt
+//   ...)` in `src/duckstation-qt/CMakeLists.txt`; the `OUTPUT_NAME
+//   DuckStation` override in that same file is guarded to the macOS `.app`
+//   bundle case only). This is the same name [`discover_executables`]
+//   already searches `PATH` for.
+// - There is no CLI flag to override the user/config/data directory at
+//   all - `-help`/`-version`/`-batch`/`-fastboot`/`-slowboot`/`-bios`/
+//   `-resume`/`-state`/`-statefile`/`-exe`/`-fullscreen`/`-nofullscreen`/
+//   `-nogui`/`-bigpicture`/`-setupwizard`/`-earlyconsole`/
+//   `-updatecleanup`/`--` are the complete current set. This is why
+//   [`DuckStationUserDirectoryMode`] has exactly one variant: unlike
+//   Dolphin (`-u <dir>`) or a hypothetical explicit-root override, nothing
+//   in the current DuckStation CLI can force an arbitrary directory to
+//   become the active user directory - only the fixed platform rule below,
+//   or the `portable.txt`/`settings.ini` co-location rule, ever apply.
+// - `Core::SetDataRoot()`'s exact current Linux rule for a single, unified
+//   user directory (BIOS, settings.ini, memory cards, save states, cheats,
+//   textures all live under it - there is no separate "config root"):
+//   1. First, portable detection: if `portable.txt` OR `settings.ini`
+//      already exists in the executable's own directory (resolved via
+//      `$APPIMAGE`'s directory for a running AppImage, since AppImages
+//      self-mount under `/tmp`), that directory becomes the user
+//      directory. A statically discovered (not-yet-running) executable
+//      has no `/tmp` mount to resolve, so this reduces to: does
+//      `portable.txt`/`settings.ini` exist beside the executable's real,
+//      on-disk path?
+//   2. Otherwise: if `$XDG_CONFIG_HOME` is set in the environment *and
+//      absolute*, the user directory is `$XDG_CONFIG_HOME/duckstation`.
+//   3. Otherwise: the user directory is the **hardcoded**
+//      `$HOME/.local/share/duckstation` - critically, this fallback does
+//      **not** consult `$XDG_DATA_HOME` at all, even when it is set to
+//      something else. (This is why [`DuckStationProfileDiscoveryRoots`]
+//      needed the additional `xdg_config_home_explicit` field: the
+//      already-defaulted `xdg_config_home`/`xdg_data_home` fields alone
+//      cannot reproduce this exact branch.)
+// - Upstream officially distributes Linux builds only as an AppImage
+//   (`README.md`'s "Downloading and running" section names no native
+//   tarball/installer for Linux); Flatpak (`org.duckstation.DuckStation`)
+//   is mentioned only in the context of migrating *away* from it to
+//   AppImage, so it is no longer an officially supported channel. A
+//   `duckstation-qt` binary on `PATH` is therefore always a
+//   distro/community package, never an upstream-shipped artifact - this
+//   binding still supports it (as [`DuckStationInstallationType::Native`])
+//   because its CLI/directory behavior is identical (same codebase, same
+//   `Core::SetDataRoot()`), but Flatpak and AppImage/portable are refused
+//   below because their extra layer (Flatpak sandboxing; AppImage's FUSE
+//   self-mount, first-run desktop-integration prompt, and reliance on a
+//   live `$APPIMAGE` environment variable this static resolver does not
+//   have) cannot be safely proven from discovery evidence alone.
+// - A future command planner's proven, safe argv contract is exactly:
+//   `<duckstation-qt-executable> [-batch] [--] <content-path>` - the
+//   trailing path argument alone is sufficient to boot directly into that
+//   content (bypassing the game list), `-batch` additionally makes the
+//   process exit when the emulated session ends (rather than returning to
+//   an open frontend window), which is what an EmuWiz watcher needs for
+//   "one process per play session" semantics identical to the existing
+//   RetroArch/Dolphin/PCSX2 model. `--` is only required when the content
+//   path starts with `-` or must not be parsed for flags. No command is
+//   built or spawned by this module.
+
+/// Facts identifying exactly which local executable a native DuckStation
+/// launch would use, and how its user directory resolves - never a command
+/// line. See this module's own "Native launch binding" section doc comment
+/// for the exact proven upstream contract this represents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationNativeLaunchBinding {
+    pub executable: PathBuf,
+    pub user_directory_mode: DuckStationUserDirectoryMode,
+}
+
+/// How DuckStation's single unified user directory (BIOS/settings/memory
+/// cards/save states - there is no separate config root) resolves for a
+/// bound executable. Only one variant exists today because DuckStation's
+/// current CLI has no override flag at all - see the "Native launch
+/// binding" section's own doc comment. Data only, never turned into an
+/// argv flag by this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuckStationUserDirectoryMode {
+    /// The platform-default resolution: `$XDG_CONFIG_HOME/duckstation` when
+    /// that variable is set and absolute, else the hardcoded
+    /// `$HOME/.local/share/duckstation`.
+    DefaultNative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuckStationLaunchBlockerKind {
+    /// Any installation type other than [`DuckStationInstallationType::Native`].
+    /// `FlatpakUser` is refused because Flatpak is no longer an officially
+    /// distributed channel and its sandboxing cannot be proven safe here;
+    /// `Portable` is refused because the current profile model reports the
+    /// same tag for a genuine `portable.txt`-marker install and an
+    /// AppImage-derived one (see [`DuckStationProfile::provenance`]) and
+    /// AppImage's FUSE self-mount/`$APPIMAGE`-dependent behavior cannot be
+    /// proven from static discovery evidence; `Explicit` is refused because
+    /// DuckStation's current CLI has no mechanism to force an arbitrary
+    /// caller-confirmed directory to become the active user directory (no
+    /// `-u`-equivalent flag exists) - see the module's own CLI contract
+    /// doc comment.
+    UnsupportedInstallationType,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// No candidate executable exists on disk.
+    ExecutableMissing,
+    /// A candidate executable exists but is a symlink, not a regular file,
+    /// or is not an absolute path.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+    /// The profile's configuration root (or its DuckStation evidence -
+    /// `settings.ini`) no longer matches what discovery originally
+    /// observed, or the profile itself is not eligible.
+    ProfileRootMismatch,
+    /// The profile's configuration root does not match DuckStation's
+    /// current default single-user-directory resolution, so `DefaultNative`
+    /// cannot be proven.
+    DefaultResolutionMismatch,
+    /// A `portable.txt` or `settings.ini` file exists beside the resolved
+    /// executable, which would make DuckStation itself treat that
+    /// directory (not the profile just proven) as the active user
+    /// directory - see `Core::SetDataRoot()`'s exact rule in the module's
+    /// own CLI contract doc comment.
+    PortableMarkerConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckStationLaunchBlocker {
+    pub kind: DuckStationLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(
+    kind: DuckStationLaunchBlockerKind,
+    detail: impl Into<String>,
+) -> DuckStationLaunchBlocker {
+    DuckStationLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` against `roots` and either proves a launch
+/// binding or returns a structured blocker. Pure and read-only: inspects
+/// only filesystem metadata and the supplied environment-derived roots,
+/// never spawns a process, writes DuckStation configuration, or creates a
+/// directory. Safe - and intended - to call again at future launch time.
+pub fn resolve_duckstation_native_launch_binding(
+    profile: &DuckStationProfile,
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ProfileRootMismatch,
+            "profile is not eligible",
+        ));
+    }
+    match profile.installation_type {
+        DuckStationInstallationType::Native => resolve_default_native_binding(profile, roots),
+        DuckStationInstallationType::FlatpakUser
+        | DuckStationInstallationType::Portable
+        | DuckStationInstallationType::Explicit => Err(launch_blocker(
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType,
+            format!(
+                "only {:?} DuckStation installations are supported by this native launch \
+                 binding, got {:?} ({})",
+                DuckStationInstallationType::Native,
+                profile.installation_type,
+                profile.provenance,
+            ),
+        )),
+    }
+}
+
+/// The single unified user-directory root DuckStation's own
+/// `Core::SetDataRoot()` resolves to for a non-portable install - see the
+/// module's own "Native launch binding" doc comment for the exact proven
+/// rule this mirrors.
+fn expected_duckstation_native_root(roots: &DuckStationProfileDiscoveryRoots) -> PathBuf {
+    if roots.xdg_config_home_explicit {
+        roots.xdg_config_home.join("duckstation")
+    } else {
+        roots.home.join(".local/share").join("duckstation")
+    }
+}
+
+fn resolve_default_native_binding(
+    profile: &DuckStationProfile,
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    let expected_root = expected_duckstation_native_root(roots);
+    if profile.configuration_path != expected_root {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::DefaultResolutionMismatch,
+            format!(
+                "profile root {} does not match the current default resolution {}",
+                profile.configuration_path.display(),
+                expected_root.display(),
+            ),
+        ));
+    }
+    if !is_real_directory(&profile.configuration_path) {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ProfileRootMismatch,
+            "configuration root no longer matches the discovered profile",
+        ));
+    }
+    if !is_regular_file(&profile.configuration_path.join("settings.ini")) {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ProfileRootMismatch,
+            "DuckStation configuration evidence (settings.ini) is no longer present",
+        ));
+    }
+    let executable = resolve_native_duckstation_executable(profile)?;
+    if let Some(blocker) = portable_marker_conflict(&executable) {
+        return Err(blocker);
+    }
+    Ok(DuckStationNativeLaunchBinding {
+        executable,
+        user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+    })
+}
+
+/// `portable.txt` **or** `settings.ini` next to the executable forces
+/// DuckStation into portable mode, which redirects directory resolution
+/// away from the profile just proven - see `Core::SetDataRoot()`'s exact
+/// rule in the module's own CLI contract doc comment. Checking for
+/// `settings.ini` here (not just `portable.txt`) matters: a stray/leftover
+/// settings file beside the executable is just as authoritative to
+/// DuckStation itself as an explicit marker.
+fn portable_marker_conflict(executable: &Path) -> Option<DuckStationLaunchBlocker> {
+    let directory = executable.parent()?;
+    let marker = directory.join("portable.txt");
+    let settings = directory.join("settings.ini");
+    if is_regular_file(&marker) {
+        return Some(launch_blocker(
+            DuckStationLaunchBlockerKind::PortableMarkerConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                marker.display()
+            ),
+        ));
+    }
+    if is_regular_file(&settings) {
+        return Some(launch_blocker(
+            DuckStationLaunchBlockerKind::PortableMarkerConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                settings.display()
+            ),
+        ));
+    }
+    None
+}
+
+/// Binds exactly one executable to `profile`, matching candidates only by
+/// the profile's own installation type - `executable_candidates` is shared
+/// across every discovered profile and is not otherwise scoped per-profile.
+/// Never falls back to a hard-coded name: a profile with no matching,
+/// verified-safe candidate is always blocked.
+fn resolve_native_duckstation_executable(
+    profile: &DuckStationProfile,
+) -> Result<PathBuf, DuckStationLaunchBlocker> {
+    let matching: Vec<&DuckStationExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == profile.installation_type)
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableMissing,
+            "no discovered executable is associated with this profile's installation type",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_duckstation_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(valid.into_iter().next().expect("length checked above")),
+        count => Err(launch_blocker(
+            DuckStationLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable executables match this profile and none is distinguished as \
+                 authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_duckstation_executable(path: &Path) -> Result<(), DuckStationLaunchBlocker> {
+    if !path.is_absolute() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn warn(
     warnings: &mut Vec<DuckStationWarning>,
     kind: DuckStationWarningKind,
@@ -1307,6 +1691,7 @@ mod tests {
             home: temp.path().join("home"),
             xdg_config_home: temp.path().join("config"),
             xdg_data_home: temp.path().join("data"),
+            xdg_config_home_explicit: true,
             explicit_configuration_roots: Vec::new(),
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
@@ -1327,6 +1712,7 @@ mod tests {
             home: temp_home.clone(),
             xdg_config_home: temp_home,
             xdg_data_home: root.parent().unwrap().join("data"),
+            xdg_config_home_explicit: true,
             explicit_configuration_roots: vec![root],
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
@@ -1610,5 +1996,580 @@ mod tests {
         let inspection = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"));
         assert_eq!(inspection.cheats.unwrap().entries, 0);
         assert!(!inspection.textures.unwrap().complete);
+    }
+
+    // -----------------------------------------------------------------
+    // Native launch binding
+    // -----------------------------------------------------------------
+
+    fn binding_fixture_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "archivefs-duckstation-binding-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    /// `xdg_config_home_explicit: true` - the common case, and the one the
+    /// resolver's `DefaultResolutionMismatch` check exercises directly
+    /// against `roots.xdg_config_home`.
+    fn binding_roots(root: &Path) -> DuckStationProfileDiscoveryRoots {
+        DuckStationProfileDiscoveryRoots {
+            home: root.join("home"),
+            xdg_config_home: root.join("config"),
+            xdg_data_home: root.join("data"),
+            xdg_config_home_explicit: true,
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+        }
+    }
+
+    fn make_native_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn duckstation_executable(
+        path: PathBuf,
+        installation_type: DuckStationInstallationType,
+    ) -> DuckStationExecutable {
+        DuckStationExecutable {
+            path,
+            installation_type,
+            version: None,
+        }
+    }
+
+    /// A minimal, hand-built, genuinely eligible profile at the exact
+    /// `DefaultNative` root `binding_roots` resolves to - `settings.ini`
+    /// is real on disk (matching `profile.eligible`'s own real
+    /// requirement), never faked.
+    fn native_duckstation_profile(
+        roots: &DuckStationProfileDiscoveryRoots,
+        executable_candidates: Vec<DuckStationExecutable>,
+    ) -> DuckStationProfile {
+        let config = expected_duckstation_native_root(roots);
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("settings.ini"), "[Main]\n").unwrap();
+        DuckStationProfile {
+            profile_id: "test-native".to_string(),
+            installation_type: DuckStationInstallationType::Native,
+            configuration_path: config.clone(),
+            provenance: "test",
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            global_config_path: config.join("settings.ini"),
+            game_settings_path: config.join("gamesettings"),
+            cheats_path: config.join("cheats"),
+            patches_path: config.join("patches"),
+            textures_path: config.join("textures"),
+            bios_path: config.join("bios"),
+            memory_cards_path: config.join("memcards"),
+            save_states_path: config.join("savestates"),
+        }
+    }
+
+    // --- 1: valid native binding --------------------------------------------------------------
+
+    #[test]
+    fn valid_native_duckstation_binding() {
+        let root = binding_fixture_root("valid");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin.clone(),
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, bin);
+        assert_eq!(
+            binding.user_directory_mode,
+            DuckStationUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 2: executable missing ------------------------------------------------------------------
+
+    #[test]
+    fn missing_executable_is_blocked() {
+        let root = binding_fixture_root("missing-exe");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_candidates_is_blocked() {
+        let root = binding_fixture_root("zero-candidates");
+        let roots = binding_roots(&root);
+        let profile = native_duckstation_profile(&roots, Vec::new());
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 3: ambiguous executable ------------------------------------------------------------------
+
+    #[test]
+    fn ambiguous_executable_is_blocked() {
+        let root = binding_fixture_root("ambiguous");
+        let roots = binding_roots(&root);
+        let first = root.join("bin/duckstation-qt");
+        let second = root.join("alt-bin/duckstation-qt");
+        make_native_executable(&first);
+        make_native_executable(&second);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![
+                duckstation_executable(first, DuckStationInstallationType::Native),
+                duckstation_executable(second, DuckStationInstallationType::Native),
+            ],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::AmbiguousExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 4: symlink executable ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_executable_is_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let root = binding_fixture_root("symlink");
+        let roots = binding_roots(&root);
+        let real = root.join("bin/duckstation-qt-real");
+        make_native_executable(&real);
+        let link = root.join("bin/duckstation-qt");
+        symlink(&real, &link).unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                link,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DuckStationLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 5: non-regular executable ------------------------------------------------------------------
+
+    #[test]
+    fn directory_executable_is_blocked() {
+        let root = binding_fixture_root("directory-exe");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        fs::create_dir_all(&bin).unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, DuckStationLaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 6: non-executable file ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_permission_is_blocked() {
+        let root = binding_fixture_root("non-executable");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"not executable").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&bin, perms).unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableNotExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 7: config root drift (XDG_CONFIG_HOME explicit branch) ------------------------------------
+
+    #[test]
+    fn config_root_drift_is_blocked() {
+        let root = binding_fixture_root("config-drift");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let mut profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        // The profile's own root drifted away from what `binding_roots`
+        // currently resolves to (e.g. `$XDG_CONFIG_HOME` changed since
+        // discovery ran).
+        profile.configuration_path = root.join("config-old/duckstation");
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 8: data root drift (XDG_CONFIG_HOME-unset fallback branch) --------------------------------
+
+    #[test]
+    fn data_root_drift_is_blocked_when_xdg_config_home_is_unset() {
+        let root = binding_fixture_root("data-drift");
+        let mut roots = binding_roots(&root);
+        roots.xdg_config_home_explicit = false;
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        // Correctly resolved once (against `roots.home`), matching the
+        // hardcoded `$HOME/.local/share/duckstation` fallback rule.
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        resolve_duckstation_native_launch_binding(&profile, &roots)
+            .expect("profile matches the current hardcoded fallback root");
+        // `$HOME` itself drifts (e.g. re-derived in a different session) -
+        // the previously proven root must no longer match.
+        let mut drifted_roots = roots.clone();
+        drifted_roots.home = root.join("a-different-home");
+        let blocker =
+            resolve_duckstation_native_launch_binding(&profile, &drifted_roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn xdg_config_home_explicit_and_hardcoded_fallback_resolve_to_different_roots() {
+        let root = binding_fixture_root("root-rule");
+        let mut roots = binding_roots(&root);
+        roots.xdg_config_home_explicit = true;
+        let via_config_home = expected_duckstation_native_root(&roots);
+        roots.xdg_config_home_explicit = false;
+        let via_hardcoded_fallback = expected_duckstation_native_root(&roots);
+        assert_ne!(via_config_home, via_hardcoded_fallback);
+        assert_eq!(via_config_home, roots.xdg_config_home.join("duckstation"));
+        assert_eq!(
+            via_hardcoded_fallback,
+            roots.home.join(".local/share").join("duckstation")
+        );
+    }
+
+    // --- 9: unsupported Flatpak -----------------------------------------------------------------
+
+    #[test]
+    fn flatpak_installation_is_unsupported() {
+        let root = binding_fixture_root("flatpak");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::FlatpakUser;
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 10: unsupported AppImage/portable ------------------------------------------------------
+
+    #[test]
+    fn portable_installation_is_unsupported() {
+        let root = binding_fixture_root("portable");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::Portable;
+        profile.provenance = "AppImage-adjacent directory (from $APPIMAGE)";
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_confirmed_portable_root_is_still_unsupported_today() {
+        // Even the *genuine* portable case (never AppImage-derived) is
+        // refused today - see the module's own doc comment: the current
+        // model cannot distinguish this from an AppImage-derived
+        // `Portable` profile from `installation_type` alone, and blocking
+        // uniformly is the conservative, provable choice for this task's
+        // scope.
+        let root = binding_fixture_root("genuine-portable");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::Portable;
+        profile.provenance = "caller-confirmed portable configuration root";
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 11: wrong installation kind (Explicit) ---------------------------------------------------
+
+    #[test]
+    fn explicit_installation_is_unsupported() {
+        let root = binding_fixture_root("explicit");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.installation_type = DuckStationInstallationType::Explicit;
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ineligible_profile_is_blocked_before_installation_type_is_even_checked() {
+        let root = binding_fixture_root("ineligible");
+        let roots = binding_roots(&root);
+        let mut profile = native_duckstation_profile(&roots, Vec::new());
+        profile.eligible = false;
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ProfileRootMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 12: no hard-coded fallback ---------------------------------------------------------------
+
+    #[test]
+    fn no_hard_coded_executable_fallback() {
+        // A profile whose installation type is `Native` but whose
+        // candidate list is empty must never fall back to a well-known
+        // name/path - it must be blocked exactly like any other
+        // no-candidate case.
+        let root = binding_fixture_root("no-fallback");
+        let roots = binding_roots(&root);
+        let profile = native_duckstation_profile(&roots, Vec::new());
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 13: exact executable retained -------------------------------------------------------------
+
+    #[test]
+    fn exact_executable_path_is_retained_unmodified() {
+        let root = binding_fixture_root("exact-path");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin.clone(),
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, bin);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 14: user-directory mode is data, not a command string -------------------------------------
+
+    #[test]
+    fn user_directory_mode_is_data_never_a_command_string() {
+        // Exhaustive destructure/match: if a future change ever added an
+        // argv-shaped field, this would fail to compile, forcing a review.
+        let mode = DuckStationUserDirectoryMode::DefaultNative;
+        match mode {
+            DuckStationUserDirectoryMode::DefaultNative => {}
+        }
+        let root = binding_fixture_root("mode-is-data");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        let DuckStationNativeLaunchBinding {
+            executable: _,
+            user_directory_mode: _,
+        } = binding;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 15: fresh rediscovery detects changed executable/profile ----------------------------------
+
+    #[test]
+    fn fresh_rediscovery_detects_a_swapped_executable_between_calls() {
+        let root = binding_fixture_root("fresh-rediscovery");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin.clone(),
+                DuckStationInstallationType::Native,
+            )],
+        );
+        resolve_duckstation_native_launch_binding(&profile, &roots)
+            .expect("first resolution must succeed against the real on-disk executable");
+        // The executable is removed and replaced with a symlink between
+        // calls - a fresh call must detect this, never trust a cached
+        // result.
+        fs::remove_file(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let real = root.join("bin/duckstation-qt-swapped");
+            make_native_executable(&real);
+            symlink(&real, &bin).unwrap();
+            let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+            assert_eq!(blocker.kind, DuckStationLaunchBlockerKind::ExecutableUnsafe);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_rediscovery_detects_profile_root_removed() {
+        let root = binding_fixture_root("profile-removed");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        resolve_duckstation_native_launch_binding(&profile, &roots)
+            .expect("first resolution must succeed against the real on-disk profile root");
+        fs::remove_dir_all(&profile.configuration_path).unwrap();
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::ProfileRootMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- portable.txt / settings.ini co-location conflict -------------------------------------------
+
+    #[test]
+    fn portable_marker_beside_executable_rejects_default_native() {
+        let root = binding_fixture_root("portable-marker");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        fs::write(bin.parent().unwrap().join("portable.txt"), b"").unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::PortableMarkerConflict
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settings_ini_beside_executable_also_rejects_default_native() {
+        // Proven from upstream source: `Core::SetDataRoot()` treats a
+        // stray `settings.ini` beside the executable exactly like
+        // `portable.txt` - not just the marker file alone.
+        let root = binding_fixture_root("settings-marker");
+        let roots = binding_roots(&root);
+        let bin = root.join("bin/duckstation-qt");
+        make_native_executable(&bin);
+        fs::write(bin.parent().unwrap().join("settings.ini"), b"[Main]\n").unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                bin,
+                DuckStationInstallationType::Native,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::PortableMarkerConflict
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

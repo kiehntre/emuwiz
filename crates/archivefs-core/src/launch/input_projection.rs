@@ -414,6 +414,7 @@ mod tests {
             profile_id: "duckstation:test".to_string(),
             installation_type: crate::patch_manager::DuckStationInstallationType::Explicit,
             configuration_path: dir.clone(),
+            provenance: "explicit caller-confirmed configuration root",
             eligible: true,
             blocker: None,
             executable_candidates: Vec::new(),

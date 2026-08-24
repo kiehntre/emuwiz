@@ -347,12 +347,14 @@ pub use duckstation_local::{
     DuckStationCheatInventory, DuckStationConfigInspection, DuckStationDiscContext,
     DuckStationDiscoveryError, DuckStationExecutable, DuckStationGameInspection,
     DuckStationGameRequest, DuckStationHealth, DuckStationInstallationType,
-    DuckStationMemoryCardInventory, DuckStationPatchInventory, DuckStationPlaylistInventory,
+    DuckStationLaunchBlocker, DuckStationLaunchBlockerKind, DuckStationMemoryCardInventory,
+    DuckStationNativeLaunchBinding, DuckStationPatchInventory, DuckStationPlaylistInventory,
     DuckStationProfile, DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots,
     DuckStationSaveStateInventory, DuckStationSerialMapping, DuckStationSettings,
-    DuckStationTextureInventory, DuckStationWarning, DuckStationWarningKind,
-    discover_duckstation_profiles, inspect_duckstation_game, inspect_duckstation_playlist,
-    normalize_duckstation_ps1_serial, parse_duckstation_version,
+    DuckStationTextureInventory, DuckStationUserDirectoryMode, DuckStationWarning,
+    DuckStationWarningKind, discover_duckstation_profiles, inspect_duckstation_game,
+    inspect_duckstation_playlist, normalize_duckstation_ps1_serial, parse_duckstation_version,
+    resolve_duckstation_native_launch_binding,
 };
 pub use emulator_profile_memory::{
     EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,

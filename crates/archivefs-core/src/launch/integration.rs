@@ -295,6 +295,7 @@ mod tests {
             profile_id: "duckstation-native".to_string(),
             installation_type: DuckStationInstallationType::Native,
             configuration_path: root.clone(),
+            provenance: "XDG_CONFIG_HOME DuckStation directory",
             eligible: true,
             blocker: None,
             executable_candidates: Vec::new(),

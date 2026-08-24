@@ -102,6 +102,7 @@ fn build_fixture(label: &str, global_ini: &str) -> Fixture {
         home: temp_root.join("home"),
         xdg_config_home: temp_root.join("home"),
         xdg_data_home: temp_root.join("data"),
+        xdg_config_home_explicit: false,
         explicit_configuration_roots: vec![configuration_path.clone()],
         portable_configuration_roots: Vec::new(),
         explicit_executables: Vec::new(),

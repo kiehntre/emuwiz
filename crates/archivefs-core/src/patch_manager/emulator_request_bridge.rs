@@ -174,6 +174,7 @@ mod tests {
             installation_type:
                 super::super::duckstation_local::DuckStationInstallationType::Explicit,
             configuration_path: dir.clone(),
+            provenance: "explicit caller-confirmed configuration root",
             eligible: true,
             blocker: None,
             executable_candidates: Vec::new(),
