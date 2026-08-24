@@ -32,7 +32,7 @@ const MAME_REPOSITORY: &str = "mamedev/mame";
 const STAGING_DIRECTORY: &str = "staging";
 const GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_RAW_HOST: &str = "raw.githubusercontent.com";
-const REDUMP_HOST: &str = "redump.org";
+const REDUMP_HOST: &str = "redump.info";
 /// Redump BIOS DATs are a handful of records at most - a few KiB. This cap
 /// is generous while still being a real, enforced bound rather than reusing
 /// the multi-hundred-MiB general DAT ceiling MAME software lists need.
@@ -56,7 +56,7 @@ pub enum ManagedDatProvider {
     /// [`RedumpGameSystem`] for the fixed, closed set of systems this
     /// provider may name. A deliberately narrower set than
     /// [`RedumpBiosSystem`]'s three systems is not required - both draw
-    /// from the same proven `redump.org` host and `/datfile/<slug>/` path
+    /// from the same proven `redump.info` host and `/datfile/<slug>/` path
     /// family (see [`RedumpGameSystem::fixed_url`]'s own doc comment) - but
     /// only systems this codebase has actual evidence for are ever added.
     RedumpGames,
@@ -107,9 +107,9 @@ impl RedumpBiosSystem {
     /// - this is the entire "approved endpoint" surface for this provider.
     fn fixed_url(self) -> &'static str {
         match self {
-            Self::PlayStation => "https://redump.org/datfile/psx-bios/",
-            Self::PlayStation2 => "https://redump.org/datfile/ps2-bios/",
-            Self::Xbox => "https://redump.org/datfile/xbox-bios/",
+            Self::PlayStation => "https://redump.info/datfile/psx-bios/",
+            Self::PlayStation2 => "https://redump.info/datfile/ps2-bios/",
+            Self::Xbox => "https://redump.info/datfile/xbox-bios/",
         }
     }
 
@@ -130,7 +130,7 @@ impl RedumpBiosSystem {
 /// Redump's ordinary (non-BIOS) per-system game/disc DAT.
 ///
 /// Deliberately limited to the same three systems [`RedumpBiosSystem`]
-/// already proves a working `redump.org` contract for - not because other
+/// already proves a working `redump.info` contract for - not because other
 /// Redump systems (Saturn, Dreamcast, GameCube, Wii, ...) lack a game DAT,
 /// but because this codebase has no proven slug for any of them: Redump's
 /// own BIOS URLs (`.../datfile/psx-bios/`, `.../datfile/ps2-bios/`,
@@ -173,9 +173,9 @@ impl RedumpGameSystem {
     /// guessed slug (see this enum's own doc comment).
     fn fixed_url(self) -> &'static str {
         match self {
-            Self::PlayStation => "https://redump.org/datfile/psx/",
-            Self::PlayStation2 => "https://redump.org/datfile/ps2/",
-            Self::Xbox => "https://redump.org/datfile/xbox/",
+            Self::PlayStation => "https://redump.info/datfile/psx/",
+            Self::PlayStation2 => "https://redump.info/datfile/ps2/",
+            Self::Xbox => "https://redump.info/datfile/xbox/",
         }
     }
 
@@ -2731,7 +2731,7 @@ mod tests {
         <name>{header}</name>
         <description>{header}</description>
         <version>20240115</version>
-        <author>Redump.org</author>
+        <author>Redump.info</author>
     </header>
     <game name="{game}">
         <description>{game}</description>
@@ -3254,6 +3254,41 @@ mod tests {
             let expected_url = bios_system.fixed_url().replace("-bios", "");
             assert_eq!(system.fixed_url(), expected_url);
             descriptor.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn every_fixed_redump_url_uses_the_current_info_host_without_changing_paths() {
+        for (system, expected) in [
+            (
+                RedumpBiosSystem::PlayStation,
+                "https://redump.info/datfile/psx-bios/",
+            ),
+            (
+                RedumpBiosSystem::PlayStation2,
+                "https://redump.info/datfile/ps2-bios/",
+            ),
+            (
+                RedumpBiosSystem::Xbox,
+                "https://redump.info/datfile/xbox-bios/",
+            ),
+        ] {
+            assert_eq!(system.fixed_url(), expected);
+            validate_managed_dat_http_url(system.fixed_url()).unwrap();
+        }
+        for (system, expected) in [
+            (
+                RedumpGameSystem::PlayStation,
+                "https://redump.info/datfile/psx/",
+            ),
+            (
+                RedumpGameSystem::PlayStation2,
+                "https://redump.info/datfile/ps2/",
+            ),
+            (RedumpGameSystem::Xbox, "https://redump.info/datfile/xbox/"),
+        ] {
+            assert_eq!(system.fixed_url(), expected);
+            validate_managed_dat_http_url(system.fixed_url()).unwrap();
         }
     }
 
