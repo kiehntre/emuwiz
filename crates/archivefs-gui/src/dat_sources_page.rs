@@ -48,6 +48,10 @@ use archivefs_core::dat::classification::{
     ContentSelectionPolicy, DatContentClassification, DatContentSummary,
 };
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::managed_sources::{
+    ManagedDatSources, ResolvedManagedDatSource, default_managed_dat_sources_config_path,
+    load_managed_dat_sources_from, resolve_managed_dat_sources, save_managed_dat_sources_to,
+};
 use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::policy::{
     ClonePolicy, DatPolicyConfig, EffectiveDatPolicy, LanguageId, LanguagePreference, PolicyField,
@@ -67,6 +71,11 @@ use archivefs_core::dat::sources::{
     DatFileOutcome, DatHealthState, DatSourceEntry, DatSourceKind, DatSourceRegistry,
     DatValidationReport, UnresolvedDatSetting, load_dat_sources_config_from,
     save_dat_sources_config_to, suggest_display_name, validate_dat_source,
+};
+use archivefs_core::dat::updates::{
+    HttpsManagedDatTransport, ManagedDatSourceDescriptor, ManagedDatUpdateFailureKind,
+    ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy,
+    check_managed_dat_update, managed_dat_root, update_managed_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -456,6 +465,11 @@ impl AuditProgressView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DatSourcesPageView {
     pub(crate) rows: Vec<DatSourceRowView>,
+    /// Separately configured, app-managed DATs. These are never inferred from
+    /// a local source's name, origin, or path.
+    pub(crate) managed_rows: Vec<ManagedDatSourceRowView>,
+    pub(crate) managed_load_error: Option<String>,
+    pub(crate) managed_action_error: Option<String>,
     pub(crate) unresolved: Vec<UnresolvedDatRowView>,
     /// Problems found while reading the file that this build could not act on
     /// (an unusable ID, a second entry claiming one ID).
@@ -468,6 +482,9 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) action_error: Option<String>,
     pub(crate) pending_consequences: Vec<String>,
     pub(crate) running: Option<RunningJobView>,
+    /// Any page-owned worker is running, including an explicit managed-DAT
+    /// check/update which intentionally has no generic cancellation button.
+    pub(crate) background_busy: bool,
     /// The folders offered as audit targets: the configured library source
     /// folders, in configuration order.
     pub(crate) library_folders: Vec<PathBuf>,
@@ -488,6 +505,95 @@ impl DatSourcesPageView {
     /// Whether the page has nothing registered yet.
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+}
+
+/// One explicitly configured, typed managed MAME software-list source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedDatSourceRowView {
+    pub(crate) authoritative_name: String,
+    pub(crate) installed: bool,
+    pub(crate) current_revision: Option<String>,
+    pub(crate) last_checked: Option<String>,
+    pub(crate) status: ManagedDatStatusView,
+    pub(crate) update_enabled: bool,
+    pub(crate) busy: bool,
+    pub(crate) technical: ManagedDatTechnicalView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedDatTechnicalView {
+    pub(crate) sha256: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) current_path: Option<String>,
+    pub(crate) previous_snapshot: Option<String>,
+    pub(crate) previous_path: Option<String>,
+}
+
+/// The human-facing result of an explicit managed-DAT operation. It is kept
+/// separate from the persisted state: no status text is updater authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagedDatStatusView {
+    NotInstalled,
+    Idle,
+    Checking,
+    UpdateAvailable { upstream_revision: String },
+    UpToDate,
+    Updating,
+    Updated,
+    Offline,
+    RateLimited { retry_after_seconds: Option<u64> },
+    Disabled,
+    Failed { detail: String },
+}
+
+fn managed_dat_status_from_outcome(outcome: ManagedDatUpdateOutcome) -> ManagedDatStatusView {
+    match outcome {
+        ManagedDatUpdateOutcome::Disabled => ManagedDatStatusView::Disabled,
+        ManagedDatUpdateOutcome::UpToDate { .. } => ManagedDatStatusView::UpToDate,
+        ManagedDatUpdateOutcome::UpdateAvailable { upstream_revision } => {
+            ManagedDatStatusView::UpdateAvailable { upstream_revision }
+        }
+        ManagedDatUpdateOutcome::Updated { .. } => ManagedDatStatusView::Updated,
+        ManagedDatUpdateOutcome::Offline => ManagedDatStatusView::Offline,
+        ManagedDatUpdateOutcome::RateLimited {
+            retry_after_seconds,
+        } => ManagedDatStatusView::RateLimited {
+            retry_after_seconds,
+        },
+        ManagedDatUpdateOutcome::Failed { kind, detail } => ManagedDatStatusView::Failed {
+            detail: managed_dat_failure_message(kind, &detail),
+        },
+    }
+}
+
+fn managed_dat_failure_message(kind: ManagedDatUpdateFailureKind, detail: &str) -> String {
+    let message = match kind {
+        ManagedDatUpdateFailureKind::Forbidden | ManagedDatUpdateFailureKind::NotFound => {
+            "Source unavailable"
+        }
+        ManagedDatUpdateFailureKind::Parser
+        | ManagedDatUpdateFailureKind::WrongEcosystem
+        | ManagedDatUpdateFailureKind::WrongAuthoritativeName
+        | ManagedDatUpdateFailureKind::EmptyCatalogue
+        | ManagedDatUpdateFailureKind::DownloadTooLarge
+        | ManagedDatUpdateFailureKind::EmptyDownload
+        | ManagedDatUpdateFailureKind::TruncatedDownload => {
+            "Downloaded DAT failed validation; current copy kept"
+        }
+        ManagedDatUpdateFailureKind::Storage => "Could not store update; current copy kept",
+        ManagedDatUpdateFailureKind::Network
+        | ManagedDatUpdateFailureKind::Timeout
+        | ManagedDatUpdateFailureKind::Tls => "Update check failed; existing DAT remains available",
+        ManagedDatUpdateFailureKind::HttpStatus | ManagedDatUpdateFailureKind::InvalidResponse => {
+            "Update check failed; current copy kept"
+        }
+    };
+    if detail.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}: {detail}")
     }
 }
 
@@ -914,6 +1020,22 @@ pub(crate) enum DatSourcesPageAction {
         id: String,
         scan_root: PathBuf,
     },
+    /// Adds one explicitly typed MAME software-list source. The authoritative
+    /// name is validated by core; no remote endpoint is configurable here.
+    AddManagedMameSoftwareList {
+        authoritative_name: String,
+    },
+    /// Removes only the managed-source configuration. Downloaded state and
+    /// immutable objects are deliberately retained by core for later cleanup.
+    RemoveManagedMameSoftwareList {
+        authoritative_name: String,
+    },
+    CheckManagedDat {
+        authoritative_name: String,
+    },
+    UpdateManagedDat {
+        authoritative_name: String,
+    },
     CancelJob,
     Save,
     Revert,
@@ -1035,6 +1157,37 @@ enum JobMessage {
 enum JobKind {
     Validate,
     Audit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedDatOperation {
+    Check,
+    Update,
+}
+
+fn managed_dat_action(
+    authoritative_name: String,
+    operation: ManagedDatOperation,
+) -> DatSourcesPageAction {
+    match operation {
+        ManagedDatOperation::Check => DatSourcesPageAction::CheckManagedDat { authoritative_name },
+        ManagedDatOperation::Update => {
+            DatSourcesPageAction::UpdateManagedDat { authoritative_name }
+        }
+    }
+}
+
+struct ManagedDatJobMessage {
+    authoritative_name: String,
+    result: archivefs_core::Result<ManagedDatUpdateOutcome>,
+}
+
+/// A separate serial worker for explicit managed-DAT network operations.
+/// Unlike local validation/audit jobs it is not cancellable: the core updater
+/// has no cancellation contract, so presenting a cancel button would lie.
+struct RunningManagedDatJob {
+    authoritative_name: String,
+    messages: Receiver<ManagedDatJobMessage>,
 }
 
 /// A rename apply or rollback worker result.
@@ -1548,6 +1701,15 @@ impl EtaEstimator {
 
 pub(crate) struct DatSourcesPageState {
     config_path: PathBuf,
+    /// Dedicated configuration and storage for explicitly managed DATs. This
+    /// remains wholly separate from the user-local DAT registry above.
+    managed_config_path: PathBuf,
+    managed_root: PathBuf,
+    managed_sources: ManagedDatSources,
+    managed_load_error: Option<String>,
+    managed_action_error: Option<String>,
+    managed_statuses: BTreeMap<String, ManagedDatStatusView>,
+    managed_job: Option<RunningManagedDatJob>,
     /// Existing EmuWiz catalogue to enrich after a completed audit. Absent
     /// in injected tests and when no catalogue exists.
     database_path: Option<PathBuf>,
@@ -1633,7 +1795,18 @@ impl DatSourcesPageState {
     ) -> Self {
         let transaction_dir = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
             .unwrap_or_else(|_| std::env::temp_dir().join("archivefs-rename-transactions"));
-        Self::load_with_transaction_dir(config_path, library_folders, trusted, transaction_dir)
+        let managed_config_path = default_managed_dat_sources_config_path()
+            .unwrap_or_else(|_| config_path.with_file_name("managed_dat_sources.toml"));
+        let managed_root =
+            managed_dat_root().unwrap_or_else(|_| config_path.with_file_name("managed-dats"));
+        Self::load_with_transaction_dir_and_managed_paths(
+            config_path,
+            library_folders,
+            trusted,
+            transaction_dir,
+            managed_config_path,
+            managed_root,
+        )
     }
 
     /// [`Self::load`] with the rename-transaction journal directory injected,
@@ -1643,6 +1816,30 @@ impl DatSourcesPageState {
         library_folders: Vec<PathBuf>,
         trusted: TrustedRoots,
         transaction_dir: PathBuf,
+    ) -> Self {
+        // Tests and injected callers stay entirely inside their supplied
+        // registry location rather than reading the real app configuration.
+        let managed_config_path = config_path.with_file_name("managed_dat_sources.toml");
+        let managed_root = config_path.with_file_name("managed-dats");
+        Self::load_with_transaction_dir_and_managed_paths(
+            config_path,
+            library_folders,
+            trusted,
+            transaction_dir,
+            managed_config_path,
+            managed_root,
+        )
+    }
+
+    /// Testable/injected variant with dedicated managed config and object
+    /// roots. It performs local reads only; it never starts a network action.
+    pub(crate) fn load_with_transaction_dir_and_managed_paths(
+        config_path: PathBuf,
+        library_folders: Vec<PathBuf>,
+        trusted: TrustedRoots,
+        transaction_dir: PathBuf,
+        managed_config_path: PathBuf,
+        managed_root: PathBuf,
     ) -> Self {
         let mut load_error = None;
         let mut load_problems = Vec::new();
@@ -1658,6 +1855,11 @@ impl DatSourcesPageState {
             }
         };
         let draft = saved.clone();
+        let (managed_sources, managed_load_error) =
+            match load_managed_dat_sources_from(&managed_config_path) {
+                Ok(sources) => (sources, None),
+                Err(error) => (ManagedDatSources::new(), Some(error.to_string())),
+            };
         // The durable journal directory and any transactions found in it that
         // are still actionable: settled `Applied` batches offered for rollback
         // and interrupted batches offered for explicit crash recovery. Uses
@@ -1668,6 +1870,13 @@ impl DatSourcesPageState {
         let recovery_transactions = Self::load_reconciled_recovery_transactions(&transaction_dir);
         Self {
             config_path,
+            managed_config_path,
+            managed_root,
+            managed_sources,
+            managed_load_error,
+            managed_action_error: None,
+            managed_statuses: BTreeMap::new(),
+            managed_job: None,
             database_path: None,
             saved,
             draft,
@@ -1734,7 +1943,7 @@ impl DatSourcesPageState {
 
     /// Whether a background job is running.
     pub(crate) fn is_busy(&self) -> bool {
-        self.job.is_some() || self.apply_job.is_some()
+        self.job.is_some() || self.apply_job.is_some() || self.managed_job.is_some()
     }
 
     /// Signals cancellation and immediately forgets the running job, whatever
@@ -1917,6 +2126,7 @@ impl DatSourcesPageState {
 
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = self.poll_apply();
+        changed |= self.poll_managed_dat_job();
         // Surface (and reconcile) interrupted transactions on every frame so the
         // recovery banner appears as soon as the page is entered.
         self.refresh_recovery();
@@ -2123,6 +2333,18 @@ impl DatSourcesPageState {
             }
             DatSourcesPageAction::Validate { id } => self.start_validate(id),
             DatSourcesPageAction::Audit { id, scan_root } => self.start_audit(id, scan_root),
+            DatSourcesPageAction::AddManagedMameSoftwareList { authoritative_name } => {
+                self.add_managed_mame_software_list(authoritative_name);
+            }
+            DatSourcesPageAction::RemoveManagedMameSoftwareList { authoritative_name } => {
+                self.remove_managed_mame_software_list(&authoritative_name);
+            }
+            DatSourcesPageAction::CheckManagedDat { authoritative_name } => {
+                self.start_managed_dat_operation(authoritative_name, ManagedDatOperation::Check);
+            }
+            DatSourcesPageAction::UpdateManagedDat { authoritative_name } => {
+                self.start_managed_dat_operation(authoritative_name, ManagedDatOperation::Update);
+            }
             DatSourcesPageAction::CancelJob => {
                 if let Some(job) = self.job.as_mut() {
                     job.cancel.store(true, Ordering::Relaxed);
@@ -2551,6 +2773,162 @@ impl DatSourcesPageState {
         }
     }
 
+    /// Persists a new managed source immediately. Unlike local DAT sources,
+    /// this configuration is not a draft: it grants only the fixed typed MAME
+    /// descriptor authority, and must survive a restart before any download.
+    fn add_managed_mame_software_list(&mut self, authoritative_name: String) {
+        self.managed_action_error = None;
+        if self.managed_load_error.is_some() {
+            self.managed_action_error = Some(
+                "Not changing managed sources: their existing configuration could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if let Err(error) =
+            next.add_mame_software_list(authoritative_name, ManagedDatUpdatePolicy::Manual)
+        {
+            self.managed_action_error = Some(error.to_string());
+            return;
+        }
+        match save_managed_dat_sources_to(&self.managed_config_path, &next) {
+            Ok(()) => self.managed_sources = next,
+            Err(error) => self.managed_action_error = Some(error.to_string()),
+        }
+    }
+
+    /// Removes configuration only. The core deliberately leaves immutable
+    /// snapshots and state in place for a later explicit maintenance command.
+    fn remove_managed_mame_software_list(&mut self, authoritative_name: &str) {
+        self.managed_action_error = None;
+        if self.managed_job.is_some() {
+            return;
+        }
+        if self.managed_load_error.is_some() {
+            self.managed_action_error = Some(
+                "Not changing managed sources: their existing configuration could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if next.remove_mame_software_list(authoritative_name).is_none() {
+            return;
+        }
+        match save_managed_dat_sources_to(&self.managed_config_path, &next) {
+            Ok(()) => {
+                self.managed_sources = next;
+                self.managed_statuses.remove(authoritative_name);
+            }
+            Err(error) => self.managed_action_error = Some(error.to_string()),
+        }
+    }
+
+    /// Starts the only network-capable managed-DAT operation. This is called
+    /// solely from an explicit page action, never while loading or rendering.
+    fn start_managed_dat_operation(
+        &mut self,
+        authoritative_name: String,
+        operation: ManagedDatOperation,
+    ) {
+        if self.is_busy() || self.managed_load_error.is_some() {
+            return;
+        }
+        let Some(config) = self
+            .managed_sources
+            .entries()
+            .iter()
+            .find(|entry| entry.authoritative_name == authoritative_name)
+        else {
+            return;
+        };
+        let descriptor = match config.descriptor() {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                self.managed_action_error = Some(error.to_string());
+                return;
+            }
+        };
+        if operation == ManagedDatOperation::Update
+            && !matches!(
+                self.managed_statuses.get(&authoritative_name),
+                Some(ManagedDatStatusView::UpdateAvailable { .. })
+            )
+        {
+            return;
+        }
+        self.managed_action_error = None;
+        self.managed_statuses.insert(
+            authoritative_name.clone(),
+            match operation {
+                ManagedDatOperation::Check => ManagedDatStatusView::Checking,
+                ManagedDatOperation::Update => ManagedDatStatusView::Updating,
+            },
+        );
+        let managed_root = self.managed_root.clone();
+        let (sender, messages) = sync_channel(1);
+        let worker_name = authoritative_name.clone();
+        std::thread::spawn(move || {
+            let now_unix_seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let options = ManagedDatUpdateOptions::new(managed_root, now_unix_seconds);
+            let transport = HttpsManagedDatTransport::default();
+            let result = match operation {
+                ManagedDatOperation::Check => {
+                    check_managed_dat_update(&descriptor, &options, &transport)
+                }
+                ManagedDatOperation::Update => {
+                    update_managed_dat(&descriptor, &options, &transport)
+                }
+            };
+            let _ = sender.send(ManagedDatJobMessage {
+                authoritative_name: worker_name,
+                result,
+            });
+        });
+        self.managed_job = Some(RunningManagedDatJob {
+            authoritative_name,
+            messages,
+        });
+    }
+
+    /// Drains one terminal managed-DAT operation and refreshes only the
+    /// display state. The core operation itself has already atomically
+    /// preserved or promoted the snapshot before this point.
+    fn poll_managed_dat_job(&mut self) -> bool {
+        let Some(job) = self.managed_job.as_mut() else {
+            return false;
+        };
+        match job.messages.try_recv() {
+            Ok(message) => {
+                let status = match message.result {
+                    Ok(outcome) => managed_dat_status_from_outcome(outcome),
+                    Err(error) => ManagedDatStatusView::Failed {
+                        detail: error.to_string(),
+                    },
+                };
+                self.managed_statuses
+                    .insert(message.authoritative_name, status);
+                self.managed_job = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.managed_statuses.insert(
+                    job.authoritative_name.clone(),
+                    ManagedDatStatusView::Failed {
+                        detail: "Managed DAT worker stopped before reporting a result".to_string(),
+                    },
+                );
+                self.managed_job = None;
+                true
+            }
+        }
+    }
+
     fn save(&mut self) {
         if self.load_error.is_some() {
             self.save_state = DatSaveState::Failed(
@@ -2570,7 +2948,7 @@ impl DatSourcesPageState {
     }
 
     fn start_validate(&mut self, id: String) {
-        if self.job.is_some() {
+        if self.is_busy() {
             return;
         }
         let Some(entry) = self.draft.get(&id).cloned() else {
@@ -2603,7 +2981,7 @@ impl DatSourcesPageState {
     }
 
     fn start_audit(&mut self, id: String, scan_root: PathBuf) {
-        if self.job.is_some() {
+        if self.is_busy() {
             return;
         }
         let Some(entry) = self.draft.get(&id).cloned() else {
@@ -2755,6 +3133,9 @@ impl DatSourcesPageState {
             .collect();
 
         DatSourcesPageView {
+            managed_rows: self.managed_rows_view(),
+            managed_load_error: self.managed_load_error.clone(),
+            managed_action_error: self.managed_action_error.clone(),
             unresolved: self
                 .draft
                 .unresolved_settings()
@@ -2770,6 +3151,7 @@ impl DatSourcesPageState {
             load_error: self.load_error.clone(),
             action_error: self.action_error.clone(),
             pending_consequences: self.pending_consequences(&rows),
+            background_busy: self.is_busy(),
             running: self.job.as_ref().map(|job| RunningJobView {
                 source_id: job.source_id.clone(),
                 what: match job.kind {
@@ -2802,6 +3184,122 @@ impl DatSourcesPageState {
             rename_plan: self.rename_plan_view(),
             rename_apply: self.rename_apply_view(),
             rows,
+        }
+    }
+
+    /// Resolves typed managed configuration only against local state/object
+    /// files. This uses no transport and never creates state, so rendering the
+    /// page cannot check or download anything.
+    fn managed_rows_view(&self) -> Vec<ManagedDatSourceRowView> {
+        self.managed_sources
+            .entries()
+            .iter()
+            .filter_map(|config| {
+                let descriptor = config.descriptor().ok()?;
+                // Resolve each configured source independently: malformed or
+                // missing local state for one source must not hide another
+                // known-good managed snapshot.
+                let mut one_source = ManagedDatSources::new();
+                if one_source
+                    .add_mame_software_list(config.authoritative_name.clone(), config.update_policy)
+                    .is_err()
+                {
+                    return Some(self.managed_row_view_without_state(
+                        &descriptor,
+                        Some("Managed source configuration is invalid".to_string()),
+                    ));
+                }
+                match resolve_managed_dat_sources(&one_source, &self.managed_root) {
+                    Ok(mut sources) => sources
+                        .pop()
+                        .map(|source| self.managed_row_view(&source, None)),
+                    Err(error) => Some(self.managed_row_view_without_state(
+                        &descriptor,
+                        Some(format!("Managed state could not be resolved: {error}")),
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    fn managed_row_view(
+        &self,
+        source: &ResolvedManagedDatSource,
+        resolution_error: Option<String>,
+    ) -> ManagedDatSourceRowView {
+        let name = source.config.authoritative_name.clone();
+        let status = self
+            .managed_statuses
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| {
+                if source.is_installed() {
+                    ManagedDatStatusView::Idle
+                } else {
+                    ManagedDatStatusView::NotInstalled
+                }
+            });
+        let state = source.state.as_ref();
+        ManagedDatSourceRowView {
+            authoritative_name: name.clone(),
+            installed: source.is_installed(),
+            current_revision: state.and_then(|state| state.upstream_revision.clone()),
+            last_checked: state
+                .and_then(|state| state.last_checked_at_unix_seconds)
+                .map(format_unix_timestamp),
+            update_enabled: matches!(status, ManagedDatStatusView::UpdateAvailable { .. }),
+            busy: self
+                .managed_job
+                .as_ref()
+                .is_some_and(|job| job.authoritative_name == name),
+            status: resolution_error
+                .map_or(status, |detail| ManagedDatStatusView::Failed { detail }),
+            technical: ManagedDatTechnicalView {
+                sha256: state.map(|state| state.sha256.clone()),
+                etag: state.and_then(|state| state.etag.clone()),
+                last_modified: state.and_then(|state| state.last_modified.clone()),
+                current_path: source
+                    .current
+                    .as_ref()
+                    .map(|current| current.path().display().to_string()),
+                previous_snapshot: state
+                    .and_then(|state| state.previous_snapshot.as_ref())
+                    .map(|snapshot| snapshot.sha256.clone()),
+                previous_path: source
+                    .previous
+                    .as_ref()
+                    .map(|previous| previous.path().display().to_string()),
+            },
+        }
+    }
+
+    fn managed_row_view_without_state(
+        &self,
+        descriptor: &ManagedDatSourceDescriptor,
+        error: Option<String>,
+    ) -> ManagedDatSourceRowView {
+        let authoritative_name = descriptor.expected_softwarelist_name().to_string();
+        ManagedDatSourceRowView {
+            authoritative_name: authoritative_name.clone(),
+            installed: false,
+            current_revision: None,
+            last_checked: None,
+            status: error.map_or(ManagedDatStatusView::NotInstalled, |detail| {
+                ManagedDatStatusView::Failed { detail }
+            }),
+            update_enabled: false,
+            busy: self
+                .managed_job
+                .as_ref()
+                .is_some_and(|job| job.authoritative_name == authoritative_name),
+            technical: ManagedDatTechnicalView {
+                sha256: None,
+                etag: None,
+                last_modified: None,
+                current_path: None,
+                previous_snapshot: None,
+                previous_path: None,
+            },
         }
     }
 
@@ -3671,6 +4169,11 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) open_audit_picker: Option<String>,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
+    /// Typed MAME software-list name for the deliberately narrow managed
+    /// source add flow. There is intentionally no URL/provider field.
+    pub(crate) managed_mame_name: String,
+    pub(crate) confirm_remove_managed: Option<String>,
+    pub(crate) open_managed_technical: Option<String>,
     /// Which diagnostic group's drill-down is open, as the group's stable id.
     /// One group expands at a time; expanding another collapses this one.
     pub(crate) open_diagnostic: Option<String>,
@@ -3690,6 +4193,9 @@ impl DatSourcesPageUi {
         self.platform_query.clear();
         self.open_audit_picker = None;
         self.confirm_remove = None;
+        self.managed_mame_name.clear();
+        self.confirm_remove_managed = None;
+        self.open_managed_technical = None;
         self.open_diagnostic = None;
         self.plan_review_open = None;
         self.plan_typed_confirmation.clear();
@@ -3767,6 +4273,11 @@ pub(crate) fn show_dat_sources_page(
         ui.add_space(8.0);
     }
 
+    widgets::section_header(
+        ui,
+        "Local DAT Sources",
+        Some("User-added DAT files and folders. These stay local-only and are never updateable."),
+    );
     if view.is_empty() {
         widgets::empty_state(
             ui,
@@ -3784,6 +4295,13 @@ pub(crate) fn show_dat_sources_page(
             }
             ui.add_space(8.0);
         }
+    }
+
+    ui.add_space(12.0);
+    if action.is_none()
+        && let Some(managed_action) = show_managed_dat_sources_section(ui, view, ui_state)
+    {
+        action = Some(managed_action);
     }
 
     // The policy section is always shown: its preferences and the Effective
@@ -3879,9 +4397,302 @@ pub(crate) fn show_dat_sources_page(
     action
 }
 
+fn show_managed_dat_sources_section(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "Managed DAT Sources",
+        Some(
+            "EmuWiz-managed MAME software lists. Checks and downloads happen only after you click an action.",
+        ),
+    );
+
+    if let Some(error) = &view.managed_load_error {
+        widgets::banner(
+            ui,
+            "Managed source configuration not read",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+        ui.add_space(6.0);
+    }
+    if let Some(error) = &view.managed_action_error {
+        widgets::banner(
+            ui,
+            "Managed source action could not be completed",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+        ui.add_space(6.0);
+    }
+
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Add MAME software list").strong());
+        ui.label(
+            egui::RichText::new(
+                "Enter the authoritative MAME software-list name. EmuWiz uses its fixed built-in MAME contract; URLs and providers are not configurable here.",
+            )
+            .color(theme::muted(ui))
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Software-list name:");
+            ui.text_edit_singleline(&mut ui_state.managed_mame_name);
+            let enabled = !view.background_busy
+                && view.managed_load_error.is_none()
+                && !ui_state.managed_mame_name.trim().is_empty();
+            if widgets::action_button(
+                ui,
+                "Add managed source",
+                widgets::ActionStyle::Primary,
+                enabled,
+            )
+            .clicked()
+            {
+                action = Some(DatSourcesPageAction::AddManagedMameSoftwareList {
+                    authoritative_name: ui_state.managed_mame_name.trim().to_string(),
+                });
+                ui_state.managed_mame_name.clear();
+            }
+        });
+    });
+    ui.add_space(8.0);
+
+    if view.managed_rows.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No managed DAT sources configured",
+            "Add a MAME software-list name to configure it. This does not contact the network or download anything.",
+            None,
+        );
+        return action;
+    }
+
+    for row in &view.managed_rows {
+        if action.is_none()
+            && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+        {
+            action = Some(row_action);
+        }
+        ui.add_space(8.0);
+    }
+    action
+}
+
+fn show_managed_dat_source_row(
+    ui: &mut egui::Ui,
+    row: &ManagedDatSourceRowView,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    let busy = view.background_busy;
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("MAME software list").strong());
+            let (label, tone) = managed_dat_status_presentation(&row.status);
+            widgets::status_badge(ui, label, tone);
+            if row.busy {
+                ui.spinner();
+            }
+        });
+        ui.label(format!("System/List: {}", row.authoritative_name));
+        ui.label(
+            egui::RichText::new(if row.installed {
+                "Installed"
+            } else {
+                "Not installed"
+            })
+            .color(theme::muted(ui)),
+        );
+        if let Some(revision) = &row.current_revision {
+            ui.label(
+                egui::RichText::new(format!("Current revision: {revision}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        if let Some(last_checked) = &row.last_checked {
+            ui.label(
+                egui::RichText::new(format!("Last checked: {last_checked}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("Last checked: Never")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        match &row.status {
+            ManagedDatStatusView::UpdateAvailable { upstream_revision } => {
+                ui.label(
+                    egui::RichText::new(format!("Available revision: {upstream_revision}"))
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+            ManagedDatStatusView::RateLimited {
+                retry_after_seconds: Some(seconds),
+            } => {
+                ui.label(
+                    egui::RichText::new(format!("Retry after: {seconds}s"))
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+            ManagedDatStatusView::Failed { detail } => {
+                ui.label(
+                    egui::RichText::new(detail)
+                        .color(widgets::StatusTone::Blocked.color(ui))
+                        .small(),
+                );
+            }
+            _ => {}
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if widgets::action_button(ui, "Check", widgets::ActionStyle::Secondary, !busy).clicked()
+                && action.is_none()
+            {
+                action = Some(managed_dat_action(
+                    row.authoritative_name.clone(),
+                    ManagedDatOperation::Check,
+                ));
+            }
+            if widgets::action_button(
+                ui,
+                "Update",
+                widgets::ActionStyle::Primary,
+                !busy && row.update_enabled,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                action = Some(managed_dat_action(
+                    row.authoritative_name.clone(),
+                    ManagedDatOperation::Update,
+                ));
+            }
+            if widgets::action_button(ui, "Remove", widgets::ActionStyle::Quiet, !busy).clicked() {
+                ui_state.confirm_remove_managed = Some(row.authoritative_name.clone());
+            }
+            let technical_open =
+                ui_state.open_managed_technical.as_deref() == Some(row.authoritative_name.as_str());
+            if widgets::action_button(
+                ui,
+                if technical_open {
+                    "Hide details"
+                } else {
+                    "Technical details"
+                },
+                widgets::ActionStyle::Quiet,
+                true,
+            )
+            .clicked()
+            {
+                ui_state.open_managed_technical = if technical_open {
+                    None
+                } else {
+                    Some(row.authoritative_name.clone())
+                };
+            }
+        });
+
+        if ui_state.confirm_remove_managed.as_deref() == Some(row.authoritative_name.as_str()) {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "Remove this managed source configuration?",
+                "This removes only the configured source. Existing managed snapshots are retained and no game files are touched.",
+                widgets::StatusTone::Warning,
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Remove configuration",
+                    widgets::ActionStyle::Primary,
+                    !busy,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(DatSourcesPageAction::RemoveManagedMameSoftwareList {
+                        authoritative_name: row.authoritative_name.clone(),
+                    });
+                    ui_state.confirm_remove_managed = None;
+                }
+                if widgets::action_button(ui, "Keep it", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    ui_state.confirm_remove_managed = None;
+                }
+            });
+        }
+
+        if ui_state.open_managed_technical.as_deref() == Some(row.authoritative_name.as_str()) {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Technical details").strong());
+            managed_dat_technical_line(ui, "SHA-256", row.technical.sha256.as_deref());
+            managed_dat_technical_line(ui, "ETag", row.technical.etag.as_deref());
+            managed_dat_technical_line(ui, "Last-Modified", row.technical.last_modified.as_deref());
+            managed_dat_technical_line(ui, "Current object", row.technical.current_path.as_deref());
+            managed_dat_technical_line(
+                ui,
+                "Previous snapshot (not active)",
+                row.technical.previous_snapshot.as_deref(),
+            );
+            managed_dat_technical_line(
+                ui,
+                "Previous object (not active)",
+                row.technical.previous_path.as_deref(),
+            );
+        }
+    });
+    action
+}
+
+fn managed_dat_technical_line(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    ui.label(
+        egui::RichText::new(format!("{label}: {}", value.unwrap_or("Not recorded")))
+            .color(theme::muted(ui))
+            .small(),
+    );
+}
+
+fn managed_dat_status_presentation(status: &ManagedDatStatusView) -> (&str, widgets::StatusTone) {
+    match status {
+        ManagedDatStatusView::NotInstalled => ("Not installed", widgets::StatusTone::Pending),
+        ManagedDatStatusView::Idle => ("Ready", widgets::StatusTone::Info),
+        ManagedDatStatusView::Checking => ("Checking…", widgets::StatusTone::Pending),
+        ManagedDatStatusView::UpdateAvailable { .. } => {
+            ("Update available", widgets::StatusTone::Warning)
+        }
+        ManagedDatStatusView::UpToDate => ("Up to date", widgets::StatusTone::Success),
+        ManagedDatStatusView::Updating => ("Updating…", widgets::StatusTone::Pending),
+        ManagedDatStatusView::Updated => ("Updated successfully", widgets::StatusTone::Success),
+        ManagedDatStatusView::Offline => (
+            "Offline — existing DAT remains available",
+            widgets::StatusTone::Warning,
+        ),
+        ManagedDatStatusView::RateLimited { .. } => (
+            "Rate limited — try again later",
+            widgets::StatusTone::Warning,
+        ),
+        ManagedDatStatusView::Disabled => ("Manual updates disabled", widgets::StatusTone::Pending),
+        ManagedDatStatusView::Failed { .. } => ("Update failed", widgets::StatusTone::Blocked),
+    }
+}
+
 fn show_toolbar(ui: &mut egui::Ui, view: &DatSourcesPageView) -> Option<DatSourcesPageAction> {
     let mut action = None;
-    let busy = view.running.is_some();
+    let busy = view.background_busy;
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
             // rfd's pickers are synchronous and return `None` on cancel or
@@ -4028,7 +4839,7 @@ fn show_source_row(
     ui_state: &mut DatSourcesPageUi,
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
-    let busy_elsewhere = view.running.is_some();
+    let busy_elsewhere = view.background_busy;
 
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {

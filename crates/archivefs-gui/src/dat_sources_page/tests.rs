@@ -17,12 +17,14 @@ use std::time::{Duration, Instant};
 
 use archivefs_core::dat::audit::{AuditReport, AuditSummary};
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::managed_sources::load_managed_dat_sources_from;
 use archivefs_core::dat::model::{DatEcosystem, DatFormat};
 use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::sources::{
     DatDiagnostic, DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
     DatValidationReport, audit_run::DatAuditOutcome, load_dat_sources_config_from,
 };
+use archivefs_core::dat::updates::{ManagedDatSnapshot, ManagedDatState, save_managed_dat_state};
 use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
@@ -5002,4 +5004,251 @@ fn the_empty_state_uses_the_verify_identity_and_short_wording() {
     // "No DATs added" with the verify icon - not a long technical block.
     assert!(rendered_text_contains(&output, "[V]"));
     assert!(rendered_text_contains(&output, "No DATs added"));
+}
+
+// ---------------------------------------------------------------------------
+// Managed MAME DAT sources
+// ---------------------------------------------------------------------------
+
+#[test]
+fn managed_sources_render_in_a_separate_section_from_local_sources() {
+    let fixture = Fixture::new();
+    let local = fixture.write("MAME-local.xml", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: local });
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+
+    let view = page.view();
+    assert_eq!(view.rows.len(), 1);
+    assert_eq!(view.managed_rows.len(), 1);
+    assert_eq!(view.managed_rows[0].authoritative_name, "gamecom");
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(&output, "Local DAT Sources"));
+    assert!(rendered_text_contains(&output, "Managed DAT Sources"));
+    assert!(rendered_text_contains(&output, "System/List: gamecom"));
+}
+
+#[test]
+fn a_local_mame_named_source_never_becomes_managed() {
+    let fixture = Fixture::new();
+    let local = fixture.write("MAME.xml", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: local });
+    let id = page.view().rows[0].id.clone();
+    page.draft.get_mut(&id).unwrap().origin = Some("MAME".to_string());
+    assert_eq!(page.view().rows.len(), 1);
+    assert!(page.view().managed_rows.is_empty());
+}
+
+#[test]
+fn configured_but_uninstalled_managed_source_survives_restart() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    assert!(page.managed_config_path.exists());
+
+    let reloaded = fixture.page();
+    let view = reloaded.view();
+    assert_eq!(view.managed_rows.len(), 1);
+    assert!(!view.managed_rows[0].installed);
+    assert_eq!(
+        view.managed_rows[0].status,
+        ManagedDatStatusView::NotInstalled
+    );
+    assert!(view.managed_rows[0].current_revision.is_none());
+}
+
+#[test]
+fn managed_add_uses_only_the_typed_mame_configuration() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let persisted = load_managed_dat_sources_from(&page.managed_config_path).unwrap();
+    assert_eq!(persisted.entries().len(), 1);
+    assert_eq!(persisted.entries()[0].authoritative_name, "gamecom");
+    assert_eq!(
+        persisted.entries()[0].update_policy,
+        ManagedDatUpdatePolicy::Manual,
+        "an explicit manual GUI source must never opt into automatic checks"
+    );
+    let config_text = std::fs::read_to_string(&page.managed_config_path).unwrap();
+    assert!(!config_text.contains("http"));
+    assert!(!config_text.contains("repository"));
+}
+
+#[test]
+fn removing_managed_configuration_keeps_existing_object_files() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let object = page
+        .managed_root
+        .join("mame-software-list/gamecom/objects/keep-me");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, "immutable object").unwrap();
+
+    page.apply(DatSourcesPageAction::RemoveManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    assert!(page.view().managed_rows.is_empty());
+    assert!(object.exists(), "removing config must not delete objects");
+    assert!(
+        load_managed_dat_sources_from(&page.managed_config_path)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+}
+
+#[test]
+fn rendering_managed_sources_starts_no_worker_or_network_operation() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let view = page.view();
+    let _ = render(&view, &mut DatSourcesPageUi::default());
+    assert!(page.managed_job.is_none());
+    assert!(!page.is_busy());
+    assert_eq!(
+        page.managed_statuses.get("gamecom"),
+        None,
+        "rendering is read-only and must not synthesize a check result"
+    );
+}
+
+#[test]
+fn update_requires_a_prior_explicit_check_result() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    assert!(!page.view().managed_rows[0].update_enabled);
+
+    page.managed_statuses.insert(
+        "gamecom".to_string(),
+        ManagedDatStatusView::UpdateAvailable {
+            upstream_revision: "a".repeat(40),
+        },
+    );
+    assert!(page.view().managed_rows[0].update_enabled);
+}
+
+#[test]
+fn managed_buttons_emit_only_typed_check_and_update_actions() {
+    assert_eq!(
+        managed_dat_action("gamecom".to_string(), ManagedDatOperation::Check),
+        DatSourcesPageAction::CheckManagedDat {
+            authoritative_name: "gamecom".to_string()
+        }
+    );
+    assert_eq!(
+        managed_dat_action("gamecom".to_string(), ManagedDatOperation::Update),
+        DatSourcesPageAction::UpdateManagedDat {
+            authoritative_name: "gamecom".to_string()
+        }
+    );
+}
+
+#[test]
+fn installed_current_and_previous_snapshots_refresh_the_managed_row_without_promoting_previous() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let descriptor = page.managed_sources.entries()[0].descriptor().unwrap();
+    let current = "a".repeat(64);
+    let previous = "b".repeat(64);
+    let objects = page
+        .managed_root
+        .join(descriptor.source_id().storage_relative_path())
+        .join("objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join(&current), "current XML").unwrap();
+    std::fs::write(objects.join(&previous), "previous XML").unwrap();
+    let mut state = ManagedDatState::new(
+        &descriptor,
+        ManagedDatSnapshot::new(current.clone()).unwrap(),
+    )
+    .unwrap();
+    state.previous_snapshot = Some(ManagedDatSnapshot::new(previous.clone()).unwrap());
+    state.upstream_revision = Some("c".repeat(40));
+    state.sha256 = current.clone();
+    save_managed_dat_state(&page.managed_root, &state).unwrap();
+
+    let view = page.view();
+    let row = &view.managed_rows[0];
+    assert!(row.installed);
+    assert_eq!(row.current_revision, Some("c".repeat(40)));
+    assert_eq!(row.technical.sha256, Some(current.clone()));
+    assert_eq!(row.technical.previous_snapshot, Some(previous.clone()));
+    assert!(
+        row.technical
+            .current_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(&current))
+    );
+    assert!(
+        row.technical
+            .previous_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(&previous))
+    );
+    assert_ne!(row.technical.current_path, row.technical.previous_path);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    ui_state.open_managed_technical = Some("gamecom".to_string());
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "Previous snapshot (not active)"
+    ));
+}
+
+#[test]
+fn managed_outcomes_have_honest_non_destructive_presentations() {
+    assert_eq!(
+        managed_dat_status_from_outcome(ManagedDatUpdateOutcome::UpToDate {
+            upstream_revision: None,
+        }),
+        ManagedDatStatusView::UpToDate
+    );
+    assert!(matches!(
+        managed_dat_status_from_outcome(ManagedDatUpdateOutcome::UpdateAvailable {
+            upstream_revision: "a".repeat(40),
+        }),
+        ManagedDatStatusView::UpdateAvailable { .. }
+    ));
+    assert_eq!(
+        managed_dat_status_from_outcome(ManagedDatUpdateOutcome::Offline),
+        ManagedDatStatusView::Offline
+    );
+    assert_eq!(
+        managed_dat_status_from_outcome(ManagedDatUpdateOutcome::RateLimited {
+            retry_after_seconds: Some(60),
+        }),
+        ManagedDatStatusView::RateLimited {
+            retry_after_seconds: Some(60)
+        }
+    );
+    let validation = managed_dat_status_from_outcome(ManagedDatUpdateOutcome::Failed {
+        kind: ManagedDatUpdateFailureKind::Parser,
+        detail: "bad XML".to_string(),
+    });
+    assert!(matches!(
+        validation,
+        ManagedDatStatusView::Failed { ref detail }
+            if detail.contains("Downloaded DAT failed validation; current copy kept")
+    ));
 }
