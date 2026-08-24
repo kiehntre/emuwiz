@@ -31,13 +31,14 @@
 //!
 //! # Nothing here writes to a ROM
 //!
-//! The only file this page writes is its own registry, through the core's
-//! durable-write path. Validation reads DAT files; an audit reads DAT files and
-//! ROMs. Removing a source removes a registry entry. There is no rename, move,
-//! delete, archive rewrite, or symlink change anywhere on this page, and none
-//! is deferred behind a flag - the capability is simply not present.
+//! The page writes only its own durable DAT configuration: the local registry,
+//! typed managed-source configuration, and persisted TOSEC pack selections.
+//! Validation reads DAT files; an audit reads DAT files and ROMs. Removing a
+//! source removes a registry entry. There is no rename, move, delete, archive
+//! rewrite, or symlink change anywhere on this page, and none is deferred
+//! behind a flag - the capability is simply not present.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,8 +50,9 @@ use archivefs_core::dat::classification::{
 };
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::managed_sources::{
-    ManagedDatSources, ResolvedManagedDatSource, default_managed_dat_sources_config_path,
-    load_managed_dat_sources_from, resolve_managed_dat_sources, save_managed_dat_sources_to,
+    ManagedDatSources, default_managed_dat_sources_config_path, load_managed_dat_sources_from,
+    resolve_managed_dat_sources, resolve_redump_bios_sources, resolve_redump_games_sources,
+    save_managed_dat_sources_to,
 };
 use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::policy::{
@@ -72,10 +74,16 @@ use archivefs_core::dat::sources::{
     DatValidationReport, UnresolvedDatSetting, load_dat_sources_config_from,
     save_dat_sources_config_to, suggest_display_name, validate_dat_source,
 };
+use archivefs_core::dat::tosec_release_pack::{
+    PackAvailability, PersistedTosecPack, TosecPackDat, TosecSelectionKey,
+    apply_selection_to_registry, default_tosec_packs_path, inventory_release_pack,
+    load_tosec_packs, save_tosec_packs,
+};
 use archivefs_core::dat::updates::{
-    HttpsManagedDatTransport, ManagedDatSourceDescriptor, ManagedDatUpdateFailureKind,
-    ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy,
-    check_managed_dat_update, managed_dat_root, update_managed_dat,
+    HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
+    ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState, ManagedDatUpdateFailureKind,
+    ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy, RedumpBiosSystem,
+    RedumpGameSystem, check_managed_dat_update, managed_dat_root, update_managed_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -468,8 +476,18 @@ pub(crate) struct DatSourcesPageView {
     /// Separately configured, app-managed DATs. These are never inferred from
     /// a local source's name, origin, or path.
     pub(crate) managed_rows: Vec<ManagedDatSourceRowView>,
+    /// Fixed Redump BIOS datasets are separate from ordinary game/disc DATs
+    /// even though both use the same typed managed-DAT updater.
+    pub(crate) redump_bios_rows: Vec<ManagedDatSourceRowView>,
+    /// The deliberately closed set of ordinary Redump game/disc datasets.
+    /// Unconfigured systems remain visible so configuration is explicit.
+    pub(crate) redump_game_rows: Vec<ManagedDatSourceRowView>,
     pub(crate) managed_load_error: Option<String>,
     pub(crate) managed_action_error: Option<String>,
+    pub(crate) tosec_packs: Vec<TosecPackView>,
+    pub(crate) tosec_load_error: Option<String>,
+    pub(crate) tosec_action_error: Option<String>,
+    pub(crate) tosec_last_apply: Option<TosecApplyView>,
     pub(crate) unresolved: Vec<UnresolvedDatRowView>,
     /// Problems found while reading the file that this build could not act on
     /// (an unusable ID, a second entry claiming one ID).
@@ -511,7 +529,12 @@ impl DatSourcesPageView {
 /// One explicitly configured, typed managed MAME software-list source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedDatSourceRowView {
+    pub(crate) source_id: ManagedDatSourceId,
+    pub(crate) provider: ManagedDatProvider,
+    pub(crate) source_label: String,
     pub(crate) authoritative_name: String,
+    pub(crate) configured: bool,
+    pub(crate) update_policy: ManagedDatUpdatePolicy,
     pub(crate) installed: bool,
     pub(crate) current_revision: Option<String>,
     pub(crate) last_checked: Option<String>,
@@ -519,6 +542,36 @@ pub(crate) struct ManagedDatSourceRowView {
     pub(crate) update_enabled: bool,
     pub(crate) busy: bool,
     pub(crate) technical: ManagedDatTechnicalView,
+}
+
+/// A bounded, read-only projection of one persisted TOSEC release pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TosecPackView {
+    pub(crate) pack_id: String,
+    pub(crate) root_path: PathBuf,
+    pub(crate) availability: PackAvailability,
+    pub(crate) imported_at: String,
+    pub(crate) dat_count: usize,
+    pub(crate) selected_dat_count: usize,
+    pub(crate) groups: Vec<TosecSelectionGroupView>,
+    pub(crate) deferred_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TosecSelectionGroupView {
+    pub(crate) key: TosecSelectionKey,
+    pub(crate) dat_count: usize,
+    pub(crate) selected: bool,
+    pub(crate) deferred_count: usize,
+    pub(crate) raw_categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TosecApplyView {
+    pub(crate) pack_id: String,
+    pub(crate) registered: usize,
+    pub(crate) removed: usize,
+    pub(crate) failed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,11 +1083,37 @@ pub(crate) enum DatSourcesPageAction {
     RemoveManagedMameSoftwareList {
         authoritative_name: String,
     },
+    AddManagedRedumpBios {
+        system: RedumpBiosSystem,
+    },
+    RemoveManagedRedumpBios {
+        system: RedumpBiosSystem,
+    },
+    AddManagedRedumpGames {
+        system: RedumpGameSystem,
+    },
+    RemoveManagedRedumpGames {
+        system: RedumpGameSystem,
+    },
     CheckManagedDat {
-        authoritative_name: String,
+        source_id: ManagedDatSourceId,
     },
     UpdateManagedDat {
-        authoritative_name: String,
+        source_id: ManagedDatSourceId,
+    },
+    ImportTosecReleasePack {
+        root: PathBuf,
+    },
+    RemoveTosecReleasePack {
+        pack_id: String,
+    },
+    SetTosecSelection {
+        pack_id: String,
+        key: TosecSelectionKey,
+        enabled: bool,
+    },
+    ApplyTosecSelection {
+        pack_id: String,
     },
     CancelJob,
     Save,
@@ -1166,19 +1245,17 @@ enum ManagedDatOperation {
 }
 
 fn managed_dat_action(
-    authoritative_name: String,
+    source_id: ManagedDatSourceId,
     operation: ManagedDatOperation,
 ) -> DatSourcesPageAction {
     match operation {
-        ManagedDatOperation::Check => DatSourcesPageAction::CheckManagedDat { authoritative_name },
-        ManagedDatOperation::Update => {
-            DatSourcesPageAction::UpdateManagedDat { authoritative_name }
-        }
+        ManagedDatOperation::Check => DatSourcesPageAction::CheckManagedDat { source_id },
+        ManagedDatOperation::Update => DatSourcesPageAction::UpdateManagedDat { source_id },
     }
 }
 
 struct ManagedDatJobMessage {
-    authoritative_name: String,
+    source_id: ManagedDatSourceId,
     result: archivefs_core::Result<ManagedDatUpdateOutcome>,
 }
 
@@ -1186,7 +1263,7 @@ struct ManagedDatJobMessage {
 /// Unlike local validation/audit jobs it is not cancellable: the core updater
 /// has no cancellation contract, so presenting a cancel button would lie.
 struct RunningManagedDatJob {
-    authoritative_name: String,
+    source_id: ManagedDatSourceId,
     messages: Receiver<ManagedDatJobMessage>,
 }
 
@@ -1710,6 +1787,13 @@ pub(crate) struct DatSourcesPageState {
     managed_action_error: Option<String>,
     managed_statuses: BTreeMap<String, ManagedDatStatusView>,
     managed_job: Option<RunningManagedDatJob>,
+    /// Persisted, user-selected local TOSEC release packs. This is wholly
+    /// separate from both the local DAT registry and managed remote sources.
+    tosec_packs_path: PathBuf,
+    tosec_packs: Vec<PersistedTosecPack>,
+    tosec_load_error: Option<String>,
+    tosec_action_error: Option<String>,
+    tosec_last_apply: Option<TosecApplyView>,
     /// Existing EmuWiz catalogue to enrich after a completed audit. Absent
     /// in injected tests and when no catalogue exists.
     database_path: Option<PathBuf>,
@@ -1860,6 +1944,21 @@ impl DatSourcesPageState {
                 Ok(sources) => (sources, None),
                 Err(error) => (ManagedDatSources::new(), Some(error.to_string())),
             };
+        // Keep injected/test pages inside the supplied configuration tree;
+        // production callers pass the normal app-owned default path above.
+        let tosec_packs_path = if managed_config_path
+            == default_managed_dat_sources_config_path()
+                .unwrap_or_else(|_| config_path.with_file_name("managed_dat_sources.toml"))
+        {
+            default_tosec_packs_path()
+                .unwrap_or_else(|_| config_path.with_file_name("tosec_release_packs.json"))
+        } else {
+            config_path.with_file_name("tosec_release_packs.json")
+        };
+        let (tosec_packs, tosec_load_error) = match load_tosec_packs(&tosec_packs_path) {
+            Ok(packs) => (packs, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         // The durable journal directory and any transactions found in it that
         // are still actionable: settled `Applied` batches offered for rollback
         // and interrupted batches offered for explicit crash recovery. Uses
@@ -1877,6 +1976,11 @@ impl DatSourcesPageState {
             managed_action_error: None,
             managed_statuses: BTreeMap::new(),
             managed_job: None,
+            tosec_packs_path,
+            tosec_packs,
+            tosec_load_error,
+            tosec_action_error: None,
+            tosec_last_apply: None,
             database_path: None,
             saved,
             draft,
@@ -2339,11 +2443,35 @@ impl DatSourcesPageState {
             DatSourcesPageAction::RemoveManagedMameSoftwareList { authoritative_name } => {
                 self.remove_managed_mame_software_list(&authoritative_name);
             }
-            DatSourcesPageAction::CheckManagedDat { authoritative_name } => {
-                self.start_managed_dat_operation(authoritative_name, ManagedDatOperation::Check);
+            DatSourcesPageAction::AddManagedRedumpBios { system } => {
+                self.add_managed_redump_bios(system);
             }
-            DatSourcesPageAction::UpdateManagedDat { authoritative_name } => {
-                self.start_managed_dat_operation(authoritative_name, ManagedDatOperation::Update);
+            DatSourcesPageAction::RemoveManagedRedumpBios { system } => {
+                self.remove_managed_redump_bios(system);
+            }
+            DatSourcesPageAction::AddManagedRedumpGames { system } => {
+                self.add_managed_redump_games(system);
+            }
+            DatSourcesPageAction::RemoveManagedRedumpGames { system } => {
+                self.remove_managed_redump_games(system);
+            }
+            DatSourcesPageAction::CheckManagedDat { source_id } => {
+                self.start_managed_dat_operation(source_id, ManagedDatOperation::Check);
+            }
+            DatSourcesPageAction::UpdateManagedDat { source_id } => {
+                self.start_managed_dat_operation(source_id, ManagedDatOperation::Update);
+            }
+            DatSourcesPageAction::ImportTosecReleasePack { root } => self.import_tosec_pack(root),
+            DatSourcesPageAction::RemoveTosecReleasePack { pack_id } => {
+                self.remove_tosec_pack(&pack_id);
+            }
+            DatSourcesPageAction::SetTosecSelection {
+                pack_id,
+                key,
+                enabled,
+            } => self.set_tosec_selection(&pack_id, key, enabled),
+            DatSourcesPageAction::ApplyTosecSelection { pack_id } => {
+                self.apply_tosec_selection(&pack_id);
             }
             DatSourcesPageAction::CancelJob => {
                 if let Some(job) = self.job.as_mut() {
@@ -2819,9 +2947,255 @@ impl DatSourcesPageState {
         match save_managed_dat_sources_to(&self.managed_config_path, &next) {
             Ok(()) => {
                 self.managed_sources = next;
-                self.managed_statuses.remove(authoritative_name);
+                self.managed_statuses.remove(&managed_source_key(
+                    &ManagedDatSourceId::mame_software_list(authoritative_name.to_string())
+                        .expect("configured MAME source names were validated by core"),
+                ));
             }
             Err(error) => self.managed_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn save_managed_sources(&mut self, next: ManagedDatSources) {
+        match save_managed_dat_sources_to(&self.managed_config_path, &next) {
+            Ok(()) => self.managed_sources = next,
+            Err(error) => self.managed_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn can_change_managed_sources(&mut self) -> bool {
+        self.managed_action_error = None;
+        if self.managed_job.is_some() || self.managed_load_error.is_some() {
+            if self.managed_load_error.is_some() {
+                self.managed_action_error = Some(
+                    "Not changing managed sources: their existing configuration could not be read."
+                        .to_string(),
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    fn add_managed_redump_bios(&mut self, system: RedumpBiosSystem) {
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if let Err(error) = next.add_redump_bios(system, ManagedDatUpdatePolicy::Manual) {
+            self.managed_action_error = Some(error.to_string());
+            return;
+        }
+        self.save_managed_sources(next);
+    }
+
+    fn remove_managed_redump_bios(&mut self, system: RedumpBiosSystem) {
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if next.remove_redump_bios(system).is_none() {
+            return;
+        }
+        let source_id = ManagedDatSourceId::redump_bios(system);
+        self.managed_statuses
+            .remove(&managed_source_key(&source_id));
+        self.save_managed_sources(next);
+    }
+
+    fn add_managed_redump_games(&mut self, system: RedumpGameSystem) {
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if let Err(error) = next.add_redump_games(system, ManagedDatUpdatePolicy::Manual) {
+            self.managed_action_error = Some(error.to_string());
+            return;
+        }
+        self.save_managed_sources(next);
+    }
+
+    fn remove_managed_redump_games(&mut self, system: RedumpGameSystem) {
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if next.remove_redump_games(system).is_none() {
+            return;
+        }
+        let source_id = ManagedDatSourceId::redump_games(system);
+        self.managed_statuses
+            .remove(&managed_source_key(&source_id));
+        self.save_managed_sources(next);
+    }
+
+    /// Imports a user-selected, already-extracted release-pack directory.
+    /// Inventory is strictly read-only; registration remains a separate,
+    /// explicit action after the user has enabled groups.
+    fn import_tosec_pack(&mut self, root: PathBuf) {
+        self.tosec_action_error = None;
+        if self.tosec_load_error.is_some() {
+            self.tosec_action_error = Some(
+                "Not changing TOSEC release packs: existing pack configuration could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        let inventory = match inventory_release_pack(&root) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                self.tosec_action_error = Some(error.to_string());
+                return;
+            }
+        };
+        if self
+            .tosec_packs
+            .iter()
+            .any(|pack| pack.pack_id == inventory.pack_id)
+        {
+            self.tosec_action_error = Some(
+                "This TOSEC release pack is already configured. Remove it first before importing a new inventory."
+                    .to_string(),
+            );
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let mut next = self.tosec_packs.clone();
+        next.push(PersistedTosecPack {
+            pack_id: inventory.pack_id,
+            root_path: inventory.pack_root,
+            imported_unix_seconds: now,
+            selections: BTreeSet::new(),
+            dats: inventory.dats,
+        });
+        next.sort_by(|left, right| left.pack_id.cmp(&right.pack_id));
+        match save_tosec_packs(&self.tosec_packs_path, &next) {
+            Ok(()) => self.tosec_packs = next,
+            Err(error) => self.tosec_action_error = Some(error.to_string()),
+        }
+    }
+
+    /// Removing a pack changes its saved selection/inventory configuration
+    /// only. Already registered local DAT entries remain until the user makes
+    /// an explicit selection application while the pack still exists.
+    fn remove_tosec_pack(&mut self, pack_id: &str) {
+        self.tosec_action_error = None;
+        if self.tosec_load_error.is_some() {
+            self.tosec_action_error = Some(
+                "Not changing TOSEC release packs: existing pack configuration could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut next = self.tosec_packs.clone();
+        let before = next.len();
+        next.retain(|pack| pack.pack_id != pack_id);
+        if next.len() == before {
+            return;
+        }
+        match save_tosec_packs(&self.tosec_packs_path, &next) {
+            Ok(()) => self.tosec_packs = next,
+            Err(error) => self.tosec_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn set_tosec_selection(&mut self, pack_id: &str, key: TosecSelectionKey, enabled: bool) {
+        self.tosec_action_error = None;
+        if self.tosec_load_error.is_some() {
+            self.tosec_action_error = Some(
+                "Not changing TOSEC release packs: existing pack configuration could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut next = self.tosec_packs.clone();
+        let Some(pack) = next.iter_mut().find(|pack| pack.pack_id == pack_id) else {
+            return;
+        };
+        if enabled {
+            let selected_group: Vec<_> = pack
+                .dats
+                .iter()
+                .filter(|dat| dat.selection_key() == key)
+                .collect();
+            if selected_group.is_empty() {
+                self.tosec_action_error = Some(
+                    "That TOSEC selection group is no longer present in the stored inventory."
+                        .to_string(),
+                );
+                return;
+            }
+            if selected_group.iter().any(|dat| tosec_dat_is_deferred(dat)) {
+                self.tosec_action_error = Some(
+                    "TOSEC-ISO and TOSEC-PIX catalogues are deferred by current TOSEC support and cannot be enabled."
+                        .to_string(),
+                );
+                return;
+            }
+            pack.selections.insert(key);
+        } else {
+            pack.selections.remove(&key);
+        }
+        match save_tosec_packs(&self.tosec_packs_path, &next) {
+            Ok(()) => self.tosec_packs = next,
+            Err(error) => self.tosec_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn apply_tosec_selection(&mut self, pack_id: &str) {
+        self.tosec_action_error = None;
+        self.tosec_last_apply = None;
+        if self.is_busy() || self.tosec_load_error.is_some() || self.load_error.is_some() {
+            self.tosec_action_error = Some(
+                "Cannot apply TOSEC selections while a DAT operation is running or the local DAT registry could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        if self.is_dirty() {
+            self.tosec_action_error = Some(
+                "Save or revert local DAT source edits before applying TOSEC selections, so no local changes are lost."
+                    .to_string(),
+            );
+            return;
+        }
+        let Some(pack) = self.tosec_packs.iter().find(|pack| pack.pack_id == pack_id) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        match apply_selection_to_registry(pack, &self.config_path, now) {
+            Ok(outcome) => match load_dat_sources_config_from(&self.config_path) {
+                Ok(config) => {
+                    let (registry, problems) = DatSourceRegistry::from_config(&config);
+                    self.saved = registry.clone();
+                    self.draft = registry;
+                    self.load_problems = problems;
+                    self.tosec_last_apply = Some(TosecApplyView {
+                        pack_id: pack_id.to_string(),
+                        registered: outcome.registered.len(),
+                        removed: outcome.removed.len(),
+                        failed: outcome.failed.len(),
+                    });
+                    if !outcome.failed.is_empty() {
+                        self.tosec_action_error = Some(format!(
+                            "{} selected TOSEC DAT(s) were not registered. They remain unregistered; existing known-good entries were kept.",
+                            outcome.failed.len()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.tosec_action_error = Some(format!(
+                        "TOSEC selection was applied, but the local DAT registry could not be reloaded: {error}"
+                    ));
+                }
+            },
+            Err(error) => self.tosec_action_error = Some(error.to_string()),
         }
     }
 
@@ -2829,30 +3203,32 @@ impl DatSourcesPageState {
     /// solely from an explicit page action, never while loading or rendering.
     fn start_managed_dat_operation(
         &mut self,
-        authoritative_name: String,
+        source_id: ManagedDatSourceId,
         operation: ManagedDatOperation,
     ) {
         if self.is_busy() || self.managed_load_error.is_some() {
             return;
         }
-        let Some(config) = self
-            .managed_sources
-            .entries()
-            .iter()
-            .find(|entry| entry.authoritative_name == authoritative_name)
-        else {
-            return;
-        };
-        let descriptor = match config.descriptor() {
+        let descriptor = match self.managed_sources.descriptors().and_then(|descriptors| {
+            descriptors
+                .into_iter()
+                .find(|descriptor| descriptor.source_id() == &source_id)
+                .ok_or_else(|| {
+                    archivefs_core::ArchiveFsError::Config(
+                        "managed DAT source is not configured".to_string(),
+                    )
+                })
+        }) {
             Ok(descriptor) => descriptor,
             Err(error) => {
                 self.managed_action_error = Some(error.to_string());
                 return;
             }
         };
+        let source_key = managed_source_key(&source_id);
         if operation == ManagedDatOperation::Update
             && !matches!(
-                self.managed_statuses.get(&authoritative_name),
+                self.managed_statuses.get(&source_key),
                 Some(ManagedDatStatusView::UpdateAvailable { .. })
             )
         {
@@ -2860,7 +3236,7 @@ impl DatSourcesPageState {
         }
         self.managed_action_error = None;
         self.managed_statuses.insert(
-            authoritative_name.clone(),
+            source_key,
             match operation {
                 ManagedDatOperation::Check => ManagedDatStatusView::Checking,
                 ManagedDatOperation::Update => ManagedDatStatusView::Updating,
@@ -2868,7 +3244,7 @@ impl DatSourcesPageState {
         );
         let managed_root = self.managed_root.clone();
         let (sender, messages) = sync_channel(1);
-        let worker_name = authoritative_name.clone();
+        let worker_source_id = source_id.clone();
         std::thread::spawn(move || {
             let now_unix_seconds = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2885,12 +3261,12 @@ impl DatSourcesPageState {
                 }
             };
             let _ = sender.send(ManagedDatJobMessage {
-                authoritative_name: worker_name,
+                source_id: worker_source_id,
                 result,
             });
         });
         self.managed_job = Some(RunningManagedDatJob {
-            authoritative_name,
+            source_id,
             messages,
         });
     }
@@ -2911,14 +3287,14 @@ impl DatSourcesPageState {
                     },
                 };
                 self.managed_statuses
-                    .insert(message.authoritative_name, status);
+                    .insert(managed_source_key(&message.source_id), status);
                 self.managed_job = None;
                 true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.managed_statuses.insert(
-                    job.authoritative_name.clone(),
+                    managed_source_key(&job.source_id),
                     ManagedDatStatusView::Failed {
                         detail: "Managed DAT worker stopped before reporting a result".to_string(),
                     },
@@ -3134,8 +3510,14 @@ impl DatSourcesPageState {
 
         DatSourcesPageView {
             managed_rows: self.managed_rows_view(),
+            redump_bios_rows: self.redump_bios_rows_view(),
+            redump_game_rows: self.redump_game_rows_view(),
             managed_load_error: self.managed_load_error.clone(),
             managed_action_error: self.managed_action_error.clone(),
+            tosec_packs: self.tosec_packs_view(),
+            tosec_load_error: self.tosec_load_error.clone(),
+            tosec_action_error: self.tosec_action_error.clone(),
+            tosec_last_apply: self.tosec_last_apply.clone(),
             unresolved: self
                 .draft
                 .unresolved_settings()
@@ -3210,9 +3592,19 @@ impl DatSourcesPageState {
                     ));
                 }
                 match resolve_managed_dat_sources(&one_source, &self.managed_root) {
-                    Ok(mut sources) => sources
-                        .pop()
-                        .map(|source| self.managed_row_view(&source, None)),
+                    Ok(mut sources) => sources.pop().map(|source| {
+                        self.managed_row_from_parts(
+                            source.descriptor,
+                            ManagedDatProvider::MameSoftwareList,
+                            format!("System/List: {}", source.config.authoritative_name),
+                            true,
+                            source.config.update_policy,
+                            source.state.as_ref(),
+                            source.current.as_ref(),
+                            source.previous.as_ref(),
+                            None,
+                        )
+                    }),
                     Err(error) => Some(self.managed_row_view_without_state(
                         &descriptor,
                         Some(format!("Managed state could not be resolved: {error}")),
@@ -3222,27 +3614,42 @@ impl DatSourcesPageState {
             .collect()
     }
 
-    fn managed_row_view(
+    fn managed_row_from_parts(
         &self,
-        source: &ResolvedManagedDatSource,
+        descriptor: ManagedDatSourceDescriptor,
+        provider: ManagedDatProvider,
+        source_label: String,
+        configured: bool,
+        update_policy: ManagedDatUpdatePolicy,
+        state: Option<&ManagedDatState>,
+        current: Option<&ManagedDatReadOnlySource>,
+        previous: Option<&ManagedDatReadOnlySource>,
         resolution_error: Option<String>,
     ) -> ManagedDatSourceRowView {
-        let name = source.config.authoritative_name.clone();
-        let status = self
-            .managed_statuses
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| {
-                if source.is_installed() {
-                    ManagedDatStatusView::Idle
-                } else {
-                    ManagedDatStatusView::NotInstalled
-                }
-            });
-        let state = source.state.as_ref();
+        let source_id = descriptor.source_id().clone();
+        let key = managed_source_key(&source_id);
+        let authoritative_name = if descriptor.expected_softwarelist_name().is_empty() {
+            source_label.clone()
+        } else {
+            descriptor.expected_softwarelist_name().to_string()
+        };
+        let status = self.managed_statuses.get(&key).cloned().unwrap_or_else(|| {
+            if !configured {
+                ManagedDatStatusView::NotInstalled
+            } else if current.is_some() {
+                ManagedDatStatusView::Idle
+            } else {
+                ManagedDatStatusView::NotInstalled
+            }
+        });
         ManagedDatSourceRowView {
-            authoritative_name: name.clone(),
-            installed: source.is_installed(),
+            source_id: source_id.clone(),
+            provider,
+            source_label,
+            authoritative_name,
+            configured,
+            update_policy,
+            installed: current.is_some(),
             current_revision: state.and_then(|state| state.upstream_revision.clone()),
             last_checked: state
                 .and_then(|state| state.last_checked_at_unix_seconds)
@@ -3251,24 +3658,18 @@ impl DatSourcesPageState {
             busy: self
                 .managed_job
                 .as_ref()
-                .is_some_and(|job| job.authoritative_name == name),
+                .is_some_and(|job| job.source_id == source_id),
             status: resolution_error
                 .map_or(status, |detail| ManagedDatStatusView::Failed { detail }),
             technical: ManagedDatTechnicalView {
                 sha256: state.map(|state| state.sha256.clone()),
                 etag: state.and_then(|state| state.etag.clone()),
                 last_modified: state.and_then(|state| state.last_modified.clone()),
-                current_path: source
-                    .current
-                    .as_ref()
-                    .map(|current| current.path().display().to_string()),
+                current_path: current.map(|current| current.path().display().to_string()),
                 previous_snapshot: state
                     .and_then(|state| state.previous_snapshot.as_ref())
                     .map(|snapshot| snapshot.sha256.clone()),
-                previous_path: source
-                    .previous
-                    .as_ref()
-                    .map(|previous| previous.path().display().to_string()),
+                previous_path: previous.map(|previous| previous.path().display().to_string()),
             },
         }
     }
@@ -3278,29 +3679,155 @@ impl DatSourcesPageState {
         descriptor: &ManagedDatSourceDescriptor,
         error: Option<String>,
     ) -> ManagedDatSourceRowView {
-        let authoritative_name = descriptor.expected_softwarelist_name().to_string();
-        ManagedDatSourceRowView {
-            authoritative_name: authoritative_name.clone(),
-            installed: false,
-            current_revision: None,
-            last_checked: None,
-            status: error.map_or(ManagedDatStatusView::NotInstalled, |detail| {
-                ManagedDatStatusView::Failed { detail }
-            }),
-            update_enabled: false,
-            busy: self
-                .managed_job
-                .as_ref()
-                .is_some_and(|job| job.authoritative_name == authoritative_name),
-            technical: ManagedDatTechnicalView {
-                sha256: None,
-                etag: None,
-                last_modified: None,
-                current_path: None,
-                previous_snapshot: None,
-                previous_path: None,
-            },
+        self.managed_row_from_parts(
+            descriptor.clone(),
+            ManagedDatProvider::MameSoftwareList,
+            format!("System/List: {}", descriptor.expected_softwarelist_name()),
+            true,
+            ManagedDatUpdatePolicy::Manual,
+            None,
+            None,
+            None,
+            error,
+        )
+    }
+
+    fn redump_bios_rows_view(&self) -> Vec<ManagedDatSourceRowView> {
+        [
+            RedumpBiosSystem::PlayStation,
+            RedumpBiosSystem::PlayStation2,
+            RedumpBiosSystem::Xbox,
+        ]
+        .into_iter()
+        .map(|system| self.redump_bios_row_view(system))
+        .collect()
+    }
+
+    fn redump_bios_row_view(&self, system: RedumpBiosSystem) -> ManagedDatSourceRowView {
+        let descriptor = ManagedDatSourceDescriptor::redump_bios(system)
+            .expect("closed Redump BIOS systems must have valid descriptors");
+        let configured = self
+            .managed_sources
+            .redump_bios_entries()
+            .iter()
+            .find(|entry| entry.system == system);
+        let policy = configured
+            .map(|entry| entry.update_policy)
+            .unwrap_or(ManagedDatUpdatePolicy::Manual);
+        let mut one = ManagedDatSources::new();
+        if configured.is_some() && one.add_redump_bios(system, policy).is_ok() {
+            match resolve_redump_bios_sources(&one, &self.managed_root) {
+                Ok(mut sources) => {
+                    let source = sources.pop().expect("one configured Redump BIOS source");
+                    return self.managed_row_from_parts(
+                        source.descriptor,
+                        ManagedDatProvider::RedumpBios,
+                        format!("System: {}", redump_bios_label(system)),
+                        true,
+                        policy,
+                        source.state.as_ref(),
+                        source.current.as_ref(),
+                        source.previous.as_ref(),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    return self.managed_row_from_parts(
+                        descriptor,
+                        ManagedDatProvider::RedumpBios,
+                        format!("System: {}", redump_bios_label(system)),
+                        true,
+                        policy,
+                        None,
+                        None,
+                        None,
+                        Some(format!("Managed state could not be resolved: {error}")),
+                    );
+                }
+            }
         }
+        self.managed_row_from_parts(
+            descriptor,
+            ManagedDatProvider::RedumpBios,
+            format!("System: {}", redump_bios_label(system)),
+            false,
+            policy,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn redump_game_rows_view(&self) -> Vec<ManagedDatSourceRowView> {
+        [
+            RedumpGameSystem::PlayStation,
+            RedumpGameSystem::PlayStation2,
+            RedumpGameSystem::Xbox,
+        ]
+        .into_iter()
+        .map(|system| self.redump_game_row_view(system))
+        .collect()
+    }
+
+    fn redump_game_row_view(&self, system: RedumpGameSystem) -> ManagedDatSourceRowView {
+        let descriptor = ManagedDatSourceDescriptor::redump_games(system)
+            .expect("closed Redump game systems must have valid descriptors");
+        let configured = self
+            .managed_sources
+            .redump_games_entries()
+            .iter()
+            .find(|entry| entry.system == system);
+        let policy = configured
+            .map(|entry| entry.update_policy)
+            .unwrap_or(ManagedDatUpdatePolicy::Manual);
+        let mut one = ManagedDatSources::new();
+        if configured.is_some() && one.add_redump_games(system, policy).is_ok() {
+            match resolve_redump_games_sources(&one, &self.managed_root) {
+                Ok(mut sources) => {
+                    let source = sources.pop().expect("one configured Redump game source");
+                    return self.managed_row_from_parts(
+                        source.descriptor,
+                        ManagedDatProvider::RedumpGames,
+                        format!("System: {}", redump_game_label(system)),
+                        true,
+                        policy,
+                        source.state.as_ref(),
+                        source.current.as_ref(),
+                        source.previous.as_ref(),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    return self.managed_row_from_parts(
+                        descriptor,
+                        ManagedDatProvider::RedumpGames,
+                        format!("System: {}", redump_game_label(system)),
+                        true,
+                        policy,
+                        None,
+                        None,
+                        None,
+                        Some(format!("Managed state could not be resolved: {error}")),
+                    );
+                }
+            }
+        }
+        self.managed_row_from_parts(
+            descriptor,
+            ManagedDatProvider::RedumpGames,
+            format!("System: {}", redump_game_label(system)),
+            false,
+            policy,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn tosec_packs_view(&self) -> Vec<TosecPackView> {
+        self.tosec_packs.iter().map(tosec_pack_view).collect()
     }
 
     /// Builds the apply/recovery view. Pure: it renders the core's built
@@ -4172,8 +4699,12 @@ pub(crate) struct DatSourcesPageUi {
     /// Typed MAME software-list name for the deliberately narrow managed
     /// source add flow. There is intentionally no URL/provider field.
     pub(crate) managed_mame_name: String,
-    pub(crate) confirm_remove_managed: Option<String>,
-    pub(crate) open_managed_technical: Option<String>,
+    pub(crate) confirm_remove_managed: Option<ManagedDatSourceId>,
+    pub(crate) open_managed_technical: Option<ManagedDatSourceId>,
+    /// Per-pack free-text group filter. It limits rendering only; persisted
+    /// selection remains the typed System/Category/Media key.
+    pub(crate) tosec_group_filter: BTreeMap<String, String>,
+    pub(crate) show_tosec_raw: BTreeSet<String>,
     /// Which diagnostic group's drill-down is open, as the group's stable id.
     /// One group expands at a time; expanding another collapses this one.
     pub(crate) open_diagnostic: Option<String>,
@@ -4196,6 +4727,8 @@ impl DatSourcesPageUi {
         self.managed_mame_name.clear();
         self.confirm_remove_managed = None;
         self.open_managed_technical = None;
+        self.tosec_group_filter.clear();
+        self.show_tosec_raw.clear();
         self.open_diagnostic = None;
         self.plan_review_open = None;
         self.plan_typed_confirmation.clear();
@@ -4304,6 +4837,13 @@ pub(crate) fn show_dat_sources_page(
         action = Some(managed_action);
     }
 
+    ui.add_space(12.0);
+    if action.is_none()
+        && let Some(tosec_action) = show_tosec_release_packs_section(ui, view, ui_state)
+    {
+        action = Some(tosec_action);
+    }
+
     // The policy section is always shown: its preferences and the Effective
     // Policy Summary are meaningful even before any source is registered.
     if action.is_none()
@@ -4407,7 +4947,7 @@ fn show_managed_dat_sources_section(
         ui,
         "Managed DAT Sources",
         Some(
-            "EmuWiz-managed MAME software lists. Checks and downloads happen only after you click an action.",
+            "Built-in MAME and Redump sources. Checks and downloads happen only after you click an action.",
         ),
     );
 
@@ -4462,17 +5002,34 @@ fn show_managed_dat_sources_section(
     });
     ui.add_space(8.0);
 
-    if view.managed_rows.is_empty() {
-        widgets::empty_state(
-            ui,
-            "No managed DAT sources configured",
-            "Add a MAME software-list name to configure it. This does not contact the network or download anything.",
-            None,
-        );
-        return action;
-    }
-
     for row in &view.managed_rows {
+        if action.is_none()
+            && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+        {
+            action = Some(row_action);
+        }
+        ui.add_space(8.0);
+    }
+    ui.add_space(4.0);
+    widgets::section_header(
+        ui,
+        "Redump BIOS DATs",
+        Some("Fixed Redump firmware metadata sources. No URLs or provider settings are exposed."),
+    );
+    for row in &view.redump_bios_rows {
+        if action.is_none()
+            && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+        {
+            action = Some(row_action);
+        }
+        ui.add_space(8.0);
+    }
+    widgets::section_header(
+        ui,
+        "Redump Game/Disc DATs",
+        Some("Fixed Redump catalogues for PlayStation, PlayStation 2, and Xbox only."),
+    );
+    for row in &view.redump_game_rows {
         if action.is_none()
             && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
         {
@@ -4493,14 +5050,40 @@ fn show_managed_dat_source_row(
     let busy = view.background_busy;
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("MAME software list").strong());
+            ui.label(egui::RichText::new(managed_provider_label(row.provider)).strong());
             let (label, tone) = managed_dat_status_presentation(&row.status);
             widgets::status_badge(ui, label, tone);
             if row.busy {
                 ui.spinner();
             }
         });
-        ui.label(format!("System/List: {}", row.authoritative_name));
+        ui.label(&row.source_label);
+        ui.label(
+            egui::RichText::new(if row.configured {
+                format!(
+                    "Configured · {} updates",
+                    managed_update_policy_label(row.update_policy)
+                )
+            } else {
+                "Not configured".to_string()
+            })
+            .color(theme::muted(ui))
+            .small(),
+        );
+        if !row.configured {
+            ui.horizontal(|ui| {
+                let add_label = format!("Enable {}", managed_provider_short_label(row.provider));
+                if widgets::action_button(ui, &add_label, widgets::ActionStyle::Primary, !busy)
+                    .clicked()
+                    && action.is_none()
+                {
+                    action = managed_add_action(row);
+                }
+                let _ = widgets::action_button(ui, "Check", widgets::ActionStyle::Secondary, false);
+                let _ = widgets::action_button(ui, "Update", widgets::ActionStyle::Primary, false);
+            });
+            return;
+        }
         ui.label(
             egui::RichText::new(if row.installed {
                 "Installed"
@@ -4558,11 +5141,17 @@ fn show_managed_dat_source_row(
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if widgets::action_button(ui, "Check", widgets::ActionStyle::Secondary, !busy).clicked()
+            if widgets::action_button(
+                ui,
+                "Check",
+                widgets::ActionStyle::Secondary,
+                !busy && row.configured,
+            )
+            .clicked()
                 && action.is_none()
             {
                 action = Some(managed_dat_action(
-                    row.authoritative_name.clone(),
+                    row.source_id.clone(),
                     ManagedDatOperation::Check,
                 ));
             }
@@ -4570,21 +5159,23 @@ fn show_managed_dat_source_row(
                 ui,
                 "Update",
                 widgets::ActionStyle::Primary,
-                !busy && row.update_enabled,
+                !busy && row.configured && row.update_enabled,
             )
             .clicked()
                 && action.is_none()
             {
                 action = Some(managed_dat_action(
-                    row.authoritative_name.clone(),
+                    row.source_id.clone(),
                     ManagedDatOperation::Update,
                 ));
             }
-            if widgets::action_button(ui, "Remove", widgets::ActionStyle::Quiet, !busy).clicked() {
-                ui_state.confirm_remove_managed = Some(row.authoritative_name.clone());
+            if row.configured
+                && widgets::action_button(ui, "Remove", widgets::ActionStyle::Quiet, !busy)
+                    .clicked()
+            {
+                ui_state.confirm_remove_managed = Some(row.source_id.clone());
             }
-            let technical_open =
-                ui_state.open_managed_technical.as_deref() == Some(row.authoritative_name.as_str());
+            let technical_open = ui_state.open_managed_technical.as_ref() == Some(&row.source_id);
             if widgets::action_button(
                 ui,
                 if technical_open {
@@ -4600,12 +5191,12 @@ fn show_managed_dat_source_row(
                 ui_state.open_managed_technical = if technical_open {
                     None
                 } else {
-                    Some(row.authoritative_name.clone())
+                    Some(row.source_id.clone())
                 };
             }
         });
 
-        if ui_state.confirm_remove_managed.as_deref() == Some(row.authoritative_name.as_str()) {
+        if ui_state.confirm_remove_managed.as_ref() == Some(&row.source_id) {
             ui.add_space(6.0);
             widgets::banner(
                 ui,
@@ -4623,9 +5214,7 @@ fn show_managed_dat_source_row(
                 .clicked()
                     && action.is_none()
                 {
-                    action = Some(DatSourcesPageAction::RemoveManagedMameSoftwareList {
-                        authoritative_name: row.authoritative_name.clone(),
-                    });
+                    action = managed_remove_action(row);
                     ui_state.confirm_remove_managed = None;
                 }
                 if widgets::action_button(ui, "Keep it", widgets::ActionStyle::Secondary, true)
@@ -4636,7 +5225,7 @@ fn show_managed_dat_source_row(
             });
         }
 
-        if ui_state.open_managed_technical.as_deref() == Some(row.authoritative_name.as_str()) {
+        if ui_state.open_managed_technical.as_ref() == Some(&row.source_id) {
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Technical details").strong());
             managed_dat_technical_line(ui, "SHA-256", row.technical.sha256.as_deref());
@@ -4655,6 +5244,350 @@ fn show_managed_dat_source_row(
             );
         }
     });
+    action
+}
+
+fn managed_source_key(source_id: &ManagedDatSourceId) -> String {
+    format!("{:?}:{}", source_id.provider, source_id.source_key)
+}
+
+fn managed_provider_label(provider: ManagedDatProvider) -> &'static str {
+    match provider {
+        ManagedDatProvider::MameSoftwareList => "MAME software list",
+        ManagedDatProvider::RedumpBios => "Redump BIOS DAT",
+        ManagedDatProvider::RedumpGames => "Redump game/disc DAT",
+    }
+}
+
+fn managed_provider_short_label(provider: ManagedDatProvider) -> &'static str {
+    match provider {
+        ManagedDatProvider::MameSoftwareList => "MAME source",
+        ManagedDatProvider::RedumpBios => "BIOS source",
+        ManagedDatProvider::RedumpGames => "game/disc source",
+    }
+}
+
+fn managed_update_policy_label(policy: ManagedDatUpdatePolicy) -> &'static str {
+    match policy {
+        ManagedDatUpdatePolicy::Disabled => "disabled",
+        ManagedDatUpdatePolicy::Manual => "manual",
+    }
+}
+
+fn managed_add_action(row: &ManagedDatSourceRowView) -> Option<DatSourcesPageAction> {
+    match row.provider {
+        ManagedDatProvider::MameSoftwareList => None,
+        ManagedDatProvider::RedumpBios => redump_bios_from_source_key(&row.source_id.source_key)
+            .map(|system| DatSourcesPageAction::AddManagedRedumpBios { system }),
+        ManagedDatProvider::RedumpGames => redump_game_from_source_key(&row.source_id.source_key)
+            .map(|system| DatSourcesPageAction::AddManagedRedumpGames { system }),
+    }
+}
+
+fn managed_remove_action(row: &ManagedDatSourceRowView) -> Option<DatSourcesPageAction> {
+    match row.provider {
+        ManagedDatProvider::MameSoftwareList => {
+            Some(DatSourcesPageAction::RemoveManagedMameSoftwareList {
+                authoritative_name: row.authoritative_name.clone(),
+            })
+        }
+        ManagedDatProvider::RedumpBios => redump_bios_from_source_key(&row.source_id.source_key)
+            .map(|system| DatSourcesPageAction::RemoveManagedRedumpBios { system }),
+        ManagedDatProvider::RedumpGames => redump_game_from_source_key(&row.source_id.source_key)
+            .map(|system| DatSourcesPageAction::RemoveManagedRedumpGames { system }),
+    }
+}
+
+fn redump_bios_from_source_key(key: &str) -> Option<RedumpBiosSystem> {
+    match key {
+        "psx" => Some(RedumpBiosSystem::PlayStation),
+        "ps2" => Some(RedumpBiosSystem::PlayStation2),
+        "xbox" => Some(RedumpBiosSystem::Xbox),
+        _ => None,
+    }
+}
+
+fn redump_game_from_source_key(key: &str) -> Option<RedumpGameSystem> {
+    match key {
+        "playstation" => Some(RedumpGameSystem::PlayStation),
+        "playstation2" => Some(RedumpGameSystem::PlayStation2),
+        "xbox" => Some(RedumpGameSystem::Xbox),
+        _ => None,
+    }
+}
+
+fn redump_bios_label(system: RedumpBiosSystem) -> &'static str {
+    match system {
+        RedumpBiosSystem::PlayStation => "PlayStation",
+        RedumpBiosSystem::PlayStation2 => "PlayStation 2",
+        RedumpBiosSystem::Xbox => "Xbox",
+    }
+}
+
+fn redump_game_label(system: RedumpGameSystem) -> &'static str {
+    match system {
+        RedumpGameSystem::PlayStation => "PlayStation",
+        RedumpGameSystem::PlayStation2 => "PlayStation 2",
+        RedumpGameSystem::Xbox => "Xbox",
+    }
+}
+
+fn tosec_pack_view(pack: &PersistedTosecPack) -> TosecPackView {
+    let mut groups: BTreeMap<TosecSelectionKey, (usize, usize, BTreeSet<String>)> = BTreeMap::new();
+    let mut deferred_count = 0;
+    for dat in &pack.dats {
+        let key = dat.selection_key();
+        let deferred = tosec_dat_is_deferred(dat);
+        if deferred {
+            deferred_count += 1;
+        }
+        let entry = groups.entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += usize::from(deferred);
+        entry.2.insert(dat.raw_category_label.clone());
+    }
+    TosecPackView {
+        pack_id: pack.pack_id.clone(),
+        root_path: pack.root_path.clone(),
+        availability: pack.availability(),
+        imported_at: format_unix_timestamp(pack.imported_unix_seconds),
+        dat_count: pack.dats.len(),
+        selected_dat_count: pack.selected_dats().count(),
+        groups: groups
+            .into_iter()
+            .map(
+                |(key, (dat_count, deferred_count, raw_categories))| TosecSelectionGroupView {
+                    selected: pack.selections.contains(&key),
+                    key,
+                    dat_count,
+                    deferred_count,
+                    raw_categories: raw_categories.into_iter().collect(),
+                },
+            )
+            .collect(),
+        deferred_count,
+    }
+}
+
+fn tosec_dat_is_deferred(dat: &TosecPackDat) -> bool {
+    let upper = dat.raw_catalogue_name.to_ascii_uppercase();
+    upper.starts_with("TOSEC-ISO") || upper.starts_with("TOSEC-PIX")
+}
+
+const MAX_TOSEC_GROUPS_RENDERED: usize = 200;
+
+fn show_tosec_release_packs_section(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    widgets::section_header(
+        ui,
+        "TOSEC Release Packs",
+        Some(
+            "Read-only inventories of extracted TOSEC packs. Enable only the System / Category / Media groups you want, then apply them to Local DAT Sources.",
+        ),
+    );
+    if let Some(error) = &view.tosec_load_error {
+        widgets::banner(
+            ui,
+            "TOSEC pack configuration not read",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    if let Some(error) = &view.tosec_action_error {
+        widgets::banner(
+            ui,
+            "TOSEC release-pack action could not be completed",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    if let Some(last) = &view.tosec_last_apply {
+        widgets::banner(
+            ui,
+            "TOSEC selection applied",
+            &format!(
+                "{}: {} registered, {} removed after deselection, {} skipped or deferred.",
+                last.pack_id, last.registered, last.removed, last.failed
+            ),
+            if last.failed == 0 {
+                widgets::StatusTone::Success
+            } else {
+                widgets::StatusTone::Warning
+            },
+        );
+    }
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Add extracted release pack").strong());
+        ui.label(egui::RichText::new("Choose a local, already-extracted TOSEC directory. EmuWiz inventories it read-only and starts with no DAT groups enabled.").color(theme::muted(ui)).small());
+        if widgets::action_button(
+            ui,
+            "Choose release-pack folder",
+            widgets::ActionStyle::Primary,
+            !view.background_busy && view.tosec_load_error.is_none(),
+        )
+        .clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            action = Some(DatSourcesPageAction::ImportTosecReleasePack { root: path });
+        }
+    });
+    for pack in &view.tosec_packs {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&pack.pack_id).strong());
+                let (status, tone) = match pack.availability {
+                    PackAvailability::Available => ("Available", widgets::StatusTone::Success),
+                    PackAvailability::Missing => ("Pack missing", widgets::StatusTone::Blocked),
+                };
+                widgets::status_badge(ui, status, tone);
+            });
+            ui.label(
+                egui::RichText::new(pack.root_path.display().to_string())
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} DATs inventoried · {} selected · imported {}",
+                    pack.dat_count, pack.selected_dat_count, pack.imported_at
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+            if pack.deferred_count > 0 {
+                ui.label(egui::RichText::new(format!("{} TOSEC-ISO / TOSEC-PIX catalogue(s) are visible but deferred and will not be registered.", pack.deferred_count)).color(widgets::StatusTone::Warning.color(ui)).small());
+            }
+            let filter = ui_state
+                .tosec_group_filter
+                .entry(pack.pack_id.clone())
+                .or_default();
+            ui.horizontal(|ui| {
+                ui.label("Filter groups:");
+                ui.text_edit_singleline(filter);
+                let mut show_raw = ui_state.show_tosec_raw.contains(&pack.pack_id);
+                if ui
+                    .checkbox(&mut show_raw, "Show raw TOSEC details")
+                    .changed()
+                {
+                    if show_raw {
+                        ui_state.show_tosec_raw.remove(&pack.pack_id);
+                    } else {
+                        ui_state.show_tosec_raw.insert(pack.pack_id.clone());
+                    }
+                }
+            });
+            let normalized_filter = filter.trim().to_ascii_lowercase();
+            let matching: Vec<_> = pack
+                .groups
+                .iter()
+                .filter(|group| {
+                    normalized_filter.is_empty()
+                        || group
+                            .key
+                            .label()
+                            .to_ascii_lowercase()
+                            .contains(&normalized_filter)
+                })
+                .collect();
+            let shown = matching.len().min(MAX_TOSEC_GROUPS_RENDERED);
+            for group in matching.iter().take(MAX_TOSEC_GROUPS_RENDERED) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "{} · {} DAT(s)",
+                        group.key.label(),
+                        group.dat_count
+                    ));
+                    if group.deferred_count > 0 {
+                        ui.label(
+                            egui::RichText::new("deferred")
+                                .color(widgets::StatusTone::Warning.color(ui))
+                                .small(),
+                        );
+                    }
+                    let button = if group.selected { "Disable" } else { "Enable" };
+                    let toggle_enabled = !view.background_busy
+                        && pack.availability == PackAvailability::Available
+                        && (group.deferred_count == 0 || group.selected);
+                    if group.deferred_count > 0 && !group.selected {
+                        ui.label(
+                            egui::RichText::new("Deferred by current TOSEC support")
+                                .color(theme::muted(ui))
+                                .small(),
+                        );
+                    } else if widgets::action_button(
+                        ui,
+                        button,
+                        widgets::ActionStyle::Secondary,
+                        toggle_enabled,
+                    )
+                    .clicked()
+                        && action.is_none()
+                    {
+                        action = Some(DatSourcesPageAction::SetTosecSelection {
+                            pack_id: pack.pack_id.clone(),
+                            key: group.key.clone(),
+                            enabled: !group.selected,
+                        });
+                    }
+                });
+                if ui_state.show_tosec_raw.contains(&pack.pack_id) {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Raw category: {}",
+                            group.raw_categories.join("; ")
+                        ))
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                }
+            }
+            if matching.len() > shown {
+                ui.label(egui::RichText::new(format!("Showing {shown} of {} matching groups. Refine the filter to keep rendering bounded.", matching.len())).color(theme::muted(ui)).small());
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Apply selected DATs",
+                    widgets::ActionStyle::Primary,
+                    !view.background_busy && pack.availability == PackAvailability::Available,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(DatSourcesPageAction::ApplyTosecSelection {
+                        pack_id: pack.pack_id.clone(),
+                    });
+                }
+                if widgets::action_button(
+                    ui,
+                    "Remove pack configuration",
+                    widgets::ActionStyle::Quiet,
+                    !view.background_busy,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(DatSourcesPageAction::RemoveTosecReleasePack {
+                        pack_id: pack.pack_id.clone(),
+                    });
+                }
+            });
+        });
+    }
+    if view.tosec_packs.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No TOSEC release packs configured",
+            "Choose an extracted local pack to inventory it. Nothing is registered until you explicitly enable groups and apply them.",
+            None,
+        );
+    }
     action
 }
 

@@ -24,6 +24,7 @@ use archivefs_core::dat::sources::{
     DatDiagnostic, DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
     DatValidationReport, audit_run::DatAuditOutcome, load_dat_sources_config_from,
 };
+use archivefs_core::dat::tosec_release_pack::{TosecFriendlyCategory, TosecMediaType};
 use archivefs_core::dat::updates::{ManagedDatSnapshot, ManagedDatState, save_managed_dat_state};
 use archivefs_core::safe_read::TrustedRoots;
 
@@ -5005,13 +5006,35 @@ fn the_empty_state_uses_the_verify_identity_and_short_wording() {
     let output = render(&view, &mut ui_state);
     // With no DAT sources registered the empty state is the friendly, short
     // "No DATs added" with the verify icon - not a long technical block.
-    assert!(rendered_text_contains(&output, "[V]"));
+    assert!(rendered_text_contains(&output, crate::ui::icons::VERIFY));
     assert!(rendered_text_contains(&output, "No DATs added"));
 }
 
 // ---------------------------------------------------------------------------
 // Managed MAME DAT sources
 // ---------------------------------------------------------------------------
+
+const TOSEC_AMIGA_FLOPPY: &str = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Amiga - Games - Floppy</name>
+    <description>Amiga - Games - Floppy (TOSEC-v2021-01-09)</description>
+    <version>2021-01-09</version>
+    <author>TOSEC</author>
+  </header>
+  <game name="Example"><rom name="example.adf" size="4" crc="00000001" md5="00000000000000000000000000000001" sha1="0000000000000000000000000000000000000001"/></game>
+</datafile>"#;
+
+const TOSEC_ISO_DEFERRED: &str = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>TOSEC-ISO - PC</name>
+    <description>TOSEC-ISO - PC (TOSEC-v2021-01-09)</description>
+    <version>2021-01-09</version>
+    <author>TOSEC</author>
+  </header>
+  <game name="Example"><rom name="example.iso" size="4" crc="00000001" md5="00000000000000000000000000000001" sha1="0000000000000000000000000000000000000001"/></game>
+</datafile>"#;
 
 #[test]
 fn managed_sources_render_in_a_separate_section_from_local_sources() {
@@ -5031,6 +5054,206 @@ fn managed_sources_render_in_a_separate_section_from_local_sources() {
     assert!(rendered_text_contains(&output, "Local DAT Sources"));
     assert!(rendered_text_contains(&output, "Managed DAT Sources"));
     assert!(rendered_text_contains(&output, "System/List: gamecom"));
+}
+
+#[test]
+fn redump_game_disc_rows_show_only_the_three_typed_supported_systems() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+    assert_eq!(view.redump_game_rows.len(), 3);
+    assert!(
+        view.redump_game_rows
+            .iter()
+            .all(|row| !row.configured && row.provider == ManagedDatProvider::RedumpGames)
+    );
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(&output, "Redump Game/Disc DATs"));
+    assert!(rendered_text_contains(&output, "System: PlayStation"));
+    assert!(rendered_text_contains(&output, "System: PlayStation 2"));
+    assert!(rendered_text_contains(&output, "System: Xbox"));
+    assert!(!rendered_text_contains(&output, "Saturn"));
+    assert!(rendered_text_contains(&output, "Redump BIOS DATs"));
+    assert!(rendered_text_contains(&output, "MAME software list"));
+}
+
+#[test]
+fn redump_game_check_and_update_actions_keep_the_closed_typed_system_identity() {
+    let source_id = ManagedDatSourceId::redump_games(RedumpGameSystem::PlayStation2);
+    assert_eq!(
+        managed_dat_action(source_id.clone(), ManagedDatOperation::Check),
+        DatSourcesPageAction::CheckManagedDat {
+            source_id: source_id.clone()
+        }
+    );
+    assert_eq!(
+        managed_dat_action(source_id.clone(), ManagedDatOperation::Update),
+        DatSourcesPageAction::UpdateManagedDat { source_id }
+    );
+}
+
+#[test]
+fn tosec_pack_inventory_starts_with_empty_selection_and_renders_bounded_groups() {
+    let fixture = Fixture::new();
+    let pack = fixture.dir("tosec-pack");
+    fixture.write(
+        "tosec-pack/Amiga - Games - Floppy (TOSEC-v2021-01-09).dat",
+        TOSEC_AMIGA_FLOPPY,
+    );
+    fixture.write(
+        "tosec-pack/TOSEC-ISO - PC (TOSEC-v2021-01-09).dat",
+        TOSEC_ISO_DEFERRED,
+    );
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack });
+
+    let view = page.view();
+    assert_eq!(view.tosec_packs.len(), 1);
+    assert_eq!(view.tosec_packs[0].selected_dat_count, 0);
+    assert!(view.tosec_packs[0].deferred_count > 0);
+    assert!(
+        view.tosec_packs[0]
+            .groups
+            .iter()
+            .any(|group| group.key.category.label() == "Games"
+                && group.key.media.label() == "Floppy / Disk")
+    );
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(&output, "TOSEC Release Packs"));
+    assert!(rendered_text_contains(&output, "Enable"));
+    assert!(rendered_text_contains(&output, "TOSEC-ISO / TOSEC-PIX"));
+}
+
+#[test]
+fn deferred_tosec_groups_cannot_be_enabled_even_through_a_direct_page_action() {
+    let fixture = Fixture::new();
+    let pack_root = fixture.dir("deferred-tosec-pack");
+    let key = TosecSelectionKey {
+        system: "PC".to_string(),
+        category: TosecFriendlyCategory::Games,
+        media: TosecMediaType::CdOpticalDisc,
+    };
+    let mut page = fixture.page();
+    page.tosec_packs = vec![PersistedTosecPack {
+        pack_id: "deferred-pack".to_string(),
+        root_path: pack_root,
+        imported_unix_seconds: 0,
+        selections: Default::default(),
+        dats: vec![TosecPackDat {
+            relative_path: PathBuf::from("TOSEC-ISO - PC.dat"),
+            raw_catalogue_name: "TOSEC-ISO - PC".to_string(),
+            system: key.system.clone(),
+            category: key.category,
+            media: key.media,
+            raw_category_label: "Games".to_string(),
+            classification_confident: true,
+            content_sha256: None,
+        }],
+    }];
+
+    page.apply(DatSourcesPageAction::SetTosecSelection {
+        pack_id: "deferred-pack".to_string(),
+        key,
+        enabled: true,
+    });
+
+    assert!(page.tosec_packs[0].selections.is_empty());
+    assert!(
+        page.tosec_action_error
+            .as_deref()
+            .is_some_and(|error| error.contains("cannot be enabled"))
+    );
+}
+
+#[test]
+fn tosec_group_rendering_never_draws_more_than_two_hundred_rows() {
+    let fixture = Fixture::new();
+    let pack_root = fixture.dir("large-tosec-pack");
+    let dats = (0..205)
+        .map(|index| TosecPackDat {
+            relative_path: PathBuf::from(format!("System {index}.dat")),
+            raw_catalogue_name: format!("System {index} - Games - ROM"),
+            system: format!("System {index}"),
+            category: TosecFriendlyCategory::Games,
+            media: TosecMediaType::Rom,
+            raw_category_label: "Games".to_string(),
+            classification_confident: true,
+            content_sha256: None,
+        })
+        .collect();
+    let mut page = fixture.page();
+    page.tosec_packs = vec![PersistedTosecPack {
+        pack_id: "large-pack".to_string(),
+        root_path: pack_root,
+        imported_unix_seconds: 0,
+        selections: Default::default(),
+        dats,
+    }];
+
+    let output = render(&page.view(), &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(
+        &output,
+        "Showing 200 of 205 matching groups"
+    ));
+    assert!(
+        rendered_text_count(&output, "DAT(s)") <= 200,
+        "only the bounded visible group rows may be rendered"
+    );
+}
+
+#[test]
+fn tosec_missing_pack_is_honest_after_restart_and_selection_is_explicit() {
+    let fixture = Fixture::new();
+    let pack = fixture.dir("missing-tosec-pack");
+    fixture.write(
+        "missing-tosec-pack/Amiga - Games - Floppy (TOSEC-v2021-01-09).dat",
+        TOSEC_AMIGA_FLOPPY,
+    );
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack.clone() });
+    let group = page.view().tosec_packs[0].groups[0].key.clone();
+    let pack_id = page.view().tosec_packs[0].pack_id.clone();
+    page.apply(DatSourcesPageAction::SetTosecSelection {
+        pack_id: pack_id.clone(),
+        key: group,
+        enabled: true,
+    });
+    assert_eq!(page.view().tosec_packs[0].selected_dat_count, 1);
+
+    std::fs::remove_dir_all(pack).unwrap();
+    let reloaded = fixture.page();
+    assert_eq!(
+        reloaded.view().tosec_packs[0].availability,
+        PackAvailability::Missing
+    );
+    let output = render(&reloaded.view(), &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(&output, "Pack missing"));
+}
+
+#[test]
+fn applying_an_explicit_tosec_selection_registers_only_the_selected_group() {
+    let fixture = Fixture::new();
+    let pack = fixture.dir("apply-tosec-pack");
+    fixture.write(
+        "apply-tosec-pack/Amiga - Games - Floppy (TOSEC-v2021-01-09).dat",
+        TOSEC_AMIGA_FLOPPY,
+    );
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack });
+    let view = page.view();
+    let pack_id = view.tosec_packs[0].pack_id.clone();
+    let key = view.tosec_packs[0].groups[0].key.clone();
+    page.apply(DatSourcesPageAction::SetTosecSelection {
+        pack_id: pack_id.clone(),
+        key,
+        enabled: true,
+    });
+    page.apply(DatSourcesPageAction::ApplyTosecSelection { pack_id });
+
+    assert_eq!(page.view().rows.len(), 1);
+    let applied = page.tosec_last_apply.as_ref().unwrap();
+    assert_eq!(applied.registered, 1);
+    assert_eq!(applied.failed, 0);
 }
 
 #[test]
@@ -5123,7 +5346,9 @@ fn rendering_managed_sources_starts_no_worker_or_network_operation() {
     assert!(page.managed_job.is_none());
     assert!(!page.is_busy());
     assert_eq!(
-        page.managed_statuses.get("gamecom"),
+        page.managed_statuses.get(&managed_source_key(
+            &ManagedDatSourceId::mame_software_list("gamecom").unwrap()
+        )),
         None,
         "rendering is read-only and must not synthesize a check result"
     );
@@ -5139,7 +5364,7 @@ fn update_requires_a_prior_explicit_check_result() {
     assert!(!page.view().managed_rows[0].update_enabled);
 
     page.managed_statuses.insert(
-        "gamecom".to_string(),
+        managed_source_key(&ManagedDatSourceId::mame_software_list("gamecom").unwrap()),
         ManagedDatStatusView::UpdateAvailable {
             upstream_revision: "a".repeat(40),
         },
@@ -5150,15 +5375,21 @@ fn update_requires_a_prior_explicit_check_result() {
 #[test]
 fn managed_buttons_emit_only_typed_check_and_update_actions() {
     assert_eq!(
-        managed_dat_action("gamecom".to_string(), ManagedDatOperation::Check),
+        managed_dat_action(
+            ManagedDatSourceId::mame_software_list("gamecom").unwrap(),
+            ManagedDatOperation::Check,
+        ),
         DatSourcesPageAction::CheckManagedDat {
-            authoritative_name: "gamecom".to_string()
+            source_id: ManagedDatSourceId::mame_software_list("gamecom").unwrap()
         }
     );
     assert_eq!(
-        managed_dat_action("gamecom".to_string(), ManagedDatOperation::Update),
+        managed_dat_action(
+            ManagedDatSourceId::mame_software_list("gamecom").unwrap(),
+            ManagedDatOperation::Update,
+        ),
         DatSourcesPageAction::UpdateManagedDat {
-            authoritative_name: "gamecom".to_string()
+            source_id: ManagedDatSourceId::mame_software_list("gamecom").unwrap()
         }
     );
 }
@@ -5211,7 +5442,8 @@ fn installed_current_and_previous_snapshots_refresh_the_managed_row_without_prom
     assert_ne!(row.technical.current_path, row.technical.previous_path);
 
     let mut ui_state = DatSourcesPageUi::default();
-    ui_state.open_managed_technical = Some("gamecom".to_string());
+    ui_state.open_managed_technical =
+        Some(ManagedDatSourceId::mame_software_list("gamecom").unwrap());
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,
