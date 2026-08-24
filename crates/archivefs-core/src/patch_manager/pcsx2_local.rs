@@ -179,6 +179,14 @@ pub struct Pcsx2ProfileDiscoveryRoots {
     /// Portable roots must come from an already known PCSX2 configuration,
     /// never from blind filesystem searching.
     pub portable_configuration_roots: Vec<PathBuf>,
+    /// Exact, already-known native `pcsx2-qt` executable paths, reported as
+    /// [`Pcsx2InstallationType::Native`] candidates alongside whatever a
+    /// `PATH` scan finds - never guessed or searched for. Always empty from
+    /// [`Self::from_environment`]; this exists so a caller that has already
+    /// confirmed an executable (or a test) can supply it deterministically
+    /// without this module ever having to search an arbitrary directory
+    /// tree.
+    pub explicit_executables: Vec<PathBuf>,
 }
 
 impl Pcsx2ProfileDiscoveryRoots {
@@ -204,6 +212,7 @@ impl Pcsx2ProfileDiscoveryRoots {
             flatpak_system_root: PathBuf::from("/var/lib/flatpak"),
             appimage_directory,
             portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         })
     }
 }
@@ -646,17 +655,20 @@ fn blocked_profile(
     }
 }
 
-/// Discovers candidate native `pcsx2-qt` executables from `PATH` only -
-/// never guesses a legacy/plugin-era binary name, never searches an
-/// arbitrary directory tree. This is deliberately the only discovery
-/// source: unlike `patch_manager::dolphin_local`, this module has no
-/// caller-supplied explicit-executable or AppImage-directory channel yet,
-/// so it never invents Flatpak/AppImage/portable executable evidence -
-/// see [`resolve_pcsx2_native_launch_binding`]'s own doc comment for why
+/// Discovers candidate native `pcsx2-qt` executables from `PATH` plus
+/// `roots.explicit_executables` only - never guesses a legacy/plugin-era
+/// binary name, never searches an arbitrary directory tree, and never
+/// invents Flatpak/AppImage/portable executable evidence (there is no
+/// AppImage-directory channel here, unlike `patch_manager::dolphin_local`)
+/// - see [`resolve_pcsx2_native_launch_binding`]'s own doc comment for why
 /// only [`Pcsx2InstallationType::Native`] is supported by the launch
-/// binding this feeds.
-fn discover_pcsx2_local_executables(_roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<Pcsx2Executable> {
-    let mut paths = Vec::new();
+/// binding this feeds. `explicit_executables` entries are reported as
+/// `Native` too: this model has no separate "caller-confirmed" installation
+/// type the way Dolphin's does, and an already-confirmed exact path is at
+/// least as trustworthy as a `PATH` match for the one installation type
+/// this binding ever authorizes.
+fn discover_pcsx2_local_executables(roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<Pcsx2Executable> {
+    let mut paths = roots.explicit_executables.clone();
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path).take(128) {
             paths.push(directory.join("pcsx2-qt"));
@@ -2504,6 +2516,7 @@ mod tests {
             flatpak_system_root: root.join("system-flatpak"),
             appimage_directory: None,
             portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
         }
     }
 

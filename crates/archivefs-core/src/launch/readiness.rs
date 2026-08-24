@@ -125,6 +125,24 @@ pub enum LaunchBlockerKind {
     /// profile - see the blocker detail for the underlying
     /// [`crate::patch_manager::DolphinLaunchBlockerKind`].
     DolphinBindingUnavailable,
+    /// A PCSX2 command-plan request was given a non-PCSX2-standalone launch
+    /// candidate.
+    Pcsx2CandidateRequired,
+    /// The canonical identity this PCSX2 plan was built for does not target
+    /// `PS2` - the only platform this native launch slice supports.
+    Pcsx2PlatformMismatch,
+    /// The content is not a direct, non-mounted `.iso` file - no archive
+    /// member, no CHD, no mount-input container.
+    Pcsx2ContentFormatUnsupported,
+    /// No verified PS2 serial is available for this content - this native
+    /// launch slice requires one even though a resolved identity could in
+    /// principle rest on an executable CRC alone.
+    Pcsx2SerialMissing,
+    /// [`crate::patch_manager::resolve_pcsx2_native_launch_binding`] itself
+    /// refused to produce a launch binding for the candidate's profile -
+    /// see the blocker detail for the underlying
+    /// [`crate::patch_manager::Pcsx2LaunchBlockerKind`].
+    Pcsx2BindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].

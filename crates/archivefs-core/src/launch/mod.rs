@@ -69,6 +69,8 @@ pub mod evidence_bridge;
 pub mod execution;
 pub mod input_projection;
 pub mod integration;
+pub mod pcsx2_command;
+pub mod pcsx2_execution;
 pub mod planning;
 pub mod platform_map;
 pub mod process_spawn;
@@ -111,6 +113,16 @@ pub use input_projection::{
 };
 pub use integration::{
     DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,
+};
+pub use pcsx2_command::{
+    PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,
+    build_pcsx2_command_plan,
+};
+pub use pcsx2_execution::{
+    LaunchedPcsx2Process, Pcsx2LaunchCommandFacts, Pcsx2LaunchExecutionError,
+    Pcsx2LaunchExitReport, Pcsx2LaunchPreflightError, Pcsx2LaunchPreflightErrorKind,
+    Pcsx2LaunchRequest, Pcsx2LaunchSpawnError, preflight_and_launch_pcsx2, preflight_pcsx2_launch,
+    spawn_pcsx2,
 };
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
