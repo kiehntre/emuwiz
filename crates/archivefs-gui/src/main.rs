@@ -1929,6 +1929,79 @@ fn gather_selected_evidence_with_registry_at(
     result
 }
 
+/// The bridge from the persisted DAT source registry
+/// (`archivefs_core::dat::sources::DatSourceRegistry` - the same one
+/// [`gather_selected_evidence_with_registry`] reads) into
+/// [`archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord`]
+/// values PCSX2 Launch Readiness needs to genuinely verify a BIOS - see
+/// `launch_readiness_page`'s Launch PCSX2 doc comment.
+///
+/// Never downloads anything and never invents a record: every registered,
+/// enabled source's file(s) are parsed with the exact same
+/// [`archivefs_core::dat::parsers::parse_dat_file`] the DAT Sources page
+/// itself uses, then handed to
+/// [`archivefs_core::dat::firmware_evidence::ps2_bios_evidence_from_dat`],
+/// which only ever yields records for a DAT it can itself prove is the
+/// Redump PS2 BIOS dataset (ecosystem plus dataset-identifying header text)
+/// - an unrelated ROM-set DAT, or one that fails to parse, silently
+/// contributes nothing rather than erroring the whole scan. A source's own
+/// `platform` label is never trusted as extraction authority here, for the
+/// same "never treat an arbitrary DAT as authoritative" reason
+/// `ps2_bios_evidence_from_dat` itself documents - every enabled source is
+/// tried, and only what genuinely re-parses as the right dataset survives.
+///
+/// Runs entirely off the UI thread (see
+/// [`App::start_pcsx2_firmware_evidence_load`]) - registered DAT files can
+/// be large, so this is never called from `build_launch_readiness_input`,
+/// which runs every frame the Selected page is shown.
+fn pcsx2_firmware_evidence_from_registry(
+    registry: &archivefs_core::dat::sources::DatSourceRegistry,
+) -> Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord> {
+    use archivefs_core::dat::firmware_evidence::ps2_bios_evidence_from_dat;
+    use archivefs_core::dat::limits::DatLimits;
+    use archivefs_core::dat::parsers::parse_dat_file;
+    use archivefs_core::dat::sources::{DatSourceKind, discover_dat_files};
+
+    let mut evidence = Vec::new();
+    for entry in registry.sorted_enabled() {
+        let files: Vec<PathBuf> = match entry.kind {
+            DatSourceKind::File => vec![entry.path.clone()],
+            DatSourceKind::Folder => discover_dat_files(&entry.path)
+                .map(|scan| scan.files)
+                .unwrap_or_default(),
+        };
+        for file in files {
+            if let Ok(outcome) = parse_dat_file(&file, DatLimits::default())
+                && let Ok(records) = ps2_bios_evidence_from_dat(&outcome.dat)
+            {
+                evidence.extend(records);
+            }
+        }
+    }
+    evidence
+}
+
+/// [`pcsx2_firmware_evidence_from_registry`] with the registry loaded fresh
+/// from `default_dat_sources_config_path()` - the same on-disk file the DAT
+/// Sources page reads and writes, never a second persistent registry. An
+/// absent config file (nothing registered yet) or an unresolvable path
+/// (e.g. `HOME` unset) both honestly resolve to zero evidence records,
+/// mirroring `gather_selected_evidence_with_registry`'s own fallback -
+/// never an error banner for the ordinary "nothing configured yet" case.
+/// Only a genuine read/parse failure of the registry file itself is
+/// reported as `Err`.
+fn load_pcsx2_firmware_evidence_from_registry()
+-> Result<Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord>, String> {
+    let Ok(config_path) = archivefs_core::dat::sources::default_dat_sources_config_path() else {
+        return Ok(Vec::new());
+    };
+    let config = archivefs_core::dat::sources::load_dat_sources_config_from(&config_path)
+        .map_err(|error| error.to_string())?;
+    let (registry, _warnings) =
+        archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
+    Ok(pcsx2_firmware_evidence_from_registry(&registry))
+}
+
 /// Collects the path-based Doctor inputs. Runs on a worker thread.
 ///
 /// Every call here is read-only by the callee's own documented contract:
@@ -3725,6 +3798,21 @@ struct ArchiveFsApp {
     /// `dolphin_profiles`. Triggered automatically once the Selected page
     /// is shown, mirroring the existing Dolphin-Cheats-workflow auto-scan.
     dolphin_local_profiles: DolphinLocalProfilesState,
+    /// PCSX2 profile discovery Launch Readiness uses to build a native
+    /// launch binding - a separate scan from `pcsx2_profiles` for the same
+    /// reason [`DolphinLocalProfilesState`] is separate from
+    /// `dolphin_profiles`: this one retains the discovery `roots`
+    /// ([`resolve_pcsx2_native_launch_binding`] needs them) and is
+    /// triggered automatically once the Selected page is shown, rather
+    /// than only when the Cheats & Mods PCSX2 workflow is active like
+    /// `pcsx2_profiles` is.
+    pcsx2_launch_profiles: Pcsx2LaunchProfilesState,
+    /// PS2 firmware/BIOS evidence resolved from the user's registered DAT
+    /// sources - see [`pcsx2_firmware_evidence_from_registry`]. Loaded
+    /// once in the background, the same way `pcsx2_launch_profiles` and
+    /// `dolphin_local_profiles` are; never re-parsed on the UI thread and
+    /// never re-parsed per frame.
+    pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState,
     /// Explicit-directory-only Xenia Canary profile discovery.
     xenia_profiles: XeniaProfilesState,
     /// Per-emulator remembered profile choices, loaded once at startup
@@ -3752,6 +3840,9 @@ struct ArchiveFsApp {
     /// The Launch Readiness panel's "Launch Dolphin" tracker - the same
     /// reasoning as `launch_retroarch` above applies unchanged.
     launch_dolphin: launch_readiness_page::DolphinLaunchState,
+    /// The Launch Readiness panel's "Launch PCSX2" tracker - the same
+    /// reasoning as `launch_retroarch` above applies unchanged.
+    launch_pcsx2: launch_readiness_page::Pcsx2LaunchState,
     /// A tentative archive choice is isolated here until the picker is
     /// applied. It never mutates Library focus or multi-selection.
     cheat_archive_picker: Option<CheatArchivePickerState>,
@@ -4282,6 +4373,8 @@ impl ArchiveFsApp {
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
+            pcsx2_launch_profiles: Pcsx2LaunchProfilesState::NotScanned,
+            pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
@@ -4289,6 +4382,7 @@ impl ArchiveFsApp {
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
             launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
+            launch_pcsx2: launch_readiness_page::Pcsx2LaunchState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
@@ -5438,16 +5532,24 @@ impl ArchiveFsApp {
             })
             .and_then(ready_game_identity);
 
-        // `VerifiedIdentityFact`s feed standalone-adapter input projection
-        // only (`launch::input_projection`) - this RetroArch-only slice has
-        // no use for them yet, so they are deliberately discarded here.
-        let (identity_status, _verified_facts) = match game_identity_report {
+        let (identity_status, verified_facts) = match game_identity_report {
             Some(report) => archivefs_core::launch::canonical_identity_from_game_report(report),
             None => (
                 archivefs_core::launch::CanonicalIdentityStatus::Unknown,
                 Vec::new(),
             ),
         };
+        // PCSX2's `Pcsx2LaunchRequest` needs a genuinely verified PS2
+        // serial specifically - never `plan.game_key` alone, which for PS2
+        // may instead be a verified executable CRC (see
+        // `evidence_bridge::resolved_identity_for_platform`'s `Ps2Serial`/
+        // `Pcsx2ExecutableCrc` handling) when no serial was verified.
+        let verified_ps2_serial = verified_facts.iter().find_map(|fact| match fact {
+            archivefs_core::launch::VerifiedIdentityFact::Ps2Serial(serial) => {
+                Some(serial.clone())
+            }
+            _ => None,
+        });
 
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
@@ -5527,16 +5629,88 @@ impl ArchiveFsApp {
                 })
                 .unwrap_or_default();
 
+        // Real, already-discovered PCSX2 profiles and already-resolved PS2
+        // firmware evidence only - never fabricated. Both
+        // `Pcsx2LaunchProfilesState` and `Pcsx2FirmwareEvidenceState`
+        // starting anything other than `Ready` simply contribute no PCSX2
+        // candidate yet, the same additive-not-blocking shape as `dolphin`
+        // above - a missing/incomplete DAT scan never widens readiness, it
+        // only means no PCSX2 candidate is offered until it completes.
+        let pcsx2_firmware_evidence: &[archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord] =
+            match &self.pcsx2_firmware_evidence {
+                Pcsx2FirmwareEvidenceState::Ready(evidence) => evidence,
+                Pcsx2FirmwareEvidenceState::NotLoaded
+                | Pcsx2FirmwareEvidenceState::Loading { .. }
+                | Pcsx2FirmwareEvidenceState::Error(_) => &[],
+            };
+        let pcsx2_context = match &self.pcsx2_launch_profiles {
+            Pcsx2LaunchProfilesState::Ready(ready) => {
+                Some(launch_readiness_page::Pcsx2LaunchContext {
+                    discovery: ready.discovery.clone(),
+                    roots: ready.roots.clone(),
+                    firmware_evidence: pcsx2_firmware_evidence.to_vec(),
+                    verified_ps2_serial: verified_ps2_serial.clone(),
+                })
+            }
+            Pcsx2LaunchProfilesState::NotScanned
+            | Pcsx2LaunchProfilesState::Scanning { .. }
+            | Pcsx2LaunchProfilesState::Error(_) => None,
+        };
+        // A profile's BIOS readiness never depends on the currently
+        // selected game - `resolve_pcsx2_bios`/`inspect_pcsx2_bios` only
+        // ever read the profile's own global config and `bios/` directory
+        // - so an all-`None` `Pcsx2GameRequest` here is a genuine,
+        // honest inspection, not a placeholder.
+        let pcsx2_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
+            pcsx2_context
+                .as_ref()
+                .map(|context| {
+                    context
+                        .discovery
+                        .profiles
+                        .iter()
+                        .map(|profile| {
+                            let inspection =
+                                archivefs_core::patch_manager::inspect_pcsx2_game_with_firmware_evidence(
+                                    profile,
+                                    &archivefs_core::patch_manager::Pcsx2GameRequest {
+                                        verified_ps2_serial: None,
+                                        verified_executable_crc: None,
+                                        emulator_serial: None,
+                                    },
+                                    &context.firmware_evidence,
+                                );
+                            archivefs_core::launch::StandaloneProfileInput {
+                                adapter_id: "pcsx2",
+                                profile_id: profile.profile_id.clone(),
+                                profile_path: Some(profile.configuration_path.clone()),
+                                eligible: profile.eligible,
+                                firmware: archivefs_core::launch::pcsx2_firmware_readiness(
+                                    inspection.inspection.bios.verification,
+                                ),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+        let standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
+            dolphin_standalone_profiles
+                .into_iter()
+                .chain(pcsx2_standalone_profiles)
+                .collect();
+
         let plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
-            &dolphin_standalone_profiles,
+            &standalone_profiles,
             &discovery.environment,
             &[],
         );
         LaunchReadinessInput::Plan {
             plan,
             dolphin: dolphin_context,
+            pcsx2: pcsx2_context,
         }
     }
 
@@ -13588,6 +13762,78 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Starts the PCSX2 profile discovery Launch Readiness needs to build a
+    /// native launch binding - see [`Pcsx2LaunchProfilesState`]'s own doc
+    /// comment. Read-only, same shape as
+    /// [`Self::start_dolphin_local_profile_scan`].
+    fn start_pcsx2_launch_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result = Pcsx2ProfileDiscoveryRoots::from_environment()
+                .map_err(|error| error.to_string())
+                .and_then(|roots| {
+                    discover_pcsx2_profiles(&roots)
+                        .map_err(|error| error.to_string())
+                        .map(|discovery| Pcsx2LaunchProfilesReady { discovery, roots })
+                });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_pcsx2_launch_profiles(&mut self) {
+        if let Pcsx2LaunchProfilesState::Scanning { receiver } = &self.pcsx2_launch_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(ready)) => {
+                    self.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Ready(ready);
+                }
+                Ok(Err(message)) => {
+                    self.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Error(
+                        "PCSX2 launch-profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Starts the background load of PS2 firmware/BIOS evidence from the
+    /// user's registered DAT sources - see
+    /// [`load_pcsx2_firmware_evidence_from_registry`]. Read-only: parses
+    /// DAT files already on disk, never downloads or writes anything.
+    fn start_pcsx2_firmware_evidence_load(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Loading { receiver };
+        thread::spawn(move || {
+            let result = load_pcsx2_firmware_evidence_from_registry();
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_pcsx2_firmware_evidence(&mut self) {
+        if let Pcsx2FirmwareEvidenceState::Loading { receiver } = &self.pcsx2_firmware_evidence {
+            match receiver.try_recv() {
+                Ok(Ok(evidence)) => {
+                    self.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(evidence);
+                }
+                Ok(Err(message)) => {
+                    self.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Error(
+                        "PS2 firmware evidence load stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     /// Starts a background RetroArch profile discovery scan - blocking
     /// filesystem probing, so it never runs on the UI thread, exactly
     /// like every other workflow. The result replaces the previous
@@ -14659,6 +14905,8 @@ impl ArchiveFsApp {
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
         self.poll_dolphin_local_profiles();
+        self.poll_pcsx2_launch_profiles();
+        self.poll_pcsx2_firmware_evidence();
         self.poll_cheat_workflow(context);
         if matches!(self.view, MainView::Sources | MainView::CheatsMods)
             && matches!(self.bsfree_manager, BsFreeManagerState::NotLoaded)
@@ -16086,6 +16334,18 @@ impl ArchiveFsApp {
                     ) {
                         self.start_dolphin_local_profile_scan(context.clone());
                     }
+                    if matches!(
+                        self.pcsx2_launch_profiles,
+                        Pcsx2LaunchProfilesState::NotScanned
+                    ) {
+                        self.start_pcsx2_launch_profile_scan(context.clone());
+                    }
+                    if matches!(
+                        self.pcsx2_firmware_evidence,
+                        Pcsx2FirmwareEvidenceState::NotLoaded
+                    ) {
+                        self.start_pcsx2_firmware_evidence_load(context.clone());
+                    }
                     let live = match &self.state {
                         LoadState::Ready(data) => Some(data.as_ref()),
                         _ => None,
@@ -16135,11 +16395,18 @@ impl ArchiveFsApp {
                     if self.launch_dolphin.poll() || self.launch_dolphin.is_active() {
                         ui.ctx().request_repaint();
                     }
+                    // Same reasoning as `launch_retroarch` above: drained
+                    // unconditionally so a tracked PCSX2 launch is still
+                    // reaped even after the user selects a different game.
+                    if self.launch_pcsx2.poll() || self.launch_pcsx2.is_active() {
+                        ui.ctx().request_repaint();
+                    }
                     launch_readiness_page::show_launch_readiness_panel(
                         ui,
                         &launch_readiness_input,
                         &mut self.launch_retroarch,
                         &mut self.launch_dolphin,
+                        &mut self.launch_pcsx2,
                     );
                     ui.add_space(crate::ui::theme::SECTION_GAP);
                     let identity_sources_action = identity_sources_page::show_identity_sources_panel(
@@ -28565,6 +28832,41 @@ enum DolphinLocalProfilesState {
         receiver: Receiver<Result<DolphinLocalProfilesReady, String>>,
     },
     Ready(DolphinLocalProfilesReady),
+    Error(String),
+}
+
+/// PCSX2 profile discovery, plus the roots it ran against, for Launch
+/// Readiness's use only - see `pcsx2_launch_profiles`'s own doc comment for
+/// why this is a separate scan from [`Pcsx2ProfilesState`] (used by Cheats
+/// & Mods), which never retains its roots.
+struct Pcsx2LaunchProfilesReady {
+    discovery: archivefs_core::patch_manager::Pcsx2ProfileDiscovery,
+    roots: archivefs_core::patch_manager::Pcsx2ProfileDiscoveryRoots,
+}
+
+enum Pcsx2LaunchProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<Pcsx2LaunchProfilesReady, String>>,
+    },
+    Ready(Pcsx2LaunchProfilesReady),
+    Error(String),
+}
+
+/// PS2 firmware/BIOS evidence resolved from the user's registered DAT
+/// sources - see [`pcsx2_firmware_evidence_from_registry`]. `Ready(vec![])`
+/// is a genuine, honest outcome (nothing registered qualifies as Redump PS2
+/// BIOS evidence yet), distinct from `Error`, which is reserved for an
+/// actual registry read/parse failure - see
+/// [`load_pcsx2_firmware_evidence_from_registry`].
+enum Pcsx2FirmwareEvidenceState {
+    NotLoaded,
+    Loading {
+        receiver: Receiver<
+            Result<Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord>, String>,
+        >,
+    },
+    Ready(Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord>),
     Error(String),
 }
 

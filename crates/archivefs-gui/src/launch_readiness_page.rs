@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
+use archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord;
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
     DiscoveryEnvironment, ProfileKind, ProfileRef,
@@ -53,11 +54,16 @@ use archivefs_core::launch::{
     DolphinLaunchSpawnError, FirmwareReadiness, LaunchBlocker, LaunchCandidate,
     LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
     LaunchPreflightErrorKind, LaunchReadiness, LaunchSpawnError, LaunchTarget, LaunchWarning,
-    LaunchedDolphinProcess, LaunchedRetroArchProcess, RetroArchLaunchRequest,
-    preflight_and_launch_dolphin, preflight_and_launch_retroarch,
+    LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
+    PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError, Pcsx2LaunchExitReport,
+    Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest, Pcsx2LaunchSpawnError,
+    RetroArchLaunchRequest, preflight_and_launch_dolphin, preflight_and_launch_pcsx2,
+    preflight_and_launch_retroarch,
 };
 use archivefs_core::patch_manager::{
-    DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, resolve_dolphin_native_launch_binding,
+    DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, resolve_dolphin_native_launch_binding,
+    resolve_pcsx2_native_launch_binding,
 };
 use eframe::egui;
 
@@ -95,6 +101,16 @@ pub(crate) enum LaunchReadinessInput {
         /// names and compute its real launch binding for the "Launch
         /// Dolphin" button - see [`dolphin_launch_request`].
         dolphin: Option<DolphinLaunchContext>,
+        /// The already-discovered PCSX2 profile data (roots included) and
+        /// the already-resolved PS2 firmware evidence `plan`'s PCSX2
+        /// standalone candidate, if any, was built from - `None` while
+        /// discovery has not completed yet, the same additive-not-blocking
+        /// shape as `dolphin` above. Needed here, not fabricated in this
+        /// module, to look up the exact profile a PCSX2 candidate names,
+        /// compute its real launch binding, and pass real firmware
+        /// evidence through to core's own fresh BIOS verification - see
+        /// [`pcsx2_launch_request`].
+        pcsx2: Option<Pcsx2LaunchContext>,
     },
 }
 
@@ -104,6 +120,27 @@ pub(crate) enum LaunchReadinessInput {
 pub(crate) struct DolphinLaunchContext {
     pub(crate) discovery: DolphinLocalProfileDiscovery,
     pub(crate) roots: DolphinLocalDiscoveryRoots,
+}
+
+/// The real, already-gathered PCSX2 profile discovery and PS2 firmware
+/// evidence this panel needs to compute a launch binding and pass to core's
+/// own fresh BIOS verification - never (re)discovered or (re)parsed by this
+/// module itself. See `main.rs`'s `Pcsx2LaunchProfilesState` and
+/// `Pcsx2FirmwareEvidenceState`.
+pub(crate) struct Pcsx2LaunchContext {
+    pub(crate) discovery: Pcsx2ProfileDiscovery,
+    pub(crate) roots: Pcsx2ProfileDiscoveryRoots,
+    /// PS2 BIOS evidence resolved from the user's registered DAT sources -
+    /// this module never downloads, parses, or invents any of it; see
+    /// `main.rs`'s `pcsx2_firmware_evidence_from_registry`. An empty slice
+    /// is an honest "no evidence available" state, never `Verified`.
+    pub(crate) firmware_evidence: Vec<FirmwareIdentityRecord>,
+    /// The verified PS2 serial for the currently focused game, when one
+    /// exists - taken from `VerifiedIdentityFact::Ps2Serial`, never
+    /// derived from `plan.game_key` alone (which may instead be a verified
+    /// executable CRC when no serial was verified) - see
+    /// [`pcsx2_launch_request`].
+    pub(crate) verified_ps2_serial: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +407,141 @@ impl DolphinLaunchState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Launch PCSX2 state
+// ---------------------------------------------------------------------------
+
+/// Identifies exactly which candidate a tracked PCSX2 launch belongs to -
+/// the selected content path plus the exact requested PCSX2 profile id.
+/// Same reasoning as [`DolphinLaunchKey`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pcsx2LaunchKey {
+    content_path: PathBuf,
+    profile_id: String,
+}
+
+impl Pcsx2LaunchKey {
+    fn from_request(request: &Pcsx2LaunchRequest) -> Self {
+        Self {
+            content_path: request.selected_content_path.clone(),
+            profile_id: request.profile_id.clone(),
+        }
+    }
+}
+
+enum Pcsx2LaunchStage {
+    Starting {
+        receiver: Receiver<Result<LaunchedPcsx2Process, Pcsx2LaunchExecutionError>>,
+    },
+    Running {
+        process: LaunchedPcsx2Process,
+    },
+    Exited {
+        process: LaunchedPcsx2Process,
+    },
+    Failed {
+        error: Pcsx2LaunchExecutionError,
+    },
+}
+
+/// A small sibling of [`DolphinLaunchState`] - same "tracks at most one
+/// launch, reaped regardless of the currently rendered selection" contract,
+/// same reasoning for staying a distinct, non-generic tracker rather than
+/// unifying all three emulators' launch state into one generic type.
+#[derive(Default)]
+pub(crate) struct Pcsx2LaunchState {
+    tracked: Option<(Pcsx2LaunchKey, Pcsx2LaunchStage)>,
+}
+
+impl Pcsx2LaunchState {
+    /// Non-blocking. Returns whether anything changed (a repaint hint).
+    pub(crate) fn poll(&mut self) -> bool {
+        let Some((key, stage)) = self.tracked.take() else {
+            return false;
+        };
+        match stage {
+            Pcsx2LaunchStage::Starting { receiver } => match receiver.try_recv() {
+                Ok(Ok(process)) => {
+                    self.tracked = Some((key, Pcsx2LaunchStage::Running { process }));
+                    true
+                }
+                Ok(Err(error)) => {
+                    self.tracked = Some((key, Pcsx2LaunchStage::Failed { error }));
+                    true
+                }
+                Err(TryRecvError::Empty) => {
+                    self.tracked = Some((key, Pcsx2LaunchStage::Starting { receiver }));
+                    false
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.tracked = Some((
+                        key,
+                        Pcsx2LaunchStage::Failed {
+                            error: Pcsx2LaunchExecutionError::Spawn(Pcsx2LaunchSpawnError::Spawn(
+                                std::io::Error::other(
+                                    "the launch worker stopped without reporting a result",
+                                ),
+                            )),
+                        },
+                    ));
+                    true
+                }
+            },
+            Pcsx2LaunchStage::Running { mut process } => {
+                if process.poll().is_some() {
+                    self.tracked = Some((key, Pcsx2LaunchStage::Exited { process }));
+                    true
+                } else {
+                    self.tracked = Some((key, Pcsx2LaunchStage::Running { process }));
+                    false
+                }
+            }
+            other @ (Pcsx2LaunchStage::Exited { .. } | Pcsx2LaunchStage::Failed { .. }) => {
+                self.tracked = Some((key, other));
+                false
+            }
+        }
+    }
+
+    /// Whether the caller should keep repainting - a `Starting` preflight
+    /// or a `Running` process can change state without any user input.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(
+            self.tracked,
+            Some((
+                _,
+                Pcsx2LaunchStage::Starting { .. } | Pcsx2LaunchStage::Running { .. }
+            ))
+        )
+    }
+
+    /// Re-derives the PCSX2 discovery roots fresh from the environment
+    /// inside the background thread (never the roots captured at button-
+    /// render time) - the same "never trust cached readiness as execution
+    /// authority" reasoning as [`DolphinLaunchState::start`]. `evidence` is
+    /// the already-loaded PS2 firmware evidence snapshot (see
+    /// `main.rs`'s `Pcsx2FirmwareEvidenceState`) - core's own preflight
+    /// still re-hashes the actual BIOS file fresh against it at this exact
+    /// moment, so a stale on-disk BIOS is never silently accepted; only the
+    /// evidence *records themselves* are not re-parsed from the DAT source
+    /// on every click, the same way this whole panel does not re-scan
+    /// RetroArch/Dolphin/PCSX2 profiles on every click either.
+    fn start(&mut self, request: Pcsx2LaunchRequest, evidence: Vec<FirmwareIdentityRecord>) {
+        let key = Pcsx2LaunchKey::from_request(&request);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match Pcsx2ProfileDiscoveryRoots::from_environment() {
+                Ok(roots) => preflight_and_launch_pcsx2(&request, &roots, &evidence),
+                Err(error) => Err(Pcsx2LaunchExecutionError::Spawn(
+                    Pcsx2LaunchSpawnError::Spawn(std::io::Error::other(error.to_string())),
+                )),
+            };
+            let _ = sender.send(result);
+        });
+        self.tracked = Some((key, Pcsx2LaunchStage::Starting { receiver }));
+    }
+}
+
 /// Whether `path`'s extension is `.iso`/`.gcm` (case-insensitive) - the only
 /// direct GameCube content this native launch slice supports. Kept as a
 /// small local re-derivation rather than reaching into
@@ -531,6 +703,165 @@ fn dolphin_launch_error_message(error: &DolphinLaunchExecutionError) -> (&'stati
     }
 }
 
+/// Whether `path`'s extension is `.iso` (case-insensitive) - the only
+/// direct PS2 content this native launch slice supports (no CHD yet). Same
+/// reasoning as [`is_direct_gamecube_extension`]: only ever decides whether
+/// to *show* the button, never authorizes a launch.
+fn is_direct_ps2_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("iso"))
+}
+
+/// The single eligibility rule for the "Launch PCSX2" button, and the exact
+/// facts sent to core when it is clicked - one function so the button can
+/// never show for a request core's own preflight would refuse. `Some` only
+/// when every current PCSX2 first-slice condition holds:
+/// [`LaunchTarget::Standalone`] for adapter id `"pcsx2"`, the resolved plan
+/// platform is exactly [`PCSX2_SUPPORTED_PLATFORM_ID`] (`"PS2"`), a verified
+/// PS2 serial actually exists for this game (never just any resolved
+/// `game_key`, which may instead be a verified executable CRC - see
+/// [`Pcsx2LaunchContext::verified_ps2_serial`]), strictly
+/// [`LaunchReadiness::Ready`] with [`FirmwareReadiness::Verified`], direct loose/plain content
+/// ([`LaunchContainerKind::PlainFile`], `requires_mount == false`, a `.iso`
+/// extension), no blockers, no warnings, the named profile is still present
+/// in `context.discovery`, and [`resolve_pcsx2_native_launch_binding`]
+/// proves a real launch binding for it right now - the same reasoning as
+/// [`dolphin_launch_request`], plus the additional PS2-serial requirement
+/// core's own [`Pcsx2LaunchRequest`] needs that Dolphin's does not.
+///
+/// This function deliberately does not re-check firmware/BIOS verification
+/// itself: `candidate.readiness`/`candidate.firmware` already reflect
+/// whatever [`archivefs_core::launch::build_launch_plan`] computed from the
+/// same `context.firmware_evidence` this function hands to the request, so
+/// a candidate whose BIOS is not genuinely `Verified` is already `Blocked`
+/// or `ReadyWithWarnings`, never `Ready` - see
+/// `main.rs`'s `build_launch_readiness_input` for where that projection
+/// happens.
+fn pcsx2_launch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    context: &Pcsx2LaunchContext,
+) -> Option<Pcsx2LaunchRequest> {
+    let (Some(platform_id), Some(_game_key)) = (&plan.platform_id, &plan.game_key) else {
+        return None;
+    };
+    if platform_id != PCSX2_SUPPORTED_PLATFORM_ID {
+        return None;
+    }
+    let verified_ps2_serial = context.verified_ps2_serial.clone()?;
+    if candidate.readiness != LaunchReadiness::Ready {
+        return None;
+    }
+    if candidate.firmware != FirmwareReadiness::Verified {
+        return None;
+    }
+    if !candidate.blockers.is_empty() || !candidate.warnings.is_empty() {
+        return None;
+    }
+    if candidate.content.requires_mount {
+        return None;
+    }
+    if candidate.content.container != Some(LaunchContainerKind::PlainFile) {
+        return None;
+    }
+    let content_path = candidate.content.resolved_path.clone()?;
+    if !is_direct_ps2_extension(&content_path) {
+        return None;
+    }
+    let LaunchTarget::Standalone {
+        adapter_id,
+        profile_id,
+        ..
+    } = &candidate.target
+    else {
+        return None;
+    };
+    if *adapter_id != "pcsx2" {
+        return None;
+    }
+    let profile = context
+        .discovery
+        .profiles
+        .iter()
+        .find(|profile| &profile.profile_id == profile_id)?;
+    let binding = resolve_pcsx2_native_launch_binding(profile, &context.roots).ok()?;
+    Some(Pcsx2LaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: platform_id.clone(),
+        expected_game_key: verified_ps2_serial.clone(),
+        expected_ps2_serial: verified_ps2_serial,
+        profile_id: profile.profile_id.clone(),
+        expected_executable: binding.executable,
+        expected_user_directory_mode: binding.user_directory_mode,
+    })
+}
+
+/// Translates a core PCSX2 launch error into a short player-facing message
+/// - the same reasoning as [`dolphin_launch_error_message`]. Core's own
+/// [`Pcsx2LaunchPreflightErrorKind::CandidateNotReady`]/
+/// `CandidateContentUnsupported`/`RequestedCandidateNotFound` cover *every*
+/// readiness regression at click time - including the BIOS having stopped
+/// verifying since the panel was last drawn - as one coarse bucket; core
+/// does not report a separate "BIOS specifically regressed" kind, so this
+/// function is honest about that rather than fabricating a BIOS-specific
+/// message it cannot actually prove.
+fn pcsx2_launch_error_message(error: &Pcsx2LaunchExecutionError) -> (&'static str, String) {
+    match error {
+        Pcsx2LaunchExecutionError::Preflight(preflight) => {
+            let message = match preflight.kind {
+                Pcsx2LaunchPreflightErrorKind::ContentNotFound
+                | Pcsx2LaunchPreflightErrorKind::ContentIsSymlink
+                | Pcsx2LaunchPreflightErrorKind::ContentNotRegularFile
+                | Pcsx2LaunchPreflightErrorKind::ContentChangedBeforeSpawn => {
+                    "Game file changed since readiness was checked."
+                }
+                Pcsx2LaunchPreflightErrorKind::ContentRequiresMount => {
+                    "This game's content needs to be mounted before it can launch."
+                }
+                Pcsx2LaunchPreflightErrorKind::ContentFormatUnsupported => {
+                    "Only a direct PS2 .iso file can be launched here."
+                }
+                Pcsx2LaunchPreflightErrorKind::IdentityUnresolved
+                | Pcsx2LaunchPreflightErrorKind::IdentityMismatch
+                | Pcsx2LaunchPreflightErrorKind::Ps2SerialUnavailable
+                | Pcsx2LaunchPreflightErrorKind::Ps2SerialMismatch => {
+                    "Game identity changed; refresh readiness."
+                }
+                Pcsx2LaunchPreflightErrorKind::DiscoveryFailed
+                | Pcsx2LaunchPreflightErrorKind::ProfileNotFound
+                | Pcsx2LaunchPreflightErrorKind::BindingUnavailable
+                | Pcsx2LaunchPreflightErrorKind::BindingDrift => {
+                    "PCSX2 installation changed; refresh readiness."
+                }
+                Pcsx2LaunchPreflightErrorKind::RequestedCandidateNotFound
+                | Pcsx2LaunchPreflightErrorKind::CandidateNotReady
+                | Pcsx2LaunchPreflightErrorKind::CandidateContentUnsupported => {
+                    "PCSX2 is no longer ready to launch - re-check readiness and try again."
+                }
+                Pcsx2LaunchPreflightErrorKind::CommandBlocked
+                | Pcsx2LaunchPreflightErrorKind::CommandMissing
+                | Pcsx2LaunchPreflightErrorKind::ExecutableMissing
+                | Pcsx2LaunchPreflightErrorKind::ExecutableUnsafe
+                | Pcsx2LaunchPreflightErrorKind::ExecutableNotExecutable
+                | Pcsx2LaunchPreflightErrorKind::DataPathRootInvalid => {
+                    "PCSX2 executable is no longer available."
+                }
+                Pcsx2LaunchPreflightErrorKind::ContentPathNotAbsolute => {
+                    "This game's file path is invalid."
+                }
+            };
+            (
+                message,
+                format!("{:?}: {}", preflight.kind, preflight.detail),
+            )
+        }
+        Pcsx2LaunchExecutionError::Spawn(Pcsx2LaunchSpawnError::Spawn(io_error)) => {
+            ("PCSX2 failed to launch.", io_error.to_string())
+        }
+    }
+}
+
 /// The single eligibility rule for the "Launch RetroArch" button, and the
 /// exact facts sent to core when it is clicked - one function so the button
 /// can never show for a request core's own preflight would refuse. `Some`
@@ -639,6 +970,7 @@ pub(crate) fn show_launch_readiness_panel(
     input: &LaunchReadinessInput,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
+    pcsx2_launch_state: &mut Pcsx2LaunchState,
 ) {
     widgets::section_header(
         ui,
@@ -675,12 +1007,18 @@ pub(crate) fn show_launch_readiness_panel(
                 widgets::StatusTone::Warning,
             );
         }
-        LaunchReadinessInput::Plan { plan, dolphin } => show_plan(
+        LaunchReadinessInput::Plan {
+            plan,
+            dolphin,
+            pcsx2,
+        } => show_plan(
             ui,
             plan,
             dolphin.as_ref(),
+            pcsx2.as_ref(),
             retroarch_launch_state,
             dolphin_launch_state,
+            pcsx2_launch_state,
         ),
     }
 }
@@ -689,8 +1027,10 @@ fn show_plan(
     ui: &mut egui::Ui,
     plan: &LaunchPlan,
     dolphin: Option<&DolphinLaunchContext>,
+    pcsx2: Option<&Pcsx2LaunchContext>,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
+    pcsx2_launch_state: &mut Pcsx2LaunchState,
 ) {
     if plan.candidates.is_empty() {
         widgets::empty_state(
@@ -708,8 +1048,10 @@ fn show_plan(
             plan,
             candidate,
             dolphin,
+            pcsx2,
             retroarch_launch_state,
             dolphin_launch_state,
+            pcsx2_launch_state,
         );
     }
 }
@@ -768,8 +1110,10 @@ fn show_candidate(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
     dolphin: Option<&DolphinLaunchContext>,
+    pcsx2: Option<&Pcsx2LaunchContext>,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
+    pcsx2_launch_state: &mut Pcsx2LaunchState,
 ) {
     widgets::card(ui, |ui| {
         let (name, profile) = target_labels(&candidate.target);
@@ -829,6 +1173,17 @@ fn show_candidate(
         {
             ui.add_space(6.0);
             show_dolphin_launch_action(ui, dolphin_launch_state, request);
+        }
+        if let Some(context) = pcsx2
+            && let Some(request) = pcsx2_launch_request(plan, candidate, context)
+        {
+            ui.add_space(6.0);
+            show_pcsx2_launch_action(
+                ui,
+                pcsx2_launch_state,
+                request,
+                context.firmware_evidence.clone(),
+            );
         }
     });
 }
@@ -1059,6 +1414,121 @@ fn show_dolphin_launch_action(
             });
             if ui.button("Launch Dolphin").clicked() {
                 launch_state.start(request);
+            }
+        }
+    }
+}
+
+/// Renders the "Launch PCSX2" action for one eligible candidate - the same
+/// structure as [`show_dolphin_launch_action`], for [`Pcsx2LaunchState`].
+/// `firmware_evidence` is the already-loaded PS2 BIOS evidence snapshot,
+/// only ever cloned here to move into the click handler's background
+/// thread - see [`Pcsx2LaunchState::start`].
+fn show_pcsx2_launch_action(
+    ui: &mut egui::Ui,
+    launch_state: &mut Pcsx2LaunchState,
+    request: Pcsx2LaunchRequest,
+    firmware_evidence: Vec<FirmwareIdentityRecord>,
+) {
+    enum Display {
+        Idle,
+        Starting,
+        Running {
+            pid: u32,
+        },
+        Exited {
+            success: bool,
+            status_detail: String,
+            stderr_tail: Option<String>,
+        },
+        Failed {
+            message: &'static str,
+            detail: String,
+        },
+    }
+
+    let this_key = Pcsx2LaunchKey::from_request(&request);
+    let display = match launch_state.tracked.as_mut() {
+        Some((key, stage)) if *key == this_key => match stage {
+            Pcsx2LaunchStage::Starting { .. } => Display::Starting,
+            Pcsx2LaunchStage::Running { process } => Display::Running { pid: process.pid },
+            Pcsx2LaunchStage::Exited { process } => {
+                let report: &Pcsx2LaunchExitReport = process
+                    .poll()
+                    .expect("Exited stage always has a cached exit report");
+                let success = matches!(&report.status, Ok(status) if status.success());
+                let status_detail = match &report.status {
+                    Ok(status) => format!("{status}"),
+                    Err(error) => format!("wait() failed: {error}"),
+                };
+                let stderr_tail = (!success && !report.stderr.is_empty())
+                    .then(|| String::from_utf8_lossy(&report.stderr).into_owned());
+                Display::Exited {
+                    success,
+                    status_detail,
+                    stderr_tail,
+                }
+            }
+            Pcsx2LaunchStage::Failed { error } => {
+                let (message, detail) = pcsx2_launch_error_message(error);
+                Display::Failed { message, detail }
+            }
+        },
+        _ => Display::Idle,
+    };
+
+    match display {
+        Display::Idle => {
+            if ui.button("Launch PCSX2").clicked() {
+                launch_state.start(request, firmware_evidence);
+            }
+        }
+        Display::Starting => {
+            ui.add_enabled(false, egui::Button::new("Starting PCSX2…"));
+        }
+        Display::Running { pid } => {
+            widgets::status_badge(ui, "PCSX2 running", widgets::StatusTone::Success);
+            ui.label(egui::RichText::new(format!("PID {pid}")).small());
+            ui.add_enabled(false, egui::Button::new("Launch PCSX2"));
+        }
+        Display::Exited {
+            success,
+            status_detail,
+            stderr_tail,
+        } => {
+            if success {
+                widgets::banner(
+                    ui,
+                    "PCSX2 exited",
+                    "PCSX2 closed normally.",
+                    widgets::StatusTone::Success,
+                );
+            } else {
+                widgets::banner(
+                    ui,
+                    "PCSX2 exited",
+                    &format!("PCSX2 exited unexpectedly ({status_detail})."),
+                    widgets::StatusTone::Warning,
+                );
+                if let Some(stderr_tail) = stderr_tail {
+                    widgets::technical_details(ui, "pcsx2-exit-stderr", |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(stderr_tail).monospace()).wrap(),
+                        );
+                    });
+                }
+            }
+            if ui.button("Launch PCSX2").clicked() {
+                launch_state.start(request, firmware_evidence);
+            }
+        }
+        Display::Failed { message, detail } => {
+            widgets::banner(ui, "Launch failed", message, widgets::StatusTone::Blocked);
+            widgets::technical_details(ui, "pcsx2-launch-error", |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
+            });
+            if ui.button("Launch PCSX2").clicked() {
+                launch_state.start(request, firmware_evidence);
             }
         }
     }

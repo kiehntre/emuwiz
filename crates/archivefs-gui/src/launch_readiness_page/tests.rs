@@ -18,25 +18,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use archivefs_core::dat::firmware_evidence::{FirmwareIdentityRecord, FirmwareSystem};
+use archivefs_core::dat::model::DatEcosystem;
 use archivefs_core::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
+use archivefs_core::identity_source::hashing::Crc32;
 use archivefs_core::launch::{
     DolphinCommand, DolphinCommandSelection, LaunchBlocker, LaunchBlockerKind, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchPlanSummary, LaunchWarning, LaunchWarningKind,
-    RetroArchCommand, RetroArchCommandSelection, spawn_dolphin, spawn_retroarch,
+    Pcsx2Command, Pcsx2CommandSelection, RetroArchCommand, RetroArchCommandSelection,
+    spawn_dolphin, spawn_pcsx2, spawn_retroarch,
 };
 use archivefs_core::patch_manager::{
     DolphinLocalProfileDiscovery, DolphinNativeLaunchBinding, DolphinUserDirectoryMode,
-    discover_dolphin_local_profiles,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2UserDirectoryMode, discover_dolphin_local_profiles,
+    discover_pcsx2_profiles,
 };
 
 use super::*;
 
 static NEXT_DOLPHIN_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_PCSX2_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
         dolphin: None,
+        pcsx2: None,
     }
 }
 
@@ -44,6 +51,15 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
     LaunchReadinessInput::Plan {
         plan,
         dolphin: Some(context),
+        pcsx2: None,
+    }
+}
+
+fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchReadinessInput {
+    LaunchReadinessInput::Plan {
+        plan,
+        dolphin: None,
+        pcsx2: Some(context),
     }
 }
 
@@ -141,6 +157,7 @@ fn render(input: &LaunchReadinessInput) -> egui::FullOutput {
         input,
         &mut RetroArchLaunchState::default(),
         &mut DolphinLaunchState::default(),
+        &mut Pcsx2LaunchState::default(),
     )
 }
 
@@ -148,25 +165,48 @@ fn render_with_state(
     input: &LaunchReadinessInput,
     state: &mut RetroArchLaunchState,
 ) -> egui::FullOutput {
-    render_with_states(input, state, &mut DolphinLaunchState::default())
+    render_with_states(
+        input,
+        state,
+        &mut DolphinLaunchState::default(),
+        &mut Pcsx2LaunchState::default(),
+    )
 }
 
 fn render_with_dolphin_state(
     input: &LaunchReadinessInput,
     state: &mut DolphinLaunchState,
 ) -> egui::FullOutput {
-    render_with_states(input, &mut RetroArchLaunchState::default(), state)
+    render_with_states(
+        input,
+        &mut RetroArchLaunchState::default(),
+        state,
+        &mut Pcsx2LaunchState::default(),
+    )
+}
+
+fn render_with_pcsx2_state(
+    input: &LaunchReadinessInput,
+    state: &mut Pcsx2LaunchState,
+) -> egui::FullOutput {
+    render_with_states(
+        input,
+        &mut RetroArchLaunchState::default(),
+        &mut DolphinLaunchState::default(),
+        state,
+    )
 }
 
 fn render_with_states(
     input: &LaunchReadinessInput,
     retroarch_state: &mut RetroArchLaunchState,
     dolphin_state: &mut DolphinLaunchState,
+    pcsx2_state: &mut Pcsx2LaunchState,
 ) -> egui::FullOutput {
     let ctx = egui::Context::default();
     ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            show_launch_readiness_panel(ui, input, retroarch_state, dolphin_state);
+            show_launch_readiness_panel(ui, input, retroarch_state, dolphin_state, pcsx2_state);
         });
     })
 }
@@ -710,6 +750,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
             &LaunchReadinessInput,
             &mut RetroArchLaunchState,
             &mut DolphinLaunchState,
+            &mut Pcsx2LaunchState,
         ),
     ) {
     }
@@ -1331,4 +1372,569 @@ fn dolphin_switching_selection_never_shows_stale_state_and_still_reaps_the_old_w
     assert!(state.tracked.is_some());
     state.poll();
     assert!(state.tracked.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Launch PCSX2 fixtures
+// ---------------------------------------------------------------------------
+
+struct Pcsx2Fixture {
+    root: PathBuf,
+}
+
+impl Pcsx2Fixture {
+    fn new(label: &str) -> Self {
+        let sequence = NEXT_PCSX2_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-pcsx2-launch-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn path(&self, relative: &str) -> PathBuf {
+        self.root.join(relative)
+    }
+}
+
+impl Drop for Pcsx2Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn base_pcsx2_roots(fixture: &Pcsx2Fixture) -> Pcsx2ProfileDiscoveryRoots {
+    Pcsx2ProfileDiscoveryRoots {
+        home: fixture.path("home"),
+        xdg_config_home: fixture.path("config"),
+        xdg_data_home: fixture.path("data"),
+        documents_home: fixture.path("home/Documents"),
+        flatpak_system_root: fixture.path("system-flatpak"),
+        appimage_directory: None,
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: Vec::new(),
+    }
+}
+
+/// The smallest ISO9660 structure the core PS2 identity inspector needs to
+/// derive `SLUS-12345` from `SYSTEM.CNF` - synthetic test bytes only.
+fn ps2_iso_bytes() -> Vec<u8> {
+    const SECTOR: usize = 2_048;
+    fn directory_record(name: &[u8], extent: u32, size: u32, directory: bool) -> Vec<u8> {
+        let length = 33 + name.len() + usize::from(name.len().is_multiple_of(2));
+        let mut record = vec![0_u8; length];
+        record[0] = length as u8;
+        record[2..6].copy_from_slice(&extent.to_le_bytes());
+        record[6..10].copy_from_slice(&extent.to_be_bytes());
+        record[10..14].copy_from_slice(&size.to_le_bytes());
+        record[14..18].copy_from_slice(&size.to_be_bytes());
+        record[25] = if directory { 2 } else { 0 };
+        record[28..30].copy_from_slice(&1_u16.to_le_bytes());
+        record[30..32].copy_from_slice(&1_u16.to_be_bytes());
+        record[32] = name.len() as u8;
+        record[33..33 + name.len()].copy_from_slice(name);
+        record
+    }
+
+    let mut iso = vec![0_u8; 24 * SECTOR];
+    let pvd = 16 * SECTOR;
+    iso[pvd] = 1;
+    iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    iso[pvd + 6] = 1;
+    let root = directory_record(&[0], 20, SECTOR as u32, true);
+    iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+    let terminator = 17 * SECTOR;
+    iso[terminator] = 255;
+    iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+    iso[terminator + 6] = 1;
+
+    let cnf = b"VER = 1.00\r\nBOOT2 = cdrom0:\\SLUS_123.45;1\r\n";
+    let root_offset = 20 * SECTOR;
+    let cnf_record = directory_record(b"SYSTEM.CNF;1", 21, cnf.len() as u32, false);
+    iso[root_offset..root_offset + cnf_record.len()].copy_from_slice(&cnf_record);
+    let cnf_offset = 21 * SECTOR;
+    iso[cnf_offset..cnf_offset + cnf.len()].copy_from_slice(cnf);
+    iso
+}
+
+const PS2_SERIAL: &str = "SLUS-12345";
+/// The standard `abc` hash vector. It is synthetic fixture data, never a
+/// real BIOS dump or a Redump-published BIOS hash.
+const SYNTHETIC_BIOS_BYTES: &[u8] = b"abc";
+
+fn matching_ps2_firmware_record() -> FirmwareIdentityRecord {
+    FirmwareIdentityRecord {
+        system: FirmwareSystem::PlayStation2,
+        provider: DatEcosystem::Redump,
+        name: "synthetic PS2 BIOS fixture".to_string(),
+        description: Some("synthetic test record; not a real Redump hash".to_string()),
+        size_bytes: SYNTHETIC_BIOS_BYTES.len() as u64,
+        crc32: Crc32::of(SYNTHETIC_BIOS_BYTES),
+        md5: "900150983cd24fb0d6963f7d28e17f72".to_string(),
+        sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_string(),
+        dat_version: Some("test-revision".to_string()),
+    }
+}
+
+struct ReadyPcsx2Fixture {
+    fixture: Pcsx2Fixture,
+    context: Pcsx2LaunchContext,
+    profile_id: String,
+    executable: PathBuf,
+    content_path: PathBuf,
+}
+
+fn build_ready_pcsx2_fixture(label: &str) -> ReadyPcsx2Fixture {
+    let fixture = Pcsx2Fixture::new(label);
+    let mut roots = base_pcsx2_roots(&fixture);
+    let profile_root = roots.xdg_config_home.join("PCSX2");
+    std::fs::create_dir_all(profile_root.join("bios")).unwrap();
+    std::fs::write(profile_root.join("PCSX2.ini"), b"[Filenames]\n").unwrap();
+    std::fs::write(
+        profile_root.join("bios/scph-test.bin"),
+        SYNTHETIC_BIOS_BYTES,
+    )
+    .unwrap();
+    let executable = fixture.path("bin/pcsx2-qt");
+    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    roots.explicit_executables.push(executable.clone());
+    let content_path = fixture.path("games/game.iso");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(&content_path, ps2_iso_bytes()).unwrap();
+
+    let discovery = discover_pcsx2_profiles(&roots).unwrap();
+    let profile_id = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.configuration_path == profile_root)
+        .expect("fixture profile must be discovered")
+        .profile_id
+        .clone();
+    let context = Pcsx2LaunchContext {
+        discovery,
+        roots,
+        firmware_evidence: vec![matching_ps2_firmware_record()],
+        verified_ps2_serial: Some(PS2_SERIAL.to_string()),
+    };
+    ReadyPcsx2Fixture {
+        fixture,
+        context,
+        profile_id,
+        executable,
+        content_path,
+    }
+}
+
+fn empty_pcsx2_context() -> Pcsx2LaunchContext {
+    Pcsx2LaunchContext {
+        discovery: Pcsx2ProfileDiscovery {
+            profiles: Vec::new(),
+            warnings: Vec::new(),
+            complete: true,
+        },
+        roots: Pcsx2ProfileDiscoveryRoots {
+            home: PathBuf::from("/nonexistent-pcsx2-launch-home"),
+            xdg_config_home: PathBuf::from("/nonexistent-pcsx2-launch-config"),
+            xdg_data_home: PathBuf::from("/nonexistent-pcsx2-launch-data"),
+            documents_home: PathBuf::from("/nonexistent-pcsx2-launch-home/Documents"),
+            flatpak_system_root: PathBuf::from("/nonexistent-pcsx2-launch-flatpak"),
+            appimage_directory: None,
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+        },
+        firmware_evidence: Vec::new(),
+        verified_ps2_serial: Some(PS2_SERIAL.to_string()),
+    }
+}
+
+fn pcsx2_candidate(profile_id: &str, content_path: &Path) -> LaunchCandidate {
+    LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "pcsx2",
+            profile_id: profile_id.to_string(),
+            profile_path: None,
+        },
+        content: resolved_content(content_path.to_str().unwrap()),
+        firmware: FirmwareReadiness::Verified,
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+        readiness: LaunchReadiness::Ready,
+        preference: CandidatePreference::SoleEligible,
+    }
+}
+
+fn pcsx2_plan_with(candidates: Vec<LaunchCandidate>) -> LaunchPlan {
+    let ready = candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Ready)
+        .count();
+    let ready_with_warnings = candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::ReadyWithWarnings)
+        .count();
+    let blocked = candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Blocked)
+        .count();
+    LaunchPlan {
+        platform_id: Some(PCSX2_SUPPORTED_PLATFORM_ID.to_string()),
+        game_key: Some(PS2_SERIAL.to_string()),
+        summary: LaunchPlanSummary {
+            candidates: candidates.len(),
+            ready,
+            ready_with_warnings,
+            blocked,
+        },
+        candidates,
+    }
+}
+
+fn spawn_test_pcsx2_process(
+    executable: &str,
+    arguments: &[&str],
+    content_path: &Path,
+    profile_id: &str,
+) -> LaunchedPcsx2Process {
+    spawn_pcsx2(Pcsx2Command {
+        executable: PathBuf::from(executable),
+        arguments: arguments
+            .iter()
+            .map(|argument| (*argument).into())
+            .collect(),
+        working_directory: None,
+        selection: Pcsx2CommandSelection {
+            profile_id: profile_id.to_string(),
+            user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+            platform_id: PCSX2_SUPPORTED_PLATFORM_ID.to_string(),
+            verified_ps2_serial: PS2_SERIAL.to_string(),
+            content_path: content_path.to_path_buf(),
+        },
+    })
+    .expect("spawning the fixture test process must succeed")
+}
+
+fn wait_until_pcsx2_exited(process: &mut LaunchedPcsx2Process) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.poll().is_none() {
+        assert!(Instant::now() < deadline, "fixture process never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// --- Launch PCSX2 button eligibility and request facts ---------------------
+
+#[test]
+fn strict_ready_ps2_candidate_exposes_launch_pcsx2() {
+    let ready = build_ready_pcsx2_fixture("eligible");
+    let plan = pcsx2_plan_with(vec![pcsx2_candidate(
+        &ready.profile_id,
+        &ready.content_path,
+    )]);
+    let output = render(&pcsx2_plan_input(plan, ready.context));
+    assert!(rendered_text_contains(&output, "Launch PCSX2"));
+}
+
+#[test]
+fn pcsx2_ready_with_warnings_or_blocked_candidates_do_not_offer_launch() {
+    for readiness in [LaunchReadiness::ReadyWithWarnings, LaunchReadiness::Blocked] {
+        let mut candidate = pcsx2_candidate("pcsx2:unknown", Path::new("/library/game.iso"));
+        candidate.readiness = readiness;
+        if readiness == LaunchReadiness::ReadyWithWarnings {
+            candidate.warnings.push(LaunchWarning::new(
+                LaunchWarningKind::MultipleEligibleProfiles,
+                "profile choice is not strict",
+            ));
+        } else {
+            candidate.blockers.push(LaunchBlocker::new(
+                LaunchBlockerKind::RequiredFirmwareMissing,
+                "firmware is missing",
+            ));
+        }
+        let output = render(&pcsx2_plan_input(
+            pcsx2_plan_with(vec![candidate]),
+            empty_pcsx2_context(),
+        ));
+        assert!(!rendered_text_contains(&output, "Launch PCSX2"));
+    }
+}
+
+#[test]
+fn pcsx2_wrong_platform_wrong_adapter_mount_or_non_iso_never_yield_request() {
+    let ready = build_ready_pcsx2_fixture("ineligible-content");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    assert!(pcsx2_launch_request(&plan, &candidate, &ready.context).is_some());
+
+    let mut wrong_platform = plan.clone();
+    wrong_platform.platform_id = Some("PSX".to_string());
+    assert!(pcsx2_launch_request(&wrong_platform, &candidate, &ready.context).is_none());
+
+    let mut wrong_adapter = candidate.clone();
+    wrong_adapter.target = LaunchTarget::Standalone {
+        adapter_id: "dolphin",
+        profile_id: ready.profile_id.clone(),
+        profile_path: None,
+    };
+    assert!(pcsx2_launch_request(&plan, &wrong_adapter, &ready.context).is_none());
+
+    let mut mounted = candidate.clone();
+    mounted.content = unresolved_archive_content();
+    assert!(pcsx2_launch_request(&plan, &mounted, &ready.context).is_none());
+
+    let mut non_iso = candidate;
+    non_iso.content.resolved_path = Some(ready.fixture.path("games/game.chd"));
+    assert!(pcsx2_launch_request(&plan, &non_iso, &ready.context).is_none());
+}
+
+#[test]
+fn missing_firmware_or_verified_serial_prevents_pcsx2_request() {
+    let ready = build_ready_pcsx2_fixture("missing-firmware");
+    let mut candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    candidate.firmware = FirmwareReadiness::Missing;
+    candidate.readiness = LaunchReadiness::Blocked;
+    candidate.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::RequiredFirmwareMissing,
+        "no verified PS2 BIOS",
+    ));
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    assert!(pcsx2_launch_request(&plan, &candidate, &ready.context).is_none());
+
+    // The real planner also makes this inconsistent state non-Ready, but
+    // button eligibility independently requires verified firmware so a
+    // malformed/stale UI candidate can never expose a launch action first.
+    let mut unverified_but_ready = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    unverified_but_ready.firmware = FirmwareReadiness::PresentUnverified;
+    let plan = pcsx2_plan_with(vec![unverified_but_ready.clone()]);
+    assert!(pcsx2_launch_request(&plan, &unverified_but_ready, &ready.context).is_none());
+
+    let mut context = ready.context;
+    context.verified_ps2_serial = None;
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    assert!(pcsx2_launch_request(&plan, &candidate, &context).is_none());
+}
+
+#[test]
+fn matching_synthetic_redump_evidence_is_preserved_for_core_preflight() {
+    let ready = build_ready_pcsx2_fixture("firmware-evidence");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    let request = pcsx2_launch_request(&plan, &candidate, &ready.context)
+        .expect("verified firmware and serial must permit a facts-only request");
+    let command = archivefs_core::launch::preflight_pcsx2_launch(
+        &request,
+        &ready.context.roots,
+        &ready.context.firmware_evidence,
+    )
+    .expect("the exact evidence handed from the context must verify the synthetic BIOS");
+    assert_eq!(command.selection.verified_ps2_serial, PS2_SERIAL);
+}
+
+#[test]
+fn clicking_pcsx2_uses_a_facts_only_request_never_argv_or_shell() {
+    let ready = build_ready_pcsx2_fixture("request-facts");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let request = pcsx2_launch_request(
+        &pcsx2_plan_with(vec![candidate.clone()]),
+        &candidate,
+        &ready.context,
+    )
+    .unwrap();
+    assert_eq!(request.selected_content_path, ready.content_path);
+    assert_eq!(request.expected_platform_id, PCSX2_SUPPORTED_PLATFORM_ID);
+    assert_eq!(request.expected_game_key, PS2_SERIAL);
+    assert_eq!(request.expected_ps2_serial, PS2_SERIAL);
+    assert_eq!(request.profile_id, ready.profile_id);
+    assert_eq!(request.expected_executable, ready.executable);
+    assert_eq!(
+        request.expected_user_directory_mode,
+        Pcsx2UserDirectoryMode::DefaultNative
+    );
+    let Pcsx2LaunchRequest {
+        selected_content_path: _,
+        expected_platform_id: _,
+        expected_game_key: _,
+        expected_ps2_serial: _,
+        profile_id: _,
+        expected_executable: _,
+        expected_user_directory_mode: _,
+    } = request;
+}
+
+// --- PCSX2 lifecycle and stale-selection handling --------------------------
+
+#[test]
+fn pcsx2_starting_and_running_states_show_status_and_pid_without_stop_controls() {
+    let ready = build_ready_pcsx2_fixture("starting-running");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    let request = pcsx2_launch_request(&plan, &candidate, &ready.context).unwrap();
+    let key = Pcsx2LaunchKey::from_request(&request);
+    let (_sender, receiver) = mpsc::channel();
+    let mut starting = Pcsx2LaunchState {
+        tracked: Some((key.clone(), Pcsx2LaunchStage::Starting { receiver })),
+    };
+    let output = render_with_pcsx2_state(
+        &pcsx2_plan_input(plan.clone(), ready.context),
+        &mut starting,
+    );
+    assert!(rendered_text_contains(&output, "Starting PCSX2…"));
+    assert!(!rendered_text_contains(&output, "Launch PCSX2"));
+
+    let ready = build_ready_pcsx2_fixture("running");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    let request = pcsx2_launch_request(&plan, &candidate, &ready.context).unwrap();
+    let key = Pcsx2LaunchKey::from_request(&request);
+    let process =
+        spawn_test_pcsx2_process("/bin/sleep", &["1"], &ready.content_path, &ready.profile_id);
+    let pid = process.pid;
+    let mut running = Pcsx2LaunchState {
+        tracked: Some((key, Pcsx2LaunchStage::Running { process })),
+    };
+    let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut running);
+    assert!(rendered_text_contains(&output, "PCSX2 running"));
+    assert!(rendered_text_contains(&output, &pid.to_string()));
+    assert!(!rendered_text_contains(&output, "Stop"));
+    assert!(!rendered_text_contains(&output, "Kill"));
+}
+
+#[test]
+fn pcsx2_exit_states_show_clean_or_nonzero_status_without_exposing_stderr_inline() {
+    let ready = build_ready_pcsx2_fixture("clean-exit");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    let request = pcsx2_launch_request(&plan, &candidate, &ready.context).unwrap();
+    let key = Pcsx2LaunchKey::from_request(&request);
+    let mut process =
+        spawn_test_pcsx2_process("/bin/true", &[], &ready.content_path, &ready.profile_id);
+    wait_until_pcsx2_exited(&mut process);
+    let mut state = Pcsx2LaunchState {
+        tracked: Some((key, Pcsx2LaunchStage::Exited { process })),
+    };
+    let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut state);
+    assert!(rendered_text_contains(&output, "PCSX2 exited"));
+    assert!(rendered_text_contains(&output, "closed normally"));
+
+    let ready = build_ready_pcsx2_fixture("nonzero-exit");
+    let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    let request = pcsx2_launch_request(&plan, &candidate, &ready.context).unwrap();
+    let key = Pcsx2LaunchKey::from_request(&request);
+    let mut process = spawn_test_pcsx2_process(
+        "/bin/sh",
+        &["-c", "echo pcsx2-failure-marker-9f31 >&2; exit 3"],
+        &ready.content_path,
+        &ready.profile_id,
+    );
+    wait_until_pcsx2_exited(&mut process);
+    let mut state = Pcsx2LaunchState {
+        tracked: Some((key, Pcsx2LaunchStage::Exited { process })),
+    };
+    let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut state);
+    assert!(rendered_text_contains(&output, "PCSX2 exited unexpectedly"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(
+        &output,
+        "pcsx2-failure-marker-9f31"
+    ));
+}
+
+#[test]
+fn pcsx2_preflight_failure_and_stale_selection_are_isolated_honestly() {
+    let ready = build_ready_pcsx2_fixture("stale-selection");
+    let missing = PathBuf::from("/nonexistent/pcsx2-launch-readiness-fixture.iso");
+    let candidate = pcsx2_candidate(&ready.profile_id, &missing);
+    let plan = pcsx2_plan_with(vec![candidate.clone()]);
+    let request = Pcsx2LaunchRequest {
+        selected_content_path: missing,
+        expected_platform_id: PCSX2_SUPPORTED_PLATFORM_ID.to_string(),
+        expected_game_key: PS2_SERIAL.to_string(),
+        expected_ps2_serial: PS2_SERIAL.to_string(),
+        profile_id: ready.profile_id.clone(),
+        expected_executable: ready.executable.clone(),
+        expected_user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+    };
+    let key = Pcsx2LaunchKey::from_request(&request);
+    let error =
+        Pcsx2LaunchExecutionError::Preflight(archivefs_core::launch::Pcsx2LaunchPreflightError {
+            kind: Pcsx2LaunchPreflightErrorKind::ContentNotFound,
+            detail: "fixture content was removed".to_string(),
+        });
+    let mut failed = Pcsx2LaunchState {
+        tracked: Some((key, Pcsx2LaunchStage::Failed { error })),
+    };
+    let output = render_with_pcsx2_state(&pcsx2_plan_input(plan, ready.context), &mut failed);
+    assert!(rendered_text_contains(&output, "Launch failed"));
+    assert!(rendered_text_contains(
+        &output,
+        "Game file changed since readiness was checked."
+    ));
+
+    let ready = build_ready_pcsx2_fixture("stale-running");
+    let first = pcsx2_candidate(&ready.profile_id, &ready.content_path);
+    let first_plan = pcsx2_plan_with(vec![first.clone()]);
+    let first_request = pcsx2_launch_request(&first_plan, &first, &ready.context).unwrap();
+    let process =
+        spawn_test_pcsx2_process("/bin/sleep", &["1"], &ready.content_path, &ready.profile_id);
+    let mut state = Pcsx2LaunchState {
+        tracked: Some((
+            Pcsx2LaunchKey::from_request(&first_request),
+            Pcsx2LaunchStage::Running { process },
+        )),
+    };
+    let other_content = ready.fixture.path("games/other.iso");
+    std::fs::write(&other_content, ps2_iso_bytes()).unwrap();
+    let other_plan = pcsx2_plan_with(vec![pcsx2_candidate(&ready.profile_id, &other_content)]);
+    let output = render_with_pcsx2_state(&pcsx2_plan_input(other_plan, ready.context), &mut state);
+    assert!(!rendered_text_contains(&output, "PCSX2 running"));
+    assert!(rendered_text_contains(&output, "Launch PCSX2"));
+    assert!(
+        state.tracked.is_some(),
+        "the old watcher must remain owned for reaping"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        state.poll();
+        if matches!(state.tracked, Some((_, Pcsx2LaunchStage::Exited { .. }))) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the old selection's PCSX2 watcher was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn pcsx2_binding_and_bios_readiness_drift_have_honest_gamer_facing_messages() {
+    let binding =
+        Pcsx2LaunchExecutionError::Preflight(archivefs_core::launch::Pcsx2LaunchPreflightError {
+            kind: Pcsx2LaunchPreflightErrorKind::BindingDrift,
+            detail: "native executable no longer matches the approved binding".to_string(),
+        });
+    let (message, detail) = pcsx2_launch_error_message(&binding);
+    assert_eq!(message, "PCSX2 installation changed; refresh readiness.");
+    assert!(detail.contains("BindingDrift"));
+
+    // Core deliberately reports a fresh BIOS verification regression as the
+    // general readiness failure below; the GUI must not claim a more specific
+    // diagnosis than core supplied, while still making the required refresh
+    // action clear.
+    let bios =
+        Pcsx2LaunchExecutionError::Preflight(archivefs_core::launch::Pcsx2LaunchPreflightError {
+            kind: Pcsx2LaunchPreflightErrorKind::CandidateNotReady,
+            detail: "fresh firmware verification did not remain Verified".to_string(),
+        });
+    let (message, detail) = pcsx2_launch_error_message(&bios);
+    assert_eq!(
+        message,
+        "PCSX2 is no longer ready to launch - re-check readiness and try again."
+    );
+    assert!(detail.contains("firmware verification"));
 }

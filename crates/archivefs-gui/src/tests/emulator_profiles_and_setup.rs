@@ -15,6 +15,9 @@
 
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[test]
 fn advanced_view_cheats_mods_has_no_back_to_games_button() {
     // The button is Gamer-View-only - Advanced View already has its
@@ -3381,7 +3384,12 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
     };
     let input = app.build_launch_readiness_input(live);
 
-    let launch_readiness_page::LaunchReadinessInput::Plan { plan, dolphin } = input else {
+    let launch_readiness_page::LaunchReadinessInput::Plan {
+        plan,
+        dolphin,
+        pcsx2: _,
+    } = input
+    else {
         panic!("a resolved GameCube identity with RetroArch scanned must produce a Plan");
     };
     assert!(
@@ -3399,6 +3407,149 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
         )),
         "the real discovered Dolphin profile must become a Standalone launch candidate, \
          never silently dropped by an empty standalone-profiles slice"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+// --- Launch Readiness: Selected page threads PS2 firmware evidence ---------
+
+#[test]
+fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads_it_to_context() {
+    // `abc` is a standard synthetic hash vector, not a real BIOS dump or a
+    // Redump-published BIOS hash. The record is deliberately computed as
+    // fixture data only, so this regression test never embeds firmware
+    // content or real provider data.
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-selected-pcsx2-launch-readiness-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let content = directory.join("game.iso");
+    std::fs::write(&content, b"direct ISO fixture bytes").unwrap();
+
+    let mut roots = archivefs_core::patch_manager::Pcsx2ProfileDiscoveryRoots {
+        home: directory.join("home"),
+        xdg_config_home: directory.join("config"),
+        xdg_data_home: directory.join("data"),
+        documents_home: directory.join("home/Documents"),
+        flatpak_system_root: directory.join("system-flatpak"),
+        appimage_directory: None,
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: Vec::new(),
+    };
+    let profile_root = roots.xdg_config_home.join("PCSX2");
+    std::fs::create_dir_all(profile_root.join("bios")).unwrap();
+    std::fs::write(profile_root.join("PCSX2.ini"), b"[Filenames]\n").unwrap();
+    std::fs::write(profile_root.join("bios/synthetic.bin"), b"abc").unwrap();
+    let executable = directory.join("bin/pcsx2-qt");
+    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    roots.explicit_executables.push(executable);
+    let discovery = archivefs_core::patch_manager::discover_pcsx2_profiles(&roots).unwrap();
+    assert!(discovery.profiles.iter().any(|profile| profile.eligible));
+
+    let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(pcsx2_profile_fixture());
+    if let LoadState::Ready(data) = &mut app.state {
+        data.records = vec![record(content.to_str().unwrap(), MountState::NotMountable)];
+    }
+    app.archive_context.focused = Some(content.clone());
+    app.archive_context.selected = [content.clone()].into_iter().collect();
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    workflow.archive_path = content.clone();
+    workflow.source_root = directory.clone();
+    if let CheatStepResource::Ready((request, report)) = &mut workflow.identity {
+        request.archive_path = content.clone();
+        report.archive_path = content.clone();
+    } else {
+        panic!("fixture must retain its verified PS2 identity report");
+    }
+    app.selected_evidence = ready_selected_evidence_state(&content);
+    app.pcsx2_launch_profiles =
+        Pcsx2LaunchProfilesState::Ready(Pcsx2LaunchProfilesReady { discovery, roots });
+
+    // An installed BIOS alone is never enough: absent authoritative records
+    // must surface as non-verified firmware and therefore never strict Ready.
+    app.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(Vec::new());
+    let live = match &app.state {
+        LoadState::Ready(data) => Some(data.as_ref()),
+        _ => None,
+    };
+    let input = app.build_launch_readiness_input(live);
+    let launch_readiness_page::LaunchReadinessInput::Plan { plan, .. } = input else {
+        panic!("verified PS2 identity must reach planning");
+    };
+    let missing = plan
+        .candidates
+        .iter()
+        .find(|candidate| {
+            matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::Standalone {
+                    adapter_id: "pcsx2",
+                    ..
+                }
+            )
+        })
+        .expect("real discovered PCSX2 profile must remain an additive candidate");
+    assert_eq!(
+        missing.firmware,
+        archivefs_core::launch::FirmwareReadiness::PresentUnverified
+    );
+    assert_ne!(
+        missing.readiness,
+        archivefs_core::launch::LaunchReadiness::Ready
+    );
+
+    let evidence = archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord {
+        system: archivefs_core::dat::firmware_evidence::FirmwareSystem::PlayStation2,
+        provider: archivefs_core::dat::model::DatEcosystem::Redump,
+        name: "synthetic PS2 BIOS fixture".to_string(),
+        description: Some("synthetic test record; not a real Redump hash".to_string()),
+        size_bytes: 3,
+        crc32: "352441c2".to_string(),
+        md5: "900150983cd24fb0d6963f7d28e17f72".to_string(),
+        sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_string(),
+        dat_version: Some("test-revision".to_string()),
+    };
+    app.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(vec![evidence.clone()]);
+    let live = match &app.state {
+        LoadState::Ready(data) => Some(data.as_ref()),
+        _ => None,
+    };
+    let input = app.build_launch_readiness_input(live);
+    let launch_readiness_page::LaunchReadinessInput::Plan { plan, pcsx2, .. } = input else {
+        panic!("verified PS2 identity must reach planning");
+    };
+    let context = pcsx2.expect("app state must pass loaded evidence to the PCSX2 launch context");
+    assert_eq!(context.firmware_evidence, vec![evidence]);
+    let verified = plan
+        .candidates
+        .iter()
+        .find(|candidate| {
+            matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::Standalone {
+                    adapter_id: "pcsx2",
+                    ..
+                }
+            )
+        })
+        .expect("PCSX2 candidate must remain present");
+    assert_eq!(
+        verified.firmware,
+        archivefs_core::launch::FirmwareReadiness::Verified
+    );
+    assert_eq!(
+        verified.readiness,
+        archivefs_core::launch::LaunchReadiness::Ready
     );
 
     let _ = std::fs::remove_dir_all(&directory);
