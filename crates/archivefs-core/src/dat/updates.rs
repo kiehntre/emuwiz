@@ -52,6 +52,14 @@ pub enum ManagedDatProvider {
     /// [`RedumpBiosSystem`] for the fixed, closed set of systems this
     /// provider may name.
     RedumpBios,
+    /// Redump's ordinary per-system game/disc DATs - see
+    /// [`RedumpGameSystem`] for the fixed, closed set of systems this
+    /// provider may name. A deliberately narrower set than
+    /// [`RedumpBiosSystem`]'s three systems is not required - both draw
+    /// from the same proven `redump.org` host and `/datfile/<slug>/` path
+    /// family (see [`RedumpGameSystem::fixed_url`]'s own doc comment) - but
+    /// only systems this codebase has actual evidence for are ever added.
+    RedumpGames,
 }
 
 impl ManagedDatProvider {
@@ -59,6 +67,7 @@ impl ManagedDatProvider {
         match self {
             Self::MameSoftwareList => "mame-software-list",
             Self::RedumpBios => "redump-bios",
+            Self::RedumpGames => "redump-games",
         }
     }
 }
@@ -117,6 +126,72 @@ impl RedumpBiosSystem {
     }
 }
 
+/// The fixed, closed set of systems this build has actual evidence for
+/// Redump's ordinary (non-BIOS) per-system game/disc DAT.
+///
+/// Deliberately limited to the same three systems [`RedumpBiosSystem`]
+/// already proves a working `redump.org` contract for - not because other
+/// Redump systems (Saturn, Dreamcast, GameCube, Wii, ...) lack a game DAT,
+/// but because this codebase has no proven slug for any of them: Redump's
+/// own BIOS URLs (`.../datfile/psx-bios/`, `.../datfile/ps2-bios/`,
+/// `.../datfile/xbox-bios/`) are the only place a `/datfile/<slug>/`-shaped
+/// path has ever been confirmed correct in this repository, and the
+/// ordinary-dataset slug for each is exactly that BIOS slug with the
+/// `-bios` suffix removed - not a separately invented guess. A system whose
+/// slug cannot be derived this way (Saturn included) is intentionally left
+/// unsupported rather than guessed at; see the module's managed-provider
+/// task notes for why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedumpGameSystem {
+    PlayStation,
+    PlayStation2,
+    Xbox,
+}
+
+impl RedumpGameSystem {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::PlayStation => "playstation",
+            Self::PlayStation2 => "playstation2",
+            Self::Xbox => "xbox",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "playstation" => Some(Self::PlayStation),
+            "playstation2" => Some(Self::PlayStation2),
+            "xbox" => Some(Self::Xbox),
+            _ => None,
+        }
+    }
+
+    /// The one fixed, approved HTTPS URL for this system's ordinary Redump
+    /// game DAT - the [`RedumpBiosSystem::fixed_url`] URL for the same
+    /// system with the `-bios` path segment removed, never a separately
+    /// guessed slug (see this enum's own doc comment).
+    fn fixed_url(self) -> &'static str {
+        match self {
+            Self::PlayStation => "https://redump.org/datfile/psx/",
+            Self::PlayStation2 => "https://redump.org/datfile/ps2/",
+            Self::Xbox => "https://redump.org/datfile/xbox/",
+        }
+    }
+
+    /// A plain descriptive label for provenance/error text only - this is
+    /// never asserted to appear verbatim in a downloaded DAT's header; see
+    /// [`header_identifies_redump_game_dataset`] for the actual (tolerant,
+    /// substring-based) match.
+    fn dataset_label(self) -> &'static str {
+        match self {
+            Self::PlayStation => "Sony - PlayStation",
+            Self::PlayStation2 => "Sony - PlayStation 2",
+            Self::Xbox => "Microsoft - Xbox",
+        }
+    }
+}
+
 /// A stable provider-scoped identity, not a filename-derived local-source ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ManagedDatSourceId {
@@ -145,6 +220,16 @@ impl ManagedDatSourceId {
         }
     }
 
+    /// Creates the stable ID for one of the fixed Redump ordinary
+    /// game-DAT systems. Infallible: `system` is a closed enum, so there is
+    /// no free-text input to validate.
+    pub fn redump_games(system: RedumpGameSystem) -> Self {
+        Self {
+            provider: ManagedDatProvider::RedumpGames,
+            source_key: system.slug().to_string(),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         match self.provider {
             ManagedDatProvider::MameSoftwareList => {
@@ -154,6 +239,14 @@ impl ManagedDatSourceId {
                 if RedumpBiosSystem::from_slug(&self.source_key).is_none() {
                     return Err(config_error(
                         "Redump BIOS source key must name one of the fixed supported systems",
+                    ));
+                }
+                Ok(())
+            }
+            ManagedDatProvider::RedumpGames => {
+                if RedumpGameSystem::from_slug(&self.source_key).is_none() {
+                    return Err(config_error(
+                        "Redump game DAT source key must name one of the fixed supported systems",
                     ));
                 }
                 Ok(())
@@ -219,6 +312,11 @@ enum ExpectedDataset {
     /// rather than exact string equality (see that function's own doc
     /// comment for why).
     RedumpBios(RedumpBiosSystem),
+    /// Redump: the fixed system's ordinary game/disc dataset, matched via
+    /// [`header_identifies_redump_game_dataset`] - tolerant substring
+    /// matching, and an explicit rejection of anything that looks like a
+    /// BIOS dataset instead.
+    RedumpGames(RedumpGameSystem),
 }
 
 /// A built-in, validated future source contract.
@@ -279,6 +377,29 @@ impl ManagedDatSourceDescriptor {
         Ok(descriptor)
     }
 
+    /// Constructs the fixed contract for one of Redump's ordinary
+    /// per-system game/disc DATs. The caller supplies only a closed
+    /// [`RedumpGameSystem`] enum value - never a URL, hostname, or
+    /// free-text dataset name - and each variant maps internally to exactly
+    /// one approved endpoint (see [`RedumpGameSystem::fixed_url`]). The
+    /// downloaded body may be a bare DAT/XML file or a ZIP archive
+    /// containing exactly one - see [`fetch_and_validate_redump_games`] for
+    /// how that is detected and safely unwrapped.
+    pub fn redump_games(system: RedumpGameSystem) -> Result<Self> {
+        let descriptor = Self {
+            source_id: ManagedDatSourceId::redump_games(system),
+            remote: ManagedDatRemote::DirectHttps {
+                url: system.fixed_url(),
+            },
+            expected_ecosystem: DatEcosystem::Redump,
+            expected_dataset: ExpectedDataset::RedumpGames(system),
+            max_payload_size: DEFAULT_MAX_FILE_SIZE,
+            update_policy: ManagedDatUpdatePolicy::Disabled,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
     pub fn source_id(&self) -> &ManagedDatSourceId {
         &self.source_id
     }
@@ -314,16 +435,25 @@ impl ManagedDatSourceDescriptor {
     pub fn expected_softwarelist_name(&self) -> &str {
         match &self.expected_dataset {
             ExpectedDataset::MameSoftwareList(name) => name,
-            ExpectedDataset::RedumpBios(_) => "",
+            ExpectedDataset::RedumpBios(_) | ExpectedDataset::RedumpGames(_) => "",
         }
     }
 
     /// The fixed Redump BIOS system this descriptor represents, for the
-    /// Redump contract only. `None` for a MAME descriptor.
+    /// Redump BIOS contract only. `None` otherwise.
     pub fn redump_bios_system(&self) -> Option<RedumpBiosSystem> {
         match &self.expected_dataset {
             ExpectedDataset::RedumpBios(system) => Some(*system),
-            ExpectedDataset::MameSoftwareList(_) => None,
+            ExpectedDataset::MameSoftwareList(_) | ExpectedDataset::RedumpGames(_) => None,
+        }
+    }
+
+    /// The fixed Redump ordinary game-DAT system this descriptor
+    /// represents, for the Redump game contract only. `None` otherwise.
+    pub fn redump_games_system(&self) -> Option<RedumpGameSystem> {
+        match &self.expected_dataset {
+            ExpectedDataset::RedumpGames(system) => Some(*system),
+            ExpectedDataset::MameSoftwareList(_) | ExpectedDataset::RedumpBios(_) => None,
         }
     }
 
@@ -339,6 +469,7 @@ impl ManagedDatSourceDescriptor {
             ExpectedDataset::RedumpBios(system) => {
                 system.firmware_system().redump_dataset_label().to_string()
             }
+            ExpectedDataset::RedumpGames(system) => system.dataset_label().to_string(),
         }
     }
 
@@ -400,6 +531,20 @@ impl ManagedDatSourceDescriptor {
                 {
                     return Err(config_error(
                         "managed DAT descriptor is not a fixed Redump BIOS contract",
+                    ));
+                }
+            }
+            (
+                ManagedDatProvider::RedumpGames,
+                ManagedDatRemote::DirectHttps { url },
+                ExpectedDataset::RedumpGames(system),
+            ) => {
+                if system.slug() != self.source_id.source_key
+                    || self.expected_ecosystem != DatEcosystem::Redump
+                    || *url != system.fixed_url()
+                {
+                    return Err(config_error(
+                        "managed DAT descriptor is not a fixed Redump game contract",
                     ));
                 }
             }
@@ -635,6 +780,12 @@ fn descriptor_from_source_id(source_id: &ManagedDatSourceId) -> Result<ManagedDa
                 config_error("managed DAT state names an unknown Redump BIOS system")
             })?;
             ManagedDatSourceDescriptor::redump_bios(system)
+        }
+        ManagedDatProvider::RedumpGames => {
+            let system = RedumpGameSystem::from_slug(&source_id.source_key).ok_or_else(|| {
+                config_error("managed DAT state names an unknown Redump game system")
+            })?;
+            ManagedDatSourceDescriptor::redump_games(system)
         }
     }
 }
@@ -1196,6 +1347,9 @@ pub fn check_managed_dat_update(
     match descriptor.source_id().provider {
         ManagedDatProvider::MameSoftwareList => check_mame_update(descriptor, options, transport),
         ManagedDatProvider::RedumpBios => check_redump_bios_update(descriptor, options, transport),
+        ManagedDatProvider::RedumpGames => {
+            check_redump_games_update(descriptor, options, transport)
+        }
     }
 }
 
@@ -1253,6 +1407,7 @@ pub fn update_managed_dat(
     match descriptor.source_id().provider {
         ManagedDatProvider::MameSoftwareList => update_mame_dat(descriptor, options, transport),
         ManagedDatProvider::RedumpBios => update_redump_bios(descriptor, options, transport),
+        ManagedDatProvider::RedumpGames => update_redump_games(descriptor, options, transport),
     }
 }
 
@@ -1884,6 +2039,320 @@ fn update_redump_bios(
         format!(
             "validated Redump {} BIOS DAT with {} usable record(s)",
             system.firmware_system().redump_dataset_label(),
+            fetched.entry_count
+        ),
+    )
+}
+
+/// Whether `parsed`'s header text identifies it as Redump's ordinary
+/// (non-BIOS) game/disc dataset for `system` - checked across the same
+/// header fields [`crate::dat::firmware_evidence::header_identifies_redump_bios_dataset`]
+/// checks, using the same PS1-vs-PS2 disambiguation, but requiring "bios"
+/// to be *absent* rather than present (task requirement: an ordinary game
+/// DAT that happens to look like the BIOS dataset must never be accepted
+/// here - the BIOS provider already owns that dataset).
+fn header_identifies_redump_game_dataset(
+    source: &crate::dat::model::DatSource,
+    system: RedumpGameSystem,
+) -> bool {
+    let fields = [
+        &source.name,
+        &source.description,
+        &source.author,
+        &source.version,
+    ];
+    let joined: String = fields
+        .iter()
+        .filter_map(|field| field.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if joined.contains("bios") {
+        return false;
+    }
+    let mentions_ps2 = joined.contains("playstation 2")
+        || joined.contains("playstation2")
+        || joined.contains("ps2");
+    match system {
+        RedumpGameSystem::PlayStation2 => mentions_ps2,
+        RedumpGameSystem::PlayStation => joined.contains("playstation") && !mentions_ps2,
+        RedumpGameSystem::Xbox => joined.contains("xbox") && !joined.contains("360"),
+    }
+}
+
+/// Whether the bytes staged at `path` begin with a ZIP local-file-header
+/// signature (`PK\x03\x04`) - the one detail this function inspects. It
+/// never trusts a `Content-Type` header or file extension; only these first
+/// four bytes decide whether [`fetch_and_validate_redump_games`] attempts a
+/// bounded ZIP unwrap before parsing.
+fn staged_file_looks_like_zip(path: &Path) -> std::result::Result<bool, ManagedDatUpdateOutcome> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| storage_failure(ArchiveFsError::io(path.to_path_buf(), error)))?;
+    let mut magic = [0_u8; 4];
+    let read = file
+        .read(&mut magic)
+        .map_err(|error| storage_failure(ArchiveFsError::io(path.to_path_buf(), error)))?;
+    Ok(read == 4 && magic == *b"PK\x03\x04")
+}
+
+/// The validated result of [`fetch_and_validate_redump_games`].
+struct FetchedRedumpGames {
+    response: ManagedDatHttpResponse,
+    sha256: String,
+    upstream_version: Option<String>,
+    entry_count: usize,
+}
+
+/// Downloads `descriptor`'s fixed Redump game-DAT URL into a private
+/// staging file, unwraps a ZIP-wrapped response to its single DAT/XML
+/// member if present (see [`crate::dat::archive::zip::extract_sole_zip_member`],
+/// reusing the same bounded ZIP metadata scan and member-safety checks
+/// every other ZIP consumer in this crate relies on - never a second,
+/// independent extraction path), and fully validates the resulting bytes
+/// (parse, ecosystem, dataset identity for the requested system, not a
+/// BIOS dataset, non-empty game list). An HTML/login/error page - which is
+/// neither a ZIP nor a well-formed DAT - fails closed at the parse step
+/// with [`ManagedDatUpdateFailureKind::Parser`], exactly like any other
+/// malformed response. Never renames the staging file into the managed
+/// object store; see [`update_redump_games`] for promotion. Returns `Ok(None)`
+/// for a `304 Not Modified` conditional response.
+fn fetch_and_validate_redump_games(
+    descriptor: &ManagedDatSourceDescriptor,
+    system: RedumpGameSystem,
+    existing: Option<&ManagedDatState>,
+    staging_path: &Path,
+    transport: &dyn ManagedDatTransport,
+) -> std::result::Result<Option<FetchedRedumpGames>, ManagedDatUpdateOutcome> {
+    let mut headers = Vec::new();
+    if let Some(state) = existing {
+        if let Some(etag) = &state.etag {
+            headers.push(("If-None-Match".to_string(), etag.clone()));
+        }
+        if let Some(last_modified) = &state.last_modified {
+            headers.push(("If-Modified-Since".to_string(), last_modified.clone()));
+        }
+    }
+    let request = ManagedDatHttpRequest {
+        url: system.fixed_url().to_string(),
+        headers,
+    };
+    let (response, downloaded_sha256) = download_to_staging(
+        &request,
+        staging_path,
+        descriptor.max_payload_size(),
+        "Redump game DAT",
+        transport,
+    )?;
+    if response.status == 304 {
+        return Ok(None);
+    }
+    if response.status != 200 {
+        return Err(http_failure(response.status, response.retry_after_seconds));
+    }
+
+    // The content digest that ends up in `ManagedDatState`/no-update-churn
+    // comparisons must always be over the *DAT bytes themselves*, never the
+    // outer ZIP container (whose own metadata/compression could vary
+    // without the actual game data changing) - so a ZIP response replaces
+    // the staged bytes with its unwrapped content before hashing continues.
+    let sha256 = if staged_file_looks_like_zip(staging_path)? {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let extracted = crate::dat::archive::zip::extract_sole_zip_member(
+            staging_path,
+            &crate::dat::archive::limits::ArchiveLimits::default(),
+            &cancel,
+        )
+        .map_err(|error| ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::InvalidResponse,
+            detail: format!("Redump game DAT ZIP could not be safely unwrapped: {error:?}"),
+        })?;
+        fs::write(staging_path, &extracted).map_err(|error| {
+            storage_failure(ArchiveFsError::io(staging_path.to_path_buf(), error))
+        })?;
+        sha256_file(staging_path).map_err(storage_failure)?
+    } else {
+        downloaded_sha256
+    };
+
+    let parsed =
+        crate::dat::parsers::parse_dat_file(staging_path, crate::dat::limits::DatLimits::default())
+            .map_err(|error| ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::Parser,
+                detail: error.to_string(),
+            })?
+            .dat;
+    if parsed.source.ecosystem != descriptor.expected_ecosystem() {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::WrongEcosystem,
+            detail: format!(
+                "expected {}, received {}",
+                descriptor.expected_ecosystem().label(),
+                parsed.source.ecosystem.label()
+            ),
+        });
+    }
+    if !header_identifies_redump_game_dataset(&parsed.source, system) {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+            detail: format!(
+                "downloaded DAT does not identify itself as the {} game dataset (or looks like \
+                 a BIOS dataset)",
+                system.dataset_label()
+            ),
+        });
+    }
+    if parsed.games.is_empty() {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::EmptyCatalogue,
+            detail: "downloaded Redump game DAT contains no game records".to_string(),
+        });
+    }
+    Ok(Some(FetchedRedumpGames {
+        response,
+        sha256,
+        upstream_version: parsed.source.version.clone(),
+        entry_count: parsed.games.len(),
+    }))
+}
+
+/// Checks Redump's fixed game-DAT URL for `descriptor` - structurally
+/// identical to [`check_redump_bios_update`] (same fully-validate-then-
+/// compare-digest model, since Redump exposes no separate cheap version
+/// endpoint here either), dispatching to [`fetch_and_validate_redump_games`]
+/// instead of the BIOS fetch.
+fn check_redump_games_update(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    transport: &dyn ManagedDatTransport,
+) -> Result<ManagedDatUpdateOutcome> {
+    let system = descriptor
+        .redump_games_system()
+        .expect("check_redump_games_update is only ever called with a Redump games descriptor");
+    let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
+    let source_dir = match create_managed_source_dir(&options.managed_root, descriptor.source_id())
+    {
+        Ok(()) => managed_source_dir(&options.managed_root, descriptor.source_id())?,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let staging = match create_private_staging_file(&options.managed_root, &source_dir) {
+        Ok(file) => file,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let _cleanup = ManagedDatStagingCleanup(staging.path.clone());
+    let fetched = match fetch_and_validate_redump_games(
+        descriptor,
+        system,
+        existing.as_ref(),
+        &staging.path,
+        transport,
+    ) {
+        Ok(fetched) => fetched,
+        Err(outcome) => return Ok(outcome),
+    };
+    let Some(fetched) = fetched else {
+        let revision = ResolvedRevisionMeta {
+            label: existing
+                .as_ref()
+                .and_then(|state| state.upstream_revision.clone())
+                .unwrap_or_default(),
+            etag: None,
+            last_modified: None,
+            not_modified: true,
+        };
+        return mark_up_to_date(existing, options, revision);
+    };
+    let up_to_date = existing
+        .as_ref()
+        .is_some_and(|state| state.sha256 == fetched.sha256);
+    if up_to_date {
+        let revision = ResolvedRevisionMeta {
+            label: fetched
+                .upstream_version
+                .unwrap_or_else(|| fetched.sha256[..12].to_string()),
+            etag: fetched.response.etag,
+            last_modified: fetched.response.last_modified,
+            not_modified: false,
+        };
+        return mark_up_to_date(existing, options, revision);
+    }
+    Ok(ManagedDatUpdateOutcome::UpdateAvailable {
+        upstream_revision: fetched
+            .upstream_version
+            .unwrap_or_else(|| fetched.sha256[..12].to_string()),
+    })
+}
+
+/// Downloads, validates, and (only on a genuine content change) promotes
+/// Redump's fixed game DAT for `descriptor`'s system - structurally
+/// identical to [`update_redump_bios`]: bytes identical to the current
+/// snapshot's SHA-256 leave `current`/`previous` untouched even when the
+/// parsed header version text differs.
+fn update_redump_games(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    transport: &dyn ManagedDatTransport,
+) -> Result<ManagedDatUpdateOutcome> {
+    let system = descriptor
+        .redump_games_system()
+        .expect("update_redump_games is only ever called with a Redump games descriptor");
+    let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
+    let source_dir = match create_managed_source_dir(&options.managed_root, descriptor.source_id())
+    {
+        Ok(()) => managed_source_dir(&options.managed_root, descriptor.source_id())?,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let staging = match create_private_staging_file(&options.managed_root, &source_dir) {
+        Ok(file) => file,
+        Err(error) => return Ok(storage_failure(error)),
+    };
+    let _cleanup = ManagedDatStagingCleanup(staging.path.clone());
+    let fetched = match fetch_and_validate_redump_games(
+        descriptor,
+        system,
+        existing.as_ref(),
+        &staging.path,
+        transport,
+    ) {
+        Ok(fetched) => fetched,
+        Err(outcome) => return Ok(outcome),
+    };
+    let Some(fetched) = fetched else {
+        let revision = ResolvedRevisionMeta {
+            label: existing
+                .as_ref()
+                .and_then(|state| state.upstream_revision.clone())
+                .unwrap_or_default(),
+            etag: None,
+            last_modified: None,
+            not_modified: true,
+        };
+        return mark_up_to_date(existing, options, revision);
+    };
+    let revision = ResolvedRevisionMeta {
+        label: fetched
+            .upstream_version
+            .clone()
+            .unwrap_or_else(|| fetched.sha256[..12].to_string()),
+        etag: fetched.response.etag,
+        last_modified: fetched.response.last_modified,
+        not_modified: false,
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|state| state.sha256 == fetched.sha256)
+    {
+        return mark_up_to_date(existing, options, revision);
+    }
+    publish_validated_snapshot(
+        descriptor,
+        options,
+        existing,
+        revision,
+        fetched.sha256,
+        staging.path,
+        format!(
+            "validated Redump {} game DAT with {} record(s)",
+            system.dataset_label(),
             fetched.entry_count
         ),
     )
@@ -2651,6 +3120,517 @@ mod tests {
         // A wrong-dataset DAT must never replace the known-good current
         // snapshot, even though it is bytewise well-formed XML.
         let bad_body = redump_bios_dat(RedumpBiosSystem::Xbox, "Xbox BIOS", b"unrelated bytes");
+        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(bad_body))]);
+        let outcome =
+            update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+                ..
+            }
+        ));
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state.current_snapshot.sha256, good_sha256);
+    }
+
+    // -----------------------------------------------------------------
+    // Redump game/disc DAT provider
+    // -----------------------------------------------------------------
+
+    fn redump_games_descriptor(system: RedumpGameSystem) -> ManagedDatSourceDescriptor {
+        ManagedDatSourceDescriptor::redump_games(system)
+            .unwrap()
+            .with_update_policy(ManagedDatUpdatePolicy::Manual)
+    }
+
+    fn redump_game_header(system: RedumpGameSystem) -> &'static str {
+        match system {
+            RedumpGameSystem::PlayStation => "Sony - PlayStation",
+            RedumpGameSystem::PlayStation2 => "Sony - PlayStation 2",
+            RedumpGameSystem::Xbox => "Microsoft - Xbox",
+        }
+    }
+
+    /// A synthetic, self-hashing Redump ordinary game DAT body - deliberate
+    /// never real Redump content, and deliberately carries no "bios"
+    /// wording anywhere.
+    fn redump_game_dat(system: RedumpGameSystem, game: &str, bytes: &[u8]) -> Vec<u8> {
+        let crc32 = crate::identity_source::hashing::Crc32::of(bytes);
+        let md5 = {
+            use md5::{Digest as _, Md5};
+            digest_hex(Md5::digest(bytes))
+        };
+        let sha1 = {
+            use sha1::{Digest as _, Sha1};
+            digest_hex(Sha1::digest(bytes))
+        };
+        let header = redump_game_header(system);
+        format!(
+            r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>{header}</name>
+        <description>{header} Datfile</description>
+        <version>20240115</version>
+        <author>Redump.org</author>
+    </header>
+    <game name="{game}">
+        <description>{game}</description>
+        <rom name="track.bin" size="{}" crc="{crc32}" md5="{md5}" sha1="{sha1}"/>
+    </game>
+</datafile>"#,
+            bytes.len()
+        )
+        .into_bytes()
+    }
+
+    fn redump_game_bytes(seed: &str) -> Vec<u8> {
+        format!("synthetic managed redump game bytes - {seed}").into_bytes()
+    }
+
+    /// Wraps `entries` in an in-memory ZIP - mirrors exactly what a
+    /// ZIP-wrapped Redump datfile download would deliver as its body.
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Cursor;
+        use std::io::Write as _;
+        use zip::ZipWriter;
+        use zip::write::SimpleFileOptions;
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn install_redump_games(
+        system: RedumpGameSystem,
+        root: PathBuf,
+        body: Vec<u8>,
+    ) -> ManagedDatUpdateOutcome {
+        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(body))]);
+        update_managed_dat(
+            &redump_games_descriptor(system),
+            &update_options(root),
+            &transport,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn typed_game_descriptor_derives_its_url_from_the_proven_bios_url_for_all_three_systems() {
+        for (system, slug, bios_system) in [
+            (
+                RedumpGameSystem::PlayStation,
+                "playstation",
+                RedumpBiosSystem::PlayStation,
+            ),
+            (
+                RedumpGameSystem::PlayStation2,
+                "playstation2",
+                RedumpBiosSystem::PlayStation2,
+            ),
+            (RedumpGameSystem::Xbox, "xbox", RedumpBiosSystem::Xbox),
+        ] {
+            let descriptor = ManagedDatSourceDescriptor::redump_games(system).unwrap();
+            assert_eq!(
+                descriptor.source_id().provider,
+                ManagedDatProvider::RedumpGames
+            );
+            assert_eq!(descriptor.source_id().source_key, slug);
+            assert_eq!(descriptor.expected_ecosystem(), DatEcosystem::Redump);
+            assert_eq!(descriptor.redump_games_system(), Some(system));
+            assert_eq!(descriptor.redump_bios_system(), None);
+            assert_eq!(
+                descriptor.source_id().to_string(),
+                format!("redump-games/{slug}")
+            );
+            // Every game-DAT URL is exactly its proven BIOS sibling's URL
+            // with the `-bios` path segment removed - never a separately
+            // invented slug (see `RedumpGameSystem`'s own doc comment).
+            let expected_url = bios_system.fixed_url().replace("-bios", "");
+            assert_eq!(system.fixed_url(), expected_url);
+            descriptor.validate().unwrap();
+        }
+    }
+
+    /// Compile-time proof: the only way to build a Redump game-DAT
+    /// descriptor is through this closed enum.
+    #[test]
+    fn redump_games_constructor_takes_only_the_closed_system_enum() {
+        fn assert_signature(_: fn(RedumpGameSystem) -> Result<ManagedDatSourceDescriptor>) {}
+        assert_signature(ManagedDatSourceDescriptor::redump_games);
+    }
+
+    #[test]
+    fn arbitrary_redump_games_source_key_fails_validation() {
+        let bogus = ManagedDatSourceId {
+            provider: ManagedDatProvider::RedumpGames,
+            source_key: "saturn".to_string(),
+        };
+        assert!(
+            bogus.validate().is_err(),
+            "an unproven system (e.g. Saturn) must never validate as a game-DAT source key"
+        );
+    }
+
+    #[test]
+    fn manual_and_disabled_policy_persist_for_all_three_game_systems() {
+        for system in [
+            RedumpGameSystem::PlayStation,
+            RedumpGameSystem::PlayStation2,
+            RedumpGameSystem::Xbox,
+        ] {
+            for policy in [
+                ManagedDatUpdatePolicy::Manual,
+                ManagedDatUpdatePolicy::Disabled,
+            ] {
+                let descriptor = ManagedDatSourceDescriptor::redump_games(system)
+                    .unwrap()
+                    .with_update_policy(policy);
+                assert_eq!(descriptor.update_policy(), policy);
+                descriptor.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn valid_raw_xml_dat_is_accepted_for_each_system() {
+        for system in [
+            RedumpGameSystem::PlayStation,
+            RedumpGameSystem::PlayStation2,
+            RedumpGameSystem::Xbox,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+            let body = redump_game_dat(system, "Some Game (USA)", &redump_game_bytes("raw"));
+            let outcome = install_redump_games(system, root, body);
+            assert!(
+                matches!(outcome, ManagedDatUpdateOutcome::Updated { .. }),
+                "{system:?}: expected Updated, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_zip_wrapped_dat_is_safely_unwrapped_and_the_content_hash_is_of_the_xml_not_the_zip() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::PlayStation2;
+        let xml = redump_game_dat(system, "Zipped Game (Europe)", &redump_game_bytes("zip"));
+        let zip_body = build_zip(&[("ps2.dat", &xml)]);
+        assert_ne!(
+            zip_body, xml,
+            "the test must genuinely exercise the ZIP path"
+        );
+
+        let outcome = install_redump_games(system, root.clone(), zip_body);
+        let sha256 = match outcome {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+        let expected_dir = tempfile::tempdir().unwrap();
+        let expected_path = expected_dir.path().join("expected.dat");
+        fs::write(&expected_path, &xml).unwrap();
+        let expected_sha256 = sha256_file(&expected_path).unwrap();
+        assert_eq!(
+            sha256, expected_sha256,
+            "the published content hash must be over the unwrapped XML bytes, not the ZIP bytes"
+        );
+
+        let descriptor = redump_games_descriptor(system);
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        let parsed = parse_dat_file(
+            resolve_current_managed_dat_source(&root, &state)
+                .unwrap()
+                .path(),
+            DatLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(parsed.dat.games.len(), 1);
+        assert_eq!(parsed.dat.games[0].name, "Zipped Game (Europe)");
+    }
+
+    #[test]
+    fn raw_xml_and_zip_wrapped_identical_content_hash_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::Xbox;
+        let xml = redump_game_dat(system, "Same Game", &redump_game_bytes("same"));
+
+        let raw_outcome = install_redump_games(system, root.clone(), xml.clone());
+        let raw_sha256 = match raw_outcome {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        // The very next check with the ZIP-wrapped equivalent of the exact
+        // same bytes must be UpToDate, never a new snapshot - proving the
+        // format wrapper never affects the content-addressed identity.
+        let zip_body = build_zip(&[("xbox.dat", &xml)]);
+        let outcome = install_redump_games(system, root.clone(), zip_body);
+        assert!(
+            matches!(outcome, ManagedDatUpdateOutcome::UpToDate { .. }),
+            "expected UpToDate (same content, different wrapper), got {outcome:?}"
+        );
+        let descriptor = redump_games_descriptor(system);
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state.current_snapshot.sha256, raw_sha256);
+        assert!(state.previous_snapshot.is_none());
+    }
+
+    #[test]
+    fn a_bios_dataset_is_rejected_by_the_games_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::PlayStation2;
+        // Genuinely a BIOS dataset - the games provider must never accept
+        // this, even though it is otherwise well-formed Redump XML for the
+        // same system (task requirement: "must not be a BIOS dataset").
+        let body = redump_bios_dat(
+            RedumpBiosSystem::PlayStation2,
+            "PS2 BIOS",
+            &redump_bios_bytes("cross-provider"),
+        );
+        let outcome = install_redump_games(system, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wrong_system_game_dataset_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let body = redump_game_dat(
+            RedumpGameSystem::PlayStation2,
+            "PS2 Game",
+            &redump_game_bytes("cross-system"),
+        );
+        let outcome = install_redump_games(RedumpGameSystem::PlayStation, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongAuthoritativeName,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_game_list_is_rejected_at_update_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::Xbox;
+        let header = redump_game_header(system);
+        let body = format!(
+            r#"<?xml version="1.0"?>
+<datafile><header><name>{header}</name><description>{header} Datfile</description><author>Redump.org</author></header></datafile>"#
+        )
+        .into_bytes();
+        let outcome = install_redump_games(system, root, body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::EmptyCatalogue,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn html_error_page_fails_closed_never_installs_and_never_panics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let body = b"<!DOCTYPE html><html><body>Please log in</body></html>".to_vec();
+        let descriptor = redump_games_descriptor(RedumpGameSystem::PlayStation);
+        let outcome = install_redump_games(RedumpGameSystem::PlayStation, root.clone(), body);
+        // An HTML/login page is not valid XML and identifies no ecosystem -
+        // it is sniffed as an empty generic DAT rather than tripping a hard
+        // XML syntax error, so the exact failure kind is either `Parser` or
+        // a downstream content-validation rejection (`WrongEcosystem`,
+        // `EmptyCatalogue`); what matters is that it is always a structured
+        // `Failed`, never `Updated`, and never a panic.
+        assert!(
+            matches!(
+                outcome,
+                ManagedDatUpdateOutcome::Failed {
+                    kind: ManagedDatUpdateFailureKind::Parser
+                        | ManagedDatUpdateFailureKind::WrongEcosystem
+                        | ManagedDatUpdateFailureKind::EmptyCatalogue,
+                    ..
+                }
+            ),
+            "expected a structured fail-closed outcome, got {outcome:?}"
+        );
+        assert!(
+            load_optional_managed_dat_state(&root, &descriptor)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_zip_bytes_fail_closed_without_installing_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        // Begins with the ZIP local-file-header signature but is otherwise
+        // garbage - must never panic or silently accept partial content.
+        let mut body = b"PK\x03\x04".to_vec();
+        body.extend_from_slice(&[0u8; 64]);
+        let outcome = install_redump_games(RedumpGameSystem::PlayStation, root.clone(), body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::InvalidResponse,
+                ..
+            }
+        ));
+        assert!(
+            load_optional_managed_dat_state(
+                &root,
+                &redump_games_descriptor(RedumpGameSystem::PlayStation)
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_zip_with_more_than_one_member_is_refused_rather_than_guessed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::PlayStation;
+        let xml = redump_game_dat(system, "Ambiguous", &redump_game_bytes("ambiguous"));
+        let zip_body = build_zip(&[("psx.dat", &xml), ("readme.txt", b"extra file")]);
+        let outcome = install_redump_games(system, root, zip_body);
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::InvalidResponse,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn game_dat_no_churn_on_header_only_change_with_identical_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::PlayStation;
+        let descriptor = redump_games_descriptor(system);
+        let bytes_v1 = redump_game_bytes("v1");
+        let body_v1 = redump_game_dat(system, "Game v1", &bytes_v1);
+
+        let outcome = install_redump_games(system, root.clone(), body_v1.clone());
+        let first_sha256 = match outcome {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        let mut mutated_label_state = load_managed_dat_state(&root, &descriptor).unwrap();
+        mutated_label_state.upstream_revision = Some("stale-label".to_string());
+        save_managed_dat_state(&root, &mutated_label_state).unwrap();
+
+        let outcome = install_redump_games(system, root.clone(), body_v1);
+        assert!(
+            matches!(outcome, ManagedDatUpdateOutcome::UpToDate { .. }),
+            "identical downloaded bytes must never churn a snapshot"
+        );
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state.current_snapshot.sha256, first_sha256);
+        assert!(state.previous_snapshot.is_none());
+    }
+
+    #[test]
+    fn game_dat_changed_bytes_promote_current_and_retain_previous() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::PlayStation;
+        let descriptor = redump_games_descriptor(system);
+
+        let body_v1 = redump_game_dat(system, "Game v1", &redump_game_bytes("v1"));
+        let first_sha256 = match install_redump_games(system, root.clone(), body_v1) {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        let body_v2 = redump_game_dat(system, "Game v2", &redump_game_bytes("v2 different"));
+        let second_sha256 = match install_redump_games(system, root.clone(), body_v2) {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+        assert_ne!(first_sha256, second_sha256);
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state.current_snapshot.sha256, second_sha256);
+        assert_eq!(
+            state.previous_snapshot.as_ref().unwrap().sha256,
+            first_sha256
+        );
+    }
+
+    #[test]
+    fn game_dat_403_404_429_and_offline_are_structured_and_do_not_create_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let descriptor = redump_games_descriptor(RedumpGameSystem::Xbox);
+
+        for (reply, expected) in [
+            (
+                FakeReply::status(403),
+                ManagedDatUpdateFailureKind::Forbidden,
+            ),
+            (
+                FakeReply::status(404),
+                ManagedDatUpdateFailureKind::NotFound,
+            ),
+        ] {
+            let transport = FakeTransport::new(vec![Ok(reply)]);
+            let outcome =
+                update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
+            assert!(matches!(
+                outcome,
+                ManagedDatUpdateOutcome::Failed { kind, .. } if kind == expected
+            ));
+            assert!(
+                load_optional_managed_dat_state(&root, &descriptor)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let transport = FakeTransport::new(Vec::new());
+        let mut options = update_options(root.clone());
+        options.offline = true;
+        let outcome = update_managed_dat(&descriptor, &options, &transport).unwrap();
+        assert!(matches!(outcome, ManagedDatUpdateOutcome::Offline));
+        assert!(transport.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn game_dat_validation_failure_preserves_the_existing_current_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpGameSystem::PlayStation;
+        let descriptor = redump_games_descriptor(system);
+        let good_body = redump_game_dat(system, "Known Good", &redump_game_bytes("known-good"));
+        let good_sha256 = match install_redump_games(system, root.clone(), good_body) {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        let bad_body = redump_game_dat(
+            RedumpGameSystem::Xbox,
+            "Wrong System",
+            b"unrelated bytes for the wrong system",
+        );
         let transport = FakeTransport::new(vec![Ok(FakeReply::ok(bad_body))]);
         let outcome =
             update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();

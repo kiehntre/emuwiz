@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::dat::updates::{
     ManagedDatReadOnlySource, ManagedDatSourceDescriptor, ManagedDatState, ManagedDatUpdatePolicy,
-    RedumpBiosSystem, load_managed_dat_state, managed_dat_root, resolve_current_managed_dat_source,
-    resolve_managed_dat_snapshot_source,
+    RedumpBiosSystem, RedumpGameSystem, load_managed_dat_state, managed_dat_root,
+    resolve_current_managed_dat_source, resolve_managed_dat_snapshot_source,
 };
 use crate::{ArchiveFsError, Result};
 
@@ -33,6 +33,10 @@ pub struct ManagedDatSourcesConfig {
     /// never a URL or endpoint. See [`ManagedRedumpBiosConfigEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redump_bios: Vec<ManagedRedumpBiosConfigEntry>,
+    /// Persists only the fixed typed system and Disabled/Manual policy -
+    /// never a URL or endpoint. See [`ManagedRedumpGamesConfigEntry`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redump_games: Vec<ManagedRedumpGamesConfigEntry>,
 }
 
 /// One explicitly configured MAME software list.  `authoritative_name` is
@@ -71,6 +75,24 @@ impl ManagedRedumpBiosConfigEntry {
     }
 }
 
+/// One explicitly configured Redump ordinary game-DAT system. `system` is
+/// the only identity persisted - never a URL, hostname, or free-text
+/// dataset name - the game-DAT sibling of [`ManagedRedumpBiosConfigEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRedumpGamesConfigEntry {
+    pub system: RedumpGameSystem,
+    #[serde(default)]
+    pub update_policy: ManagedDatUpdatePolicy,
+}
+
+impl ManagedRedumpGamesConfigEntry {
+    pub fn descriptor(&self) -> Result<ManagedDatSourceDescriptor> {
+        ManagedDatSourceDescriptor::redump_games(self.system)
+            .map(|descriptor| descriptor.with_update_policy(self.update_policy))
+    }
+}
+
 /// A registry-like in-memory store with deterministic ordering and explicit
 /// add/remove behavior.  Removing an entry changes configuration only; it
 /// never deletes state or immutable managed objects.
@@ -78,6 +100,7 @@ impl ManagedRedumpBiosConfigEntry {
 pub struct ManagedDatSources {
     entries: Vec<ManagedMameSoftwareListConfigEntry>,
     redump_bios_entries: Vec<ManagedRedumpBiosConfigEntry>,
+    redump_games_entries: Vec<ManagedRedumpGamesConfigEntry>,
 }
 
 impl ManagedDatSources {
@@ -93,6 +116,9 @@ impl ManagedDatSources {
         for entry in config.redump_bios {
             sources.add_redump_bios(entry.system, entry.update_policy)?;
         }
+        for entry in config.redump_games {
+            sources.add_redump_games(entry.system, entry.update_policy)?;
+        }
         Ok(sources)
     }
 
@@ -100,6 +126,7 @@ impl ManagedDatSources {
         ManagedDatSourcesConfig {
             mame_software_lists: self.entries.clone(),
             redump_bios: self.redump_bios_entries.clone(),
+            redump_games: self.redump_games_entries.clone(),
         }
     }
 
@@ -109,6 +136,10 @@ impl ManagedDatSources {
 
     pub fn redump_bios_entries(&self) -> &[ManagedRedumpBiosConfigEntry] {
         &self.redump_bios_entries
+    }
+
+    pub fn redump_games_entries(&self) -> &[ManagedRedumpGamesConfigEntry] {
+        &self.redump_games_entries
     }
 
     /// Adds only a source constructible through the typed MAME descriptor.
@@ -197,15 +228,63 @@ impl ManagedDatSources {
         Some(self.redump_bios_entries.remove(index))
     }
 
-    /// Produces typed descriptors for every configured source of both
+    /// Adds only a source constructible through the typed Redump game-DAT
+    /// descriptor - `system` is a closed enum, so there is no free-text
+    /// input that could name an unapproved dataset. Each of the fixed
+    /// systems may be configured at most once, the same reasoning as
+    /// [`Self::add_redump_bios`].
+    pub fn add_redump_games(
+        &mut self,
+        system: RedumpGameSystem,
+        update_policy: ManagedDatUpdatePolicy,
+    ) -> Result<()> {
+        ManagedDatSourceDescriptor::redump_games(system)?;
+        if self
+            .redump_games_entries
+            .iter()
+            .any(|entry| entry.system == system)
+        {
+            return Err(ArchiveFsError::Config(format!(
+                "Redump game system '{system:?}' is already configured"
+            )));
+        }
+        self.redump_games_entries
+            .push(ManagedRedumpGamesConfigEntry {
+                system,
+                update_policy,
+            });
+        self.redump_games_entries
+            .sort_by_key(|entry| format!("{:?}", entry.system));
+        Ok(())
+    }
+
+    /// Removes configuration only.  Existing downloaded snapshots and state
+    /// are intentionally retained for a later explicit maintenance feature -
+    /// the same reasoning as [`Self::remove_mame_software_list`].
+    pub fn remove_redump_games(
+        &mut self,
+        system: RedumpGameSystem,
+    ) -> Option<ManagedRedumpGamesConfigEntry> {
+        let index = self
+            .redump_games_entries
+            .iter()
+            .position(|entry| entry.system == system)?;
+        Some(self.redump_games_entries.remove(index))
+    }
+
+    /// Produces typed descriptors for every configured source of all three
     /// providers, preserving each source's explicit policy.
     pub fn descriptors(&self) -> Result<Vec<ManagedDatSourceDescriptor>> {
         let mame = self.entries.iter().map(|entry| entry.descriptor());
-        let redump = self
+        let redump_bios = self
             .redump_bios_entries
             .iter()
             .map(|entry| entry.descriptor());
-        mame.chain(redump).collect()
+        let redump_games = self
+            .redump_games_entries
+            .iter()
+            .map(|entry| entry.descriptor());
+        mame.chain(redump_bios).chain(redump_games).collect()
     }
 }
 
@@ -398,6 +477,74 @@ pub fn resolve_redump_bios_sources_default(
     sources: &ManagedDatSources,
 ) -> Result<Vec<ResolvedRedumpBiosSource>> {
     resolve_redump_bios_sources(sources, &managed_dat_root()?)
+}
+
+/// A configured Redump ordinary game-DAT source plus its entirely local
+/// installation state - the game-DAT sibling of [`ResolvedRedumpBiosSource`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRedumpGamesSource {
+    pub config: ManagedRedumpGamesConfigEntry,
+    pub descriptor: ManagedDatSourceDescriptor,
+    pub state: Option<ManagedDatState>,
+    pub current: Option<ManagedDatReadOnlySource>,
+    pub previous: Option<ManagedDatReadOnlySource>,
+}
+
+impl ResolvedRedumpGamesSource {
+    pub fn is_installed(&self) -> bool {
+        self.current.is_some()
+    }
+}
+
+/// Resolves every configured Redump game-DAT source against its local
+/// managed state - the game-DAT sibling of [`resolve_redump_bios_sources`].
+/// Performs no network operation and makes no filesystem mutation.
+pub fn resolve_redump_games_sources(
+    sources: &ManagedDatSources,
+    managed_root: &Path,
+) -> Result<Vec<ResolvedRedumpGamesSource>> {
+    let mut resolved = Vec::with_capacity(sources.redump_games_entries.len());
+    for config in &sources.redump_games_entries {
+        let descriptor = config.descriptor()?;
+        let state = match load_managed_dat_state(managed_root, &descriptor) {
+            Ok(state) => Some(state),
+            Err(ArchiveFsError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let (current, previous) = match &state {
+            None => (None, None),
+            Some(state) => {
+                let current = Some(resolve_current_managed_dat_source(managed_root, state)?);
+                let previous = match &state.previous_snapshot {
+                    Some(snapshot) => Some(resolve_managed_dat_snapshot_source(
+                        managed_root,
+                        state,
+                        snapshot,
+                    )?),
+                    None => None,
+                };
+                (current, previous)
+            }
+        };
+        resolved.push(ResolvedRedumpGamesSource {
+            config: *config,
+            descriptor,
+            state,
+            current,
+            previous,
+        });
+    }
+    Ok(resolved)
+}
+
+pub fn resolve_redump_games_sources_default(
+    sources: &ManagedDatSources,
+) -> Result<Vec<ResolvedRedumpGamesSource>> {
+    resolve_redump_games_sources(sources, &managed_dat_root()?)
 }
 
 #[cfg(test)]
@@ -728,6 +875,147 @@ mod tests {
         let sources = load_managed_dat_sources_from(&config).unwrap();
         assert_eq!(sources.entries().len(), 1);
         assert!(sources.redump_bios_entries().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Redump game/disc DAT config persistence
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn redump_games_add_reload_and_policy_round_trip_for_all_three_systems() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("managed_dat_sources.toml");
+        let mut sources = ManagedDatSources::new();
+        sources
+            .add_redump_games(
+                RedumpGameSystem::PlayStation2,
+                ManagedDatUpdatePolicy::Manual,
+            )
+            .unwrap();
+        sources
+            .add_redump_games(RedumpGameSystem::Xbox, ManagedDatUpdatePolicy::Disabled)
+            .unwrap();
+        sources
+            .add_redump_games(
+                RedumpGameSystem::PlayStation,
+                ManagedDatUpdatePolicy::Manual,
+            )
+            .unwrap();
+        save_managed_dat_sources_to(&config, &sources).unwrap();
+        let reloaded = load_managed_dat_sources_from(&config).unwrap();
+        assert_eq!(reloaded, sources);
+        assert_eq!(reloaded.redump_games_entries().len(), 3);
+        let xbox_entry = reloaded
+            .redump_games_entries()
+            .iter()
+            .find(|entry| entry.system == RedumpGameSystem::Xbox)
+            .unwrap();
+        assert_eq!(xbox_entry.update_policy, ManagedDatUpdatePolicy::Disabled);
+    }
+
+    #[test]
+    fn redump_games_duplicate_system_is_rejected_and_remove_only_changes_configuration() {
+        let mut sources = ManagedDatSources::new();
+        sources
+            .add_redump_games(
+                RedumpGameSystem::PlayStation2,
+                ManagedDatUpdatePolicy::Manual,
+            )
+            .unwrap();
+        assert!(
+            sources
+                .add_redump_games(
+                    RedumpGameSystem::PlayStation2,
+                    ManagedDatUpdatePolicy::Manual
+                )
+                .is_err()
+        );
+        assert!(
+            sources
+                .remove_redump_games(RedumpGameSystem::PlayStation2)
+                .is_some()
+        );
+        assert!(sources.redump_games_entries().is_empty());
+    }
+
+    #[test]
+    fn persisted_toml_never_carries_a_url_for_a_redump_games_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("managed_dat_sources.toml");
+        let mut sources = ManagedDatSources::new();
+        sources
+            .add_redump_games(
+                RedumpGameSystem::PlayStation2,
+                ManagedDatUpdatePolicy::Manual,
+            )
+            .unwrap();
+        save_managed_dat_sources_to(&config, &sources).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("play_station2"));
+        assert!(!text.to_ascii_lowercase().contains("redump.org"));
+        assert!(!text.to_ascii_lowercase().contains("http"));
+    }
+
+    #[test]
+    fn a_config_with_only_bios_entries_still_loads_with_no_game_entries() {
+        // Proves the existing BIOS-only schema still loads unchanged now
+        // that `redump_games` is an additional, optional table - the same
+        // backward-compatibility property `redump_bios` itself already had
+        // to preserve for MAME-only configs.
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("managed_dat_sources.toml");
+        fs::write(
+            &config,
+            "[[redump_bios]]\nsystem = \"xbox\"\nupdate_policy = \"manual\"\n",
+        )
+        .unwrap();
+        let sources = load_managed_dat_sources_from(&config).unwrap();
+        assert_eq!(sources.redump_bios_entries().len(), 1);
+        assert!(sources.redump_games_entries().is_empty());
+    }
+
+    #[test]
+    fn resolved_redump_games_source_installs_and_resolves_as_a_read_only_dat_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed-dats");
+        let system = RedumpGameSystem::PlayStation2;
+        let redump_descriptor = ManagedDatSourceDescriptor::redump_games(system)
+            .unwrap()
+            .with_update_policy(ManagedDatUpdatePolicy::Manual);
+        let snapshot = ManagedDatSnapshot::new(SHA_A).unwrap();
+        let state = ManagedDatState::new(&redump_descriptor, snapshot).unwrap();
+        let object_path = root
+            .join(state.source_id.storage_relative_path())
+            .join("objects")
+            .join(SHA_A);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(
+            &object_path,
+            r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation 2</name><description>Sony - PlayStation 2 Datfile</description><author>Redump.org</author></header><game name="Some Game"><rom name="track.bin" size="1" crc="00000000" md5="00000000000000000000000000000000" sha1="0000000000000000000000000000000000000000"/></game></datafile>"#,
+        )
+        .unwrap();
+        save_managed_dat_state(&root, &state).unwrap();
+
+        let mut sources = ManagedDatSources::new();
+        sources
+            .add_redump_games(system, ManagedDatUpdatePolicy::Manual)
+            .unwrap();
+        let resolved = resolve_redump_games_sources(&sources, &root).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].is_installed());
+        let parsed = parse_dat_file(
+            resolved[0].current.as_ref().unwrap().path(),
+            DatLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.dat.source.ecosystem,
+            crate::dat::model::DatEcosystem::Redump
+        );
+        assert_eq!(parsed.dat.games.len(), 1);
+
+        // Both providers' descriptors are chained by `descriptors()`.
+        assert_eq!(sources.descriptors().unwrap().len(), 1);
     }
 
     #[test]

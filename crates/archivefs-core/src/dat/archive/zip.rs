@@ -369,6 +369,132 @@ impl ArchiveMemberSource for ZipArchiveSource {
     }
 }
 
+/// Why [`extract_sole_zip_member`] refused to return bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZipExtractError {
+    Open(String),
+    /// The preflight scan itself refused or found the ZIP corrupt - see
+    /// [`super::zip_preflight::ZipPreflightError`].
+    Preflight(ZipPreflightError),
+    /// Zero, or more than one, non-directory member - this function is
+    /// deliberately narrow (see its own doc comment) and never guesses which
+    /// member a caller wants.
+    MemberCountNotOne(usize),
+    Refused(&'static str),
+    Corrupt(String),
+    Cancelled,
+}
+
+/// Extracts the raw decoded bytes of the single non-directory member in the
+/// ZIP archive at `path`, reusing exactly the same bounded metadata scan
+/// ([`preflight_zip`]) and member-safety checks (`ArchiveLimits`, encrypted/
+/// unsupported-codec refusal, compression-ratio refusal) that
+/// [`ZipArchiveSource::verify_all`] already applies to every member it
+/// hashes - the only difference is that this keeps the decoded bytes instead
+/// of only their hash, and requires the archive to contain exactly one real
+/// member.
+///
+/// This exists for `dat::updates`'s managed Redump game-DAT provider, which
+/// must unwrap a single DAT/XML file from a ZIP-wrapped download without a
+/// second, independent (and therefore independently-unsafe) ZIP-parsing
+/// path. It is deliberately not a general extraction API: a ZIP with zero or
+/// more than one real member is refused outright rather than guessing which
+/// member is wanted.
+pub fn extract_sole_zip_member(
+    path: &Path,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, ZipExtractError> {
+    let mut file = File::open(path).map_err(|error| ZipExtractError::Open(error.to_string()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| ZipExtractError::Open(error.to_string()))?
+        .len();
+    let preflight =
+        preflight_zip(&mut file, file_len, limits, cancel).map_err(ZipExtractError::Preflight)?;
+
+    let real_entries: Vec<_> = preflight
+        .entries
+        .iter()
+        .filter(|entry| !entry.is_directory)
+        .collect();
+    if real_entries.len() != 1 {
+        return Err(ZipExtractError::MemberCountNotOne(real_entries.len()));
+    }
+    let entry = real_entries[0];
+
+    let encrypted = entry.flags & ((1 << 0) | (1 << 6) | (1 << 13)) != 0;
+    let unsupported_flags = entry.flags & ((1 << 4) | (1 << 5)) != 0;
+    if encrypted {
+        return Err(ZipExtractError::Refused("encrypted member"));
+    }
+    if unsupported_flags || !matches!(entry.method, 0 | 8) {
+        return Err(ZipExtractError::Refused("unsupported ZIP feature"));
+    }
+    if entry.logical_size > limits.max_member_logical_bytes {
+        return Err(ZipExtractError::Refused("member size"));
+    }
+    if ratio_exceeded(
+        entry.logical_size,
+        entry.compressed_size,
+        limits.max_compression_ratio,
+    ) {
+        return Err(ZipExtractError::Refused("compression ratio"));
+    }
+
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(entry.data_start))
+        .map_err(|error| ZipExtractError::Corrupt(error.to_string()))?;
+    let packed = (&mut file).take(entry.compressed_size);
+    let (bytes, bytes_read, crc32) = if entry.method == 0 {
+        read_bounded_with_crc(packed, entry.logical_size, cancel)?
+    } else {
+        let decoder = flate2::read::DeflateDecoder::new(packed);
+        read_bounded_with_crc(decoder, entry.logical_size, cancel)?
+    };
+    if bytes_read != entry.logical_size || crc32 != entry.crc32 {
+        return Err(ZipExtractError::Corrupt(format!(
+            "decoded {bytes_read} bytes of the {} declared, or CRC32 disagreed",
+            entry.logical_size
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Reads `reader` fully, bounded to `max_bytes` (refused, not silently
+/// truncated, the instant more would be read), returning the bytes, how many
+/// were read, and their CRC32 - the caller compares this against the
+/// preflighted central-directory value, exactly like every other member this
+/// module decodes.
+fn read_bounded_with_crc<R: Read>(
+    mut reader: R,
+    max_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<(Vec<u8>, u64, u32), ZipExtractError> {
+    let mut buffer = Vec::new();
+    let mut crc = crate::identity_source::hashing::Crc32::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ZipExtractError::Cancelled);
+        }
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| ZipExtractError::Corrupt(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(ZipExtractError::Refused("member size"));
+        }
+        crc.update(&chunk[..read]);
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    Ok((buffer, total, crc.finish()))
+}
+
 fn construct_archive(file: File) -> zip::result::ZipResult<ZipArchive<File>> {
     #[cfg(test)]
     ZIP_ARCHIVE_NEW_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1053,5 +1179,148 @@ mod tests {
             .collect();
         assert_eq!(bytes(&path), before);
         assert_eq!(names_after, names_before);
+    }
+
+    // --- extract_sole_zip_member ---------------------------------------------------------------
+
+    #[test]
+    fn extract_sole_zip_member_returns_the_one_members_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sole.zip");
+        write_zip(
+            &path,
+            &[("only.dat", b"the dat content", CompressionMethod::Stored)],
+        );
+        let extracted =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(extracted, b"the dat content");
+    }
+
+    #[test]
+    fn extract_sole_zip_member_decodes_deflated_content_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deflated.zip");
+        let content = b"deflated dat content repeated repeated repeated".to_vec();
+        write_zip(
+            &path,
+            &[("only.dat", &content, CompressionMethod::Deflated)],
+        );
+        let extracted =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(extracted, content);
+    }
+
+    #[test]
+    fn extract_sole_zip_member_refuses_zero_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.zip");
+        write_zip(&path, &[]);
+        let error =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap_err();
+        assert_eq!(error, ZipExtractError::MemberCountNotOne(0));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_refuses_more_than_one_member_rather_than_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.zip");
+        write_zip(
+            &path,
+            &[
+                ("first.dat", b"first", CompressionMethod::Stored),
+                ("second.dat", b"second", CompressionMethod::Stored),
+            ],
+        );
+        let error =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap_err();
+        assert_eq!(error, ZipExtractError::MemberCountNotOne(2));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_refuses_an_encrypted_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.zip");
+        let mut writer = ZipWriter::new(File::create(&path).unwrap());
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .with_aes_encryption(AesMode::Aes256, "secret");
+        writer.start_file("only.dat", options).unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer.finish().unwrap();
+        let error =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap_err();
+        assert_eq!(error, ZipExtractError::Refused("encrypted member"));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_refuses_a_member_over_the_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.zip");
+        write_zip(&path, &[("only.dat", b"12345", CompressionMethod::Stored)]);
+        let limits = ArchiveLimits {
+            max_member_logical_bytes: 4,
+            ..ArchiveLimits::default()
+        };
+        let error = extract_sole_zip_member(&path, &limits, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(error, ZipExtractError::Refused("member size"));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_refuses_an_excessive_compression_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.zip");
+        write_zip(
+            &path,
+            &[("only.dat", &[0_u8; 100], CompressionMethod::Deflated)],
+        );
+        let limits = ArchiveLimits {
+            max_compression_ratio: 1,
+            ..ArchiveLimits::default()
+        };
+        let error = extract_sole_zip_member(&path, &limits, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(error, ZipExtractError::Refused("compression ratio"));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_rejects_a_corrupt_crc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badcrc.zip");
+        write_zip(&path, &[("only.dat", b"good", CompressionMethod::Stored)]);
+        let mut data = bytes(&path);
+        let local = local_offsets(&data)[0];
+        let central = central_offsets(&data)[0];
+        data[local + 14..local + 18].copy_from_slice(&0_u32.to_le_bytes());
+        data[central + 16..central + 20].copy_from_slice(&0_u32.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+        let error =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap_err();
+        assert!(matches!(error, ZipExtractError::Corrupt(_)));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_rejects_a_truncated_zip_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.zip");
+        std::fs::write(&path, b"PK\x03\x04short").unwrap();
+        let error =
+            extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false))
+                .unwrap_err();
+        assert!(matches!(error, ZipExtractError::Preflight(_)));
+    }
+
+    #[test]
+    fn extract_sole_zip_member_never_writes_or_rewrites_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.zip");
+        write_zip(&path, &[("only.dat", b"abc", CompressionMethod::Stored)]);
+        let before = bytes(&path);
+        let _ = extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false));
+        assert_eq!(bytes(&path), before);
     }
 }
