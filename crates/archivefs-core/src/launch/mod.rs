@@ -64,6 +64,8 @@
 
 pub mod dolphin_command;
 pub mod dolphin_execution;
+pub mod duckstation_command;
+pub mod duckstation_execution;
 pub mod es_de_export;
 pub mod evidence_bridge;
 pub mod execution;
@@ -89,6 +91,16 @@ pub use dolphin_execution::{
     DolphinLaunchPreflightError, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
     DolphinLaunchSpawnError, LaunchedDolphinProcess, preflight_and_launch_dolphin,
     preflight_dolphin_launch, spawn_dolphin,
+};
+pub use duckstation_command::{
+    DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, DuckStationCommandPlan,
+    DuckStationCommandSelection, build_duckstation_command_plan,
+};
+pub use duckstation_execution::{
+    DuckStationLaunchCommandFacts, DuckStationLaunchExecutionError, DuckStationLaunchExitReport,
+    DuckStationLaunchPreflightError, DuckStationLaunchPreflightErrorKind, DuckStationLaunchRequest,
+    DuckStationLaunchSpawnError, LaunchedDuckStationProcess, preflight_and_launch_duckstation,
+    preflight_duckstation_launch, spawn_duckstation,
 };
 pub use es_de_export::{
     ES_DE_SYSTEM_MAP, EsDeEntryBlocker, EsDeEntryBlockerKind, EsDeEntryPlan, EsDeEntryStatus,

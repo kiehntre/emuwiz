@@ -143,6 +143,25 @@ pub enum LaunchBlockerKind {
     /// see the blocker detail for the underlying
     /// [`crate::patch_manager::Pcsx2LaunchBlockerKind`].
     Pcsx2BindingUnavailable,
+    /// A DuckStation command-plan request was given a non-DuckStation-
+    /// standalone launch candidate.
+    DuckStationCandidateRequired,
+    /// The canonical identity this DuckStation plan was built for does not
+    /// target `PSX` - the only platform this native launch slice supports.
+    DuckStationPlatformMismatch,
+    /// The content is not a direct, non-mounted `.iso`/`.chd` file - no
+    /// archive member, no mount-input container, no `.cue`/`.bin` or other
+    /// format the current archive-kind registry does not yet classify as
+    /// direct content.
+    DuckStationContentFormatUnsupported,
+    /// No verified PS1 serial is available for this content - this native
+    /// launch slice always requires one.
+    DuckStationSerialMissing,
+    /// [`crate::patch_manager::resolve_duckstation_native_launch_binding`]
+    /// itself refused to produce a launch binding for the candidate's
+    /// profile - see the blocker detail for the underlying
+    /// [`crate::patch_manager::DuckStationLaunchBlockerKind`].
+    DuckStationBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
