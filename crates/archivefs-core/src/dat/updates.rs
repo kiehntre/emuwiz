@@ -344,6 +344,16 @@ pub struct ManagedDatReadOnlySource {
     path: PathBuf,
 }
 
+/// One immutable managed object that is not named by the source's current or
+/// retained previous state. This is intentionally an inspection result only:
+/// no API here deletes, moves, or promotes an orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDatOrphanedObject {
+    pub snapshot: ManagedDatSnapshot,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
 impl ManagedDatReadOnlySource {
     pub fn ownership(&self) -> DatSourceOwnership {
         DatSourceOwnership::EmuWizManaged
@@ -456,6 +466,83 @@ pub fn resolve_managed_dat_snapshot_source(
         source_id: state.source_id.clone(),
         path,
     })
+}
+
+/// Lists unreferenced immutable objects for one typed managed source.
+///
+/// This is wholly offline and read-only. Every entry is required to be a
+/// regular non-symlink file with a valid SHA-256 filename under the source's
+/// app-owned `objects` directory. A malformed entry or a path/symlink escape
+/// is rejected instead of being silently ignored or treated as deletable.
+///
+/// If no state exists yet, every valid immutable object is reported as
+/// unreferenced. Callers must make any cleanup decision explicitly; this
+/// function intentionally offers no deletion operation.
+pub fn list_managed_dat_orphaned_objects(
+    managed_root: &Path,
+    descriptor: &ManagedDatSourceDescriptor,
+) -> Result<Vec<ManagedDatOrphanedObject>> {
+    descriptor.validate()?;
+    let source_dir = managed_source_dir(managed_root, descriptor.source_id())?;
+    let objects_dir = source_dir.join(OBJECTS_DIRECTORY);
+    ensure_existing_path_is_not_symlinked(managed_root, &objects_dir)?;
+    let entries = match fs::read_dir(&objects_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(ArchiveFsError::io(objects_dir, error)),
+    };
+    let objects_metadata = fs::symlink_metadata(&objects_dir)
+        .map_err(|source| ArchiveFsError::io(objects_dir.clone(), source))?;
+    if !objects_metadata.is_dir() || objects_metadata.file_type().is_symlink() {
+        return Err(config_error(format!(
+            "managed DAT objects directory is not a real directory: {}",
+            objects_dir.display()
+        )));
+    }
+
+    let state = load_optional_managed_dat_state(managed_root, descriptor)?;
+    let current = state
+        .as_ref()
+        .map(|state| state.current_snapshot.sha256.as_str());
+    let previous = state
+        .as_ref()
+        .and_then(|state| state.previous_snapshot.as_ref())
+        .map(|snapshot| snapshot.sha256.as_str());
+    let mut orphans = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ArchiveFsError::io(objects_dir.clone(), source))?;
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(config_error(format!(
+                "managed DAT object filename is not valid UTF-8: {}",
+                path.display()
+            )));
+        };
+        let snapshot = ManagedDatSnapshot::new(name)?;
+        let expected = objects_dir.join(&snapshot.sha256);
+        if path != expected {
+            return Err(config_error("managed DAT object path was not canonical"));
+        }
+        ensure_existing_path_is_not_symlinked(managed_root, &path)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|source| ArchiveFsError::io(path.clone(), source))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(config_error(format!(
+                "managed DAT object is not a regular non-symlink file: {}",
+                path.display()
+            )));
+        }
+        if current == Some(snapshot.sha256.as_str()) || previous == Some(snapshot.sha256.as_str()) {
+            continue;
+        }
+        orphans.push(ManagedDatOrphanedObject {
+            snapshot,
+            path,
+            size_bytes: metadata.len(),
+        });
+    }
+    orphans.sort_by(|left, right| left.snapshot.sha256.cmp(&right.snapshot.sha256));
+    Ok(orphans)
 }
 
 fn managed_snapshot_path(
@@ -1992,5 +2079,86 @@ kind = "file"
         .unwrap();
         assert_eq!(result, ManagedDatUpdateOutcome::Disabled);
         assert!(transport.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn orphan_inspection_reports_only_objects_outside_current_and_previous() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let mut state = state();
+        state.previous_snapshot = Some(ManagedDatSnapshot::new(SHA_B).unwrap());
+        write_current_object(&root, &state);
+        let previous = root
+            .join(state.source_id.storage_relative_path())
+            .join(OBJECTS_DIRECTORY)
+            .join(SHA_B);
+        fs::create_dir_all(previous.parent().unwrap()).unwrap();
+        fs::write(&previous, b"previous").unwrap();
+        let orphan_sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let orphan = previous.with_file_name(orphan_sha);
+        fs::write(&orphan, b"orphan").unwrap();
+        save_managed_dat_state(&root, &state).unwrap();
+
+        let found = list_managed_dat_orphaned_objects(&root, &descriptor()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].snapshot.sha256, orphan_sha);
+        assert_eq!(found[0].path, orphan);
+        assert_eq!(found[0].size_bytes, 6);
+        assert!(
+            previous.exists(),
+            "inspection must not delete previous data"
+        );
+        assert!(
+            root.join(state.source_id.storage_relative_path())
+                .join(OBJECTS_DIRECTORY)
+                .join(SHA_A)
+                .exists(),
+            "inspection must not delete current data"
+        );
+    }
+
+    #[test]
+    fn orphan_inspection_is_read_only_and_reports_objects_without_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let orphan_sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let object = root
+            .join(descriptor().source_id().storage_relative_path())
+            .join(OBJECTS_DIRECTORY)
+            .join(orphan_sha);
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(&object, b"orphan").unwrap();
+        let before = fs::read(&object).unwrap();
+
+        let found = list_managed_dat_orphaned_objects(&root, &descriptor()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, object);
+        assert_eq!(fs::read(&object).unwrap(), before);
+        assert!(
+            load_optional_managed_dat_state(&root, &descriptor())
+                .unwrap()
+                .is_none(),
+            "inspection must not create state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_inspection_rejects_symlinked_objects() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let object = root
+            .join(descriptor().source_id().storage_relative_path())
+            .join(OBJECTS_DIRECTORY)
+            .join(SHA_A);
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        let external = temp.path().join("external");
+        fs::write(&external, b"not managed").unwrap();
+        symlink(&external, &object).unwrap();
+
+        assert!(list_managed_dat_orphaned_objects(&root, &descriptor()).is_err());
+        assert!(external.exists(), "inspection must not touch external data");
     }
 }
