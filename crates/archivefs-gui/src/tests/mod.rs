@@ -677,6 +677,7 @@ fn pcsx2_profile_fixture() -> Pcsx2Profile {
             },
         ],
         configuration_identity: None,
+        executable_candidates: Vec::new(),
     }
 }
 

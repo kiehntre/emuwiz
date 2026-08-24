@@ -321,6 +321,7 @@ mod tests {
             blockers: Vec::new(),
             patch_directories: Vec::new(),
             configuration_identity: None,
+            executable_candidates: Vec::new(),
         }
     }
 

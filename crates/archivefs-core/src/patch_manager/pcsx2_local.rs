@@ -18,6 +18,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -119,6 +121,19 @@ pub struct Pcsx2DirectoryIdentity {
     pub inode: u64,
 }
 
+/// One discovered candidate native `pcsx2-qt` executable. Discovery only
+/// ever reports a `PATH` match here as [`Pcsx2InstallationType::Native`] -
+/// it never invents a Flatpak/AppImage/portable executable path, and it
+/// never executes the binary itself (no `--version` probe; unlike Dolphin's
+/// adapter, this module has no caller-supplied version-output channel to
+/// parse yet, so no `version` field exists here - narrower, not omitted by
+/// oversight).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2Executable {
+    pub path: PathBuf,
+    pub installation_type: Pcsx2InstallationType,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pcsx2Profile {
     pub profile_id: String,
@@ -130,6 +145,13 @@ pub struct Pcsx2Profile {
     pub blockers: Vec<Pcsx2ProfileBlocker>,
     pub patch_directories: Vec<Pcsx2PatchDirectory>,
     pub configuration_identity: Option<Pcsx2DirectoryIdentity>,
+    /// Discovered native `pcsx2-qt` executable candidates, shared across
+    /// every profile the same way [`discover_pcsx2_profiles`] discovers
+    /// them once - not otherwise scoped per-profile. Not itself sufficient
+    /// to authorize a launch; see
+    /// [`resolve_pcsx2_native_launch_binding`], which is the only thing
+    /// that binds one of these to a specific profile.
+    pub executable_candidates: Vec<Pcsx2Executable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +438,7 @@ pub fn discover_pcsx2_profiles(
     candidates.sort_by(|left, right| left.configuration_path.cmp(&right.configuration_path));
     candidates.dedup_by(|left, right| left.configuration_path == right.configuration_path);
 
+    let executables = discover_pcsx2_local_executables(roots);
     let mut profiles = Vec::new();
     let mut warnings = Vec::new();
     for candidate in candidates {
@@ -432,6 +455,7 @@ pub fn discover_pcsx2_profiles(
                 candidate,
                 Pcsx2ProfileBlockerKind::PathNotAbsolute,
                 "configuration path is not absolute",
+                &executables,
             ));
             continue;
         }
@@ -440,6 +464,7 @@ pub fn discover_pcsx2_profiles(
                 candidate,
                 Pcsx2ProfileBlockerKind::FilesystemRoot,
                 "a filesystem root cannot be a PCSX2 profile",
+                &executables,
             ));
             continue;
         }
@@ -460,6 +485,7 @@ pub fn discover_pcsx2_profiles(
                     candidate,
                     kind,
                     format!("configuration path rejected: {:?}", error.reason),
+                    &executables,
                 ));
                 continue;
             }
@@ -470,13 +496,14 @@ pub fn discover_pcsx2_profiles(
                     candidate,
                     Pcsx2ProfileBlockerKind::MissingConfiguration,
                     "configuration directory does not exist",
+                    &executables,
                 ));
             }
             continue;
         }
         let marker_state = inspect_pcsx2_marker(&candidate.configuration_path);
         if let Err((kind, detail)) = marker_state {
-            profiles.push(blocked_profile(candidate, kind, detail));
+            profiles.push(blocked_profile(candidate, kind, detail, &executables));
             continue;
         }
         let configuration_identity = fs::symlink_metadata(&candidate.configuration_path)
@@ -493,6 +520,7 @@ pub fn discover_pcsx2_profiles(
             blockers: Vec::new(),
             patch_directories,
             configuration_identity,
+            executable_candidates: executables.clone(),
         });
     }
     profiles.sort_by(|left, right| {
@@ -602,6 +630,7 @@ fn blocked_profile(
     candidate: ProfileCandidate,
     kind: Pcsx2ProfileBlockerKind,
     detail: impl Into<String>,
+    executables: &[Pcsx2Executable],
 ) -> Pcsx2Profile {
     Pcsx2Profile {
         profile_id: profile_id(candidate.installation_type, &candidate.configuration_path),
@@ -613,7 +642,299 @@ fn blocked_profile(
         eligible: false,
         patch_directories: Vec::new(),
         configuration_identity: None,
+        executable_candidates: executables.to_vec(),
     }
+}
+
+/// Discovers candidate native `pcsx2-qt` executables from `PATH` only -
+/// never guesses a legacy/plugin-era binary name, never searches an
+/// arbitrary directory tree. This is deliberately the only discovery
+/// source: unlike `patch_manager::dolphin_local`, this module has no
+/// caller-supplied explicit-executable or AppImage-directory channel yet,
+/// so it never invents Flatpak/AppImage/portable executable evidence -
+/// see [`resolve_pcsx2_native_launch_binding`]'s own doc comment for why
+/// only [`Pcsx2InstallationType::Native`] is supported by the launch
+/// binding this feeds.
+fn discover_pcsx2_local_executables(_roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<Pcsx2Executable> {
+    let mut paths = Vec::new();
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path).take(128) {
+            paths.push(directory.join("pcsx2-qt"));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|path| is_regular_file_no_follow(path))
+        .map(|path| Pcsx2Executable {
+            path,
+            installation_type: Pcsx2InstallationType::Native,
+        })
+        .collect()
+}
+
+// --- Native launch binding ---------------------------------------------
+//
+// Proves, freshly and read-only, exactly which native `pcsx2-qt` executable
+// belongs to a discovered profile and which user-directory-selection mode a
+// later launch command must use. This is the standalone-launch
+// prerequisite: it never launches PCSX2, never writes configuration, and
+// never creates a directory.
+//
+// # Authoritative current PCSX2 CLI contract (Qt UI, native Linux build)
+//
+// - Executable name: `pcsx2-qt` (the Linux package/AppImage/AUR binary
+//   name; the historic `PCSX2`/`--long-flag` wx-era syntax documented in
+//   some distro man pages is superseded and never used here).
+// - Plain launch: `pcsx2-qt <game>` - no flag is required for a normal GUI
+//   launch of one game.
+// - Default directory resolution on Linux (no flags): `$XDG_CONFIG_HOME/PCSX2`
+//   (falling back to `~/.config/PCSX2` exactly like this crate's existing
+//   `Pcsx2ProfileDiscoveryRoots::from_environment` already assumes for the
+//   `Native` installation type).
+// - Explicit override: `-datapath <path>` selects an arbitrary data
+//   directory - the PCSX2 equivalent of Dolphin's `-u <root>`. Modeled as
+//   [`Pcsx2UserDirectoryMode::ExplicitDataPath`] for a future planner, but
+//   never produced by [`resolve_pcsx2_native_launch_binding`] today - see
+//   that type's own doc comment for why.
+// - Portable mode: `-portable` on the command line, or automatically
+//   whenever a `portable.ini` file exists beside the executable (which
+//   silently overrides `-datapath`/the XDG default). [`resolve_default_native_binding`]
+//   fails closed whenever this marker is present, exactly like Dolphin's
+//   `portable.txt` check.
+// - No PCSX2-specific environment variable (equivalent to Dolphin's
+//   `DOLPHIN_EMU_USERPATH`) is documented; only the already-handled
+//   `XDG_CONFIG_HOME` affects default resolution.
+
+/// How the eventual launch command should select PCSX2's data directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pcsx2UserDirectoryMode {
+    /// No `-datapath`/`-portable` argument; PCSX2 resolves its own default
+    /// `$XDG_CONFIG_HOME/PCSX2` directory.
+    DefaultNative,
+    /// `-datapath <path>` - PCSX2 uses this directory for all application
+    /// data. Never produced by [`resolve_pcsx2_native_launch_binding`] in
+    /// this build: the only way to prove a genuine, caller-confirmed
+    /// explicit PCSX2 data root (as opposed to a merely-observed
+    /// `NativeAlternate`/`Portable` location - see
+    /// [`Pcsx2InstallationType`]'s own doc comment) would require a new
+    /// explicit-root discovery channel this module does not have yet,
+    /// mirroring exactly the gap `patch_manager::dolphin_local`'s first
+    /// binding prerequisite closed for Dolphin in a later step. Modeled
+    /// here so a future planner can consume it without another type change.
+    ExplicitDataPath(PathBuf),
+}
+
+/// A freshly proven executable/profile pairing, safe to use as the first
+/// token(s) of a native PCSX2 launch command. Must be re-derived, not
+/// cached: call [`resolve_pcsx2_native_launch_binding`] again at the moment
+/// of launch, exactly like Dolphin's equivalent binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2NativeLaunchBinding {
+    pub executable: PathBuf,
+    pub user_directory_mode: Pcsx2UserDirectoryMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pcsx2LaunchBlockerKind {
+    /// Any installation type other than [`Pcsx2InstallationType::Native`] -
+    /// `NativeAlternate`, `Portable`, `FlatpakUser`, and `FlatpakSystem` are
+    /// all refused here, before any executable is even considered. See the
+    /// module doc comment for why `Portable` in particular cannot yet be
+    /// proven safe (it conflates an AppImage-inferred directory with a
+    /// genuinely caller-confirmed one).
+    UnsupportedInstallationType,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// No candidate executable exists on disk.
+    ExecutableMissing,
+    /// A candidate executable exists but is a symlink or not a regular
+    /// file.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+    /// The profile's configuration root (or its PCSX2 evidence) no longer
+    /// matches what discovery originally observed, or the profile itself
+    /// is not eligible.
+    ProfileRootMismatch,
+    /// The profile's configuration root does not match PCSX2's current
+    /// default `$XDG_CONFIG_HOME/PCSX2` resolution, so `DefaultNative`
+    /// cannot be proven.
+    DefaultResolutionMismatch,
+    /// A `portable.ini` marker exists beside the resolved executable, which
+    /// would silently force portable mode and relocate PCSX2's data
+    /// directory away from the profile just proven.
+    PortableMarkerConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2LaunchBlocker {
+    pub kind: Pcsx2LaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(kind: Pcsx2LaunchBlockerKind, detail: impl Into<String>) -> Pcsx2LaunchBlocker {
+    Pcsx2LaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` against `roots` and either proves a launch
+/// binding or returns a structured blocker. Pure and read-only: inspects
+/// only filesystem metadata and the supplied environment-derived roots,
+/// never spawns a process, writes PCSX2 configuration, or creates a
+/// directory. Safe - and intended - to call again at future launch time.
+pub fn resolve_pcsx2_native_launch_binding(
+    profile: &Pcsx2Profile,
+    roots: &Pcsx2ProfileDiscoveryRoots,
+) -> Result<Pcsx2NativeLaunchBinding, Pcsx2LaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ProfileRootMismatch,
+            "profile is not eligible",
+        ));
+    }
+    match profile.installation_type {
+        Pcsx2InstallationType::Native => resolve_default_native_binding(profile, roots),
+        Pcsx2InstallationType::NativeAlternate
+        | Pcsx2InstallationType::Portable
+        | Pcsx2InstallationType::FlatpakUser
+        | Pcsx2InstallationType::FlatpakSystem => Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::UnsupportedInstallationType,
+            format!(
+                "only {:?} PCSX2 installations are supported by this native launch binding, got \
+                 {:?}",
+                Pcsx2InstallationType::Native,
+                profile.installation_type
+            ),
+        )),
+    }
+}
+
+fn resolve_default_native_binding(
+    profile: &Pcsx2Profile,
+    roots: &Pcsx2ProfileDiscoveryRoots,
+) -> Result<Pcsx2NativeLaunchBinding, Pcsx2LaunchBlocker> {
+    let expected_config = roots.xdg_config_home.join("PCSX2");
+    if profile.configuration_path != expected_config {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::DefaultResolutionMismatch,
+            format!(
+                "profile root {} does not match the current default XDG resolution {}",
+                profile.configuration_path.display(),
+                expected_config.display(),
+            ),
+        ));
+    }
+    if !is_real_directory_no_follow(&profile.configuration_path).unwrap_or(false) {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ProfileRootMismatch,
+            "configuration root no longer matches the discovered profile",
+        ));
+    }
+    if inspect_pcsx2_marker(&profile.configuration_path).is_err() {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ProfileRootMismatch,
+            "PCSX2 configuration evidence (PCSX2.ini or inis/) is no longer present",
+        ));
+    }
+    let executable = resolve_native_pcsx2_executable(profile)?;
+    if let Some(blocker) = portable_marker_conflict(&executable) {
+        return Err(blocker);
+    }
+    Ok(Pcsx2NativeLaunchBinding {
+        executable,
+        user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+    })
+}
+
+/// `portable.ini` next to the executable forces PCSX2 into portable mode,
+/// which redirects directory resolution away from the profile just proven -
+/// the PCSX2 equivalent of Dolphin's `portable.txt` check.
+fn portable_marker_conflict(executable: &Path) -> Option<Pcsx2LaunchBlocker> {
+    let marker = executable.parent()?.join("portable.ini");
+    is_regular_file_no_follow(&marker).then(|| {
+        launch_blocker(
+            Pcsx2LaunchBlockerKind::PortableMarkerConflict,
+            format!(
+                "{} exists next to the executable and would force portable mode",
+                marker.display()
+            ),
+        )
+    })
+}
+
+/// Binds exactly one executable to `profile`, matching candidates only by
+/// the profile's own installation type - `executable_candidates` is shared
+/// across every discovered profile and is not otherwise scoped per-profile.
+/// Never falls back to a hard-coded name: a profile with no matching,
+/// verified-safe candidate is always blocked.
+fn resolve_native_pcsx2_executable(profile: &Pcsx2Profile) -> Result<PathBuf, Pcsx2LaunchBlocker> {
+    let matching: Vec<&Pcsx2Executable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == profile.installation_type)
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ExecutableMissing,
+            "no discovered executable is associated with this profile's installation type",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_pcsx2_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(valid.into_iter().next().expect("length checked above")),
+        count => Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable executables match this profile and none is distinguished as \
+                 authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_pcsx2_executable(path: &Path) -> Result<(), Pcsx2LaunchBlocker> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            Pcsx2LaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn blocker(
@@ -3193,5 +3514,249 @@ mod tests {
         let _ = inspect_pcsx2_game(&profile, &Pcsx2GameRequest::default());
         let after = fs::read(&config_path).unwrap();
         assert_eq!(before, after);
+    }
+
+    // --- Native launch binding ---------------------------------------------
+
+    fn make_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not executed").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn executable(path: PathBuf, installation_type: Pcsx2InstallationType) -> Pcsx2Executable {
+        Pcsx2Executable {
+            path,
+            installation_type,
+        }
+    }
+
+    fn native_profile(
+        roots: &Pcsx2ProfileDiscoveryRoots,
+        executable_candidates: Vec<Pcsx2Executable>,
+    ) -> Pcsx2Profile {
+        let config = roots.xdg_config_home.join("PCSX2");
+        make_profile(&config);
+        Pcsx2Profile {
+            profile_id: "test-native".into(),
+            installation_type: Pcsx2InstallationType::Native,
+            scope: Pcsx2ProfileScope::User,
+            configuration_path: config,
+            provenance: "test",
+            eligible: true,
+            blockers: Vec::new(),
+            patch_directories: Vec::new(),
+            configuration_identity: None,
+            executable_candidates,
+        }
+    }
+
+    #[test]
+    fn valid_native_pcsx2_binding() {
+        let root = fixture_root("binding-valid");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        make_executable(&bin);
+        let profile = native_profile(
+            &roots,
+            vec![executable(bin.clone(), Pcsx2InstallationType::Native)],
+        );
+        let binding = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, bin);
+        assert_eq!(
+            binding.user_directory_mode,
+            Pcsx2UserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_executable_is_blocked() {
+        let root = fixture_root("binding-ambiguous");
+        let roots = roots(&root);
+        let first = root.join("bin/pcsx2-qt");
+        let second = root.join("alt-bin/pcsx2-qt");
+        make_executable(&first);
+        make_executable(&second);
+        let profile = native_profile(
+            &roots,
+            vec![
+                executable(first, Pcsx2InstallationType::Native),
+                executable(second, Pcsx2InstallationType::Native),
+            ],
+        );
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::AmbiguousExecutable);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_executable_is_blocked() {
+        let root = fixture_root("binding-missing");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        let profile = native_profile(&roots, vec![executable(bin, Pcsx2InstallationType::Native)]);
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::ExecutableMissing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_executable_is_blocked() {
+        let root = fixture_root("binding-symlink");
+        let roots = roots(&root);
+        let real = root.join("bin/pcsx2-qt-real");
+        make_executable(&real);
+        let link = root.join("bin/pcsx2-qt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let profile = native_profile(
+            &roots,
+            vec![executable(link, Pcsx2InstallationType::Native)],
+        );
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_regular_executable_is_blocked() {
+        let root = fixture_root("binding-non-regular");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        fs::create_dir_all(&bin).unwrap();
+        let profile = native_profile(&roots, vec![executable(bin, Pcsx2InstallationType::Native)]);
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::ExecutableUnsafe);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_permission_is_blocked() {
+        let root = fixture_root("binding-non-executable");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"not executed").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&bin, perms).unwrap();
+        let profile = native_profile(&roots, vec![executable(bin, Pcsx2InstallationType::Native)]);
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            Pcsx2LaunchBlockerKind::ExecutableNotExecutable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_installation_kinds_are_blocked() {
+        let root = fixture_root("binding-unsupported-kinds");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        make_executable(&bin);
+        for kind in [
+            Pcsx2InstallationType::NativeAlternate,
+            Pcsx2InstallationType::Portable,
+            Pcsx2InstallationType::FlatpakUser,
+            Pcsx2InstallationType::FlatpakSystem,
+        ] {
+            let mut profile = native_profile(
+                &roots,
+                vec![executable(bin.clone(), Pcsx2InstallationType::Native)],
+            );
+            profile.installation_type = kind;
+            let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+            assert_eq!(
+                blocker.kind,
+                Pcsx2LaunchBlockerKind::UnsupportedInstallationType,
+                "installation type {kind:?} must be blocked"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_root_drift_is_blocked() {
+        let root = fixture_root("binding-root-drift");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        make_executable(&bin);
+        let mut profile =
+            native_profile(&roots, vec![executable(bin, Pcsx2InstallationType::Native)]);
+        // Simulate a profile snapshot that no longer matches the fresh
+        // default XDG resolution (e.g. XDG_CONFIG_HOME changed since
+        // discovery ran).
+        profile.configuration_path = root.join("stale-config/PCSX2");
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            Pcsx2LaunchBlockerKind::DefaultResolutionMismatch
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_hard_coded_executable_fallback() {
+        let root = fixture_root("binding-no-fallback");
+        let roots = roots(&root);
+        // No executable candidates supplied at all; a well-known name like
+        // "pcsx2-qt" must never be assumed even though the profile is
+        // otherwise eligible and native.
+        let profile = native_profile(&roots, Vec::new());
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::ExecutableMissing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_ini_marker_beside_executable_rejects_default_native() {
+        let root = fixture_root("binding-portable-marker");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        make_executable(&bin);
+        fs::write(bin.parent().unwrap().join("portable.ini"), b"").unwrap();
+        let profile = native_profile(&roots, vec![executable(bin, Pcsx2InstallationType::Native)]);
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::PortableMarkerConflict);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ineligible_profile_is_blocked() {
+        let root = fixture_root("binding-ineligible");
+        let roots = roots(&root);
+        let bin = root.join("bin/pcsx2-qt");
+        make_executable(&bin);
+        let mut profile =
+            native_profile(&roots, vec![executable(bin, Pcsx2InstallationType::Native)]);
+        profile.eligible = false;
+        let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(blocker.kind, Pcsx2LaunchBlockerKind::ProfileRootMismatch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_data_path_mode_carries_the_root_as_data_only() {
+        // Not currently produced by `resolve_pcsx2_native_launch_binding`
+        // (see its own doc comment for why), but proves the type is ready
+        // for a future planner: constructing it never invents an argv
+        // string, only carries the verified path through as data.
+        let root = PathBuf::from("/profiles/pcsx2-explicit");
+        let binding = Pcsx2NativeLaunchBinding {
+            executable: PathBuf::from("/usr/bin/pcsx2-qt"),
+            user_directory_mode: Pcsx2UserDirectoryMode::ExplicitDataPath(root.clone()),
+        };
+        assert_eq!(
+            binding.user_directory_mode,
+            Pcsx2UserDirectoryMode::ExplicitDataPath(root)
+        );
     }
 }

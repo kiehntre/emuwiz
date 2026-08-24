@@ -1582,6 +1582,7 @@ fn pcsx2_profile_card_shows_the_first_blocker_directly_and_the_rest_behind_techn
         ],
         patch_directories: Vec::new(),
         configuration_identity: None,
+        executable_candidates: Vec::new(),
     };
     let discovery = Pcsx2ProfileDiscovery {
         profiles: vec![profile],
