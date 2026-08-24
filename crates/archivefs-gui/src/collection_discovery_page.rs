@@ -442,6 +442,7 @@ fn content_label(content: ContentKind) -> &'static str {
         ContentKind::DiscImage => "Disc image",
         ContentKind::AmigaImage => "Amiga image",
         ContentKind::ComputerDisk => "Computer disk image",
+        ContentKind::TapeImage => "Cassette/tape image",
         ContentKind::WhdloadInstall => "WHDLoad install",
         ContentKind::ExtractedGameFolder => "Game folder",
     }
@@ -562,12 +563,28 @@ fn show_detail_row(
             .on_hover_text(item.path.display().to_string());
     });
     ui.label(egui::RichText::new(human_item_kind(item)).color(theme::muted(ui)));
-    if let Some(action) = suggested_action {
-        ui.label(
-            egui::RichText::new(format!("Suggested: {action}"))
-                .small()
-                .color(theme::muted(ui)),
-        );
+    let action = if matches!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    ) {
+        item.content.map(|content| {
+            let extension = item
+                .path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!(" (.{value})"))
+                .unwrap_or_default();
+            format!(
+                "{}{} recognised, but no configured DAT/evidence verified its platform.",
+                content_label(content),
+                extension
+            )
+        })
+    } else {
+        suggested_action.map(str::to_string)
+    };
+    if let Some(action) = action {
+        ui.label(egui::RichText::new(action).small().color(theme::muted(ui)));
     }
     ui.add_space(6.0);
 }
