@@ -3206,7 +3206,7 @@ fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
     let ctx = egui::Context::default();
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            show_collection_discovery_panel(ui, Some(&summary));
+            show_collection_discovery_panel(ui, Some(&summary), None);
         });
     });
 
@@ -3238,7 +3238,7 @@ fn collection_discovery_panel_has_a_friendly_empty_state() {
     let ctx = egui::Context::default();
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            show_collection_discovery_panel(ui, None);
+            show_collection_discovery_panel(ui, None, None);
         });
     });
     assert!(rendered_text_contains(&output, "No scan has completed yet"));

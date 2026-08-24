@@ -129,6 +129,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist bounded direct-image identity reports with source metadata",
         sql: include_str!("migrations/0006_game_identity_reports.sql"),
     },
+    Migration {
+        version: 7,
+        description: "persist every ingestion-discovery item per scan run for paged Collection Discovery browsing",
+        sql: include_str!("migrations/0007_discovery_details.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -1280,6 +1285,226 @@ impl ScanPersistSummary {
     pub fn skipped_files_truncated(&self) -> bool {
         self.skipped_files_total() > self.skipped_files.len() as i64
     }
+}
+
+/// How many recent `scan_runs` a caller may still page through
+/// [`Database::query_discovery_details`] results for. Older runs' detail
+/// rows are pruned (see [`Database::prune_old_discovery_details`]) the
+/// next time a scan starts, so this table cannot grow without bound the
+/// way `archive_scan_observations` currently does - a person can always
+/// still see the collection they just scanned plus a little history,
+/// never every scan this database has ever run.
+pub const MAX_RETAINED_DISCOVERY_RUNS: i64 = 3;
+
+/// Hard upper bound for one persisted Collection Discovery page. GUI callers
+/// deliberately request fewer rows (currently 200), while the core bound
+/// prevents a mistaken caller from turning a paged query back into an
+/// unbounded in-memory load.
+pub const MAX_DISCOVERY_DETAIL_PAGE_SIZE: i64 = 500;
+
+/// A stable, forever-comparable identifier for one Collection Discovery
+/// scan's persisted detail rows - exactly `scan_runs.id`/`ScanPersistSummary::scan_run_id`.
+/// A separate type alias only (not a newtype) so every existing
+/// `scan_run_id: i64` call site keeps working unchanged.
+pub type DiscoveryRunId = i64;
+
+/// [`crate::ingestion::GameDiscovery`]'s state, reused verbatim so
+/// `scan_and_persist` never needs to invent a second "is this run done"
+/// vocabulary - see the migration 0007 doc comment for why this is not a
+/// new state model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl DiscoveryRunStatus {
+    fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
+/// Which coarse bucket of persisted [`DiscoveryDetailRecord`] rows a
+/// Collection Discovery page wants. Deliberately only the buckets already
+/// naturally represented by [`crate::ingestion::GameDiscovery`]'s own
+/// fields - no free-text search, no new classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscoveryDetailFilter {
+    #[default]
+    All,
+    /// [`crate::ingestion::ValidationState::Accepted`].
+    Recognised,
+    /// [`crate::ingestion::SkipReason::RecognizedContentNoIdentityMatch`].
+    Unverified,
+    /// [`crate::ingestion::SkipReason::UnsupportedExtension`].
+    Unsupported,
+    /// [`crate::ingestion::SkipReason::MissingPairedFile`].
+    MissingPairedFile,
+    /// [`crate::ingestion::SkipReason::AmbiguousPlatform`].
+    AmbiguousPlatform,
+    /// [`crate::ingestion::SkipReason::InvalidContent`].
+    InvalidContent,
+    /// [`crate::ingestion::ContainerKind::Archive`].
+    Archive,
+    /// [`crate::ingestion::ContentKind::DiscImage`].
+    Disk,
+    /// [`crate::ingestion::ContentKind::TapeImage`].
+    Tape,
+}
+
+/// One persisted ingestion-discovery item - a durable, queryable
+/// projection of [`crate::ingestion::GameDiscovery`], scoped to the
+/// [`DiscoveryRunId`] that found it. `path` carries exact bytes, exactly
+/// like every other path column in this schema (see `archives.relative_path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryDetailRecord {
+    pub id: i64,
+    pub scan_run_id: DiscoveryRunId,
+    pub path: PathBuf,
+    /// Coarse container shape: `"archive"`, `"folder"`, or `"direct_file"` -
+    /// see [`container_db_str`]. The nested archive-format/folder-role
+    /// detail [`crate::ingestion::ContainerKind`] itself carries is not
+    /// persisted; nothing reading this table today needs more than the
+    /// coarse shape the "Archive" filter and item-detail row already show.
+    pub container: String,
+    pub content: Option<crate::ingestion::ContentKind>,
+    pub platform_hint: Option<String>,
+    pub validation_state: crate::ingestion::ValidationState,
+    pub skip_reason: Option<crate::ingestion::SkipReason>,
+    pub explanation: String,
+    pub identity_display_name: Option<String>,
+    pub identity_platform: Option<String>,
+}
+
+/// One page of [`Database::query_discovery_details`] results, with the
+/// exact total matching count so a caller can render "144,996 items,
+/// showing 501-600" without ever counting a truncated in-memory sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryDetailsPage {
+    pub run_id: DiscoveryRunId,
+    pub run_status: DiscoveryRunStatus,
+    pub filter: DiscoveryDetailFilter,
+    pub offset: i64,
+    pub limit: i64,
+    pub total_matching: i64,
+    pub rows: Vec<DiscoveryDetailRecord>,
+}
+
+fn container_db_str(container: &crate::ingestion::ContainerKind) -> &'static str {
+    use crate::ingestion::ContainerKind;
+    match container {
+        ContainerKind::Archive(_) => "archive",
+        ContainerKind::Folder(_) => "folder",
+        ContainerKind::DirectFile => "direct_file",
+    }
+}
+
+fn content_db_str(content: crate::ingestion::ContentKind) -> &'static str {
+    use crate::ingestion::ContentKind;
+    match content {
+        ContentKind::RomCartridge => "rom_cartridge",
+        ContentKind::DiscImage => "disc_image",
+        ContentKind::AmigaImage => "amiga_image",
+        ContentKind::ComputerDisk => "computer_disk",
+        ContentKind::TapeImage => "tape_image",
+        ContentKind::WhdloadInstall => "whdload_install",
+        ContentKind::ExtractedGameFolder => "extracted_game_folder",
+    }
+}
+
+fn content_from_db_str(value: &str) -> Option<crate::ingestion::ContentKind> {
+    use crate::ingestion::ContentKind;
+    Some(match value {
+        "rom_cartridge" => ContentKind::RomCartridge,
+        "disc_image" => ContentKind::DiscImage,
+        "amiga_image" => ContentKind::AmigaImage,
+        "computer_disk" => ContentKind::ComputerDisk,
+        "tape_image" => ContentKind::TapeImage,
+        "whdload_install" => ContentKind::WhdloadInstall,
+        "extracted_game_folder" => ContentKind::ExtractedGameFolder,
+        _ => return None,
+    })
+}
+
+fn validation_state_db_str(state: crate::ingestion::ValidationState) -> &'static str {
+    use crate::ingestion::ValidationState;
+    match state {
+        ValidationState::Accepted => "accepted",
+        ValidationState::Skipped => "skipped",
+    }
+}
+
+fn validation_state_from_db_str(value: &str) -> crate::ingestion::ValidationState {
+    use crate::ingestion::ValidationState;
+    match value {
+        "accepted" => ValidationState::Accepted,
+        _ => ValidationState::Skipped,
+    }
+}
+
+/// `(stable machine name, detail text)` - `detail` is only ever populated
+/// for [`crate::ingestion::SkipReason::InvalidContent`], carried in the
+/// separate `skip_reason_detail` column so filtering never has to parse it
+/// back out of a combined string.
+fn skip_reason_db_parts(reason: &crate::ingestion::SkipReason) -> (&'static str, Option<&str>) {
+    use crate::ingestion::SkipReason;
+    match reason {
+        SkipReason::UnsupportedExtension => ("unsupported_extension", None),
+        SkipReason::RecognizedContentNoIdentityMatch => ("no_identity_match", None),
+        SkipReason::MissingPairedFile => ("missing_paired_file", None),
+        SkipReason::AmbiguousPlatform => ("ambiguous_platform", None),
+        SkipReason::InvalidContent(detail) => ("invalid_content", Some(detail.as_str())),
+    }
+}
+
+fn skip_reason_from_db_parts(
+    reason: Option<&str>,
+    detail: Option<&str>,
+) -> Option<crate::ingestion::SkipReason> {
+    use crate::ingestion::SkipReason;
+    Some(match reason? {
+        "unsupported_extension" => SkipReason::UnsupportedExtension,
+        "no_identity_match" => SkipReason::RecognizedContentNoIdentityMatch,
+        "missing_paired_file" => SkipReason::MissingPairedFile,
+        "ambiguous_platform" => SkipReason::AmbiguousPlatform,
+        "invalid_content" => SkipReason::InvalidContent(detail.unwrap_or_default().to_string()),
+        _ => return None,
+    })
+}
+
+fn discovery_detail_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DiscoveryDetailRecord> {
+    let path_bytes: Vec<u8> = row.get("path")?;
+    let container: String = row.get("container")?;
+    let content: Option<String> = row.get("content")?;
+    let validation_state: String = row.get("validation_state")?;
+    let skip_reason: Option<String> = row.get("skip_reason")?;
+    let skip_reason_detail: Option<String> = row.get("skip_reason_detail")?;
+    Ok(DiscoveryDetailRecord {
+        id: row.get("id")?,
+        scan_run_id: row.get("scan_run_id")?,
+        path: PathBuf::from(OsString::from_vec(path_bytes)),
+        container,
+        content: content.as_deref().and_then(content_from_db_str),
+        platform_hint: row.get("platform_hint")?,
+        validation_state: validation_state_from_db_str(&validation_state),
+        skip_reason: skip_reason_from_db_parts(
+            skip_reason.as_deref(),
+            skip_reason_detail.as_deref(),
+        ),
+        explanation: row.get("explanation")?,
+        identity_display_name: row.get("identity_display_name")?,
+        identity_platform: row.get("identity_platform")?,
+    })
 }
 
 /// A persisted `archives` row joined with its current platform (if any),
@@ -3697,6 +3922,164 @@ impl Database {
             truncated,
         }))
     }
+
+    /// `scan_runs.status` for one run, or `None` if no such run exists
+    /// (already pruned, or the id was never valid) - the same status
+    /// `mark_interrupted_scan_runs`/`complete_scan_run`/`fail_scan_run`
+    /// already maintain, read back rather than duplicated.
+    pub fn discovery_run_status(
+        &self,
+        run_id: DiscoveryRunId,
+    ) -> Result<Option<DiscoveryRunStatus>> {
+        self.connection
+            .query_row(
+                "SELECT status FROM scan_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to load discovery run status", error))
+            .map(|status| status.and_then(|status| DiscoveryRunStatus::from_db_str(&status)))
+    }
+
+    /// Pages through [`DiscoveryDetailRecord`] rows persisted for one
+    /// [`DiscoveryRunId`], in deterministic insertion order, without ever
+    /// loading more than `limit` rows into memory. `total_matching` is the
+    /// exact count for `filter` (not just `rows.len()`), computed by the
+    /// same `WHERE` clause in one extra indexed query - see the migration
+    /// 0007 doc comment for the `(scan_run_id, id)` index this relies on.
+    pub fn query_discovery_details(
+        &self,
+        run_id: DiscoveryRunId,
+        offset: i64,
+        limit: i64,
+        filter: DiscoveryDetailFilter,
+    ) -> Result<DiscoveryDetailsPage> {
+        let limit = limit.clamp(0, MAX_DISCOVERY_DETAIL_PAGE_SIZE);
+        let offset = offset.max(0);
+        let run_status = self
+            .discovery_run_status(run_id)?
+            .ok_or_else(|| ArchiveFsError::Database(format!("no discovery run {run_id}")))?;
+
+        let filter_sql = match filter {
+            DiscoveryDetailFilter::All => "1 = 1",
+            DiscoveryDetailFilter::Recognised => "validation_state = 'accepted'",
+            DiscoveryDetailFilter::Unverified => "skip_reason = 'no_identity_match'",
+            DiscoveryDetailFilter::Unsupported => "skip_reason = 'unsupported_extension'",
+            DiscoveryDetailFilter::MissingPairedFile => "skip_reason = 'missing_paired_file'",
+            DiscoveryDetailFilter::AmbiguousPlatform => "skip_reason = 'ambiguous_platform'",
+            DiscoveryDetailFilter::InvalidContent => "skip_reason = 'invalid_content'",
+            DiscoveryDetailFilter::Archive => "container = 'archive'",
+            // "Disk" is a media-family filter, not a platform claim. It
+            // intentionally includes optical, computer-disk, and Amiga disk
+            // images, all of which are separately stored content kinds.
+            DiscoveryDetailFilter::Disk => {
+                "content IN ('disc_image', 'amiga_image', 'computer_disk')"
+            }
+            DiscoveryDetailFilter::Tape => "content = 'tape_image'",
+        };
+
+        let total_matching: i64 = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM discovery_details WHERE scan_run_id = ?1 AND {filter_sql}"
+                ),
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| db_error("failed to count discovery details", error))?;
+
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT id, scan_run_id, path, container, content, platform_hint, \
+                 validation_state, skip_reason, skip_reason_detail, explanation, \
+                 identity_display_name, identity_platform \
+                 FROM discovery_details WHERE scan_run_id = ?1 AND {filter_sql} \
+                 ORDER BY id ASC LIMIT ?2 OFFSET ?3"
+            ))
+            .map_err(|error| db_error("failed to prepare discovery details page", error))?;
+        let rows = statement
+            .query_map(
+                params![run_id, limit, offset],
+                discovery_detail_record_from_row,
+            )
+            .map_err(|error| db_error("failed to load discovery details page", error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| db_error("failed to decode discovery details page", error))?;
+
+        Ok(DiscoveryDetailsPage {
+            run_id,
+            run_status,
+            filter,
+            offset,
+            limit,
+            total_matching,
+            rows,
+        })
+    }
+
+    /// Deletes every persisted [`DiscoveryDetailRecord`] belonging to a run
+    /// outside the [`MAX_RETAINED_DISCOVERY_RUNS`] most recent `scan_runs`
+    /// rows - called once at the start of a new scan (see
+    /// `scan_and_persist_folders_transaction`), inside that scan's own
+    /// transaction, so a crash never leaves this table half-pruned.
+    fn prune_old_discovery_details(&mut self) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM discovery_details WHERE scan_run_id NOT IN \
+                 (SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?1)",
+                params![MAX_RETAINED_DISCOVERY_RUNS],
+            )
+            .map_err(|error| db_error("failed to prune old discovery details", error))?;
+        Ok(())
+    }
+
+    /// Persists one [`crate::ingestion::GameDiscovery`] item as a
+    /// [`DiscoveryDetailRecord`] row for `scan_run_id`, called directly
+    /// from the scan loop as each item is discovered (never accumulated in
+    /// a `Vec` first) - see `scan_and_persist_folders_transaction`.
+    fn insert_discovery_detail(
+        &mut self,
+        scan_run_id: DiscoveryRunId,
+        item: &crate::ingestion::GameDiscovery,
+    ) -> Result<()> {
+        let (skip_reason, skip_reason_detail) = match &item.skip_reason {
+            Some(reason) => {
+                let (name, detail) = skip_reason_db_parts(reason);
+                (Some(name), detail)
+            }
+            None => (None, None),
+        };
+        self.connection
+            .execute(
+                "INSERT INTO discovery_details \
+                 (scan_run_id, path, container, content, platform_hint, validation_state, \
+                  skip_reason, skip_reason_detail, explanation, identity_display_name, \
+                  identity_platform) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    scan_run_id,
+                    item.path.as_os_str().as_bytes(),
+                    container_db_str(&item.container),
+                    item.content.map(content_db_str),
+                    item.platform_hint,
+                    validation_state_db_str(item.validation_state),
+                    skip_reason,
+                    skip_reason_detail,
+                    item.explanation,
+                    item.identity_candidate
+                        .as_ref()
+                        .map(|identity| identity.display_name.clone()),
+                    item.identity_candidate
+                        .as_ref()
+                        .and_then(|identity| identity.platform.clone()),
+                ],
+            )
+            .map_err(|error| db_error("failed to persist discovery detail", error))?;
+        Ok(())
+    }
 }
 
 /// Aggregate counts over the whole persisted catalogue - see
@@ -3822,6 +4205,11 @@ fn scan_and_persist_folders_transaction(
 ) -> Result<ScanPersistSummary> {
     database.mark_interrupted_scan_runs()?;
     let scan_run_id = database.start_scan_run(triggered_by, None)?;
+    // Bound `discovery_details` history before adding this run's rows -
+    // see `MAX_RETAINED_DISCOVERY_RUNS`. Inside this same transaction, so a
+    // crash before commit leaves both the prune and the new rows rolled
+    // back together, never a half-pruned table.
+    database.prune_old_discovery_details()?;
 
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
@@ -3880,6 +4268,13 @@ fn scan_and_persist_folders_transaction(
                         .entry(platform.clone())
                         .or_insert(0) += 1;
                 }
+                // Persisted immediately, one row at a time - never
+                // accumulated into a second in-memory Vec first - so a
+                // Collection Discovery page can page through the full
+                // result set later without this function ever holding
+                // more of it in memory than the bounded samples below
+                // already do.
+                database.insert_discovery_detail(scan_run_id, item)?;
             }
             if ingestion_skipped.len() < crate::MAX_RETAINED_SKIPPED_FILES {
                 let remaining = crate::MAX_RETAINED_SKIPPED_FILES - ingestion_skipped.len();
@@ -4753,6 +5148,7 @@ mod tests {
             vec![
                 "archive_scan_observations",
                 "archives",
+                "discovery_details",
                 "platform_aliases",
                 "platform_assignments",
                 "scan_runs",
@@ -9593,5 +9989,373 @@ mod tests {
         let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
         // Neither .txt nor .exe is in MEDIA_FORMATS — no archive rows are created.
         assert_eq!(summary.counts.archives_seen, 0);
+    }
+
+    // --- Collection Discovery paging (persisted `discovery_details`) ---------------------------
+
+    fn write_n_unsupported_extension_files(source: &Path, count: usize) {
+        for index in 0..count {
+            write_archive_file(
+                source,
+                format!("item{index:05}.xyz"),
+                format!("fixture {index}").as_bytes(),
+            );
+        }
+    }
+
+    #[test]
+    fn scan_run_gets_a_discovery_run_identity_and_details_are_persisted_under_it() {
+        let root = temp_dir("discovery-run-identity");
+        let source = root.join("roms");
+        write_archive_file(&source, "mystery.xyz", b"fixture");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        let page = database
+            .query_discovery_details(summary.scan_run_id, 0, 10, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(page.run_id, summary.scan_run_id);
+        assert_eq!(page.total_matching, 1);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].scan_run_id, summary.scan_run_id);
+        assert!(page.rows[0].path.ends_with("mystery.xyz"));
+    }
+
+    #[test]
+    fn total_matching_count_exceeds_the_old_in_memory_sample_cap_and_stays_exact() {
+        let root = temp_dir("discovery-exceeds-old-cap");
+        let source = root.join("roms");
+        let total = crate::MAX_RETAINED_SKIPPED_FILES + 200;
+        write_n_unsupported_extension_files(&source, total);
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        // The old bounded in-memory sample stays capped exactly as before -
+        // this feature is additive, not a removal of that cap.
+        assert_eq!(
+            summary.ingestion_skipped.len(),
+            crate::MAX_RETAINED_SKIPPED_FILES
+        );
+        // But the persisted, queryable total is the real, uncapped count.
+        let page = database
+            .query_discovery_details(summary.scan_run_id, 0, 1, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(page.total_matching, total as i64);
+        assert!(page.total_matching > crate::MAX_RETAINED_SKIPPED_FILES as i64);
+    }
+
+    #[test]
+    fn paging_reconstructs_the_full_result_set_with_no_duplicates_and_bounded_pages() {
+        let root = temp_dir("discovery-paging");
+        let source = root.join("roms");
+        let total = 1200usize;
+        write_n_unsupported_extension_files(&source, total);
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+        let run_id = summary.scan_run_id;
+
+        // A caller cannot turn the paged API into a full in-memory load by
+        // passing an arbitrary large limit.
+        let capped = database
+            .query_discovery_details(run_id, 0, total as i64, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(capped.rows.len(), MAX_DISCOVERY_DETAIL_PAGE_SIZE as usize);
+        assert_eq!(capped.total_matching, total as i64);
+
+        // First page.
+        let page_size = 100i64;
+        let first = database
+            .query_discovery_details(run_id, 0, page_size, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(first.rows.len(), page_size as usize);
+
+        // An arbitrary middle page.
+        let middle = database
+            .query_discovery_details(run_id, 500, page_size, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(middle.rows.len(), page_size as usize);
+
+        // Final partial page: 1200 rows, page size 100 starting at 1150 - only 50 remain.
+        let last = database
+            .query_discovery_details(run_id, 1150, page_size, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(last.rows.len(), 50);
+
+        // Deterministic ordering: re-running the same query yields byte-identical results.
+        let first_again = database
+            .query_discovery_details(run_id, 0, page_size, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(first, first_again);
+
+        // No duplicate rows across adjacent pages.
+        let first_ids: std::collections::HashSet<i64> =
+            first.rows.iter().map(|row| row.id).collect();
+        let second = database
+            .query_discovery_details(run_id, 100, page_size, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert!(second.rows.iter().all(|row| !first_ids.contains(&row.id)));
+
+        // Paging can still reconstruct the full result set, one bounded
+        // page at a time, without relying on an oversized "ground truth"
+        // query.
+        let mut ids = std::collections::HashSet::new();
+        for offset in (0..total as i64).step_by(page_size as usize) {
+            let page = database
+                .query_discovery_details(run_id, offset, page_size, DiscoveryDetailFilter::All)
+                .unwrap();
+            assert!(page.rows.len() <= page_size as usize);
+            ids.extend(page.rows.into_iter().map(|row| row.id));
+        }
+        assert_eq!(ids.len(), total);
+
+        // Query limit is bounded - it never silently returns more than asked.
+        let bounded = database
+            .query_discovery_details(run_id, 0, 5, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(bounded.rows.len(), 5);
+    }
+
+    #[test]
+    fn recognised_unverified_and_unsupported_status_survive_persistence() {
+        let root = temp_dir("discovery-status-retained");
+        let source = root.join("roms");
+        // Accepted: a real Amiga image.
+        write_archive_file(&source, "Workbench.hdf", &minimal_amiga_hdf());
+        // Unverified: recognised content, no identity match (CHD is never
+        // strong platform evidence alone).
+        write_archive_file(&source, "Arcade Game.chd", b"not a real chd");
+        // Unsupported: no registry recognises this extension at all.
+        write_archive_file(&source, "mystery.xyz", b"fixture");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        let recognised = database
+            .query_discovery_details(
+                summary.scan_run_id,
+                0,
+                10,
+                DiscoveryDetailFilter::Recognised,
+            )
+            .unwrap();
+        assert_eq!(recognised.total_matching, 1);
+        assert_eq!(
+            recognised.rows[0].validation_state,
+            crate::ingestion::ValidationState::Accepted
+        );
+        assert!(recognised.rows[0].path.ends_with("Workbench.hdf"));
+
+        let unverified = database
+            .query_discovery_details(
+                summary.scan_run_id,
+                0,
+                10,
+                DiscoveryDetailFilter::Unverified,
+            )
+            .unwrap();
+        assert_eq!(unverified.total_matching, 1);
+        assert_eq!(
+            unverified.rows[0].skip_reason,
+            Some(crate::ingestion::SkipReason::RecognizedContentNoIdentityMatch)
+        );
+        assert!(unverified.rows[0].path.ends_with("Arcade Game.chd"));
+
+        let unsupported = database
+            .query_discovery_details(
+                summary.scan_run_id,
+                0,
+                10,
+                DiscoveryDetailFilter::Unsupported,
+            )
+            .unwrap();
+        assert_eq!(unsupported.total_matching, 1);
+        assert_eq!(
+            unsupported.rows[0].skip_reason,
+            Some(crate::ingestion::SkipReason::UnsupportedExtension)
+        );
+        assert!(unsupported.rows[0].path.ends_with("mystery.xyz"));
+    }
+
+    #[test]
+    fn disk_and_tape_and_archive_filters_match_the_content_they_name() {
+        let root = temp_dir("discovery-disk-tape-archive");
+        let source = root.join("roms");
+        write_archive_file(&source, "Arcade Game.chd", b"not a real chd");
+        write_archive_file(&source, "unknown-platform.dsk", b"fixture bytes");
+        write_archive_file(&source, "unknown-platform.cdt", b"fixture bytes");
+        zip_fixture(&source, "Game.zip", "Game.gba", b"gba rom bytes");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        let disk = database
+            .query_discovery_details(summary.scan_run_id, 0, 10, DiscoveryDetailFilter::Disk)
+            .unwrap();
+        assert_eq!(disk.total_matching, 2);
+        assert!(
+            disk.rows
+                .iter()
+                .any(|row| row.path.ends_with("Arcade Game.chd"))
+        );
+        assert!(
+            disk.rows
+                .iter()
+                .any(|row| row.path.ends_with("unknown-platform.dsk"))
+        );
+
+        let tape = database
+            .query_discovery_details(summary.scan_run_id, 0, 10, DiscoveryDetailFilter::Tape)
+            .unwrap();
+        assert_eq!(tape.total_matching, 1);
+        assert!(tape.rows[0].path.ends_with("unknown-platform.cdt"));
+
+        let archive = database
+            .query_discovery_details(summary.scan_run_id, 0, 10, DiscoveryDetailFilter::Archive)
+            .unwrap();
+        assert_eq!(archive.total_matching, 1);
+        assert!(archive.rows[0].path.ends_with("Game.zip"));
+    }
+
+    #[test]
+    fn a_new_scan_never_mixes_rows_with_an_older_run() {
+        let root = temp_dir("discovery-run-isolation");
+        let source = root.join("roms");
+        write_archive_file(&source, "first.xyz", b"fixture");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let first_summary = scan_and_persist(&mut database, &config, "first").unwrap();
+
+        write_archive_file(&source, "second.xyz", b"fixture");
+        let second_summary = scan_and_persist(&mut database, &config, "second").unwrap();
+        assert_ne!(first_summary.scan_run_id, second_summary.scan_run_id);
+
+        let second_page = database
+            .query_discovery_details(
+                second_summary.scan_run_id,
+                0,
+                10,
+                DiscoveryDetailFilter::All,
+            )
+            .unwrap();
+        assert_eq!(second_page.total_matching, 2, "second run sees both files");
+        assert!(
+            second_page
+                .rows
+                .iter()
+                .all(|row| row.scan_run_id == second_summary.scan_run_id),
+            "no row leaks another run's scan_run_id"
+        );
+    }
+
+    #[test]
+    fn completed_run_is_reported_completed_and_query_never_rescans_the_filesystem() {
+        let root = temp_dir("discovery-completed-no-rescan");
+        let source = root.join("roms");
+        write_archive_file(&source, "mystery.xyz", b"fixture");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        assert_eq!(
+            database.discovery_run_status(summary.scan_run_id).unwrap(),
+            Some(DiscoveryRunStatus::Completed)
+        );
+
+        // Delete the source directory entirely - if paging touched the
+        // filesystem at all, this query would now fail or return nothing.
+        fs::remove_dir_all(&source).unwrap();
+        let page = database
+            .query_discovery_details(summary.scan_run_id, 0, 10, DiscoveryDetailFilter::All)
+            .unwrap();
+        assert_eq!(page.total_matching, 1);
+        assert_eq!(page.run_status, DiscoveryRunStatus::Completed);
+    }
+
+    #[test]
+    fn an_interrupted_prior_run_is_reported_as_interrupted_not_completed() {
+        let root = temp_dir("discovery-interrupted-run");
+        let source = root.join("roms");
+        write_archive_file(&source, "mystery.xyz", b"fixture");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        // Simulate a crashed scan: a `scan_runs` row left `status = 'running'`.
+        let stale_run_id = database.start_scan_run("crashed", None).unwrap();
+
+        // Starting a fresh scan marks any stale 'running' row 'interrupted'
+        // before it begins its own run - the existing, reused behaviour
+        // this feature relies on for run-state honesty (see
+        // `Database::mark_interrupted_scan_runs`).
+        let summary = scan_and_persist(&mut database, &config, "next").unwrap();
+        assert_ne!(summary.scan_run_id, stale_run_id);
+
+        assert_eq!(
+            database.discovery_run_status(stale_run_id).unwrap(),
+            Some(DiscoveryRunStatus::Interrupted)
+        );
+        assert_eq!(
+            database.discovery_run_status(summary.scan_run_id).unwrap(),
+            Some(DiscoveryRunStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn old_discovery_run_details_are_pruned_beyond_the_retained_history() {
+        let root = temp_dir("discovery-old-run-cleanup");
+        let source = root.join("roms");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+
+        let mut run_ids = Vec::new();
+        for index in 0..(MAX_RETAINED_DISCOVERY_RUNS + 2) {
+            write_archive_file(&source, format!("run{index}.xyz"), b"fixture");
+            let summary = scan_and_persist(&mut database, &config, "run").unwrap();
+            run_ids.push(summary.scan_run_id);
+        }
+
+        // The oldest two runs' detail rows must be pruned - the `scan_runs`
+        // row itself still exists (this policy only bounds
+        // `discovery_details`, not run history), so the query still
+        // succeeds but with zero matching rows.
+        for &old_run_id in &run_ids[0..2] {
+            let page = database
+                .query_discovery_details(old_run_id, 0, 10, DiscoveryDetailFilter::All)
+                .unwrap();
+            assert_eq!(
+                page.total_matching, 0,
+                "pruned run must have no detail rows left"
+            );
+        }
+        // ...while the most recent MAX_RETAINED_DISCOVERY_RUNS remain fully queryable.
+        for &recent_run_id in &run_ids[2..] {
+            let page = database
+                .query_discovery_details(recent_run_id, 0, 10, DiscoveryDetailFilter::All)
+                .unwrap();
+            assert!(page.total_matching >= 1);
+        }
+    }
+
+    #[test]
+    fn library_schema_boundary_test_includes_discovery_details_table() {
+        // `library_schema_contains_no_cheat_catalogue_journal_or_backup_tables`
+        // above already asserts the exact table list includes
+        // `discovery_details` - this test only documents that assertion is
+        // deliberate and not an oversight, for anyone extending that list
+        // in the future.
+        assert!(MIGRATIONS.iter().any(|migration| migration.version == 7));
     }
 }

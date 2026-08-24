@@ -270,6 +270,7 @@ fn entry(
         platform_display_name: String::new(),
         platform_source: String::new(),
         slug: slug.map(String::from),
+        layout_folder: None,
         mode: OrganisationMode::RenameInPlace,
         content_classification: None,
         original_metadata: Default::default(),

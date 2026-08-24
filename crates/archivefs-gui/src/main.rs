@@ -5545,9 +5545,7 @@ impl ArchiveFsApp {
         // `evidence_bridge::resolved_identity_for_platform`'s `Ps2Serial`/
         // `Pcsx2ExecutableCrc` handling) when no serial was verified.
         let verified_ps2_serial = verified_facts.iter().find_map(|fact| match fact {
-            archivefs_core::launch::VerifiedIdentityFact::Ps2Serial(serial) => {
-                Some(serial.clone())
-            }
+            archivefs_core::launch::VerifiedIdentityFact::Ps2Serial(serial) => Some(serial.clone()),
             _ => None,
         });
 
@@ -15344,8 +15342,23 @@ impl ArchiveFsApp {
                                 } => last_scan_summary.as_ref(),
                                 _ => None,
                             };
+                            // Prefer the persisted database's own record of
+                            // the most recent *completed* scan over the
+                            // session-local `last_scan_summary` - this run
+                            // id survives an app restart, so paging keeps
+                            // working even when the summary above is
+                            // `None` (nothing scanned yet this session).
+                            let discovery_run = match &self.database_state {
+                                DatabaseState::Ready { snapshot, .. } => snapshot
+                                    .last_completed_scan
+                                    .as_ref()
+                                    .map(|scan| (snapshot.database_path.as_path(), scan.scan_run_id)),
+                                _ => None,
+                            };
                             collection_discovery_page::show_collection_discovery_panel(
-                                ui, summary,
+                                ui,
+                                summary,
+                                discovery_run,
                             );
                         }
                         // The original `DoctorReport` checks, unchanged. The

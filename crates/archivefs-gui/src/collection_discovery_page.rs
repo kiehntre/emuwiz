@@ -11,6 +11,7 @@
 use super::*;
 use archivefs_core::ScanPersistSummary;
 use archivefs_core::ingestion::{ContentKind, GameDiscovery, SkipReason, SkipReasonCounts};
+use archivefs_core::{DiscoveryDetailFilter, DiscoveryDetailRecord, DiscoveryDetailsPage};
 
 /// Renders the read-only "Skipped files" drill-down: a bounded sample of
 /// the files the most recently completed scan skipped, with a concise
@@ -212,31 +213,62 @@ fn format_count(count: usize) -> String {
     grouped.chars().rev().collect()
 }
 
+/// `discovery_run` is `Some((database_path, run_id))` whenever a
+/// persisted, pageable detail set exists for the run `summary` describes -
+/// see [`crate::CachedLibrarySnapshot::database_path`] and
+/// `CompletedScanSummary::scan_run_id`/`ScanPersistSummary::scan_run_id`.
+/// `None` only when no completed scan has ever been persisted (a summary
+/// can still be `Some` from an in-session scan while the database read
+/// path is otherwise unavailable) - the panel falls back to the old bounded
+/// sample in that case rather than showing nothing.
 pub(super) fn show_collection_discovery_panel(
     ui: &mut egui::Ui,
     summary: Option<&ScanPersistSummary>,
+    discovery_run: Option<(&Path, i64)>,
 ) {
-    let Some(summary) = summary else {
-        widgets::card(ui, |ui| {
-            ui.label("No scan has completed yet this session.");
-            ui.label(
-                egui::RichText::new(
-                    "Run a scan from the Sources page, then come back here to see what \
-                     EmuWiz found in your collection.",
-                )
-                .color(theme::muted(ui)),
-            );
-        });
-        return;
-    };
+    match summary {
+        Some(summary) => {
+            show_found_summary(ui, summary);
+            ui.add_space(theme::SECTION_GAP);
+            show_needs_attention_summary(ui, &summary.ingestion_skip_reasons);
+            ui.add_space(theme::SECTION_GAP);
+            show_platform_breakdown(ui, summary);
+            ui.add_space(theme::SECTION_GAP);
+        }
+        None if discovery_run.is_some() => {
+            widgets::card(ui, |ui| {
+                ui.label("Showing details from the most recent completed scan.");
+                ui.label(
+                    egui::RichText::new(
+                        "Run a new scan to refresh the session summary and collection totals.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+            });
+            ui.add_space(theme::SECTION_GAP);
+        }
+        None => {
+            widgets::card(ui, |ui| {
+                ui.label("No scan has completed yet.");
+                ui.label(
+                    egui::RichText::new(
+                        "Run a scan from the Sources page, then come back here to see what \
+                         EmuWiz found in your collection.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+            });
+            return;
+        }
+    }
 
-    show_found_summary(ui, summary);
-    ui.add_space(theme::SECTION_GAP);
-    show_needs_attention_summary(ui, &summary.ingestion_skip_reasons);
-    ui.add_space(theme::SECTION_GAP);
-    show_platform_breakdown(ui, summary);
-    ui.add_space(theme::SECTION_GAP);
-    show_item_details(ui, summary);
+    match discovery_run {
+        Some((database_path, run_id)) => show_item_details_paged(ui, database_path, run_id),
+        None => show_item_details_bounded_sample(
+            ui,
+            summary.expect("bounded samples require a session scan summary"),
+        ),
+    }
 }
 
 fn show_found_summary(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
@@ -448,7 +480,10 @@ fn content_label(content: ContentKind) -> &'static str {
     }
 }
 
-fn show_item_details(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
+/// Fallback rendering for when no persisted, pageable run is available -
+/// the original bounded-sample behaviour, kept verbatim so the panel still
+/// shows *something* rather than nothing in that case.
+fn show_item_details_bounded_sample(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
     if summary.ingestion_recognised_sample.is_empty() && summary.ingestion_skipped.is_empty() {
         return;
     }
@@ -533,6 +568,257 @@ fn show_item_details(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
                 });
         }
     });
+}
+
+/// How many rows one Collection Discovery page requests at a time -
+/// mid-range of the project's own "100-500" guidance, matching
+/// `MAX_RETAINED_SKIPPED_FILES`'s existing order of magnitude without
+/// approaching it (this bound is per-*page*, not per-run).
+const DISCOVERY_PAGE_SIZE: i64 = 200;
+
+/// The paging/filter state one open Collection Discovery panel remembers
+/// between frames - plain egui widget memory, exactly like
+/// [`active_filter`]/[`set_active_filter`] above. `page` is the
+/// already-fetched result for `(run_id, offset, filter)`; it is `None`
+/// only before the very first fetch this session, or after an error.
+#[derive(Clone)]
+struct DiscoveryPageState {
+    run_id: i64,
+    offset: i64,
+    filter: DiscoveryDetailFilter,
+    page: Option<DiscoveryDetailsPage>,
+    error: Option<String>,
+}
+
+fn discovery_page_memory_id() -> egui::Id {
+    egui::Id::new("collection_discovery_paged_state")
+}
+
+fn discovery_page_state(ui: &egui::Ui, run_id: i64) -> DiscoveryPageState {
+    ui.memory(|memory| memory.data.get_temp(discovery_page_memory_id()))
+        .filter(|state: &DiscoveryPageState| state.run_id == run_id)
+        .unwrap_or(DiscoveryPageState {
+            run_id,
+            offset: 0,
+            filter: DiscoveryDetailFilter::All,
+            page: None,
+            error: None,
+        })
+}
+
+fn set_discovery_page_state(ui: &egui::Ui, state: DiscoveryPageState) {
+    ui.memory_mut(|memory| memory.data.insert_temp(discovery_page_memory_id(), state));
+}
+
+/// The one bucket a "Needs attention" row narrows the paged detail list to -
+/// mirrors [`NeedsAttentionFilter`] plus the always-available "Recognised"
+/// bucket, translated 1:1 into the persisted-query vocabulary
+/// [`DiscoveryDetailFilter`] (see `archivefs_core::database`'s doc comment
+/// on why this stays the same small, naturally-represented bucket set
+/// rather than growing into free-text search).
+fn discovery_detail_filter_label(filter: DiscoveryDetailFilter) -> &'static str {
+    match filter {
+        DiscoveryDetailFilter::All => "All",
+        DiscoveryDetailFilter::Recognised => "Recognised",
+        DiscoveryDetailFilter::Unverified => "Unverified",
+        DiscoveryDetailFilter::Unsupported => "Unsupported",
+        DiscoveryDetailFilter::MissingPairedFile => "Missing pair",
+        DiscoveryDetailFilter::AmbiguousPlatform => "Ambiguous platform",
+        DiscoveryDetailFilter::InvalidContent => "Could not be read",
+        DiscoveryDetailFilter::Archive => "Archive",
+        DiscoveryDetailFilter::Disk => "Disk",
+        DiscoveryDetailFilter::Tape => "Tape",
+    }
+}
+
+fn status_tone_for_row(row: &DiscoveryDetailRecord) -> (widgets::StatusTone, String) {
+    match &row.skip_reason {
+        None => (widgets::StatusTone::Success, "Recognised".to_string()),
+        Some(reason) => (widgets::StatusTone::Warning, reason.label().to_string()),
+    }
+}
+
+fn discovery_detail_filename(row: &DiscoveryDetailRecord) -> String {
+    row.path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| row.path.display().to_string())
+}
+
+fn discovery_detail_kind_label(row: &DiscoveryDetailRecord) -> String {
+    match (&row.platform_hint, row.content) {
+        (Some(platform), Some(content)) => format!("{platform} {}", content_label(content)),
+        (None, Some(content)) => content_label(content).to_string(),
+        (_, None) => "Unrecognised file".to_string(),
+    }
+}
+
+/// The full paged Item details section: fetches (only when the requested
+/// `(run_id, offset, filter)` changed since the last frame) one bounded
+/// page of persisted [`DiscoveryDetailRecord`] rows directly from the
+/// database, and renders exactly that page - never the whole result set,
+/// however large. Loading another page re-queries the already-persisted
+/// table; it never re-scans the filesystem.
+fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64) {
+    let mut state = discovery_page_state(ui, run_id);
+
+    let needs_fetch = match &state.page {
+        Some(page) => {
+            page.run_id != run_id || page.offset != state.offset || page.filter != state.filter
+        }
+        None => true,
+    };
+    if needs_fetch {
+        match fetch_discovery_page(database_path, run_id, state.offset, state.filter) {
+            Ok(page) => {
+                state.page = Some(page);
+                state.error = None;
+            }
+            Err(message) => {
+                state.page = None;
+                state.error = Some(message);
+            }
+        }
+    }
+
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Item details",
+            Some("Every recognised and skipped item found, paged from the database."),
+        );
+
+        let Some(page) = &state.page else {
+            ui.label(
+                egui::RichText::new(
+                    state
+                        .error
+                        .as_deref()
+                        .unwrap_or("Item details are not available for this scan."),
+                )
+                .color(theme::muted(ui)),
+            );
+            set_discovery_page_state(ui, state);
+            return;
+        };
+
+        if page.run_status != archivefs_core::DiscoveryRunStatus::Completed {
+            ui.label(
+                egui::RichText::new(
+                    "This scan did not finish (interrupted or failed) - these rows may be \
+                     incomplete.",
+                )
+                .color(theme::muted(ui)),
+            );
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Filter:");
+            for filter in [
+                DiscoveryDetailFilter::All,
+                DiscoveryDetailFilter::Recognised,
+                DiscoveryDetailFilter::Unverified,
+                DiscoveryDetailFilter::Unsupported,
+                DiscoveryDetailFilter::MissingPairedFile,
+                DiscoveryDetailFilter::AmbiguousPlatform,
+                DiscoveryDetailFilter::InvalidContent,
+                DiscoveryDetailFilter::Archive,
+                DiscoveryDetailFilter::Disk,
+                DiscoveryDetailFilter::Tape,
+            ] {
+                if ui
+                    .selectable_label(
+                        state.filter == filter,
+                        discovery_detail_filter_label(filter),
+                    )
+                    .clicked()
+                    && state.filter != filter
+                {
+                    state.filter = filter;
+                    state.offset = 0;
+                }
+            }
+        });
+
+        let total = page.total_matching;
+        let showing_from = if total == 0 { 0 } else { page.offset + 1 };
+        let showing_to = page.offset + page.rows.len() as i64;
+        ui.label(format!(
+            "{} item{} - showing {}-{}",
+            format_count(total as usize),
+            if total == 1 { "" } else { "s" },
+            format_count(showing_from as usize),
+            format_count(showing_to as usize),
+        ));
+
+        ui.add_space(6.0);
+        // Bounded: exactly `page.rows.len()` widgets are ever built for one
+        // frame, however large `total` is - never one widget per item in
+        // the full result set.
+        egui::ScrollArea::vertical()
+            .max_height(420.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for row in &page.rows {
+                    let (tone, status) = status_tone_for_row(row);
+                    ui.horizontal(|ui| {
+                        widgets::status_badge(ui, &status, tone);
+                        ui.label(egui::RichText::new(discovery_detail_filename(row)).strong())
+                            .on_hover_text(row.path.display().to_string());
+                    });
+                    ui.label(
+                        egui::RichText::new(discovery_detail_kind_label(row))
+                            .color(theme::muted(ui)),
+                    );
+                    ui.add_space(6.0);
+                }
+            });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let has_previous = page.offset > 0;
+            if widgets::action_button(
+                ui,
+                "Previous",
+                widgets::ActionStyle::Secondary,
+                has_previous,
+            )
+            .clicked()
+                && has_previous
+            {
+                state.offset = (page.offset - page.limit).max(0);
+            }
+            let has_next = page.offset + (page.rows.len() as i64) < page.total_matching;
+            if widgets::action_button(ui, "Next", widgets::ActionStyle::Secondary, has_next)
+                .clicked()
+                && has_next
+            {
+                state.offset = page.offset + page.limit;
+            }
+        });
+
+        set_discovery_page_state(ui, state);
+    });
+}
+
+/// Opens a short-lived read-only connection and fetches exactly one page -
+/// this never holds a `Database` handle across frames, matching how other
+/// one-off GUI actions in this codebase already open the database
+/// synchronously for a single call (see e.g. the platform-assignment
+/// actions in `main.rs`). A bounded `LIMIT`/`OFFSET` query against the
+/// `(scan_run_id, id)` index stays fast even for a very large table, so
+/// this is safe to run on click rather than needing the heavier
+/// background-thread `Gathered` pattern the full library snapshot uses.
+fn fetch_discovery_page(
+    database_path: &Path,
+    run_id: i64,
+    offset: i64,
+    filter: DiscoveryDetailFilter,
+) -> Result<DiscoveryDetailsPage, String> {
+    let database = Database::open_read_only(database_path).map_err(|error| error.to_string())?;
+    database
+        .query_discovery_details(run_id, offset, DISCOVERY_PAGE_SIZE, filter)
+        .map_err(|error| error.to_string())
 }
 
 fn needs_attention_count(filter: NeedsAttentionFilter, skip: &SkipReasonCounts) -> usize {
@@ -685,7 +971,7 @@ mod tests {
         // Frame 1: the unfiltered view offers "View unknown items".
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_collection_discovery_panel(ui, Some(&summary));
+                show_collection_discovery_panel(ui, Some(&summary), None);
             });
         });
         assert!(rendered_text_contains(
@@ -708,7 +994,7 @@ mod tests {
         // (smaller) bounded sample actually listed.
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_collection_discovery_panel(ui, Some(&summary));
+                show_collection_discovery_panel(ui, Some(&summary), None);
             });
         });
         assert!(rendered_text_contains(&output, "mystery1.xyz"));
@@ -722,5 +1008,213 @@ mod tests {
             &output,
             "Show all item details instead"
         ));
+    }
+
+    // --- Paged Item details (persisted `discovery_details`) ------------------------------------
+
+    fn temp_gui_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "archivefs-gui-discovery-page-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Scans `count` synthetic unsupported-extension files into a fresh
+    /// database and returns `(database_path, run_id)`, exactly the shape
+    /// `show_collection_discovery_panel`'s `discovery_run` parameter wants.
+    fn scanned_database_with_n_items(name: &str, count: usize) -> (PathBuf, i64) {
+        let root = temp_gui_test_dir(name);
+        let source = root.join("roms");
+        std::fs::create_dir_all(&source).unwrap();
+        for index in 0..count {
+            std::fs::write(
+                source.join(format!("item{index:05}.xyz")),
+                format!("fixture {index}"),
+            )
+            .unwrap();
+        }
+        let database_path = root.join("library.sqlite3");
+        let config = archivefs_core::Config {
+            source_folders: vec![source],
+            mount_root: root.join("mount"),
+            ratarmount_bin: String::new(),
+            master_rom_root: None,
+        };
+        let mut database = archivefs_core::Database::open_or_create(&database_path).unwrap();
+        let summary = archivefs_core::scan_and_persist(&mut database, &config, "gui-test").unwrap();
+        database.close().unwrap();
+        (database_path, summary.scan_run_id)
+    }
+
+    fn minimal_summary_for(scan_run_id: i64, total_unsupported: usize) -> ScanPersistSummary {
+        let mut ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts::default();
+        ingestion_skip_reasons.unsupported_extension = total_unsupported;
+        ScanPersistSummary {
+            scan_run_id,
+            counts: archivefs_core::ScanRunCounts::default(),
+            folder_errors: Vec::new(),
+            platform_assignment_warnings: Vec::new(),
+            skipped_files: Vec::new(),
+            ingestion_stats: archivefs_core::ingestion::DiscoveryStats::default(),
+            ingestion_skip_reasons,
+            ingestion_platform_counts: std::collections::BTreeMap::new(),
+            ingestion_skipped: Vec::new(),
+            ingestion_recognised_sample: Vec::new(),
+        }
+    }
+
+    /// The exact filenames on one page, read directly from the database -
+    /// used as ground truth so these tests never have to assume the
+    /// filesystem walk's own order matches filename order.
+    fn expect_filenames(database_path: &Path, run_id: i64, offset: i64, limit: i64) -> Vec<String> {
+        let database = archivefs_core::Database::open_read_only(database_path).unwrap();
+        database
+            .query_discovery_details(run_id, offset, limit, DiscoveryDetailFilter::All)
+            .unwrap()
+            .rows
+            .iter()
+            .map(discovery_detail_filename)
+            .collect()
+    }
+
+    #[test]
+    fn paged_panel_shows_exact_total_and_current_range_not_a_representative_example() {
+        let (database_path, run_id) = scanned_database_with_n_items("total-and-range", 450);
+        let summary = minimal_summary_for(run_id, 450);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(
+                    ui,
+                    Some(&summary),
+                    Some((database_path.as_path(), run_id)),
+                );
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "450 items"));
+        assert!(rendered_text_contains(&output, "showing 1-200"));
+        assert!(
+            !rendered_text_contains(&output, "representative example"),
+            "a persisted, pageable run must never fall back to representative-example wording"
+        );
+    }
+
+    #[test]
+    fn persisted_details_remain_browseable_without_a_session_summary() {
+        let (database_path, run_id) = scanned_database_with_n_items("after-restart", 1);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(ui, None, Some((database_path.as_path(), run_id)));
+            });
+        });
+
+        assert!(rendered_text_contains(
+            &output,
+            "Showing details from the most recent completed scan."
+        ));
+        assert!(rendered_text_contains(&output, "1 item - showing 1-1"));
+        assert!(!rendered_text_contains(
+            &output,
+            "No scan has completed yet."
+        ));
+    }
+
+    #[test]
+    fn next_and_previous_only_change_which_page_is_shown() {
+        let (database_path, run_id) = scanned_database_with_n_items("next-previous", 450);
+        let summary = minimal_summary_for(run_id, 450);
+        let discovery_run = Some((database_path.as_path(), run_id));
+        let first_page_names = expect_filenames(&database_path, run_id, 0, DISCOVERY_PAGE_SIZE);
+        let second_page_names = expect_filenames(
+            &database_path,
+            run_id,
+            DISCOVERY_PAGE_SIZE,
+            DISCOVERY_PAGE_SIZE,
+        );
+        let first_only = &first_page_names[0];
+        let second_only = &second_page_names[0];
+        assert_ne!(first_only, second_only, "pages must not overlap");
+
+        let ctx = egui::Context::default();
+        let first_frame = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(ui, Some(&summary), discovery_run);
+            });
+        });
+        assert!(rendered_text_contains(&first_frame, "showing 1-200"));
+        assert!(rendered_text_contains(&first_frame, first_only));
+        assert!(!rendered_text_contains(&first_frame, second_only));
+
+        // Simulate the "Next" click exactly as the button handler does.
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut state = discovery_page_state(ui, run_id);
+                state.offset += DISCOVERY_PAGE_SIZE;
+                set_discovery_page_state(ui, state);
+            });
+        });
+        let _ = output;
+
+        let second_frame = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(ui, Some(&summary), discovery_run);
+            });
+        });
+        assert!(rendered_text_contains(&second_frame, "showing 201-400"));
+        // The total and filter set are unaffected by paging - only the
+        // visible range and rows changed.
+        assert!(rendered_text_contains(&second_frame, "450 items"));
+        assert!(rendered_text_contains(&second_frame, second_only));
+        assert!(!rendered_text_contains(&second_frame, first_only));
+    }
+
+    #[test]
+    fn a_huge_result_set_never_renders_more_than_one_pages_worth_of_rows() {
+        let total = (DISCOVERY_PAGE_SIZE as usize) * 30;
+        let (database_path, run_id) = scanned_database_with_n_items("huge-result", total);
+        let summary = minimal_summary_for(run_id, total);
+        let first_page_names = expect_filenames(&database_path, run_id, 0, DISCOVERY_PAGE_SIZE);
+        let last_page_names = expect_filenames(
+            &database_path,
+            run_id,
+            total as i64 - DISCOVERY_PAGE_SIZE,
+            DISCOVERY_PAGE_SIZE,
+        );
+        let on_first_page = &first_page_names[0];
+        let only_on_last_page = last_page_names
+            .iter()
+            .find(|name| !first_page_names.contains(name))
+            .expect("a 6,000-item result has names outside its own first page");
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_collection_discovery_panel(
+                    ui,
+                    Some(&summary),
+                    Some((database_path.as_path(), run_id)),
+                );
+            });
+        });
+
+        assert!(rendered_text_contains(
+            &output,
+            &format!("{} items", format_count(total))
+        ));
+        // Only the first page's worth of filenames were ever rendered as
+        // widgets - the rest of a 6,000-item result never became egui
+        // shapes at all.
+        assert!(rendered_text_contains(&output, on_first_page));
+        assert!(!rendered_text_contains(&output, only_on_last_page));
     }
 }
