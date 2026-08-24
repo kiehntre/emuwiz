@@ -53,3 +53,4 @@ pub mod rom_organisation;
 pub mod set;
 pub mod sources;
 pub mod trusted_dtd;
+pub mod updates;

@@ -74,6 +74,36 @@ impl DatSourceKind {
     }
 }
 
+/// Who owns the bytes behind a DAT source input.
+///
+/// This is intentionally explicit.  In particular, a path, display name,
+/// free-text origin, URL-looking origin, or parsed DAT header can never turn a
+/// user-selected source into an EmuWiz-managed one.  A future updater must
+/// additionally prove that a managed entry's snapshot is represented by the
+/// typed state in [`crate::dat::updates`]; this enum alone is not replacement
+/// authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatSourceOwnership {
+    /// A path selected or registered by the user.  It is never updateable by
+    /// EmuWiz's managed-DAT updater.
+    #[default]
+    UserLocal,
+    /// A read-only projection of a snapshot held below EmuWiz's managed DAT
+    /// root and bound to typed managed-source state.
+    EmuWizManaged,
+}
+
+impl DatSourceOwnership {
+    pub fn is_user_local(self) -> bool {
+        matches!(self, Self::UserLocal)
+    }
+
+    pub fn is_emuwiz_managed(self) -> bool {
+        matches!(self, Self::EmuWizManaged)
+    }
+}
+
 /// A new DAT source's priority.
 ///
 /// DAT priority is *platform-local*: it is only ever compared against other DAT
@@ -263,6 +293,19 @@ impl DatSourceEntry {
         self.platform
             .as_ref()
             .is_none_or(|id| crate::canonical_platform_for_alias(id).is_some())
+    }
+
+    /// All entries in the user-editable DAT registry are user-local sources.
+    ///
+    /// Managed snapshots are kept in separate typed state and exposed through
+    /// [`crate::dat::updates::ManagedDatReadOnlySource`], rather than granting
+    /// special authority to a hand-editable registry entry.
+    pub fn ownership(&self) -> DatSourceOwnership {
+        DatSourceOwnership::UserLocal
+    }
+
+    pub fn is_user_local(&self) -> bool {
+        self.ownership().is_user_local()
     }
 }
 
