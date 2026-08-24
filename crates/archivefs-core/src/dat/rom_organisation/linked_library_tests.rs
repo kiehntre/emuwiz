@@ -22,20 +22,6 @@ fn no_cancel() -> AtomicBool {
     AtomicBool::new(false)
 }
 
-/// Slug mapping including Atari 2600 (canonical registry platform with the
-/// `atari2600` RomM folder alias), so the lifecycle proof uses a generic
-/// platform end to end.
-fn slug_for_platform(platform: &str) -> Option<String> {
-    Some(
-        match platform {
-            "Atari2600" => "atari2600",
-            "PSP" => "psp",
-            _ => return None,
-        }
-        .to_string(),
-    )
-}
-
 fn resolved(platform: &str) -> PlatformIdentityResolution {
     PlatformIdentityResolution::Resolved {
         generation: 1,
@@ -75,7 +61,6 @@ fn plan_for(library_root: &Path, candidates: &[OrganisationCandidate]) -> Organi
         mode: OrganisationMode::BuildLinkedLibrary,
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates,
-        slug_for_platform: &slug_for_platform,
         generation: 1,
     })
 }
@@ -188,7 +173,7 @@ fn a_regular_source_plans_a_canonical_destination_under_the_library_root() {
     assert_eq!(entry.mode, OrganisationMode::BuildLinkedLibrary);
     assert_eq!(
         entry.destination_path,
-        fx.library_root.join("atari2600").join("Combat (USA).bin")
+        fx.library_root.join("Atari 2600").join("Combat (USA).bin")
     );
 }
 
@@ -259,7 +244,6 @@ fn existing_move_mode_still_emits_rename_move_operations() {
         mode: OrganisationMode::MoveRealFile,
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates: std::slice::from_ref(&candidate),
-        slug_for_platform: &slug_for_platform,
         generation: 1,
     });
     let approved = approved_of(&[&source]);
@@ -290,7 +274,7 @@ fn apply_creates_the_link_and_leaves_the_source_untouched() {
     let approved = approved_of(&[&source]);
     let outcome = apply_plan(&plan, &approved, &fx.journal_dir);
 
-    let destination = fx.library_root.join("atari2600").join("Combat (USA).bin");
+    let destination = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
     let metadata = std::fs::symlink_metadata(&destination).unwrap();
     assert!(metadata.file_type().is_symlink());
     assert_eq!(std::fs::read_link(&destination).unwrap(), source);
@@ -309,8 +293,8 @@ fn an_exact_existing_link_is_already_present_and_excluded_from_the_transaction()
     let fx = Fixture::new("noop");
     let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
     // Pre-create the exact link the mode would create.
-    std::fs::create_dir_all(fx.library_root.join("atari2600")).unwrap();
-    let destination = fx.library_root.join("atari2600").join("Combat (USA).bin");
+    std::fs::create_dir_all(fx.library_root.join("Atari 2600")).unwrap();
+    let destination = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
     std::os::unix::fs::symlink(&source, &destination).unwrap();
 
     let plan = plan_for(
@@ -324,7 +308,7 @@ fn an_exact_existing_link_is_already_present_and_excluded_from_the_transaction()
     assert!(plan.suggested().next().is_none());
     // The pre-existing link was not touched.
     assert_eq!(
-        std::fs::read_link(fx.library_root.join("atari2600").join("Combat (USA).bin")).unwrap(),
+        std::fs::read_link(fx.library_root.join("Atari 2600").join("Combat (USA).bin")).unwrap(),
         fx.source_tree.join("Combat.bin")
     );
 }
@@ -334,8 +318,8 @@ fn a_wrong_target_link_regular_file_or_directory_at_the_destination_conflicts() 
     let fx = Fixture::new("conflict");
     let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
     write_source(&fx.source_tree, "other.bin", b"other");
-    std::fs::create_dir_all(fx.library_root.join("atari2600")).unwrap();
-    let destination = fx.library_root.join("atari2600").join("Combat (USA).bin");
+    std::fs::create_dir_all(fx.library_root.join("Atari 2600")).unwrap();
+    let destination = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
 
     // Wrong-target link.
     std::os::unix::fs::symlink(fx.source_tree.join("other.bin"), &destination).unwrap();
@@ -413,7 +397,7 @@ fn a_changed_source_after_preview_blocks_apply() {
     // Nothing was created.
     assert!(
         !fx.library_root
-            .join("atari2600")
+            .join("Atari 2600")
             .join("Combat (USA).bin")
             .exists()
     );
@@ -474,7 +458,7 @@ fn an_unsafe_destination_ancestry_blocks_apply() {
     std::fs::create_dir_all(&plan.master_root).unwrap();
     // Replace the would-be platform directory with a symlink to elsewhere.
     let elsewhere = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), fx.library_root.join("atari2600")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), fx.library_root.join("Atari 2600")).unwrap();
 
     let trusted = TrustedRoots::from_paths([
         std::fs::canonicalize(&plan.master_root).unwrap(),
@@ -517,7 +501,7 @@ fn safe_platform_directories_are_created_and_owned() {
 
     // The platform directory was created by this transaction and recorded as
     // owned.
-    assert!(fx.library_root.join("atari2600").is_dir());
+    assert!(fx.library_root.join("Atari 2600").is_dir());
     assert_eq!(outcome.transaction.created_directories.len(), 1);
 }
 
@@ -535,7 +519,7 @@ fn rollback_removes_the_created_link_but_never_touches_the_source() {
     );
     let approved = approved_of(&[&source]);
     apply_plan(&plan, &approved, &fx.journal_dir);
-    let destination = fx.library_root.join("atari2600").join("Combat (USA).bin");
+    let destination = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
     assert!(std::fs::symlink_metadata(&destination).is_ok());
 
     // Recover the journalled transaction (as History & Rollback would) and
@@ -569,9 +553,9 @@ fn rollback_preserves_pre_existing_directories_and_exact_links() {
     let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
     // A PRE-EXISTING platform directory and a PRE-EXISTING exact link for a
     // second game that this apply never touches.
-    std::fs::create_dir_all(fx.library_root.join("atari2600")).unwrap();
+    std::fs::create_dir_all(fx.library_root.join("Atari 2600")).unwrap();
     let other = write_source(&fx.source_tree, "Pitfall.bin", b"pitfall");
-    let other_link = fx.library_root.join("atari2600").join("Pitfall.bin");
+    let other_link = fx.library_root.join("Atari 2600").join("Pitfall.bin");
     std::os::unix::fs::symlink(&other, &other_link).unwrap();
 
     let candidates = vec![
@@ -585,7 +569,7 @@ fn rollback_preserves_pre_existing_directories_and_exact_links() {
     let approved = approved_of(&[&source]);
     apply_plan(&plan, &approved, &fx.journal_dir);
 
-    let created_link = fx.library_root.join("atari2600").join("Combat (USA).bin");
+    let created_link = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
     assert!(std::fs::symlink_metadata(&created_link).is_ok());
 
     let (mut transactions, _) = crate::dat::rename_apply::journal::list_journals(&fx.journal_dir);
@@ -603,7 +587,7 @@ fn rollback_preserves_pre_existing_directories_and_exact_links() {
     // ...the pre-existing exact link survives untouched...
     assert_eq!(std::fs::read_link(&other_link).unwrap(), other);
     // ...and the pre-existing directory is never removed.
-    assert!(fx.library_root.join("atari2600").is_dir());
+    assert!(fx.library_root.join("Atari 2600").is_dir());
     assert_eq!(std::fs::read(&source).unwrap(), b"combat");
     assert_eq!(std::fs::read(&other).unwrap(), b"pitfall");
     let _ = result;
@@ -623,7 +607,7 @@ fn rollback_refuses_a_changed_target_link() {
     );
     let approved = approved_of(&[&source]);
     apply_plan(&plan, &approved, &fx.journal_dir);
-    let destination = fx.library_root.join("atari2600").join("Combat (USA).bin");
+    let destination = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
 
     // Someone repoints the link after the transaction created it.
     std::fs::remove_file(&destination).unwrap();

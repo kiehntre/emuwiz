@@ -27,22 +27,8 @@ fn cancelled() -> AtomicBool {
     AtomicBool::new(true)
 }
 
-/// The canonical RomM slug mapping a caller would derive from the imported
-/// RomM identity cache. Folder names come from here, never from display text.
-fn slug_for_platform(platform: &str) -> Option<String> {
-    Some(
-        match platform {
-            "PSP" => "psp",
-            "Xbox360" => "xbox360",
-            "Nintendo DS" => "nds",
-            "Switch" => "switch",
-            "GameCube" => "gamecube",
-            "Wii" => "wii",
-            _ => return None,
-        }
-        .to_string(),
-    )
-}
+/// No RomM mapping is available at all in these fixtures: generic
+/// organisation must not need one.
 
 fn resolved(platform: &str, source: PlatformIdentitySource) -> PlatformIdentityResolution {
     PlatformIdentityResolution::Resolved {
@@ -76,6 +62,17 @@ fn candidate(
     }
 }
 
+fn candidate_with_name(
+    dir: &Path,
+    name: &str,
+    canonical_name: &str,
+    resolution: PlatformIdentityResolution,
+) -> OrganisationCandidate {
+    let mut cand = candidate(dir, name, resolution);
+    cand.canonical_name = Some(canonical_name.to_string());
+    cand
+}
+
 fn plan_for(
     master_root: &Path,
     mode: OrganisationMode,
@@ -87,7 +84,6 @@ fn plan_for(
         mode,
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates,
-        slug_for_platform: &slug_for_platform,
         generation,
     })
 }
@@ -157,18 +153,24 @@ fn psp_identity_proposes_master_root_psp_name() {
     assert_eq!(entry.status, OrganisationStatus::Suggested);
     assert_eq!(
         entry.destination_path,
-        master.join("psp").join("Lumines.iso")
+        master.join("Sony PlayStation Portable").join("Lumines.iso")
     );
-    assert_eq!(entry.slug.as_deref(), Some("psp"));
+    assert_eq!(
+        entry.layout_folder.as_deref(),
+        Some("Sony PlayStation Portable")
+    );
+    // Generic organisation never consults RomM: the mapping fact stays empty.
+    assert_eq!(entry.slug.as_deref(), None);
 }
 
 #[test]
-fn canonical_slug_is_used_not_the_display_label() {
+fn neutral_registry_folder_is_used_without_any_romm_mapping() {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
     let source = dir.path().join("library");
     std::fs::create_dir_all(&source).unwrap();
-    // The display name is "Sony PlayStation Portable"; the slug must be "psp".
+    // The registry display name is "Sony PlayStation Portable"; generic
+    // organisation uses it directly, with no RomM cache in sight.
     let cand = candidate(
         &source,
         "Game.iso",
@@ -182,12 +184,12 @@ fn canonical_slug_is_used_not_the_display_label() {
             .unwrap()
             .file_name()
             .unwrap(),
-        "psp"
+        "Sony PlayStation Portable"
     );
 }
 
 #[test]
-fn verified_dat_and_manual_and_romm_all_map_to_the_same_slug() {
+fn verified_dat_and_manual_and_romm_all_map_to_the_same_neutral_folder() {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
     let source = dir.path().join("library");
@@ -207,8 +209,8 @@ fn verified_dat_and_manual_and_romm_all_map_to_the_same_slug() {
                 .unwrap()
                 .file_name()
                 .unwrap(),
-            "psp",
-            "provenance {source_kind:?} must use the same canonical slug"
+            "Sony PlayStation Portable",
+            "provenance {source_kind:?} must use the same neutral EmuWiz folder"
         );
         assert_eq!(
             plan.entries[0].platform_source,
@@ -252,27 +254,27 @@ fn platform_conflict_is_blocked() {
 }
 
 #[test]
-fn missing_slug_mapping_is_unsupported() {
+fn missing_romm_mapping_does_not_block_generic_organisation() {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
     let source = dir.path().join("library");
     std::fs::create_dir_all(&source).unwrap();
+    // Atari 2600 has no RomM slug mapping anywhere in this fixture - and no
+    // RomM cache is even constructed. Generic organisation must still work,
+    // using the neutral EmuWiz registry folder.
     let cand = candidate(
         &source,
-        "Game.iso",
+        "Game.bin",
         resolved("Atari2600", PlatformIdentitySource::Romm),
     );
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
-    assert_eq!(plan.entries[0].status, OrganisationStatus::Unsupported);
-    assert!(
-        plan.entries[0]
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("slug"),
-        "{:?}",
-        plan.entries[0].reason
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        master.join("Atari 2600").join("Game.bin")
     );
+    assert_eq!(plan.entries[0].layout_folder.as_deref(), Some("Atari 2600"));
+    assert_eq!(plan.entries[0].slug.as_deref(), None);
 }
 
 #[test]
@@ -299,7 +301,7 @@ fn rename_in_place_stays_in_the_current_directory() {
         "rename in place must stay in the source directory"
     );
     assert!(
-        entry.slug.is_none(),
+        entry.layout_folder.is_none(),
         "rename in place needs no platform folder"
     );
 }
@@ -318,7 +320,7 @@ fn move_mode_proposes_the_canonical_directory() {
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(
         plan.entries[0].destination_path,
-        master.join("nds").join("Game.nds")
+        master.join("Nintendo DS").join("Game.nds")
     );
 }
 
@@ -326,7 +328,7 @@ fn move_mode_proposes_the_canonical_directory() {
 fn already_organised_is_detected() {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
-    let organised = master.join("psp");
+    let organised = master.join("Sony PlayStation Portable");
     std::fs::create_dir_all(&organised).unwrap();
     let cand = candidate(
         &organised,
@@ -353,7 +355,7 @@ fn existing_destination_is_a_conflict() {
         resolved("PSP", PlatformIdentitySource::Romm),
     );
     // The destination already exists.
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::create_dir_all(&psp).unwrap();
     std::fs::write(psp.join("Game.iso"), b"taken").unwrap();
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
@@ -371,7 +373,7 @@ fn case_only_destination_is_a_conflict() {
         "Game.iso",
         resolved("PSP", PlatformIdentitySource::Romm),
     );
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::create_dir_all(&psp).unwrap();
     std::fs::write(psp.join("game.iso"), b"case twin").unwrap();
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
@@ -425,7 +427,7 @@ fn planning_creates_no_directories_and_changes_nothing() {
     let _ = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert!(!master.exists(), "planning must not create the master root");
     assert!(
-        !master.join("psp").exists(),
+        !master.join("Sony PlayStation Portable").exists(),
         "planning must not create the platform directory"
     );
     assert_eq!(collect_tree(dir.path()), before, "planning changes nothing");
@@ -479,7 +481,7 @@ fn same_filesystem_real_file_move_succeeds_and_preserves_content() {
         crate::dat::rename_apply::TransactionState::Applied
     );
     assert!(!cand.source_path.exists(), "source moved away");
-    let dest = master.join("psp").join("Game.iso");
+    let dest = master.join("Sony PlayStation Portable").join("Game.iso");
     assert!(dest.exists());
     assert_eq!(std::fs::read(&dest).unwrap(), b"fixture contents");
 }
@@ -512,9 +514,16 @@ fn rollback_restores_original_path_and_content() {
         std::fs::read(&cand.source_path).unwrap(),
         b"fixture contents"
     );
-    assert!(!master.join("psp").join("Game.iso").exists());
     assert!(
-        rollback.directories_removed.contains(&master.join("psp")),
+        !master
+            .join("Sony PlayStation Portable")
+            .join("Game.iso")
+            .exists()
+    );
+    assert!(
+        rollback
+            .directories_removed
+            .contains(&master.join("Sony PlayStation Portable")),
         "the created platform directory is removed when empty: {:?}",
         rollback.directories_removed
     );
@@ -639,7 +648,7 @@ fn apply_creates_only_the_canonical_platform_directory() {
     std::fs::create_dir_all(&journal).unwrap();
     let cancel = no_cancel();
     let _ = apply_plan(&plan, &approved_of(&[&cand.source_path]), &journal, &cancel);
-    assert!(master.join("psp").is_dir());
+    assert!(master.join("Sony PlayStation Portable").is_dir());
     let children: Vec<String> = std::fs::read_dir(&master)
         .unwrap()
         .flatten()
@@ -647,7 +656,7 @@ fn apply_creates_only_the_canonical_platform_directory() {
         .collect();
     assert_eq!(
         children,
-        vec!["psp"],
+        vec!["Sony PlayStation Portable"],
         "only the canonical platform dir is created"
     );
 }
@@ -659,7 +668,7 @@ fn rollback_never_removes_a_pre_existing_directory() {
     let source = dir.path().join("library");
     std::fs::create_dir_all(&source).unwrap();
     // The platform directory already exists and contains a user file.
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::create_dir_all(&psp).unwrap();
     std::fs::write(psp.join("user-note.txt"), b"mine").unwrap();
 
@@ -699,7 +708,7 @@ fn rollback_never_removes_a_pre_existing_directory() {
     );
     assert_eq!(std::fs::read(psp.join("user-note.txt")).unwrap(), b"mine");
     assert!(
-        !master.join("switch").exists(),
+        !master.join("Nintendo Switch").exists(),
         "the created dir is removed"
     );
 }
@@ -751,7 +760,10 @@ fn source_identity_changed_is_rejected_at_apply() {
         std::fs::read(&cand.source_path).unwrap(),
         b"different bytes"
     );
-    assert!(!master.join("psp").exists(), "no mutation happened");
+    assert!(
+        !master.join("Sony PlayStation Portable").exists(),
+        "no mutation happened"
+    );
 }
 
 #[test]
@@ -778,7 +790,7 @@ fn destination_created_after_preview_is_rejected_at_apply() {
     let mut tx = build_organisation_transaction(&plan, &approved_of(&[&cand.source_path]), 1)
         .expect("build");
     // The destination file appears after the preview.
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::create_dir_all(&psp).unwrap();
     std::fs::write(psp.join("Game.iso"), b"sneaky").unwrap();
     let mut trusted_roots = vec![std::fs::canonicalize(&master).unwrap_or(master.clone())];
@@ -888,7 +900,7 @@ fn symlink_object_move_preserves_the_target_text_and_never_dereferences() {
         outcome.transaction.state,
         crate::dat::rename_apply::TransactionState::Applied
     );
-    let moved = master.join("psp").join("Game.iso");
+    let moved = master.join("Sony PlayStation Portable").join("Game.iso");
     assert!(moved.symlink_metadata().is_ok(), "the link object moved");
     assert_eq!(
         std::fs::read_link(&moved).unwrap(),
@@ -968,7 +980,7 @@ fn broken_symlink_object_may_be_moved_with_target_text_preserved() {
         outcome.transaction.state,
         crate::dat::rename_apply::TransactionState::Applied
     );
-    let moved = master.join("psp").join("Game.iso");
+    let moved = master.join("Sony PlayStation Portable").join("Game.iso");
     assert_eq!(
         std::fs::read_link(&moved).unwrap(),
         dir.path().join("nowhere.bin")
@@ -1053,11 +1065,14 @@ fn cancellation_before_first_mutation_moves_nothing() {
     assert!(result.is_err());
     assert!(cand.source_path.exists());
     assert!(
-        !master.join("psp").exists(),
+        !master.join("Sony PlayStation Portable").exists(),
         "no platform directory was created"
     );
     assert!(
-        !master.join("psp").join("Game.iso").exists(),
+        !master
+            .join("Sony PlayStation Portable")
+            .join("Game.iso")
+            .exists(),
         "no file was moved"
     );
 }
@@ -1119,7 +1134,9 @@ fn a_verified_canonical_name_produces_the_canonical_destination_filename() {
     assert_eq!(entry.status, OrganisationStatus::Suggested);
     assert_eq!(
         entry.destination_path,
-        master.join("psp").join("Game (Europe).iso"),
+        master
+            .join("Sony PlayStation Portable")
+            .join("Game (Europe).iso"),
         "the canonical name must drive the destination filename"
     );
 }
@@ -1174,7 +1191,7 @@ fn move_mode_uses_the_canonical_filename() {
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(
         plan.entries[0].destination_path,
-        master.join("nds").join("Sonic Rush (Europe).nds")
+        master.join("Nintendo DS").join("Sonic Rush (Europe).nds")
     );
 }
 
@@ -1196,7 +1213,9 @@ fn no_canonical_evidence_falls_back_to_the_source_basename() {
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(
         plan.entries[0].destination_path,
-        master.join("psp").join("Game_ugly.iso"),
+        master
+            .join("Sony PlayStation Portable")
+            .join("Game_ugly.iso"),
         "without a canonical name the existing basename is preserved"
     );
 }
@@ -1233,7 +1252,7 @@ fn a_pre_existing_empty_platform_directory_is_never_recorded_as_owned() {
     let master = dir.path().join("roms");
     std::fs::create_dir_all(&master).unwrap();
     // The platform directory already exists (empty).
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::create_dir(&psp).unwrap();
     let source = dir.path().join("library");
     std::fs::create_dir_all(&source).unwrap();
@@ -1291,7 +1310,7 @@ fn a_newly_created_platform_directory_is_recorded_as_owned_and_removed_when_empt
     std::fs::create_dir_all(&journal).unwrap();
     let cancel = no_cancel();
     let outcome = apply_plan(&plan, &approved_of(&[&cand.source_path]), &journal, &cancel);
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     assert!(
         outcome.transaction.created_directories.contains(&psp),
         "a directory this apply created must be recorded as owned"
@@ -1338,7 +1357,7 @@ fn two_files_sharing_one_created_platform_directory_own_it_once() {
         &journal,
         &cancel,
     );
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     let owned = outcome
         .transaction
         .created_directories
@@ -1375,7 +1394,7 @@ fn partial_rollback_leaves_a_non_empty_directory_in_place() {
     let cancel = no_cancel();
     let outcome = apply_plan(&plan, &approved_of(&[&cand.source_path]), &journal, &cancel);
     // A user file appears in the created directory after apply.
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::write(psp.join("user-note.txt"), b"mine").unwrap();
     let mut tx = outcome.transaction;
     let rollback = rollback_organisation_transaction(&mut tx, &journal, &cancel, &master).unwrap();
@@ -1423,7 +1442,7 @@ fn a_crash_between_create_dir_and_ownership_journal_is_conservative() {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
     std::fs::create_dir_all(&master).unwrap();
-    let psp = master.join("psp");
+    let psp = master.join("Sony PlayStation Portable");
     std::fs::create_dir(&psp).unwrap();
     let source = dir.path().join("library");
     std::fs::create_dir_all(&source).unwrap();
@@ -1525,7 +1544,10 @@ fn a_platform_changed_by_another_process_rejects_the_stale_apply() {
         1,
     );
     assert_eq!(plan.entries[0].platform.as_deref(), Some("PSP"));
-    assert_eq!(plan.entries[0].slug.as_deref(), Some("psp"));
+    assert_eq!(
+        plan.entries[0].layout_folder.as_deref(),
+        Some("Sony PlayStation Portable")
+    );
 
     // Another EmuWiz process changes PSP -> PS1 after planning.
     let archive_id = db
@@ -1536,16 +1558,14 @@ fn a_platform_changed_by_another_process_rejects_the_stale_apply() {
     drop(db);
 
     let master = dir.path().join("roms");
-    let error = revalidate_organisation_plan(
-        &plan,
-        &dir.path().join("test.db"),
-        &|_| None,
-        &slug_for_platform,
-    )
-    .unwrap_err();
+    let error =
+        revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &|_| None).unwrap_err();
     assert!(error.contains("changed"), "{error}");
     assert!(source_file.exists(), "zero mutation");
-    assert!(!master.join("psp").exists(), "zero mutation");
+    assert!(
+        !master.join("Sony PlayStation Portable").exists(),
+        "zero mutation"
+    );
 }
 
 #[test]
@@ -1574,18 +1594,13 @@ fn a_resolved_identity_becoming_unresolvable_is_rejected() {
     db.assign_platform(archive_id, Some("not-a-registered-platform"), "romm")
         .unwrap();
     drop(db);
-    let error = revalidate_organisation_plan(
-        &plan,
-        &dir.path().join("test.db"),
-        &|_| None,
-        &slug_for_platform,
-    )
-    .unwrap_err();
+    let error =
+        revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &|_| None).unwrap_err();
     assert!(error.contains("changed"), "{error}");
 }
 
 #[test]
-fn a_changed_slug_mapping_is_rejected() {
+fn a_changed_romm_mapping_does_not_invalidate_a_generic_plan() {
     let dir = tempfile::tempdir().unwrap();
     let source_dir = dir.path().join("library");
     std::fs::create_dir_all(&source_dir).unwrap();
@@ -1600,19 +1615,24 @@ fn a_changed_slug_mapping_is_rejected() {
         OrganisationMode::MoveRealFile,
         1,
     );
-    assert_eq!(plan.entries[0].slug.as_deref(), Some("psp"));
+    assert_eq!(
+        plan.entries[0].layout_folder.as_deref(),
+        Some("Sony PlayStation Portable")
+    );
 
-    // The slug mapping changes: PSP now maps to "psp-portable".
+    // A RomM mapping change is a RomM-specific fact. Generic plans derive
+    // destinations from the neutral EmuWiz folder, so revalidation must NOT
+    // consult any RomM mapping and must still accept the plan.
     let changed_slug = |platform: &str| -> Option<String> {
-        Some(match platform {
-            "PSP" => "psp-portable".to_string(),
-            other => slug_for_platform(other).unwrap_or_default(),
-        })
+        if platform == "PSP" {
+            Some("psp-portable".to_string())
+        } else {
+            None
+        }
     };
-    let error =
-        revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &|_| None, &changed_slug)
-            .unwrap_err();
-    assert!(error.contains("changed"), "{error}");
+    let _ = changed_slug; // the new revalidate signature takes no slug source
+    revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &|_| None)
+        .expect("a generic plan is not affected by a RomM mapping change");
 }
 
 #[test]
@@ -1637,7 +1657,9 @@ fn a_changed_canonical_name_is_rejected_when_the_destination_changes() {
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(
         plan.entries[0].destination_path,
-        master.join("psp").join("Game (Europe).iso")
+        master
+            .join("Sony PlayStation Portable")
+            .join("Game (Europe).iso")
     );
 
     // The authoritative canonical name changes between plan and apply.
@@ -1648,13 +1670,8 @@ fn a_changed_canonical_name_is_rejected_when_the_destination_changes() {
             None
         }
     };
-    let error = revalidate_organisation_plan(
-        &plan,
-        &dir.path().join("test.db"),
-        &changed_name,
-        &slug_for_platform,
-    )
-    .unwrap_err();
+    let error = revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &changed_name)
+        .unwrap_err();
     assert!(error.contains("changed"), "{error}");
 }
 
@@ -1675,13 +1692,8 @@ fn an_unchanged_live_identity_passes_revalidation() {
         1,
     );
     drop(db);
-    revalidate_organisation_plan(
-        &plan,
-        &dir.path().join("test.db"),
-        &|_| None,
-        &slug_for_platform,
-    )
-    .expect("an unchanged live identity must pass");
+    revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &|_| None)
+        .expect("an unchanged live identity must pass");
 }
 
 #[test]
@@ -1704,7 +1716,6 @@ fn games_only_organisation_blocks_unknown_without_mutation() {
         mode: OrganisationMode::MoveRealFile,
         content_policy: ContentSelectionPolicy::GamesOnly,
         candidates: &[candidate],
-        slug_for_platform: &slug_for_platform,
         generation: 1,
     });
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
@@ -1749,9 +1760,129 @@ fn games_only_organisation_allows_confirmed_game_classes() {
             mode: OrganisationMode::MoveRealFile,
             content_policy: ContentSelectionPolicy::GamesOnly,
             candidates: &[candidate],
-            slug_for_platform: &slug_for_platform,
             generation: 1,
         });
         assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Neutral EmuWiz platform layout identity (RomM-independent organisation)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn neutral_platform_layout_identity_is_stable_safe_and_romm_independent() {
+    // Atari 2600's registry display name is the layout folder.
+    assert_eq!(
+        crate::platform::canonical_layout_folder("Atari2600"),
+        Some("Atari 2600".to_string())
+    );
+    // Deterministic: pure registry lookup, no cache, no I/O, no RomM.
+    assert_eq!(
+        crate::platform::canonical_layout_folder("Atari2600"),
+        crate::platform::canonical_layout_folder("Atari2600")
+    );
+    // Safe as a single path component.
+    let folder = crate::platform::canonical_layout_folder("Atari2600").unwrap();
+    assert!(!folder.is_empty());
+    assert!(!folder.contains(['/', '\\', '\0']));
+    assert_eq!(folder.trim(), folder);
+    // An unregistered id has no invented identity.
+    assert_eq!(
+        crate::platform::canonical_layout_folder("not-a-platform"),
+        None
+    );
+}
+
+#[test]
+fn rename_in_place_needs_no_romm_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate_with_name(
+        &source,
+        "Combat.bin",
+        "Combat (USA).bin",
+        resolved("Atari2600", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(&master, OrganisationMode::RenameInPlace, &[cand], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    assert!(plan.entries[0].layout_folder.is_none());
+}
+
+#[test]
+fn build_linked_library_plans_without_any_romm_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("emuwiz-library");
+    let source = dir.path().join("sources");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate(
+        &source,
+        "Combat.bin",
+        resolved("Atari2600", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(&library, OrganisationMode::BuildLinkedLibrary, &[cand], 1);
+    let entry = &plan.entries[0];
+    assert_eq!(entry.status, OrganisationStatus::Suggested);
+    assert_eq!(
+        entry.destination_path,
+        library.join("Atari 2600").join("Combat.bin")
+    );
+    assert_eq!(entry.layout_folder.as_deref(), Some("Atari 2600"));
+}
+
+#[test]
+fn romm_specific_resolution_still_fails_honestly_when_mapping_is_missing() {
+    // Pick a canonical platform whose PRODUCTION RomM resolution is honestly
+    // unmapped (no override, no live cache, not in the vetted table).
+    let unmapped: Vec<&str> = crate::platform_evidence_fusion::romm_platform_mapping::static_coverage_by_status()
+        .get(&crate::platform_evidence_fusion::romm_platform_mapping::RommMappingSupportStatus::Unmapped)
+        .cloned()
+        .unwrap_or_default();
+    let Some(platform_id) = unmapped.first() else {
+        // Every platform happens to be mapped: the honesty claim is vacuous
+        // but not violated.
+        return;
+    };
+    let overrides = crate::library_views::FrontendPlatformMapping::default();
+    assert_eq!(
+        crate::platform_evidence_fusion::romm_platform_mapping::production_romm_slug(
+            platform_id,
+            &overrides,
+            None
+        ),
+        None,
+        "the RomM-specific resolver must keep refusing an unmapped platform"
+    );
+    assert_eq!(
+        crate::platform_evidence_fusion::romm_platform_mapping::production_romm_status(
+            platform_id,
+            &overrides,
+            None
+        ),
+        crate::platform_evidence_fusion::romm_platform_mapping::RommMappingSupportStatus::Unmapped
+    );
+
+    // The SAME platform organises fine generically: neutral identity, no RomM.
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate(
+        &source,
+        "Game.bin",
+        resolved(platform_id, PlatformIdentitySource::Manual),
+    );
+    let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    let expected_folder =
+        crate::platform::canonical_layout_folder(platform_id).expect("neutral folder");
+    assert_eq!(
+        plan.entries[0]
+            .destination_path
+            .parent()
+            .map(Path::to_path_buf),
+        Some(master.join(&expected_folder))
+    );
 }

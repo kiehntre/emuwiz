@@ -77,8 +77,8 @@ pub enum OrganisationStatus {
     /// The file cannot be organised (unknown/conflicted platform, unsafe
     /// name, wrong object kind for the mode, ...).
     Blocked,
-    /// The feature does not support this case safely (missing RomM slug
-    /// mapping, cross-filesystem move, directory source, ...).
+    /// The feature does not support this case safely (cross-filesystem move,
+    /// directory source, ...).
     Unsupported,
 }
 
@@ -107,7 +107,16 @@ pub struct OrganisationPlanEntry {
     /// "Manual", "Existing game identity", ...
     pub platform_source: String,
     /// The canonical RomM-compatible platform slug, when a mapping exists.
+    /// This is a *RomM-specific fact*: it is only populated by the explicit
+    /// RomM-specific frontend-layout workflows (see
+    /// `platform_evidence_fusion::romm_platform_mapping`) and is never
+    /// required by - or consulted during - generic organisation.
     pub slug: Option<String>,
+    /// The neutral EmuWiz layout folder for the platform, derived from the
+    /// canonical platform registry (`platform::canonical_layout_folder`).
+    /// Generic organisation destinations are `master_root/<layout_folder>/`.
+    #[serde(default)]
+    pub layout_folder: Option<String>,
     pub mode: OrganisationMode,
     pub content_classification: Option<DatContentClassification>,
     pub original_metadata: DatOriginalMetadata,

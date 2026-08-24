@@ -8,11 +8,11 @@
 //! # Platform safety
 //!
 //! A candidate may only be Suggested when its platform is resolved strongly
-//! enough: a manual assignment, verified DAT evidence, a canonical RomM
-//! mapping, or an accepted strong identity. Unknown platforms, platform
-//! conflicts and missing canonical/RomM slug mappings are never organised
+//! enough: a manual assignment, verified DAT evidence, or an accepted strong
+//! identity. Unknown platforms and platform conflicts are never organised
 //! silently - they are reported as Blocked/Unsupported and the user must
-//! resolve them first.
+//! resolve them first. Generic paths derive from neutral canonical EmuWiz
+//! platform metadata and never require a RomM mapping.
 
 use std::path::{Path, PathBuf};
 
@@ -47,10 +47,6 @@ pub struct OrganisationPlanRequest<'a> {
     pub mode: OrganisationMode,
     pub content_policy: ContentSelectionPolicy,
     pub candidates: &'a [OrganisationCandidate],
-    /// Resolves a canonical platform id to its canonical RomM-compatible slug.
-    /// The only acceptable source for folder names; nothing is derived from
-    /// display labels.
-    pub slug_for_platform: &'a dyn Fn(&str) -> Option<String>,
     /// Bumped by the caller on every plan (re)build; a plan is stale the
     /// moment its generation no longer matches the caller's current one.
     pub generation: u64,
@@ -108,6 +104,7 @@ fn plan_entry(
         platform_display_name: String::new(),
         platform_source: String::new(),
         slug: None,
+        layout_folder: None,
         mode,
         content_classification: candidate.content_classification.clone(),
         original_metadata: candidate.original_metadata.clone(),
@@ -123,6 +120,7 @@ fn plan_entry(
             platform_display_name: display.to_string(),
             platform_source: source.to_string(),
             slug: None,
+            layout_folder: None,
             mode,
             content_classification: candidate.content_classification.clone(),
             original_metadata: candidate.original_metadata.clone(),
@@ -239,27 +237,19 @@ fn plan_entry(
         None => return blocked("the resolved platform is not in the canonical registry"),
     };
 
-    // The folder name MUST come from the canonical RomM slug mapping, never
-    // from the display label. Rename-in-place has no platform folder, so it
-    // needs no slug; the move modes require one.
-    let slug = match mode {
+    // Generic organisation owns its own neutral layout identity: the
+    // canonical platform's registered EmuWiz folder name (see
+    // `platform::canonical_layout_folder`). No RomM import, cache or mapping
+    // is consulted here - RomM slugs are authority only for the explicit
+    // RomM-specific frontend-layout workflows. Rename-in-place has no
+    // platform folder at all.
+    let layout_folder = match mode {
         OrganisationMode::RenameInPlace => None,
-        OrganisationMode::MoveRealFile
-        | OrganisationMode::OrganiseSymlinkOnly
-        | OrganisationMode::BuildLinkedLibrary => {
-            let Some(slug) = (request.slug_for_platform)(&platform) else {
-                return unsupported(
-                    "no canonical RomM slug mapping exists for this platform; add an identity \
-                     cache import to define it",
-                    Some(platform),
-                    &display_name,
-                    &platform_source,
-                );
+        _ => {
+            let Some(folder) = crate::platform::canonical_layout_folder(&platform) else {
+                return blocked("the resolved platform has no safe canonical EmuWiz folder name");
             };
-            if !is_safe_basename(&slug) {
-                return blocked("the platform slug is not a safe single path component");
-            }
-            Some(slug)
+            Some(folder)
         }
     };
 
@@ -282,14 +272,16 @@ fn plan_entry(
 
     // Destination derivation. Rename-in-place stays in the source directory;
     // the move modes place the file under the master root's platform folder.
-    let destination_path = match (&mode, &slug) {
+    let destination_path = match (&mode, &layout_folder) {
         (OrganisationMode::RenameInPlace, _) => candidate
             .source_path
             .parent()
             .map(|parent| parent.join(&proposed_basename))
             .unwrap_or_else(|| candidate.source_path.clone()),
-        (_, Some(slug)) => request.master_root.join(slug).join(&proposed_basename),
-        (_, None) => return blocked("no canonical platform slug is available for this move"),
+        (_, Some(folder)) => request.master_root.join(folder).join(&proposed_basename),
+        (_, None) => {
+            return blocked("no canonical EmuWiz folder exists for this platform");
+        }
     };
 
     let already_organised = if candidate.source_path == destination_path {
@@ -300,8 +292,8 @@ fn plan_entry(
     {
         // Same name: already organised when the source already sits in the
         // canonical platform folder.
-        slug.as_deref().is_some_and(|slug| {
-            candidate.source_path.parent() == Some(request.master_root.join(slug).as_path())
+        layout_folder.as_deref().is_some_and(|folder| {
+            candidate.source_path.parent() == Some(request.master_root.join(folder).as_path())
         })
     } else {
         false
@@ -313,7 +305,8 @@ fn plan_entry(
         platform: Some(platform),
         platform_display_name: display_name,
         platform_source,
-        slug,
+        slug: None,
+        layout_folder,
         mode,
         content_classification: candidate.content_classification.clone(),
         original_metadata: candidate.original_metadata.clone(),

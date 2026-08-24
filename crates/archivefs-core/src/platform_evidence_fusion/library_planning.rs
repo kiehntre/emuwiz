@@ -83,7 +83,6 @@ use crate::platform::identity::{
     PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentityResolution,
     PlatformIdentitySource, resolve_platform_identity,
 };
-use crate::platform::platform_by_id;
 
 use super::archive_set_identity::ArchiveSetIdentity;
 use super::dat_hash_representation::RepresentationMatchOutcome;
@@ -319,21 +318,11 @@ pub fn no_slug_mapping(_platform: &str) -> Option<String> {
     None
 }
 
-/// The library-native destination-folder fallback used when no RomM slug
-/// is available (milestone sections 35-36) - the canonical platform id
-/// itself, exactly as the registry spells it (e.g. `"N64"`, `"Game Boy
-/// Advance"`). Deliberately distinct from, and never confusable with, a
-/// RomM slug: RomM slugs are lowercase/dashed provider-specific strings
-/// (`"n64"`, `"game-boy-advance"`); this is the crate's own canonical id,
-/// used only to compute a real destination path when RomM has none to
-/// offer. `entry.slug` on the returned [`LibraryItemPlan::organisation`]
-/// is always patched back to the *real* RomM resolution (or `None`) before
-/// a plan is returned, so nothing downstream ever mistakes this fallback
-/// for a RomM slug. `None` only when `platform_id` is not a real
-/// registered platform at all.
-fn canonical_library_folder_name(platform_id: &str) -> Option<String> {
-    platform_by_id(platform_id).map(|platform| platform.id.to_string())
-}
+// The former `canonical_library_folder_name` fallback is superseded by the
+// neutral EmuWiz layout identity that now lives in the generic planner
+// itself (`platform::canonical_layout_folder`, surfaced as
+// `OrganisationPlanEntry::layout_folder`). Destinations are neutral by
+// construction; RomM slugs attach only as reporting facts.
 
 pub fn romm_mapping_preview(entry: &OrganisationPlanEntry) -> RommMappingPreview {
     let status = match (&entry.platform, &entry.slug) {
@@ -450,35 +439,27 @@ pub struct LibraryItemPlan {
     pub rename: RenameSuggestion,
 }
 
-/// Builds one item's plan from *two* independently computed organisation
-/// entries for the same candidate - milestone sections 35-36's decoupling.
-///
-/// `library_entry` was built with a slug resolver that falls back to
-/// [`canonical_library_folder_name`] when no real RomM slug exists, so its
-/// `status`/`destination_path` reflect library-plan readiness on its own:
-/// a confidently resolved platform can be `Ready` here with zero RomM
-/// involvement. `romm_entry` was built with the caller's real RomM slug
-/// resolver only, so its `slug`/`status` are the honest RomM-specific
-/// picture (`Unsupported` there just means "no RomM slug", never "identity
-/// failed"). Only [`romm_mapping_preview`] ever reads from `romm_entry`;
-/// everything else (destination, rename, status) reads from
-/// `library_entry`, whose own `.slug` field is patched back to
-/// `romm_entry.slug` before being returned so a caller reading
-/// `organisation.slug` off the result always sees the real RomM slug (or
-/// `None`), never the internal library-folder fallback.
+/// Builds one item's generic organisation plan and separately attaches its
+/// RomM mapping as a reporting fact. The generic entry's status and
+/// destination use neutral EmuWiz layout identity and therefore never depend
+/// on a RomM mapping; `organisation.slug`, when present, remains the actual
+/// RomM slug for explicitly RomM-specific consumers.
 fn build_item_plan(
-    library_entry: OrganisationPlanEntry,
-    romm_entry: &OrganisationPlanEntry,
+    mut library_entry: OrganisationPlanEntry,
+    romm_slug: Option<String>,
     identity_status: IdentityStatus,
     set_identity: Option<ArchiveSetIdentity>,
 ) -> LibraryItemPlan {
-    let romm = romm_mapping_preview(romm_entry);
-    let mut entry = library_entry;
-    entry.slug = romm_entry.slug.clone();
-    let rename = rename_suggestion(&entry);
-    let status = plan_status(identity_status, entry.status);
+    // The generic plan carries only neutral EmuWiz layout facts; the real
+    // RomM resolution is attached here so a caller reading
+    // `organisation.slug` always sees the actual RomM mapping (or `None`)
+    // while destinations stay neutral.
+    library_entry.slug = romm_slug;
+    let romm = romm_mapping_preview(&library_entry);
+    let rename = rename_suggestion(&library_entry);
+    let status = plan_status(identity_status, library_entry.status);
     LibraryItemPlan {
-        organisation: entry,
+        organisation: library_entry,
         set_identity,
         status,
         romm,
@@ -568,49 +549,35 @@ pub fn plan_library(
         })
         .collect();
 
-    let romm_request = OrganisationPlanRequest {
+    // Generic organisation planning: destinations derive from the neutral
+    // EmuWiz platform layout identity. No RomM lookup happens here; RomM
+    // mapping facts are resolved per item below, only to report them.
+    let organisation_plan = build_organisation_plan(&OrganisationPlanRequest {
         master_root: context.destination_root,
         mode: context.mode,
         content_policy: Default::default(),
         candidates: &candidates,
-        slug_for_platform: context.slug_for_platform,
         generation: context.generation,
-    };
-    let romm_plan = build_organisation_plan(&romm_request);
-
-    let library_slug_for_platform = |platform: &str| {
-        (context.slug_for_platform)(platform).or_else(|| canonical_library_folder_name(platform))
-    };
-    let library_request = OrganisationPlanRequest {
-        master_root: context.destination_root,
-        mode: context.mode,
-        content_policy: Default::default(),
-        candidates: &candidates,
-        slug_for_platform: &library_slug_for_platform,
-        generation: context.generation,
-    };
-    let organisation_plan = build_organisation_plan(&library_request);
+    });
 
     // organisation_plan.entries is sorted (status, source_path,
     // destination_path) by build_organisation_plan itself - match each
-    // entry back to its input, and to its counterpart in romm_plan, by
-    // source_path for a stable, deterministic per-item plan regardless of
-    // input order (milestone section 44).
+    // entry back to its input for a stable, deterministic per-item plan
+    // regardless of input order (milestone section 44).
     let mut items = Vec::with_capacity(organisation_plan.entries.len());
     for entry in &organisation_plan.entries {
         let input = inputs
             .iter()
             .find(|input| input.source_path == entry.source_path)
             .expect("every entry corresponds to a supplied input");
-        let romm_entry = romm_plan
-            .entries
-            .iter()
-            .find(|romm_entry| romm_entry.source_path == entry.source_path)
-            .expect("romm_plan was built from the same candidates as organisation_plan");
+        let romm_slug = entry
+            .platform
+            .as_deref()
+            .and_then(|platform| (context.slug_for_platform)(platform));
         let identity_status = present_identity(&input.identity).status;
         items.push(build_item_plan(
             entry.clone(),
-            romm_entry,
+            romm_slug,
             identity_status,
             input.set_identity.clone(),
         ));

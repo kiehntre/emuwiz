@@ -2,10 +2,11 @@
 //!
 //! Configures the master ROM root, chooses an organisation mode, collects
 //! candidate ROM files, resolves each candidate's platform identity from the
-//! database and its canonical RomM slug from the identity cache, builds a
-//! read-only plan, and - only after an explicit typed confirmation - applies
-//! the approved subset through the shared journaled engine. Rollback restores
-//! the prior state.
+//! database, builds a neutral EmuWiz layout plan, and - only after an explicit
+//! typed confirmation - applies the approved subset through the shared
+//! journaled engine. RomM cache data may provide a canonical game title, but
+//! never determines a generic organisation folder. Rollback restores the
+//! prior state.
 //!
 //! The page states loudly that planning changes nothing until the user
 //! approves, and never offers Apply for conflicts, blocked or unknown entries.
@@ -291,7 +292,6 @@ impl RomOrganisationPageState {
             return;
         };
         let cache = load_romm_cache();
-        let slug_map = build_slug_map(cache.as_ref());
         let Some(candidates) =
             build_candidates(&self.sources, self.plan_generation, cache.as_ref())
         else {
@@ -299,12 +299,13 @@ impl RomOrganisationPageState {
             self.plan = None;
             return;
         };
+        // No RomM mapping is consulted: generic destinations derive from the
+        // neutral EmuWiz platform layout identity.
         let plan = build_organisation_plan(&OrganisationPlanRequest {
             master_root: &master_root,
             mode: self.mode,
             content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
             candidates: &candidates,
-            slug_for_platform: &|platform| slug_map.get(platform).cloned(),
             generation: self.plan_generation,
         });
         self.approved = plan
@@ -339,13 +340,12 @@ impl RomOrganisationPageState {
             return;
         };
         // Revalidate the live platform identity before building the
-        // transaction: a platform/slug/canonical name changed by another
-        // process since the plan was generated must reject the apply with
-        // zero mutation.
+        // transaction: a platform/canonical name changed by another process
+        // since the plan was generated must reject the apply with zero
+        // mutation. Destinations are re-derived from the same neutral EmuWiz
+        // layout identity as the preview - no RomM lookup happens here.
         let cache = load_romm_cache();
         let canonical_name_for = |source: &Path| canonical_name_for(source, cache.as_ref());
-        let slug_map = build_slug_map(cache.as_ref());
-        let slug_for_platform = |platform: &str| slug_map.get(platform).cloned();
         let database_path = default_database_path();
         match database_path {
             Ok(path) => {
@@ -353,7 +353,6 @@ impl RomOrganisationPageState {
                     plan,
                     &path,
                     &canonical_name_for,
-                    &slug_for_platform,
                 ) {
                     Ok(()) => {}
                     Err(reason) => {
@@ -698,6 +697,13 @@ fn build_candidates(
     generation: u64,
     cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
 ) -> Option<Vec<OrganisationCandidate>> {
+    // No identity lookup is needed for an empty selection.  In particular,
+    // regenerating an empty preview must be able to clear a stale approved
+    // set even when this machine has not created its local database yet.
+    if sources.is_empty() {
+        return Some(Vec::new());
+    }
+
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
     let mut candidates = Vec::new();
@@ -763,21 +769,9 @@ fn load_romm_cache() -> Option<archivefs_core::identity_source::cache::IdentityC
     load_cache(&location, None).ok()
 }
 
-/// The canonical RomM slug map from the identity cache, if any.
-fn build_slug_map(
-    cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut map = std::collections::BTreeMap::new();
-    let Some(cache) = cache else {
-        return map;
-    };
-    for platform in archivefs_core::platform::canonical_ids() {
-        if let Some(slug) = cache.romm_slug_for_platform(platform) {
-            map.insert(platform.to_string(), slug.to_string());
-        }
-    }
-    map
-}
+// The former `build_slug_map` helper is gone: generic organisation no longer
+// consults RomM slugs at all. RomM-specific frontend layouts resolve their
+// own mappings in `platform_evidence_fusion::romm_platform_mapping`.
 
 /// Draws the page and returns the confirmation request when the user clicks
 /// Apply (the caller must confirm before any mutation happens).
@@ -1854,10 +1848,11 @@ mod tests {
         OrganisationPlanEntry {
             source_path: PathBuf::from("/sources/Combat.bin"),
             destination_path: PathBuf::from("/library/atari2600/Combat.bin"),
-            platform: Some("Atari 2600".to_string()),
+            platform: Some("Atari2600".to_string()),
             platform_display_name: "Atari 2600".to_string(),
             platform_source: "Manual".to_string(),
-            slug: Some("atari2600".to_string()),
+            slug: None,
+            layout_folder: Some("Atari 2600".to_string()),
             mode: OrganisationMode::BuildLinkedLibrary,
             content_classification: None,
             original_metadata: Default::default(),
@@ -1903,10 +1898,11 @@ mod tests {
             entries: vec![OrganisationPlanEntry {
                 source_path: PathBuf::from("/sources/Combat.bin"),
                 destination_path: library_root.join("atari2600").join("Combat (USA).bin"),
-                platform: Some("Atari 2600".to_string()),
+                platform: Some("Atari2600".to_string()),
                 platform_display_name: "Atari 2600".to_string(),
                 platform_source: "Manual".to_string(),
-                slug: Some("atari2600".to_string()),
+                slug: None,
+                layout_folder: Some("Atari 2600".to_string()),
                 mode: OrganisationMode::BuildLinkedLibrary,
                 content_classification: None,
                 original_metadata: Default::default(),

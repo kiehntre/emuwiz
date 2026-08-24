@@ -2,14 +2,15 @@
 //!
 //! The user configures a master ROM root (for example `/mnt/games/roms`).
 //! EmuWiz can then *plan*, and after explicit approval *apply*, moving
-//! identified games into canonical RomM-compatible platform directories
-//! beneath that root - never guessing a folder name from a display label.
+//! identified games into neutral canonical EmuWiz platform directories
+//! beneath that root.
 //!
 //! # Safety
 //!
 //! - Planning is read-only; nothing moves until the user approves an apply.
-//! - The destination platform directory always comes from the canonical
-//!   platform id's RomM slug mapping, never from display text.
+//! - Generic destination platform directories come from the canonical
+//!   EmuWiz platform registry; RomM mappings are used only by explicit
+//!   RomM-specific workflows.
 //! - Mutations reuse the `rename_apply` engine: durable journal before any
 //!   mutation, per-entry `Applying` checkpoint, `renameat2(RENAME_NOREPLACE)`
 //!   no-clobber moves, identity re-check immediately before each move, shared
@@ -26,8 +27,9 @@
 //!
 //! # Modes
 //!
-//! Three explicit, never-combined modes: rename in place, move the real file,
-//! or organise a symlink object only.
+//! Four explicit, never-combined modes: rename in place, move the real file,
+//! organise an existing symlink object only, or build a linked library from
+//! untouched regular sources.
 
 pub mod model;
 pub mod plan;

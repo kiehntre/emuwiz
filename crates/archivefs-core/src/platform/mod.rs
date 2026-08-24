@@ -436,6 +436,39 @@ pub fn display_name_for(id: &str) -> &str {
     platform_by_id(id).map_or(id, |platform| platform.display_name)
 }
 
+/// Whether `name` can be a single safe filesystem folder component: one
+/// non-empty, non-control path segment that names the folder itself rather
+/// than something else. This is deliberately local to the registry so the
+/// platform layer never depends on the DAT layer's identical rule.
+fn is_safe_layout_folder(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains(['/', '\\', '\0'])
+        && name != "."
+        && name != ".."
+        && name.trim() == name
+        && !name.chars().any(char::is_control)
+}
+
+/// The neutral EmuWiz layout folder for a canonical platform: the display
+/// name exactly as the registry spells it (`"Atari 2600"`, `"Amiga"`),
+/// falling back to the canonical id when a display name would not be a safe
+/// single component, and `None` only when neither is (a registry defect).
+///
+/// This is generic organisation's own identity - stable, deterministic and
+/// independent of any frontend mapping. RomM slugs remain authority only for
+/// the explicit RomM-specific frontend-layout workflows.
+pub fn canonical_layout_folder(platform_id: &str) -> Option<String> {
+    let platform = platform_by_id(platform_id)?;
+    if is_safe_layout_folder(platform.display_name) {
+        return Some(platform.display_name.to_string());
+    }
+    if is_safe_layout_folder(platform.id) {
+        return Some(platform.id.to_string());
+    }
+    None
+}
+
 /// The registry. Sorted by display name so iteration order is stable and
 /// every derived list is deterministic.
 pub const PLATFORMS: &[Platform] = &[
