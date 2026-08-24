@@ -390,13 +390,13 @@ fn every_home_card_shows_its_icon_alongside_its_title() {
     // icon-only.
     let (output, _) = render(&view, 1200.0);
     for expected in [
-        "A-Z",
-        "[C]",
-        ">",
-        "[V]",
-        "[OK]",
-        "[*]",
-        "<3 x99",
+        crate::ui::icons::ORGANISE,
+        crate::ui::icons::CLEAN_UP,
+        crate::ui::icons::GAMES,
+        crate::ui::icons::VERIFY,
+        crate::ui::icons::CHECK,
+        crate::ui::icons::SETTINGS,
+        crate::ui::icons::CHEATS,
         "Clean up my library",
         "Organise",
         "My Games",
@@ -416,21 +416,21 @@ fn primary_home_cards_carry_their_visual_identity() {
     let view = build_home_view(&established_inputs(&checks));
     let find = |card: HomeCard| view.cards.iter().find(|c| c.card == card).unwrap();
     let my_games = find(HomeCard::BrowseGames);
-    assert_eq!(my_games.icon, ">");
+    assert_eq!(my_games.icon, crate::ui::icons::GAMES);
     assert_eq!(my_games.title, "My Games");
     let organise = find(HomeCard::CanonicalOrganisation);
-    assert_eq!(organise.icon, "A-Z");
+    assert_eq!(organise.icon, crate::ui::icons::ORGANISE);
     assert_eq!(organise.title, "Organise");
     let check = find(HomeCard::CheckSetup);
-    assert_eq!(check.icon, "[OK]");
+    assert_eq!(check.icon, crate::ui::icons::CHECK);
     assert_eq!(check.title, "Check Library");
     let cheats = find(HomeCard::CheatsAndMods);
-    assert_eq!(cheats.icon, "<3 x99", "the icon has an ASCII fallback");
+    assert_eq!(cheats.icon, crate::ui::icons::CHEATS);
     let verify = find(HomeCard::DatSources);
-    assert_eq!(verify.icon, "[V]");
+    assert_eq!(verify.icon, crate::ui::icons::VERIFY);
     assert_eq!(verify.title, "Verify Games");
     let settings = find(HomeCard::Settings);
-    assert_eq!(settings.icon, "[*]");
+    assert_eq!(settings.icon, crate::ui::icons::SETTINGS);
     assert_eq!(settings.title, "Settings");
 }
 
@@ -492,13 +492,13 @@ fn icons_never_replace_text_labels() {
 fn home_and_page_headers_share_the_same_concept_icons() {
     // The page headers reference the very same constants the Home cards use,
     // so the visual identity cannot drift between Home and a page.
-    assert_eq!(crate::ui::icons::GAMES, ">");
-    assert_eq!(crate::ui::icons::ORGANISE, "A-Z");
-    assert_eq!(crate::ui::icons::CHECK, "[OK]");
-    assert_eq!(crate::ui::icons::CHEATS, "<3 x99");
-    assert_eq!(crate::ui::icons::VERIFY, "[V]");
-    assert_eq!(crate::ui::icons::SETTINGS, "[*]");
-    assert_eq!(crate::ui::icons::ARTWORK, "[IMG]");
+    assert_eq!(crate::ui::icons::GAMES, "■");
+    assert_eq!(crate::ui::icons::ORGANISE, "▪");
+    assert_eq!(crate::ui::icons::CHECK, "○");
+    assert_eq!(crate::ui::icons::CHEATS, "★");
+    assert_eq!(crate::ui::icons::VERIFY, "⊞");
+    assert_eq!(crate::ui::icons::SETTINGS, "⚙");
+    assert_eq!(crate::ui::icons::ARTWORK, "■");
 }
 
 #[test]
@@ -507,12 +507,12 @@ fn the_primary_home_cards_render_at_compact_width() {
     let view = build_home_view(&established_inputs(&checks));
     let (output, _) = render(&view, 700.0);
     for expected in [
-        ">",
-        "A-Z",
-        "[OK]",
-        "<3 x99",
-        "[V]",
-        "[*]",
+        crate::ui::icons::GAMES,
+        crate::ui::icons::ORGANISE,
+        crate::ui::icons::CHECK,
+        crate::ui::icons::CHEATS,
+        crate::ui::icons::VERIFY,
+        crate::ui::icons::SETTINGS,
         "My Games",
         "Organise",
         "Check Library",
