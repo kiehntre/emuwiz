@@ -29,7 +29,8 @@ use crate::dat::rename_apply::executor::{
 use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::rename_apply::journal::write_journal;
 use crate::dat::rename_apply::model::{
-    EntryState, RenameTransaction, TransactionEntry, TransactionState,
+    EntryState, ObjectKind, RenameTransaction, TransactionEntry, TransactionOperation,
+    TransactionState,
 };
 use crate::dat::rename_apply::preflight::DirectoryPolicy;
 use crate::dat::rename_apply::rollback::{RollbackOutcome, rollback_transaction};
@@ -71,6 +72,24 @@ pub fn build_organisation_transaction(
             // cannot carry a recorded identity, so it is excluded.
             continue;
         };
+        // Linked-library defence in depth: only a regular file may become a
+        // link source, and both the recorded link target and the approved
+        // destination root must be absolute so recovery/rollback can trust
+        // them verbatim.
+        let operation = if plan.mode == OrganisationMode::BuildLinkedLibrary {
+            if identity.kind != ObjectKind::RegularFile
+                || !entry.source_path.is_absolute()
+                || !plan.master_root.is_absolute()
+            {
+                continue;
+            }
+            TransactionOperation::CreateSymlink {
+                expected_target: entry.source_path.clone(),
+                destination_root: plan.master_root.clone(),
+            }
+        } else {
+            TransactionOperation::RenameMove
+        };
         let original_basename = entry
             .source_path
             .file_name()
@@ -85,7 +104,7 @@ pub fn build_organisation_transaction(
             original_basename,
             proposed_basename: proposed_basename.to_string_lossy().into_owned(),
             identity,
-            operation: Default::default(),
+            operation,
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,

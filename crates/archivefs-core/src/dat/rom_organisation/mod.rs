@@ -18,6 +18,8 @@
 //!   is refused with "Unsupported" - there is no copy+delete fallback.
 //! - Symlink-only mode moves the link *object* and never dereferences or
 //!   touches its target.
+//! - Linked-library mode creates links beneath an approved library root and
+//!   never renames, moves, deletes or rewrites any original source file.
 //! - Only canonical platform directories created by the apply are ever
 //!   removed on rollback, and only while empty; a pre-existing user directory
 //!   is never removed.
@@ -31,6 +33,8 @@ pub mod model;
 pub mod plan;
 pub mod transaction;
 
+#[cfg(test)]
+mod linked_library_tests;
 #[cfg(test)]
 mod tests;
 

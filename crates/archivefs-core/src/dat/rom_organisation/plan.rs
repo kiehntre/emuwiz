@@ -162,8 +162,8 @@ fn plan_entry(
         OrganisationMode::MoveRealFile => {
             if kind != ObjectKind::RegularFile {
                 let reason = if kind == ObjectKind::Symlink || kind == ObjectKind::BrokenSymlink {
-                    "this is a shortcut, not a real file; use 'Keep original files where they \
-                     are' to reorganise the shortcut without touching its target"
+                    "this is a shortcut, not a real file; use 'Advanced: reorganise existing \
+                     symlinks' to reorganise the shortcut without touching its target"
                 } else {
                     "this mode organises regular files only"
                 };
@@ -173,8 +173,26 @@ fn plan_entry(
         OrganisationMode::OrganiseSymlinkOnly => {
             if kind != ObjectKind::Symlink && kind != ObjectKind::BrokenSymlink {
                 return blocked(
-                    "this is a real file, not a shortcut; 'Keep original files where they are' \
+                    "this is a real file, not a shortcut; 'Advanced: reorganise existing symlinks' \
                      only reorganises shortcuts that already exist",
+                );
+            }
+        }
+        OrganisationMode::BuildLinkedLibrary => {
+            // A linked library links regular files only: the original stays
+            // put and the canonical destination becomes a new link. A source
+            // that is itself a symlink would chain links, and directories are
+            // out of scope for this slice.
+            if kind != ObjectKind::RegularFile {
+                return blocked(
+                    "linked libraries link regular files only; this source is a shortcut or \
+                     another object kind",
+                );
+            }
+            if !candidate.source_path.is_absolute() {
+                return blocked(
+                    "the source path must be absolute so the created link can record its \
+                     exact target",
                 );
             }
         }
@@ -226,7 +244,9 @@ fn plan_entry(
     // needs no slug; the move modes require one.
     let slug = match mode {
         OrganisationMode::RenameInPlace => None,
-        OrganisationMode::MoveRealFile | OrganisationMode::OrganiseSymlinkOnly => {
+        OrganisationMode::MoveRealFile
+        | OrganisationMode::OrganiseSymlinkOnly
+        | OrganisationMode::BuildLinkedLibrary => {
             let Some(slug) = (request.slug_for_platform)(&platform) else {
                 return unsupported(
                     "no canonical RomM slug mapping exists for this platform; add an identity \
@@ -373,6 +393,40 @@ fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) 
         }
         if entries[index].status == OrganisationStatus::AlreadyOrganised {
             continue;
+        }
+        // Linked-library destinations are classified by their exact object
+        // state rather than by bare existence: an identical link is a no-op
+        // ("already present"), anything else occupying the name is a conflict.
+        // Nothing is ever auto-replaced.
+        if entries[index].mode == OrganisationMode::BuildLinkedLibrary {
+            match std::fs::symlink_metadata(&entries[index].destination_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&entries[index].destination_path).ok();
+                    if target.as_deref() == Some(entries[index].source_path.as_path()) {
+                        entries[index].status = OrganisationStatus::AlreadyOrganised;
+                        entries[index].reason =
+                            Some("already linked to this exact file; nothing to do".to_string());
+                    } else {
+                        mark_conflict(
+                            entries,
+                            index,
+                            "a different link already occupies the destination; nothing is \
+                             replaced",
+                        );
+                    }
+                    continue;
+                }
+                Ok(_) => {
+                    mark_conflict(
+                        entries,
+                        index,
+                        "the destination exists and is not a link; nothing is ever replaced",
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
         }
         if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
             mark_conflict(

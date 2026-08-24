@@ -199,6 +199,11 @@ fn preview_operation_for(item: &LibraryPlanExportItem) -> Option<PreviewOperatio
             OperationKind::Move
         }
         OperationIntent::RenameInPlace => OperationKind::Rename,
+        // This bridge only ever builds rename/move transactions. A
+        // linked-library item must not be silently downgraded to a move of
+        // the original file, so it is reported as unsupported here; actual
+        // link creation goes through `rom_organisation::transaction`.
+        OperationIntent::BuildLinkedLibrary => return None,
         OperationIntent::None => return None,
     };
     let precondition_strength = if item.precondition.physical_hash.is_some()

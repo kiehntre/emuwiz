@@ -4525,6 +4525,7 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
         source_scan_root: "/tmp/roms".to_string(),
         state: archivefs_core::dat::rename_apply::TransactionState::Applying,
         entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
             source_path: PathBuf::from("/tmp/roms/a.bin"),
             destination_path: PathBuf::from("/tmp/roms/b.bin"),
             original_basename: "a.bin".to_string(),
@@ -4597,6 +4598,7 @@ fn a_transaction_stuck_applying_with_an_applied_entry_loads_as_applied_after_res
         source_scan_root: "/tmp/roms".to_string(),
         state: archivefs_core::dat::rename_apply::TransactionState::Applying,
         entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
             source_path: PathBuf::from("/tmp/roms/a.bin"),
             destination_path: PathBuf::from("/tmp/roms/b.bin"),
             original_basename: "a.bin".to_string(),
@@ -4655,6 +4657,7 @@ fn fixture_identity() -> archivefs_core::dat::rename_apply::ObjectIdentity {
 
 fn fixture_entry(original: &str, proposed: &str) -> TransactionEntry {
     TransactionEntry {
+        operation: Default::default(),
         source_path: PathBuf::from(original),
         destination_path: PathBuf::from(proposed),
         original_basename: original.to_string(),

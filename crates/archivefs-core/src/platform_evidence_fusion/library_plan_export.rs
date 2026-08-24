@@ -40,6 +40,10 @@ pub enum OperationIntent {
     MoveToLibraryFolder,
     RenameInPlace,
     OrganiseSymlinkOnly,
+    /// Build a library of links: sources stay put, destinations become
+    /// symlinks (a label only - executable links flow through
+    /// `rom_organisation::transaction`, not through this export).
+    BuildLinkedLibrary,
     /// No operation is proposed (not `Ready`).
     None,
 }
@@ -128,6 +132,7 @@ pub fn export_item_with_context(
             OrganisationMode::MoveRealFile => OperationIntent::MoveToLibraryFolder,
             OrganisationMode::RenameInPlace => OperationIntent::RenameInPlace,
             OrganisationMode::OrganiseSymlinkOnly => OperationIntent::OrganiseSymlinkOnly,
+            OrganisationMode::BuildLinkedLibrary => OperationIntent::BuildLinkedLibrary,
         }
     } else {
         OperationIntent::None

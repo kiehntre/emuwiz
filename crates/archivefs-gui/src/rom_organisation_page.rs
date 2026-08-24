@@ -20,7 +20,7 @@ use archivefs_core::identity_source::settings::default_identity_root;
 use archivefs_core::ingestion::is_known_non_game_extension;
 use archivefs_core::platform::identity::{PlatformIdentityResolution, resolve_platform_identity};
 use archivefs_core::{
-    Config, Database, app_dirs, clear_master_rom_root_default, default_database_path,
+    Config, Database, clear_master_rom_root_default, default_database_path,
     set_master_rom_root_default,
 };
 use eframe::egui;
@@ -33,6 +33,12 @@ pub(crate) struct RomOrganisationPageState {
     master_root_draft: String,
     saved_master_root: Option<PathBuf>,
     master_root_error: Option<String>,
+    /// The explicitly chosen linked-library destination root for
+    /// BuildLinkedLibrary mode. Never inferred from source roots and never
+    /// persisted into the master ROM root config.
+    library_root_draft: String,
+    saved_library_root: Option<PathBuf>,
+    library_root_error: Option<String>,
     mode: OrganisationMode,
     /// Candidate source files collected from the configured source folders.
     sources: Vec<PathBuf>,
@@ -79,6 +85,9 @@ pub(crate) fn apply_confirmation_phrase(mode: OrganisationMode, count: usize) ->
         OrganisationMode::MoveRealFile | OrganisationMode::OrganiseSymlinkOnly => {
             format!("MOVE {count} FILES")
         }
+        // Truthful wording: a linked-library apply never renames or moves an
+        // original file - it creates links.
+        OrganisationMode::BuildLinkedLibrary => format!("CREATE {count} LINKS"),
     }
 }
 
@@ -89,7 +98,8 @@ fn organisation_mode_plain_label(mode: OrganisationMode) -> &'static str {
     match mode {
         OrganisationMode::RenameInPlace => "Rename files where they are",
         OrganisationMode::MoveRealFile => "Move files into organised folders",
-        OrganisationMode::OrganiseSymlinkOnly => "Keep original files where they are",
+        OrganisationMode::BuildLinkedLibrary => "Build linked library",
+        OrganisationMode::OrganiseSymlinkOnly => "Advanced: reorganise existing symlinks",
     }
 }
 
@@ -118,6 +128,11 @@ fn organisation_mode_plain_explanation(mode: OrganisationMode) -> &'static str {
              that isn't already one, so a folder of real files (not shortcuts) will show as \
              blocked in this mode."
         }
+        OrganisationMode::BuildLinkedLibrary => {
+            "Create an organised library of links while leaving your original files untouched. \
+             Every original file stays exactly where it is; the organised destination becomes \
+             a link pointing to it."
+        }
     }
 }
 
@@ -138,6 +153,9 @@ impl Default for RomOrganisationPageState {
             master_root_draft: String::new(),
             saved_master_root: None,
             master_root_error: None,
+            library_root_draft: String::new(),
+            saved_library_root: None,
+            library_root_error: None,
             mode: OrganisationMode::MoveRealFile,
             sources: Vec::new(),
             plan: None,
@@ -214,6 +232,37 @@ impl RomOrganisationPageState {
         }
     }
 
+    /// Saves the linked-library destination root draft (or clears it). The
+    /// user must provide this root explicitly for BuildLinkedLibrary; it is a
+    /// session setting of this page, never inferred and never mixed into the
+    /// master ROM root config.
+    pub(crate) fn save_library_root(&mut self) {
+        let trimmed = self.library_root_draft.trim().to_string();
+        if trimmed.is_empty() {
+            self.saved_library_root = None;
+            self.library_root_error = None;
+            return;
+        }
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            self.saved_library_root = Some(path);
+            self.library_root_error = None;
+        } else {
+            self.library_root_error =
+                Some("the linked-library folder must be an absolute path".to_string());
+        }
+    }
+
+    /// The destination root the current mode plans into: the explicitly
+    /// chosen linked-library root in BuildLinkedLibrary mode, otherwise the
+    /// configured master ROM root.
+    pub(crate) fn effective_root(&self) -> Option<PathBuf> {
+        match self.mode {
+            OrganisationMode::BuildLinkedLibrary => self.saved_library_root.clone(),
+            _ => self.saved_master_root.clone(),
+        }
+    }
+
     /// Re-scans the configured source folders for candidate files.
     pub(crate) fn rescan_sources(&mut self) {
         if let Ok(config) = Config::load_default() {
@@ -232,8 +281,12 @@ impl RomOrganisationPageState {
     /// rebuild bumps the generation, so any earlier review decision is stale.
     pub(crate) fn generate_plan(&mut self) {
         self.plan_generation += 1;
-        let Some(master_root) = self.saved_master_root.clone() else {
-            self.error = Some("configure a master ROM root first".to_string());
+        let Some(master_root) = self.effective_root() else {
+            self.error = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
+                "choose a linked library folder first".to_string()
+            } else {
+                "configure a master ROM root first".to_string()
+            });
             self.plan = None;
             return;
         };
@@ -282,7 +335,7 @@ impl RomOrganisationPageState {
         let Some(plan) = &self.plan else {
             return;
         };
-        let Some(master_root) = self.saved_master_root.clone() else {
+        let Some(master_root) = self.effective_root() else {
             return;
         };
         // Revalidate the live platform identity before building the
@@ -349,10 +402,18 @@ impl RomOrganisationPageState {
         ) {
             Ok(outcome) => {
                 self.applied = Some(outcome.transaction.clone());
-                self.result_message = Some(format!(
-                    "Applied {} organisation(s). Roll back is available for this transaction.",
-                    outcome.transaction.applied_count()
-                ));
+                self.result_message = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
+                    format!(
+                        "Created {} library link(s); your original files were not touched. \
+                         Roll back is available for this transaction.",
+                        outcome.transaction.applied_count()
+                    )
+                } else {
+                    format!(
+                        "Applied {} organisation(s). Roll back is available for this transaction.",
+                        outcome.transaction.applied_count()
+                    )
+                });
             }
             Err(error) => self.error = Some(error.to_string()),
         }
@@ -364,7 +425,7 @@ impl RomOrganisationPageState {
             return;
         };
         let journal = self.applied_journal.clone();
-        let Some(master_root) = self.saved_master_root.clone() else {
+        let Some(master_root) = self.effective_root() else {
             self.applied = Some(transaction);
             return;
         };
@@ -735,74 +796,161 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         "Preview how your games can be renamed or organised. Nothing moves until you approve it.",
     );
 
-    widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Game library folder").strong());
-        match &state.saved_master_root {
-            Some(root) => {
-                ui.label(
-                    egui::RichText::new(format!("Folder: {}", root.display()))
-                        .color(theme::muted(ui)),
-                );
-                if widgets::action_button(
-                    ui,
-                    "Change folder…",
-                    widgets::ActionStyle::Secondary,
-                    true,
-                )
-                .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_title("Choose Game Library Folder")
-                        .pick_folder()
-                {
-                    state.master_root_draft = path.display().to_string();
-                    state.save_master_root();
-                }
-            }
-            None => {
-                ui.label(
-                    egui::RichText::new("No game library folder is configured yet.")
-                        .color(theme::muted(ui)),
-                );
-                if widgets::action_button(ui, "Choose folder…", widgets::ActionStyle::Primary, true)
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_title("Choose Game Library Folder")
-                        .pick_folder()
-                {
-                    state.master_root_draft = path.display().to_string();
-                    state.save_master_root();
-                }
-            }
-        };
-        if let Some(error) = &state.master_root_error {
-            ui.label(
-                egui::RichText::new(error.as_str()).color(widgets::StatusTone::Blocked.color(ui)),
-            );
-        }
-        widgets::technical_details(ui, "rom_organisation_manual_path", |ui| {
+    if state.mode == OrganisationMode::BuildLinkedLibrary {
+        // Linked-library mode plans into an explicitly chosen destination
+        // root that is separate from the master ROM root. It is never
+        // inferred from the source folders.
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Linked library folder").strong());
             ui.label(
                 egui::RichText::new(
-                    "Type or paste a path directly instead of using the folder picker.",
+                    "The organised links are created inside this folder; your original \
+                     files stay where they are.",
                 )
                 .color(theme::muted(ui)),
             );
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut state.master_root_draft);
-                if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true).clicked()
-                {
-                    state.save_master_root();
+            match &state.saved_library_root {
+                Some(root) => {
+                    ui.label(
+                        egui::RichText::new(format!("Folder: {}", root.display()))
+                            .color(theme::muted(ui)),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Change folder…",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Linked Library Folder")
+                            .pick_folder()
+                    {
+                        state.library_root_draft = path.display().to_string();
+                        state.save_library_root();
+                    }
                 }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No linked library folder is chosen yet.")
+                            .color(theme::muted(ui)),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Choose folder…",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Linked Library Folder")
+                            .pick_folder()
+                    {
+                        state.library_root_draft = path.display().to_string();
+                        state.save_library_root();
+                    }
+                }
+            };
+            if let Some(error) = &state.library_root_error {
+                ui.label(
+                    egui::RichText::new(error.as_str())
+                        .color(widgets::StatusTone::Blocked.color(ui)),
+                );
+            }
+            widgets::technical_details(ui, "linked_library_manual_path", |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Type or paste a path directly instead of using the folder picker.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut state.library_root_draft);
+                    if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true)
+                        .clicked()
+                    {
+                        state.save_library_root();
+                    }
+                });
             });
         });
-        ui.add_space(4.0);
-        ui.label(
+    } else {
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Game library folder").strong());
+            match &state.saved_master_root {
+                Some(root) => {
+                    ui.label(
+                        egui::RichText::new(format!("Folder: {}", root.display()))
+                            .color(theme::muted(ui)),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Change folder…",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Game Library Folder")
+                            .pick_folder()
+                    {
+                        state.master_root_draft = path.display().to_string();
+                        state.save_master_root();
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No game library folder is configured yet.")
+                            .color(theme::muted(ui)),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Choose folder…",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose Game Library Folder")
+                            .pick_folder()
+                    {
+                        state.master_root_draft = path.display().to_string();
+                        state.save_master_root();
+                    }
+                }
+            };
+            if let Some(error) = &state.master_root_error {
+                ui.label(
+                    egui::RichText::new(error.as_str())
+                        .color(widgets::StatusTone::Blocked.color(ui)),
+                );
+            }
+            widgets::technical_details(ui, "rom_organisation_manual_path", |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Type or paste a path directly instead of using the folder picker.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut state.master_root_draft);
+                    if widgets::action_button(ui, "Save", widgets::ActionStyle::Primary, true)
+                        .clicked()
+                    {
+                        state.save_master_root();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
             egui::RichText::new(
                 "Choosing a folder never moves anything by itself: organising always requires a \
                  preview and your explicit approval.",
             )
             .color(theme::muted(ui)),
         );
-    });
+        });
+    }
 
     ui.add_space(8.0);
     widgets::card(ui, |ui| {
@@ -810,6 +958,7 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         for mode in [
             OrganisationMode::RenameInPlace,
             OrganisationMode::MoveRealFile,
+            OrganisationMode::BuildLinkedLibrary,
             OrganisationMode::OrganiseSymlinkOnly,
         ] {
             let selected = state.mode == mode;
@@ -957,29 +1106,58 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
                 }
             }
             widgets::status_badge(ui, entry.status.label(), status_tone(entry.status));
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} → {}",
-                    entry.source_path.display(),
-                    entry.destination_path.display()
-                ))
-                .monospace(),
-            );
-            if !entry.platform_display_name.is_empty() {
+            if plan.mode == OrganisationMode::BuildLinkedLibrary {
+                // Linked-library preview: make the semantics painfully
+                // obvious. Never worded as a Rename or Move.
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Source: {}", entry.source_path.display()))
+                            .monospace(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Destination link: {}",
+                            entry.destination_path.display()
+                        ))
+                        .monospace(),
+                    );
+                    ui.label("Source action: Untouched");
+                    ui.label(format!("Result: {}", linked_library_preview_result(entry)));
+                    if !entry.platform_display_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                entry.platform_display_name, entry.platform_source
+                            ))
+                            .color(theme::muted(ui)),
+                        );
+                    }
+                });
+            } else {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} · {}",
-                        entry.platform_display_name, entry.platform_source
+                        "{} → {}",
+                        entry.source_path.display(),
+                        entry.destination_path.display()
                     ))
-                    .color(theme::muted(ui)),
+                    .monospace(),
                 );
-            }
-            if let Some(reason) = &entry.reason {
-                ui.label(
-                    egui::RichText::new(format!("({reason})"))
-                        .color(widgets::StatusTone::Blocked.color(ui))
-                        .small(),
-                );
+                if !entry.platform_display_name.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {}",
+                            entry.platform_display_name, entry.platform_source
+                        ))
+                        .color(theme::muted(ui)),
+                    );
+                }
+                if let Some(reason) = &entry.reason {
+                    ui.label(
+                        egui::RichText::new(format!("({reason})"))
+                            .color(widgets::StatusTone::Blocked.color(ui))
+                            .small(),
+                    );
+                }
             }
         });
     }
@@ -1043,6 +1221,24 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
                 }
             });
         });
+    }
+}
+
+/// Plain-English result line for one linked-library preview entry. Pure:
+/// derives only from the plan entry's own status/reason so it is directly
+/// unit-testable.
+pub(crate) fn linked_library_preview_result(entry: &OrganisationPlanEntry) -> String {
+    match entry.status {
+        OrganisationStatus::Suggested => "Will create link".to_string(),
+        OrganisationStatus::AlreadyOrganised => "Already present; nothing to do".to_string(),
+        OrganisationStatus::Conflict | OrganisationStatus::Blocked => entry
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Cannot create this link".to_string()),
+        OrganisationStatus::Unsupported => entry
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Not supported for linked libraries".to_string()),
     }
 }
 
@@ -1589,5 +1785,151 @@ mod tests {
                 .is_err(),
             "create_new must refuse a symlinked path"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Build linked library (GUI mode mapping, wording, root selection)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_confirmation_phrase_says_create_links_for_linked_library() {
+        assert_eq!(
+            apply_confirmation_phrase(OrganisationMode::BuildLinkedLibrary, 2),
+            "CREATE 2 LINKS"
+        );
+        // Existing modes keep their truthful wording.
+        assert_eq!(
+            apply_confirmation_phrase(OrganisationMode::OrganiseSymlinkOnly, 1),
+            "MOVE 1 FILES"
+        );
+        assert_eq!(
+            apply_confirmation_phrase(OrganisationMode::MoveRealFile, 3),
+            "MOVE 3 FILES"
+        );
+    }
+
+    #[test]
+    fn the_symlink_object_mode_is_labelled_advanced_and_the_new_mode_is_distinct() {
+        assert_eq!(
+            organisation_mode_plain_label(OrganisationMode::OrganiseSymlinkOnly),
+            "Advanced: reorganise existing symlinks"
+        );
+        assert_eq!(
+            organisation_mode_plain_label(OrganisationMode::BuildLinkedLibrary),
+            "Build linked library"
+        );
+    }
+
+    #[test]
+    fn linked_library_mode_uses_the_explicit_library_root_not_the_master_root() {
+        let mut state = RomOrganisationPageState::default();
+        // Set directly (no config write): the master root stays session-only.
+        state.saved_master_root = Some(PathBuf::from("/master/roms"));
+        assert_eq!(state.effective_root(), Some(PathBuf::from("/master/roms")));
+
+        state.set_mode(OrganisationMode::BuildLinkedLibrary);
+        // Not yet chosen: no effective root, no inference from sources.
+        assert_eq!(state.effective_root(), None);
+
+        state.library_root_draft = "/mnt/emuwiz-library".to_string();
+        state.save_library_root();
+        assert_eq!(
+            state.effective_root(),
+            Some(PathBuf::from("/mnt/emuwiz-library"))
+        );
+        // The master ROM root config was never overwritten.
+        assert_eq!(state.saved_master_root, Some(PathBuf::from("/master/roms")));
+
+        // A relative path is refused.
+        state.library_root_draft = "relative/path".to_string();
+        state.save_library_root();
+        assert!(state.library_root_error.is_some());
+        assert_eq!(
+            state.effective_root(),
+            Some(PathBuf::from("/mnt/emuwiz-library"))
+        );
+    }
+
+    fn linked_library_plan_entry(status: OrganisationStatus) -> OrganisationPlanEntry {
+        OrganisationPlanEntry {
+            source_path: PathBuf::from("/sources/Combat.bin"),
+            destination_path: PathBuf::from("/library/atari2600/Combat.bin"),
+            platform: Some("Atari 2600".to_string()),
+            platform_display_name: "Atari 2600".to_string(),
+            platform_source: "Manual".to_string(),
+            slug: Some("atari2600".to_string()),
+            mode: OrganisationMode::BuildLinkedLibrary,
+            content_classification: None,
+            original_metadata: Default::default(),
+            status,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn linked_library_preview_results_are_plain_english_never_rename_or_move() {
+        let result = linked_library_preview_result(&linked_library_plan_entry(
+            OrganisationStatus::Suggested,
+        ));
+        assert_eq!(result, "Will create link");
+        assert!(!result.to_lowercase().contains("rename"));
+        assert!(!result.to_lowercase().contains("move"));
+
+        assert_eq!(
+            linked_library_preview_result(&linked_library_plan_entry(
+                OrganisationStatus::AlreadyOrganised
+            )),
+            "Already present; nothing to do"
+        );
+
+        let conflict =
+            linked_library_preview_result(&linked_library_plan_entry(OrganisationStatus::Conflict));
+        assert!(!conflict.is_empty());
+    }
+
+    #[test]
+    fn a_linked_library_plan_renders_source_destination_and_untouched_wording() {
+        let mut state = RomOrganisationPageState::default();
+        state.mode = OrganisationMode::BuildLinkedLibrary;
+        let library_root = test_root("linked-lib-preview").join("library");
+        state.saved_library_root = Some(library_root.clone());
+        state.plan_generation = 1;
+        state.plan = Some(OrganisationPlan {
+            master_root: library_root.clone(),
+            mode: OrganisationMode::BuildLinkedLibrary,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+            generation: 1,
+            entries: vec![OrganisationPlanEntry {
+                source_path: PathBuf::from("/sources/Combat.bin"),
+                destination_path: library_root.join("atari2600").join("Combat (USA).bin"),
+                platform: Some("Atari 2600".to_string()),
+                platform_display_name: "Atari 2600".to_string(),
+                platform_source: "Manual".to_string(),
+                slug: Some("atari2600".to_string()),
+                mode: OrganisationMode::BuildLinkedLibrary,
+                content_classification: None,
+                original_metadata: Default::default(),
+                status: OrganisationStatus::Suggested,
+                reason: None,
+            }],
+        });
+        state.approved.insert("/sources/Combat.bin".to_string());
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Source: /sources/Combat.bin"
+        ));
+        assert!(rendered_text_contains(&output, "Destination link:"));
+        assert!(rendered_text_contains(&output, "Source action: Untouched"));
+        assert!(rendered_text_contains(&output, "Result: Will create link"));
+        // The linked-library preview never shows a rename/move arrow row.
+        assert!(!rendered_text_contains(&output, "/sources/Combat.bin → "));
     }
 }

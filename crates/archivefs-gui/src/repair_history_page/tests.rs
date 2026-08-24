@@ -472,6 +472,7 @@ fn bare_transaction(
         source_scan_root: "/tmp/roms".to_string(),
         state: tx_state,
         entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
             source_path: PathBuf::from("/tmp/roms/a.bin"),
             destination_path: PathBuf::from("/tmp/roms/A.bin"),
             original_basename: "a.bin".to_string(),
@@ -507,6 +508,7 @@ fn bare_entry(
     entry_state: EntryState,
 ) -> archivefs_core::dat::rename_apply::TransactionEntry {
     archivefs_core::dat::rename_apply::TransactionEntry {
+        operation: Default::default(),
         source_path: PathBuf::from(format!("/tmp/roms/{original_basename}")),
         destination_path: PathBuf::from(format!("/tmp/roms/{proposed_basename}")),
         original_basename: original_basename.to_string(),

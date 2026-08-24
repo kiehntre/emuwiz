@@ -6,7 +6,7 @@
 //! assignment, and a status. Generating a plan never creates, moves, renames
 //! or deletes anything; only an explicitly approved transaction may mutate.
 //!
-//! The three organisation modes are separate, explicit user choices and are
+//! The four organisation modes are separate, explicit user choices and are
 //! never combined implicitly:
 //!
 //! - [`OrganisationMode::RenameInPlace`] renames the file to its canonical
@@ -14,7 +14,10 @@
 //! - [`OrganisationMode::MoveRealFile`] moves the real file into the
 //!   canonical platform directory under the master ROM root;
 //! - [`OrganisationMode::OrganiseSymlinkOnly`] moves only the symlink *object*
-//!   (never dereferencing or touching its target).
+//!   (never dereferencing or touching its target);
+//! - [`OrganisationMode::BuildLinkedLibrary`] leaves every regular source
+//!   exactly where it is and plans a symlink at the canonical destination
+//!   beneath an explicitly chosen linked-library root.
 
 use std::path::PathBuf;
 
@@ -35,6 +38,11 @@ pub enum OrganisationMode {
     /// Move only the symlink object into the canonical platform directory;
     /// the link target is never dereferenced or touched.
     OrganiseSymlinkOnly,
+    /// Build an organised library of links: every safe regular source stays
+    /// exactly where it is and the canonical organised destination becomes a
+    /// symlink pointing to it (`CreateSymlink` transaction entries under an
+    /// explicitly chosen linked-library root).
+    BuildLinkedLibrary,
 }
 
 impl OrganisationMode {
@@ -42,8 +50,17 @@ impl OrganisationMode {
         match self {
             Self::RenameInPlace => "Rename in place",
             Self::MoveRealFile => "Move real file",
-            Self::OrganiseSymlinkOnly => "Organise symlink only",
+            Self::OrganiseSymlinkOnly => "Advanced: reorganise existing symlinks",
+            Self::BuildLinkedLibrary => "Build linked library",
         }
+    }
+
+    /// Whether this mode mutates the source object itself. Only the linked-
+    /// library mode leaves every original file exactly where it is; its
+    /// mutation is confined to creating links beneath the approved library
+    /// root.
+    pub fn leaves_sources_untouched(self) -> bool {
+        matches!(self, Self::BuildLinkedLibrary)
     }
 }
 
