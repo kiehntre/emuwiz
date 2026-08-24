@@ -3300,3 +3300,106 @@ fn beginner_failure_result_names_failed_stage_and_live_target() {
         );
     }
 }
+
+// --- Launch Readiness: MainView::Selected wires real Dolphin profile input ---
+//
+// Regression test for the audited bug: `build_launch_readiness_input` used
+// to pass `&[]` for standalone profiles, so a genuinely eligible, on-disk
+// Dolphin profile could never become a `LaunchTarget::Standalone` candidate
+// on the Selected page. This drives the exact private `App` method
+// `main.rs`'s Selected-page render branch calls, with a real discovered
+// `DolphinLocalProfile` (real files on disk, matching what
+// `resolve_dolphin_native_launch_binding` itself would later re-verify) -
+// never a hand-built `LaunchPlan`/`StandaloneProfileInput`.
+
+fn ready_selected_evidence_state(
+    path: &std::path::Path,
+) -> selected_evidence_page::SelectedEvidenceState {
+    let identity_result =
+        archivefs_core::platform_evidence_fusion::identity_orchestrator::inspect_identity(
+            archivefs_core::platform_evidence_fusion::identity_orchestrator::IdentityInspectionInput::default(),
+        );
+    let identity =
+        archivefs_core::platform_evidence_fusion::identity_presentation::present_identity(
+            &identity_result,
+        );
+    selected_evidence_page::SelectedEvidenceState::Ready {
+        generation: 0,
+        report: Box::new(selected_evidence_page::SelectedEvidenceReport {
+            path: path.to_path_buf(),
+            structural_facts: Vec::new(),
+            identity,
+            identity_result,
+            hashes: None,
+            no_intro: selected_evidence_page::NoIntroLookupResult::NotImported,
+            base_observations: Vec::new(),
+        }),
+        hasheous: selected_evidence_page::HasheousState::default(),
+    }
+}
+
+#[test]
+fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_not_an_empty_slice()
+{
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-selected-dolphin-launch-readiness-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("Dolphin.ini"), b"[Core]\n").unwrap();
+
+    let mut app = dolphin_workflow_with_matched_identity(&directory, "GALE01");
+    app.selected_evidence = ready_selected_evidence_state(Path::new("/roms/a.zip"));
+
+    let roots = archivefs_core::patch_manager::DolphinLocalDiscoveryRoots {
+        home: directory.join("home"),
+        xdg_config_home: directory.join("config"),
+        xdg_data_home: directory.join("data"),
+        explicit_configuration_roots: vec![directory.clone()],
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: Vec::new(),
+        known_version_outputs: std::collections::BTreeMap::new(),
+        appimage_directory: None,
+        dolphin_emu_userpath_override: None,
+    };
+    let discovery = archivefs_core::patch_manager::discover_dolphin_local_profiles(&roots);
+    let profile_id = format!("dolphin:{}", directory.display());
+    assert!(
+        discovery
+            .profiles
+            .iter()
+            .any(|profile| profile.profile_id == profile_id && profile.eligible),
+        "fixture profile must be discovered and eligible"
+    );
+    app.dolphin_local_profiles =
+        DolphinLocalProfilesState::Ready(DolphinLocalProfilesReady { discovery, roots });
+
+    let live = match &app.state {
+        LoadState::Ready(data) => Some(data.as_ref()),
+        _ => None,
+    };
+    let input = app.build_launch_readiness_input(live);
+
+    let launch_readiness_page::LaunchReadinessInput::Plan { plan, dolphin } = input else {
+        panic!("a resolved GameCube identity with RetroArch scanned must produce a Plan");
+    };
+    assert!(
+        dolphin.is_some(),
+        "the real discovered Dolphin profile must be threaded into the panel, not omitted"
+    );
+    assert!(
+        plan.candidates.iter().any(|candidate| matches!(
+            &candidate.target,
+            archivefs_core::launch::LaunchTarget::Standalone {
+                adapter_id: "dolphin",
+                profile_id: candidate_profile_id,
+                ..
+            } if *candidate_profile_id == profile_id
+        )),
+        "the real discovered Dolphin profile must become a Standalone launch candidate, \
+         never silently dropped by an empty standalone-profiles slice"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}

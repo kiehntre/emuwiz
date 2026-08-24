@@ -3719,6 +3719,12 @@ struct ArchiveFsApp {
     pcsx2_profiles: Pcsx2ProfilesState,
     /// Read-only Dolphin profile discovery shared by GameCube and Wii archives.
     dolphin_profiles: DolphinProfilesState,
+    /// Modern-model Dolphin profile discovery Launch Readiness uses to
+    /// build a native launch binding - see [`DolphinLocalProfilesState`]'s
+    /// own doc comment for why this is a separate scan from
+    /// `dolphin_profiles`. Triggered automatically once the Selected page
+    /// is shown, mirroring the existing Dolphin-Cheats-workflow auto-scan.
+    dolphin_local_profiles: DolphinLocalProfilesState,
     /// Explicit-directory-only Xenia Canary profile discovery.
     xenia_profiles: XeniaProfilesState,
     /// Per-emulator remembered profile choices, loaded once at startup
@@ -3743,6 +3749,9 @@ struct ArchiveFsApp {
     /// must still be reaped/shown correctly even after the user selects a
     /// different game.
     launch_retroarch: launch_readiness_page::RetroArchLaunchState,
+    /// The Launch Readiness panel's "Launch Dolphin" tracker - the same
+    /// reasoning as `launch_retroarch` above applies unchanged.
+    launch_dolphin: launch_readiness_page::DolphinLaunchState,
     /// A tentative archive choice is isolated here until the picker is
     /// applied. It never mutates Library focus or multi-selection.
     cheat_archive_picker: Option<CheatArchivePickerState>,
@@ -4272,12 +4281,14 @@ impl ArchiveFsApp {
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
+            dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
             cheat_workflow: None,
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
+            launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
@@ -5480,14 +5491,53 @@ impl ArchiveFsApp {
             },
         };
 
+        // Real, already-discovered Dolphin profiles only - never a
+        // fabricated `StandaloneProfileInput`. `DolphinLocalProfilesState`
+        // starting `NotScanned`/`Scanning`/`Error` simply contributes no
+        // Dolphin candidate yet (the same honest, fail-closed shape as an
+        // empty slice), rather than blocking the whole panel the way a
+        // missing RetroArch scan does - Dolphin readiness is additive here.
+        let dolphin_context = match &self.dolphin_local_profiles {
+            DolphinLocalProfilesState::Ready(ready) => {
+                Some(launch_readiness_page::DolphinLaunchContext {
+                    discovery: ready.discovery.clone(),
+                    roots: ready.roots.clone(),
+                })
+            }
+            DolphinLocalProfilesState::NotScanned
+            | DolphinLocalProfilesState::Scanning { .. }
+            | DolphinLocalProfilesState::Error(_) => None,
+        };
+        let dolphin_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
+            dolphin_context
+                .as_ref()
+                .map(|context| {
+                    context
+                        .discovery
+                        .profiles
+                        .iter()
+                        .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                            adapter_id: "dolphin",
+                            profile_id: profile.profile_id.clone(),
+                            profile_path: Some(profile.configuration_root.clone()),
+                            eligible: profile.eligible,
+                            firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
         let plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
-            &[],
+            &dolphin_standalone_profiles,
             &discovery.environment,
             &[],
         );
-        LaunchReadinessInput::Plan(plan)
+        LaunchReadinessInput::Plan {
+            plan,
+            dolphin: dolphin_context,
+        }
     }
 
     fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
@@ -13486,6 +13536,58 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Starts the modern-model Dolphin profile discovery Launch Readiness
+    /// needs to build a native launch binding - see
+    /// [`DolphinLocalProfilesState`]'s own doc comment. Read-only: probes
+    /// only known XDG/Flatpak paths and any explicit roots already
+    /// remembered, never writes anything.
+    fn start_dolphin_local_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.dolphin_local_profiles = DolphinLocalProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result =
+                archivefs_core::patch_manager::DolphinLocalDiscoveryRoots::from_environment()
+                    .map_err(|error| error.to_string())
+                    .map(|roots| {
+                        let discovery =
+                            archivefs_core::patch_manager::discover_dolphin_local_profiles(&roots);
+                        DolphinLocalProfilesReady { discovery, roots }
+                    });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_dolphin_local_profiles(&mut self) {
+        if let DolphinLocalProfilesState::Scanning { receiver } = &self.dolphin_local_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(ready)) => {
+                    self.dolphin_local_profiles = DolphinLocalProfilesState::Ready(ready);
+                }
+                Ok(Err(message)) => {
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::DolphinProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("Dolphin launch-profile discovery failed: {message}"),
+                    ));
+                    self.dolphin_local_profiles = DolphinLocalProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    let message = "Dolphin profile discovery stopped unexpectedly.".to_string();
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::DolphinProfileScan,
+                        None,
+                        ActivityOutcome::Failed,
+                        format!("Dolphin launch-profile discovery failed: {message}"),
+                    ));
+                    self.dolphin_local_profiles = DolphinLocalProfilesState::Error(message);
+                }
+            }
+        }
+    }
+
     /// Starts a background RetroArch profile discovery scan - blocking
     /// filesystem probing, so it never runs on the UI thread, exactly
     /// like every other workflow. The result replaces the previous
@@ -14556,6 +14658,7 @@ impl ArchiveFsApp {
         self.poll_retroarch_profiles();
         self.poll_pcsx2_profiles();
         self.poll_dolphin_profiles();
+        self.poll_dolphin_local_profiles();
         self.poll_cheat_workflow(context);
         if matches!(self.view, MainView::Sources | MainView::CheatsMods)
             && matches!(self.bsfree_manager, BsFreeManagerState::NotLoaded)
@@ -15973,6 +16076,16 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::Selected {
+                    // `NotScanned` only (never retried on `Error` here) -
+                    // this branch runs every frame the Selected page is
+                    // shown, so retrying on `Error` each frame would spin
+                    // up a new discovery thread every frame forever.
+                    if matches!(
+                        self.dolphin_local_profiles,
+                        DolphinLocalProfilesState::NotScanned
+                    ) {
+                        self.start_dolphin_local_profile_scan(context.clone());
+                    }
                     let live = match &self.state {
                         LoadState::Ready(data) => Some(data.as_ref()),
                         _ => None,
@@ -16016,10 +16129,17 @@ impl ArchiveFsApp {
                     if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
                         ui.ctx().request_repaint();
                     }
+                    // Same reasoning as `launch_retroarch` above: drained
+                    // unconditionally so a tracked Dolphin launch is still
+                    // reaped even after the user selects a different game.
+                    if self.launch_dolphin.poll() || self.launch_dolphin.is_active() {
+                        ui.ctx().request_repaint();
+                    }
                     launch_readiness_page::show_launch_readiness_panel(
                         ui,
                         &launch_readiness_input,
                         &mut self.launch_retroarch,
+                        &mut self.launch_dolphin,
                     );
                     ui.add_space(crate::ui::theme::SECTION_GAP);
                     let identity_sources_action = identity_sources_page::show_identity_sources_panel(
@@ -28424,6 +28544,27 @@ enum DolphinProfilesState {
         receiver: Receiver<Result<DolphinProfileDiscovery, String>>,
     },
     Ready(DolphinProfileDiscovery),
+    Error(String),
+}
+
+/// Discovery for the modern [`archivefs_core::patch_manager::DolphinLocalProfile`]
+/// model that [`archivefs_core::patch_manager::resolve_dolphin_native_launch_binding`]
+/// consumes - distinct from [`DolphinProfilesState`]'s older
+/// [`DolphinProfile`]/[`discover_dolphin_profiles`] pipeline (used by
+/// Cheats & Mods), which cannot produce a launch binding. Launch Readiness
+/// is the only reader of this state; scanning it never touches the Cheats &
+/// Mods workflow.
+struct DolphinLocalProfilesReady {
+    discovery: archivefs_core::patch_manager::DolphinLocalProfileDiscovery,
+    roots: archivefs_core::patch_manager::DolphinLocalDiscoveryRoots,
+}
+
+enum DolphinLocalProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<DolphinLocalProfilesReady, String>>,
+    },
+    Ready(DolphinLocalProfilesReady),
     Error(String),
 }
 
