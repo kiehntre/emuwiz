@@ -407,6 +407,49 @@ mod tests {
     }
 
     #[test]
+    fn ps1_duckstation_verified_firmware_reaches_strict_ready() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let profile = duckstation_profile();
+        let profiles = [DiscoveredStandaloneProfile::DuckStation {
+            profile: &profile,
+            bios: DuckStationBiosState::Verified,
+        }];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::Ps1Serial("SLUS-12345".to_string())],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.summary.ready, 1);
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn ps1_duckstation_missing_firmware_is_blocked() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let profile = duckstation_profile();
+        let profiles = [DiscoveredStandaloneProfile::DuckStation {
+            profile: &profile,
+            bios: DuckStationBiosState::Missing,
+        }];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::Ps1Serial("SLUS-12345".to_string())],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.summary.blocked, 1);
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::RequiredFirmwareMissing)
+        );
+    }
+
+    #[test]
     fn ps2_pcsx2_missing_firmware_is_blocked() {
         let identity = resolved("PS2", "SLUS-98765");
         let profile = pcsx2_profile();

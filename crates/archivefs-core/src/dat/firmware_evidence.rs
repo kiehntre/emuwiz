@@ -32,7 +32,15 @@
 //! consumes it yet (see [`FirmwareSystem::Xbox`]'s own doc comment for the
 //! Xbox-specific caveat).
 
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use super::model::{DatEcosystem, DatGameEntry, DatSource, ParsedDat};
+use crate::identity_source::hashing::Crc32;
 
 /// A system whose firmware/BIOS this record describes.
 ///
@@ -262,6 +270,123 @@ pub fn ps2_bios_evidence_from_dat(
     parsed: &ParsedDat,
 ) -> Result<Vec<FirmwareIdentityRecord>, FirmwareEvidenceError> {
     redump_bios_evidence_from_dat(parsed, FirmwareSystem::PlayStation2)
+}
+
+// ---------------------------------------------------------------------------
+// Shared local-file hashing/matching primitives
+// ---------------------------------------------------------------------------
+//
+// The remainder of this module is the one shared implementation of "hash a
+// local firmware/BIOS file and compare it against `FirmwareIdentityRecord`
+// evidence" - originally written once for PCSX2 BIOS verification
+// (`patch_manager::pcsx2_firmware`) and extracted here so DuckStation BIOS
+// verification (`patch_manager::duckstation_firmware`) reuses the exact
+// same safe-open/streamed-hash/deterministic-match code rather than a
+// second, parallel copy. Every emulator-specific module still owns its own
+// selection policy (which file counts as "the configured BIOS") - only the
+// hashing and matching are shared here.
+
+/// One local file's computed size/CRC32/MD5/SHA-1 - the same four fields
+/// every [`FirmwareIdentityRecord`] carries, so a caller can compare them
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputedFirmwareDigests {
+    pub size_bytes: u64,
+    pub crc32: String,
+    pub md5: String,
+    pub sha1: String,
+}
+
+/// Safely opens (refusing a symlink via `O_NOFOLLOW` on Unix, and refusing
+/// a non-regular file even where that flag is unavailable), then streams
+/// `path` in `chunk_bytes`-sized reads to compute CRC32/MD5/SHA-1
+/// simultaneously. Refuses a file above `max_bytes` before reading its
+/// contents, and refuses a file whose size changed while being read.
+pub fn hash_firmware_file(
+    path: &Path,
+    max_bytes: u64,
+    chunk_bytes: usize,
+) -> Result<ComputedFirmwareDigests, String> {
+    use md5::Md5;
+    use sha1::Sha1;
+    use sha1::digest::Digest;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("firmware file could not be opened safely: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("firmware file could not be inspected: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("firmware file changed identity before it could be safely hashed".to_string());
+    }
+    let size_bytes = metadata.len();
+    if size_bytes > max_bytes {
+        return Err(format!(
+            "firmware file is {size_bytes} bytes, above the {max_bytes}-byte bound for this \
+             kind of firmware dump"
+        ));
+    }
+
+    let mut crc = Crc32::new();
+    let mut md5 = Md5::new();
+    let mut sha1 = Sha1::new();
+    let mut buffer = vec![0_u8; chunk_bytes.max(1)];
+    let mut total: u64 = 0;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("firmware file could not be read: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        crc.update(chunk);
+        md5.update(chunk);
+        sha1.update(chunk);
+        total += read as u64;
+    }
+    if total != size_bytes {
+        return Err("firmware file changed size while it was being read".to_string());
+    }
+
+    Ok(ComputedFirmwareDigests {
+        size_bytes: total,
+        crc32: crc.finish_hex(),
+        md5: firmware_hex(&md5.finalize()),
+        sha1: firmware_hex(&sha1.finalize()),
+    })
+}
+
+fn firmware_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Every evidence record whose size/CRC32/MD5/SHA-1 all agree with
+/// `digests`, sorted deterministically by `(name, description)` so that if
+/// more than one record happens to be identical (the same physical dump
+/// catalogued under more than one entry), the same one is always chosen.
+pub fn matching_firmware_records<'a>(
+    digests: &ComputedFirmwareDigests,
+    evidence: &'a [FirmwareIdentityRecord],
+) -> Vec<&'a FirmwareIdentityRecord> {
+    let mut matches: Vec<&FirmwareIdentityRecord> = evidence
+        .iter()
+        .filter(|record| {
+            record.size_bytes == digests.size_bytes
+                && record.crc32.eq_ignore_ascii_case(&digests.crc32)
+                && record.md5.eq_ignore_ascii_case(&digests.md5)
+                && record.sha1.eq_ignore_ascii_case(&digests.sha1)
+        })
+        .collect();
+    matches.sort_by(|left, right| {
+        (&left.name, &left.description).cmp(&(&right.name, &right.description))
+    });
+    matches
 }
 
 #[cfg(test)]

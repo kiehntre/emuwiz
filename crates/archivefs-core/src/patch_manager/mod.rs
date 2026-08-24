@@ -45,6 +45,7 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod dolphin_texture_mod;
+mod duckstation_firmware;
 mod duckstation_local;
 mod emulator_profile_memory;
 mod emulator_request_bridge;
@@ -332,6 +333,11 @@ pub use dolphin_texture_mod::{
     DolphinTextureModSource, build_dolphin_texture_mod_preview,
     dolphin_texture_mod_destination_root, validate_dolphin_texture_source,
     verified_dolphin_texture_identity,
+};
+pub use duckstation_firmware::{
+    DuckStationBiosVerificationOutcome, DuckStationGameInspectionWithFirmware, DuckStationRegion,
+    DuckStationVerifiedBios, inspect_duckstation_game_with_firmware_evidence,
+    resolve_duckstation_bios,
 };
 pub use duckstation_local::{
     DUCKSTATION_MAX_CHEAT_BYTES, DUCKSTATION_MAX_CONFIG_BYTES, DUCKSTATION_MAX_DIRECTORY_ENTRIES,

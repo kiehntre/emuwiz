@@ -222,6 +222,12 @@ pub struct DuckStationConfigInspection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DuckStationBiosState {
+    /// A trusted hash source confirmed this exact file - see
+    /// `patch_manager::duckstation_firmware::resolve_duckstation_bios`,
+    /// which is the only place this variant is ever produced. Never
+    /// produced by this module itself (filename/existence alone never
+    /// verifies a BIOS) - see [`Self::PresentUnverified`].
+    Verified,
     Unknown,
     Missing,
     PresentUnverified,
@@ -315,6 +321,11 @@ pub struct DuckStationGameInspection {
     pub textures: Option<DuckStationTextureInventory>,
     pub memory_cards: Option<DuckStationMemoryCardInventory>,
     pub save_states: Option<DuckStationSaveStateInventory>,
+    /// The configured BIOS path (if any) and its presence-only state -
+    /// exposed here (mirroring `Pcsx2GameInspection::bios`) so a firmware
+    /// verifier can locate the exact file to hash without re-parsing
+    /// configuration itself. See `patch_manager::duckstation_firmware`.
+    pub bios: DuckStationBiosInventory,
     pub health: DuckStationHealth,
 }
 
@@ -510,6 +521,7 @@ pub fn inspect_duckstation_game(
         textures,
         memory_cards,
         save_states,
+        bios,
         health,
     }
 }

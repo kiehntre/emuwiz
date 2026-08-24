@@ -193,12 +193,15 @@ impl LaunchWarning {
     }
 }
 
-/// Projects [`DuckStationBiosState`] onto [`FirmwareReadiness`]. DuckStation
-/// declares no `Verified` state today (see that enum's own doc comment for
-/// why), so this can currently only ever answer `PresentUnverified`,
-/// `Missing`, or `Unknown` - never silently invents a `Verified` result.
+/// Projects [`DuckStationBiosState`] onto [`FirmwareReadiness`]. `Verified`
+/// stays `Verified` (produced only by
+/// `patch_manager::duckstation_firmware::resolve_duckstation_bios`'s real
+/// Redump-backed hash verification, never by this projection); `Unknown`
+/// is honest uncertainty, not a proven absence, so it never becomes
+/// `Missing`.
 pub fn duckstation_firmware_readiness(state: DuckStationBiosState) -> FirmwareReadiness {
     match state {
+        DuckStationBiosState::Verified => FirmwareReadiness::Verified,
         DuckStationBiosState::PresentUnverified => FirmwareReadiness::PresentUnverified,
         DuckStationBiosState::Missing => FirmwareReadiness::Missing,
         DuckStationBiosState::Unknown => FirmwareReadiness::Unknown,
@@ -309,7 +312,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn duckstation_projection_never_produces_verified() {
+    fn duckstation_projection_matches_every_state() {
+        assert_eq!(
+            duckstation_firmware_readiness(DuckStationBiosState::Verified),
+            FirmwareReadiness::Verified
+        );
         assert_eq!(
             duckstation_firmware_readiness(DuckStationBiosState::PresentUnverified),
             FirmwareReadiness::PresentUnverified

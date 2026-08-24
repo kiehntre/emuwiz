@@ -32,15 +32,13 @@
 //! only reports `Verified` when *exactly one* of them matches the supplied
 //! evidence - see [`Pcsx2BiosVerificationOutcome::Ambiguous`].
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
-use crate::dat::firmware_evidence::FirmwareIdentityRecord;
-use crate::identity_source::hashing::Crc32;
+use crate::dat::firmware_evidence::{
+    ComputedFirmwareDigests, FirmwareIdentityRecord, hash_firmware_file, matching_firmware_records,
+};
 
 use super::pcsx2_local::{
     Pcsx2BiosVerification, Pcsx2Config, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2Profile,
@@ -120,98 +118,6 @@ impl Pcsx2BiosVerificationOutcome {
     }
 }
 
-struct ComputedDigests {
-    size_bytes: u64,
-    crc32: String,
-    md5: String,
-    sha1: String,
-}
-
-fn hash_bios_file(path: &Path) -> Result<ComputedDigests, String> {
-    use md5::Md5;
-    use sha1::Sha1;
-    use sha1::digest::Digest;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = options
-        .open(path)
-        .map_err(|error| format!("BIOS file could not be opened safely: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("BIOS file could not be inspected: {error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("BIOS file changed identity before it could be safely hashed".to_string());
-    }
-    let size_bytes = metadata.len();
-    if size_bytes > MAX_BIOS_HASH_BYTES {
-        return Err(format!(
-            "BIOS file is {size_bytes} bytes, above the {MAX_BIOS_HASH_BYTES}-byte bound for a \
-             PS2 BIOS dump"
-        ));
-    }
-
-    let mut crc = Crc32::new();
-    let mut md5 = Md5::new();
-    let mut sha1 = Sha1::new();
-    let mut buffer = vec![0_u8; HASH_CHUNK_BYTES];
-    let mut total: u64 = 0;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("BIOS file could not be read: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        let chunk = &buffer[..read];
-        crc.update(chunk);
-        md5.update(chunk);
-        sha1.update(chunk);
-        total += read as u64;
-    }
-    if total != size_bytes {
-        return Err("BIOS file changed size while it was being read".to_string());
-    }
-
-    Ok(ComputedDigests {
-        size_bytes: total,
-        crc32: crc.finish_hex(),
-        md5: hex(&md5.finalize()),
-        sha1: hex(&sha1.finalize()),
-    })
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Every evidence record whose size/CRC32/MD5/SHA-1 all agree with
-/// `digests`, sorted deterministically by `(name, description)` so that if
-/// more than one record in the evidence happens to be identical (the same
-/// physical dump catalogued under more than one entry), the same one is
-/// always chosen and reported - see the module's own "multiple identical
-/// matching records" test.
-fn matching_records<'a>(
-    digests: &ComputedDigests,
-    evidence: &'a [FirmwareIdentityRecord],
-) -> Vec<&'a FirmwareIdentityRecord> {
-    let mut matches: Vec<&FirmwareIdentityRecord> = evidence
-        .iter()
-        .filter(|record| {
-            record.size_bytes == digests.size_bytes
-                && record.crc32.eq_ignore_ascii_case(&digests.crc32)
-                && record.md5.eq_ignore_ascii_case(&digests.md5)
-                && record.sha1.eq_ignore_ascii_case(&digests.sha1)
-        })
-        .collect();
-    matches.sort_by(|left, right| {
-        (&left.name, &left.description).cmp(&(&right.name, &right.description))
-    });
-    matches
-}
-
 /// Verifies exactly one selected local BIOS path against `evidence`. Never
 /// follows a symlink, never reads a non-regular file, never reports
 /// `Verified` on a partial match.
@@ -242,11 +148,12 @@ fn verify_one_bios_path(
             detail: "BIOS path is not a regular file".to_string(),
         };
     }
-    let digests = match hash_bios_file(path) {
-        Ok(digests) => digests,
-        Err(detail) => return Pcsx2BiosVerificationOutcome::Unreadable { detail },
-    };
-    match matching_records(&digests, evidence).first() {
+    let digests: ComputedFirmwareDigests =
+        match hash_firmware_file(path, MAX_BIOS_HASH_BYTES, HASH_CHUNK_BYTES) {
+            Ok(digests) => digests,
+            Err(detail) => return Pcsx2BiosVerificationOutcome::Unreadable { detail },
+        };
+    match matching_firmware_records(&digests, evidence).first() {
         Some(record) => Pcsx2BiosVerificationOutcome::Verified(Pcsx2VerifiedBios {
             path: path.to_path_buf(),
             size_bytes: digests.size_bytes,

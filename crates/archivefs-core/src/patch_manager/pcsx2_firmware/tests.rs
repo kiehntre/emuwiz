@@ -12,7 +12,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::*;
 use crate::dat::firmware_evidence::FirmwareSystem;
 use crate::dat::model::DatEcosystem;
+use crate::identity_source::hashing::Crc32;
 use crate::patch_manager::pcsx2_local::Pcsx2Settings;
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
