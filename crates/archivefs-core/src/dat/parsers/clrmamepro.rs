@@ -29,6 +29,7 @@ use super::super::model::{
     DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
 };
 use super::super::parser::{DiagnosticSeverity, ParseError, ParseOutcome, ParseWarning};
+use encoding_rs::WINDOWS_1252;
 
 pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
@@ -44,14 +45,39 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         });
     }
 
-    let content = fs::read_to_string(path).map_err(|error| ParseError::Io {
+    let bytes = fs::read(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
     })?;
+    // ClrMamePro DATs are line-oriented legacy catalogue files.  Real-world
+    // preservation catalogues sometimes retain Windows-1252 game titles
+    // (for example `ü`) while their checksum syntax remains ASCII.  Keep
+    // UTF-8 as the normal path, but decode this format's legacy text
+    // deterministically rather than rejecting an otherwise valid catalogue.
+    // Logiqx/XML is intentionally not relaxed here.
+    let (content, decoded_windows_1252) = match String::from_utf8(bytes) {
+        Ok(content) => (content, false),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            let (decoded, _, _) = WINDOWS_1252.decode(&bytes);
+            (decoded.into_owned(), true)
+        }
+    };
 
     let lines: Vec<&str> = content.lines().collect();
 
     let mut warnings: Vec<ParseWarning> = Vec::new();
+    if decoded_windows_1252 {
+        warnings.push(ParseWarning {
+            byte_offset: None,
+            line: None,
+            column: None,
+            context: String::new(),
+            message: "decoded non-UTF-8 ClrMamePro text as Windows-1252".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            code: "legacy_windows_1252",
+        });
+    }
     let push_warning = |warnings: &mut Vec<ParseWarning>, offset: usize, msg: &str| {
         if warnings.len() < limits.max_warnings {
             let line_num = lines
@@ -878,6 +904,32 @@ mod tests {
         let limits = DatLimits::default();
         let result = parse_clrmamepro(&path, limits).unwrap();
         assert_eq!(result.dat.source.ecosystem, DatEcosystem::Tosec);
+    }
+
+    #[test]
+    fn legacy_windows_1252_catalogue_text_preserves_checksums_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.dat");
+        let mut bytes = b"clrmamepro (\n\tname Legacy\n)\ngame (\n\tname \"M".to_vec();
+        bytes.push(0xfc); // Windows-1252 'ü', not valid standalone UTF-8.
+        bytes.extend_from_slice(
+            b"nchen\"\n\trom ( name game.lha size 4 crc DEADBEEF md5 00000000000000000000000000000001 sha1 0000000000000000000000000000000000000001 )\n)\n",
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.games[0].name, "München");
+        assert_eq!(
+            result.dat.games[0].roms[0].sha1.as_deref(),
+            Some("0000000000000000000000000000000000000001")
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "legacy_windows_1252"),
+            "legacy decoding must be visible, never silent"
+        );
     }
 
     #[test]

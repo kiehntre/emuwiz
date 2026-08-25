@@ -46,6 +46,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{DatSourceKind, validation};
+use crate::dat::archive::lha::{LhaError, LhaProvider};
 use crate::dat::archive::limits::{ArchiveLimits, MAX_ARCHIVE_RUN_LOGICAL_BYTES};
 use crate::dat::archive::rar::{RarArchiveSource, RarError, RarProvider};
 use crate::dat::archive::sevenz::SevenZArchiveSource;
@@ -623,10 +624,13 @@ pub fn run_dat_audit(
 /// [`run_dat_audit`]: those formats have their own bounded evidence paths and
 /// must not gain a coincidental raw-container match. Combined audits also
 /// keep ZIP/7z outer bytes out until their member/set rules can merge several
-/// catalogues safely. Combined audits keep their *outer* ZIP/7z bytes out of
-/// loose-ROM evidence, then inspect their members through the bounded archive
-/// path. Each outer file remains visible as an unhashed, non-actionable report
-/// row rather than disappearing from the result.
+/// catalogues safely. A `.lha` is deliberately different: established
+/// WHDLoad catalogues such as the Retroplay-derived ClrMamePro DAT record the
+/// complete LHA package's size and cryptographic checksums. Its outer bytes
+/// are therefore valid catalogue evidence, provided a bounded LHA pass later
+/// confirms that the exact package is structurally safe. ZIP/7z outer files
+/// remain visible as unhashed, non-actionable report rows rather than
+/// disappearing from the result.
 struct HashedLocalScan {
     scan: LocalScan,
     known: Vec<KnownFileEvidence>,
@@ -726,11 +730,11 @@ fn collect_loose_file_evidence(
 }
 
 /// Runs one bounded scan/hash pass and compares each resulting evidence object
-/// with every supplied catalogue index. Loose files and bounded ZIP/7z member
-/// evidence use the same merge rules. CHD, RAR, and archive-set identity stay
-/// on their existing dedicated one-catalogue paths until their multi-catalogue
-/// merge rules are equally explicit. They are never promoted through a raw
-/// container hash here.
+/// with every supplied catalogue index. Loose files, whole-package LHA
+/// evidence, and bounded ZIP/7z member evidence use the same merge rules.
+/// CHD, RAR, and archive-set identity stay on their existing dedicated
+/// one-catalogue paths until their multi-catalogue merge rules are equally
+/// explicit. They are never promoted through a raw container hash here.
 pub fn run_combined_dat_audit(
     request: &CombinedDatAuditRequest,
     trusted: &TrustedRoots,
@@ -802,8 +806,50 @@ pub fn run_combined_dat_audit(
             verdict: combined.verdict,
         });
     }
-    let (archives, archive_bytes_hashed) =
-        audit_combined_archives(&hashed.scan.files, trusted, cancel, &loaded)?;
+    // An exact whole-package LHA match is meaningful only after the bounded
+    // LHA reader has confirmed that the package is structurally safe.  Keep
+    // this set narrow: an unmatched LHA does not trigger a costly member walk
+    // merely because it happens to have an `.lha` extension.
+    let exact_lha_paths: std::collections::BTreeSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| {
+            is_lha_path(Path::new(&entry.local_path))
+                && matches!(entry.verdict, AuditVerdict::Exact { .. })
+        })
+        .map(|entry| PathBuf::from(&entry.local_path))
+        .collect();
+    let (archives, archive_bytes_hashed) = audit_combined_archives(
+        &hashed.scan.files,
+        trusted,
+        cancel,
+        &loaded,
+        &exact_lha_paths,
+    )?;
+
+    // Never let a whole-package checksum turn malformed LHA bytes into a
+    // rename proposal.  The catalogue establishes identity; the bounded LHA
+    // pass establishes that the claimed package is actually a safe LHA.  A
+    // failed pass remains visible in `archives`, but loses exact-match
+    // authority in the flat report and rename planner.
+    let unsafe_exact_lha_paths: std::collections::BTreeSet<&Path> = archives
+        .iter()
+        .filter(|archive| {
+            archive.format == "lha"
+                && !matches!(archive.completion, ArchivePassCompletion::Complete)
+        })
+        .map(|archive| archive.archive_path.as_path())
+        .collect();
+    if !unsafe_exact_lha_paths.is_empty() {
+        for entry in &mut entries {
+            if unsafe_exact_lha_paths.contains(Path::new(&entry.local_path)) {
+                entry.verdict = AuditVerdict::NoUsableEvidence;
+            }
+        }
+        evidence_sources
+            .retain(|evidence| !unsafe_exact_lha_paths.contains(Path::new(&evidence.local_path)));
+        content_matches
+            .retain(|content| !unsafe_exact_lha_paths.contains(Path::new(&content.local_path)));
+    }
     let report = AuditReport {
         summary: combined_summary(&entries),
         entries,
@@ -843,6 +889,10 @@ struct LoadedCombinedCatalogue {
     names: Vec<String>,
     entries: usize,
     roms: usize,
+    /// Whether this catalogue could supply the legacy, internal-slave LHA
+    /// evidence path.  This is only a performance gate; every positive match
+    /// is still cryptographically checked by `merge_combined_evidence`.
+    may_match_lha_slave: bool,
 }
 
 fn load_combined_catalogue(
@@ -897,12 +947,18 @@ fn load_combined_catalogue(
     let Some(parsed) = merged else {
         return Err(failures.join("; "));
     };
+    let may_match_lha_slave = parsed.games.iter().flat_map(|game| &game.roms).any(|rom| {
+        Path::new(&rom.name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("slave"))
+    });
     Ok(LoadedCombinedCatalogue {
         source: source.clone(),
         entries: parsed.source.entry_count,
         roms: parsed.source.rom_count,
         index: DatIndex::build(&parsed),
         names,
+        may_match_lha_slave,
     })
 }
 
@@ -1062,33 +1118,65 @@ fn combined_content_match(
 ///
 /// RAR intentionally remains outside this combined slice: its existing
 /// provider is useful, but can require an external capability probe and has
-/// different operational behaviour. ZIP and 7z are fully in-process and
-/// already implement the common [`ArchiveMemberSource`] safety contract.
+/// different operational behaviour. LHA similarly uses the optional,
+/// fd-pinned local 7-Zip backend. It is opened only when an exact whole-LHA
+/// catalogue record already matched, or when an enabled catalogue explicitly
+/// contains `.slave` records for the optional internal-evidence path. ZIP and
+/// 7z are fully in-process; every accepted format nevertheless implements the
+/// same [`ArchiveMemberSource`] safety contract.
 fn audit_combined_archives(
     files: &[PathBuf],
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
     catalogues: &[LoadedCombinedCatalogue],
+    exact_lha_paths: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<(Vec<DatArchiveAudit>, u64), DatAuditError> {
     let mut archives = Vec::new();
     let mut bytes_hashed = 0_u64;
     let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
 
-    for path in files
+    let mut lha_provider: Option<Result<LhaProvider, LhaError>> = None;
+    let may_match_lha_slave = catalogues
         .iter()
-        .filter(|path| is_zip_path(path) || is_sevenz_path(path))
-    {
+        .any(|catalogue| catalogue.may_match_lha_slave);
+    for path in files.iter().filter(|path| {
+        is_zip_path(path)
+            || is_sevenz_path(path)
+            || (is_lha_path(path) && (exact_lha_paths.contains(*path) || may_match_lha_slave))
+    }) {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
-        let format_guess = if is_zip_path(path) { "zip" } else { "7z" };
+        let format_guess = if is_zip_path(path) {
+            "zip"
+        } else if is_sevenz_path(path) {
+            "7z"
+        } else {
+            "lha"
+        };
+        if is_lha_path(path) && lha_provider.is_none() {
+            lha_provider = Some(LhaProvider::discover(LHA_DISCOVERY_TIMEOUT));
+        }
         let identity_before = crate::dat::rename_apply::capture_identity(path).ok();
         let mut source: Box<dyn ArchiveMemberSource> = match if is_zip_path(path) {
             ZipArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
                 .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
-        } else {
+        } else if is_sevenz_path(path) {
             SevenZArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
                 .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+        } else {
+            match lha_provider.as_ref() {
+                Some(Ok(provider)) => provider
+                    .open(path, trusted, ArchiveLimits::default(), LHA_MEMBER_TIMEOUT)
+                    .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+                    .map_err(lha_open_error),
+                Some(Err(error)) => Err(ArchiveMemberSourceError::Unsupported {
+                    detail: format!("no capable LHA backend is available: {error}"),
+                }),
+                None => Err(ArchiveMemberSourceError::Unsupported {
+                    detail: "LHA backend was not probed for this run".to_string(),
+                }),
+            }
         } {
             Ok(source) => source,
             Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
@@ -1178,11 +1266,14 @@ fn audit_combined_archives(
 }
 
 /// The first combined-archive naming rule is deliberately narrower than the
-/// existing single-DAT set-completeness rule: it accepts only a complete,
+/// existing single-DAT set-completeness rule: ZIP/7z accepts only a complete,
 /// stable archive with exactly one decoded member and one agreed exact
-/// identity. Metadata, multiple game members, nested archives, and partial
-/// passes stay visible but non-actionable until their package semantics can
-/// be proven across catalogues.
+/// identity. A WHDLoad LHA package is a deliberate exception: it may contain
+/// supporting files and several disks, but can identify its outer package
+/// when exactly one safe, cryptographically matched `.slave` member names a
+/// game and no other exact member contradicts that game. Metadata, nested
+/// archives, partial passes, and conflicting game identities stay visible but
+/// non-actionable.
 fn combined_archive_identity(archive: &DatArchiveAudit) -> Option<CombinedArchiveIdentity> {
     if !matches!(archive.completion, ArchivePassCompletion::Complete)
         || archive.outer_identity.is_none()
@@ -1192,6 +1283,9 @@ fn combined_archive_identity(archive: &DatArchiveAudit) -> Option<CombinedArchiv
         })
     {
         return None;
+    }
+    if archive.format == "lha" {
+        return combined_lha_package_identity(archive);
     }
     let mut complete_members = archive
         .members
@@ -1212,6 +1306,85 @@ fn combined_archive_identity(archive: &DatArchiveAudit) -> Option<CombinedArchiv
     (!member.evidence_sources.is_empty()).then(|| CombinedArchiveIdentity {
         game_name: game_name.clone(),
         rom_name: rom_name.clone(),
+        member_name: member.evidence.member_name_display.clone(),
+        evidence_sources: member.evidence_sources.clone(),
+    })
+}
+
+/// WHDLoad packages normally contain disks, documentation, icons, and one or
+/// more slaves.  The primary Retroplay-derived catalogue path is an exact
+/// whole-package `.lha` checksum, evaluated as ordinary loose-file evidence
+/// before this function is reached.  This is the deliberately narrower
+/// secondary path for a catalogue that explicitly records internal slaves.
+/// Requiring a one-member archive would reject every legitimate package, but
+/// a filename is still not an identity. Any exact member resolving to a
+/// different game makes the whole package ambiguous rather than choosing the
+/// slave by convention.
+fn combined_lha_package_identity(archive: &DatArchiveAudit) -> Option<CombinedArchiveIdentity> {
+    let mut identity: Option<(&str, &str, &DatArchiveMemberAudit)> = None;
+    for member in &archive.members {
+        let Some(AuditVerdict::Exact {
+            game_name,
+            rom_name,
+            ..
+        }) = member.verdict.as_ref()
+        else {
+            continue;
+        };
+        if member.evidence_sources.is_empty() {
+            return None;
+        }
+        if member
+            .evidence
+            .member_name_display
+            .rsplit_once('.')
+            .is_none_or(|(_, extension)| !extension.eq_ignore_ascii_case("slave"))
+        {
+            // An exact non-slave is harmless only when it independently
+            // agrees with the one exact slave's game.  A disk archive can
+            // otherwise be a multi-title compilation.
+            if let Some((known_game, _, _)) = identity
+                && known_game != game_name
+            {
+                return None;
+            }
+            continue;
+        }
+        // The trusted catalogue must itself call the exact member a slave.
+        // A malicious package cannot turn an unrelated exact disk/ROM record
+        // into WHDLoad package authority merely by giving its member a
+        // `.slave` extension.
+        if rom_name
+            .rsplit_once('.')
+            .is_none_or(|(_, extension)| !extension.eq_ignore_ascii_case("slave"))
+        {
+            return None;
+        }
+        match identity {
+            Some((known_game, known_rom, _))
+                if known_game != game_name || known_rom != rom_name =>
+            {
+                return None;
+            }
+            Some(_) => return None,
+            None => identity = Some((game_name, rom_name, member)),
+        }
+    }
+    let (game_name, rom_name, member) = identity?;
+    // A slave was found after a prior exact non-slave. Check that that earlier
+    // member did not name another game; the loop cannot decide this until the
+    // slave identity exists.
+    if archive.members.iter().any(|candidate| {
+        matches!(
+            candidate.verdict.as_ref(),
+            Some(AuditVerdict::Exact { game_name: other, .. }) if other != game_name
+        )
+    }) {
+        return None;
+    }
+    Some(CombinedArchiveIdentity {
+        game_name: game_name.to_string(),
+        rom_name: rom_name.to_string(),
         member_name: member.evidence.member_name_display.clone(),
         evidence_sources: member.evidence_sources.clone(),
     })
@@ -1259,6 +1432,35 @@ const RAR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const RAR_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one RAR member-extraction child may take.
 const RAR_MEMBER_TIMEOUT: Duration = Duration::from_secs(120);
+/// LHA is decoded only through an optional locally installed 7-Zip backend;
+/// probe it once when an audit actually sees an `.lha`/`.lzh` package.
+const LHA_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A WHDLoad package can legitimately contain several floppy images, so allow
+/// the same supervised per-member envelope as the optional RAR backend.
+const LHA_MEMBER_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn lha_open_error(error: LhaError) -> ArchiveMemberSourceError {
+    match error {
+        LhaError::Cancelled => ArchiveMemberSourceError::Cancelled,
+        LhaError::RefusedLimits { reason } => ArchiveMemberSourceError::RefusedLimits { reason },
+        LhaError::BackendNotFound | LhaError::Unsupported { .. } => {
+            ArchiveMemberSourceError::Unsupported {
+                detail: error.to_string(),
+            }
+        }
+        LhaError::Corrupt { .. } | LhaError::Listing { .. } | LhaError::SizeMismatch { .. } => {
+            ArchiveMemberSourceError::Corrupt {
+                detail: error.to_string(),
+            }
+        }
+        LhaError::Open { .. }
+        | LhaError::Timeout
+        | LhaError::ProcessOutputLimit { .. }
+        | LhaError::BackendFailure { .. } => ArchiveMemberSourceError::Open {
+            detail: error.to_string(),
+        },
+    }
+}
 
 /// Opens the right [`ArchiveMemberSource`] for `path`'s extension.
 ///
@@ -1267,11 +1469,10 @@ const RAR_MEMBER_TIMEOUT: Duration = Duration::from_secs(120);
 /// object-safe for exactly this reason (see its doc). Dispatch is by
 /// extension only - this never sniffs file contents to pick a format.
 ///
-/// `rar_provider` is `None` only when this path is not a `.rar` (the RAR
-/// branch below is the only one that reads it); when it *is* a `.rar` and
-/// discovery already ran for this audit but found no capable backend, the
-/// discovery failure itself (never a panic, never a silent skip) is what is
-/// returned as [`ArchiveMemberSourceError::Unsupported`].
+/// `rar_provider` and `lha_provider` are `None` only when their respective
+/// extension is not being opened. When an optional local backend was probed
+/// and no capable decoder exists, that discovery failure (never a panic,
+/// never a silent skip) is returned as [`ArchiveMemberSourceError::Unsupported`].
 #[allow(clippy::too_many_arguments)]
 fn open_archive_source(
     path: &Path,
@@ -1280,6 +1481,7 @@ fn open_archive_source(
     cancel: &AtomicBool,
     index: &DatIndex,
     rar_provider: Option<&Result<RarProvider, RarError>>,
+    lha_provider: Option<&Result<LhaProvider, LhaError>>,
 ) -> Result<Box<dyn ArchiveMemberSource>, ArchiveMemberSourceError> {
     if is_zip_path(path) {
         ZipArchiveSource::open(path, trusted, limits, cancel)
@@ -1310,6 +1512,24 @@ fn open_archive_source(
             RAR_MEMBER_TIMEOUT,
         )
         .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+    } else if is_lha_path(path) {
+        let provider = match lha_provider {
+            Some(Ok(provider)) => provider,
+            Some(Err(error)) => {
+                return Err(ArchiveMemberSourceError::Unsupported {
+                    detail: format!("no capable LHA backend is available: {error}"),
+                });
+            }
+            None => {
+                return Err(ArchiveMemberSourceError::Unsupported {
+                    detail: "LHA backend was not probed for this run".to_string(),
+                });
+            }
+        };
+        provider
+            .open(path, trusted, limits, LHA_MEMBER_TIMEOUT)
+            .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+            .map_err(lha_open_error)
     } else {
         Err(ArchiveMemberSourceError::Unsupported {
             detail: "unrecognised archive extension".to_string(),
@@ -1338,11 +1558,11 @@ fn audit_archives(
     // present - never probed when a library has none, so RAR support being
     // absent costs nothing when it is never used.
     let mut rar_provider: Option<Result<RarProvider, RarError>> = None;
+    let mut lha_provider: Option<Result<LhaProvider, LhaError>> = None;
 
-    for path in files
-        .iter()
-        .filter(|path| is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path))
-    {
+    for path in files.iter().filter(|path| {
+        is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path) || is_lha_path(path)
+    }) {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
@@ -1352,11 +1572,16 @@ fn audit_archives(
             "zip"
         } else if is_sevenz_path(path) {
             "7z"
-        } else {
+        } else if is_rar_path(path) {
             "rar"
+        } else {
+            "lha"
         };
         if is_rar_path(path) && rar_provider.is_none() {
             rar_provider = Some(RarProvider::discover(RAR_DISCOVERY_TIMEOUT));
+        }
+        if is_lha_path(path) && lha_provider.is_none() {
+            lha_provider = Some(LhaProvider::discover(LHA_DISCOVERY_TIMEOUT));
         }
         let identity_before = crate::dat::rename_apply::capture_identity(path).ok();
         let mut source = match open_archive_source(
@@ -1366,6 +1591,7 @@ fn audit_archives(
             cancel,
             index,
             rar_provider.as_ref(),
+            lha_provider.as_ref(),
         ) {
             Ok(source) => source,
             Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
@@ -1485,6 +1711,14 @@ fn is_rar_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("rar"))
+}
+
+fn is_lha_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("lha") || extension.eq_ignore_ascii_case("lzh")
+        })
 }
 
 fn annotate_content_matches(
@@ -1979,6 +2213,8 @@ mod combined_audit_tests {
     use super::*;
     use std::io::Write;
 
+    use crate::identity_source::hashing::Crc32;
+    use md5::Md5;
     use sha1::{Digest, Sha1};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
@@ -2007,6 +2243,39 @@ mod combined_audit_tests {
             .collect::<String>();
         format!(
             r#"<?xml version="1.0"?><datafile><header><name>Fixture</name><author>No-Intro</author></header>{games}</datafile>"#
+        )
+    }
+
+    /// A minimal real-world-shaped WHDLoad catalogue record.  The published
+    /// Retroplay-derived catalogue is ClrMamePro and checks the outer `.lha`
+    /// package, not a slave or an unpacked disk member.
+    fn whdload_package_dat(game: &str, package_name: &str, bytes: &[u8]) -> String {
+        let mut md5 = Md5::new();
+        md5.update(bytes);
+        let md5 = md5
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let sha1 = Sha1::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!(
+            r#"clrmamepro (
+ name "Commodore - Amiga - WHDLoad"
+ description "Commodore - Amiga - WHDLoad"
+ date "2026-07-05"
+ author "MrV2K"
+ comment "Retroplay"
+)
+game (
+ name "{game}"
+ description "{game}"
+ rom ( name "{package_name}" size "{}" crc "{}" md5 "{md5}" sha1 "{sha1}" )
+)"#,
+            bytes.len(),
+            Crc32::of(bytes),
         )
     }
 
@@ -2060,6 +2329,51 @@ mod combined_audit_tests {
             .push_archive_entry(entry, Some(std::io::Cursor::new(bytes)))
             .unwrap();
         writer.finish().unwrap();
+    }
+
+    fn write_lha(path: &Path, members: &[(&str, &[u8])]) {
+        let mut archive = Vec::new();
+        for (name, bytes) in members {
+            assert!(name.len() <= u8::MAX as usize);
+            let header_size = name.len() + 23;
+            assert!(header_size <= u8::MAX as usize);
+            let start = archive.len();
+            archive.extend([header_size as u8, 0]);
+            archive.extend_from_slice(b"-lh0-");
+            archive.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            archive.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            archive.extend_from_slice(&0_u32.to_le_bytes());
+            archive.extend([0x20, 0, name.len() as u8]);
+            archive.extend_from_slice(name.as_bytes());
+            archive.extend_from_slice(&lha_crc16(bytes).to_le_bytes());
+            archive.push(0);
+            archive[start + 1] = archive[start + 2..]
+                .iter()
+                .take(header_size)
+                .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+            archive.extend_from_slice(bytes);
+        }
+        archive.push(0);
+        std::fs::write(path, archive).unwrap();
+    }
+
+    fn lha_crc16(bytes: &[u8]) -> u16 {
+        let mut crc = 0_u16;
+        for byte in bytes {
+            crc ^= u16::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xa001
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc
+    }
+
+    fn lha_available() -> bool {
+        LhaProvider::discover(Duration::from_secs(10)).is_ok()
     }
 
     #[test]
@@ -2393,6 +2707,253 @@ mod combined_audit_tests {
             Some("Canonical Game.7z")
         );
     }
+
+    #[test]
+    fn whdload_clrmamepro_whole_package_hash_proposes_an_lha_rename() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("whdload.dat");
+        let archive = dir.path().join("messy-name.lha");
+        write_lha(
+            &archive,
+            &[
+                ("Game/Game.Slave", b"a WHDLoad slave"),
+                ("Game/Disk.1", b"game data"),
+            ],
+        );
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::write(
+            &dat_path,
+            whdload_package_dat("Canonical WHDLoad Game", "Canonical_v1.0_0001.lha", &bytes),
+        )
+        .unwrap();
+
+        let outcome = run(vec![source(dat_path, "whdload-catalogue")], archive.clone());
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Exact { .. }
+        ));
+        assert_eq!(outcome.evidence_sources.len(), 1);
+        assert_eq!(
+            outcome.evidence_sources[0].game_name,
+            "Canonical WHDLoad Game"
+        );
+        assert_eq!(
+            outcome.evidence_sources[0].rom_name,
+            "Canonical_v1.0_0001.lha"
+        );
+        assert!(matches!(
+            outcome.archives[0].completion,
+            ArchivePassCompletion::Complete
+        ));
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(
+            plan.proposals[0].proposed_basename.as_deref(),
+            Some("Canonical_v1.0_0001.lha")
+        );
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+    }
+
+    #[test]
+    fn exact_outer_hash_cannot_promote_a_corrupt_lha_package() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("whdload.dat");
+        let archive = dir.path().join("broken.lha");
+        let bytes = b"not an LHA package";
+        std::fs::write(&archive, bytes).unwrap();
+        std::fs::write(
+            &dat_path,
+            whdload_package_dat("Incorrectly catalogued bytes", "broken.lha", bytes),
+        )
+        .unwrap();
+
+        let outcome = run(vec![source(dat_path, "whdload-catalogue")], archive);
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::NoUsableEvidence
+        ));
+        assert!(matches!(
+            outcome.archives[0].completion,
+            ArchivePassCompletion::Incomplete { .. }
+        ));
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn whdload_lha_with_exact_slave_evidence_proposes_an_outer_rename() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("whdload.dat");
+        let archive = dir.path().join("Superfrog_v1.2_0035.lha");
+        let slave = b"validated WHDLoad slave fixture";
+        write_lha(
+            &archive,
+            &[
+                ("Game/Game.Slave", slave),
+                ("Game/ReadMe", b"supporting text"),
+            ],
+        );
+        std::fs::write(
+            &dat_path,
+            dat_entries(&[("Canonical WHDLoad Game", "Game/Game.Slave", slave)]),
+        )
+        .unwrap();
+        let before = std::fs::read(&archive).unwrap();
+
+        let outcome = run(vec![source(dat_path, "whdload-catalogue")], archive.clone());
+        let identity = outcome.archives[0].combined_identity.as_ref().unwrap();
+        assert_eq!(identity.game_name, "Canonical WHDLoad Game");
+        assert_eq!(identity.member_name, "Game/Game.Slave");
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(
+            plan.proposals[0].proposed_basename.as_deref(),
+            Some("Canonical WHDLoad Game.lha")
+        );
+        assert_eq!(std::fs::read(&archive).unwrap(), before);
+    }
+
+    #[test]
+    fn whdload_filename_without_exact_slave_evidence_is_not_actionable() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("whdload.dat");
+        let archive = dir.path().join("Superfrog_v1.2_0035.lha");
+        write_lha(&archive, &[("Game/Game.Slave", b"not catalogued")]);
+        std::fs::write(
+            &dat_path,
+            dat_entries(&[("Superfrog", "Game/Game.Slave", b"different bytes")]),
+        )
+        .unwrap();
+
+        let outcome = run(vec![source(dat_path, "whdload-catalogue")], archive);
+        assert!(outcome.archives[0].combined_identity.is_none());
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn slave_named_member_cannot_repurpose_an_exact_non_slave_catalogue_record() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("disk.dat");
+        let archive = dir.path().join("lookalike.lha");
+        let bytes = b"exact bytes but not a WHDLoad slave catalogue record";
+        write_lha(&archive, &[("Game/Game.Slave", bytes)]);
+        std::fs::write(
+            &dat_path,
+            dat_entries(&[("Different Representation", "Game/Disk.1", bytes)]),
+        )
+        .unwrap();
+
+        let outcome = run(vec![source(dat_path, "disk-catalogue")], archive);
+        // A catalogue without any `.slave` record cannot identify an
+        // internal WHDLoad slave, so the bounded reader is not even opened.
+        // That performance gate must still leave the package non-actionable.
+        assert!(outcome.archives.is_empty());
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn corrupt_lha_stays_visible_and_non_actionable() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("broken.lha");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&archive, b"not an LHA archive").unwrap();
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+        // No whole-package or slave-capable catalogue record exists, so a
+        // corrupt LHA is left visible as an unmatched file without launching
+        // the optional decompressor. The exact-outer-hash test above proves a
+        // corrupt package can never become actionable when a catalogue does
+        // claim its bytes.
+        assert!(outcome.archives.is_empty());
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn whdload_lha_conflicting_catalogues_and_unsafe_member_are_non_actionable() {
+        if !lha_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.dat");
+        let second = dir.path().join("second.dat");
+        let conflict = dir.path().join("conflict.lha");
+        let unsafe_path = dir.path().join("unsafe.lha");
+        let slave = b"same slave";
+        write_lha(&conflict, &[("Game/Game.Slave", slave)]);
+        write_lha(&unsafe_path, &[("../Game.Slave", slave)]);
+        std::fs::write(&first, dat_entries(&[("Game A", "Game/Game.Slave", slave)])).unwrap();
+        std::fs::write(
+            &second,
+            dat_entries(&[("Game B", "Game/Game.Slave", slave)]),
+        )
+        .unwrap();
+
+        let conflict_outcome = run(
+            vec![source(first.clone(), "one"), source(second, "two")],
+            conflict,
+        );
+        assert!(conflict_outcome.archives[0].combined_identity.is_none());
+        let unsafe_outcome = run(vec![source(first, "one")], unsafe_path);
+        assert!(unsafe_outcome.archives[0].combined_identity.is_none());
+        assert!(matches!(
+            unsafe_outcome.archives[0].members[0].evidence.status,
+            ArchiveMemberStatus::NotVerified {
+                reason: "unsafe member path"
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2453,6 +3014,7 @@ mod rar_dispatch_tests {
             &no_cancel(),
             &index,
             None,
+            None,
         ));
         assert_eq!(
             error,
@@ -2478,6 +3040,7 @@ mod rar_dispatch_tests {
             &no_cancel(),
             &index,
             Some(&discovery),
+            None,
         ));
         assert!(matches!(
             error,
@@ -2499,6 +3062,7 @@ mod rar_dispatch_tests {
             ArchiveLimits::default(),
             &no_cancel(),
             &index,
+            None,
             None,
         ));
         assert_eq!(

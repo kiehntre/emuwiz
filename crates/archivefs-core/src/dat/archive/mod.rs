@@ -26,6 +26,7 @@ use serde::Serialize;
 pub mod chd;
 pub mod external_process;
 pub mod hash;
+pub mod lha;
 pub mod limits;
 pub mod rar;
 pub mod sevenz;

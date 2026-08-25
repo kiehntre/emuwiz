@@ -54,7 +54,9 @@ use archivefs_core::dat::managed_sources::{
     resolve_managed_dat_sources, resolve_redump_bios_sources, resolve_redump_games_sources,
     save_managed_dat_sources_to,
 };
+use archivefs_core::dat::model::DatFormat;
 use archivefs_core::dat::parser::DiagnosticSeverity;
+use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::dat::policy::{
     ClonePolicy, DatPolicyConfig, EffectiveDatPolicy, LanguageId, LanguagePreference, PolicyField,
     RegionId, RevisionPolicy, participating_sources, resolve, validate_policy_config,
@@ -955,8 +957,9 @@ pub(crate) struct AuditResultView {
     pub(crate) entries: Vec<AuditEntryView>,
     pub(crate) entries_truncated: usize,
     /// Archive-member evidence is visually separate from physical loose files.
-    /// A complete single-member ZIP/7z exact match may safely produce an
-    /// outer-container proposal; member paths are never renamed directly.
+    /// A complete single-member ZIP/7z exact match, or a package-level LHA
+    /// slave match, may safely produce an outer-container proposal; member
+    /// paths are never renamed directly.
     pub(crate) archives: Vec<ArchiveAuditView>,
     pub(crate) unhashed: Vec<(String, String)>,
     pub(crate) unreadable_catalogues: Vec<String>,
@@ -1056,6 +1059,12 @@ pub(crate) const MAX_AUDIT_ENTRIES_SHOWN: usize = 500;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatSourcesPageAction {
     AddFile {
+        path: PathBuf,
+    },
+    /// A deliberately narrow local import for the public Retroplay-derived
+    /// WHDLoad catalogue.  It remains a user-selected local DAT: no Retroplay
+    /// package infrastructure is downloaded or scraped by EmuWiz.
+    AddWHDLoadDat {
         path: PathBuf,
     },
     AddFolder {
@@ -2406,6 +2415,7 @@ impl DatSourcesPageState {
         }
         match action {
             DatSourcesPageAction::AddFile { path } => self.add(path, DatSourceKind::File),
+            DatSourcesPageAction::AddWHDLoadDat { path } => self.add_whdload_catalogue(path),
             DatSourcesPageAction::AddFolder { path } => self.add(path, DatSourceKind::Folder),
             DatSourcesPageAction::SetEnabled { id, enabled } => {
                 if let Some(entry) = self.draft.get_mut(&id) {
@@ -2909,6 +2919,45 @@ impl DatSourcesPageState {
                 suggest_display_name(&path),
                 path,
                 kind,
+            )
+        };
+        if let Err(error) = self.draft.add(entry) {
+            self.action_error = Some(error.to_string());
+        }
+    }
+
+    /// Registers only the known public WHDLoad catalogue shape.  The source
+    /// remains `UserLocal`: its provenance is presentation/audit information,
+    /// never authority to update a remote Retroplay collection.
+    fn add_whdload_catalogue(&mut self, path: PathBuf) {
+        self.action_error = None;
+        let parsed = match parse_dat_file(&path, DatLimits::default()) {
+            Ok(parsed) => parsed.dat,
+            Err(error) => {
+                self.action_error = Some(format!("WHDLoad DAT could not be parsed: {error}"));
+                return;
+            }
+        };
+        if parsed.source.format != DatFormat::ClrMamePro
+            || parsed.source.name.as_deref() != Some("Commodore - Amiga - WHDLoad")
+        {
+            self.action_error = Some(
+                "That file is not the expected Commodore - Amiga - WHDLoad ClrMamePro catalogue; it was not added."
+                    .to_string(),
+            );
+            return;
+        }
+        let entry = DatSourceEntry {
+            display_name: "WHDLoad / Retroplay catalogue".to_string(),
+            origin: Some(
+                "WHDLoad / Retroplay-derived local catalogue selected through DAT Sources"
+                    .to_string(),
+            ),
+            ..DatSourceEntry::new(
+                self.draft.suggest_id(&path),
+                "WHDLoad / Retroplay catalogue".to_string(),
+                path,
+                DatSourceKind::File,
             )
         };
         if let Err(error) = self.draft.add(entry) {
@@ -5241,6 +5290,28 @@ fn show_evidence_acquisition_section(
     ui.add_space(8.0);
     ui.columns(2, |columns| {
         widgets::card(&mut columns[0], |ui| {
+            ui.label(egui::RichText::new("WHDLoad — Amiga packages").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Import the public Commodore - Amiga - WHDLoad DAT. It records complete Retroplay-derived LHA package checksums; EmuWiz never identifies a package from its filename.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+            if widgets::action_button(
+                ui,
+                "Choose WHDLoad DAT…",
+                widgets::ActionStyle::Primary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+                && let Some(path) = choose_whdload_dat_file()
+            {
+                action = Some(DatSourcesPageAction::AddWHDLoadDat { path });
+            }
+        });
+        widgets::card(&mut columns[1], |ui| {
             ui.label(egui::RichText::new("Redump — disc and BIOS metadata").strong());
             ui.label(
                 egui::RichText::new(format!(
@@ -5280,6 +5351,13 @@ fn choose_local_dat_file(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title(title)
         .add_filter("DAT catalogues", &["dat", "xml"])
+        .pick_file()
+}
+
+fn choose_whdload_dat_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Choose Commodore - Amiga - WHDLoad DAT")
+        .add_filter("WHDLoad DAT", &["dat"])
         .pick_file()
 }
 
@@ -8503,7 +8581,7 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
                 ui,
                 "Archive members",
                 Some(
-                    "Read-only ZIP/7z evidence. A complete archive with one exact game member can rename only its outer container; member paths are never changed.",
+                    "Read-only ZIP/7z/LHA evidence. A complete ZIP/7z with one exact game member, or a WHDLoad LHA with one exact slave match, can rename only its outer container; member paths are never changed.",
                 ),
             );
             for archive in &audit.archives {

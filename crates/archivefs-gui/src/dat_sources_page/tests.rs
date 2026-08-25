@@ -5152,6 +5152,8 @@ fn dat_acquisition_entry_point_exposes_existing_safe_provider_paths_without_auto
     ));
     assert!(rendered_text_contains(&output, "No-Intro — cartridge ROMs"));
     assert!(rendered_text_contains(&output, "Choose No-Intro DAT…"));
+    assert!(rendered_text_contains(&output, "WHDLoad — Amiga packages"));
+    assert!(rendered_text_contains(&output, "Choose WHDLoad DAT…"));
     assert!(rendered_text_contains(&output, "TOSEC — vintage systems"));
     assert!(rendered_text_contains(
         &output,
@@ -5186,6 +5188,46 @@ const TOSEC_ISO_DEFERRED: &str = r#"<?xml version="1.0"?>
   </header>
   <game name="Example"><rom name="example.iso" size="4" crc="00000001" md5="00000000000000000000000000000001" sha1="0000000000000000000000000000000000000001"/></game>
 </datafile>"#;
+
+const WHDLOAD_PACKAGE_DAT: &str = r#"clrmamepro (
+  name "Commodore - Amiga - WHDLoad"
+  description "Commodore - Amiga - WHDLoad"
+  date "2026-07-05"
+  author "MrV2K"
+  comment "Retroplay"
+)
+game (
+  name "Fixture Game"
+  rom ( name "Fixture_v1.0_0001.lha" size 4 crc 00000001 md5 00000000000000000000000000000001 sha1 0000000000000000000000000000000000000001 )
+)
+"#;
+
+#[test]
+fn whdload_local_import_requires_the_parsed_catalogue_identity_and_preserves_provenance() {
+    let fixture = Fixture::new();
+    let valid = fixture.write("Commodore - Amiga - WHDLoad.dat", WHDLOAD_PACKAGE_DAT);
+    let invalid = fixture.write("lookalike.dat", LOGIQX);
+    let mut page = fixture.page();
+
+    page.apply(DatSourcesPageAction::AddWHDLoadDat { path: invalid });
+    assert!(page.view().rows.is_empty());
+    assert!(
+        page.view()
+            .action_error
+            .as_deref()
+            .is_some_and(|error| error.contains("expected Commodore - Amiga - WHDLoad"))
+    );
+
+    page.apply(DatSourcesPageAction::AddWHDLoadDat { path: valid });
+    assert_eq!(page.draft.entries().len(), 1);
+    let entry = &page.draft.entries()[0];
+    assert_eq!(entry.display_name, "WHDLoad / Retroplay catalogue");
+    assert_eq!(
+        entry.origin.as_deref(),
+        Some("WHDLoad / Retroplay-derived local catalogue selected through DAT Sources")
+    );
+    assert!(entry.enabled);
+}
 
 #[test]
 fn managed_sources_render_in_a_separate_section_from_local_sources() {
