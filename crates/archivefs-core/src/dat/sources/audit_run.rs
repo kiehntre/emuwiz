@@ -54,7 +54,9 @@ use crate::dat::archive::{
     ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
     ArchivePassCompletion, ArchivePassStopReason, ArchiveRunBudget,
 };
-use crate::dat::audit::{AuditReport, AuditVerdict, KnownFileEvidence, audit_files, audit_one};
+use crate::dat::audit::{
+    AuditEntry, AuditReport, AuditSummary, AuditVerdict, KnownFileEvidence, audit_files, audit_one,
+};
 use crate::dat::classification::{
     ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
     DatOriginalMetadata, summarize,
@@ -96,7 +98,9 @@ pub struct DatAuditRequest {
     pub source_display_name: String,
     pub dat_path: PathBuf,
     pub dat_kind: DatSourceKind,
-    /// The folder of local files to compare against the catalogue.
+    /// One local regular file, or a folder of local files, to compare against
+    /// the catalogue. A single-file target is useful for a deliberately
+    /// bounded evidence check before auditing a whole collection.
     pub scan_root: PathBuf,
     pub limits: DatLimits,
     /// The effective DAT policy, when the caller wants multi-candidate
@@ -109,6 +113,47 @@ pub struct DatAuditRequest {
     /// recognised. Carried for provenance so a rename plan derived from the
     /// outcome can report the platform without re-reading the registry.
     pub platform: Option<String>,
+}
+
+/// One enabled, locally readable catalogue participating in a combined audit.
+///
+/// Callers construct this only from an existing local registry entry or a
+/// validated managed snapshot projection.  It deliberately carries no URL or
+/// remote-provider authority: combined auditing is wholly local and read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedDatAuditSource {
+    pub source_id: String,
+    pub source_display_name: String,
+    pub dat_path: PathBuf,
+    pub dat_kind: DatSourceKind,
+    /// A canonical platform when this source was explicitly assigned one.
+    /// `None` is retained honestly; a DAT header alone is not promoted to a
+    /// platform assignment here.
+    pub platform: Option<String>,
+}
+
+/// A read-only request to compare one library target with every enabled local
+/// and managed game catalogue the caller supplies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedDatAuditRequest {
+    pub sources: Vec<CombinedDatAuditSource>,
+    pub scan_root: PathBuf,
+    pub limits: DatLimits,
+}
+
+/// One exact catalogue observation retained for a combined-match result.
+///
+/// Agreement is represented by several observations with the same canonical
+/// game/ROM identity.  Disagreement never gets collapsed to a first source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatAuditEvidenceSource {
+    pub local_path: String,
+    pub source_id: String,
+    pub source_display_name: String,
+    pub platform: Option<String>,
+    pub game_name: String,
+    pub rom_name: String,
+    pub algorithm: String,
 }
 
 /// A file that was audited without hash evidence, and why.
@@ -201,6 +246,10 @@ pub struct DatAuditOutcome {
     /// nothing to the index.
     pub unreadable_catalogues: Vec<String>,
     pub report: AuditReport,
+    /// Exact source observations for combined audits.  Ordinary one-source
+    /// audits retain an empty list, preserving their existing model.
+    #[serde(default)]
+    pub evidence_sources: Vec<DatAuditEvidenceSource>,
     /// Archive-member evidence is deliberately separate from the flat
     /// physical-file report. In particular, rename planning consumes only
     /// `report` and cannot turn a member name into a filesystem rename.
@@ -427,92 +476,13 @@ pub fn run_dat_audit(
         roms: catalogue_roms,
     });
 
-    // ---- 2. Walk the folder ---------------------------------------------
-    if cancelled(cancel) {
-        return Err(DatAuditError::Cancelled);
-    }
-    let scan = scan_local_files(&request.scan_root, cancel, on_progress)?;
-    if scan.files.is_empty() {
-        return Err(DatAuditError::NothingToAudit(format!(
-            "no files were found in {}",
-            request.scan_root.display()
-        )));
-    }
-
-    // ---- 3. Hash what was found -----------------------------------------
-    let total = scan.files.len();
-    let mut known: Vec<KnownFileEvidence> = Vec::with_capacity(total);
-    let mut unhashed: Vec<UnhashedFile> = Vec::new();
-    let mut bytes_hashed: u64 = 0;
-
-    for (position, path) in scan.files.iter().enumerate() {
-        if cancelled(cancel) {
-            return Err(DatAuditError::Cancelled);
-        }
-        // CHDs are never ordinary loose ROM files: a CHD's DAT identity is
-        // its header's `overall_sha1`, not a hash of the `.chd` container's
-        // own bytes. Hashing the container here and matching it against the
-        // ROM `DatIndex` would be a false-evidence path (and, on a
-        // pathological container whose whole-file digest happens to equal
-        // some ROM's declared hash, a false `Exact` ROM match). CHDs are
-        // handled exclusively by the disk-evidence pass below (step 3.5),
-        // via `audit_chd_disk`/`overall_sha1` - never `KnownFileEvidence`,
-        // never `audit_one`, never `outcome.report`, never rename-eligible.
-        if is_chd_path(path) {
-            continue;
-        }
-        // A `.rar`'s outer container bytes are never loose-hashed: RAR is
-        // the one format whose evidence must come exclusively through the
-        // fd-pinned archive provider (`audit_archives` below), which is the
-        // only path that can fail closed on an unsupported/unavailable/
-        // corrupt archive. Loose-hashing the raw container here would let
-        // its bytes reach `audit_one` and, on a coincidental (or crafted)
-        // hash collision with a declared DAT ROM, produce a loose `Exact`
-        // verdict and a loose rename proposal - a bypass of the archive
-        // trust boundary that stands regardless of whether the RAR itself
-        // ever verified anything. The file is still visible to the scan
-        // (`files_scanned` counts it) and still dispatched to
-        // `audit_archives` below; it is only absent from `known`/`report`.
-        if is_rar_path(path) {
-            continue;
-        }
-        let file_name = file_name_of(path);
-        on_progress(DatAuditProgress::Hashing {
-            index: position + 1,
-            total,
-            file_name: file_name.clone(),
-        });
-
-        let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
-        // Progress inside a single file is deliberately not forwarded: a
-        // per-chunk callback over 25,000 files is a great deal of traffic for
-        // a number nobody reads, and the per-file line already moves.
-        match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
-            Ok(hashes) => {
-                bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
-                known.push(
-                    evidence
-                        .with_size(hashes.fingerprint.size_bytes)
-                        .with_crc32(hashes.crc32)
-                        .with_md5(hashes.md5)
-                        .with_sha1(hashes.sha1),
-                );
-            }
-            Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
-            Err(refusal) => {
-                unhashed.push(UnhashedFile {
-                    path: path.to_string_lossy().into_owned(),
-                    file_name,
-                    code: refusal.code().to_string(),
-                    detail: refusal.detail(),
-                });
-                // Still audited, on its name alone. The verdict it can reach
-                // that way is `FilenameOnly` at best, which is exactly what
-                // the evidence supports, and `unhashed` records why.
-                known.push(evidence);
-            }
-        }
-    }
+    // ---- 2-3. Walk and hash once ----------------------------------------
+    let hashed =
+        collect_loose_file_evidence(&request.scan_root, trusted, cancel, on_progress, true)?;
+    let scan = hashed.scan;
+    let known = hashed.known;
+    let unhashed = hashed.unhashed;
+    let bytes_hashed = hashed.bytes_hashed;
 
     // ---- 3.5 CHD disk evidence --------------------------------------------
     // Deliberately not folded into step 3's loop: a CHD's DAT identity is its
@@ -613,6 +583,7 @@ pub fn run_dat_audit(
         files_scanned: scan.files.len(),
         truncated: scan.truncated,
         report,
+        evidence_sources: Vec::new(),
         archives,
         sets,
         unhashed,
@@ -621,6 +592,457 @@ pub fn run_dat_audit(
         policy,
         platform: request.platform.clone(),
     })
+}
+
+/// The one shared local scan/hash pass used by both one-catalogue and
+/// combined-catalogue audits. It deliberately excludes CHD and RAR outer
+/// bytes from loose-ROM evidence for the same reasons documented in
+/// [`run_dat_audit`]: those formats have their own bounded evidence paths and
+/// must not gain a coincidental raw-container match. Combined audits also
+/// keep ZIP/7z outer bytes out until their member/set rules can merge several
+/// catalogues safely; each deferred file remains visible as an unhashed,
+/// non-actionable report row rather than disappearing from the result.
+struct HashedLocalScan {
+    scan: LocalScan,
+    known: Vec<KnownFileEvidence>,
+    unhashed: Vec<UnhashedFile>,
+    bytes_hashed: u64,
+}
+
+fn collect_loose_file_evidence(
+    scan_root: &Path,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+    include_archive_outers: bool,
+) -> Result<HashedLocalScan, DatAuditError> {
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
+    let scan = scan_local_files(scan_root, cancel, on_progress)?;
+    if scan.files.is_empty() {
+        return Err(DatAuditError::NothingToAudit(format!(
+            "no files were found in {}",
+            scan_root.display()
+        )));
+    }
+
+    let total = scan.files.len();
+    let mut known = Vec::with_capacity(total);
+    let mut unhashed = Vec::new();
+    let mut bytes_hashed = 0_u64;
+    for (position, path) in scan.files.iter().enumerate() {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let defer_container = is_chd_path(path)
+            || is_rar_path(path)
+            || (!include_archive_outers && (is_zip_path(path) || is_sevenz_path(path)));
+        if defer_container {
+            let file_name = file_name_of(path);
+            if !include_archive_outers {
+                unhashed.push(UnhashedFile {
+                    path: path.to_string_lossy().into_owned(),
+                    file_name: file_name.clone(),
+                    code: "combined-container-deferred".to_string(),
+                    detail: "Combined evidence does not yet merge this container's specialised identity path; it was left non-actionable."
+                        .to_string(),
+                });
+                // Retain a physical-file row. With no digest it can reach at
+                // most FilenameOnly and the rename planner never promotes
+                // that weak result to an action.
+                known.push(KnownFileEvidence::new(
+                    path.to_string_lossy().into_owned(),
+                    file_name,
+                ));
+            }
+            continue;
+        }
+        let file_name = file_name_of(path);
+        on_progress(DatAuditProgress::Hashing {
+            index: position + 1,
+            total,
+            file_name: file_name.clone(),
+        });
+        let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
+        match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
+            Ok(hashes) => {
+                bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
+                known.push(
+                    evidence
+                        .with_size(hashes.fingerprint.size_bytes)
+                        .with_crc32(hashes.crc32)
+                        .with_md5(hashes.md5)
+                        .with_sha1(hashes.sha1),
+                );
+            }
+            Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
+            Err(refusal) => {
+                unhashed.push(UnhashedFile {
+                    path: path.to_string_lossy().into_owned(),
+                    file_name,
+                    code: refusal.code().to_string(),
+                    detail: refusal.detail(),
+                });
+                known.push(evidence);
+            }
+        }
+    }
+    Ok(HashedLocalScan {
+        scan,
+        known,
+        unhashed,
+        bytes_hashed,
+    })
+}
+
+/// Runs one bounded scan/hash pass and compares each resulting evidence object
+/// with every supplied catalogue index.  It is intentionally a loose-file
+/// first slice: CHD and archive-set identity stay on their existing dedicated
+/// one-catalogue paths until their multi-catalogue merge rules are equally
+/// explicit.  They are never promoted through a raw-container hash here.
+pub fn run_combined_dat_audit(
+    request: &CombinedDatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<DatAuditOutcome, DatAuditError> {
+    if request.sources.is_empty() {
+        return Err(DatAuditError::NoCatalogue(
+            "no enabled, installed DAT catalogues are available".to_string(),
+        ));
+    }
+
+    let mut loaded = Vec::new();
+    let mut unreadable_catalogues = Vec::new();
+    let mut catalogue_names = Vec::new();
+    let mut catalogue_entries = 0_usize;
+    let mut catalogue_roms = 0_usize;
+    for source in &request.sources {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        match load_combined_catalogue(source, request.limits, on_progress) {
+            Ok(catalogue) => {
+                catalogue_entries = catalogue_entries.saturating_add(catalogue.entries);
+                catalogue_roms = catalogue_roms.saturating_add(catalogue.roms);
+                catalogue_names.extend(catalogue.names.iter().cloned());
+                loaded.push(catalogue);
+            }
+            Err(detail) => {
+                unreadable_catalogues.push(format!("{}: {detail}", source.source_display_name))
+            }
+        }
+    }
+    if loaded.is_empty() {
+        return Err(DatAuditError::NoCatalogue(unreadable_catalogues.join("; ")));
+    }
+
+    on_progress(DatAuditProgress::CatalogueReady {
+        entries: catalogue_entries,
+        roms: catalogue_roms,
+    });
+    let hashed =
+        collect_loose_file_evidence(&request.scan_root, trusted, cancel, on_progress, false)?;
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
+    on_progress(DatAuditProgress::Comparing {
+        files: hashed.known.len(),
+    });
+
+    let mut entries = Vec::with_capacity(hashed.known.len());
+    let mut evidence_sources = Vec::new();
+    let mut content_matches = Vec::new();
+    for known in &hashed.known {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let combined = merge_combined_evidence(known, &loaded);
+        if let Some(content) = combined.content {
+            content_matches.push(content);
+        }
+        evidence_sources.extend(combined.evidence);
+        entries.push(AuditEntry {
+            local_path: known.filepath.clone(),
+            local_filename: std::path::Path::new(&known.filepath)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| known.filename.clone()),
+            verdict: combined.verdict,
+        });
+    }
+    let report = AuditReport {
+        summary: combined_summary(&entries),
+        entries,
+    };
+
+    Ok(DatAuditOutcome {
+        source_id: "combined-enabled-dat-sources".to_string(),
+        source_display_name: "All enabled evidence catalogues".to_string(),
+        dat_path: "multiple local and managed DAT catalogues".to_string(),
+        scan_root: request.scan_root.to_string_lossy().into_owned(),
+        catalogue_names,
+        catalogue_entries,
+        catalogue_roms,
+        content: DatAuditContentOutcome {
+            selection: ContentSelectionPolicy::AllEntries,
+            catalogue: DatContentSummary::default(),
+            matches: content_matches,
+        },
+        unreadable_catalogues,
+        report,
+        evidence_sources,
+        archives: Vec::new(),
+        sets: Vec::new(),
+        unhashed: hashed.unhashed,
+        files_scanned: hashed.scan.files.len(),
+        bytes_hashed: hashed.bytes_hashed,
+        archive_bytes_hashed: 0,
+        truncated: hashed.scan.truncated,
+        policy: None,
+        platform: None,
+    })
+}
+
+struct LoadedCombinedCatalogue {
+    source: CombinedDatAuditSource,
+    index: DatIndex,
+    names: Vec<String>,
+    entries: usize,
+    roms: usize,
+}
+
+fn load_combined_catalogue(
+    source: &CombinedDatAuditSource,
+    limits: DatLimits,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<LoadedCombinedCatalogue, String> {
+    let dat_files = match source.dat_kind {
+        DatSourceKind::File => {
+            validation::validate_dat_path(&source.dat_path, DatSourceKind::File)
+                .map_err(|refusal| refusal.detail())?;
+            vec![source.dat_path.clone()]
+        }
+        DatSourceKind::Folder => {
+            validation::discover_dat_files(&source.dat_path)
+                .map_err(|refusal| refusal.detail())?
+                .files
+        }
+    };
+    if dat_files.is_empty() {
+        return Err("contains no DAT files".to_string());
+    }
+    let mut names = Vec::new();
+    let mut merged: Option<ParsedDat> = None;
+    let mut failures = Vec::new();
+    for path in dat_files {
+        let file_name = file_name_of(&path);
+        on_progress(DatAuditProgress::ReadingCatalogue {
+            file_name: file_name.clone(),
+        });
+        match parse_dat_file(&path, limits) {
+            Ok(parsed) => {
+                names.push(parsed.dat.source.name.clone().unwrap_or(file_name));
+                match merged.as_mut() {
+                    Some(existing) => {
+                        existing.games.extend(parsed.dat.games);
+                        existing.source.entry_count = existing
+                            .source
+                            .entry_count
+                            .saturating_add(parsed.dat.source.entry_count);
+                        existing.source.rom_count = existing
+                            .source
+                            .rom_count
+                            .saturating_add(parsed.dat.source.rom_count);
+                    }
+                    None => merged = Some(parsed.dat),
+                }
+            }
+            Err(error) => failures.push(format!("{file_name}: {error}")),
+        }
+    }
+    let Some(parsed) = merged else {
+        return Err(failures.join("; "));
+    };
+    Ok(LoadedCombinedCatalogue {
+        source: source.clone(),
+        entries: parsed.source.entry_count,
+        roms: parsed.source.rom_count,
+        index: DatIndex::build(&parsed),
+        names,
+    })
+}
+
+struct CombinedEvidenceResult {
+    verdict: AuditVerdict,
+    evidence: Vec<DatAuditEvidenceSource>,
+    content: Option<DatContentMatch>,
+}
+
+fn merge_combined_evidence(
+    known: &KnownFileEvidence,
+    catalogues: &[LoadedCombinedCatalogue],
+) -> CombinedEvidenceResult {
+    let mut exact = Vec::new();
+    let mut source_ambiguities = Vec::new();
+    let mut non_exact = Vec::new();
+    for catalogue in catalogues {
+        match audit_one(known, &catalogue.index) {
+            AuditVerdict::Exact {
+                game_name,
+                rom_name,
+                algorithm,
+            } => exact.push((catalogue, game_name, rom_name, algorithm)),
+            AuditVerdict::ExactMultipleCandidates { count, .. } => {
+                source_ambiguities.push(format!(
+                    "{} has {count} exact candidates",
+                    catalogue.source.source_display_name
+                ))
+            }
+            verdict => non_exact.push(verdict),
+        }
+    }
+    if !source_ambiguities.is_empty() {
+        return CombinedEvidenceResult {
+            verdict: AuditVerdict::Ambiguous {
+                detail: source_ambiguities.join("; "),
+            },
+            evidence: Vec::new(),
+            content: None,
+        };
+    }
+    let Some((first_source, first_game, first_rom, first_algorithm)) = exact.first() else {
+        // Keep useful non-exact diagnostics, but never allow a filename-only
+        // result from one catalogue to eclipse hash evidence from another.
+        let verdict = non_exact
+            .iter()
+            .find(|verdict| matches!(verdict, AuditVerdict::Ambiguous { .. }))
+            .cloned()
+            .or_else(|| {
+                non_exact
+                    .iter()
+                    .find(|verdict| matches!(verdict, AuditVerdict::Probable { .. }))
+                    .cloned()
+            })
+            .or_else(|| {
+                non_exact
+                    .iter()
+                    .find(|verdict| {
+                        matches!(verdict, AuditVerdict::ProbableMultipleCandidates { .. })
+                    })
+                    .cloned()
+            })
+            .or_else(|| {
+                non_exact
+                    .iter()
+                    .find(|verdict| matches!(verdict, AuditVerdict::NotInDat))
+                    .cloned()
+            })
+            .unwrap_or(AuditVerdict::NoUsableEvidence);
+        return CombinedEvidenceResult {
+            verdict,
+            evidence: Vec::new(),
+            content: None,
+        };
+    };
+    let same_identity = exact
+        .iter()
+        .all(|(_, game, rom, _)| game == first_game && rom == first_rom);
+    let known_platform = exact
+        .iter()
+        .filter_map(|(source, _, _, _)| source.source.platform.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !same_identity || known_platform.len() > 1 {
+        let details = exact
+            .iter()
+            .map(|(source, game, rom, _)| {
+                let platform = source
+                    .source
+                    .platform
+                    .as_deref()
+                    .unwrap_or("platform not assigned");
+                format!(
+                    "{}: {game} / {rom} ({platform})",
+                    source.source.source_display_name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return CombinedEvidenceResult {
+            verdict: AuditVerdict::Ambiguous {
+                detail: format!("exact catalogues disagree: {details}"),
+            },
+            evidence: Vec::new(),
+            content: None,
+        };
+    }
+    let evidence = exact
+        .iter()
+        .map(|(source, game, rom, algorithm)| DatAuditEvidenceSource {
+            local_path: known.filepath.clone(),
+            source_id: source.source.source_id.clone(),
+            source_display_name: source.source.source_display_name.clone(),
+            platform: source.source.platform.clone(),
+            game_name: game.clone(),
+            rom_name: rom.clone(),
+            algorithm: (*algorithm).to_string(),
+        })
+        .collect();
+    let content = combined_content_match(known, first_source, first_game, first_rom);
+    CombinedEvidenceResult {
+        verdict: AuditVerdict::Exact {
+            game_name: first_game.clone(),
+            rom_name: first_rom.clone(),
+            algorithm: first_algorithm,
+        },
+        evidence,
+        content,
+    }
+}
+
+fn combined_content_match(
+    known: &KnownFileEvidence,
+    catalogue: &LoadedCombinedCatalogue,
+    game_name: &str,
+    rom_name: &str,
+) -> Option<DatContentMatch> {
+    let candidate = catalogue
+        .index
+        .lookup_filename(rom_name)
+        .iter()
+        .find(|candidate| candidate.game_name == game_name && candidate.rom_name == rom_name)?;
+    Some(DatContentMatch {
+        local_path: known.filepath.clone(),
+        candidates: vec![DatContentCandidate {
+            game_name: candidate.game_name.clone(),
+            rom_name: candidate.rom_name.clone(),
+            classification: candidate.content_classification.clone(),
+            eligibility: ContentSelectionPolicy::AllEntries
+                .eligibility(&candidate.content_classification),
+            original_metadata: candidate.original_metadata.clone(),
+        }],
+    })
+}
+
+fn combined_summary(entries: &[AuditEntry]) -> AuditSummary {
+    let mut summary = AuditSummary {
+        total: entries.len(),
+        ..AuditSummary::default()
+    };
+    for entry in entries {
+        match entry.verdict {
+            AuditVerdict::Exact { .. } => summary.exact += 1,
+            AuditVerdict::ExactMultipleCandidates { .. } => summary.exact_multiple += 1,
+            AuditVerdict::Probable { .. } => summary.probable += 1,
+            AuditVerdict::ProbableMultipleCandidates { .. } => summary.probable_multiple += 1,
+            AuditVerdict::FilenameOnly { .. } => summary.filename_only += 1,
+            AuditVerdict::Ambiguous { .. } => summary.ambiguous += 1,
+            AuditVerdict::NotInDat => summary.not_in_dat += 1,
+            AuditVerdict::NoUsableEvidence => summary.no_evidence += 1,
+        }
+    }
+    summary
 }
 
 /// How long one RAR-backend capability probe (`RarProvider::discover`) may
@@ -1059,7 +1481,8 @@ struct LocalScan {
     scan_complete: bool,
 }
 
-/// Walks `root`, collecting regular files in a deterministic order.
+/// Walks a folder target, or accepts one regular-file target, collecting files
+/// in a deterministic order.
 ///
 /// Symlinked *directories* are not descended into: following one can produce a
 /// cycle, and a folder that links elsewhere is asking the scan to leave the
@@ -1093,9 +1516,25 @@ fn scan_local_files_impl(
     }
     let metadata = std::fs::symlink_metadata(root)
         .map_err(|error| DatAuditError::ScanPath(format!("{}: {error}", root.display())))?;
+    if metadata.is_file() {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        on_progress(DatAuditProgress::Scanning {
+            files_found: 1,
+            current_dir: root
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned()),
+        });
+        return Ok(LocalScan {
+            files: vec![root.to_path_buf()],
+            truncated: false,
+            scan_complete: true,
+        });
+    }
     if !metadata.is_dir() {
         return Err(DatAuditError::ScanPath(format!(
-            "{} is not a folder",
+            "{} is not a folder or regular file",
             root.display()
         )));
     }
@@ -1309,6 +1748,208 @@ mod local_scan_traversal_tests {
 
         assert!(scan.scan_complete);
         assert!(!scan.truncated);
+    }
+
+    #[test]
+    fn a_regular_file_target_is_a_complete_one_file_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.st");
+        std::fs::write(&file, b"test").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scan = scan_local_files_impl(&file, &cancel, &no_progress, &|_| false).unwrap();
+
+        assert_eq!(scan.files, vec![file]);
+        assert!(scan.scan_complete);
+        assert!(!scan.truncated);
+    }
+}
+
+#[cfg(test)]
+mod combined_audit_tests {
+    use super::*;
+
+    const TEST_SHA1: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
+
+    fn dat(game: &str, rom: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name><author>No-Intro</author></header><game name="{game}"><rom name="{rom}" size="4" sha1="{TEST_SHA1}"/></game></datafile>"#
+        )
+    }
+
+    fn source(path: PathBuf, id: &str) -> CombinedDatAuditSource {
+        CombinedDatAuditSource {
+            source_id: id.to_string(),
+            source_display_name: format!("Catalogue {id}"),
+            dat_path: path,
+            dat_kind: DatSourceKind::File,
+            platform: None,
+        }
+    }
+
+    fn run(sources: Vec<CombinedDatAuditSource>, root: PathBuf) -> DatAuditOutcome {
+        run_combined_dat_audit(
+            &CombinedDatAuditRequest {
+                sources,
+                scan_root: root,
+                limits: DatLimits::default(),
+            },
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn one_exact_source_is_verified_without_writing_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let rom_path = dir.path().join("messy-name.bin");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&rom_path, b"test").unwrap();
+        let before = std::fs::read(&rom_path).unwrap();
+
+        let outcome = run(vec![source(dat_path, "no-intro")], rom_path.clone());
+
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Exact { .. }
+        ));
+        assert_eq!(outcome.evidence_sources.len(), 1);
+        assert_eq!(outcome.evidence_sources[0].source_id, "no-intro");
+        assert_eq!(std::fs::read(&rom_path).unwrap(), before);
+    }
+
+    #[test]
+    fn agreeing_exact_catalogues_preserve_both_provenances() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.dat");
+        let second = dir.path().join("second.dat");
+        let rom = dir.path().join("source.bin");
+        std::fs::write(&first, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&second, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&rom, b"test").unwrap();
+
+        let outcome = run(vec![source(first, "one"), source(second, "two")], rom);
+
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Exact { .. }
+        ));
+        assert_eq!(outcome.evidence_sources.len(), 2);
+        assert_eq!(outcome.evidence_sources[0].source_id, "one");
+        assert_eq!(outcome.evidence_sources[1].source_id, "two");
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        assert!(
+            plan.proposals[0]
+                .source_display_name
+                .contains("Catalogue one")
+        );
+        assert!(
+            plan.proposals[0]
+                .source_display_name
+                .contains("Catalogue two")
+        );
+    }
+
+    #[test]
+    fn conflicting_exact_catalogues_are_ambiguous_and_non_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.dat");
+        let second = dir.path().join("second.dat");
+        let rom = dir.path().join("source.bin");
+        std::fs::write(&first, dat("Game A", "a.bin")).unwrap();
+        std::fs::write(&second, dat("Game B", "b.bin")).unwrap();
+        std::fs::write(&rom, b"test").unwrap();
+
+        let outcome = run(vec![source(first, "one"), source(second, "two")], rom);
+
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Ambiguous { .. }
+        ));
+        assert!(outcome.evidence_sources.is_empty());
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn agreeing_names_with_conflicting_explicit_platforms_are_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.dat");
+        let second = dir.path().join("second.dat");
+        let rom = dir.path().join("source.bin");
+        std::fs::write(&first, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&second, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&rom, b"test").unwrap();
+
+        let mut first_source = source(first, "one");
+        first_source.platform = Some("nintendo-nes".to_string());
+        let mut second_source = source(second, "two");
+        second_source.platform = Some("sega-mega-drive".to_string());
+        let outcome = run(vec![first_source, second_source], rom);
+
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Ambiguous { .. }
+        ));
+        assert!(outcome.evidence_sources.is_empty());
+    }
+
+    #[test]
+    fn no_match_remains_unmatched() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let rom = dir.path().join("source.bin");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&rom, b"other").unwrap();
+
+        let outcome = run(vec![source(dat_path, "one")], rom);
+
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::NotInDat
+        ));
+    }
+
+    #[test]
+    fn combined_archive_outer_is_visible_but_never_raw_hash_matched_or_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("source.zip");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        // It need not be a valid archive: the combined loose slice must not
+        // inspect outer bytes as though they were a ROM.
+        std::fs::write(&archive, b"test").unwrap();
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+
+        assert_eq!(outcome.report.entries.len(), 1);
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::NoUsableEvidence
+        ));
+        assert_eq!(outcome.unhashed.len(), 1);
+        assert_eq!(outcome.unhashed[0].code, "combined-container-deferred");
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
     }
 }
 

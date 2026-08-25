@@ -30,7 +30,7 @@ use crate::dat::rename_plan::model::{
 };
 use crate::dat::set::{SetResolution, SetState};
 use crate::dat::sources::audit_run::{
-    DatArchiveAudit, DatAuditOutcome, DatContentMatch, DatPolicyNote,
+    DatArchiveAudit, DatAuditEvidenceSource, DatAuditOutcome, DatContentMatch, DatPolicyNote,
 };
 
 /// The identity a plan is built for. `generation` lets a caller reject a plan
@@ -89,6 +89,16 @@ pub fn build_rename_plan(
         .iter()
         .map(|note| (note.local_path.as_str(), note))
         .collect();
+    let evidence_by_path: HashMap<&str, Vec<&DatAuditEvidenceSource>> = outcome
+        .evidence_sources
+        .iter()
+        .fold(HashMap::new(), |mut by_path, evidence| {
+            by_path
+                .entry(evidence.local_path.as_str())
+                .or_default()
+                .push(evidence);
+            by_path
+        });
 
     // The sibling index comes from the audit's own file list: every walked
     // file is in `report.entries`, so no second scan is needed to answer
@@ -138,13 +148,14 @@ pub fn build_rename_plan(
         let content = content_by_path.get(entry.local_path.as_str()).copied();
         let source_path = Path::new(&entry.local_path);
         match classify_object(source_path) {
-            Some(object_kind) => proposals.push(derive_proposal(
-                entry,
-                note,
-                content,
-                &proposal_context,
-                object_kind,
-            )),
+            Some(object_kind) => {
+                let mut proposal =
+                    derive_proposal(entry, note, content, &proposal_context, object_kind);
+                if let Some(evidence) = evidence_by_path.get(entry.local_path.as_str()) {
+                    apply_combined_provenance(&mut proposal, evidence);
+                }
+                proposals.push(proposal);
+            }
             None => proposals.push(blocked_missing_source(
                 entry,
                 note,
@@ -195,6 +206,30 @@ pub fn build_rename_plan(
         verified_total,
         truncated: outcome.truncated,
     })
+}
+
+/// Replaces the virtual aggregate source label with the exact agreeing source
+/// labels when a plan came from a combined audit.  The transaction engine does
+/// not grant authority from these display fields; they are provenance for the
+/// user reviewing a proposal.
+fn apply_combined_provenance(proposal: &mut RenameProposal, evidence: &[&DatAuditEvidenceSource]) {
+    let mut source_ids = Vec::new();
+    let mut source_labels = Vec::new();
+    for item in evidence {
+        if !source_ids.iter().any(|value| value == &item.source_id) {
+            source_ids.push(item.source_id.clone());
+        }
+        if !source_labels
+            .iter()
+            .any(|value| value == &item.source_display_name)
+        {
+            source_labels.push(item.source_display_name.clone());
+        }
+    }
+    if !source_ids.is_empty() {
+        proposal.source_id = source_ids.join(" + ");
+        proposal.source_display_name = source_labels.join(" + ");
+    }
 }
 
 /// Classifies a source path without following any link. `None` means the path
@@ -818,6 +853,7 @@ mod tests {
                 entries,
                 summary: AuditSummary::default(),
             },
+            evidence_sources: Vec::new(),
             archives: Vec::new(),
             sets: Vec::new(),
             unhashed: Vec::new(),

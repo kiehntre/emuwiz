@@ -98,6 +98,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
             }],
             summary: AuditSummary::default(),
         },
+        evidence_sources: Vec::new(),
         archives: Vec::new(),
         sets: Vec::new(),
         unhashed: Vec::new(),

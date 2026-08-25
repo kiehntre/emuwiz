@@ -67,7 +67,8 @@ use archivefs_core::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
 };
 use archivefs_core::dat::sources::audit_run::{
-    DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
+    CombinedDatAuditRequest, CombinedDatAuditSource, DatAuditOutcome, DatAuditProgress,
+    DatAuditRequest, run_combined_dat_audit, run_dat_audit,
 };
 use archivefs_core::dat::sources::{
     DatFileOutcome, DatHealthState, DatSourceEntry, DatSourceKind, DatSourceRegistry,
@@ -1017,6 +1018,9 @@ pub(crate) struct AuditEntryView {
     pub(crate) file_name: String,
     pub(crate) verdict: &'static str,
     pub(crate) detail: String,
+    /// Every enabled catalogue that supplied the agreeing exact match. This
+    /// stays empty for ordinary one-source audits and non-actionable rows.
+    pub(crate) evidence_sources: Vec<String>,
     pub(crate) content: Vec<ContentTechnicalView>,
 }
 
@@ -1071,6 +1075,12 @@ pub(crate) enum DatSourcesPageAction {
     },
     Audit {
         id: String,
+        scan_root: PathBuf,
+    },
+    /// Read-only all-evidence audit for the normal Identify & Rename flow.
+    /// The state gathers only enabled local DATs and validated installed game
+    /// snapshots; BIOS metadata is never included.
+    AuditAllEnabled {
         scan_root: PathBuf,
     },
     /// Adds one explicitly typed MAME software-list source. The authoritative
@@ -2437,6 +2447,9 @@ impl DatSourcesPageState {
             }
             DatSourcesPageAction::Validate { id } => self.start_validate(id),
             DatSourcesPageAction::Audit { id, scan_root } => self.start_audit(id, scan_root),
+            DatSourcesPageAction::AuditAllEnabled { scan_root } => {
+                self.start_combined_audit(scan_root)
+            }
             DatSourcesPageAction::AddManagedMameSoftwareList { authoritative_name } => {
                 self.add_managed_mame_software_list(authoritative_name);
             }
@@ -3491,6 +3504,142 @@ impl DatSourcesPageState {
         });
     }
 
+    /// Starts the normal Identify & Rename audit.  The source list is built
+    /// entirely from already-enabled local entries and locally validated
+    /// managed *current* snapshots; it performs no check, download, or source
+    /// configuration mutation.
+    fn start_combined_audit(&mut self, scan_root: PathBuf) {
+        if self.is_busy() {
+            return;
+        }
+        let sources = self.combined_audit_sources();
+        if sources.is_empty() {
+            self.audit_error = Some(
+                "No enabled, installed game DAT catalogues are available. Add a local DAT or install a managed game catalogue first."
+                    .to_string(),
+            );
+            return;
+        }
+        self.audit = None;
+        self.identity_enrichment_completed = false;
+        self.identity_enrichment = None;
+        self.audit_error = None;
+        self.audit_elapsed_seconds = None;
+        self.rename_plan = None;
+        self.rename_plan_error = None;
+        self.review_decisions.clear();
+        self.abandon_apply_work();
+        self.audit_generation = self.audit_generation.wrapping_add(1);
+        let generation = self.audit_generation;
+        let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let trusted = self.trusted.clone();
+        let source_count = sources.len();
+        let request = CombinedDatAuditRequest {
+            sources,
+            scan_root,
+            limits: self.limits,
+        };
+
+        std::thread::spawn(move || {
+            let report_sender = sender.clone();
+            let outcome = run_combined_dat_audit(&request, &trusted, &worker_cancel, &|progress| {
+                send_progress(&report_sender, JobMessage::AuditProgress(progress));
+            });
+            let _ = match outcome {
+                Ok(outcome) => {
+                    send_progress(
+                        &sender,
+                        JobMessage::Progress("Building combined rename plan…".to_string()),
+                    );
+                    let plan = build_rename_plan(
+                        &outcome,
+                        &RenamePlanContext { generation },
+                        &worker_cancel,
+                    )
+                    .ok()
+                    .map(Box::new);
+                    sender.send(JobMessage::Audited {
+                        generation,
+                        outcome: Box::new(outcome),
+                        enrichment: None,
+                        plan,
+                    })
+                }
+                Err(archivefs_core::dat::sources::audit_run::DatAuditError::Cancelled) => {
+                    sender.send(JobMessage::Cancelled)
+                }
+                Err(error) => sender.send(JobMessage::Failed(error.to_string())),
+            };
+        });
+
+        self.job = Some(RunningJob {
+            kind: JobKind::Audit,
+            source_id: "all-enabled-evidence".to_string(),
+            cancel,
+            cancel_requested: false,
+            messages,
+            latest: format!("Starting with {source_count} evidence catalogue(s)…"),
+            started_at: Instant::now(),
+            audit_progress: Some(AuditProgressTracker::new()),
+            platform_display: None,
+        });
+    }
+
+    fn combined_audit_sources(&self) -> Vec<CombinedDatAuditSource> {
+        let mut sources: Vec<CombinedDatAuditSource> = self
+            .draft
+            .entries()
+            .iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| CombinedDatAuditSource {
+                source_id: entry.id.clone(),
+                source_display_name: entry.display_name.clone(),
+                dat_path: entry.path.clone(),
+                dat_kind: entry.kind,
+                platform: entry
+                    .platform
+                    .as_deref()
+                    .and_then(archivefs_core::canonical_platform_for_alias)
+                    .map(str::to_string),
+            })
+            .collect();
+
+        for config in self.managed_sources.entries() {
+            let mut one = ManagedDatSources::new();
+            if one
+                .add_mame_software_list(config.authoritative_name.clone(), config.update_policy)
+                .is_ok()
+                && let Ok(mut resolved) = resolve_managed_dat_sources(&one, &self.managed_root)
+                && let Some(source) = resolved.pop().and_then(|resolved| resolved.current)
+            {
+                sources.push(combined_source_from_managed(
+                    source,
+                    format!("MAME software list: {}", config.authoritative_name),
+                ));
+            }
+        }
+        // BIOS DATs are deliberately absent.  They describe firmware, never
+        // game identity, and must not enter a rename plan.
+        for config in self.managed_sources.redump_games_entries() {
+            let mut one = ManagedDatSources::new();
+            if one
+                .add_redump_games(config.system, config.update_policy)
+                .is_ok()
+                && let Ok(mut resolved) = resolve_redump_games_sources(&one, &self.managed_root)
+                && let Some(source) = resolved.pop().and_then(|resolved| resolved.current)
+            {
+                sources.push(combined_source_from_managed(
+                    source,
+                    format!("Redump game DAT: {}", redump_game_label(config.system)),
+                ));
+            }
+        }
+        sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+        sources
+    }
+
     /// The validation report for one source, if it has been validated this
     /// session.
     pub(crate) fn validation(&self, id: &str) -> Option<&DatValidationReport> {
@@ -4244,6 +4393,23 @@ impl DatSourcesPageState {
     }
 }
 
+fn combined_source_from_managed(
+    source: ManagedDatReadOnlySource,
+    source_display_name: String,
+) -> CombinedDatAuditSource {
+    CombinedDatAuditSource {
+        source_id: format!(
+            "managed:{:?}:{}",
+            source.source_id().provider,
+            source.source_id().source_key
+        ),
+        source_display_name,
+        dat_path: source.path().to_path_buf(),
+        dat_kind: DatSourceKind::File,
+        platform: None,
+    }
+}
+
 /// Turns a validation report into the Inspect panel's rows.
 fn inspect_view(report: &DatValidationReport) -> InspectView {
     InspectView {
@@ -4424,6 +4590,16 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         .iter()
         .map(|matched| (matched.local_path.as_str(), matched))
         .collect();
+    let evidence_by_path: std::collections::HashMap<_, Vec<_>> = outcome
+        .evidence_sources
+        .iter()
+        .fold(std::collections::HashMap::new(), |mut by_path, evidence| {
+            by_path
+                .entry(evidence.local_path.as_str())
+                .or_default()
+                .push(evidence.source_display_name.as_str());
+            by_path
+        });
     let entries: Vec<AuditEntryView> = outcome
         .report
         .entries
@@ -4449,6 +4625,15 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
                 file_name: entry.local_filename.clone(),
                 verdict: entry.verdict.label(),
                 detail: verdict_detail(&entry.verdict),
+                evidence_sources: evidence_by_path
+                    .get(entry.local_path.as_str())
+                    .map(|sources| {
+                        let mut sources = sources.clone();
+                        sources.sort_unstable();
+                        sources.dedup();
+                        sources.into_iter().map(str::to_string).collect()
+                    })
+                    .unwrap_or_default(),
                 content,
             }
         })
@@ -4694,6 +4879,9 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) platform_query: String,
     /// Which source's audit target chooser is open.
     pub(crate) open_audit_picker: Option<String>,
+    /// Whether the normal all-enabled Identify & Rename target chooser is
+    /// open. It is transient UI only and never starts a scan by itself.
+    pub(crate) open_combined_audit_picker: bool,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
     /// Typed MAME software-list name for the deliberately narrow managed
@@ -4723,6 +4911,7 @@ impl DatSourcesPageUi {
         self.open_platform_picker = None;
         self.platform_query.clear();
         self.open_audit_picker = None;
+        self.open_combined_audit_picker = false;
         self.confirm_remove = None;
         self.managed_mame_name.clear();
         self.confirm_remove_managed = None;
@@ -4785,8 +4974,15 @@ pub(crate) fn show_dat_sources_page(
     );
     ui.add_space(10.0);
 
+    if let Some(acquisition_action) = show_evidence_acquisition_section(ui, view) {
+        action = Some(acquisition_action);
+    }
+    ui.add_space(10.0);
+
     if let Some(bar_action) = show_toolbar(ui, view) {
-        action = Some(bar_action);
+        if action.is_none() {
+            action = Some(bar_action);
+        }
     }
     ui.add_space(10.0);
 
@@ -4934,6 +5130,288 @@ pub(crate) fn show_dat_sources_page(
         show_kept_but_not_understood(ui, view);
     }
 
+    action
+}
+
+/// A small, task-oriented entry point into the existing DAT-source flows.
+///
+/// This deliberately does not manufacture a generic downloader: No-Intro and
+/// local DATs remain user-supplied files, TOSEC remains a user-supplied
+/// extracted release pack, and the fixed managed MAME/Redump contracts remain
+/// below.  The controls here merely make those existing, distinct authority
+/// models discoverable without requiring a user to understand the parser
+/// names first.
+fn show_evidence_acquisition_section(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    let managed_configured = view
+        .managed_rows
+        .iter()
+        .chain(view.redump_bios_rows.iter())
+        .chain(view.redump_game_rows.iter())
+        .filter(|row| row.configured)
+        .count();
+    let managed_installed = view
+        .managed_rows
+        .iter()
+        .chain(view.redump_bios_rows.iter())
+        .chain(view.redump_game_rows.iter())
+        .filter(|row| row.installed)
+        .count();
+    let available_tosec_packs = view
+        .tosec_packs
+        .iter()
+        .filter(|pack| pack.availability == PackAvailability::Available)
+        .count();
+    let selected_tosec_dats: usize = view
+        .tosec_packs
+        .iter()
+        .map(|pack| pack.selected_dat_count)
+        .sum();
+
+    widgets::section_header(
+        ui,
+        "Get evidence for your library",
+        Some(
+            "Choose the source that fits your games. Importing or configuring a catalogue never changes game files.",
+        ),
+    );
+
+    ui.columns(2, |columns| {
+        widgets::card(&mut columns[0], |ui| {
+            ui.label(egui::RichText::new("No-Intro — cartridge ROMs").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Import an official, extracted DAT from No-Intro DAT-o-MATIC. EmuWiz verifies the DAT's internal header; its filename is not trusted.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+            if widgets::action_button(
+                ui,
+                "Choose No-Intro DAT…",
+                widgets::ActionStyle::Primary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+                && let Some(path) = choose_local_dat_file("Choose a No-Intro DAT")
+            {
+                action = Some(DatSourcesPageAction::AddFile { path });
+            }
+        });
+
+        widgets::card(&mut columns[1], |ui| {
+            ui.label(egui::RichText::new("TOSEC — vintage systems").strong());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{available_tosec_packs} available pack(s) · {selected_tosec_dats} selected DAT(s). Choose an extracted pack, then enable System / Category / Media below."
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+            if widgets::action_button(
+                ui,
+                "Choose extracted TOSEC pack…",
+                widgets::ActionStyle::Primary,
+                !view.background_busy && view.tosec_load_error.is_none(),
+            )
+            .clicked()
+                && action.is_none()
+                && let Some(root) = choose_tosec_release_pack()
+            {
+                action = Some(DatSourcesPageAction::ImportTosecReleasePack { root });
+            }
+        });
+    });
+    ui.add_space(8.0);
+    ui.columns(2, |columns| {
+        widgets::card(&mut columns[0], |ui| {
+            ui.label(egui::RichText::new("Redump — disc and BIOS metadata").strong());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{managed_configured} managed source(s) configured · {managed_installed} installed. Fixed PlayStation, PlayStation 2, and Xbox sources are configured below, then checked or updated only when you click an action."
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        });
+        widgets::card(&mut columns[1], |ui| {
+            ui.label(egui::RichText::new("MAME and other local DATs").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Add a fixed MAME software-list by its authoritative name below, or import any local Logiqx / ClrMamePro DAT using the Local DAT Sources controls.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+            if widgets::action_button(
+                ui,
+                "Choose local DAT…",
+                widgets::ActionStyle::Secondary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+                && let Some(path) = choose_local_dat_file("Choose a local DAT")
+            {
+                action = Some(DatSourcesPageAction::AddFile { path });
+            }
+        });
+    });
+    action
+}
+
+fn choose_local_dat_file(title: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("DAT catalogues", &["dat", "xml"])
+        .pick_file()
+}
+
+fn choose_tosec_release_pack() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Choose an extracted TOSEC release pack")
+        .pick_folder()
+}
+
+/// Draws the task-oriented entry point for evidence-backed library renaming.
+///
+/// This intentionally reuses the same `DatSourcesPageState` actions and
+/// read-only audit/plan/apply pipeline as the advanced DAT Sources page. It
+/// does not infer a catalogue from a folder name or a file extension: it uses
+/// every enabled local catalogue and installed managed *game* snapshot, then
+/// preserves the exact agreeing source provenance. The user chooses only a
+/// library folder (or one regular file). The resulting plan still requires an
+/// explicit review and apply.
+pub(crate) fn show_identify_rename_page(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+
+    widgets::page_header_with_icon(
+        ui,
+        crate::ui::icons::VERIFY,
+        "Identify & Rename",
+        "Identify files from enabled evidence catalogues, review canonical names, then apply only the changes you approve.",
+    );
+    widgets::banner(
+        ui,
+        "No filename guessing",
+        "A rename is suggested only after an exact cryptographic DAT match. Unmatched, ambiguous, unsupported, and conflicting files stay untouched.",
+        widgets::StatusTone::Info,
+    );
+    ui.add_space(8.0);
+
+    if let Some(running) = &view.running
+        && let Some(job_action) = show_running_job(ui, running)
+    {
+        action = Some(job_action);
+    }
+    if let Some(error) = &view.audit_error {
+        ui.add_space(8.0);
+        widgets::banner(
+            ui,
+            "Identification could not run",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+
+    let local_enabled = view.rows.iter().filter(|row| row.enabled).count();
+    let mame_installed = view.managed_rows.iter().filter(|row| row.installed).count();
+    let redump_installed = view
+        .redump_game_rows
+        .iter()
+        .filter(|row| row.installed)
+        .count();
+    let selected_tosec: usize = view
+        .tosec_packs
+        .iter()
+        .map(|pack| pack.selected_dat_count)
+        .sum();
+    widgets::section_header(
+        ui,
+        "Available evidence",
+        Some(
+            "One scan compares each file with every eligible installed catalogue. BIOS DATs are excluded.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("No-Intro and local DATs").strong());
+        ui.label(
+            egui::RichText::new(format!("{local_enabled} enabled local catalogue(s)"))
+                .color(theme::muted(ui))
+                .small(),
+        );
+        ui.label(egui::RichText::new("TOSEC").strong());
+        ui.label(
+            egui::RichText::new(format!(
+                "{selected_tosec} selected TOSEC DAT(s); apply their selection in DAT Sources before scanning."
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
+        ui.label(egui::RichText::new("Redump game/disc DATs").strong());
+        ui.label(
+            egui::RichText::new(format!("{redump_installed} installed game catalogue(s)"))
+                .color(theme::muted(ui))
+                .small(),
+        );
+        ui.label(egui::RichText::new("MAME software lists").strong());
+        ui.label(
+            egui::RichText::new(format!("{mame_installed} installed software list(s)"))
+                .color(theme::muted(ui))
+                .small(),
+        );
+        let can_scan =
+            !view.background_busy && local_enabled + mame_installed + redump_installed > 0;
+        if widgets::action_button(
+            ui,
+            if ui_state.open_combined_audit_picker {
+                "Cancel library choice"
+            } else {
+                "Choose library or file…"
+            },
+            widgets::ActionStyle::Primary,
+            can_scan,
+        )
+        .clicked()
+            && action.is_none()
+        {
+            ui_state.open_combined_audit_picker = !ui_state.open_combined_audit_picker;
+        }
+        if ui_state.open_combined_audit_picker
+            && action.is_none()
+            && let Some(audit_action) = show_combined_audit_target_picker(ui, view)
+        {
+            action = Some(audit_action);
+        }
+    });
+
+    if let Some(audit) = &view.audit {
+        ui.add_space(10.0);
+        show_audit_result(ui, audit);
+    }
+    if let Some(plan) = &view.rename_plan
+        && action.is_none()
+        && let Some(plan_action) = show_rename_plan_section(ui, plan, ui_state)
+    {
+        action = Some(plan_action);
+    }
+    if action.is_none()
+        && let Some(apply_action) = show_rename_apply_section(ui, &view.rename_apply, ui_state)
+    {
+        action = Some(apply_action);
+    }
+
+    if matches!(action, Some(DatSourcesPageAction::AuditAllEnabled { .. })) {
+        ui_state.open_combined_audit_picker = false;
+    }
     action
 }
 
@@ -5430,7 +5908,7 @@ fn show_tosec_release_packs_section(
             !view.background_busy && view.tosec_load_error.is_none(),
         )
         .clicked()
-            && let Some(path) = rfd::FileDialog::new().pick_folder()
+            && let Some(path) = choose_tosec_release_pack()
         {
             action = Some(DatSourcesPageAction::ImportTosecReleasePack { root: path });
         }
@@ -5633,10 +6111,7 @@ fn show_toolbar(ui: &mut egui::Ui, view: &DatSourcesPageView) -> Option<DatSourc
             // the state stays testable without a window.
             if widgets::action_button(ui, "Add DAT file…", widgets::ActionStyle::Primary, !busy)
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose a DAT file")
-                    .add_filter("DAT catalogues", &["dat", "xml"])
-                    .pick_file()
+                && let Some(path) = choose_local_dat_file("Choose a DAT file")
             {
                 action = Some(DatSourcesPageAction::AddFile { path });
             }
@@ -6341,6 +6816,71 @@ fn friendly_folder_label(folder: &Path) -> String {
         .unwrap_or_else(|| folder.display().to_string())
 }
 
+fn show_combined_audit_target_picker(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    ui.add_space(6.0);
+    widgets::section_header(
+        ui,
+        "Check which files?",
+        Some(
+            "Every candidate is read once and compared against all available evidence. Nothing is renamed, moved, or written.",
+        ),
+    );
+    if view.library_folders.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No library folders are configured. Choose another folder or one regular file.",
+            )
+            .color(theme::muted(ui)),
+        );
+    } else {
+        for folder in &view.library_folders {
+            if widgets::action_button(
+                ui,
+                &format!("Use {}", friendly_folder_label(folder)),
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                action = Some(DatSourcesPageAction::AuditAllEnabled {
+                    scan_root: folder.clone(),
+                });
+            }
+            ui.label(
+                egui::RichText::new(folder.display().to_string())
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    }
+    if widgets::action_button(
+        ui,
+        "Choose another folder…",
+        widgets::ActionStyle::Quiet,
+        true,
+    )
+    .clicked()
+        && action.is_none()
+        && let Some(path) = rfd::FileDialog::new().pick_folder()
+    {
+        action = Some(DatSourcesPageAction::AuditAllEnabled { scan_root: path });
+    }
+    if widgets::action_button(ui, "Choose one file…", widgets::ActionStyle::Quiet, true).clicked()
+        && action.is_none()
+        && let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose one file to identify")
+            .pick_file()
+    {
+        action = Some(DatSourcesPageAction::AuditAllEnabled { scan_root: path });
+    }
+    action
+}
+
 fn show_audit_target_picker(
     ui: &mut egui::Ui,
     row: &DatSourceRowView,
@@ -6353,8 +6893,8 @@ fn show_audit_target_picker(
             ui,
             "Check which files?",
             Some(
-                "Every file in the chosen folder is read and compared against this catalogue. \
-                 Nothing is renamed, moved, or written.",
+                "Choose a folder, or one regular file for a small evidence check. Nothing is \
+                 renamed, moved, or written.",
             ),
         );
         if view.library_folders.is_empty() {
@@ -6404,6 +6944,18 @@ fn show_audit_target_picker(
             && let Some(path) = rfd::FileDialog::new()
                 .set_title("Choose a folder to check")
                 .pick_folder()
+        {
+            action = Some(DatSourcesPageAction::Audit {
+                id: row.id.clone(),
+                scan_root: path,
+            });
+        }
+        if widgets::action_button(ui, "Choose one file…", widgets::ActionStyle::Quiet, true)
+            .clicked()
+            && action.is_none()
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose one file to check")
+                .pick_file()
         {
             action = Some(DatSourcesPageAction::Audit {
                 id: row.id.clone(),
@@ -7893,6 +8445,16 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
                                     egui::RichText::new(&entry.detail)
                                         .color(theme::muted(ui))
                                         .small(),
+                                );
+                            }
+                            if !entry.evidence_sources.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Verified by: {}",
+                                        entry.evidence_sources.join(" · ")
+                                    ))
+                                    .color(theme::muted(ui))
+                                    .small(),
                                 );
                             }
                             for (content_index, content) in entry.content.iter().enumerate() {

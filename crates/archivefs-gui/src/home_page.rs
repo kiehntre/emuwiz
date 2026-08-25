@@ -280,7 +280,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             accent: Some(HomeAccent::Organise),
             readiness: None,
             action_label: "Open Organise",
-            secondary: Some((HomeCard::CleanUpLibrary, "Review filename suggestions")),
+            secondary: Some((HomeCard::CleanUpLibrary, "Identify & Rename")),
         },
         HomeCardView {
             card: HomeCard::CheckSetup,
@@ -341,12 +341,12 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         HomeCardView {
             card: HomeCard::CleanUpLibrary,
             icon: crate::ui::icons::CLEAN_UP,
-            title: "Clean up my library",
-            explanation: "Review suggested filenames before renaming, using DAT catalogues.",
+            title: "Identify & Rename",
+            explanation: "Identify files with cryptographic DAT evidence, review canonical names, then rename only what you approve.",
             tier: HomeCardTier::Secondary,
             accent: None,
             readiness: None,
-            action_label: "Open DAT Sources",
+            action_label: "Identify files",
             secondary: None,
         },
         HomeCardView {

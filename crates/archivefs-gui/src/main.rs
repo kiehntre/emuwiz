@@ -3231,6 +3231,11 @@ enum MainView {
     /// Canonical organisation: planning and (only after explicit approval)
     /// applying moves of identified games into a configured master ROM root.
     CanonicalOrganisation,
+    /// Evidence-backed filename cleanup for one chosen library folder. This
+    /// is a task-oriented entry point over the existing DAT audit, rename
+    /// plan, review, and journalled apply flow; DAT Sources remains the
+    /// advanced catalogue-management page.
+    IdentifyRename,
     /// Repair Review: preview-only review of a saved whole-library repair
     /// plan. Loads a `LibraryRepairPlan` produced by the CLI's
     /// `repair scan --plan-out` contract and shows its proposals. Nothing is
@@ -3316,7 +3321,7 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         home_page::HomeCard::BrowseGames => MainView::Library,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
-        home_page::HomeCard::CleanUpLibrary => MainView::DatSources,
+        home_page::HomeCard::CleanUpLibrary => MainView::IdentifyRename,
         home_page::HomeCard::CheatSources => MainView::CheatSources,
         home_page::HomeCard::DatSources => MainView::DatSources,
         home_page::HomeCard::CheckSetup => MainView::Doctor,
@@ -3516,6 +3521,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::CheatsMods => "Cheats & Mods",
         MainView::CheatSources => "Cheat Sources",
         MainView::CanonicalOrganisation => "Library organisation",
+        MainView::IdentifyRename => "Identify & Rename",
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
         MainView::LibraryViewHistory => "Library View History",
@@ -3546,6 +3552,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
+        | MainView::IdentifyRename
         | MainView::RepairReview
         | MainView::DatSources
         | MainView::Doctor
@@ -3587,6 +3594,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::Sources
             | MainView::CheatSources
             | MainView::DatSources
+            | MainView::IdentifyRename
             | MainView::Doctor
             | MainView::HistoryLogs
             | MainView::Settings
@@ -5770,6 +5778,18 @@ impl ArchiveFsApp {
     /// no folders are offered and no symlink may be followed, which are the
     /// safe answers rather than an error the user cannot act on from this page.
     fn show_dat_sources_page(&mut self, ui: &mut egui::Ui) {
+        self.show_dat_sources_page_mode(ui, false);
+    }
+
+    /// Shares loading, background-job polling, action dispatch, and history
+    /// recording between the advanced catalogue page and the task-oriented
+    /// Identify & Rename workflow. The two views deliberately use the same
+    /// state and core actions; neither gets a private rename implementation.
+    fn show_identify_rename_page(&mut self, ui: &mut egui::Ui) {
+        self.show_dat_sources_page_mode(ui, true);
+    }
+
+    fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
         if self.dat_sources_page.is_none() {
             let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
                 Ok(path) => path,
@@ -5810,7 +5830,11 @@ impl ArchiveFsApp {
             ui.ctx().request_repaint();
         }
         let view = page.view();
-        let action = dat_sources_page::show_dat_sources_page(ui, &view, &mut self.dat_sources_ui);
+        let action = if identify_rename {
+            dat_sources_page::show_identify_rename_page(ui, &view, &mut self.dat_sources_ui)
+        } else {
+            dat_sources_page::show_dat_sources_page(ui, &view, &mut self.dat_sources_ui)
+        };
         if let Some(action) = action {
             if matches!(action, dat_sources_page::DatSourcesPageAction::Revert) {
                 self.dat_sources_ui.clear();
@@ -15812,6 +15836,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::CanonicalOrganisation {
                     self.show_rom_organisation_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::IdentifyRename {
+                    self.show_identify_rename_page(ui);
                     return;
                 }
 

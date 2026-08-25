@@ -928,6 +928,7 @@ fn the_audit_folder_picker_shows_friendly_names_with_the_full_path_secondary() {
         "every offered folder's full path must stay reachable"
     );
     assert!(rendered_text_contains(&output, "Choose another folder…"));
+    assert!(rendered_text_contains(&output, "Choose one file…"));
 }
 
 #[test]
@@ -959,6 +960,104 @@ fn the_audit_folder_picker_stays_usable_at_compact_width() {
         "the full path must remain reachable at compact width"
     );
     assert!(rendered_text_contains(&output, "Choose another folder…"));
+    assert!(rendered_text_contains(&output, "Choose one file…"));
+}
+
+#[test]
+fn a_single_regular_file_audit_builds_a_read_only_rename_preview() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let roms = fixture.dir("roms");
+    let source = roms.join("not-canonical.bin");
+    std::fs::write(&source, SUPER_BIN).unwrap();
+
+    let mut page = fixture.page_with_library(vec![roms]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    let before = snapshot(&fixture.root);
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: source.clone(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let audit = view.audit.as_ref().expect("single-file audit result");
+    assert_eq!(audit.files_scanned, 1);
+    assert_eq!(audit.scan_root, source.to_string_lossy());
+    let plan = view.rename_plan.as_ref().expect("read-only rename plan");
+    assert_eq!(plan.counts.suggested, 1, "{:?}", plan.counts);
+    assert_eq!(plan.rows[0].proposed_basename.as_deref(), Some("super.bin"));
+    assert_eq!(
+        snapshot(&fixture.root),
+        before,
+        "audit and planning never mutate files"
+    );
+}
+
+#[test]
+fn identify_rename_uses_all_enabled_evidence_without_manual_catalogue_choice() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let roms = fixture.dir("roms");
+    let mut page = fixture.page_with_library(vec![roms]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+
+    let before = snapshot(&fixture.root);
+    let output = render_identify_rename(&page.view(), &mut DatSourcesPageUi::default());
+
+    assert!(rendered_text_contains(&output, "Identify & Rename"));
+    assert!(rendered_text_contains(&output, "No filename guessing"));
+    assert!(rendered_text_contains(&output, "Available evidence"));
+    assert!(rendered_text_contains(&output, "No-Intro and local DATs"));
+    assert!(rendered_text_contains(&output, "Choose library or file…"));
+    assert_eq!(
+        snapshot(&fixture.root),
+        before,
+        "opening the workflow must not start an audit or mutate the collection"
+    );
+}
+
+#[test]
+fn identify_rename_combined_action_scans_once_and_builds_a_rename_plan() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let roms = fixture.dir("roms");
+    let source = roms.join("messy-name.bin");
+    std::fs::write(&source, SUPER_BIN).unwrap();
+    let mut page = fixture.page_with_library(vec![roms]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    let before = snapshot(&fixture.root);
+
+    page.apply(DatSourcesPageAction::AuditAllEnabled {
+        scan_root: source.clone(),
+    });
+    run_to_completion(&mut page);
+
+    let audit = page.view().audit.expect("combined audit result");
+    assert_eq!(audit.source_id, "combined-enabled-dat-sources");
+    assert_eq!(audit.files_scanned, 1);
+    let plan = page.view().rename_plan.expect("combined rename plan");
+    assert_eq!(plan.counts.suggested, 1);
+    assert_eq!(plan.rows[0].proposed_basename.as_deref(), Some("super.bin"));
+    assert_eq!(
+        snapshot(&fixture.root),
+        before,
+        "combined preview is read-only"
+    );
+}
+
+#[test]
+fn combined_identify_rename_excludes_configured_redump_bios_sources() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.managed_sources
+        .add_redump_bios(
+            RedumpBiosSystem::PlayStation,
+            archivefs_core::dat::updates::ManagedDatUpdatePolicy::Manual,
+        )
+        .unwrap();
+
+    assert!(page.combined_audit_sources().is_empty());
 }
 
 #[test]
@@ -1361,6 +1460,21 @@ fn render(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi) -> egui::F
     context.run(egui::RawInput::default(), |context| {
         egui::CentralPanel::default().show(context, |ui| {
             let _ = show_dat_sources_page(ui, view, ui_state);
+        });
+    })
+}
+
+/// Draws the task-oriented rename entry point without creating an audit job.
+/// Rendering must stay read-only: starting an audit always requires the
+/// explicit catalogue and folder/file clicks the page exposes.
+fn render_identify_rename(
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_identify_rename_page(ui, view, ui_state);
         });
     })
 }
@@ -2713,6 +2827,7 @@ fn minimal_outcome() -> DatAuditOutcome {
             entries: Vec::new(),
             summary: AuditSummary::default(),
         },
+        evidence_sources: Vec::new(),
         archives: Vec::new(),
         sets: Vec::new(),
         unhashed: Vec::new(),
@@ -5013,6 +5128,40 @@ fn the_empty_state_uses_the_verify_identity_and_short_wording() {
 // ---------------------------------------------------------------------------
 // Managed MAME DAT sources
 // ---------------------------------------------------------------------------
+
+#[test]
+fn dat_acquisition_entry_point_exposes_existing_safe_provider_paths_without_auto_configuring() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+
+    // Drawing is descriptive only: it must not create a managed source, start
+    // a network operation, or enable a TOSEC selection.
+    assert!(view.managed_rows.is_empty());
+    assert!(view.redump_bios_rows.iter().all(|row| !row.configured));
+    assert!(view.redump_game_rows.iter().all(|row| !row.configured));
+    assert!(view.tosec_packs.is_empty());
+    assert!(!view.background_busy);
+
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(
+        &output,
+        "Get evidence for your library"
+    ));
+    assert!(rendered_text_contains(&output, "No-Intro — cartridge ROMs"));
+    assert!(rendered_text_contains(&output, "Choose No-Intro DAT…"));
+    assert!(rendered_text_contains(&output, "TOSEC — vintage systems"));
+    assert!(rendered_text_contains(
+        &output,
+        "Choose extracted TOSEC pack…"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Redump — disc and BIOS metadata"
+    ));
+    assert!(rendered_text_contains(&output, "MAME and other local DATs"));
+    assert!(rendered_text_contains(&output, "Choose local DAT…"));
+}
 
 const TOSEC_AMIGA_FLOPPY: &str = r#"<?xml version="1.0"?>
 <datafile>

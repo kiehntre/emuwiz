@@ -185,7 +185,7 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::DatSources, "Open DAT Sources"),
         (HomeCard::Settings, "Open Settings"),
         (HomeCard::BuildLibrary, "Open Sources"),
-        (HomeCard::CleanUpLibrary, "Open DAT Sources"),
+        (HomeCard::CleanUpLibrary, "Identify files"),
         (HomeCard::RomM, "Open Sources"),
     ];
     assert_eq!(view.cards.len(), expected.len());
@@ -363,20 +363,20 @@ fn rename_and_organise_are_discoverable_from_home() {
         .iter()
         .find(|c| c.card == HomeCard::CanonicalOrganisation)
         .unwrap();
-    // "Organise by platform" is the primary action; "Review filename
-    // suggestions" (the DAT rename-planning workflow) is the secondary route.
+    // "Organise by platform" is the primary action; the evidence-backed
+    // Identify & Rename workflow is the secondary route.
     assert_eq!(organise.action_label, "Open Organise");
     assert_eq!(
         organise.secondary,
-        Some((HomeCard::CleanUpLibrary, "Review filename suggestions"))
+        Some((HomeCard::CleanUpLibrary, "Identify & Rename"))
     );
     let clean = view
         .cards
         .iter()
         .find(|c| c.card == HomeCard::CleanUpLibrary)
         .unwrap();
-    assert_eq!(clean.title, "Clean up my library");
-    assert_eq!(clean.action_label, "Open DAT Sources");
+    assert_eq!(clean.title, "Identify & Rename");
+    assert_eq!(clean.action_label, "Identify files");
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn every_home_card_shows_its_icon_alongside_its_title() {
         crate::ui::icons::CHECK,
         crate::ui::icons::SETTINGS,
         crate::ui::icons::CHEATS,
-        "Clean up my library",
+        "Identify & Rename",
         "Organise",
         "My Games",
     ] {

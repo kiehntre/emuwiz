@@ -9615,6 +9615,7 @@ mod tests {
                 }],
                 summary: AuditSummary::default(),
             },
+            evidence_sources: Vec::new(),
             archives: Vec::new(),
             sets: Vec::new(),
             unhashed: Vec::new(),
