@@ -15,8 +15,10 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::dat::firmware_evidence::FirmwareSystem;
 use crate::dat::limits::DEFAULT_MAX_FILE_SIZE;
@@ -33,6 +35,9 @@ const STAGING_DIRECTORY: &str = "staging";
 const GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_RAW_HOST: &str = "raw.githubusercontent.com";
 const REDUMP_HOST: &str = "redump.info";
+const REDUMP_DOWNLOADS_URL: &str = "https://redump.info/downloads";
+const REDUMP_BIOS_STATIC_PATH: &str = "/static/bios/";
+const REDUMP_DOWNLOADS_MAX_PAYLOAD: u64 = 1024 * 1024;
 /// Redump BIOS DATs are a handful of records at most - a few KiB. This cap
 /// is generous while still being a real, enforced bound rather than reusing
 /// the multi-hundred-MiB general DAT ceiling MAME software lists need.
@@ -102,14 +107,14 @@ impl RedumpBiosSystem {
         }
     }
 
-    /// The one fixed, approved HTTPS URL for this system's Redump BIOS DAT.
-    /// Never caller-supplied, never inferred from a URL a caller passed in
-    /// - this is the entire "approved endpoint" surface for this provider.
-    fn fixed_url(self) -> &'static str {
+    /// The exact system label on Redump's fixed downloads page.  This is
+    /// used only to select one already-constrained BIOS DAT link, never as
+    /// game/platform identity authority.
+    fn downloads_page_label(self) -> &'static str {
         match self {
-            Self::PlayStation => "https://redump.info/datfile/psx-bios",
-            Self::PlayStation2 => "https://redump.info/datfile/ps2-bios",
-            Self::Xbox => "https://redump.info/datfile/xbox-bios",
+            Self::PlayStation => "Sony PlayStation",
+            Self::PlayStation2 => "Sony PlayStation 2",
+            Self::Xbox => "Microsoft Xbox",
         }
     }
 
@@ -133,13 +138,10 @@ impl RedumpBiosSystem {
 /// already proves a working `redump.info` contract for - not because other
 /// Redump systems (Saturn, Dreamcast, GameCube, Wii, ...) lack a game DAT,
 /// but because this codebase has no proven slug for any of them: Redump's
-/// own BIOS URLs (`.../datfile/psx-bios`, `.../datfile/ps2-bios`,
-/// `.../datfile/xbox-bios`) are the only place a `/datfile/<slug>`-shaped
-/// path has ever been confirmed correct in this repository, and the
-/// ordinary-dataset slug for each is exactly that BIOS slug with the
-/// `-bios` suffix removed - not a separately invented guess. A system whose
-/// slug cannot be derived this way (Saturn included) is intentionally left
-/// unsupported rather than guessed at; see the module's managed-provider
+/// ordinary-dataset URLs are fixed separately from the versioned BIOS DAT
+/// links resolved through Redump's downloads page. A system whose game-DAT
+/// slug has not been independently proven (Saturn included) is intentionally
+/// left unsupported rather than guessed at; see the module's managed-provider
 /// task notes for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -295,10 +297,13 @@ enum ManagedDatRemote {
         repository: &'static str,
         repository_relative_path: PathBuf,
     },
-    /// Redump's model: one fixed HTTPS URL serves the current DAT directly.
-    /// There is no separate "resolve a revision" step - see
-    /// [`check_redump_bios_update`]/[`update_redump_bios`].
+    /// Redump's game/disc DAT model: one fixed HTTPS URL serves the current
+    /// DAT directly.
     DirectHttps { url: &'static str },
+    /// Redump's BIOS DAT model: the fixed downloads page exposes a
+    /// versioned DAT link. The resolver accepts exactly one system-matching
+    /// `https://redump.info/static/bios/*.dat` link before fetching it.
+    RedumpBiosDownloadsPage,
 }
 
 /// Which authoritative dataset a downloaded DAT's parsed header must
@@ -359,15 +364,12 @@ impl ManagedDatSourceDescriptor {
 
     /// Constructs the fixed contract for one of Redump's dedicated BIOS
     /// DATs. The caller supplies only a closed [`RedumpBiosSystem`] enum
-    /// value - never a URL, hostname, or free-text dataset name - and each
-    /// variant maps internally to exactly one approved endpoint (see
-    /// [`RedumpBiosSystem::fixed_url`]).
+    /// value - never a URL, hostname, or free-text dataset name. The fixed
+    /// downloads page resolves the current versioned static DAT URL.
     pub fn redump_bios(system: RedumpBiosSystem) -> Result<Self> {
         let descriptor = Self {
             source_id: ManagedDatSourceId::redump_bios(system),
-            remote: ManagedDatRemote::DirectHttps {
-                url: system.fixed_url(),
-            },
+            remote: ManagedDatRemote::RedumpBiosDownloadsPage,
             expected_ecosystem: DatEcosystem::Redump,
             expected_dataset: ExpectedDataset::RedumpBios(system),
             max_payload_size: REDUMP_BIOS_MAX_PAYLOAD,
@@ -409,7 +411,9 @@ impl ManagedDatSourceDescriptor {
     pub fn repository(&self) -> Option<&'static str> {
         match &self.remote {
             ManagedDatRemote::GithubCommitPinned { repository, .. } => Some(repository),
-            ManagedDatRemote::DirectHttps { .. } => None,
+            ManagedDatRemote::DirectHttps { .. } | ManagedDatRemote::RedumpBiosDownloadsPage => {
+                None
+            }
         }
     }
 
@@ -421,7 +425,9 @@ impl ManagedDatSourceDescriptor {
                 repository_relative_path,
                 ..
             } => Some(repository_relative_path),
-            ManagedDatRemote::DirectHttps { .. } => None,
+            ManagedDatRemote::DirectHttps { .. } | ManagedDatRemote::RedumpBiosDownloadsPage => {
+                None
+            }
         }
     }
 
@@ -522,12 +528,11 @@ impl ManagedDatSourceDescriptor {
             }
             (
                 ManagedDatProvider::RedumpBios,
-                ManagedDatRemote::DirectHttps { url },
+                ManagedDatRemote::RedumpBiosDownloadsPage,
                 ExpectedDataset::RedumpBios(system),
             ) => {
                 if system.slug() != self.source_id.source_key
                     || self.expected_ecosystem != DatEcosystem::Redump
-                    || *url != system.fixed_url()
                 {
                     return Err(config_error(
                         "managed DAT descriptor is not a fixed Redump BIOS contract",
@@ -1328,7 +1333,8 @@ impl ManagedDatUpdateOptions {
 
 /// Checks whether an update is available for `descriptor`, dispatching by
 /// provider - see [`check_mame_update`] for MAME's immutable-commit model
-/// and [`check_redump_bios_update`] for Redump's single-URL model. Neither
+/// and [`check_redump_bios_update`] for Redump's resolve-then-fetch BIOS
+/// model. Neither
 /// branch downloads a full XML/DAT into the managed object store or changes
 /// a current/previous snapshot; each only persists check metadata for an
 /// already installed state.
@@ -1792,6 +1798,153 @@ fn mark_up_to_date(
     })
 }
 
+/// Resolves the current versioned BIOS DAT for one closed Redump system from
+/// Redump's fixed downloads page.  The page is untrusted delivery metadata:
+/// it may select only one exact system row and one `Dat` link which then has
+/// to remain an HTTPS `redump.info/static/bios/*.dat` URL.  The DAT itself is
+/// still parsed and identified independently by the existing BIOS pipeline.
+fn resolve_redump_bios_download_url(
+    system: RedumpBiosSystem,
+    transport: &dyn ManagedDatTransport,
+) -> std::result::Result<String, ManagedDatUpdateOutcome> {
+    let request = ManagedDatHttpRequest {
+        url: REDUMP_DOWNLOADS_URL.to_string(),
+        headers: Vec::new(),
+    };
+    let mut page = Vec::new();
+    let response = transport
+        .get(&request, REDUMP_DOWNLOADS_MAX_PAYLOAD, &mut page)
+        .map_err(transport_failure)?;
+    if response.status != 200 {
+        return Err(http_failure(response.status, response.retry_after_seconds));
+    }
+    if page.is_empty() || response.downloaded_bytes == 0 {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::EmptyDownload,
+            detail: "Redump downloads page was empty".to_string(),
+        });
+    }
+    if response
+        .content_length
+        .is_some_and(|length| length != response.downloaded_bytes)
+        || page.len() as u64 != response.downloaded_bytes
+    {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::TruncatedDownload,
+            detail: "Redump downloads page length did not match bytes received".to_string(),
+        });
+    }
+    let page = std::str::from_utf8(&page).map_err(|_| ManagedDatUpdateOutcome::Failed {
+        kind: ManagedDatUpdateFailureKind::InvalidResponse,
+        detail: "Redump downloads page was not UTF-8 HTML".to_string(),
+    })?;
+    resolve_redump_bios_download_link(system, page)
+}
+
+fn resolve_redump_bios_download_link(
+    system: RedumpBiosSystem,
+    page: &str,
+) -> std::result::Result<String, ManagedDatUpdateOutcome> {
+    let document = Html::parse_document(page);
+    let row_selector = Selector::parse("tr").expect("static CSS selector must parse");
+    let cell_selector = Selector::parse("td").expect("static CSS selector must parse");
+    let link_selector = Selector::parse("a[href]").expect("static CSS selector must parse");
+    let mut candidates = Vec::new();
+
+    for row in document.select(&row_selector) {
+        let Some(system_cell) = row.select(&cell_selector).next() else {
+            continue;
+        };
+        if normalise_downloads_page_text(&system_cell.text().collect::<String>())
+            != system.downloads_page_label()
+        {
+            continue;
+        }
+        for link in row.select(&link_selector) {
+            if normalise_downloads_page_text(&link.text().collect::<String>()) != "Dat" {
+                continue;
+            }
+            let href = link.value().attr("href").expect("a[href] always has href");
+            // The downloads page also lists ordinary game DATs for the same
+            // system name. They are not BIOS candidates and must never make
+            // a valid static BIOS link ambiguous or invalid.
+            if !looks_like_redump_bios_static_candidate(href) {
+                continue;
+            }
+            candidates.push(validate_redump_bios_download_candidate(href)?);
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.pop().expect("one candidate exists")),
+        0 => Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::InvalidResponse,
+            detail: format!(
+                "Redump downloads page exposed no BIOS DAT link for {}",
+                system.downloads_page_label()
+            ),
+        }),
+        _ => Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::InvalidResponse,
+            detail: format!(
+                "Redump downloads page exposed multiple BIOS DAT links for {}",
+                system.downloads_page_label()
+            ),
+        }),
+    }
+}
+
+fn normalise_downloads_page_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn looks_like_redump_bios_static_candidate(href: &str) -> bool {
+    let base = Url::parse(REDUMP_DOWNLOADS_URL).expect("fixed downloads URL must parse");
+    base.join(href)
+        .ok()
+        .is_some_and(|url| url.path().starts_with(REDUMP_BIOS_STATIC_PATH))
+}
+
+fn validate_redump_bios_download_candidate(
+    href: &str,
+) -> std::result::Result<String, ManagedDatUpdateOutcome> {
+    let base = Url::parse(REDUMP_DOWNLOADS_URL).expect("fixed downloads URL must parse");
+    let url = base
+        .join(href)
+        .map_err(|_| ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::InvalidResponse,
+            detail: "Redump downloads page contained an invalid BIOS DAT link".to_string(),
+        })?;
+    let valid_path = url
+        .path()
+        .strip_prefix(REDUMP_BIOS_STATIC_PATH)
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            !name.is_empty()
+                && !name.contains('/')
+                && !lower.contains("%2f")
+                && !lower.contains("%5c")
+                && !lower.contains("%2e")
+                && lower.ends_with(".dat")
+        });
+    if url.scheme() != "https"
+        || url.host_str() != Some(REDUMP_HOST)
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !valid_path
+    {
+        return Err(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::InvalidResponse,
+            detail: "Redump downloads page BIOS DAT link was outside the approved static BIOS path"
+                .to_string(),
+        });
+    }
+    Ok(url.into())
+}
+
 /// The validated result of [`fetch_and_validate_redump_bios`].
 struct FetchedRedumpBios {
     response: ManagedDatHttpResponse,
@@ -1800,8 +1953,9 @@ struct FetchedRedumpBios {
     entry_count: usize,
 }
 
-/// Downloads `descriptor`'s fixed Redump BIOS URL into a private staging
-/// file and fully validates it (parse, ecosystem, dataset identity,
+/// Resolves `descriptor`'s versioned Redump BIOS DAT link from the fixed
+/// downloads page, then downloads it into a private staging file and fully
+/// validates it (parse, ecosystem, dataset identity,
 /// non-empty usable evidence) - but never renames it into the managed
 /// object store or touches `objects/`. Returns `Ok(None)` for a `304 Not
 /// Modified` conditional response (no body to validate). Used by both
@@ -1818,6 +1972,7 @@ fn fetch_and_validate_redump_bios(
     staging_path: &Path,
     transport: &dyn ManagedDatTransport,
 ) -> std::result::Result<Option<FetchedRedumpBios>, ManagedDatUpdateOutcome> {
+    let url = resolve_redump_bios_download_url(system, transport)?;
     let mut headers = Vec::new();
     if let Some(state) = existing {
         if let Some(etag) = &state.etag {
@@ -1827,10 +1982,7 @@ fn fetch_and_validate_redump_bios(
             headers.push(("If-Modified-Since".to_string(), last_modified.clone()));
         }
     }
-    let request = ManagedDatHttpRequest {
-        url: system.fixed_url().to_string(),
-        headers,
-    };
+    let request = ManagedDatHttpRequest { url, headers };
     let (response, sha256) = download_to_staging(
         &request,
         staging_path,
@@ -1889,9 +2041,9 @@ fn fetch_and_validate_redump_bios(
     }))
 }
 
-/// Checks Redump's fixed BIOS URL for `descriptor`. Redump exposes no
-/// separate cheap version endpoint, so this genuinely downloads the (small,
-/// bounded) DAT into private staging and fully validates it exactly like
+/// Resolves and checks Redump's fixed BIOS provider contract for `descriptor`.
+/// Redump exposes no separate cheap version endpoint, so this genuinely
+/// downloads the (small, bounded) DAT into private staging and fully validates it exactly like
 /// [`update_redump_bios`] does - the only difference is that it never
 /// renames the staging file into the managed object store and never
 /// updates `current_snapshot`/`previous_snapshot`; only check-timestamp/
@@ -2747,14 +2899,40 @@ mod tests {
         format!("synthetic managed redump bios bytes - {seed}").into_bytes()
     }
 
-    /// A single-request Redump update: unlike MAME's two-phase resolve/
-    /// download, Redump's fixed URL serves the whole DAT in one GET.
+    fn redump_bios_downloads_page(system: RedumpBiosSystem) -> Vec<u8> {
+        format!(
+            r#"<table><tr><td>{}</td><td><a href="/static/bios/{}.dat">Dat</a></td></tr></table>"#,
+            system.downloads_page_label(),
+            system.slug()
+        )
+        .into_bytes()
+    }
+
+    fn redump_downloads_page_with_rows(rows: &[(&str, &str)]) -> String {
+        let rows = rows
+            .iter()
+            .map(|(system, href)| {
+                format!(r#"<tr><td>{system}</td><td><a href="{href}">Dat</a></td></tr>"#)
+            })
+            .collect::<String>();
+        format!("<table>{rows}</table>")
+    }
+
+    fn redump_bios_transport(system: RedumpBiosSystem, dat_reply: FakeReply) -> FakeTransport {
+        FakeTransport::new(vec![
+            Ok(FakeReply::ok(redump_bios_downloads_page(system))),
+            Ok(dat_reply),
+        ])
+    }
+
+    /// A two-request Redump BIOS update: the fixed downloads page resolves
+    /// the current versioned static DAT URL before the DAT is downloaded.
     fn install_redump(
         system: RedumpBiosSystem,
         root: PathBuf,
         body: Vec<u8>,
     ) -> ManagedDatUpdateOutcome {
-        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(body))]);
+        let transport = redump_bios_transport(system, FakeReply::ok(body));
         update_redump_dat(system, root, &transport)
     }
 
@@ -2799,6 +2977,89 @@ mod tests {
             );
             assert_eq!(system.firmware_system().redump_dataset_label(), label);
             descriptor.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn redump_downloads_page_resolves_exactly_one_static_bios_dat_per_supported_system() {
+        for (system, page_label, expected_url) in [
+            (
+                RedumpBiosSystem::PlayStation,
+                "Sony PlayStation",
+                "https://redump.info/static/bios/ps1-current.dat",
+            ),
+            (
+                RedumpBiosSystem::PlayStation2,
+                "Sony PlayStation 2",
+                "https://redump.info/static/bios/ps2-current.dat",
+            ),
+            (
+                RedumpBiosSystem::Xbox,
+                "Microsoft Xbox",
+                "https://redump.info/static/bios/xbox-current.dat",
+            ),
+        ] {
+            let page = redump_downloads_page_with_rows(&[(page_label, expected_url)]);
+            assert_eq!(
+                resolve_redump_bios_download_link(system, &page).unwrap(),
+                expected_url
+            );
+        }
+    }
+
+    #[test]
+    fn redump_bios_resolution_ignores_the_same_systems_ordinary_game_dat_link() {
+        let page = redump_downloads_page_with_rows(&[
+            ("Sony PlayStation", "/datfile/psx"),
+            ("Sony PlayStation", "/static/bios/ps1-current.dat"),
+        ]);
+        assert_eq!(
+            resolve_redump_bios_download_link(RedumpBiosSystem::PlayStation, &page).unwrap(),
+            "https://redump.info/static/bios/ps1-current.dat"
+        );
+    }
+
+    #[test]
+    fn redump_bios_downloads_page_does_not_confuse_ps1_with_ps2() {
+        let page = redump_downloads_page_with_rows(&[
+            ("Sony PlayStation", "/static/bios/ps1-current.dat"),
+            ("Sony PlayStation 2", "/static/bios/ps2-current.dat"),
+        ]);
+        assert_eq!(
+            resolve_redump_bios_download_link(RedumpBiosSystem::PlayStation, &page).unwrap(),
+            "https://redump.info/static/bios/ps1-current.dat"
+        );
+        let only_ps2 = redump_downloads_page_with_rows(&[(
+            "Sony PlayStation 2",
+            "/static/bios/ps2-current.dat",
+        )]);
+        assert!(
+            resolve_redump_bios_download_link(RedumpBiosSystem::PlayStation, &only_ps2).is_err()
+        );
+    }
+
+    #[test]
+    fn redump_bios_downloads_page_rejects_zero_ambiguous_and_unapproved_candidates() {
+        let no_match = redump_downloads_page_with_rows(&[(
+            "Microsoft Xbox 360",
+            "/static/bios/xbox-360-current.dat",
+        )]);
+        assert!(resolve_redump_bios_download_link(RedumpBiosSystem::Xbox, &no_match).is_err());
+
+        let multiple = redump_downloads_page_with_rows(&[
+            ("Microsoft Xbox", "/static/bios/xbox-first.dat"),
+            ("Microsoft Xbox", "/static/bios/xbox-second.dat"),
+        ]);
+        assert!(resolve_redump_bios_download_link(RedumpBiosSystem::Xbox, &multiple).is_err());
+
+        for href in [
+            "https://example.invalid/static/bios/xbox.dat",
+            "/static/not-bios/xbox.dat",
+            "/static/bios/xbox.zip",
+            "/static/bios/%2e%2e%2foutside.dat",
+        ] {
+            let page = redump_downloads_page_with_rows(&[("Microsoft Xbox", href)]);
+            assert!(resolve_redump_bios_download_link(RedumpBiosSystem::Xbox, &page).is_err());
         }
     }
 
@@ -3063,7 +3324,7 @@ mod tests {
                 ManagedDatUpdateFailureKind::NotFound,
             ),
         ] {
-            let transport = FakeTransport::new(vec![Ok(reply)]);
+            let transport = redump_bios_transport(system, reply);
             let outcome =
                 update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
             assert!(matches!(
@@ -3079,7 +3340,7 @@ mod tests {
 
         let mut rate_limited = FakeReply::status(429);
         rate_limited.retry_after_seconds = Some(120);
-        let transport = FakeTransport::new(vec![Ok(rate_limited)]);
+        let transport = redump_bios_transport(system, rate_limited);
         let outcome =
             update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
         assert!(matches!(
@@ -3120,7 +3381,7 @@ mod tests {
         // A wrong-dataset DAT must never replace the known-good current
         // snapshot, even though it is bytewise well-formed XML.
         let bad_body = redump_bios_dat(RedumpBiosSystem::Xbox, "Xbox BIOS", b"unrelated bytes");
-        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(bad_body))]);
+        let transport = redump_bios_transport(system, FakeReply::ok(bad_body));
         let outcome =
             update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
         assert!(matches!(
@@ -3130,6 +3391,37 @@ mod tests {
                 ..
             }
         ));
+        let state = load_managed_dat_state(&root, &descriptor).unwrap();
+        assert_eq!(state.current_snapshot.sha256, good_sha256);
+    }
+
+    #[test]
+    fn redump_bios_resolution_failure_preserves_the_existing_current_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let system = RedumpBiosSystem::PlayStation;
+        let descriptor = redump_descriptor(system);
+        let good_body = redump_bios_dat(system, "PS1 BIOS", &redump_bios_bytes("known-good"));
+        let good_sha256 = match install_redump(system, root.clone(), good_body) {
+            ManagedDatUpdateOutcome::Updated { sha256, .. } => sha256,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+
+        let page = redump_downloads_page_with_rows(&[(
+            "Sony PlayStation 2",
+            "/static/bios/ps2-current.dat",
+        )]);
+        let transport = FakeTransport::new(vec![Ok(FakeReply::ok(page))]);
+        let outcome =
+            update_managed_dat(&descriptor, &update_options(root.clone()), &transport).unwrap();
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::InvalidResponse,
+                ..
+            }
+        ));
+        assert_eq!(transport.calls.borrow().len(), 1);
         let state = load_managed_dat_state(&root, &descriptor).unwrap();
         assert_eq!(state.current_snapshot.sha256, good_sha256);
     }
@@ -3221,19 +3513,23 @@ mod tests {
     }
 
     #[test]
-    fn typed_game_descriptor_derives_its_url_from_the_proven_bios_url_for_all_three_systems() {
-        for (system, slug, bios_system) in [
+    fn typed_game_descriptor_uses_the_fixed_url_for_all_three_systems() {
+        for (system, slug, expected_url) in [
             (
                 RedumpGameSystem::PlayStation,
                 "playstation",
-                RedumpBiosSystem::PlayStation,
+                "https://redump.info/datfile/psx",
             ),
             (
                 RedumpGameSystem::PlayStation2,
                 "playstation2",
-                RedumpBiosSystem::PlayStation2,
+                "https://redump.info/datfile/ps2",
             ),
-            (RedumpGameSystem::Xbox, "xbox", RedumpBiosSystem::Xbox),
+            (
+                RedumpGameSystem::Xbox,
+                "xbox",
+                "https://redump.info/datfile/xbox",
+            ),
         ] {
             let descriptor = ManagedDatSourceDescriptor::redump_games(system).unwrap();
             assert_eq!(
@@ -3248,33 +3544,25 @@ mod tests {
                 descriptor.source_id().to_string(),
                 format!("redump-games/{slug}")
             );
-            // Every game-DAT URL is exactly its proven BIOS sibling's URL
-            // with the `-bios` path segment removed - never a separately
-            // invented slug (see `RedumpGameSystem`'s own doc comment).
-            let expected_url = bios_system.fixed_url().replace("-bios", "");
             assert_eq!(system.fixed_url(), expected_url);
             descriptor.validate().unwrap();
         }
     }
 
     #[test]
-    fn every_fixed_redump_url_uses_the_current_info_host_without_changing_paths() {
-        for (system, expected) in [
-            (
-                RedumpBiosSystem::PlayStation,
-                "https://redump.info/datfile/psx-bios",
-            ),
-            (
-                RedumpBiosSystem::PlayStation2,
-                "https://redump.info/datfile/ps2-bios",
-            ),
-            (
-                RedumpBiosSystem::Xbox,
-                "https://redump.info/datfile/xbox-bios",
-            ),
+    fn redump_bios_uses_the_fixed_downloads_page_and_game_urls_remain_typed() {
+        assert_eq!(REDUMP_DOWNLOADS_URL, "https://redump.info/downloads");
+        validate_managed_dat_http_url(REDUMP_DOWNLOADS_URL).unwrap();
+        for (system, expected_label) in [
+            (RedumpBiosSystem::PlayStation, "Sony PlayStation"),
+            (RedumpBiosSystem::PlayStation2, "Sony PlayStation 2"),
+            (RedumpBiosSystem::Xbox, "Microsoft Xbox"),
         ] {
-            assert_eq!(system.fixed_url(), expected);
-            validate_managed_dat_http_url(system.fixed_url()).unwrap();
+            assert_eq!(system.downloads_page_label(), expected_label);
+            ManagedDatSourceDescriptor::redump_bios(system)
+                .unwrap()
+                .validate()
+                .unwrap();
         }
         for (system, expected) in [
             (

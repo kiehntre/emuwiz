@@ -5300,8 +5300,8 @@ fn managed_remove_action(row: &ManagedDatSourceRowView) -> Option<DatSourcesPage
 
 fn redump_bios_from_source_key(key: &str) -> Option<RedumpBiosSystem> {
     match key {
-        "psx" => Some(RedumpBiosSystem::PlayStation),
-        "ps2" => Some(RedumpBiosSystem::PlayStation2),
+        "playstation" => Some(RedumpBiosSystem::PlayStation),
+        "playstation2" => Some(RedumpBiosSystem::PlayStation2),
         "xbox" => Some(RedumpBiosSystem::Xbox),
         _ => None,
     }

@@ -5093,6 +5093,85 @@ fn redump_game_check_and_update_actions_keep_the_closed_typed_system_identity() 
 }
 
 #[test]
+fn each_redump_bios_enable_row_emits_its_exact_typed_add_action() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    for system in [
+        RedumpBiosSystem::PlayStation,
+        RedumpBiosSystem::PlayStation2,
+        RedumpBiosSystem::Xbox,
+    ] {
+        let source_id = ManagedDatSourceId::redump_bios(system);
+        let row = page
+            .view()
+            .redump_bios_rows
+            .into_iter()
+            .find(|row| row.source_id == source_id)
+            .expect("every closed Redump BIOS system has a visible row");
+        assert!(!row.configured);
+        assert_eq!(
+            managed_add_action(&row),
+            Some(DatSourcesPageAction::AddManagedRedumpBios { system })
+        );
+    }
+}
+
+#[test]
+fn redump_bios_enable_actions_configure_ps1_ps2_and_xbox_independently_and_persist() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    for system in [
+        RedumpBiosSystem::PlayStation,
+        RedumpBiosSystem::PlayStation2,
+        RedumpBiosSystem::Xbox,
+    ] {
+        let source_id = ManagedDatSourceId::redump_bios(system);
+        let row = page
+            .view()
+            .redump_bios_rows
+            .into_iter()
+            .find(|row| row.source_id == source_id)
+            .expect("every closed Redump BIOS system has a visible row");
+        page.apply(
+            managed_add_action(&row).expect("the enabled BIOS row must produce an add action"),
+        );
+        assert!(
+            page.view()
+                .redump_bios_rows
+                .iter()
+                .find(|row| row.source_id == source_id)
+                .is_some_and(|row| row.configured),
+            "{system:?} must refresh as configured after its add action"
+        );
+    }
+
+    let persisted = load_managed_dat_sources_from(&page.managed_config_path).unwrap();
+    assert_eq!(persisted.redump_bios_entries().len(), 3);
+    for system in [
+        RedumpBiosSystem::PlayStation,
+        RedumpBiosSystem::PlayStation2,
+        RedumpBiosSystem::Xbox,
+    ] {
+        assert!(
+            persisted
+                .redump_bios_entries()
+                .iter()
+                .any(|entry| entry.system == system),
+            "{system:?} must persist independently"
+        );
+    }
+
+    let reloaded = fixture.page();
+    assert!(
+        reloaded
+            .view()
+            .redump_bios_rows
+            .iter()
+            .all(|row| row.configured)
+    );
+}
+
+#[test]
 fn tosec_pack_inventory_starts_with_empty_selection_and_renders_bounded_groups() {
     let fixture = Fixture::new();
     let pack = fixture.dir("tosec-pack");
