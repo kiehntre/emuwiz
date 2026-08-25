@@ -2878,7 +2878,9 @@ fn archive_member_evidence_has_separate_gui_rows() {
                 algorithm: "SHA-1",
             }),
             matched_refs: Vec::new(),
+            evidence_sources: Vec::new(),
         }],
+        combined_identity: None,
     });
 
     let view = audit_view(&outcome, Some(1));

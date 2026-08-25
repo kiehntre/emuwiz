@@ -954,8 +954,9 @@ pub(crate) struct AuditResultView {
     /// Per-file lines, capped for display.
     pub(crate) entries: Vec<AuditEntryView>,
     pub(crate) entries_truncated: usize,
-    /// ZIP-member evidence is visually and structurally separate from the
-    /// physical files that can participate in rename planning.
+    /// Archive-member evidence is visually separate from physical loose files.
+    /// A complete single-member ZIP/7z exact match may safely produce an
+    /// outer-container proposal; member paths are never renamed directly.
     pub(crate) archives: Vec<ArchiveAuditView>,
     pub(crate) unhashed: Vec<(String, String)>,
     pub(crate) unreadable_catalogues: Vec<String>,
@@ -983,6 +984,7 @@ pub(crate) struct ArchiveMemberAuditView {
     pub(crate) status: String,
     pub(crate) verdict: Option<String>,
     pub(crate) detail: String,
+    pub(crate) evidence_sources: Vec<String>,
 }
 
 /// The policy annotation of one audit result.
@@ -4679,6 +4681,16 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
                             .as_ref()
                             .map(verdict_detail)
                             .unwrap_or_default(),
+                        evidence_sources: {
+                            let mut sources = member
+                                .evidence_sources
+                                .iter()
+                                .map(|source| source.source_display_name.clone())
+                                .collect::<Vec<_>>();
+                            sources.sort();
+                            sources.dedup();
+                            sources
+                        },
                     })
                     .collect(),
             })
@@ -8489,8 +8501,10 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
         widgets::card(ui, |ui| {
             widgets::section_header(
                 ui,
-                "ZIP members",
-                Some("Read-only member evidence; these rows never become rename proposals."),
+                "Archive members",
+                Some(
+                    "Read-only ZIP/7z evidence. A complete archive with one exact game member can rename only its outer container; member paths are never changed.",
+                ),
             );
             for archive in &audit.archives {
                 ui.label(egui::RichText::new(&archive.archive_name).strong());
@@ -8523,6 +8537,16 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
                                     egui::RichText::new(&member.detail)
                                         .color(theme::muted(ui))
                                         .small(),
+                                );
+                            }
+                            if !member.evidence_sources.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Verified by: {}",
+                                        member.evidence_sources.join(" · ")
+                                    ))
+                                    .color(theme::muted(ui))
+                                    .small(),
                                 );
                             }
                         });

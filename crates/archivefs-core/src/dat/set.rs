@@ -1829,6 +1829,7 @@ mod tests {
                 algorithm: "SHA-1",
             }),
             matched_refs: Vec::new(),
+            evidence_sources: Vec::new(),
         }
     }
 
@@ -1853,6 +1854,7 @@ mod tests {
             evidence: evidence(index, &refs[0].rom_name),
             verdict: Some(verdict),
             matched_refs: refs,
+            evidence_sources: Vec::new(),
         }
     }
 
@@ -1940,6 +1942,7 @@ mod tests {
             total_members,
             completion,
             members,
+            combined_identity: None,
         }
     }
 
@@ -2099,6 +2102,7 @@ mod tests {
                 ],
             }),
             matched_refs: Vec::new(),
+            evidence_sources: Vec::new(),
         }];
         let audit = archive(members, complete_pass());
 
@@ -2975,6 +2979,7 @@ mod tests {
                     rom_name: "nested.bin".to_string(),
                 }),
                 matched_refs: Vec::new(),
+                evidence_sources: Vec::new(),
             }],
             complete_pass(),
         );
@@ -3013,16 +3018,19 @@ mod tests {
                     rom_name: "game.bin".to_string(),
                 }),
                 matched_refs: Vec::new(),
+                evidence_sources: Vec::new(),
             },
             DatArchiveMemberAudit {
                 evidence: evidence(1, "extra.bin"),
                 verdict: Some(AuditVerdict::NotInDat),
                 matched_refs: Vec::new(),
+                evidence_sources: Vec::new(),
             },
             DatArchiveMemberAudit {
                 evidence: evidence(2, "unmatched.bin"),
                 verdict: None,
                 matched_refs: Vec::new(),
+                evidence_sources: Vec::new(),
             },
         ];
         let audit = archive(members, complete_pass());

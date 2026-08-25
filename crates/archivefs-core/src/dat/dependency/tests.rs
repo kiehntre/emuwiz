@@ -187,6 +187,7 @@ fn member(index: usize, refs: Vec<DatRomRef>) -> DatArchiveMemberAudit {
         },
         verdict: Some(verdict),
         matched_refs: refs,
+        evidence_sources: Vec::new(),
     }
 }
 
@@ -198,6 +199,7 @@ fn archive(members: Vec<DatArchiveMemberAudit>) -> DatArchiveAudit {
         total_members: members.len(),
         completion: ArchivePassCompletion::Complete,
         members,
+        combined_identity: None,
     }
 }
 

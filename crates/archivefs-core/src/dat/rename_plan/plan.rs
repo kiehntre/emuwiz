@@ -177,6 +177,10 @@ pub fn build_rename_plan(
         &outcome.sets,
         &proposal_context,
     ));
+    proposals.extend(derive_combined_archive_proposals(
+        &outcome.archives,
+        &proposal_context,
+    ));
 
     detect_target_collisions(&mut proposals, &siblings_by_parent);
     detect_proposal_collisions(&mut proposals);
@@ -639,6 +643,132 @@ fn derive_outer_archive_proposals(
             // Per-ROM content classification does not apply to a whole-set
             // resolution; Games-only filtering is not applied to outer
             // archive proposals for the same reason.
+            content_classification: DatContentClassification::unknown(),
+            original_metadata: DatOriginalMetadata::default(),
+            state,
+            object_kind,
+            ambiguity_reason: None,
+            collision: None,
+            blockers,
+            extension_status,
+            sanitisation_notes,
+            actionable: state == ProposalState::Suggested,
+            audited_identity: Some(audited_identity.clone()),
+            is_outer_archive: true,
+        });
+    }
+    proposals
+}
+
+/// Derives outer-archive proposals from the strict one-member combined-audit
+/// identity. Unlike [`derive_outer_archive_proposals`], this has no
+/// single-catalogue `SetResolution`: agreement across enabled catalogues is
+/// already recorded on the archive itself. Its eligibility is intentionally
+/// narrower—one hash-complete member, complete pass, stable outer file—so it
+/// never claims a multi-member package is complete.
+fn derive_combined_archive_proposals(
+    archives: &[DatArchiveAudit],
+    context: &ProposalContext<'_>,
+) -> Vec<RenameProposal> {
+    let mut proposals = Vec::new();
+    for archive in archives {
+        let Some(identity) = archive.combined_identity.as_ref() else {
+            continue;
+        };
+        if !matches!(archive.completion, ArchivePassCompletion::Complete) {
+            continue;
+        }
+        let Some(audited_identity) = archive.outer_identity.as_ref() else {
+            continue;
+        };
+        if !crate::dat::rename_apply::capture_identity(&archive.archive_path)
+            .as_ref()
+            .is_ok_and(|current| {
+                crate::dat::rename_apply::identity_matches(audited_identity, current)
+            })
+        {
+            continue;
+        }
+        let Some(current_basename) = archive
+            .archive_path
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        let Some(object_kind) = classify_object(&archive.archive_path) else {
+            continue;
+        };
+
+        let mut state = ProposalState::Suggested;
+        let mut blockers = Vec::new();
+        let mut proposed_basename = None;
+        let mut extension_status = None;
+        let mut sanitisation_notes = Vec::new();
+        match object_kind {
+            SourceObjectKind::RegularFile => {}
+            SourceObjectKind::Symlink => {
+                state = ProposalState::Unsupported;
+                blockers.push("the source archive is a symlink".to_string());
+            }
+            SourceObjectKind::BrokenSymlink => {
+                state = ProposalState::Unsupported;
+                blockers.push("the source archive is a broken symlink".to_string());
+            }
+        }
+        if state == ProposalState::Suggested {
+            match derive_outer_archive_basename(&identity.game_name, current_basename) {
+                DeriveOutcome::Ok(derived) => {
+                    extension_status = Some(derived.extension_status);
+                    sanitisation_notes = derived.sanitisation_notes;
+                    if derived.proposed_basename == current_basename {
+                        state = ProposalState::AlreadyCanonical;
+                    } else {
+                        proposed_basename = Some(derived.proposed_basename);
+                    }
+                }
+                DeriveOutcome::Blocked(reason) => {
+                    state = ProposalState::Blocked;
+                    blockers.push(reason);
+                }
+                DeriveOutcome::Unsupported(reason) => {
+                    state = ProposalState::Unsupported;
+                    blockers.push(reason);
+                }
+            }
+        }
+
+        let mut source_ids = identity
+            .evidence_sources
+            .iter()
+            .map(|source| source.source_id.clone())
+            .collect::<Vec<_>>();
+        source_ids.sort();
+        source_ids.dedup();
+        let mut source_labels = identity
+            .evidence_sources
+            .iter()
+            .map(|source| source.source_display_name.clone())
+            .collect::<Vec<_>>();
+        source_labels.sort();
+        source_labels.dedup();
+        proposals.push(RenameProposal {
+            source_path: archive.archive_path.clone(),
+            current_basename: current_basename.to_string(),
+            proposed_basename,
+            platform: context.platform.map(str::to_string),
+            platform_display: context.platform_display.map(str::to_string),
+            source_id: source_ids.join(" + "),
+            source_display_name: source_labels.join(" + "),
+            game_name: Some(identity.game_name.clone()),
+            rom_name: Some(identity.rom_name.clone()),
+            verdict_label: "Archive member exact".to_string(),
+            match_confident: true,
+            explanations: vec![format!(
+                "{} decoded member '{}' exactly matched enabled catalogue evidence",
+                archive.format, identity.member_name
+            )],
+            content_policy: context.content_policy,
             content_classification: DatContentClassification::unknown(),
             original_metadata: DatOriginalMetadata::default(),
             state,
@@ -1567,9 +1697,11 @@ mod tests {
                             algorithm: "SHA-1",
                         }),
                         matched_refs: Vec::new(),
+                        evidence_sources: Vec::new(),
                     }
                 })
                 .collect(),
+            combined_identity: None,
         }
     }
 

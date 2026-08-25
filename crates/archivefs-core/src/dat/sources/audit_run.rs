@@ -287,6 +287,12 @@ pub struct DatArchiveAudit {
     pub total_members: usize,
     pub completion: ArchivePassCompletion,
     pub members: Vec<DatArchiveMemberAudit>,
+    /// A deliberately narrow whole-archive identity produced only by a
+    /// combined audit: one hash-complete member, one exact agreed identity,
+    /// and a complete, stable archive pass. It is separate from `sets`, whose
+    /// stronger multi-member completeness contract is bound to one DAT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combined_identity: Option<CombinedArchiveIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -301,6 +307,23 @@ pub struct DatArchiveMemberAudit {
     /// fallback; filename-only evidence is never placed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_refs: Vec<DatRomRef>,
+    /// Exact agreeing catalogue observations from a combined audit. Normal
+    /// one-catalogue archive audits leave this empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_sources: Vec<DatAuditEvidenceSource>,
+}
+
+/// The safe single-content-member identity of an outer ZIP/7z archive.
+///
+/// This does not claim a multi-file DAT set is complete. It only authorizes
+/// preserving the container extension while naming the archive after one
+/// member whose decoded bytes have an exact, non-conflicting DAT identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CombinedArchiveIdentity {
+    pub game_name: String,
+    pub rom_name: String,
+    pub member_name: String,
+    pub evidence_sources: Vec<DatAuditEvidenceSource>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -600,8 +623,10 @@ pub fn run_dat_audit(
 /// [`run_dat_audit`]: those formats have their own bounded evidence paths and
 /// must not gain a coincidental raw-container match. Combined audits also
 /// keep ZIP/7z outer bytes out until their member/set rules can merge several
-/// catalogues safely; each deferred file remains visible as an unhashed,
-/// non-actionable report row rather than disappearing from the result.
+/// catalogues safely. Combined audits keep their *outer* ZIP/7z bytes out of
+/// loose-ROM evidence, then inspect their members through the bounded archive
+/// path. Each outer file remains visible as an unhashed, non-actionable report
+/// row rather than disappearing from the result.
 struct HashedLocalScan {
     scan: LocalScan,
     known: Vec<KnownFileEvidence>,
@@ -641,12 +666,16 @@ fn collect_loose_file_evidence(
         if defer_container {
             let file_name = file_name_of(path);
             if !include_archive_outers {
+                let detail = if is_zip_path(path) || is_sevenz_path(path) {
+                    "Outer container bytes are not identity evidence; decoded member evidence is checked separately."
+                } else {
+                    "Combined evidence does not yet merge this container's specialised identity path; it was left non-actionable."
+                };
                 unhashed.push(UnhashedFile {
                     path: path.to_string_lossy().into_owned(),
                     file_name: file_name.clone(),
                     code: "combined-container-deferred".to_string(),
-                    detail: "Combined evidence does not yet merge this container's specialised identity path; it was left non-actionable."
-                        .to_string(),
+                    detail: detail.to_string(),
                 });
                 // Retain a physical-file row. With no digest it can reach at
                 // most FilenameOnly and the rename planner never promotes
@@ -697,10 +726,11 @@ fn collect_loose_file_evidence(
 }
 
 /// Runs one bounded scan/hash pass and compares each resulting evidence object
-/// with every supplied catalogue index.  It is intentionally a loose-file
-/// first slice: CHD and archive-set identity stay on their existing dedicated
-/// one-catalogue paths until their multi-catalogue merge rules are equally
-/// explicit.  They are never promoted through a raw-container hash here.
+/// with every supplied catalogue index. Loose files and bounded ZIP/7z member
+/// evidence use the same merge rules. CHD, RAR, and archive-set identity stay
+/// on their existing dedicated one-catalogue paths until their multi-catalogue
+/// merge rules are equally explicit. They are never promoted through a raw
+/// container hash here.
 pub fn run_combined_dat_audit(
     request: &CombinedDatAuditRequest,
     trusted: &TrustedRoots,
@@ -772,6 +802,8 @@ pub fn run_combined_dat_audit(
             verdict: combined.verdict,
         });
     }
+    let (archives, archive_bytes_hashed) =
+        audit_combined_archives(&hashed.scan.files, trusted, cancel, &loaded)?;
     let report = AuditReport {
         summary: combined_summary(&entries),
         entries,
@@ -793,12 +825,12 @@ pub fn run_combined_dat_audit(
         unreadable_catalogues,
         report,
         evidence_sources,
-        archives: Vec::new(),
+        archives,
         sets: Vec::new(),
         unhashed: hashed.unhashed,
         files_scanned: hashed.scan.files.len(),
         bytes_hashed: hashed.bytes_hashed,
-        archive_bytes_hashed: 0,
+        archive_bytes_hashed,
         truncated: hashed.scan.truncated,
         policy: None,
         platform: None,
@@ -1025,6 +1057,180 @@ fn combined_content_match(
     })
 }
 
+/// Runs the existing bounded ZIP/7z member readers once, then applies the
+/// same exact-agreement merge used for loose files to each decoded member.
+///
+/// RAR intentionally remains outside this combined slice: its existing
+/// provider is useful, but can require an external capability probe and has
+/// different operational behaviour. ZIP and 7z are fully in-process and
+/// already implement the common [`ArchiveMemberSource`] safety contract.
+fn audit_combined_archives(
+    files: &[PathBuf],
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    catalogues: &[LoadedCombinedCatalogue],
+) -> Result<(Vec<DatArchiveAudit>, u64), DatAuditError> {
+    let mut archives = Vec::new();
+    let mut bytes_hashed = 0_u64;
+    let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
+
+    for path in files
+        .iter()
+        .filter(|path| is_zip_path(path) || is_sevenz_path(path))
+    {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let format_guess = if is_zip_path(path) { "zip" } else { "7z" };
+        let identity_before = crate::dat::rename_apply::capture_identity(path).ok();
+        let mut source: Box<dyn ArchiveMemberSource> = match if is_zip_path(path) {
+            ZipArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
+                .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+        } else {
+            SevenZArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
+                .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+        } {
+            Ok(source) => source,
+            Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
+            Err(error) => {
+                archives.push(DatArchiveAudit {
+                    archive_path: path.clone(),
+                    outer_identity: None,
+                    format: format_guess.to_string(),
+                    total_members: 0,
+                    completion: ArchivePassCompletion::Incomplete {
+                        reason: ArchivePassStopReason::SourceError {
+                            detail: format!("{error:?}"),
+                        },
+                    },
+                    members: Vec::new(),
+                    combined_identity: None,
+                });
+                continue;
+            }
+        };
+
+        let mut pass = source.verify_all(cancel, &mut run_budget);
+        let identity_after = crate::dat::rename_apply::capture_identity(path).ok();
+        let stable_outer_identity = identity_before.filter(|before| {
+            identity_after
+                .as_ref()
+                .is_some_and(|after| crate::dat::rename_apply::identity_matches(before, after))
+        });
+        if stable_outer_identity.is_none() {
+            pass.completion = ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::OuterFileChanged,
+            };
+        }
+        let outer_changed = matches!(
+            pass.completion,
+            ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::OuterFileChanged
+            }
+        );
+        let members = pass
+            .members
+            .into_iter()
+            .map(|evidence| {
+                if let (false, ArchiveMemberStatus::HashComplete, Some(hashes)) =
+                    (outer_changed, &evidence.status, evidence.hashes.as_ref())
+                {
+                    bytes_hashed = bytes_hashed.saturating_add(evidence.logical_size);
+                    let known = KnownFileEvidence::new(
+                        format!("{}::#{}", path.display(), evidence.index),
+                        &evidence.member_name_display,
+                    )
+                    .with_size(evidence.logical_size)
+                    .with_crc32(&hashes.crc32)
+                    .with_md5(&hashes.md5)
+                    .with_sha1(&hashes.sha1)
+                    .with_sha256(&hashes.sha256);
+                    let combined = merge_combined_evidence(&known, catalogues);
+                    DatArchiveMemberAudit {
+                        evidence,
+                        verdict: Some(combined.verdict),
+                        matched_refs: Vec::new(),
+                        evidence_sources: combined.evidence,
+                    }
+                } else {
+                    DatArchiveMemberAudit {
+                        evidence,
+                        verdict: None,
+                        matched_refs: Vec::new(),
+                        evidence_sources: Vec::new(),
+                    }
+                }
+            })
+            .collect();
+        let mut archive = DatArchiveAudit {
+            archive_path: path.clone(),
+            outer_identity: stable_outer_identity,
+            format: source.archive_format().to_string(),
+            total_members: pass.total_members,
+            completion: pass.completion,
+            members,
+            combined_identity: None,
+        };
+        archive.combined_identity = combined_archive_identity(&archive);
+        archives.push(archive);
+    }
+    Ok((archives, bytes_hashed))
+}
+
+/// The first combined-archive naming rule is deliberately narrower than the
+/// existing single-DAT set-completeness rule: it accepts only a complete,
+/// stable archive with exactly one decoded member and one agreed exact
+/// identity. Metadata, multiple game members, nested archives, and partial
+/// passes stay visible but non-actionable until their package semantics can
+/// be proven across catalogues.
+fn combined_archive_identity(archive: &DatArchiveAudit) -> Option<CombinedArchiveIdentity> {
+    if !matches!(archive.completion, ArchivePassCompletion::Complete)
+        || archive.outer_identity.is_none()
+        || archive.members.iter().any(|member| {
+            member.evidence.is_nested_archive
+                || !safe_archive_member_name(&member.evidence.member_name_display)
+        })
+    {
+        return None;
+    }
+    let mut complete_members = archive
+        .members
+        .iter()
+        .filter(|member| matches!(member.evidence.status, ArchiveMemberStatus::HashComplete));
+    let member = complete_members.next()?;
+    if complete_members.next().is_some() {
+        return None;
+    }
+    let AuditVerdict::Exact {
+        game_name,
+        rom_name,
+        ..
+    } = member.verdict.as_ref()?
+    else {
+        return None;
+    };
+    (!member.evidence_sources.is_empty()).then(|| CombinedArchiveIdentity {
+        game_name: game_name.clone(),
+        rom_name: rom_name.clone(),
+        member_name: member.evidence.member_name_display.clone(),
+        evidence_sources: member.evidence_sources.clone(),
+    })
+}
+
+/// Archive readers never extract members to disk, but an unsafe member name
+/// still must not become part of an actionable outer-archive identity. This
+/// keeps the combined result safe if a later consumer ever surfaces member
+/// names more directly and makes the no-traversal contract explicit here.
+fn safe_archive_member_name(name: &str) -> bool {
+    !name.contains('\\')
+        && Path::new(name).components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
 fn combined_summary(entries: &[AuditEntry]) -> AuditSummary {
     let mut summary = AuditSummary {
         total: entries.len(),
@@ -1175,6 +1381,7 @@ fn audit_archives(
                         },
                     },
                     members: Vec::new(),
+                    combined_identity: None,
                 });
                 continue;
             }
@@ -1230,6 +1437,7 @@ fn audit_archives(
                     evidence,
                     verdict,
                     matched_refs,
+                    evidence_sources: Vec::new(),
                 }
             })
             .collect();
@@ -1240,6 +1448,7 @@ fn audit_archives(
             total_members: pass.total_members,
             completion: pass.completion,
             members,
+            combined_identity: None,
         };
         // `games` is the exact parsed instance `index` (above) was built
         // from - see dat::set's "Runtime DAT binding" doc for why this must
@@ -1768,12 +1977,36 @@ mod local_scan_traversal_tests {
 #[cfg(test)]
 mod combined_audit_tests {
     use super::*;
+    use std::io::Write;
+
+    use sha1::{Digest, Sha1};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     const TEST_SHA1: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
 
     fn dat(game: &str, rom: &str) -> String {
         format!(
             r#"<?xml version="1.0"?><datafile><header><name>Fixture</name><author>No-Intro</author></header><game name="{game}"><rom name="{rom}" size="4" sha1="{TEST_SHA1}"/></game></datafile>"#
+        )
+    }
+
+    fn dat_entries(entries: &[(&str, &str, &[u8])]) -> String {
+        let games = entries
+            .iter()
+            .map(|(game, rom, bytes)| {
+                format!(
+                    r#"<game name="{game}"><rom name="{rom}" size="{}" sha1="{}"/></game>"#,
+                    bytes.len(),
+                    Sha1::digest(bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name><author>No-Intro</author></header>{games}</datafile>"#
         )
     }
 
@@ -1799,6 +2032,34 @@ mod combined_audit_tests {
             &|_| {},
         )
         .unwrap()
+    }
+
+    fn write_zip(path: &Path, members: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        for (name, bytes) in members {
+            writer
+                .start_file(
+                    *name,
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn write_7z(path: &Path, member_name: &str, bytes: &[u8]) {
+        let mut entry = sevenz_rust2::ArchiveEntry::new();
+        entry.name = member_name.to_string();
+        entry.has_stream = true;
+        entry.size = bytes.len() as u64;
+        let mut writer =
+            sevenz_rust2::ArchiveWriter::new(std::fs::File::create(path).unwrap()).unwrap();
+        writer
+            .push_archive_entry(entry, Some(std::io::Cursor::new(bytes)))
+            .unwrap();
+        writer.finish().unwrap();
     }
 
     #[test]
@@ -1950,6 +2211,187 @@ mod combined_audit_tests {
         )
         .unwrap();
         assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn one_member_zip_exact_match_produces_a_safe_outer_rename_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("random-name.zip");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_zip(&archive, &[("game.bin", b"test")]);
+        let before = std::fs::read(&archive).unwrap();
+
+        let outcome = run(vec![source(dat_path, "one")], archive.clone());
+
+        assert_eq!(outcome.archives.len(), 1);
+        let identity = outcome.archives[0].combined_identity.as_ref().unwrap();
+        assert_eq!(identity.game_name, "Canonical Game");
+        assert_eq!(identity.rom_name, "canonical.bin");
+        assert_eq!(identity.evidence_sources.len(), 1);
+        assert_eq!(std::fs::read(&archive).unwrap(), before);
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        assert!(plan.proposals[0].is_outer_archive);
+        assert_eq!(
+            plan.proposals[0].proposed_basename.as_deref(),
+            Some("Canonical Game.zip")
+        );
+    }
+
+    #[test]
+    fn one_member_zip_preserves_agreeing_multi_source_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.dat");
+        let second = dir.path().join("second.dat");
+        let archive = dir.path().join("random.zip");
+        std::fs::write(&first, dat("Canonical Game", "canonical.bin")).unwrap();
+        std::fs::write(&second, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_zip(&archive, &[("game.bin", b"test")]);
+
+        let outcome = run(vec![source(first, "one"), source(second, "two")], archive);
+
+        let identity = outcome.archives[0].combined_identity.as_ref().unwrap();
+        assert_eq!(identity.evidence_sources.len(), 2);
+    }
+
+    #[test]
+    fn conflicting_archive_member_evidence_is_non_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.dat");
+        let second = dir.path().join("second.dat");
+        let archive = dir.path().join("random.zip");
+        std::fs::write(&first, dat("Game A", "a.bin")).unwrap();
+        std::fs::write(&second, dat("Game B", "b.bin")).unwrap();
+        write_zip(&archive, &[("game.bin", b"test")]);
+
+        let outcome = run(vec![source(first, "one"), source(second, "two")], archive);
+
+        assert!(outcome.archives[0].combined_identity.is_none());
+        assert!(matches!(
+            outcome.archives[0].members[0].verdict,
+            Some(AuditVerdict::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn multi_member_zip_is_non_actionable_even_when_one_member_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("bundle.zip");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_zip(&archive, &[("game.bin", b"test"), ("readme.txt", b"notes")]);
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+
+        assert!(outcome.archives[0].combined_identity.is_none());
+    }
+
+    #[test]
+    fn multi_member_zip_with_two_exact_games_is_non_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("two.dat");
+        let archive = dir.path().join("two-games.zip");
+        std::fs::write(
+            &dat_path,
+            dat_entries(&[
+                ("Game A", "a.bin", b"first"),
+                ("Game B", "b.bin", b"second"),
+            ]),
+        )
+        .unwrap();
+        write_zip(&archive, &[("a.bin", b"first"), ("b.bin", b"second")]);
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+
+        assert!(outcome.archives[0].combined_identity.is_none());
+        assert!(
+            outcome.archives[0]
+                .members
+                .iter()
+                .all(|member| matches!(member.verdict, Some(AuditVerdict::Exact { .. })))
+        );
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn unmatched_or_corrupt_zip_never_gets_an_outer_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let unmatched = dir.path().join("unmatched.zip");
+        let corrupt = dir.path().join("corrupt.zip");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_zip(&unmatched, &[("game.bin", b"other")]);
+        std::fs::write(&corrupt, b"not a zip").unwrap();
+
+        let unmatched_outcome = run(vec![source(dat_path.clone(), "one")], unmatched);
+        assert!(unmatched_outcome.archives[0].combined_identity.is_none());
+        let corrupt_outcome = run(vec![source(dat_path, "one")], corrupt);
+        assert!(corrupt_outcome.archives[0].combined_identity.is_none());
+        assert!(!matches!(
+            corrupt_outcome.archives[0].completion,
+            ArchivePassCompletion::Complete
+        ));
+    }
+
+    #[test]
+    fn nested_zip_member_is_non_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("nested.zip");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_zip(&archive, &[("inner.zip", b"test")]);
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+
+        assert!(outcome.archives[0].combined_identity.is_none());
+    }
+
+    #[test]
+    fn traversal_named_member_is_never_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("unsafe.zip");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_zip(&archive, &[("../game.bin", b"test")]);
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+
+        assert!(outcome.archives[0].combined_identity.is_none());
+    }
+
+    #[test]
+    fn one_member_7z_exact_match_produces_a_safe_outer_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("one.dat");
+        let archive = dir.path().join("random.7z");
+        std::fs::write(&dat_path, dat("Canonical Game", "canonical.bin")).unwrap();
+        write_7z(&archive, "game.bin", b"test");
+
+        let outcome = run(vec![source(dat_path, "one")], archive);
+        let identity = outcome.archives[0].combined_identity.as_ref().unwrap();
+        assert_eq!(identity.game_name, "Canonical Game");
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.proposals[0].proposed_basename.as_deref(),
+            Some("Canonical Game.7z")
+        );
     }
 }
 
