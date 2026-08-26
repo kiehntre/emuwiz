@@ -1045,6 +1045,30 @@ pub(crate) struct ContentTechnicalView {
 /// left out rather than implying the list is complete.
 pub(crate) const MAX_AUDIT_ENTRIES_SHOWN: usize = 500;
 
+/// How many rename-plan rows are drawn on one page. A verified library the
+/// size of the proven Game Boy run (1839 actionable entries) must stay
+/// scrollable and responsive; rendering all of them into one `ScrollArea`
+/// at once is what this bounds against. Selection is unaffected by paging:
+/// it is keyed by source path on [`DatSourcesPageState`], not by what is on
+/// screen.
+pub(crate) const RENAME_PLAN_PAGE_SIZE: usize = 150;
+
+/// The `[start, end)` slice bounds and total page count for page `page`
+/// (0-based, clamped into range) over `total` rows at
+/// [`RENAME_PLAN_PAGE_SIZE`] rows per page. Pulled out of the drawing
+/// function so pagination math is unit-testable without an egui context -
+/// an egui `ScrollArea` only *paints* the rows that fit in its visible
+/// height regardless of how many are handed to it, so a rendered-text
+/// assertion cannot see far-down rows even when they are correctly
+/// included in the page.
+pub(crate) fn rename_plan_page_bounds(total: usize, page: usize) -> (usize, usize, usize) {
+    let page_count = total.div_ceil(RENAME_PLAN_PAGE_SIZE).max(1);
+    let page = page.min(page_count - 1);
+    let start = page * RENAME_PLAN_PAGE_SIZE;
+    let end = (start + RENAME_PLAN_PAGE_SIZE).min(total);
+    (start, end, page_count)
+}
+
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
@@ -1194,6 +1218,12 @@ pub(crate) enum DatSourcesPageAction {
     },
     /// Clears every review decision for the current plan.
     ClearReviewDecisions,
+    /// Accepts every actionable (`Suggested`) proposal in the current plan
+    /// for review, regardless of the active display filter or which page a
+    /// row is currently rendered on. Never touches a non-actionable row
+    /// (unmatched, ambiguous, unsupported, conflicting, or blocked stay
+    /// unselected) - session-only, like every other review decision.
+    SelectAllActionable,
     /// Build the transaction for the approved, applicable proposals and show
     /// the read-only review. No mutation.
     BeginApplyReview,
@@ -2637,6 +2667,18 @@ impl DatSourcesPageState {
             },
             DatSourcesPageAction::ClearReviewDecisions => {
                 self.review_decisions.clear();
+            }
+            DatSourcesPageAction::SelectAllActionable => {
+                if let Some(plan) = self.rename_plan.as_ref() {
+                    for proposal in &plan.proposals {
+                        if proposal.state.is_actionable() {
+                            self.review_decisions.insert(
+                                proposal.source_path.to_string_lossy().into_owned(),
+                                ReviewDecision::AcceptedForReview,
+                            );
+                        }
+                    }
+                }
             }
             DatSourcesPageAction::BeginApplyReview => self.begin_apply_review(),
             DatSourcesPageAction::ConfirmApply { typed } => {
@@ -4961,6 +5003,12 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) plan_review_open: Option<String>,
     /// Which rename-plan filter is active.
     pub(crate) plan_filter: RenamePlanFilter,
+    /// 0-based page of the rename-plan rows list currently shown, so a
+    /// large plan (Game Boy's proven 1839 actionable entries) never
+    /// renders every row of the current filter's list at once. Selection
+    /// itself (`review_decisions`, on [`DatSourcesPageState`]) is keyed by
+    /// path and is unaffected by which page is on screen.
+    pub(crate) plan_page: usize,
     /// The typed confirmation phrase for a large apply batch.
     pub(crate) plan_typed_confirmation: String,
 }
@@ -4981,6 +5029,7 @@ impl DatSourcesPageUi {
         self.show_tosec_raw.clear();
         self.open_diagnostic = None;
         self.plan_review_open = None;
+        self.plan_page = 0;
         self.plan_typed_confirmation.clear();
     }
 }
@@ -5196,12 +5245,13 @@ pub(crate) fn show_dat_sources_page(
 
 /// A small, task-oriented entry point into the existing DAT-source flows.
 ///
-/// This deliberately does not manufacture a generic downloader: No-Intro and
-/// local DATs remain user-supplied files, TOSEC remains a user-supplied
-/// extracted release pack, and the fixed managed MAME/Redump contracts remain
-/// below.  The controls here merely make those existing, distinct authority
-/// models discoverable without requiring a user to understand the parser
-/// names first.
+/// This deliberately does not manufacture a generic downloader. No-Intro's
+/// DAT-o-MATIC flow is request/form driven and does not expose a stable
+/// anonymous download contract; TOSEC's official site exposes release pages
+/// and generated pack downloads, but no durable machine-readable resolver.
+/// Both therefore remain explicit local-import workflows. The controls here
+/// make those authority models discoverable without requiring a user to
+/// understand raw DAT filenames.
 fn show_evidence_acquisition_section(
     ui: &mut egui::Ui,
     view: &DatSourcesPageView,
@@ -5245,7 +5295,7 @@ fn show_evidence_acquisition_section(
             ui.label(egui::RichText::new("No-Intro — cartridge ROMs").strong());
             ui.label(
                 egui::RichText::new(
-                    "Import an official, extracted DAT from No-Intro DAT-o-MATIC. EmuWiz verifies the DAT's internal header; its filename is not trusted.",
+                    "Managed download is not available: DAT-o-MATIC requires an interactive request flow. Import an official DAT from it; EmuWiz verifies the internal header, not the filename.",
                 )
                 .color(theme::muted(ui))
                 .small(),
@@ -5268,7 +5318,7 @@ fn show_evidence_acquisition_section(
             ui.label(egui::RichText::new("TOSEC — vintage systems").strong());
             ui.label(
                 egui::RichText::new(format!(
-                    "{available_tosec_packs} available pack(s) · {selected_tosec_dats} selected DAT(s). Choose an extracted pack, then enable System / Category / Media below."
+                    "Managed download is not available: the official site has no durable pack resolver. {available_tosec_packs} imported pack(s) · {selected_tosec_dats} selected DAT(s). Enable System / Category / Media below."
                 ))
                 .color(theme::muted(ui))
                 .small(),
@@ -5367,6 +5417,22 @@ fn choose_tosec_release_pack() -> Option<PathBuf> {
         .pick_folder()
 }
 
+/// One line of the compact evidence-readiness list: a Ready/Missing badge
+/// plus the underlying count, so a normal user sees at a glance which
+/// evidence a scan will use without opening DAT Sources or choosing a DAT
+/// by hand.
+fn show_evidence_readiness_row(ui: &mut egui::Ui, label: &str, count: usize, detail: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).strong());
+        if count > 0 {
+            widgets::status_badge(ui, "Ready", widgets::StatusTone::Success);
+        } else {
+            widgets::status_badge(ui, "Missing", widgets::StatusTone::Pending);
+        }
+    });
+    ui.label(egui::RichText::new(detail).color(theme::muted(ui)).small());
+}
+
 /// Draws the task-oriented entry point for evidence-backed library renaming.
 ///
 /// This intentionally reuses the same `DatSourcesPageState` actions and
@@ -5412,7 +5478,19 @@ pub(crate) fn show_identify_rename_page(
         );
     }
 
-    let local_enabled = view.rows.iter().filter(|row| row.enabled).count();
+    // WHDLoad is identified only by the exact display name EmuWiz itself
+    // assigns on import (`add_whdload_catalogue`) - never by platform, so
+    // this stays a UI-only evidence-category split, not a per-platform rule.
+    let whdload_enabled = view
+        .rows
+        .iter()
+        .filter(|row| row.enabled && row.display_name == "WHDLoad / Retroplay catalogue")
+        .count();
+    let local_enabled = view
+        .rows
+        .iter()
+        .filter(|row| row.enabled && row.display_name != "WHDLoad / Retroplay catalogue")
+        .count();
     let mame_installed = view.managed_rows.iter().filter(|row| row.installed).count();
     let redump_installed = view
         .redump_game_rows
@@ -5428,38 +5506,47 @@ pub(crate) fn show_identify_rename_page(
         ui,
         "Available evidence",
         Some(
-            "One scan compares each file with every eligible installed catalogue. BIOS DATs are excluded.",
+            "One scan compares each file with every eligible installed catalogue. BIOS DATs are excluded. DAT Sources is where you add or change any of these; nothing here needs a manual per-scan choice.",
         ),
     );
     widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("No-Intro and local DATs").strong());
-        ui.label(
-            egui::RichText::new(format!("{local_enabled} enabled local catalogue(s)"))
-                .color(theme::muted(ui))
-                .small(),
+        show_evidence_readiness_row(
+            ui,
+            "No-Intro / Local DATs",
+            local_enabled,
+            &format!("{local_enabled} enabled local catalogue(s)"),
         );
-        ui.label(egui::RichText::new("TOSEC").strong());
-        ui.label(
-            egui::RichText::new(format!(
-                "{selected_tosec} selected TOSEC DAT(s); apply their selection in DAT Sources before scanning."
-            ))
-            .color(theme::muted(ui))
-            .small(),
+        show_evidence_readiness_row(
+            ui,
+            "TOSEC",
+            selected_tosec,
+            &format!("{selected_tosec} selected TOSEC DAT(s)"),
         );
-        ui.label(egui::RichText::new("Redump game/disc DATs").strong());
-        ui.label(
-            egui::RichText::new(format!("{redump_installed} installed game catalogue(s)"))
-                .color(theme::muted(ui))
-                .small(),
+        show_evidence_readiness_row(
+            ui,
+            "Redump",
+            redump_installed,
+            &format!("{redump_installed} installed game catalogue(s)"),
         );
-        ui.label(egui::RichText::new("MAME software lists").strong());
-        ui.label(
-            egui::RichText::new(format!("{mame_installed} installed software list(s)"))
-                .color(theme::muted(ui))
-                .small(),
+        show_evidence_readiness_row(
+            ui,
+            "MAME",
+            mame_installed,
+            &format!("{mame_installed} installed software list(s)"),
         );
-        let can_scan =
-            !view.background_busy && local_enabled + mame_installed + redump_installed > 0;
+        show_evidence_readiness_row(
+            ui,
+            "WHDLoad",
+            whdload_enabled,
+            &format!("{whdload_enabled} enabled WHDLoad catalogue(s)"),
+        );
+        ui.add_space(4.0);
+        // TOSEC and WHDLoad are valid audit inputs too. Keep the gate aligned
+        // with `combined_audit_sources`, otherwise a user who has enabled
+        // only the BBC's TOSEC evidence can never reach the folder picker.
+        let can_scan = !view.background_busy
+            && local_enabled + selected_tosec + whdload_enabled + mame_installed + redump_installed
+                > 0;
         if widgets::action_button(
             ui,
             if ui_state.open_combined_audit_picker {
@@ -8113,6 +8200,7 @@ fn show_rename_plan_section(
                 let selected = ui_state.plan_filter == filter;
                 if ui.selectable_label(selected, filter.label()).clicked() {
                     ui_state.plan_filter = filter;
+                    ui_state.plan_page = 0;
                 }
             }
         });
@@ -8131,11 +8219,39 @@ fn show_rename_plan_section(
             );
             return;
         }
+        let (start, end, page_count) = rename_plan_page_bounds(visible.len(), ui_state.plan_page);
+        ui_state.plan_page = ui_state.plan_page.min(page_count - 1);
+        if page_count > 1 {
+            ui.horizontal(|ui| {
+                let at_first_page = ui_state.plan_page == 0;
+                if ui
+                    .add_enabled(!at_first_page, egui::Button::new("← Previous page"))
+                    .clicked()
+                {
+                    ui_state.plan_page -= 1;
+                }
+                ui.label(format!(
+                    "Page {} of {page_count} · showing {}-{} of {}",
+                    ui_state.plan_page + 1,
+                    start + 1,
+                    end,
+                    visible.len()
+                ));
+                let at_last_page = ui_state.plan_page + 1 >= page_count;
+                if ui
+                    .add_enabled(!at_last_page, egui::Button::new("Next page →"))
+                    .clicked()
+                {
+                    ui_state.plan_page += 1;
+                }
+            });
+            ui.add_space(4.0);
+        }
         egui::ScrollArea::vertical()
             .max_height(360.0)
             .id_salt("dat-rename-plan-rows")
             .show(ui, |ui| {
-                for row in visible {
+                for row in &visible[start..end] {
                     show_rename_plan_row(ui, row, &mut action);
                     ui.add_space(4.0);
                 }
@@ -8167,9 +8283,30 @@ fn show_rename_plan_section(
                 }
                 ui.add_space(8.0);
             }
+            let actionable_count = plan
+                .rows
+                .iter()
+                .filter(|row| row.state == ProposalState::Suggested)
+                .count();
             if widgets::action_button(
                 ui,
-                "Reset all review decisions",
+                format!("Select all verified actionable ({actionable_count})"),
+                widgets::ActionStyle::Secondary,
+                actionable_count > 0,
+            )
+            .on_hover_text(
+                "Accept every Suggested proposal for review, across every page and filter. \
+                 Unmatched, ambiguous, unsupported, conflicting, and blocked rows are never \
+                 selected.",
+            )
+            .clicked()
+            {
+                action = Some(DatSourcesPageAction::SelectAllActionable);
+            }
+            ui.add_space(8.0);
+            if widgets::action_button(
+                ui,
+                "Clear selection",
                 widgets::ActionStyle::Quiet,
                 !plan.rows.is_empty(),
             )

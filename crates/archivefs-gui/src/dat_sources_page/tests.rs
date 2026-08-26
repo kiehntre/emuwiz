@@ -1008,7 +1008,7 @@ fn identify_rename_uses_all_enabled_evidence_without_manual_catalogue_choice() {
     assert!(rendered_text_contains(&output, "Identify & Rename"));
     assert!(rendered_text_contains(&output, "No filename guessing"));
     assert!(rendered_text_contains(&output, "Available evidence"));
-    assert!(rendered_text_contains(&output, "No-Intro and local DATs"));
+    assert!(rendered_text_contains(&output, "No-Intro / Local DATs"));
     assert!(rendered_text_contains(&output, "Choose library or file…"));
     assert_eq!(
         snapshot(&fixture.root),
@@ -3947,6 +3947,195 @@ fn clearing_review_decisions_leaves_source_files_untouched() {
         page.view().rename_plan.as_ref().unwrap().rows[0].decision,
         None,
         "the decision is cleared"
+    );
+}
+
+/// Bulk selection must accept only the actionable (`Suggested`) rows and
+/// never touch a row unmatched, ambiguous, unsupported, conflicting,
+/// already-canonical, or blocked - those must stay unselectable regardless
+/// of a bulk action.
+#[test]
+fn select_all_actionable_accepts_only_suggested_rows() {
+    let fixture = Fixture::new();
+    let roms = fixture.dir("roms");
+    for name in ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin"] {
+        std::fs::write(roms.join(name), b"fixture contents").unwrap();
+    }
+    let mut page = fixture.page();
+    let proposals = vec![
+        plan_proposal(
+            roms.join("a.bin").to_str().unwrap(),
+            "a.bin",
+            Some("Game A (Europe).bin"),
+            ProposalState::Suggested,
+        ),
+        plan_proposal(
+            roms.join("b.bin").to_str().unwrap(),
+            "b.bin",
+            Some("Game B (Europe).bin"),
+            ProposalState::Suggested,
+        ),
+        plan_proposal(
+            roms.join("c.bin").to_str().unwrap(),
+            "c.bin",
+            Some("Other.bin"),
+            ProposalState::Conflict,
+        ),
+        plan_proposal(
+            roms.join("d.bin").to_str().unwrap(),
+            "d.bin",
+            None,
+            ProposalState::Ambiguous,
+        ),
+        plan_proposal(
+            roms.join("e.bin").to_str().unwrap(),
+            "Game E.bin",
+            Some("Game E.bin"),
+            ProposalState::AlreadyCanonical,
+        ),
+    ];
+    let counts = RenamePlanCounts::from_proposals(&proposals);
+    page.rename_plan = Some(RenamePlan {
+        generation: 1,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        scan_root: roms.to_string_lossy().into_owned(),
+        platform: None,
+        platform_display: None,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        proposals,
+        counts,
+        audited_total: 5,
+        verified_total: 5,
+        truncated: false,
+    });
+
+    let before = snapshot(&roms);
+    page.apply(DatSourcesPageAction::SelectAllActionable);
+    let after = snapshot(&roms);
+    assert_eq!(before, after, "bulk selection must not change any file");
+
+    let view = page.view();
+    let rows = &view.rename_plan.as_ref().unwrap().rows;
+    let decision_for = |name: &str| {
+        rows.iter()
+            .find(|row| row.current_basename == name)
+            .and_then(|row| row.decision)
+    };
+    assert_eq!(
+        decision_for("a.bin"),
+        Some(ReviewDecision::AcceptedForReview)
+    );
+    assert_eq!(
+        decision_for("b.bin"),
+        Some(ReviewDecision::AcceptedForReview)
+    );
+    assert_eq!(
+        decision_for("c.bin"),
+        None,
+        "a conflict must stay unselected"
+    );
+    assert_eq!(
+        decision_for("d.bin"),
+        None,
+        "an ambiguous row must stay unselected"
+    );
+    assert_eq!(
+        decision_for("Game E.bin"),
+        None,
+        "an already-canonical row must stay unselected"
+    );
+}
+
+/// The pagination slicing math itself, exercised without an egui context.
+/// A rendered-text assertion cannot prove which rows are *included* on a
+/// page: an egui `ScrollArea` only paints whatever fits in its visible
+/// height regardless of how many rows are hits handed to it, so a row far
+/// down a page would never show up in the shape list even when correctly
+/// included. This is the ground truth the drawing code (`show_rename_plan_
+/// section`) reads its `start`/`end` slice from.
+#[test]
+fn rename_plan_page_bounds_slices_and_clamps_correctly() {
+    // A page of exactly the configured size: one page, the whole range.
+    assert_eq!(
+        rename_plan_page_bounds(RENAME_PLAN_PAGE_SIZE, 0),
+        (0, RENAME_PLAN_PAGE_SIZE, 1)
+    );
+    // 320 rows at 150/page: three pages, the last one partial.
+    assert_eq!(rename_plan_page_bounds(320, 0), (0, 150, 3));
+    assert_eq!(rename_plan_page_bounds(320, 1), (150, 300, 3));
+    assert_eq!(rename_plan_page_bounds(320, 2), (300, 320, 3));
+    // The proven Game Boy production scale: 1839 actionable entries.
+    assert_eq!(rename_plan_page_bounds(1839, 0), (0, 150, 13));
+    assert_eq!(rename_plan_page_bounds(1839, 12), (1800, 1839, 13));
+    // An out-of-range requested page clamps to the last real page rather
+    // than slicing out of bounds.
+    assert_eq!(rename_plan_page_bounds(320, 99), (300, 320, 3));
+    // Zero rows still yields one (empty) page, never a divide-by-zero page
+    // count.
+    assert_eq!(rename_plan_page_bounds(0, 0), (0, 0, 1));
+}
+
+/// A large plan (the scale Game Boy's proven production run actually
+/// produced: 1839 actionable entries) must expose page-header text proving
+/// which bounded page is showing, and moving to another page must never
+/// lose or alter a selection made on a different page - selection lives on
+/// `review_decisions` keyed by path, entirely independent of what is
+/// currently drawn or which page is active.
+#[test]
+fn large_plans_are_paginated_and_selection_survives_paging() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(320);
+    let view = page.view();
+    let plan = view.rename_plan.as_ref().unwrap();
+    assert_eq!(plan.rows.len(), 320);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let first_page = render_identify_rename(&view, &mut ui_state);
+    assert!(rendered_text_contains(&first_page, "Page 1 of 3"));
+    assert!(rendered_text_contains(&first_page, "showing 1-150 of 320"));
+    assert!(
+        rendered_text_contains(&first_page, "game0.bin"),
+        "the first row of page 1 must render"
+    );
+
+    // Select a row on page 1, then move to page 2 and confirm the
+    // selection is unaffected by which page is now active.
+    page.apply(DatSourcesPageAction::SetReviewDecision {
+        path: page
+            .view()
+            .rename_plan
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.current_basename == "game0.bin")
+            .unwrap()
+            .source_path
+            .to_string_lossy()
+            .into_owned(),
+        decision: Some(ReviewDecision::AcceptedForReview),
+    });
+    let view = page.view();
+    ui_state.plan_page = 1;
+    let second_page = render_identify_rename(&view, &mut ui_state);
+    assert!(rendered_text_contains(&second_page, "Page 2 of 3"));
+    assert!(rendered_text_contains(
+        &second_page,
+        "showing 151-300 of 320"
+    ));
+    assert!(
+        rendered_text_contains(&second_page, "game150.bin"),
+        "the first row of page 2 must render"
+    );
+    assert!(
+        !rendered_text_contains(&second_page, "game0.bin"),
+        "page 1's first row must not render on page 2"
+    );
+    assert_eq!(
+        view.rename_plan.as_ref().unwrap().rows[0].decision,
+        Some(ReviewDecision::AcceptedForReview),
+        "the selection made while on page 1 must survive navigating to page 2"
     );
 }
 
