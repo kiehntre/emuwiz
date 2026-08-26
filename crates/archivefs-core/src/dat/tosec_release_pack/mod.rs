@@ -763,10 +763,22 @@ pub struct RegisteredTosecDat {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TosecRegistrationOutcome {
     pub registered: Vec<RegisteredTosecDat>,
+    /// Selected DATs whose current bytes are already represented by an
+    /// existing source.  They are satisfied without replacing or duplicating
+    /// the user's source.
+    pub already_registered: Vec<PathBuf>,
     /// Entries this exact pack previously created but whose group is no
     /// longer selected. User-local and other-provider entries never appear
     /// here.
     pub removed: Vec<DatSourceConfigEntry>,
+    /// TOSEC-ISO/PIX entries remain visible in the inventory but are outside
+    /// the classic-media authority boundary of this adapter.
+    pub deferred: Vec<(PathBuf, String)>,
+    /// An existing source was deliberately preserved because it conflicts
+    /// with the selected pack entry.
+    pub conflicts: Vec<(PathBuf, String)>,
+    /// Actual registration errors (bad path, parse failure, vanished file,
+    /// and similar failures), distinct from intentional deferral/conflict.
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -893,16 +905,45 @@ pub fn register_selected_tosec_dats(
                     pack_id: pack.pack_id.clone(),
                     relative_path: dat.relative_path.clone(),
                 };
-                if sources.sources.iter().flatten().any(|existing| {
-                    existing.id == id
-                        && (existing.path != absolute_text || existing.ownership != ownership)
-                }) {
-                    outcome.failed.push((
-                        dat.relative_path.clone(),
-                        "TOSEC registration ID conflicts with a different existing local DAT source"
-                            .to_string(),
-                    ));
-                    continue;
+                let existing = sources
+                    .sources
+                    .iter()
+                    .flatten()
+                    .find(|existing| existing.path == absolute_text || existing.id == id);
+                if let Some(existing) = existing {
+                    if existing.path == absolute_text {
+                        if existing.ownership.is_user_local() {
+                            outcome.already_registered.push(dat.relative_path.clone());
+                            continue;
+                        }
+                        if existing.id == id
+                            && existing.ownership == ownership
+                            && existing
+                                .origin
+                                .as_deref()
+                                .is_some_and(|origin| origin.contains(&imported.artifact_sha256))
+                        {
+                            outcome.already_registered.push(dat.relative_path.clone());
+                            continue;
+                        }
+                        if existing.id == id && existing.ownership == ownership {
+                            // This pack owns the entry and the bytes changed;
+                            // replace it below so provenance follows the
+                            // artifact actually parsed now.
+                        } else {
+                            outcome.conflicts.push((
+                                dat.relative_path.clone(),
+                                "the selected DAT path is already owned by another source; the existing entry was preserved".to_string(),
+                            ));
+                            continue;
+                        }
+                    } else {
+                        outcome.conflicts.push((
+                            dat.relative_path.clone(),
+                            "the generated TOSEC source ID is already used by a different local DAT source; the existing entry was preserved".to_string(),
+                        ));
+                        continue;
+                    }
                 }
                 let entry = DatSourceConfigEntry {
                     id: id.clone(),
@@ -933,11 +974,18 @@ pub fn register_selected_tosec_dats(
                     .registered
                     .push(RegisteredTosecDat { entry, provenance });
             }
-            Err(error) => {
-                outcome
+            Err(error) => match error {
+                crate::identity_source::tosec::TosecImportError::OutOfScope {
+                    catalogue_kind,
+                    ..
+                } => outcome.deferred.push((
+                    dat.relative_path.clone(),
+                    format!("deferred TOSEC {catalogue_kind} catalogue"),
+                )),
+                error => outcome
                     .failed
-                    .push((dat.relative_path.clone(), error.to_string()));
-            }
+                    .push((dat.relative_path.clone(), error.to_string())),
+            },
         }
     }
     if let Some(sources_list) = sources.sources.as_mut() {

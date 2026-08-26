@@ -573,7 +573,10 @@ pub(crate) struct TosecSelectionGroupView {
 pub(crate) struct TosecApplyView {
     pub(crate) pack_id: String,
     pub(crate) registered: usize,
+    pub(crate) already_registered: usize,
     pub(crate) removed: usize,
+    pub(crate) deferred: usize,
+    pub(crate) conflicts: usize,
     pub(crate) failed: usize,
 }
 
@@ -3285,13 +3288,21 @@ impl DatSourcesPageState {
                     self.tosec_last_apply = Some(TosecApplyView {
                         pack_id: pack_id.to_string(),
                         registered: outcome.registered.len(),
+                        already_registered: outcome.already_registered.len(),
                         removed: outcome.removed.len(),
+                        deferred: outcome.deferred.len(),
+                        conflicts: outcome.conflicts.len(),
                         failed: outcome.failed.len(),
                     });
                     if !outcome.failed.is_empty() {
                         self.tosec_action_error = Some(format!(
                             "{} selected TOSEC DAT(s) were not registered. They remain unregistered; existing known-good entries were kept.",
                             outcome.failed.len()
+                        ));
+                    } else if !outcome.conflicts.is_empty() {
+                        self.tosec_action_error = Some(format!(
+                            "{} selected TOSEC DAT(s) conflicted with existing sources; those entries were preserved.",
+                            outcome.conflicts.len()
                         ));
                     }
                 }
@@ -6065,10 +6076,16 @@ fn show_tosec_release_packs_section(
             ui,
             "TOSEC selection applied",
             &format!(
-                "{}: {} registered, {} removed after deselection, {} skipped or deferred.",
-                last.pack_id, last.registered, last.removed, last.failed
+                "{}: {} registered, {} already registered, {} deferred, {} conflicts, {} failed, {} removed after deselection.",
+                last.pack_id,
+                last.registered,
+                last.already_registered,
+                last.deferred,
+                last.conflicts,
+                last.failed,
+                last.removed
             ),
-            if last.failed == 0 {
+            if last.failed == 0 && last.conflicts == 0 {
                 widgets::StatusTone::Success
             } else {
                 widgets::StatusTone::Warning

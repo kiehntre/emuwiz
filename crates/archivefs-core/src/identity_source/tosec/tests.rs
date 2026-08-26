@@ -113,6 +113,17 @@ fn non_tosec_no_intro_dat_is_refused() {
 }
 
 #[test]
+fn official_tosec_homepage_with_contributor_author_is_accepted() {
+    let dir = tempdir().unwrap();
+    let path = write_dat(
+        dir.path(),
+        "official.dat",
+        r#"<datafile><header><name>Acorn BBC - Games - [DSD]</name><description>Acorn BBC - Games - [DSD] (TOSEC-v2013-10-22)</description><version>2013-10-22</version><author>CRSV - Cassiel</author><homepage>TOSEC</homepage></header><game name="G"><rom name="g" size="1" crc="12345678"/></game></datafile>"#,
+    );
+    assert!(import_tosec_dat(&path).is_ok());
+}
+
+#[test]
 fn tosec_iso_and_pix_are_deferred_from_classic_media_scope() {
     let dir = tempdir().unwrap();
     for (filename, internal_name) in [

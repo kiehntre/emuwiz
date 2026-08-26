@@ -146,7 +146,17 @@ fn header_identifies_tosec_dataset(dat: &ParsedDat) -> bool {
     .flatten()
     .any(|value| value.trim_start().to_ascii_lowercase().starts_with("tosec"));
 
-    author_is_tosec || header_leads_with_tosec
+    // Official classic TOSEC releases commonly identify the project through
+    // the homepage while using a contributor name (for example CRSV) as the
+    // author. The parser does not retain the separate XML URL field, so keep
+    // this allow-list narrow and project-specific rather than trusting an
+    // arbitrary filename, directory, or incidental prose.
+    let homepage_identifies_tosec = dat.source.homepage.as_deref().is_some_and(|homepage| {
+        let homepage = homepage.trim().to_ascii_lowercase();
+        homepage == "tosec" || homepage.contains("tosecdev.org")
+    });
+
+    author_is_tosec || header_leads_with_tosec || homepage_identifies_tosec
 }
 
 /// Imports one local classic TOSEC DAT. Parsing remains entirely in

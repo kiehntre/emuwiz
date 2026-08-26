@@ -681,8 +681,8 @@ fn an_unrelated_local_source_with_a_tosec_id_collision_is_not_replaced() {
         .push(local_source(&generated_id, "/unrelated/user.dat"));
     let outcome = register_selected_tosec_dats(&pack, &mut sources, 42);
     assert!(outcome.registered.is_empty());
-    assert_eq!(outcome.failed.len(), 1);
-    assert!(outcome.failed[0].1.contains("conflicts with a different"));
+    assert_eq!(outcome.conflicts.len(), 1);
+    assert!(outcome.conflicts[0].1.contains("source ID"));
     assert_eq!(sources.sources.unwrap()[0].path, "/unrelated/user.dat");
 }
 
@@ -730,8 +730,12 @@ fn deferred_tosec_iso_catalogues_remain_in_inventory_but_are_not_registered() {
     let registry = fixture._root.path().join("dat_sources.toml");
     let outcome = apply_selection_to_registry(&pack, &registry, 42).unwrap();
     assert!(outcome.registered.is_empty());
-    assert_eq!(outcome.failed.len(), 1);
-    assert!(outcome.failed[0].1.contains("deferred TOSEC ISO catalogue"));
+    assert_eq!(outcome.deferred.len(), 1);
+    assert!(
+        outcome.deferred[0]
+            .1
+            .contains("deferred TOSEC ISO catalogue")
+    );
 }
 
 #[test]
@@ -758,7 +762,7 @@ fn registration_revalidates_changed_selected_bytes_and_replaces_its_own_entry() 
 
     let registry = fixture._root.path().join("dat_sources.toml");
     let first = apply_selection_to_registry(&pack, &registry, 42).unwrap();
-    assert_eq!(first.registered.len(), 1);
+    assert_eq!(first.registered.len(), 1, "failed: {:?}", first.failed);
     assert_ne!(
         first.registered[0].provenance.content_sha256.as_deref(),
         Some(inventory_digest.as_str()),
@@ -767,14 +771,73 @@ fn registration_revalidates_changed_selected_bytes_and_replaces_its_own_entry() 
     let first_id = first.registered[0].entry.id.clone();
 
     let second = apply_selection_to_registry(&pack, &registry, 43).unwrap();
-    assert_eq!(second.registered.len(), 1);
-    assert_eq!(second.registered[0].entry.id, first_id);
+    assert_eq!(second.registered.len(), 0);
+    assert_eq!(second.already_registered.len(), 1);
+    assert_eq!(
+        load_dat_sources_config_from(&registry)
+            .unwrap()
+            .sources
+            .unwrap()[0]
+            .id,
+        first_id
+    );
     let saved = load_dat_sources_config_from(&registry).unwrap();
     assert_eq!(
         saved.sources.unwrap().len(),
         1,
         "a changed pack DAT must replace this pack/path's entry, not leave stale provenance"
     );
+}
+
+#[test]
+fn an_exact_user_local_pack_path_is_already_satisfied_without_duplication() {
+    let fixture = PackFixture::standard();
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let mut pack = persisted_from_inventory(&inventory);
+    select_amiga_floppy(&mut pack);
+    let selected = find_dat(&inventory, "Amiga - Games - Floppy");
+    let selected_path = fixture.pack_root.join(&selected.relative_path);
+    let mut sources = DatSourcesConfig::default();
+    sources.sources = Some(vec![local_source(
+        "manual-amiga",
+        selected_path.to_str().unwrap(),
+    )]);
+
+    let outcome = register_selected_tosec_dats(&pack, &mut sources, 42);
+    assert!(outcome.registered.is_empty());
+    assert_eq!(outcome.already_registered.len(), 1);
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(sources.sources.unwrap().len(), 1);
+}
+
+#[test]
+fn a_mixed_selection_reports_registered_already_deferred_and_conflict_separately() {
+    let fixture = PackFixture::standard();
+    fixture.write_dat(
+        &["TOSEC-ISO - PC.dat"],
+        &dat_xml("TOSEC-ISO - PC", "TOSEC-ISO - PC", "2021-01-09"),
+    );
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let mut pack = persisted_from_inventory(&inventory);
+    select_amiga_floppy(&mut pack);
+    let iso = find_dat(&inventory, "TOSEC-ISO - PC");
+    pack.selections.insert(iso.selection_key());
+    let selected = find_dat(&inventory, "Amiga - Games - Floppy");
+    let generated_id = registration_id(&pack, selected);
+    pack.selections.insert(TosecSelectionKey {
+        system: "ZX Spectrum".to_string(),
+        category: TosecFriendlyCategory::Games,
+        media: TosecMediaType::Tape,
+    });
+    let mut sources = DatSourcesConfig::default();
+    sources.sources = Some(vec![local_source(&generated_id, "/unrelated/user.dat")]);
+
+    let outcome = register_selected_tosec_dats(&pack, &mut sources, 42);
+    assert_eq!(outcome.registered.len(), 1);
+    assert_eq!(outcome.already_registered.len(), 0);
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.conflicts.len(), 1);
+    assert!(outcome.failed.is_empty());
 }
 
 #[test]
