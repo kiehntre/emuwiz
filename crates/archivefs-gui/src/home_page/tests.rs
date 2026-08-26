@@ -186,6 +186,7 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::Settings, "Open Settings"),
         (HomeCard::BuildLibrary, "Open Sources"),
         (HomeCard::CleanUpLibrary, "Identify files"),
+        (HomeCard::QuickRename, "Choose a library"),
         (HomeCard::RomM, "Open Sources"),
     ];
     assert_eq!(view.cards.len(), expected.len());
@@ -363,12 +364,12 @@ fn rename_and_organise_are_discoverable_from_home() {
         .iter()
         .find(|c| c.card == HomeCard::CanonicalOrganisation)
         .unwrap();
-    // "Organise by platform" is the primary action; the evidence-backed
-    // Identify & Rename workflow is the secondary route.
+    // "Organise by platform" is the primary action; Quick Rename is the
+    // simple route and the full evidence-backed workflow remains available.
     assert_eq!(organise.action_label, "Open Organise");
     assert_eq!(
         organise.secondary,
-        Some((HomeCard::CleanUpLibrary, "Identify & Rename"))
+        Some((HomeCard::QuickRename, "Quick Rename"))
     );
     let clean = view
         .cards
@@ -446,6 +447,7 @@ fn all_destinations_remain_and_six_are_primary() {
         HomeCard::CheatsAndMods,
         HomeCard::CanonicalOrganisation,
         HomeCard::CleanUpLibrary,
+        HomeCard::QuickRename,
         HomeCard::DatSources,
         HomeCard::RomM,
         HomeCard::CheckSetup,
@@ -458,7 +460,7 @@ fn all_destinations_remain_and_six_are_primary() {
             .iter()
             .filter(|c| c.tier == HomeCardTier::Primary)
             .count(),
-        6
+        7
     );
     assert!(
         view.cards

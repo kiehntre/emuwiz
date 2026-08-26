@@ -3322,6 +3322,7 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
         home_page::HomeCard::CleanUpLibrary => MainView::IdentifyRename,
+        home_page::HomeCard::QuickRename => MainView::IdentifyRename,
         home_page::HomeCard::CheatSources => MainView::CheatSources,
         home_page::HomeCard::DatSources => MainView::DatSources,
         home_page::HomeCard::CheckSetup => MainView::Doctor,
@@ -3933,6 +3934,7 @@ struct ArchiveFsApp {
     /// Cheat Sources is: starting the GUI should not read a registry file for
     /// a page nobody has opened.
     dat_sources_page: Option<dat_sources_page::DatSourcesPageState>,
+    quick_rename_mode: bool,
     /// Unsubmitted DAT Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy.
     dat_sources_ui: dat_sources_page::DatSourcesPageUi,
@@ -4357,6 +4359,7 @@ impl ArchiveFsApp {
             library_view_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
+            quick_rename_mode: false,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
             library_filters: LibraryRowFilters::default(),
             library_platform_query: String::new(),
@@ -5831,15 +5834,33 @@ impl ArchiveFsApp {
         }
         let view = page.view();
         let action = if identify_rename {
-            dat_sources_page::show_identify_rename_page(ui, &view, &mut self.dat_sources_ui)
+            if self.quick_rename_mode {
+                dat_sources_page::show_quick_rename_page(ui, &view, &mut self.dat_sources_ui)
+            } else {
+                dat_sources_page::show_identify_rename_page(ui, &view, &mut self.dat_sources_ui)
+            }
         } else {
             dat_sources_page::show_dat_sources_page(ui, &view, &mut self.dat_sources_ui)
         };
         if let Some(action) = action {
+            let open_dat_sources = matches!(
+                action,
+                dat_sources_page::DatSourcesPageAction::OpenDatSources
+            );
+            let open_advanced = matches!(
+                action,
+                dat_sources_page::DatSourcesPageAction::OpenAdvancedIdentifyRename
+            );
             if matches!(action, dat_sources_page::DatSourcesPageAction::Revert) {
                 self.dat_sources_ui.clear();
             }
             page.apply(action);
+            if open_dat_sources {
+                self.quick_rename_mode = false;
+                self.view = MainView::DatSources;
+            } else if open_advanced {
+                self.quick_rename_mode = false;
+            }
         }
         // Surface apply/rollback outcomes into History & Logs, without private
         // paths (the journal keeps those, never the general log).
@@ -15235,6 +15256,10 @@ impl ArchiveFsApp {
         }
         match navigation_request {
             Some(NavClick::View(view)) => self.navigate_to_main_view(view),
+            Some(NavClick::QuickRename) => {
+                self.quick_rename_mode = true;
+                self.navigate_to_main_view(MainView::IdentifyRename);
+            }
             Some(NavClick::Overlay(overlay)) => self.tools_overlay = overlay,
             None => {}
         }
@@ -15650,6 +15675,7 @@ impl ArchiveFsApp {
                     };
                     let home_view = home_page::build_home_view(&home_inputs);
                     if let Some(card) = home_page::show_home_page(ui, &home_view) {
+                        self.quick_rename_mode = card == home_page::HomeCard::QuickRename;
                         self.navigate_to_main_view(main_view_for_home_card(card));
                     }
                 }

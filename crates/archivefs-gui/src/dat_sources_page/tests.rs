@@ -1479,6 +1479,33 @@ fn render_identify_rename(
     })
 }
 
+fn render_quick_rename(
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_quick_rename_page(ui, view, ui_state);
+        });
+    })
+}
+
+#[test]
+fn quick_rename_opens_without_scanning_or_writing() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_quick_rename(&view, &mut ui_state);
+
+    assert!(rendered_text_contains(&output, "Quick Rename"));
+    assert!(view.running.is_none());
+    assert!(view.audit.is_none());
+    assert!(view.rename_plan.is_none());
+    assert!(!fixture.config_path.exists());
+}
+
 /// Draws every disclosure body for assertions about information retained in
 /// the technical view. The normal `render` helper deliberately keeps those
 /// bodies closed so beginner-facing tests exercise the real default.

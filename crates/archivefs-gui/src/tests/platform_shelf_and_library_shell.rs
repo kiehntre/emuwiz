@@ -190,6 +190,7 @@ fn every_home_card_maps_to_its_real_existing_destination() {
         (home_page::HomeCard::RomM, MainView::Sources),
         (home_page::HomeCard::CheckSetup, MainView::Doctor),
         (home_page::HomeCard::Settings, MainView::Settings),
+        (home_page::HomeCard::QuickRename, MainView::IdentifyRename),
     ];
     for (card, expected_view) in expected {
         assert_eq!(main_view_for_home_card(card), expected_view, "{card:?}");
@@ -3184,5 +3185,132 @@ fn view_entries_do_not_stay_highlighted_once_an_overlay_is_open() {
     assert!(
         collection_discovery_selected,
         "Collection Discovery must be the only highlighted entry while it is open"
+    );
+}
+
+/// Every destination `PRIMARY_NAVIGATION_DESTINATIONS` names, plus Quick
+/// Rename, must still have a sidebar entry - a data-level check that
+/// survives independently of whether any of them can currently be scrolled
+/// into view, unlike a render-based assertion.
+#[test]
+fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
+        // `About` is deliberately reached only through the Help menu, never
+        // the sidebar (see `main.rs`'s Help-menu handler) - it is not a
+        // sidebar regression for it to be absent here.
+        if view == MainView::About {
+            continue;
+        }
+        assert!(
+            sidebar_views.contains(&view),
+            "{label} ({view:?}) is a primary destination but has no sidebar entry"
+        );
+    }
+    let has_quick_rename = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .any(|entry| matches!(entry.click, NavClick::QuickRename));
+    assert!(
+        has_quick_rename,
+        "Quick Rename must still have a sidebar entry"
+    );
+}
+
+/// Renders the sidebar alone, the way `SidePanel::left("app_navigation")`
+/// does, at a screen height short enough that the full nav list cannot fit
+/// unclipped (`ADVANCED_NAV_GROUPS` has grown past what 1536x864 and
+/// smaller desktop windows show above their own taskbar/status chrome).
+fn render_sidebar_at_height(
+    context: &egui::Context,
+    height: f32,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(218.0, height),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ctx| {
+            egui::SidePanel::left("app_navigation")
+                .resizable(false)
+                .exact_width(218.0)
+                .show(ctx, |ui| {
+                    let _ = show_primary_navigation(ui, MainView::Home, ToolsOverlay::None, true);
+                });
+        },
+    )
+}
+
+/// The regression this whole fix addresses: at a short window height, the
+/// last group's entry ("Settings") must not simply be clipped out of
+/// existence. Proving it via rendered text alone is not enough - an egui
+/// `ScrollArea` only *paints* whatever fits in its current scroll offset,
+/// so an unscrolled short viewport legitimately shows nothing below the
+/// fold on the very first frame, scrollable or not. The proof a scroll
+/// container exists (rather than a plain `Ui` that would clip permanently)
+/// is that a mouse-wheel scroll event over the sidebar changes what is
+/// visible - the same technique already used for the platform shelf's own
+/// scroll strip in this file.
+#[test]
+fn low_sidebar_destinations_become_visible_after_scrolling_a_short_sidebar() {
+    let context = egui::Context::default();
+
+    let unscrolled = render_sidebar_at_height(&context, 400.0, Vec::new());
+    assert!(
+        rendered_text_contains(&unscrolled, "Home"),
+        "the topmost destination must render without any scrolling"
+    );
+    assert!(
+        !rendered_text_contains(&unscrolled, "Settings"),
+        "a 400px-tall sidebar showing every group unscrolled would defeat this test's premise \
+         (nothing to prove by scrolling) - Settings must start out of view"
+    );
+
+    let scroll_down = vec![
+        egui::Event::PointerMoved(egui::pos2(100.0, 200.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -2000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        },
+    ];
+    // A couple of frames: one to deliver the wheel event, one to settle the
+    // resulting scroll offset before painting.
+    let _ = render_sidebar_at_height(&context, 400.0, scroll_down);
+    let scrolled = render_sidebar_at_height(&context, 400.0, Vec::new());
+    assert!(
+        rendered_text_contains(&scrolled, "Settings"),
+        "scrolling the sidebar down must reveal the last group's destination"
+    );
+    assert!(
+        rendered_text_contains(&scrolled, "Library View History"),
+        "scrolling must also reach History & Journals, not only the very last entry"
+    );
+}
+
+/// Quick Rename must survive at every scroll position it can reach - this
+/// fix must not have moved, hidden, or duplicated it while adding the
+/// scroll container.
+#[test]
+fn quick_rename_remains_reachable_in_the_scrollable_sidebar() {
+    let context = egui::Context::default();
+    let unscrolled = render_sidebar_at_height(&context, 400.0, Vec::new());
+    assert!(
+        rendered_text_contains(&unscrolled, "Quick Rename"),
+        "Quick Rename sits in the LIBRARY group, near the top - it must not have been pushed \
+         out of the initial, unscrolled view"
     );
 }

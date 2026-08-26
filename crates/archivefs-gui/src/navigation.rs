@@ -47,6 +47,7 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 18] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NavClick {
     View(MainView),
+    QuickRename,
     Overlay(ToolsOverlay),
 }
 
@@ -91,6 +92,14 @@ pub(crate) const fn nav_overlay(overlay: ToolsOverlay, label: &'static str) -> N
         click: NavClick::Overlay(overlay),
         label,
         highlightable: true,
+    }
+}
+
+pub(crate) const fn nav_quick_rename(label: &'static str) -> NavEntry {
+    NavEntry {
+        click: NavClick::QuickRename,
+        label,
+        highlightable: false,
     }
 }
 
@@ -163,6 +172,7 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
             nav_view(MainView::Library, "Library"),
             nav_view(MainView::RecentlyFound, "Recently Found"),
             nav_view(MainView::Selected, "Selected"),
+            nav_quick_rename("Quick Rename"),
             nav_view(MainView::IdentifyRename, "Identify & Rename"),
             nav_view(MainView::CanonicalOrganisation, "Library Organisation"),
         ],
@@ -264,25 +274,37 @@ pub(crate) fn show_primary_navigation(
     has_database: bool,
 ) -> Option<NavClick> {
     let mut clicked = None;
-    ui.vertical(|ui| {
-        ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
-        ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
-        ui.add_space(18.0);
-        for group in ADVANCED_NAV_GROUPS {
-            if let Some(heading) = group.heading {
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(heading)
-                        .small()
-                        .strong()
-                        .color(theme::muted(ui)),
-                );
-            }
-            for entry in group.entries {
-                let (enabled, selected) = match entry.click {
-                    NavClick::View(view) => (
-                        navigation_destination_enabled(view, has_database),
-                        entry.highlightable
+    // The sidebar's own scroll area, independent of the main content's.
+    // `ADVANCED_NAV_GROUPS` has grown past a typical laptop-height window
+    // (1536x864 and smaller): without this, `SidePanel::left` simply clips
+    // whatever does not fit, and every group below the clip line - History &
+    // Journals, Diagnostics, Settings - becomes permanently unreachable.
+    // `auto_shrink([false, false])` is what makes that clip line the panel's
+    // own height rather than the content's: a `ScrollArea` that auto-shrinks
+    // to fit its content never needs to scroll in the first place, which
+    // would silently reintroduce this exact bug.
+    egui::ScrollArea::vertical()
+        .id_salt("primary_navigation_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
+            ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
+            ui.add_space(18.0);
+            for group in ADVANCED_NAV_GROUPS {
+                if let Some(heading) = group.heading {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(heading)
+                            .small()
+                            .strong()
+                            .color(theme::muted(ui)),
+                    );
+                }
+                for entry in group.entries {
+                    let (enabled, selected) = match entry.click {
+                        NavClick::View(view) => (
+                            navigation_destination_enabled(view, has_database),
+                            entry.highlightable
                             // An open overlay renders in place of the main
                             // view's content (see the `CentralPanel` body's
                             // `if self.tools_overlay != ToolsOverlay::None`
@@ -294,18 +316,19 @@ pub(crate) fn show_primary_navigation(
                             // overlay opened.
                             && current_overlay == ToolsOverlay::None
                             && navigation_destination_selected(current, view),
-                    ),
-                    NavClick::Overlay(overlay) => {
-                        (true, entry.highlightable && current_overlay == overlay)
+                        ),
+                        NavClick::Overlay(overlay) => {
+                            (true, entry.highlightable && current_overlay == overlay)
+                        }
+                        NavClick::QuickRename => (true, false),
+                    };
+                    let button = egui::Button::selectable(selected, entry.label)
+                        .min_size(egui::vec2(ui.available_width(), 30.0));
+                    if ui.add_enabled(enabled, button).clicked() {
+                        clicked = Some(entry.click);
                     }
-                };
-                let button = egui::Button::selectable(selected, entry.label)
-                    .min_size(egui::vec2(ui.available_width(), 30.0));
-                if ui.add_enabled(enabled, button).clicked() {
-                    clicked = Some(entry.click);
                 }
             }
-        }
-    });
+        });
     clicked
 }

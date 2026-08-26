@@ -1121,6 +1121,8 @@ pub(crate) enum DatSourcesPageAction {
     AuditAllEnabled {
         scan_root: PathBuf,
     },
+    OpenDatSources,
+    OpenAdvancedIdentifyRename,
     /// Adds one explicitly typed MAME software-list source. The authoritative
     /// name is validated by core; no remote endpoint is configurable here.
     AddManagedMameSoftwareList {
@@ -2495,6 +2497,8 @@ impl DatSourcesPageState {
             DatSourcesPageAction::AuditAllEnabled { scan_root } => {
                 self.start_combined_audit(scan_root)
             }
+            DatSourcesPageAction::OpenDatSources
+            | DatSourcesPageAction::OpenAdvancedIdentifyRename => {}
             DatSourcesPageAction::AddManagedMameSoftwareList { authoritative_name } => {
                 self.add_managed_mame_software_list(authoritative_name);
             }
@@ -4996,6 +5000,7 @@ pub(crate) struct DatSourcesPageUi {
     /// Whether the normal all-enabled Identify & Rename target chooser is
     /// open. It is transient UI only and never starts a scan by itself.
     pub(crate) open_combined_audit_picker: bool,
+    pub(crate) quick_review_open: bool,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
     /// Typed MAME software-list name for the deliberately narrow managed
@@ -5032,6 +5037,7 @@ impl DatSourcesPageUi {
         self.platform_query.clear();
         self.open_audit_picker = None;
         self.open_combined_audit_picker = false;
+        self.quick_review_open = false;
         self.confirm_remove = None;
         self.managed_mame_name.clear();
         self.confirm_remove_managed = None;
@@ -5597,6 +5603,175 @@ pub(crate) fn show_identify_rename_page(
         action = Some(apply_action);
     }
 
+    if matches!(action, Some(DatSourcesPageAction::AuditAllEnabled { .. })) {
+        ui_state.open_combined_audit_picker = false;
+    }
+    action
+}
+
+/// Draws the plain-language front door onto the same Identify & Rename state.
+/// It intentionally keeps the technical plan hidden until the user asks to
+/// review it; all scanning, selection, transaction, journal and apply actions
+/// remain the existing production actions above.
+pub(crate) fn show_quick_rename_page(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    widgets::page_header_with_icon(
+        ui,
+        crate::ui::icons::CLEAN_UP,
+        "Quick Rename",
+        "Safely identify and rename games using verified catalogue evidence.",
+    );
+    widgets::banner(
+        ui,
+        "Your files are safe",
+        "Scanning is read-only. Renaming still requires review, fresh safety checks, and a recovery journal.",
+        widgets::StatusTone::Info,
+    );
+
+    if let Some(running) = &view.running
+        && let Some(job_action) = show_running_job(ui, running)
+    {
+        action = Some(job_action);
+    }
+    if let Some(error) = &view.audit_error {
+        widgets::banner(
+            ui,
+            "Scan could not run",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+
+    if view.rename_plan.is_none() && view.rename_apply.review.is_none() {
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Library").strong());
+            ui.label(
+                egui::RichText::new(
+                    "EmuWiz will use every enabled, applicable evidence catalogue automatically.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+            if widgets::action_button(
+                ui,
+                if ui_state.open_combined_audit_picker {
+                    "Cancel library choice"
+                } else {
+                    "Choose library or folder…"
+                },
+                widgets::ActionStyle::Primary,
+                !view.background_busy,
+            )
+            .clicked()
+            {
+                ui_state.open_combined_audit_picker = !ui_state.open_combined_audit_picker;
+            }
+            if ui_state.open_combined_audit_picker
+                && let Some(picker_action) = show_combined_audit_target_picker(ui, view)
+            {
+                action = Some(picker_action);
+            }
+        });
+    }
+
+    if let Some(plan) = &view.rename_plan {
+        let safe = plan.counts.suggested;
+        let canonical = plan.counts.already_canonical;
+        let unsupported = plan.counts.unsupported;
+        let unresolved = plan.counts.ambiguous + plan.counts.conflicts + plan.counts.blocked;
+        // Metadata and other non-game files (for example RomM's
+        // gamelist.xml, artwork and manuals) remain in Details but are not
+        // presented as game candidates in this normal-user summary.
+        let candidate_count = plan.rows.len().saturating_sub(
+            plan.counts.excluded_by_content_policy + plan.counts.unclassified_content,
+        );
+        ui.add_space(10.0);
+        widgets::card(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{candidate_count} game archive(s) found")).strong(),
+            );
+            ui.label(format!("{safe} safe renames"));
+            ui.label(format!("{canonical} already correct"));
+            ui.label(format!("{unsupported} verified but unsupported"));
+            ui.label(format!("{unresolved} files left unchanged"));
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let approved = plan
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.state == ProposalState::Suggested
+                            && row.decision == Some(ReviewDecision::AcceptedForReview)
+                    })
+                    .count();
+                if widgets::action_button(
+                    ui,
+                    "Review changes",
+                    widgets::ActionStyle::Secondary,
+                    safe > 0,
+                )
+                .clicked()
+                {
+                    ui_state.quick_review_open = true;
+                }
+                if widgets::action_button(
+                    ui,
+                    if approved > 0 {
+                        format!("Rename {approved} verified files")
+                    } else {
+                        format!("Select {safe} verified files")
+                    },
+                    widgets::ActionStyle::Primary,
+                    safe > 0,
+                )
+                .clicked()
+                {
+                    action = Some(if approved > 0 {
+                        DatSourcesPageAction::BeginApplyReview
+                    } else {
+                        DatSourcesPageAction::SelectAllActionable
+                    });
+                }
+                if unresolved > 0 {
+                    if ui.button("Get missing evidence").clicked() {
+                        action = Some(DatSourcesPageAction::OpenDatSources);
+                    }
+                    if ui.button("See unresolved files").clicked() {
+                        ui_state.quick_review_open = true;
+                    }
+                }
+            });
+            if unresolved > 0 {
+                ui.label(
+                    egui::RichText::new("Some files need more evidence or are not safe to rename.")
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+        });
+        if ui_state.quick_review_open {
+            if ui.button("← Back to Quick Rename summary").clicked() {
+                ui_state.quick_review_open = false;
+            }
+            if action.is_none()
+                && let Some(plan_action) = show_rename_plan_section(ui, plan, ui_state)
+            {
+                action = Some(plan_action);
+            }
+        }
+    }
+    if action.is_none()
+        && let Some(apply_action) = show_rename_apply_section(ui, &view.rename_apply, ui_state)
+    {
+        action = Some(apply_action);
+    }
+    if action.is_none() && ui.button("Open advanced Identify & Rename").clicked() {
+        action = Some(DatSourcesPageAction::OpenAdvancedIdentifyRename);
+    }
     if matches!(action, Some(DatSourcesPageAction::AuditAllEnabled { .. })) {
         ui_state.open_combined_audit_picker = false;
     }

@@ -2233,6 +2233,7 @@ fn primary_nav_rects(
                                 navigation_destination_selected(current, view),
                             ),
                             NavClick::Overlay(overlay) => (true, current_overlay == overlay),
+                            NavClick::QuickRename => (true, false),
                         };
                         let button = egui::Button::selectable(selected, entry.label)
                             .min_size(egui::vec2(ui.available_width(), 30.0));
