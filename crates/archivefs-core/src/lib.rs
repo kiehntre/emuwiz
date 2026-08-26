@@ -109,6 +109,11 @@ pub mod ingestion;
 /// Stage 1A: core model, parsers, indexes, and audit - no persistence or GUI.
 pub mod dat;
 
+/// Read-only "Build Playing Library" 1G1R planner over authoritatively
+/// grouped DAT families. See the module documentation for the identity
+/// rule, election contract, and apply seam.
+pub mod playing_library;
+
 pub mod disk_format;
 
 /// Pure content/container/media evidence, deliberately separate from
