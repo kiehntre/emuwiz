@@ -1232,6 +1232,12 @@ pub(crate) enum DatSourcesPageAction {
     /// Build the transaction for the approved, applicable proposals and show
     /// the read-only review. No mutation.
     BeginApplyReview,
+    /// Quick Rename's one-click "prepare to rename": [`Self::SelectAllActionable`]
+    /// immediately followed by [`Self::BeginApplyReview`]. Exists so the
+    /// simple workflow never makes a user click Select, wait for a
+    /// re-render, then click Rename - it is exactly those two existing
+    /// steps, not a new one.
+    QuickRenamePrepareApply,
     /// Confirm the review and run the apply in AbortAll mode. `typed` is the
     /// user's typed confirmation phrase, validated before any mutation.
     ConfirmApply {
@@ -2675,19 +2681,20 @@ impl DatSourcesPageState {
             DatSourcesPageAction::ClearReviewDecisions => {
                 self.review_decisions.clear();
             }
-            DatSourcesPageAction::SelectAllActionable => {
-                if let Some(plan) = self.rename_plan.as_ref() {
-                    for proposal in &plan.proposals {
-                        if proposal.state.is_actionable() {
-                            self.review_decisions.insert(
-                                proposal.source_path.to_string_lossy().into_owned(),
-                                ReviewDecision::AcceptedForReview,
-                            );
-                        }
-                    }
-                }
-            }
+            DatSourcesPageAction::SelectAllActionable => self.select_all_actionable(),
             DatSourcesPageAction::BeginApplyReview => self.begin_apply_review(),
+            DatSourcesPageAction::QuickRenamePrepareApply => {
+                // Quick Rename's single "prepare to rename" step: the whole
+                // point of the button is "make every currently safe file
+                // ready to rename," so it always selects every actionable
+                // proposal fresh (never a partial manual selection left over
+                // from Review changes) before building the same apply
+                // review the advanced planner uses. No new engine: this is
+                // exactly `SelectAllActionable` followed by
+                // `BeginApplyReview`, just as one click instead of two.
+                self.select_all_actionable();
+                self.begin_apply_review();
+            }
             DatSourcesPageAction::ConfirmApply { typed } => {
                 self.confirm_apply(HardConflictMode::AbortAll, typed)
             }
@@ -2708,6 +2715,22 @@ impl DatSourcesPageState {
                 self.rollback_result = None;
                 self.apply_error = None;
                 self.rollback_error = None;
+            }
+        }
+    }
+
+    /// Marks every currently actionable (`Suggested`) proposal as accepted
+    /// for review. Session-only, like every other review decision; never
+    /// touches a file.
+    fn select_all_actionable(&mut self) {
+        if let Some(plan) = self.rename_plan.as_ref() {
+            for proposal in &plan.proposals {
+                if proposal.state.is_actionable() {
+                    self.review_decisions.insert(
+                        proposal.source_path.to_string_lossy().into_owned(),
+                        ReviewDecision::AcceptedForReview,
+                    );
+                }
             }
         }
     }
@@ -5001,6 +5024,10 @@ pub(crate) struct DatSourcesPageUi {
     /// open. It is transient UI only and never starts a scan by itself.
     pub(crate) open_combined_audit_picker: bool,
     pub(crate) quick_review_open: bool,
+    /// Whether Quick Rename's success summary is showing the itemized
+    /// per-file "View details" disclosure. Reset whenever a new apply
+    /// outcome replaces the one it was open for.
+    pub(crate) quick_success_details_open: bool,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
     /// Typed MAME software-list name for the deliberately narrow managed
@@ -5038,6 +5065,7 @@ impl DatSourcesPageUi {
         self.open_audit_picker = None;
         self.open_combined_audit_picker = false;
         self.quick_review_open = false;
+        self.quick_success_details_open = false;
         self.confirm_remove = None;
         self.managed_mame_name.clear();
         self.confirm_remove_managed = None;
@@ -5646,7 +5674,58 @@ pub(crate) fn show_quick_rename_page(
         );
     }
 
-    if view.rename_plan.is_none() && view.rename_apply.review.is_none() {
+    // Recovery transactions, split so the simple workflow only ever shows
+    // history directly when it is not really history: an unresolved
+    // (non-`Applied`) transaction genuinely blocks safely trusting this
+    // folder's current state, so it stays in view. A settled, already-
+    // applied transaction is optional rollback history - collapsed behind
+    // "View recovery/history" rather than shown inline, where it previously
+    // crowded out the actual Quick Rename workflow.
+    if action.is_none() && !view.rename_apply.recovery.is_empty() {
+        let (blocking, settled): (Vec<_>, Vec<_>) = view
+            .rename_apply
+            .recovery
+            .iter()
+            .cloned()
+            .partition(|recovery| recovery.state != TransactionState::Applied);
+        if !blocking.is_empty() {
+            ui.add_space(10.0);
+            widgets::section_header(
+                ui,
+                "Unresolved rename transaction",
+                Some(
+                    "This must be resolved before Quick Rename can safely continue in this folder.",
+                ),
+            );
+            if let Some(recovery_action) =
+                show_recovery_transactions(ui, &blocking, view.rename_apply.rollback_running)
+            {
+                action = Some(recovery_action);
+            }
+        }
+        if action.is_none() && !settled.is_empty() {
+            ui.add_space(10.0);
+            egui::CollapsingHeader::new(format!("View recovery/history ({})", settled.len()))
+                .id_salt("quick_rename_history")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Some(recovery_action) =
+                        show_recovery_transactions(ui, &settled, view.rename_apply.rollback_running)
+                    {
+                        action = Some(recovery_action);
+                    }
+                });
+        }
+    }
+
+    let showing_confirmation_or_success =
+        view.rename_apply.review.is_some() || view.rename_apply.outcome.is_some();
+
+    if action.is_none()
+        && !showing_confirmation_or_success
+        && view.rename_plan.is_none()
+        && view.rename_apply.review.is_none()
+    {
         widgets::card(ui, |ui| {
             ui.label(egui::RichText::new("Library").strong());
             ui.label(
@@ -5682,77 +5761,83 @@ pub(crate) fn show_quick_rename_page(
         let safe = plan.counts.suggested;
         let canonical = plan.counts.already_canonical;
         let unsupported = plan.counts.unsupported;
-        let unresolved = plan.counts.ambiguous + plan.counts.conflicts + plan.counts.blocked;
+        let ambiguous = plan.counts.ambiguous;
+        let conflicts = plan.counts.conflicts;
+        let unresolved = ambiguous + conflicts + plan.counts.blocked;
         // Metadata and other non-game files (for example RomM's
         // gamelist.xml, artwork and manuals) remain in Details but are not
         // presented as game candidates in this normal-user summary.
         let candidate_count = plan.rows.len().saturating_sub(
             plan.counts.excluded_by_content_policy + plan.counts.unclassified_content,
         );
-        ui.add_space(10.0);
-        widgets::card(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{candidate_count} game archive(s) found")).strong(),
-            );
-            ui.label(format!("{safe} safe renames"));
-            ui.label(format!("{canonical} already correct"));
-            ui.label(format!("{unsupported} verified but unsupported"));
-            ui.label(format!("{unresolved} files left unchanged"));
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                let approved = plan
-                    .rows
-                    .iter()
-                    .filter(|row| {
-                        row.state == ProposalState::Suggested
-                            && row.decision == Some(ReviewDecision::AcceptedForReview)
-                    })
-                    .count();
-                if widgets::action_button(
-                    ui,
-                    "Review changes",
-                    widgets::ActionStyle::Secondary,
-                    safe > 0,
-                )
-                .clicked()
-                {
-                    ui_state.quick_review_open = true;
-                }
-                if widgets::action_button(
-                    ui,
-                    if approved > 0 {
-                        format!("Rename {approved} verified files")
-                    } else {
-                        format!("Select {safe} verified files")
-                    },
-                    widgets::ActionStyle::Primary,
-                    safe > 0,
-                )
-                .clicked()
-                {
-                    action = Some(if approved > 0 {
-                        DatSourcesPageAction::BeginApplyReview
-                    } else {
-                        DatSourcesPageAction::SelectAllActionable
-                    });
-                }
-                if unresolved > 0 {
-                    if ui.button("Get missing evidence").clicked() {
-                        action = Some(DatSourcesPageAction::OpenDatSources);
-                    }
-                    if ui.button("See unresolved files").clicked() {
+
+        // The summary card and its buttons are the starting point of the
+        // simple workflow; once a confirmation or a result is on screen,
+        // Quick Rename shows exactly one thing at a time so the user is
+        // never looking at two conflicting next steps.
+        if action.is_none() && !showing_confirmation_or_success {
+            ui.add_space(10.0);
+            widgets::card(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{candidate_count} game archive(s) found"))
+                        .strong(),
+                );
+                ui.label(format!("{safe} safe renames"));
+                ui.label(format!("{canonical} already correct"));
+                ui.label(format!("{unsupported} verified but unsupported"));
+                ui.label(format!("{unresolved} files left unchanged"));
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Review changes",
+                        widgets::ActionStyle::Secondary,
+                        safe > 0,
+                    )
+                    .clicked()
+                    {
                         ui_state.quick_review_open = true;
                     }
-                }
-            });
-            if unresolved > 0 {
-                ui.label(
-                    egui::RichText::new("Some files need more evidence or are not safe to rename.")
+                    if widgets::action_button(
+                        ui,
+                        format!("Rename {safe} verified files"),
+                        widgets::ActionStyle::Primary,
+                        safe > 0,
+                    )
+                    .clicked()
+                    {
+                        // One click does everything: select every currently
+                        // safe/actionable proposal, then build the exact
+                        // same production transaction the advanced planner
+                        // builds. See `DatSourcesPageAction::QuickRenamePrepareApply`.
+                        ui_state.quick_success_details_open = false;
+                        action = Some(DatSourcesPageAction::QuickRenamePrepareApply);
+                    }
+                    if unresolved > 0 {
+                        if ui.button("Get missing evidence").clicked() {
+                            action = Some(DatSourcesPageAction::OpenDatSources);
+                        }
+                        if ui.button("See unresolved files").clicked() {
+                            ui_state.quick_review_open = true;
+                        }
+                    }
+                });
+                if unresolved > 0 {
+                    ui.label(
+                        egui::RichText::new(
+                            "Some files need more evidence or are not safe to rename.",
+                        )
                         .color(theme::muted(ui))
                         .small(),
-                );
-            }
-        });
+                    );
+                }
+            });
+        }
+
+        // "Review changes" is the deliberately separate advanced route: it
+        // is the full Identify & Rename planner (filters, per-row Accept/
+        // Ignore/Needs review, "Planning only" terminology and all), never
+        // required for the simple path above.
         if ui_state.quick_review_open {
             if ui.button("← Back to Quick Rename summary").clicked() {
                 ui_state.quick_review_open = false;
@@ -5762,14 +5847,74 @@ pub(crate) fn show_quick_rename_page(
             {
                 action = Some(plan_action);
             }
+            if action.is_none()
+                && let Some(apply_action) =
+                    show_rename_apply_review_and_outcome(ui, &view.rename_apply, ui_state)
+            {
+                action = Some(apply_action);
+            }
+        } else {
+            // The simple path's own confirmation and success cards - no
+            // planner terminology, no row-by-row selection, no trusted-root
+            // or transaction-ID detail.
+            if action.is_none()
+                && let Some(review) = &view.rename_apply.review
+            {
+                if let Some(confirm_action) = show_quick_rename_confirmation(
+                    ui,
+                    review,
+                    unsupported,
+                    ambiguous,
+                    conflicts,
+                    &view.rename_apply,
+                    ui_state,
+                ) {
+                    action = Some(confirm_action);
+                }
+            }
+            if action.is_none()
+                && let Some(outcome) = &view.rename_apply.outcome
+                && let Some(success_action) = show_quick_rename_success(ui, outcome, ui_state)
+            {
+                action = Some(success_action);
+            }
+        }
+    }
+    // Rollback feedback is rendered at the page level, not nested under
+    // `rename_plan` - a user can roll back a settled transaction straight
+    // from the recovery/history section above without ever having loaded a
+    // plan (or scanned) in this session, and the result must still be
+    // visible. Suppressed only in the exact case where
+    // `show_rename_apply_review_and_outcome` already rendered this same
+    // data above (the advanced `Review changes` route, which is only ever
+    // reachable once a plan exists) - never suppressed merely because
+    // `quick_review_open` happens to be `true` while no plan is loaded,
+    // since that combination shows nothing in the advanced branch either.
+    if action.is_none() && !(ui_state.quick_review_open && view.rename_plan.is_some()) {
+        if let Some(result) = &view.rename_apply.rollback_result {
+            widgets::banner(
+                ui,
+                result.label,
+                &result.detail,
+                match result.label {
+                    "Fully rolled back" => widgets::StatusTone::Success,
+                    _ => widgets::StatusTone::Warning,
+                },
+            );
+        }
+        if let Some(error) = &view.rename_apply.rollback_error {
+            widgets::banner(
+                ui,
+                "Rollback could not run",
+                error,
+                widgets::StatusTone::Blocked,
+            );
         }
     }
     if action.is_none()
-        && let Some(apply_action) = show_rename_apply_section(ui, &view.rename_apply, ui_state)
+        && !ui_state.quick_review_open
+        && ui.button("Open advanced Identify & Rename").clicked()
     {
-        action = Some(apply_action);
-    }
-    if action.is_none() && ui.button("Open advanced Identify & Rename").clicked() {
         action = Some(DatSourcesPageAction::OpenAdvancedIdentifyRename);
     }
     if matches!(action, Some(DatSourcesPageAction::AuditAllEnabled { .. })) {
@@ -8022,12 +8167,109 @@ fn plan_state_tone(state: ProposalState) -> widgets::StatusTone {
     }
 }
 
+/// Renders one card per recovery/crash-recovery transaction. Shared by the
+/// advanced planner (every transaction, always shown directly) and Quick
+/// Rename (split into a directly-shown "blocking" subset and a collapsed
+/// "settled" subset - see `show_quick_rename_page`).
+fn show_recovery_transactions(
+    ui: &mut egui::Ui,
+    recoveries: &[RecoveryTransactionView],
+    rollback_running: bool,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    widgets::card(ui, |ui| {
+        for recovery in recoveries {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&recovery.human_summary).strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "({})",
+                        recovery_human_state_label(recovery.state)
+                    ))
+                    .color(theme::muted(ui)),
+                );
+            });
+            // The raw transaction ID and exact applied/total counts are
+            // developer-facing detail, not meaningful to a normal user
+            // deciding whether to roll back - moved behind Technical
+            // details, same as History & Logs already does for its own
+            // transaction IDs. `transaction_id` is unique per real
+            // transaction, so it alone is a safe, stable per-row salt.
+            widgets::technical_details(
+                ui,
+                ("rename_recovery_technical_detail", &recovery.transaction_id),
+                |ui| {
+                    widgets::copyable_value(ui, "Transaction ID", &recovery.transaction_id);
+                    ui.label(format!(
+                        "State: {} ({} applied of {})",
+                        recovery.state.label(),
+                        recovery.applied_count,
+                        recovery.total_count
+                    ));
+                },
+            );
+            let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
+                (
+                    "A completed rename transaction is still applied and can be rolled \
+                         back.",
+                    "Roll back transaction",
+                )
+            } else {
+                (
+                    "An interrupted rename transaction was found. EmuWiz will never \
+                         resume it automatically.",
+                    "Roll back completed steps",
+                )
+            };
+            ui.label(
+                egui::RichText::new(explanation)
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    rollback_label,
+                    widgets::ActionStyle::Destructive,
+                    !rollback_running,
+                )
+                .clicked()
+                {
+                    action = Some(DatSourcesPageAction::RecoveryChoice {
+                        id: recovery.transaction_id.clone(),
+                        choice: RecoveryChoice::RollBack,
+                    });
+                }
+                if widgets::action_button(
+                    ui,
+                    "Leave untouched",
+                    widgets::ActionStyle::Quiet,
+                    !rollback_running,
+                )
+                .clicked()
+                {
+                    action = Some(DatSourcesPageAction::RecoveryChoice {
+                        id: recovery.transaction_id.clone(),
+                        choice: RecoveryChoice::LeaveUntouched,
+                    });
+                }
+            });
+            ui.add_space(6.0);
+        }
+    });
+    action
+}
+
 /// The gated apply and crash-recovery section.
 ///
-/// This is the only place the page offers a rename: an explicitly approved,
-/// actionable batch is built by the core, shown read-only, confirmed (with a
-/// typed phrase for large batches), and executed by the core executor on a
-/// worker thread. The GUI never calls `std::fs::rename`.
+/// This is the only place the advanced planner offers a rename: an
+/// explicitly approved, actionable batch is built by the core, shown
+/// read-only, confirmed (with a typed phrase for large batches), and
+/// executed by the core executor on a worker thread. The GUI never calls
+/// `std::fs::rename`. Quick Rename's own simple confirmation/success cards
+/// (`show_quick_rename_confirmation`, `show_quick_rename_success`) render
+/// the exact same [`RenameApplyView`] data through friendlier UI instead of
+/// calling this - see `show_quick_rename_page`.
 fn show_rename_apply_section(
     ui: &mut egui::Ui,
     apply: &RenameApplyView,
@@ -8041,88 +8283,33 @@ fn show_rename_apply_section(
     if !apply.recovery.is_empty() {
         ui.add_space(10.0);
         widgets::section_header(ui, "Rename transactions", None);
-        widgets::card(ui, |ui| {
-            for recovery in &apply.recovery {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&recovery.human_summary).strong());
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "({})",
-                            recovery_human_state_label(recovery.state)
-                        ))
-                        .color(theme::muted(ui)),
-                    );
-                });
-                // The raw transaction ID and exact applied/total counts are
-                // developer-facing detail, not meaningful to a normal user
-                // deciding whether to roll back - moved behind Technical
-                // details, same as History & Logs already does for its own
-                // transaction IDs. `transaction_id` is unique per real
-                // transaction, so it alone is a safe, stable per-row salt.
-                widgets::technical_details(
-                    ui,
-                    ("rename_recovery_technical_detail", &recovery.transaction_id),
-                    |ui| {
-                        widgets::copyable_value(ui, "Transaction ID", &recovery.transaction_id);
-                        ui.label(format!(
-                            "State: {} ({} applied of {})",
-                            recovery.state.label(),
-                            recovery.applied_count,
-                            recovery.total_count
-                        ));
-                    },
-                );
-                let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
-                    (
-                        "A completed rename transaction is still applied and can be rolled \
-                             back.",
-                        "Roll back transaction",
-                    )
-                } else {
-                    (
-                        "An interrupted rename transaction was found. EmuWiz will never \
-                             resume it automatically.",
-                        "Roll back completed steps",
-                    )
-                };
-                ui.label(
-                    egui::RichText::new(explanation)
-                        .color(theme::muted(ui))
-                        .small(),
-                );
-                ui.horizontal(|ui| {
-                    if widgets::action_button(
-                        ui,
-                        rollback_label,
-                        widgets::ActionStyle::Destructive,
-                        !apply.rollback_running,
-                    )
-                    .clicked()
-                    {
-                        action = Some(DatSourcesPageAction::RecoveryChoice {
-                            id: recovery.transaction_id.clone(),
-                            choice: RecoveryChoice::RollBack,
-                        });
-                    }
-                    if widgets::action_button(
-                        ui,
-                        "Leave untouched",
-                        widgets::ActionStyle::Quiet,
-                        !apply.rollback_running,
-                    )
-                    .clicked()
-                    {
-                        action = Some(DatSourcesPageAction::RecoveryChoice {
-                            id: recovery.transaction_id.clone(),
-                            choice: RecoveryChoice::LeaveUntouched,
-                        });
-                    }
-                });
-                ui.add_space(6.0);
-            }
-        });
+        if let Some(recovery_action) =
+            show_recovery_transactions(ui, &apply.recovery, apply.rollback_running)
+        {
+            action = Some(recovery_action);
+        }
     }
 
+    if action.is_none()
+        && let Some(review_action) = show_rename_apply_review_and_outcome(ui, apply, ui_state)
+    {
+        action = Some(review_action);
+    }
+    action
+}
+
+/// The review/confirm/outcome/rollback body of the apply section, without
+/// the recovery-transaction cards above it - split out so Quick Rename's
+/// simple path can show its own recovery split (see `show_quick_rename_page`)
+/// while still reaching this exact technical rendering for its "Review
+/// changes" (advanced) route, unchanged from what the advanced planner has
+/// always shown.
+fn show_rename_apply_review_and_outcome(
+    ui: &mut egui::Ui,
+    apply: &RenameApplyView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
     if let Some(review) = &apply.review {
         ui.add_space(10.0);
         widgets::section_header(
@@ -8308,6 +8495,233 @@ fn apply_row_tone(state: EntryState) -> widgets::StatusTone {
         EntryState::ApplyFailed | EntryState::RollbackFailed => widgets::StatusTone::Blocked,
         _ => widgets::StatusTone::Info,
     }
+}
+
+/// Whether a skip/failure reason names a collision specifically (the
+/// destination already existing, a case-only collision, or two proposals
+/// landing on the same target) rather than some other preflight refusal
+/// (source vanished, became a symlink, moved outside the trusted root, …).
+/// Display-only bucketing for Quick Rename's success summary - it reads an
+/// already-decided [`PreflightFailure::reason`] string, never re-derives or
+/// weakens the refusal itself.
+fn is_collision_reason(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    // Matches exactly the three `PreflightFailure` reasons that name a real
+    // destination collision - `DestinationExists` ("now exists"),
+    // `DestinationCaseCollision` ("only by case"), and `ConflictingBatchTarget`
+    // ("target the same destination", its literal wording). Deliberately
+    // narrow: every other preflight refusal (source vanished, became a
+    // symlink, left the trusted root, a stale generation, …) must keep
+    // counting as an ordinary skip, not a collision.
+    lower.contains("now exists")
+        || lower.contains("only by case")
+        || lower.contains("target the same destination")
+}
+
+/// Quick Rename's compact confirmation card - the "simple confirmation"
+/// step for its normal path. Renders exactly the [`ApplyReviewView`] the
+/// advanced planner's `show_rename_apply_review_and_outcome` also shows
+/// (same `build_transaction`, same typed-phrase safety gate for large
+/// batches via `required_phrase`, same safe-subset offer after a hard
+/// conflict), just without planner terminology, a trusted-root path, or a
+/// full old->new file listing. Confirming issues the exact same
+/// [`DatSourcesPageAction::ConfirmApply`] / `ConfirmApplySafeSubset` the
+/// advanced path uses; nothing here calls `std::fs::rename`.
+fn show_quick_rename_confirmation(
+    ui: &mut egui::Ui,
+    review: &ApplyReviewView,
+    unsupported: usize,
+    ambiguous: usize,
+    conflicts: usize,
+    apply: &RenameApplyView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    let count = review.rows.len();
+    ui.add_space(10.0);
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "Ready to rename {count} verified file{}.",
+                if count == 1 { "" } else { "s" }
+            ))
+            .strong(),
+        );
+        ui.add_space(4.0);
+        if unsupported > 0 {
+            ui.label(format!(
+                "{unsupported} unsupported file{} will remain unchanged.",
+                if unsupported == 1 { "" } else { "s" }
+            ));
+        }
+        ui.label(format!("{ambiguous} ambiguous."));
+        ui.label(format!(
+            "{conflicts} conflict{}.",
+            if conflicts == 1 { "" } else { "s" }
+        ));
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("A recovery journal will be created.")
+                .color(theme::muted(ui))
+                .small(),
+        );
+        ui.add_space(8.0);
+        if let Some(phrase) = &review.required_phrase {
+            ui.label(egui::RichText::new(format!("Type {phrase} to confirm:")).small());
+            ui.add(
+                egui::TextEdit::singleline(&mut ui_state.plan_typed_confirmation)
+                    .hint_text(phrase)
+                    .id_salt("quick-rename-typed-confirmation"),
+            );
+            ui.add_space(4.0);
+        }
+        if apply.apply_running {
+            ui.label(egui::RichText::new("Renaming…").color(theme::muted(ui)));
+        } else {
+            let typed = ui_state.plan_typed_confirmation.clone();
+            let can_confirm = match &review.required_phrase {
+                Some(phrase) => typed.trim() == *phrase,
+                None => true,
+            };
+            ui.horizontal(|ui| {
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
+                    action = Some(DatSourcesPageAction::CancelApplyReview);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Rename files",
+                    widgets::ActionStyle::Destructive,
+                    can_confirm,
+                )
+                .clicked()
+                {
+                    action = Some(DatSourcesPageAction::ConfirmApply {
+                        typed: typed.clone(),
+                    });
+                }
+                if apply.subset_available
+                    && widgets::action_button(
+                        ui,
+                        "Rename the safe subset only",
+                        widgets::ActionStyle::Secondary,
+                        can_confirm,
+                    )
+                    .clicked()
+                {
+                    action = Some(DatSourcesPageAction::ConfirmApplySafeSubset { typed });
+                }
+            });
+        }
+    });
+    if let Some(error) = &apply.apply_error {
+        ui.add_space(8.0);
+        widgets::banner(
+            ui,
+            "Rename did not run",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    action
+}
+
+/// Quick Rename's compact success card - shown once its own (non-advanced)
+/// confirmation has been applied. Reads the same [`ApplyOutcomeView`] the
+/// advanced planner's technical "Rename transaction" card shows; the
+/// itemized per-file rows and rollback control are unchanged, just tucked
+/// behind "View details" instead of always on screen.
+fn show_quick_rename_success(
+    ui: &mut egui::Ui,
+    outcome: &ApplyOutcomeView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    let collisions = outcome
+        .rows
+        .iter()
+        .filter(|row| {
+            row.state == EntryState::Skipped
+                && row
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(is_collision_reason)
+        })
+        .count();
+    ui.add_space(10.0);
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Quick Rename complete")
+                .strong()
+                .size(18.0),
+        );
+        ui.add_space(6.0);
+        ui.label(format!(
+            "{} file{} renamed",
+            outcome.applied,
+            if outcome.applied == 1 { "" } else { "s" }
+        ));
+        ui.label(format!("{} left unchanged", outcome.skipped));
+        ui.label(format!("{} failed", outcome.failed));
+        ui.label(format!(
+            "{collisions} collision{}",
+            if collisions == 1 { "" } else { "s" }
+        ));
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Recovery journal saved.")
+                .color(theme::muted(ui))
+                .small(),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if widgets::action_button(ui, "Done", widgets::ActionStyle::Primary, true).clicked() {
+                action = Some(DatSourcesPageAction::ClearApplyOutcome);
+            }
+            let label = if ui_state.quick_success_details_open {
+                "Hide details"
+            } else {
+                "View details"
+            };
+            if widgets::action_button(ui, label, widgets::ActionStyle::Secondary, true).clicked() {
+                ui_state.quick_success_details_open = !ui_state.quick_success_details_open;
+            }
+        });
+        if ui_state.quick_success_details_open {
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .id_salt("quick-rename-outcome-rows")
+                .show(ui, |ui| {
+                    for row in &outcome.rows {
+                        ui.horizontal(|ui| {
+                            widgets::status_badge(ui, row.state.label(), apply_row_tone(row.state));
+                            ui.label(egui::RichText::new(&row.current_basename).monospace());
+                            ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                            ui.label(egui::RichText::new(&row.proposed_basename).monospace());
+                        });
+                        if let Some(reason) = &row.failure_reason {
+                            ui.label(egui::RichText::new(reason).color(theme::WARNING).small());
+                        }
+                    }
+                });
+            ui.add_space(6.0);
+            if outcome.applied > 0
+                && widgets::action_button(
+                    ui,
+                    "Roll back these renames",
+                    widgets::ActionStyle::Destructive,
+                    true,
+                )
+                .clicked()
+            {
+                action = Some(DatSourcesPageAction::RollbackTransaction {
+                    id: outcome.transaction_id.clone(),
+                });
+            }
+        }
+    });
+    action
 }
 
 /// The read-only rename-planning section.
