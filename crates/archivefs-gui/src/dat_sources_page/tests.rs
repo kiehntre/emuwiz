@@ -4464,6 +4464,7 @@ fn fixture_recovery_transaction(
         applied_count: 1,
         total_count: 1,
         human_summary: human_summary.to_string(),
+        source_scan_root: String::new(),
     }
 }
 
@@ -4512,6 +4513,7 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
     };
     let plan = RenamePlanView {
         generation: 1,
+        scan_root: "/roms".to_string(),
         scan_root_short: "roms".to_string(),
         platform_display: None,
         source_display_name: "Source".to_string(),
@@ -6240,8 +6242,9 @@ fn quick_rename_apply_uses_the_production_transaction_path_and_creates_a_journal
 /// this folder's state and must stay directly visible.
 #[test]
 fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
-    let (_fixture, _roms, mut page) = page_with_apply_plan(1);
+    let (_fixture, roms, mut page) = page_with_apply_plan(1);
     let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
+    let roms_str = roms.to_string_lossy().into_owned();
 
     let settled = archivefs_core::dat::rename_apply::RenameTransaction {
         transaction_id: "settled-old-one".to_string(),
@@ -6287,12 +6290,12 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
             archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
         ),
         created_at_unix: 2,
-        source_scan_root: "/tmp/roms".to_string(),
+        source_scan_root: roms_str.clone(),
         state: archivefs_core::dat::rename_apply::TransactionState::Applying,
         entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
             operation: Default::default(),
-            source_path: PathBuf::from("/tmp/roms/mid-a.bin"),
-            destination_path: PathBuf::from("/tmp/roms/mid-alpha.bin"),
+            source_path: roms.join("mid-a.bin"),
+            destination_path: roms.join("mid-alpha.bin"),
             original_basename: "mid-a.bin".to_string(),
             proposed_basename: "mid-alpha.bin".to_string(),
             identity: archivefs_core::dat::rename_apply::ObjectIdentity {
@@ -6541,4 +6544,397 @@ fn quick_rename_success_summary_counts_a_conflicting_batch_target_as_a_collision
         });
     });
     assert!(rendered_text_contains(&output, "1 collision"));
+}
+
+// ---------------------------------------------------------------------------
+// Quick Rename: restart action, current-library recovery filtering, and
+// durable "Leave untouched" resolution
+// ---------------------------------------------------------------------------
+
+/// Requested tests: "successful Quick Rename exposes Rename another
+/// library" and "successful BBC-style batch returns to simple completion
+/// state, not planner".
+#[test]
+fn quick_rename_success_exposes_rename_another_library_not_the_planner() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(2);
+    page.apply(DatSourcesPageAction::QuickRenamePrepareApply);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_quick_rename(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Quick Rename complete"));
+    assert!(rendered_text_contains(&output, "Rename another library"));
+    assert!(
+        !rendered_text_contains(&output, "Planning only"),
+        "a completed batch must never fall back into the advanced planner"
+    );
+}
+
+/// Requested tests: "starting another Quick Rename clears only current
+/// session state", "DAT source configuration survives reset", and
+/// "transaction history survives reset". One end-to-end scenario: a real
+/// DAT source is registered, a batch is applied, an unrelated settled
+/// journal already exists on disk, then the user resets for another
+/// library.
+#[test]
+fn quick_rename_reset_clears_only_session_state_and_preserves_config_and_history() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(2);
+    let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
+
+    // A real DAT source, registered the normal way.
+    let dat_path = roms.join("collection.dat");
+    std::fs::write(&dat_path, LOGIQX).unwrap();
+    page.apply(DatSourcesPageAction::AddFile {
+        path: dat_path.clone(),
+    });
+    let dat_sources_before = page.view().rows.len();
+    assert_eq!(
+        dat_sources_before, 1,
+        "sanity check: the DAT source was registered"
+    );
+
+    // An unrelated, already-settled transaction from some earlier session -
+    // durable history that must survive a Quick Rename reset untouched.
+    let unrelated_settled = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "unrelated-settled".to_string(),
+        plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
+        created_at_unix: 1,
+        source_scan_root: "/some/other/library".to_string(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applied,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
+            source_path: PathBuf::from("/some/other/library/a.bin"),
+            destination_path: PathBuf::from("/some/other/library/alpha.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "alpha.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Applied,
+            failure_reason: None,
+            applied_at_unix: Some(1),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &unrelated_settled).unwrap();
+
+    // Run a real, successful apply for this session.
+    page.apply(DatSourcesPageAction::QuickRenamePrepareApply);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+    assert!(page.view().rename_apply.outcome.is_some());
+    let before_reset = snapshot(&roms);
+    let journal_files_before: usize = std::fs::read_dir(&journal_dir).unwrap().count();
+
+    page.apply(DatSourcesPageAction::ResetQuickRenameSession);
+
+    let view = page.view();
+    assert!(view.rename_plan.is_none(), "the plan must be cleared");
+    assert!(view.audit.is_none(), "the audit result must be cleared");
+    assert!(
+        view.rename_apply.review.is_none(),
+        "any pending review must be cleared"
+    );
+    assert!(
+        view.rename_apply.outcome.is_none(),
+        "the completed outcome must be cleared"
+    );
+
+    // Nothing on disk changed as a result of the reset itself.
+    assert_eq!(
+        snapshot(&roms),
+        before_reset,
+        "reset must not touch any file"
+    );
+    let journal_files_after: usize = std::fs::read_dir(&journal_dir).unwrap().count();
+    assert_eq!(
+        journal_files_after, journal_files_before,
+        "reset must not delete or add any journal file"
+    );
+
+    // DAT source configuration survives.
+    assert_eq!(
+        view.rows.len(),
+        dat_sources_before,
+        "DAT source configuration must survive a Quick Rename reset"
+    );
+
+    // Transaction history survives: both this session's own just-applied
+    // transaction and the pre-existing unrelated one are still visible as
+    // recovery/rollback history.
+    let ids: Vec<&str> = view
+        .rename_apply
+        .recovery
+        .iter()
+        .map(|recovery| recovery.transaction_id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"unrelated-settled"),
+        "the pre-existing unrelated settled transaction must still be visible: {ids:?}"
+    );
+}
+
+/// Requested tests: "old unrelated unresolved transaction does not
+/// dominate/block current library when path/root relationship can be
+/// proven" and "unresolved transaction for current library still surfaces
+/// prominently" - in one scenario, so the split is proven relative to each
+/// other, not just in isolation.
+#[test]
+fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(1);
+    let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
+
+    fn interrupted_transaction(
+        id: &str,
+        scan_root: &str,
+    ) -> archivefs_core::dat::rename_apply::RenameTransaction {
+        archivefs_core::dat::rename_apply::RenameTransaction {
+            transaction_id: id.to_string(),
+            plan_generation: 1,
+            classifier_version: Some(
+                archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+            ),
+            created_at_unix: 1,
+            source_scan_root: scan_root.to_string(),
+            state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+            entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+                operation: Default::default(),
+                source_path: PathBuf::from(scan_root).join("a.bin"),
+                destination_path: PathBuf::from(scan_root).join("alpha.bin"),
+                original_basename: "a.bin".to_string(),
+                proposed_basename: "alpha.bin".to_string(),
+                identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                    size_bytes: 1,
+                    modified_unix: 1,
+                    kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                    #[cfg(unix)]
+                    ino: 1,
+                    #[cfg(unix)]
+                    dev: 1,
+                },
+                preflight_passed: false,
+                preflight_failures: Vec::new(),
+                state: archivefs_core::dat::rename_apply::EntryState::Planned,
+                failure_reason: None,
+                applied_at_unix: None,
+                rolled_back_at_unix: None,
+                unknown: Default::default(),
+            }],
+            created_directories: Vec::new(),
+            unknown: Default::default(),
+        }
+    }
+
+    let roms_str = roms.to_string_lossy().into_owned();
+    let current = interrupted_transaction("current-library-interrupted", &roms_str);
+    let other = interrupted_transaction(
+        "other-library-interrupted",
+        "/tmp/some-unrelated-test-folder",
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &current).unwrap();
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &other).unwrap();
+    page.refresh_recovery();
+    assert_eq!(page.view().rename_apply.recovery.len(), 2);
+
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_quick_rename(&view, &mut ui_state);
+
+    assert!(
+        rendered_text_contains(&output, "An interrupted rename transaction was found"),
+        "the current library's own unresolved transaction must surface directly"
+    );
+    assert!(
+        rendered_text_contains(&output, "View recovery/history (1)"),
+        "the other library's unresolved transaction must collapse instead of dominating"
+    );
+}
+
+/// Requested test: "choosing Leave untouched resolves/removes Needs
+/// attention state". This is the exact regression the fix targets:
+/// `refresh_recovery` reloads from disk on every `poll()`, so the choice
+/// must be remembered (`dismissed_recovery_ids`), not just removed from the
+/// in-memory list for one frame.
+#[test]
+fn leave_untouched_removes_needs_attention_state_across_subsequent_polls() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(0);
+    let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
+    let tx = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "leave-untouched-test".to_string(),
+        plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
+        created_at_unix: 1,
+        source_scan_root: roms.to_string_lossy().into_owned(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
+            source_path: roms.join("a.bin"),
+            destination_path: roms.join("alpha.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "alpha.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: false,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Planned,
+            failure_reason: None,
+            applied_at_unix: None,
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &tx).unwrap();
+    page.refresh_recovery();
+    assert_eq!(page.view().rename_apply.recovery.len(), 1);
+
+    page.apply(DatSourcesPageAction::RecoveryChoice {
+        id: "leave-untouched-test".to_string(),
+        choice: RecoveryChoice::LeaveUntouched,
+    });
+    assert!(
+        page.view().rename_apply.recovery.is_empty(),
+        "must be gone immediately"
+    );
+
+    // The regression: simulate the next frame's poll, which reloads
+    // straight from disk (the journal is untouched, so a naive reload
+    // would resurrect it).
+    page.poll();
+    assert!(
+        page.view().rename_apply.recovery.is_empty(),
+        "Leave untouched must survive a subsequent poll/refresh, not just one frame"
+    );
+
+    // The journal itself was never touched or deleted.
+    assert!(
+        archivefs_core::dat::rename_apply::journal_exists(&journal_dir, "leave-untouched-test"),
+        "Leave untouched must never delete the journal"
+    );
+}
+
+/// Requested test: "settled history remains available but collapsed" - the
+/// shared rendering function still offers the real rollback control for a
+/// settled transaction once the collapsed section is actually shown; only
+/// the default collapsed state hides it, nothing about its availability
+/// changed.
+#[test]
+fn settled_history_remains_available_once_expanded() {
+    let settled = vec![fixture_recovery_transaction(
+        "settled-1",
+        TransactionState::Applied,
+        "Renamed \"a.bin\" -> \"Alpha.bin\"",
+    )];
+    let context = egui::Context::default();
+    let mut action = None;
+    let output = context.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            action = show_recovery_transactions(ui, &settled, false);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Roll back transaction"));
+    assert!(
+        action.is_none(),
+        "rendering alone must not perform any action"
+    );
+}
+
+/// Requested test: "no journal is silently deleted" - covering both new
+/// actions this task adds (`ResetQuickRenameSession`,
+/// `HideSettledRecoveryHistory`), neither of which has any business
+/// touching the journal directory.
+#[test]
+fn hide_settled_history_never_deletes_a_journal() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(0);
+    let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
+    let settled = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "settled-to-hide".to_string(),
+        plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
+        created_at_unix: 1,
+        source_scan_root: roms.to_string_lossy().into_owned(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applied,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
+            source_path: roms.join("a.bin"),
+            destination_path: roms.join("alpha.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "alpha.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Applied,
+            failure_reason: None,
+            applied_at_unix: Some(1),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &settled).unwrap();
+    page.refresh_recovery();
+    assert_eq!(page.view().rename_apply.recovery.len(), 1);
+
+    page.apply(DatSourcesPageAction::HideSettledRecoveryHistory);
+    assert!(page.view().rename_apply.recovery.is_empty());
+    assert!(
+        archivefs_core::dat::rename_apply::journal_exists(&journal_dir, "settled-to-hide"),
+        "Hide settled history must never delete the journal file"
+    );
+
+    // Requested test: "advanced Repair History still sees all durable
+    // journals" - Repair History reads the same journal directory
+    // independently from disk; `dismissed_recovery_ids`/`HideSettledRecoveryHistory`
+    // live only on `DatSourcesPageState` and never touch what is on disk,
+    // so a fresh, independent read of the directory (exactly what Repair
+    // History's own load does) must still see it.
+    let (all_journals, problems) = archivefs_core::dat::rename_apply::list_journals(&journal_dir);
+    assert!(problems.is_empty());
+    assert!(
+        all_journals
+            .iter()
+            .any(|transaction| transaction.transaction_id == "settled-to-hide"),
+        "the durable journal must still be discoverable by Repair History's own independent read"
+    );
 }

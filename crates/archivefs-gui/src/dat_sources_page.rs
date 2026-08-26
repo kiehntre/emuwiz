@@ -720,6 +720,10 @@ impl RenamePlanFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenamePlanView {
     pub(crate) generation: u64,
+    /// The full, unshortened folder this plan audited - used only for exact
+    /// current-library comparisons (see `transaction_targets_root`), never
+    /// displayed; `scan_root_short` is what the UI shows.
+    pub(crate) scan_root: String,
     pub(crate) scan_root_short: String,
     pub(crate) platform_display: Option<String>,
     pub(crate) source_display_name: String,
@@ -848,6 +852,13 @@ pub(crate) struct RecoveryTransactionView {
     /// same `TransactionEntry::original_basename`/`proposed_basename`
     /// already recorded in the journal (never a new persisted field).
     pub(crate) human_summary: String,
+    /// The folder this transaction's plan audited
+    /// ([`archivefs_core::dat::rename_apply::RenameTransaction::source_scan_root`],
+    /// recorded verbatim, for provenance only). Lets a consumer (Quick
+    /// Rename) tell "this transaction concerns the folder I'm working in
+    /// right now" apart from "this is some other, unrelated library" -
+    /// see `transaction_targets_root`.
+    pub(crate) source_scan_root: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1271,22 @@ pub(crate) enum DatSourcesPageAction {
     },
     /// Forget the apply outcome display.
     ClearApplyOutcome,
+    /// Quick Rename's "Rename another library" / "Rename N another
+    /// library" reset: clears this session's chosen folder, scan result,
+    /// plan, and apply outcome so the page returns to its initial "Choose
+    /// library or folder…" state. Never touches DAT source configuration,
+    /// the transaction journal directory, or `recovery_transactions`/
+    /// `dismissed_recovery_ids` - those are library-wide state, not part of
+    /// "this Quick Rename session".
+    ResetQuickRenameSession,
+    /// Session-only dismissal of every currently-settled (`Applied`)
+    /// recovery transaction from Quick Rename's collapsed history list.
+    /// Never deletes a journal - see `dismissed_recovery_ids`'s doc for why
+    /// that would not be honest for an unresolved transaction, though a
+    /// settled one *is* already safely removable via Repair History's
+    /// existing "Clear completed history" (`remove_journal`), which this
+    /// deliberately does not duplicate.
+    HideSettledRecoveryHistory,
 }
 
 /// A crash-recovery choice, mirroring the journal recovery options.
@@ -1923,6 +1950,14 @@ pub(crate) struct DatSourcesPageState {
     /// batches (eligible for rollback after a restart) and interrupted batches
     /// (offered for crash recovery). `RolledBack` journals are neither.
     recovery_transactions: Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+    /// Transaction ids the user chose "Leave untouched" for. Session-only:
+    /// no `TransactionState` honestly means "the user chose not to act on
+    /// this", so nothing is written to the journal - see
+    /// `handle_recovery_choice`. Filtered out of `recovery_transactions` on
+    /// every reload so the choice sticks for the rest of this session
+    /// (`refresh_recovery` reloads from disk on every poll and would
+    /// otherwise silently re-surface it next frame).
+    dismissed_recovery_ids: std::collections::BTreeSet<String>,
     /// History & Logs records produced by apply/rollback outcomes, drained by
     /// the shell. No private paths are included.
     history_records: Vec<RenameHistoryRecord>,
@@ -2078,6 +2113,7 @@ impl DatSourcesPageState {
             rollback_error: None,
             apply_job: None,
             recovery_transactions,
+            dismissed_recovery_ids: std::collections::BTreeSet::new(),
             history_records: Vec::new(),
         }
     }
@@ -2247,6 +2283,15 @@ impl DatSourcesPageState {
                 transaction.transaction_id != outcome.transaction.transaction_id
             });
         }
+        // Re-applied on every reload: this is a session-only UI dismissal
+        // (see `dismissed_recovery_ids`'s own doc), not a journal edit, so it
+        // has to be re-excluded every time this function re-reads the
+        // journal directory from disk.
+        recovery.retain(|transaction| {
+            !self
+                .dismissed_recovery_ids
+                .contains(&transaction.transaction_id)
+        });
         self.recovery_transactions = recovery;
     }
 
@@ -2716,6 +2761,25 @@ impl DatSourcesPageState {
                 self.apply_error = None;
                 self.rollback_error = None;
             }
+            DatSourcesPageAction::ResetQuickRenameSession => {
+                self.audit = None;
+                self.audit_error = None;
+                self.identity_enrichment = None;
+                self.rename_plan = None;
+                self.rename_plan_error = None;
+                self.review_decisions.clear();
+                self.abandon_apply_work();
+            }
+            DatSourcesPageAction::HideSettledRecoveryHistory => {
+                for transaction in &self.recovery_transactions {
+                    if transaction.state == TransactionState::Applied {
+                        self.dismissed_recovery_ids
+                            .insert(transaction.transaction_id.clone());
+                    }
+                }
+                self.recovery_transactions
+                    .retain(|transaction| transaction.state != TransactionState::Applied);
+            }
         }
     }
 
@@ -2889,7 +2953,13 @@ impl DatSourcesPageState {
         match choice {
             RecoveryChoice::RollBack => self.start_rollback(id),
             RecoveryChoice::LeaveUntouched => {
-                // The journal stays on disk; the user chose not to act now.
+                // The journal stays on disk untouched; the user chose not to
+                // act now. Recorded in `dismissed_recovery_ids` (session-only
+                // - see its doc) so it stays gone across the next poll's
+                // `refresh_recovery`, not just this one frame; the immediate
+                // `retain` below is only for this frame's own render, before
+                // the next poll would otherwise re-apply the same filter.
+                self.dismissed_recovery_ids.insert(id.clone());
                 self.recovery_transactions
                     .retain(|transaction| transaction.transaction_id != id);
             }
@@ -4192,6 +4262,7 @@ impl DatSourcesPageState {
                 applied_count: transaction.applied_count(),
                 total_count: transaction.entries.len(),
                 human_summary: rename_transaction_human_summary(&transaction.entries),
+                source_scan_root: transaction.source_scan_root.clone(),
             })
             .collect();
         RenameApplyView {
@@ -4217,6 +4288,7 @@ impl DatSourcesPageState {
             // learns why rather than the section silently vanishing.
             return self.rename_plan_error.as_ref().map(|error| RenamePlanView {
                 generation: self.audit_generation,
+                scan_root: String::new(),
                 scan_root_short: String::new(),
                 platform_display: None,
                 source_display_name: String::new(),
@@ -4267,6 +4339,7 @@ impl DatSourcesPageState {
             .collect();
         Some(RenamePlanView {
             generation: plan.generation,
+            scan_root: plan.scan_root.clone(),
             scan_root_short: shorten_path(&plan.scan_root),
             platform_display: plan.platform_display.clone(),
             source_display_name: plan.source_display_name.clone(),
@@ -5674,20 +5747,38 @@ pub(crate) fn show_quick_rename_page(
         );
     }
 
-    // Recovery transactions, split so the simple workflow only ever shows
-    // history directly when it is not really history: an unresolved
-    // (non-`Applied`) transaction genuinely blocks safely trusting this
-    // folder's current state, so it stays in view. A settled, already-
-    // applied transaction is optional rollback history - collapsed behind
-    // "View recovery/history" rather than shown inline, where it previously
-    // crowded out the actual Quick Rename workflow.
+    // Recovery transactions, split three ways so the simple workflow only
+    // ever force-shows history that is genuinely about *this* folder:
+    //   A) unresolved (non-`Applied`) AND for the current target -> shown
+    //      directly, since it genuinely blocks trusting this folder's state.
+    //   B) unresolved but for some OTHER folder/library entirely -> not a
+    //      reason to interrupt this one; collapsed with (C) below.
+    //   C) settled/`Applied` -> optional rollback history regardless of
+    //      folder; always collapsed.
+    // The current target is the best folder identity actually available:
+    // a completed plan's `scan_root`, falling back to the last audit's own
+    // `scan_root` if the plan failed to build. Before either exists there
+    // is no current target to compare against at all - matching nothing is
+    // not the same as *proven* irrelevant, so every unresolved transaction
+    // stays in group (A) rather than being guessed into (B).
     if action.is_none() && !view.rename_apply.recovery.is_empty() {
-        let (blocking, settled): (Vec<_>, Vec<_>) = view
-            .rename_apply
-            .recovery
-            .iter()
-            .cloned()
-            .partition(|recovery| recovery.state != TransactionState::Applied);
+        let current_root: Option<&str> = view
+            .rename_plan
+            .as_ref()
+            .map(|plan| plan.scan_root.as_str())
+            .or_else(|| view.audit.as_ref().map(|audit| audit.scan_root.as_str()));
+        let mut blocking = Vec::new();
+        let mut other = Vec::new();
+        for recovery in &view.rename_apply.recovery {
+            if recovery.state != TransactionState::Applied
+                && current_root
+                    .is_none_or(|root| transaction_targets_root(&recovery.source_scan_root, root))
+            {
+                blocking.push(recovery.clone());
+            } else {
+                other.push(recovery.clone());
+            }
+        }
         if !blocking.is_empty() {
             ui.add_space(10.0);
             widgets::section_header(
@@ -5703,14 +5794,30 @@ pub(crate) fn show_quick_rename_page(
                 action = Some(recovery_action);
             }
         }
-        if action.is_none() && !settled.is_empty() {
+        if action.is_none() && !other.is_empty() {
             ui.add_space(10.0);
-            egui::CollapsingHeader::new(format!("View recovery/history ({})", settled.len()))
+            egui::CollapsingHeader::new(format!("View recovery/history ({})", other.len()))
                 .id_salt("quick_rename_history")
                 .default_open(false)
                 .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Transactions for other folders, and settled transactions still \
+                             eligible for rollback.",
+                        )
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    if other
+                        .iter()
+                        .any(|recovery| recovery.state == TransactionState::Applied)
+                        && ui.button("Hide settled history").clicked()
+                    {
+                        action = Some(DatSourcesPageAction::HideSettledRecoveryHistory);
+                    }
                     if let Some(recovery_action) =
-                        show_recovery_transactions(ui, &settled, view.rename_apply.rollback_running)
+                        show_recovery_transactions(ui, &other, view.rename_apply.rollback_running)
                     {
                         action = Some(recovery_action);
                     }
@@ -5820,6 +5927,21 @@ pub(crate) fn show_quick_rename_page(
                         if ui.button("See unresolved files").clicked() {
                             ui_state.quick_review_open = true;
                         }
+                    }
+                    // Always available, not only after a completed apply:
+                    // covers a scan with zero safe renames, or simply
+                    // deciding not to proceed with this folder - the user
+                    // is never forced to navigate away and back to pick a
+                    // different library.
+                    if widgets::action_button(
+                        ui,
+                        "Rename another library",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::ResetQuickRenameSession);
                     }
                 });
                 if unresolved > 0 {
@@ -8167,10 +8289,30 @@ fn plan_state_tone(state: ProposalState) -> widgets::StatusTone {
     }
 }
 
+/// Whether a recovery transaction's audited folder (`transaction_scan_root`,
+/// recorded verbatim from
+/// [`archivefs_core::dat::rename_apply::RenameTransaction::source_scan_root`])
+/// is the same folder as - or an ancestor/descendant of - `current_root`.
+///
+/// Plain path-component comparison only: no `canonicalize`, no symlink
+/// resolution, no guessing across differently-spelled-but-equivalent paths.
+/// An empty or otherwise unreadable scan root is never trusted to mean
+/// "unrelated" - the caller must not guess relevance it cannot prove.
+fn transaction_targets_root(transaction_scan_root: &str, current_root: &str) -> bool {
+    if transaction_scan_root.trim().is_empty() {
+        return true;
+    }
+    let transaction_path = Path::new(transaction_scan_root);
+    let current_path = Path::new(current_root);
+    transaction_path == current_path
+        || current_path.starts_with(transaction_path)
+        || transaction_path.starts_with(current_path)
+}
+
 /// Renders one card per recovery/crash-recovery transaction. Shared by the
 /// advanced planner (every transaction, always shown directly) and Quick
 /// Rename (split into a directly-shown "blocking" subset and a collapsed
-/// "settled" subset - see `show_quick_rename_page`).
+/// "settled/other-folder" subset - see `show_quick_rename_page`).
 fn show_recovery_transactions(
     ui: &mut egui::Ui,
     recoveries: &[RecoveryTransactionView],
@@ -8675,7 +8817,17 @@ fn show_quick_rename_success(
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if widgets::action_button(ui, "Done", widgets::ActionStyle::Primary, true).clicked() {
+            if widgets::action_button(
+                ui,
+                "Rename another library",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(DatSourcesPageAction::ResetQuickRenameSession);
+            }
+            if widgets::action_button(ui, "Done", widgets::ActionStyle::Secondary, true).clicked() {
                 action = Some(DatSourcesPageAction::ClearApplyOutcome);
             }
             let label = if ui_state.quick_success_details_open {
