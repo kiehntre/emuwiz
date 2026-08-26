@@ -1394,7 +1394,7 @@ fn combined_lha_package_identity(archive: &DatArchiveAudit) -> Option<CombinedAr
 /// still must not become part of an actionable outer-archive identity. This
 /// keeps the combined result safe if a later consumer ever surfaces member
 /// names more directly and makes the no-traversal contract explicit here.
-fn safe_archive_member_name(name: &str) -> bool {
+pub(crate) fn safe_archive_member_name(name: &str) -> bool {
     !name.contains('\\')
         && Path::new(name).components().all(|component| {
             matches!(
@@ -2636,7 +2636,17 @@ game (
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert!(plan.proposals.is_empty());
+        // Both members are genuinely verified (exact, combined-audit
+        // evidence), so this must not vanish from the plan entirely - but it
+        // stays non-actionable: two hash-complete members can never be a
+        // single outer-rename identity.
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(
+            plan.proposals[0].state,
+            crate::dat::rename_plan::ProposalState::Unsupported
+        );
+        assert!(!plan.proposals[0].actionable);
+        assert_eq!(plan.counts.suggested, 0);
     }
 
     #[test]

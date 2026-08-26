@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::dat::archive::ArchivePassCompletion;
+use crate::dat::archive::{ArchiveMemberStatus, ArchivePassCompletion};
 use crate::dat::audit::{AuditEntry, AuditVerdict};
 use crate::dat::classification::{
     ContentEligibility, DatContentClassification, DatOriginalMetadata,
@@ -30,7 +30,8 @@ use crate::dat::rename_plan::model::{
 };
 use crate::dat::set::{SetResolution, SetState};
 use crate::dat::sources::audit_run::{
-    DatArchiveAudit, DatAuditEvidenceSource, DatAuditOutcome, DatContentMatch, DatPolicyNote,
+    DatArchiveAudit, DatArchiveMemberAudit, DatAuditEvidenceSource, DatAuditOutcome,
+    DatContentMatch, DatPolicyNote, safe_archive_member_name,
 };
 
 /// The identity a plan is built for. `generation` lets a caller reject a plan
@@ -673,6 +674,15 @@ fn derive_combined_archive_proposals(
     let mut proposals = Vec::new();
     for archive in archives {
         let Some(identity) = archive.combined_identity.as_ref() else {
+            // A verified member (hash-complete, exact) whose archive was
+            // nonetheless refused a combined identity must still land in a
+            // visible, non-actionable bucket - never disappear from every
+            // count. This never changes what is refused (that decision is
+            // `combined_archive_identity`'s alone, untouched here); it only
+            // reports the refusal that already happened.
+            if let Some(proposal) = unresolved_verified_archive_proposal(archive, context) {
+                proposals.push(proposal);
+            }
             continue;
         };
         if !matches!(archive.completion, ArchivePassCompletion::Complete) {
@@ -784,6 +794,141 @@ fn derive_combined_archive_proposals(
         });
     }
     proposals
+}
+
+/// The one member, if any, that would have made `archive` eligible for a
+/// *combined*-audit identity: fully hashed, resolved to a single exact DAT
+/// match, and - the discriminator that matters here - carrying non-empty
+/// `evidence_sources`. Per [`DatArchiveMemberAudit::evidence_sources`]'s own
+/// contract, "normal one-catalogue archive audits leave this empty"; only a
+/// combined audit ever populates it. This is what lets this function tell
+/// "verified by a combined audit, then refused a combined identity" (worth
+/// reporting here) apart from "an ordinary single-catalogue audit, where
+/// `combined_identity` is always `None` and outer-rename identity is
+/// [`derive_outer_archive_proposals`]'s job entirely" (must stay silent
+/// here, or every one of that path's own proposals/refusals would be
+/// duplicated).
+fn verified_combined_member(archive: &DatArchiveAudit) -> Option<&DatArchiveMemberAudit> {
+    archive.members.iter().find(|member| {
+        matches!(member.evidence.status, ArchiveMemberStatus::HashComplete)
+            && matches!(member.verdict.as_ref(), Some(AuditVerdict::Exact { .. }))
+            && !member.evidence_sources.is_empty()
+    })
+}
+
+/// The visible, non-actionable proposal for an archive that has a genuinely
+/// combined-audit-verified member (see [`verified_combined_member`]) but
+/// which `combined_archive_identity` safely refused to promote to an
+/// outer-rename identity. `None` when there is no such member (nothing to
+/// report here - either the archive was never verified at all, which
+/// belongs in "not in catalogue", or it was verified by a single-catalogue
+/// audit, which is `derive_outer_archive_proposals`'s job) or the archive is
+/// no longer on disk.
+///
+/// This function makes no eligibility decision of its own: it exists only so
+/// a refusal that already happened is *shown* somewhere instead of the
+/// archive silently vanishing from every rename-plan bucket. The reason text
+/// mirrors `combined_archive_identity`'s own gate exactly (same predicates,
+/// same order) so it never claims a cause that was not the real one.
+fn unresolved_verified_archive_proposal(
+    archive: &DatArchiveAudit,
+    context: &ProposalContext<'_>,
+) -> Option<RenameProposal> {
+    let member = verified_combined_member(archive)?;
+    let current_basename = archive.archive_path.file_name()?.to_str()?.to_string();
+    let object_kind = classify_object(&archive.archive_path)?;
+    let reason = combined_identity_refusal_reason(archive);
+    let (game_name, rom_name) = match member.verdict.as_ref() {
+        Some(AuditVerdict::Exact {
+            game_name,
+            rom_name,
+            ..
+        }) => (Some(game_name.clone()), Some(rom_name.clone())),
+        _ => (None, None),
+    };
+
+    Some(RenameProposal {
+        source_path: archive.archive_path.clone(),
+        current_basename,
+        proposed_basename: None,
+        platform: context.platform.map(str::to_string),
+        platform_display: context.platform_display.map(str::to_string),
+        source_id: context.source_id.to_string(),
+        source_display_name: context.source_display_name.to_string(),
+        game_name,
+        rom_name,
+        verdict_label: "Archive member exact".to_string(),
+        match_confident: true,
+        explanations: Vec::new(),
+        content_policy: context.content_policy,
+        content_classification: DatContentClassification::unknown(),
+        original_metadata: DatOriginalMetadata::default(),
+        state: ProposalState::Unsupported,
+        object_kind,
+        ambiguity_reason: None,
+        collision: None,
+        blockers: vec![reason],
+        extension_status: None,
+        sanitisation_notes: Vec::new(),
+        actionable: false,
+        audited_identity: archive.outer_identity.clone(),
+        is_outer_archive: true,
+    })
+}
+
+/// Explains why `combined_archive_identity` returned `None` for an archive
+/// that has a genuinely verified member. Duplicates only the *predicates*
+/// of that function's gate for messaging purposes - it decides nothing and
+/// changes nothing about which archives are excluded.
+fn combined_identity_refusal_reason(archive: &DatArchiveAudit) -> String {
+    if !matches!(archive.completion, ArchivePassCompletion::Complete) {
+        return "the archive was only partially read, so its member evidence is incomplete"
+            .to_string();
+    }
+    if archive.outer_identity.is_none() {
+        return "the archive's own filesystem identity could not be captured".to_string();
+    }
+    if let Some(member) = archive
+        .members
+        .iter()
+        .find(|member| member.evidence.is_nested_archive)
+    {
+        return format!(
+            "member '{}' is itself an archive; a nested archive is never promoted to outer-rename identity",
+            member.evidence.member_name_display
+        );
+    }
+    if let Some(member) = archive
+        .members
+        .iter()
+        .find(|member| !safe_archive_member_name(&member.evidence.member_name_display))
+    {
+        return format!(
+            "member name '{}' contains a path separator or backslash and cannot be trusted as identity evidence",
+            member.evidence.member_name_display
+        );
+    }
+    let complete_members: Vec<_> = archive
+        .members
+        .iter()
+        .filter(|member| matches!(member.evidence.status, ArchiveMemberStatus::HashComplete))
+        .collect();
+    if complete_members.len() > 1 {
+        return format!(
+            "{} members were fully hashed; an outer-archive rename requires exactly one",
+            complete_members.len()
+        );
+    }
+    if let Some(member) = complete_members.first() {
+        if !matches!(member.verdict.as_ref(), Some(AuditVerdict::Exact { .. })) {
+            return "the one fully hashed member did not resolve to a single exact match"
+                .to_string();
+        }
+        if member.evidence_sources.is_empty() {
+            return "the matched member carries no recorded evidence source".to_string();
+        }
+    }
+    "this archive's evidence could not be resolved to a single outer-rename identity".to_string()
 }
 
 /// Outer-rename eligibility is stricter than Stage 1 `SetState::Complete`:
@@ -1813,6 +1958,88 @@ mod tests {
         assert!(plan.proposals[0].is_outer_archive);
         assert!(plan.proposals[0].rom_name.is_none());
         assert_eq!(plan.proposals[0].source_path, archive);
+    }
+
+    fn combined_evidence_source() -> DatAuditEvidenceSource {
+        DatAuditEvidenceSource {
+            local_path: String::new(),
+            source_id: "acorn-bbc-games-ssd".to_string(),
+            source_display_name: "Acorn BBC - Games - [SSD]".to_string(),
+            platform: None,
+            game_name: "Game".to_string(),
+            rom_name: "rom-0.ssd".to_string(),
+            algorithm: "SHA-1".to_string(),
+        }
+    }
+
+    /// The exact regression this guards: a combined audit (`evidence_sources`
+    /// non-empty, per that field's own "normal one-catalogue audits leave
+    /// this empty" contract) verifies a member exactly, but the member's own
+    /// name is unsafe (contains a backslash) - `combined_archive_identity`
+    /// correctly refuses it, and before this fix the archive then vanished
+    /// from every rename-plan bucket instead of appearing anywhere. The
+    /// real-world case this reproduces: a TOSEC BBC Micro ZIP whose single
+    /// `.ssd` member name is `Brian Jack\'s Superstar Challenge (Europe).ssd`
+    /// - the DAT's escaped apostrophe surfaces as a literal backslash.
+    #[test]
+    fn a_combined_audit_member_with_an_unsafe_name_is_reported_unsupported_not_dropped() {
+        let dir = temp();
+        let archive = write(dir.path(), "Brian Jack's Superstar Challenge (Europe).zip");
+        let mut audit = archive_audit(&archive, complete_pass(), "Game", 1);
+        audit.members[0].evidence.member_name_display =
+            "Brian Jack\\'s Superstar Challenge (Europe).ssd".to_string();
+        audit.members[0].evidence_sources = vec![combined_evidence_source()];
+        // No `SetResolution` at all: this is the combined-audit path, which
+        // never uses `outcome.sets`.
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert_eq!(
+            plan.proposals.len(),
+            1,
+            "the verified archive must appear exactly once, not vanish"
+        );
+        let proposal = &plan.proposals[0];
+        assert_eq!(proposal.state, ProposalState::Unsupported);
+        assert!(!proposal.actionable);
+        assert_eq!(proposal.proposed_basename, None);
+        assert!(proposal.is_outer_archive);
+        assert_eq!(plan.counts.unsupported, 1);
+        assert_eq!(plan.counts.suggested, 0);
+        assert!(
+            proposal
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("backslash")),
+            "the reason must name the actual cause, got {:?}",
+            proposal.blockers
+        );
+    }
+
+    /// A single-catalogue audit's outer-archive path
+    /// (`derive_outer_archive_proposals`) must not gain a duplicate,
+    /// unwanted "Unsupported" placeholder from the combined-audit reporting
+    /// added by this fix - `evidence_sources` is the discriminator, and an
+    /// ordinary single-catalogue member always leaves it empty.
+    #[test]
+    fn single_catalogue_verified_members_never_gain_a_combined_unsupported_duplicate() {
+        let dir = temp();
+        let archive = write(dir.path(), "ordinary.zip");
+        // No `SetResolution` either, so `derive_outer_archive_proposals`
+        // also produces nothing here - isolating exactly the code path this
+        // fix touches.
+        let audit = archive_audit(&archive, complete_pass(), "Game", 1);
+        assert!(audit.members[0].evidence_sources.is_empty());
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(plan.proposals.is_empty());
     }
 
     #[test]
