@@ -37,10 +37,16 @@
 
 pub mod convert;
 pub mod import;
+pub mod pack_import;
 pub mod registry;
 
 pub use convert::{claim_for_representation, lookup_no_intro, observations_from_no_intro_matches};
 pub use import::{ImportedNoIntroSource, NoIntroImportError, NoIntroVariant, import_no_intro_dat};
+pub use pack_import::{
+    NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackImportError, NoIntroPackImportReport,
+    NoIntroPackImportStatus, RejectedNoIntroPackMember, import_no_intro_pack,
+    import_no_intro_pack_at, load_current_no_intro_pack, load_current_no_intro_pack_at,
+};
 pub use registry::{
     NoIntroSourceLabel, NoIntroSourceSelection, no_intro_selection_fingerprint,
     select_no_intro_source,
