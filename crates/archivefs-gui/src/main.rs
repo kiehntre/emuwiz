@@ -20747,7 +20747,8 @@ fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
         IdentityImageFormat::Wbfs => "This WBFS file",
         IdentityImageFormat::Chd => "This disc image format",
         IdentityImageFormat::Deferred => "This disc image format",
-        IdentityImageFormat::LooseCartridgeRom
+        IdentityImageFormat::Gdi
+        | IdentityImageFormat::LooseCartridgeRom
         | IdentityImageFormat::Xex
         | IdentityImageFormat::ZipContainingXex
         | IdentityImageFormat::Unsupported => "This file",
