@@ -742,8 +742,8 @@ pub fn build_default_registry() -> CheatSourceRegistry {
         default_priority: 100,
         description:
             "Andrew Mackrodt's BSFree Archive: an optional immutable SQLite cheat database. \
-             GameCube hex-pair codes are installable via the existing Dolphin adapter; all \
-             other platforms and formats are browse-only"
+             GameCube and Wii hex-pair codes are installable via the existing Dolphin adapter; \
+             all other platforms and formats are browse-only"
                 .to_string(),
     }));
 

@@ -5724,7 +5724,7 @@ impl ArchiveFsApp {
         }
     }
 
-    fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
+    fn show_cheat_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
         if self.cheat_sources_page.is_none() {
             match archivefs_core::patch_manager::default_cheat_sources_config_path() {
                 Ok(path) => {
@@ -5767,6 +5767,24 @@ impl ArchiveFsApp {
                 self.cheat_sources_ui.clear();
             }
             page.apply(action);
+        }
+
+        // The BSFree Archive card: the same Download/Import/Validate/Enable/
+        // Remove controls the Sources page already offers, reusing the exact
+        // `BsFreeOperation` plumbing (`start_bsfree_operation`,
+        // `sources_page::show_bsfree_source_card`). Cheats & Mods tells the
+        // user BSFree is managed from the Cheat Sources page, so the real
+        // controls must actually live here rather than only on the generic
+        // Sources page.
+        ui.add_space(theme::SECTION_GAP);
+        if let Some(operation) = sources_page::show_bsfree_source_card(
+            ui,
+            &self.bsfree_manager,
+            self.bsfree_operation.is_some(),
+            &mut self.bsfree_ui,
+            &mut self.clipboard,
+        ) {
+            self.start_bsfree_operation(context.clone(), operation);
         }
     }
 
@@ -14952,8 +14970,10 @@ impl ArchiveFsApp {
         self.poll_pcsx2_launch_profiles();
         self.poll_pcsx2_firmware_evidence();
         self.poll_cheat_workflow(context);
-        if matches!(self.view, MainView::Sources | MainView::CheatsMods)
-            && matches!(self.bsfree_manager, BsFreeManagerState::NotLoaded)
+        if matches!(
+            self.view,
+            MainView::Sources | MainView::CheatsMods | MainView::CheatSources
+        ) && matches!(self.bsfree_manager, BsFreeManagerState::NotLoaded)
             && self.bsfree_operation.is_none()
         {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
@@ -15857,7 +15877,7 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::CheatSources {
-                    self.show_cheat_sources_page(ui);
+                    self.show_cheat_sources_page(context, ui);
                     return;
                 }
 
@@ -26540,8 +26560,8 @@ fn show_bsfree_gamecube(
                 || message.contains("not installed, enabled and validated")
             {
                 ui.label(
-                    "Download or import the optional historical database from Cheats → Sources, \
-                     then search again.",
+                    "Download or import the optional historical database from the Cheat Sources \
+                     page, then search again.",
                 );
             }
             if identity_ready
@@ -26823,6 +26843,21 @@ fn show_bsfree_wii(
                 message,
                 widgets::StatusTone::Warning,
             );
+            if message.contains("not installed")
+                || message.contains("not installed, enabled and validated")
+            {
+                ui.label(
+                    "Download or import the optional historical database from the Cheat Sources \
+                     page, then search again.",
+                );
+            }
+            if identity_ready
+                && widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+            {
+                let search_title = workflow.display_name.clone();
+                action = Some(CheatWorkflowAction::FetchBsFreeWii { search_title });
+            }
         }
         CheatStepResource::Ready(state) => {
             ui.horizontal_wrapped(|ui| {

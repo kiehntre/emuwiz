@@ -1610,13 +1610,13 @@ pub(super) fn show_bsfree_source_card(
             }
             widgets::status_badge(
                 ui,
-                "GameCube cheats installable via Dolphin",
+                "GameCube/Wii cheats installable via Dolphin",
                 widgets::StatusTone::Info,
             );
         });
         ui.label(
-            "This catalogue covers all supported BSFree systems. GameCube cheats can be installed \
-             with Dolphin; other formats remain browse only.",
+            "This catalogue covers all supported BSFree systems. GameCube and Wii cheats can be \
+             installed with Dolphin; other formats remain browse only.",
         );
         widgets::technical_details(ui, "bsfree-source-provenance", |ui| {
             ui.label("Source: BSFree Archive");
