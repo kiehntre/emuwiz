@@ -797,6 +797,16 @@ fn apply_playing_library_action(
         PlayingLibraryPageAction::CancelApply => state.cancel_apply(),
         PlayingLibraryPageAction::ConfirmApply => state.confirm_apply(),
         PlayingLibraryPageAction::RollbackLast => state.rollback_last(),
+        PlayingLibraryPageAction::SelectEsdePlatform(platform_id) => {
+            state.select_esde_platform(Some(platform_id))
+        }
+        PlayingLibraryPageAction::PreviewEsde => state.preview_esde_publication(),
+        PlayingLibraryPageAction::RequestEsdePublish => state.request_esde_publish(),
+        PlayingLibraryPageAction::CancelEsdePublish => state.cancel_esde_publish(),
+        PlayingLibraryPageAction::ConfirmEsdePublish => state.confirm_esde_publish(),
+        PlayingLibraryPageAction::RequestEsdeRecovery => state.request_esde_recovery(),
+        PlayingLibraryPageAction::CancelEsdeRecovery => state.cancel_esde_recovery(),
+        PlayingLibraryPageAction::ConfirmEsdeRecovery => state.confirm_esde_recovery(),
     }
 }
 

@@ -15,7 +15,7 @@
 //! apply path in this app already uses; there is no second filesystem
 //! engine anywhere in this file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use archivefs_core::dat::limits::DatLimits;
@@ -27,6 +27,13 @@ use archivefs_core::dat::rename_apply::journal::{default_rename_transaction_dir,
 use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
 use archivefs_core::dat::rename_apply::preflight::DirectoryPolicy;
 use archivefs_core::dat::rename_apply::rollback::rollback_transaction;
+use archivefs_core::emulator_environment::es_de::{EsDeEnvironmentReport, EsDeProfile};
+use archivefs_core::launch::es_de_export::{ES_DE_SYSTEM_MAP, es_de_system_for_platform};
+use archivefs_core::launch::es_de_publish::{
+    EsDeGamelistPublication, EsDePublicationError, apply_es_de_gamelist_publication,
+    has_unresolved_es_de_gamelist_recovery, plan_es_de_gamelist_publication,
+    recover_es_de_gamelist_publication,
+};
 use archivefs_core::playing_library::{
     DatArchiveMatch, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest, ReleaseClass,
     build_playing_library_plan, build_playing_library_transaction, match_loose_files_against_dat,
@@ -73,8 +80,46 @@ pub(crate) struct PlayingLibraryPageState {
     pending_apply: Option<usize>,
     confirm_text: String,
     applied: Option<RenameTransaction>,
+    /// The plan that produced `applied`, kept (instead of dropped like
+    /// `plan` is) purely so "Publish to ES-DE" - offered only once a
+    /// library has actually been created - can still name which elections
+    /// are eligible. Never mutated once set; `plan_es_de_gamelist_publication`
+    /// reads it exactly as `build_playing_library_transaction` already did.
+    applied_plan: Option<PlayingLibraryPlan>,
     apply_error: Option<String>,
     journal_dir: PathBuf,
+
+    // --- "Publish to ES-DE" (see `archivefs_core::launch::es_de_publish`) ---
+    //
+    // This page never parses, writes, or recovers a gamelist itself - every
+    // field below only remembers which choice the user made and which
+    // result the core API already returned.
+    esde_platform_id: Option<&'static str>,
+    esde_profile: Option<EsDeProfile>,
+    esde_discovery_error: Option<String>,
+    /// Set when a preview finds an unresolved recovery record for the
+    /// resolved gamelist path - the only state while this is `Some` is
+    /// "explain it and offer to restore", per
+    /// `archivefs_core::launch::es_de_publish`'s own recovery policy.
+    esde_recovery_gamelist_path: Option<PathBuf>,
+    esde_recovery_pending: bool,
+    /// Beginner-facing text, plus - only when the failure actually came
+    /// from `archivefs_core::launch::es_de_publish` - its own raw `Display`
+    /// text, shown only behind an expandable "Technical details" section
+    /// (see [`esde_friendly_error`]).
+    esde_recovery_error: Option<(String, Option<String>)>,
+    esde_recovery_done: bool,
+    esde_publication: Option<EsDeGamelistPublication>,
+    esde_preview_error: Option<(String, Option<String>)>,
+    esde_pending_publish: bool,
+    esde_publish_error: Option<(String, Option<String>)>,
+    esde_published: bool,
+    /// Test-only ES-DE discovery seam, exactly like `journal_dir`/
+    /// `with_journal_dir` above: production always calls
+    /// `discover_es_de_environment_default`, so a test never depends on the
+    /// developer's real `$HOME` or a real ES-DE install.
+    #[cfg(test)]
+    esde_home_override: Option<PathBuf>,
 }
 
 impl Default for PlayingLibraryPageState {
@@ -98,9 +143,24 @@ impl Default for PlayingLibraryPageState {
             pending_apply: None,
             confirm_text: String::new(),
             applied: None,
+            applied_plan: None,
             apply_error: None,
             journal_dir: default_rename_transaction_dir()
                 .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
+            esde_platform_id: None,
+            esde_profile: None,
+            esde_discovery_error: None,
+            esde_recovery_gamelist_path: None,
+            esde_recovery_pending: false,
+            esde_recovery_error: None,
+            esde_recovery_done: false,
+            esde_publication: None,
+            esde_preview_error: None,
+            esde_pending_publish: false,
+            esde_publish_error: None,
+            esde_published: false,
+            #[cfg(test)]
+            esde_home_override: None,
         }
     }
 }
@@ -138,6 +198,12 @@ impl PlayingLibraryPageState {
             journal_dir,
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_esde_home_override(mut self, home: PathBuf) -> Self {
+        self.esde_home_override = Some(home);
+        self
     }
 
     pub(crate) fn plan(&self) -> Option<&PlayingLibraryPlan> {
@@ -320,8 +386,11 @@ impl PlayingLibraryPageState {
         self.confirm_text.clear();
         match result {
             Ok(outcome) => {
+                // Kept (not dropped) purely so "Publish to ES-DE" - offered
+                // only once a library has actually been created - still has
+                // the elections that produced it.
+                self.applied_plan = self.plan.take();
                 self.applied = Some(outcome.transaction);
-                self.plan = None;
             }
             Err(error) => self.apply_error = Some(error.to_string()),
         }
@@ -343,6 +412,311 @@ impl PlayingLibraryPageState {
             Err(error) => self.apply_error = Some(error),
         }
     }
+
+    // --- "Publish to ES-DE" ------------------------------------------------
+    //
+    // Every filesystem operation below - planning, writing, and recovering
+    // a gamelist - goes through `archivefs_core::launch::es_de_publish`'s
+    // public API exactly as published: this page never parses or writes
+    // ES-DE's XML, and never re-implements its recovery journal.
+
+    pub(crate) fn applied_plan(&self) -> Option<&PlayingLibraryPlan> {
+        self.applied_plan.as_ref()
+    }
+
+    pub(crate) fn esde_platform_id(&self) -> Option<&'static str> {
+        self.esde_platform_id
+    }
+
+    pub(crate) fn esde_profile(&self) -> Option<&EsDeProfile> {
+        self.esde_profile.as_ref()
+    }
+
+    pub(crate) fn esde_discovery_error(&self) -> Option<&str> {
+        self.esde_discovery_error.as_deref()
+    }
+
+    pub(crate) fn esde_recovery_gamelist_path(&self) -> Option<&Path> {
+        self.esde_recovery_gamelist_path.as_deref()
+    }
+
+    pub(crate) fn esde_recovery_pending(&self) -> bool {
+        self.esde_recovery_pending
+    }
+
+    pub(crate) fn esde_recovery_error(&self) -> Option<(&str, Option<&str>)> {
+        self.esde_recovery_error
+            .as_ref()
+            .map(|(friendly, detail)| (friendly.as_str(), detail.as_deref()))
+    }
+
+    pub(crate) fn esde_recovery_done(&self) -> bool {
+        self.esde_recovery_done
+    }
+
+    pub(crate) fn esde_publication(&self) -> Option<&EsDeGamelistPublication> {
+        self.esde_publication.as_ref()
+    }
+
+    pub(crate) fn esde_preview_error(&self) -> Option<(&str, Option<&str>)> {
+        self.esde_preview_error
+            .as_ref()
+            .map(|(friendly, detail)| (friendly.as_str(), detail.as_deref()))
+    }
+
+    pub(crate) fn esde_pending_publish(&self) -> bool {
+        self.esde_pending_publish
+    }
+
+    pub(crate) fn esde_publish_error(&self) -> Option<(&str, Option<&str>)> {
+        self.esde_publish_error
+            .as_ref()
+            .map(|(friendly, detail)| (friendly.as_str(), detail.as_deref()))
+    }
+
+    pub(crate) fn esde_published(&self) -> bool {
+        self.esde_published
+    }
+
+    pub(crate) fn select_esde_platform(&mut self, platform_id: Option<&'static str>) {
+        self.esde_platform_id = platform_id;
+        self.esde_publication = None;
+        self.esde_preview_error = None;
+        self.esde_published = false;
+    }
+
+    fn discover_esde_report(&self) -> Result<EsDeEnvironmentReport, String> {
+        #[cfg(test)]
+        if let Some(home) = &self.esde_home_override {
+            use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
+            use archivefs_core::emulator_environment::es_de::{
+                DiscoveryEnvironment, ExplicitRoot, discover_es_de_environment,
+            };
+            let environment = DiscoveryEnvironment {
+                home: Some(std::ffi::OsString::from(
+                    "/nonexistent-home-not-used-by-explicit-profile",
+                )),
+                path: Some(std::ffi::OsString::from("")),
+                explicit_bundled_systems_files: Vec::new(),
+                appimage_search_roots: Vec::new(),
+                explicit_root: Some(ExplicitRoot {
+                    home_directory: home.clone(),
+                    executable_path: None,
+                }),
+                explicit_appimages: Vec::new(),
+                explicit_portables: Vec::new(),
+            };
+            return discover_es_de_environment(&HostReadOnlyFilesystem, &environment)
+                .map_err(|error| error.to_string());
+        }
+        archivefs_core::emulator_environment::es_de::discover_es_de_environment_default()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Resolves the exact gamelist path for `platform_id` in `profile` - the
+    /// same lookup `plan_es_de_gamelist_publication` performs internally.
+    /// Needed here only to display the path and to check for an unresolved
+    /// recovery record *before* running a real preview; the actual
+    /// publication planning, XML handling, and recovery logic still live
+    /// exclusively in `archivefs_core::launch::es_de_publish`.
+    fn resolve_esde_gamelist_path(profile: &EsDeProfile, platform_id: &str) -> Option<PathBuf> {
+        let mapping = es_de_system_for_platform(platform_id)?;
+        let locations = profile
+            .system_data
+            .iter()
+            .find(|entry| entry.system_name == mapping.es_de_system)?;
+        if locations.gamelist_file.path.lossy {
+            return None;
+        }
+        Some(PathBuf::from(&locations.gamelist_file.path.display))
+    }
+
+    /// Detects the user's real ES-DE installation, then previews exactly
+    /// what publishing the already-created playing library would change.
+    /// Read-only: discovery only probes paths, and
+    /// `plan_es_de_gamelist_publication` performs at most one bounded read
+    /// of the existing gamelist - nothing is written.
+    pub(crate) fn preview_esde_publication(&mut self) {
+        self.esde_discovery_error = None;
+        self.esde_recovery_gamelist_path = None;
+        self.esde_recovery_error = None;
+        self.esde_recovery_done = false;
+        self.esde_publication = None;
+        self.esde_preview_error = None;
+        self.esde_published = false;
+
+        let Some(platform_id) = self.esde_platform_id else {
+            self.esde_preview_error = Some(("choose a platform first".to_string(), None));
+            return;
+        };
+        let Some(plan) = &self.applied_plan else {
+            self.esde_preview_error = Some(("create the playing library first".to_string(), None));
+            return;
+        };
+
+        let report = match self.discover_esde_report() {
+            Ok(report) => report,
+            Err(error) => {
+                self.esde_discovery_error =
+                    format!("EmuWiz could not look for an ES-DE installation: {error}").into();
+                return;
+            }
+        };
+        // A profile's own `eligible` flag answers "would ES-DE itself
+        // launch from here" (a valid executable + config root) - not what
+        // matters for editing a gamelist, which only needs a real,
+        // already-configured system directory. So this picks the first
+        // profile that actually knows about `platform_id`'s ES-DE system,
+        // via the exact same lookup `plan_es_de_gamelist_publication`
+        // performs internally.
+        let Some(profile) = report
+            .profiles
+            .into_iter()
+            .find(|profile| Self::resolve_esde_gamelist_path(profile, platform_id).is_some())
+        else {
+            self.esde_discovery_error = Some(
+                "No ES-DE installation with this platform already configured was found on this \
+                 computer."
+                    .to_string(),
+            );
+            return;
+        };
+
+        if let Some(gamelist_path) = Self::resolve_esde_gamelist_path(&profile, platform_id)
+            && has_unresolved_es_de_gamelist_recovery(&gamelist_path)
+        {
+            self.esde_recovery_gamelist_path = Some(gamelist_path);
+            self.esde_profile = Some(profile);
+            return;
+        }
+
+        match plan_es_de_gamelist_publication(plan, platform_id, &profile) {
+            Ok(publication) => {
+                self.esde_publication = Some(publication);
+                self.esde_profile = Some(profile);
+            }
+            Err(error) => {
+                self.esde_preview_error =
+                    Some((esde_friendly_error(&error), Some(error.to_string())));
+            }
+        }
+    }
+
+    pub(crate) fn request_esde_publish(&mut self) {
+        if self.esde_publication.is_some() {
+            self.esde_pending_publish = true;
+        }
+    }
+
+    pub(crate) fn cancel_esde_publish(&mut self) {
+        self.esde_pending_publish = false;
+    }
+
+    /// Applies exactly the previewed publication - never a re-plan, never a
+    /// fresh discovery - through
+    /// `archivefs_core::launch::es_de_publish::apply_es_de_gamelist_publication`,
+    /// the same durable, recovery-journaled write every other caller of
+    /// that function uses.
+    pub(crate) fn confirm_esde_publish(&mut self) {
+        self.esde_pending_publish = false;
+        let Some(publication) = &self.esde_publication else {
+            return;
+        };
+        match apply_es_de_gamelist_publication(publication) {
+            Ok(()) => {
+                self.esde_published = true;
+                self.esde_publish_error = None;
+            }
+            Err(error) => {
+                self.esde_publish_error =
+                    Some((esde_friendly_error(&error), Some(error.to_string())));
+            }
+        }
+    }
+
+    pub(crate) fn request_esde_recovery(&mut self) {
+        if self.esde_recovery_gamelist_path.is_some() {
+            self.esde_recovery_pending = true;
+        }
+    }
+
+    pub(crate) fn cancel_esde_recovery(&mut self) {
+        self.esde_recovery_pending = false;
+    }
+
+    /// Restores ES-DE's previous gamelist exactly, through
+    /// `recover_es_de_gamelist_publication` - never touches master ROMs or
+    /// playing-library links, which live entirely outside that function's
+    /// reach.
+    pub(crate) fn confirm_esde_recovery(&mut self) {
+        self.esde_recovery_pending = false;
+        let Some(gamelist_path) = self.esde_recovery_gamelist_path.take() else {
+            return;
+        };
+        match recover_es_de_gamelist_publication(&gamelist_path) {
+            Ok(()) => self.esde_recovery_done = true,
+            Err(error) => {
+                self.esde_recovery_error =
+                    Some((esde_friendly_error(&error), Some(error.to_string())));
+            }
+        }
+    }
+}
+
+/// Beginner-facing, non-technical wording for every
+/// `EsDePublicationError` variant - the raw `Display` text (which names
+/// paths, byte counts, and internal field names) is never shown here; it
+/// remains available only behind an expandable technical-details section.
+fn esde_friendly_error(error: &EsDePublicationError) -> String {
+    match error {
+        EsDePublicationError::PlatformUnmapped { .. } => {
+            "EmuWiz does not yet know how to publish this platform to ES-DE.".to_string()
+        }
+        EsDePublicationError::SystemNotConfigured { .. } => {
+            "This platform is not set up in your ES-DE installation yet.".to_string()
+        }
+        EsDePublicationError::UnsupportedPathEncoding { .. } => {
+            "ES-DE's game list uses a file path EmuWiz cannot safely handle.".to_string()
+        }
+        EsDePublicationError::GamelistUnreadable { .. } => {
+            "EmuWiz could not read ES-DE's existing game list.".to_string()
+        }
+        EsDePublicationError::GamelistTooLarge { .. } => {
+            "ES-DE's existing game list is too large for EmuWiz to safely update.".to_string()
+        }
+        EsDePublicationError::MalformedGamelist { .. } => "ES-DE's existing game list does not \
+             look like a game list EmuWiz recognises, so nothing was changed."
+            .to_string(),
+        EsDePublicationError::NothingToPublish => {
+            "There is nothing new to publish to ES-DE.".to_string()
+        }
+        EsDePublicationError::UnresolvedRecovery { .. } => "A previous ES-DE update did not \
+             finish. Restore it before publishing again."
+            .to_string(),
+        EsDePublicationError::NoRecoveryRecord { .. } => "There is nothing to restore.".to_string(),
+        EsDePublicationError::RecoveryCorrupt { .. } => "EmuWiz could not safely read the \
+             recovery information for ES-DE, so nothing was changed."
+            .to_string(),
+        EsDePublicationError::RecoveryTooLarge { .. } => {
+            "The recovery information for ES-DE is too large for EmuWiz to safely read.".to_string()
+        }
+        EsDePublicationError::RecoveryPathMismatch { .. } => "EmuWiz found unexpected recovery \
+             information and refused to use it, to protect your files."
+            .to_string(),
+        EsDePublicationError::Io { .. } => {
+            "EmuWiz could not update ES-DE because of a filesystem error.".to_string()
+        }
+    }
+}
+
+/// The platforms `archivefs_core::launch::es_de_export::es_de_system_for_platform`
+/// already knows how to map - the only ones ES-DE publication ever offers,
+/// since anything else would fail closed anyway.
+fn esde_platform_options() -> Vec<&'static str> {
+    ES_DE_SYSTEM_MAP
+        .iter()
+        .map(|mapping| mapping.platform_id)
+        .collect()
 }
 
 pub(crate) enum PlayingLibraryPageAction {
@@ -352,6 +726,14 @@ pub(crate) enum PlayingLibraryPageAction {
     CancelApply,
     ConfirmApply,
     RollbackLast,
+    SelectEsdePlatform(&'static str),
+    PreviewEsde,
+    RequestEsdePublish,
+    CancelEsdePublish,
+    ConfirmEsdePublish,
+    RequestEsdeRecovery,
+    CancelEsdeRecovery,
+    ConfirmEsdeRecovery,
 }
 
 /// Stable, absolute widget ids for the text fields a test needs to drive
@@ -553,6 +935,17 @@ pub(crate) fn show_playing_library_page(
         );
     }
 
+    // Only offered once the links this preview describes actually exist -
+    // never while nothing has been applied yet, and never again once a
+    // rollback has removed them.
+    if matches!(
+        state.applied(),
+        Some(transaction) if transaction.state == TransactionState::Applied
+    ) {
+        ui.add_space(10.0);
+        show_esde_publish_section(ui, state, &mut action);
+    }
+
     action
 }
 
@@ -683,6 +1076,248 @@ fn show_preview_summary(
             });
         });
     }
+}
+
+/// The "Publish to ES-DE" section: choose a platform, preview, confirm,
+/// publish - or, while a previous update is unresolved, explain that and
+/// offer to restore instead. Every number and path shown here comes
+/// straight from an `archivefs_core::launch::es_de_publish` value; this
+/// function only lays them out.
+fn show_esde_publish_section(
+    ui: &mut egui::Ui,
+    state: &PlayingLibraryPageState,
+    action: &mut Option<PlayingLibraryPageAction>,
+) {
+    widgets::section_header(ui, "Publish to ES-DE", None);
+    ui.label(
+        egui::RichText::new(
+            "Add the games you just created to ES-DE's menu. Your original files and links are \
+             never touched by this step.",
+        )
+        .color(theme::muted(ui)),
+    );
+    ui.add_space(6.0);
+
+    widgets::card(ui, |ui| {
+        // A recovery record takes over the whole section: nothing else
+        // here is safe to offer until it is resolved one way or the other.
+        if let Some(gamelist_path) = state.esde_recovery_gamelist_path() {
+            widgets::banner(
+                ui,
+                "A previous ES-DE update did not finish",
+                "EmuWiz cannot tell whether that update fully applied before EmuWiz or your \
+                 computer stopped. Restore ES-DE's previous menu to a known-good state before \
+                 publishing again.",
+                widgets::StatusTone::Warning,
+            );
+            ui.label(format!("Game list: {}", gamelist_path.display()));
+
+            if state.esde_recovery_pending() {
+                ui.label("Restore ES-DE's previous menu now?");
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Confirm",
+                        widgets::ActionStyle::Destructive,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::ConfirmEsdeRecovery);
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::CancelEsdeRecovery);
+                    }
+                });
+            } else if widgets::action_button(
+                ui,
+                "Restore previous ES-DE menu",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                *action = Some(PlayingLibraryPageAction::RequestEsdeRecovery);
+            }
+
+            if let Some((friendly, detail)) = state.esde_recovery_error() {
+                ui.add_space(6.0);
+                widgets::banner(
+                    ui,
+                    "Could not restore ES-DE's previous menu",
+                    friendly,
+                    widgets::StatusTone::Blocked,
+                );
+                if let Some(detail) = detail {
+                    widgets::technical_details(ui, "playing_library_esde_recovery_error", |ui| {
+                        ui.label(detail);
+                    });
+                }
+            }
+            return;
+        }
+
+        if state.esde_recovery_done() {
+            ui.label(
+                egui::RichText::new("ES-DE's previous menu was restored.").color(theme::SUCCESS),
+            );
+            ui.add_space(6.0);
+        }
+
+        ui.label("Platform:");
+        let platforms = esde_platform_options();
+        if let Some(clicked) = widgets::platform_picker(
+            ui,
+            "playing_library_esde_platform",
+            &platforms,
+            state.esde_platform_id(),
+            true,
+        ) {
+            *action = Some(PlayingLibraryPageAction::SelectEsdePlatform(clicked));
+        }
+        ui.add_space(6.0);
+
+        if widgets::action_button(
+            ui,
+            "Preview ES-DE changes",
+            widgets::ActionStyle::Primary,
+            state.esde_platform_id().is_some(),
+        )
+        .clicked()
+        {
+            *action = Some(PlayingLibraryPageAction::PreviewEsde);
+        }
+        if state.esde_platform_id().is_none() {
+            ui.label(
+                egui::RichText::new("Choose a platform first.")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+
+        if let Some(error) = state.esde_discovery_error() {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "ES-DE was not found",
+                error,
+                widgets::StatusTone::Blocked,
+            );
+        }
+
+        if let Some((friendly, detail)) = state.esde_preview_error() {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "Could not preview ES-DE changes",
+                friendly,
+                widgets::StatusTone::Blocked,
+            );
+            if let Some(detail) = detail {
+                widgets::technical_details(ui, "playing_library_esde_preview_error", |ui| {
+                    ui.label(detail);
+                });
+            }
+        }
+
+        if let Some(publication) = state.esde_publication() {
+            ui.add_space(8.0);
+            if let Some(profile) = state.esde_profile() {
+                ui.label(format!(
+                    "ES-DE profile: {}",
+                    profile.home_directory.path.display
+                ));
+            }
+            ui.label(format!("System: {}", publication.es_de_system));
+            ui.label(format!(
+                "Game list: {}",
+                publication.gamelist_path.display()
+            ));
+            ui.label(format!("{} new game(s)", publication.added.len()));
+            ui.label(format!(
+                "{} already in ES-DE",
+                publication.already_present.len()
+            ));
+            if let Some(plan) = state.applied_plan() {
+                let not_included = plan.unresolved_groups.len() + plan.exclusions.len();
+                if not_included > 0 {
+                    ui.label(format!(
+                        "{not_included} release(s) from your playing library plan were not \
+                         part of it and so are not published (see the summary above for why)"
+                    ));
+                }
+            }
+
+            if state.esde_published() {
+                ui.add_space(6.0);
+                if publication.is_unchanged() {
+                    ui.label(
+                        egui::RichText::new("ES-DE was already up to date - nothing changed.")
+                            .color(theme::SUCCESS),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Published {} game(s) to ES-DE.",
+                            publication.added.len()
+                        ))
+                        .color(theme::SUCCESS)
+                        .strong(),
+                    );
+                }
+            } else if publication.is_unchanged() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("ES-DE is already up to date - nothing to publish.")
+                        .color(theme::muted(ui)),
+                );
+            } else if state.esde_pending_publish() {
+                ui.add_space(6.0);
+                ui.label(format!("Add {} game(s) to ES-DE?", publication.added.len()));
+                ui.horizontal(|ui| {
+                    if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Primary, true)
+                        .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::ConfirmEsdePublish);
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::CancelEsdePublish);
+                    }
+                });
+            } else {
+                ui.add_space(6.0);
+                if widgets::action_button(
+                    ui,
+                    "Publish to ES-DE",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    *action = Some(PlayingLibraryPageAction::RequestEsdePublish);
+                }
+            }
+        }
+
+        if let Some((friendly, detail)) = state.esde_publish_error() {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "Could not publish to ES-DE",
+                friendly,
+                widgets::StatusTone::Blocked,
+            );
+            if let Some(detail) = detail {
+                widgets::technical_details(ui, "playing_library_esde_publish_error", |ui| {
+                    ui.label(detail);
+                });
+            }
+        }
+    });
 }
 
 #[cfg(test)]

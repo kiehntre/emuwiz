@@ -769,3 +769,341 @@ fn a_real_existing_path_shows_no_inline_error() {
         "This folder was not found."
     ));
 }
+
+// --- "Publish to ES-DE" -------------------------------------------------
+
+mod esde {
+    use archivefs_core::launch::es_de_publish::es_de_gamelist_recovery_path;
+
+    use super::*;
+
+    const PSX_SYSTEMS_XML: &str = r#"<systemList>
+    <system>
+        <name>psx</name>
+        <fullname>Sony PlayStation</fullname>
+        <path>%ROMPATH%/psx</path>
+        <extension>.chd .cue</extension>
+        <command>retroarch %ROM%</command>
+        <platform>psx</platform>
+        <theme>psx</theme>
+    </system>
+</systemList>"#;
+
+    /// A `~/ES-DE`-shaped home directory declaring one `psx` system, ready
+    /// for `PlayingLibraryPageState::with_esde_home_override`.
+    fn esde_home(fixture: &Fixture) -> PathBuf {
+        let home = fixture.path("es-de-home");
+        std::fs::create_dir_all(home.join("custom_systems")).unwrap();
+        std::fs::write(home.join("custom_systems/es_systems.xml"), PSX_SYSTEMS_XML).unwrap();
+        home
+    }
+
+    fn gamelist_path(home: &std::path::Path) -> PathBuf {
+        home.join("gamelists/psx/gamelist.xml")
+    }
+
+    /// Builds a real, applied playing library (one election, real symlink
+    /// on disk) plus a real ES-DE home with a `psx` system - the shared
+    /// starting point for every "Publish to ES-DE" test.
+    fn library_and_esde_home(tag: &str) -> (Fixture, PlayingLibraryPageState) {
+        let fixture = Fixture::new(tag);
+        let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+        state.request_apply();
+        state.confirm_apply();
+        assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+        assert!(state.applied().is_some());
+
+        let home = esde_home(&fixture);
+        let state = state.with_esde_home_override(home);
+        (fixture, state)
+    }
+
+    #[test]
+    fn publish_section_is_absent_before_the_library_is_created() {
+        let ctx = egui::Context::default();
+        let fixture = Fixture::new("esde-absent-before-create");
+        let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+
+        let (output, _) = render(&ctx, &mut state, base_input());
+        assert!(!rendered_text_contains(&output, "Publish to ES-DE"));
+    }
+
+    #[test]
+    fn publish_section_appears_once_the_library_is_created() {
+        let ctx = egui::Context::default();
+        let (_fixture, mut state) = library_and_esde_home("esde-appears-after-create");
+
+        let (output, _) = render(&ctx, &mut state, base_input());
+        assert!(rendered_text_contains(&output, "Publish to ES-DE"));
+    }
+
+    #[test]
+    fn publish_section_disappears_again_after_rollback() {
+        let ctx = egui::Context::default();
+        let (_fixture, mut state) = library_and_esde_home("esde-hidden-after-rollback");
+        state.rollback_last();
+        assert!(state.apply_error().is_none());
+
+        let (output, _) = render(&ctx, &mut state, base_input());
+        assert!(!rendered_text_contains(&output, "Publish to ES-DE"));
+    }
+
+    #[test]
+    fn preview_never_writes_anything() {
+        let (fixture, mut state) = library_and_esde_home("esde-preview-non-mutating");
+        state.select_esde_platform(Some("PSX"));
+
+        state.preview_esde_publication();
+
+        assert!(
+            state.esde_discovery_error().is_none(),
+            "{:?}",
+            state.esde_discovery_error()
+        );
+        assert!(
+            state.esde_preview_error().is_none(),
+            "{:?}",
+            state.esde_preview_error()
+        );
+        let publication = state.esde_publication().expect("a preview");
+        assert_eq!(publication.added.len(), 1);
+        assert!(!gamelist_path(&fixture.path("es-de-home")).exists());
+    }
+
+    #[test]
+    fn existing_es_de_entries_are_reported_as_already_present() {
+        let (fixture, mut state) = library_and_esde_home("esde-already-present");
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+        let elected_path = state
+            .esde_publication()
+            .unwrap()
+            .added
+            .first()
+            .unwrap()
+            .destination_path
+            .clone();
+
+        // Seed a gamelist that already contains this exact election, plus
+        // one unrelated pre-existing entry. The fixture's own path never
+        // contains XML-significant characters, so no escaping is needed
+        // here.
+        let escaped = elected_path.to_string_lossy().into_owned();
+        let path = gamelist_path(&fixture.path("es-de-home"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "<?xml version=\"1.0\"?>\n<gameList>\n\t<game>\n\t\t<path>/library/Unrelated Game.chd</path>\n\t\t<name>Unrelated Game</name>\n\t</game>\n\t<game>\n\t\t<path>{escaped}</path>\n\t\t<name>Sonic (Europe)</name>\n\t</game>\n</gameList>\n"
+            ),
+        )
+        .unwrap();
+
+        state.preview_esde_publication();
+
+        let publication = state.esde_publication().expect("a preview");
+        assert!(publication.added.is_empty());
+        assert_eq!(publication.already_present.len(), 1);
+        assert!(publication.is_unchanged());
+    }
+
+    #[test]
+    fn publish_requires_explicit_confirmation() {
+        let (fixture, mut state) = library_and_esde_home("esde-requires-confirm");
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+        assert!(state.esde_publication().is_some());
+
+        state.request_esde_publish();
+        assert!(state.esde_pending_publish());
+        assert!(!state.esde_published());
+        assert!(!gamelist_path(&fixture.path("es-de-home")).exists());
+    }
+
+    #[test]
+    fn cancelling_the_publish_confirmation_does_nothing() {
+        let (fixture, mut state) = library_and_esde_home("esde-cancel-does-nothing");
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+
+        state.request_esde_publish();
+        state.cancel_esde_publish();
+
+        assert!(!state.esde_pending_publish());
+        assert!(!state.esde_published());
+        assert!(!gamelist_path(&fixture.path("es-de-home")).exists());
+    }
+
+    #[test]
+    fn confirmed_publish_writes_through_the_core_api_and_shows_the_count() {
+        let (fixture, mut state) = library_and_esde_home("esde-confirmed-publish");
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+        let expected_added = state.esde_publication().unwrap().added.len();
+        assert_eq!(expected_added, 1);
+
+        state.request_esde_publish();
+        state.confirm_esde_publish();
+
+        assert!(
+            state.esde_publish_error().is_none(),
+            "{:?}",
+            state.esde_publish_error()
+        );
+        assert!(state.esde_published());
+        let on_disk = std::fs::read_to_string(gamelist_path(&fixture.path("es-de-home"))).unwrap();
+        assert!(on_disk.contains("europe.bin") || on_disk.contains("Sonic (Europe)"));
+    }
+
+    #[test]
+    fn republishing_the_identical_plan_reports_unchanged() {
+        let (_fixture, mut state) = library_and_esde_home("esde-idempotent");
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+        state.request_esde_publish();
+        state.confirm_esde_publish();
+        assert!(state.esde_published());
+
+        state.preview_esde_publication();
+        let publication = state.esde_publication().expect("a second preview");
+        assert!(publication.is_unchanged());
+        assert_eq!(publication.already_present.len(), 1);
+    }
+
+    #[test]
+    fn an_unresolved_recovery_record_blocks_publication_and_offers_restore() {
+        let (fixture, mut state) = library_and_esde_home("esde-recovery-blocks");
+        let home = fixture.path("es-de-home");
+        let path = gamelist_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Simulate a crash mid-publish: a recovery record exists, naming
+        // this exact gamelist path, with no prior content.
+        std::fs::write(
+            es_de_gamelist_recovery_path(&path),
+            format!(
+                "{{\"schema_version\":1,\"gamelist_path\":{:?},\"previous_content\":null}}",
+                path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+
+        assert!(state.esde_publication().is_none());
+        assert_eq!(state.esde_recovery_gamelist_path(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn confirmed_recovery_restores_the_exact_prior_content_and_touches_nothing_else() {
+        let (fixture, mut state) = library_and_esde_home("esde-recovery-confirm");
+        let home = fixture.path("es-de-home");
+        let path = gamelist_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let previous = "<?xml version=\"1.0\"?>\n<gameList>\n\t<game>\n\t\t<path>/library/Other.chd</path>\n\t\t<name>Other</name>\n\t</game>\n</gameList>\n";
+        // A record describing a crash that happened after the real write:
+        // the file on disk currently differs from `previous_content`.
+        std::fs::write(&path, "<gameList><game><name>corrupted mid-write").unwrap();
+        std::fs::write(
+            es_de_gamelist_recovery_path(&path),
+            format!(
+                "{{\"schema_version\":1,\"gamelist_path\":{:?},\"previous_content\":{:?}}}",
+                path.to_string_lossy(),
+                previous
+            ),
+        )
+        .unwrap();
+
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+        assert!(state.esde_recovery_gamelist_path().is_some());
+
+        state.request_esde_recovery();
+        assert!(state.esde_recovery_pending());
+        state.confirm_esde_recovery();
+
+        assert!(
+            state.esde_recovery_error().is_none(),
+            "{:?}",
+            state.esde_recovery_error()
+        );
+        assert!(state.esde_recovery_done());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+        assert!(!has_unresolved_es_de_gamelist_recovery(&path));
+
+        // The master ROM and its playing-library link, entirely unrelated
+        // to ES-DE's own gamelist, are never touched by recovery.
+        let link = fixture.path("playing").join("europe.bin");
+        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read(fixture.path("roms").join("europe.bin")).unwrap(),
+            b"test"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_recovery_confirmation_does_nothing() {
+        let (fixture, mut state) = library_and_esde_home("esde-recovery-cancel");
+        let home = fixture.path("es-de-home");
+        let path = gamelist_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            es_de_gamelist_recovery_path(&path),
+            format!(
+                "{{\"schema_version\":1,\"gamelist_path\":{:?},\"previous_content\":null}}",
+                path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+        state.request_esde_recovery();
+        state.cancel_esde_recovery();
+
+        assert!(!state.esde_recovery_pending());
+        assert!(!state.esde_recovery_done());
+        assert!(has_unresolved_es_de_gamelist_recovery(&path));
+    }
+
+    #[test]
+    fn a_malformed_gamelist_produces_a_friendly_refusal_not_raw_xml_detail() {
+        let (fixture, mut state) = library_and_esde_home("esde-malformed-friendly");
+        let home = fixture.path("es-de-home");
+        let path = gamelist_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<gameList><game><name>no closing tag at all").unwrap();
+
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+
+        assert!(state.esde_publication().is_none());
+        let (friendly, detail) = state.esde_preview_error().expect("a friendly error");
+        assert!(!friendly.to_lowercase().contains("gamelist"));
+        assert!(!friendly.to_lowercase().contains("</"));
+        assert!(friendly.contains("ES-DE"));
+        // The raw technical detail still exists, but only behind the
+        // separate, explicitly-expandable channel - never inside the
+        // beginner-facing text itself.
+        assert!(detail.unwrap().to_lowercase().contains("gamelist"));
+    }
+
+    #[test]
+    fn an_oversized_gamelist_also_produces_a_friendly_refusal() {
+        let (fixture, mut state) = library_and_esde_home("esde-oversized-friendly");
+        let home = fixture.path("es-de-home");
+        let path = gamelist_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(archivefs_core::launch::es_de_publish::MAX_GAMELIST_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        state.select_esde_platform(Some("PSX"));
+        state.preview_esde_publication();
+
+        let (friendly, _detail) = state.esde_preview_error().expect("a friendly error");
+        assert!(!friendly.contains("MAX_GAMELIST_BYTES"));
+        assert!(friendly.contains("large") || friendly.contains("too large"));
+    }
+}
