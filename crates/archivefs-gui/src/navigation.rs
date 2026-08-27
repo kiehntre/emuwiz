@@ -14,7 +14,7 @@
 
 use super::*;
 
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 16] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::CheatsMods, "Cheats & Mods"),
@@ -27,6 +27,7 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 16] = [
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::Sources, "Sources"),
+    (MainView::SourcesDiscovery, "Collection Discovery"),
     (MainView::Doctor, "Doctor"),
     (MainView::HistoryLogs, "History & Logs"),
     (MainView::Settings, "Settings"),
@@ -158,6 +159,24 @@ pub(crate) struct NavGroup {
 /// already decided to keep separate, and this task's own scope is the
 /// Doctor-vs-Repair top-level destination choice, not the overlay/page
 /// distinction.
+///
+/// # GUI consolidation: one "Sources" destination
+///
+/// A later pass folded `DatSources`, `CheatSources`, and Collection
+/// Discovery's own sidebar rows above into the single `Sources` entry, over
+/// four tabs (`SourcesTab`: Libraries/DATs/Cheats/Discovery - see
+/// `sources_tab_for_main_view`/`ArchiveFsApp::show_sources_page`), so a user
+/// no longer has to understand why DAT Sources and Cheat Sources were
+/// separate sidebar concepts before knowing which one they needed.
+/// `MainView::DatSources`/`CheatSources` still exist and still render their
+/// own genuinely different data through their own unchanged engines (DAT
+/// registry, cheat-source management); Collection Discovery moved from a
+/// `ToolsOverlay` to `MainView::SourcesDiscovery` so it could share the same
+/// tab chrome (an overlay always replaces the whole central panel, which
+/// would have hidden the tab row itself). Every underlying engine -
+/// source-folder config, DAT registry, BSFree, cheat providers, collection
+/// discovery scanning - is completely untouched; only routing and
+/// presentation changed.
 pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     NavGroup {
         heading: None,
@@ -180,18 +199,11 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     },
     NavGroup {
         heading: Some("CHEATS & MODS"),
-        entries: &[
-            nav_view(MainView::CheatsMods, "Cheats & Mods"),
-            nav_view(MainView::CheatSources, "Cheat Sources"),
-        ],
+        entries: &[nav_view(MainView::CheatsMods, "Cheats & Mods")],
     },
     NavGroup {
         heading: Some("SOURCES"),
-        entries: &[
-            nav_view(MainView::Sources, "Sources"),
-            nav_view(MainView::DatSources, "DAT Sources"),
-            nav_overlay(ToolsOverlay::CollectionDiscovery, "Collection Discovery"),
-        ],
+        entries: &[nav_view(MainView::Sources, "Sources")],
     },
     NavGroup {
         heading: Some("HISTORY & JOURNALS"),
@@ -245,11 +257,17 @@ pub(crate) fn navigation_destination_enabled(view: MainView, has_database: bool)
 /// `problems_repair_tab_for_main_view`), so a deep-link that lands directly
 /// on, say, `MainView::RepairReview` still shows the one sidebar button
 /// selected rather than none.
+///
+/// `MainView::Sources` follows the identical rule: it renders selected
+/// while `current` is `Sources` itself or any of `DatSources`/
+/// `CheatSources`/`SourcesDiscovery` (see `sources_tab_for_main_view`).
 pub(crate) fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
     if candidate == MainView::Library {
         library_tab_for_main_view(current).is_some()
     } else if candidate == MainView::Problems {
         problems_repair_tab_for_main_view(current).is_some()
+    } else if candidate == MainView::Sources {
+        sources_tab_for_main_view(current).is_some()
     } else {
         current == candidate
     }

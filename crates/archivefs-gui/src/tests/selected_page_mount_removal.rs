@@ -263,7 +263,13 @@ fn gamer_view_review_still_lands_on_selected_with_the_same_focused_game() {
     app.review_identity(archive_path.clone());
 
     assert_eq!(app.ui_mode, GuiMode::AdvancedView);
-    assert_eq!(app.view, MainView::Selected);
+    // Library owns the selection now (see `review_identity`'s doc comment):
+    // landing on the Archives tab with this archive focused renders the
+    // exact same `show_game_details` panel `MainView::Selected` used to,
+    // just inline in the unified Library shell rather than a standalone
+    // destination.
+    assert_eq!(app.view, MainView::Library);
+    assert_eq!(app.library_tab, LibraryTab::Archives);
     assert_eq!(
         app.archive_context.focused.as_deref(),
         Some(archive_path.as_path())

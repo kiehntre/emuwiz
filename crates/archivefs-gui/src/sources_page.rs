@@ -2209,3 +2209,68 @@ pub(super) fn show_sources_recent_activity(ui: &mut egui::Ui, history: &Operatio
         ui.add_space(4.0);
     }
 }
+
+/// The consolidated Sources destination's shared heading and tab selector,
+/// rendered identically regardless of which tab is active - mirrors
+/// `show_library_shell_header`'s role for the unified Library shell and
+/// `problems_repair_page::show_problems_repair_tabs`'s role for Problems &
+/// Repair. Returns the newly clicked tab, if any; the caller
+/// (`ArchiveFsApp::show_sources_page`) applies it via
+/// `navigate_to_sources_tab`.
+pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Option<SourcesTab> {
+    widgets::page_header_with_icon(
+        ui,
+        crate::ui::icons::SOURCES,
+        "Sources",
+        "Manage where EmuWiz finds games, DAT catalogues, and cheats.",
+    );
+    let tab_options: [(SourcesTab, &str); 4] = [
+        (
+            SourcesTab::Libraries,
+            sources_tab_label(SourcesTab::Libraries),
+        ),
+        (SourcesTab::Dats, sources_tab_label(SourcesTab::Dats)),
+        (SourcesTab::Cheats, sources_tab_label(SourcesTab::Cheats)),
+        (
+            SourcesTab::Discovery,
+            sources_tab_label(SourcesTab::Discovery),
+        ),
+    ];
+    let clicked = widgets::tab_row(ui, &tab_options, current);
+    ui.add_space(8.0);
+    clicked
+}
+
+/// The "Discovery" tab: Collection Discovery's summary of the most recent
+/// scan's universal ingestion results. Was previously
+/// `ToolsOverlay::CollectionDiscovery`; the underlying renderer
+/// (`collection_discovery_page::show_collection_discovery_panel`) and the
+/// data it reads are unchanged - only the routing mechanism moved from an
+/// overlay to a Sources tab.
+pub(super) fn show_sources_discovery_tab(ui: &mut egui::Ui, database_state: &DatabaseState) {
+    widgets::section_header(
+        ui,
+        "Collection Discovery",
+        Some(
+            "A plain-language summary of the most recent scan's universal ingestion results: what was found, what needs attention, and what to do about it.",
+        ),
+    );
+    let summary = match database_state {
+        DatabaseState::Ready {
+            last_scan_summary, ..
+        } => last_scan_summary.as_ref(),
+        _ => None,
+    };
+    // Prefer the persisted database's own record of the most recent
+    // *completed* scan over the session-local `last_scan_summary` - this
+    // run id survives an app restart, so paging keeps working even when
+    // the summary above is `None` (nothing scanned yet this session).
+    let discovery_run = match database_state {
+        DatabaseState::Ready { snapshot, .. } => snapshot
+            .last_completed_scan
+            .as_ref()
+            .map(|scan| (snapshot.database_path.as_path(), scan.scan_run_id)),
+        _ => None,
+    };
+    collection_discovery_page::show_collection_discovery_panel(ui, summary, discovery_run);
+}

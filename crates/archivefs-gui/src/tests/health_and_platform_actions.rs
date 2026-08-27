@@ -3222,7 +3222,14 @@ fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
     assert!(rendered_text_contains(&output, "Recognised"));
     assert!(rendered_text_contains(&output, "Needs attention"));
     assert!(rendered_text_contains(&output, "Unknown.bin"));
-    assert!(rendered_text_contains(&output, "Suggested:"));
+    // The generic "Suggested:" label prefix was deliberately dropped in
+    // favour of plainer, reason-specific wording (`fix(gui): clarify
+    // recognised collection media`); the row must still explain what to
+    // do, just without that jargon-y prefix.
+    assert!(rendered_text_contains(
+        &output,
+        "check that both files are present together"
+    ));
 
     // Never the raw internal type/variant names.
     for internal_term in [

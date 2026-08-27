@@ -3302,3 +3302,174 @@ fn right_click_on_unselected_row_selects_only_that_row() {
     );
     assert_eq!(selected_archive, Some(path_b));
 }
+
+// --- Sources consolidation --------------------------------------------------
+//
+// `MainView::DatSources`/`CheatSources`/`SourcesDiscovery` still exist and
+// still render through their own unchanged engines (DAT registry,
+// cheat-source management, collection discovery scanning - all proven
+// throughout this file and elsewhere already); what these tests prove is
+// the *new* consolidated destination built on top of them: one sidebar
+// entry, a shared tab row, correct per-tab dispatch, and that every one of
+// the four tabs still reaches real content.
+
+fn sources_screen_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1400.0, 1600.0),
+        )),
+        ..Default::default()
+    }
+}
+
+fn render_sources_app(app: &mut ArchiveFsApp) -> egui::FullOutput {
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    ctx.run(sources_screen_input(), |ctx| app.update(ctx, &mut frame))
+}
+
+#[test]
+fn sources_tab_covers_every_consolidated_view() {
+    for view in [
+        MainView::Sources,
+        MainView::DatSources,
+        MainView::CheatSources,
+        MainView::SourcesDiscovery,
+    ] {
+        assert!(
+            sources_tab_for_main_view(view).is_some(),
+            "{view:?} must map to a Sources tab"
+        );
+    }
+    assert_eq!(
+        sources_tab_for_main_view(MainView::Sources),
+        Some(SourcesTab::Libraries)
+    );
+    assert_eq!(
+        sources_tab_for_main_view(MainView::DatSources),
+        Some(SourcesTab::Dats)
+    );
+    assert_eq!(
+        sources_tab_for_main_view(MainView::CheatSources),
+        Some(SourcesTab::Cheats)
+    );
+    assert_eq!(
+        sources_tab_for_main_view(MainView::SourcesDiscovery),
+        Some(SourcesTab::Discovery)
+    );
+    assert_eq!(sources_tab_for_main_view(MainView::Home), None);
+}
+
+#[test]
+fn navigate_to_sources_tab_sets_the_matching_view_and_remembers_it() {
+    let mut app = app_for_operation_tests();
+    app.navigate_to_sources_tab(SourcesTab::Cheats);
+    assert_eq!(app.view, MainView::CheatSources);
+    assert_eq!(app.sources_tab, SourcesTab::Cheats);
+
+    // Clicking the one sidebar entry again restores the last tab rather
+    // than resetting to Libraries - the same rule `MainView::Library`/
+    // `MainView::Problems` already follow.
+    app.navigate_to_main_view(MainView::Sources);
+    assert_eq!(app.view, MainView::CheatSources);
+    assert_eq!(app.sources_tab, SourcesTab::Cheats);
+}
+
+#[test]
+fn reconcile_sources_tab_follows_a_direct_view_assignment() {
+    let mut app = app_for_operation_tests();
+    app.view = MainView::DatSources;
+    app.reconcile_sources_tab();
+    assert_eq!(app.sources_tab, SourcesTab::Dats);
+}
+
+#[test]
+fn sources_libraries_tab_still_renders_source_folder_controls() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::Sources;
+    let output = render_sources_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Sources"));
+    assert!(rendered_text_contains(&output, "Libraries"));
+    assert!(rendered_text_contains(&output, "DATs"));
+    assert!(rendered_text_contains(&output, "Cheats"));
+    assert!(rendered_text_contains(&output, "Discovery"));
+    assert!(
+        rendered_text_contains(&output, "Add folder"),
+        "source-folder configuration must still render"
+    );
+}
+
+#[test]
+fn sources_dats_tab_still_renders_dat_controls() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::DatSources;
+    let output = render_sources_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Sources"));
+    assert!(
+        rendered_text_contains(&output, "Verify Games"),
+        "DAT Sources' own content must still render"
+    );
+}
+
+#[test]
+fn sources_cheats_tab_still_renders_cheat_source_and_bsfree_controls() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::CheatSources;
+    let output = render_sources_app(&mut app);
+
+    assert!(
+        rendered_text_contains(&output, "Cheat sources"),
+        "Cheat Sources' own content must still render"
+    );
+    assert!(
+        rendered_text_contains(&output, "Download"),
+        "BSFree provisioning must still be reachable from Sources / Cheats"
+    );
+}
+
+#[test]
+fn sources_discovery_tab_still_renders_collection_discovery() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::SourcesDiscovery;
+    let output = render_sources_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Collection Discovery"));
+}
+
+#[test]
+fn sources_is_the_only_sidebar_entry_for_dat_cheat_and_discovery() {
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    assert!(sidebar_views.contains(&MainView::Sources));
+    for view in [
+        MainView::DatSources,
+        MainView::CheatSources,
+        MainView::SourcesDiscovery,
+    ] {
+        assert!(
+            !sidebar_views.contains(&view),
+            "{view:?} must not have its own sidebar entry any more"
+        );
+    }
+    assert!(
+        !ADVANCED_NAV_GROUPS
+            .iter()
+            .flat_map(|group| group.entries)
+            .any(|entry| matches!(entry.click, NavClick::Overlay(_))
+                && entry.label.contains("Collection Discovery")),
+        "Collection Discovery must no longer be reachable as a standalone overlay entry"
+    );
+}

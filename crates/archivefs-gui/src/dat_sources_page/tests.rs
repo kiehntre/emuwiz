@@ -3177,12 +3177,20 @@ fn render_at_width(
     ui_state: &mut DatSourcesPageUi,
     width: f32,
 ) -> egui::FullOutput {
+    // Production always wraps this page in the shared outer page scroll
+    // (`main_view_uses_page_scroll` includes `MainView::DatSources`), so a
+    // real narrow window can always reach every section by scrolling.
+    // This harness has no such scroll container, so its fixed height must
+    // stay comfortably above the page's actual rendered height at this
+    // width - otherwise content below the fold is genuinely absent from
+    // the painted output (not just visually clipped), which would make
+    // this a test of the harness's height, not of the page's own layout.
     let context = egui::Context::default();
     context.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(width, 3000.0),
+                egui::vec2(width, 20_000.0),
             )),
             ..Default::default()
         },
@@ -5692,8 +5700,12 @@ fn tosec_group_rendering_never_draws_more_than_two_hundred_rows() {
         &output,
         "Showing 200 of 205 matching groups"
     ));
+    // Counts only the per-group "<system> · 1 DAT(s)" rows (every synthetic
+    // group here has exactly one DAT), not the unrelated page-level "N
+    // selected TOSEC DAT(s)" evidence-readiness summary that also contains
+    // the substring "DAT(s)" once per render.
     assert!(
-        rendered_text_count(&output, "DAT(s)") <= 200,
+        rendered_text_count(&output, "· 1 DAT(s)") <= 200,
         "only the bounded visible group rows may be rendered"
     );
 }

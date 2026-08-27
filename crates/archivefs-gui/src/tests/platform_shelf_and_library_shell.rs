@@ -3166,7 +3166,7 @@ fn only_one_sidebar_entry_highlights_for_a_shared_destination() {
 }
 
 /// Regression test for a live-QA bug: opening a `ToolsOverlay` (e.g.
-/// Collection Discovery) left the previously active `MainView` (e.g. DAT
+/// Database Status) left the previously active `MainView` (e.g. DAT
 /// Sources) still highlighted in the sidebar at the same time as the
 /// overlay's own entry, because the overlay replaces the main view's content
 /// without ever changing `self.view`. A `View` entry must stop rendering
@@ -3186,18 +3186,18 @@ fn view_entries_do_not_stay_highlighted_once_an_overlay_is_open() {
     // entry on `current_overlay == ToolsOverlay::None`; simulate that gate
     // directly the way the render loop does.
     let current = MainView::DatSources;
-    let current_overlay = ToolsOverlay::CollectionDiscovery;
+    let current_overlay = ToolsOverlay::DatabaseStatus;
     let dat_sources_selected = current_overlay == ToolsOverlay::None
         && navigation_destination_selected(current, MainView::DatSources);
-    let collection_discovery_selected = current_overlay == ToolsOverlay::CollectionDiscovery;
+    let database_status_selected = current_overlay == ToolsOverlay::DatabaseStatus;
 
     assert!(
         !dat_sources_selected,
-        "DAT Sources must not stay highlighted once Collection Discovery is open"
+        "DAT Sources must not stay highlighted once another overlay is open"
     );
     assert!(
-        collection_discovery_selected,
-        "Collection Discovery must be the only highlighted entry while it is open"
+        database_status_selected,
+        "Database Status must be the only highlighted entry while it is open"
     );
 }
 
@@ -3227,9 +3227,19 @@ fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
         // doc note. `problems_repair_still_covers_every_consolidated_view`
         // below is the real regression check for these three; skipping them
         // here is not a silent gap.
+        // `DatSources`/`CheatSources`/`SourcesDiscovery` are likewise
+        // reached only through the consolidated `MainView::Sources` entry's
+        // own tabs now - see `sources_still_covers_every_consolidated_view`
+        // below for the real regression check.
         if matches!(
             view,
-            MainView::About | MainView::Doctor | MainView::RepairReview | MainView::RepairHistory
+            MainView::About
+                | MainView::Doctor
+                | MainView::RepairReview
+                | MainView::RepairHistory
+                | MainView::DatSources
+                | MainView::CheatSources
+                | MainView::SourcesDiscovery
         ) {
             continue;
         }
@@ -3241,6 +3251,10 @@ fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
     assert!(
         sidebar_views.contains(&MainView::Problems),
         "the consolidated Problems & Repair destination must have a sidebar entry"
+    );
+    assert!(
+        sidebar_views.contains(&MainView::Sources),
+        "the consolidated Sources destination must have a sidebar entry"
     );
     let has_quick_rename = ADVANCED_NAV_GROUPS
         .iter()
@@ -3294,6 +3308,55 @@ fn problems_repair_still_covers_every_consolidated_view() {
     }
 }
 
+/// The GUI consolidation regression check for Sources: every destination
+/// that lost its own standalone sidebar row (`DatSources`, `CheatSources`,
+/// `SourcesDiscovery`) must still be reachable through the consolidated
+/// `MainView::Sources` entry's tab projection (`sources_tab_for_main_view`),
+/// and none of them may retain its own sidebar entry - which would recreate
+/// the exact "multiple overlapping technical destinations" problem the
+/// consolidation removed.
+#[test]
+fn sources_still_covers_every_consolidated_view() {
+    for view in [
+        MainView::Sources,
+        MainView::DatSources,
+        MainView::CheatSources,
+        MainView::SourcesDiscovery,
+    ] {
+        assert!(
+            sources_tab_for_main_view(view).is_some(),
+            "{view:?} must map to a Sources tab"
+        );
+    }
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    for view in [
+        MainView::DatSources,
+        MainView::CheatSources,
+        MainView::SourcesDiscovery,
+    ] {
+        assert!(
+            !sidebar_views.contains(&view),
+            "{view:?} must not have its own standalone sidebar entry any more - it is only reachable through Sources' tabs"
+        );
+    }
+    // The old Collection Discovery overlay entry must not survive under a
+    // different guise either.
+    assert!(
+        !ADVANCED_NAV_GROUPS
+            .iter()
+            .flat_map(|group| group.entries)
+            .any(|entry| entry.label.contains("Collection Discovery")),
+        "Collection Discovery must not have its own standalone sidebar/overlay entry any more"
+    );
+}
+
 #[test]
 fn quick_rename_is_the_single_sidebar_entry_for_the_rename_workflow() {
     let entries: Vec<&NavEntry> = ADVANCED_NAV_GROUPS
@@ -3317,12 +3380,6 @@ fn quick_rename_is_the_single_sidebar_entry_for_the_rename_workflow() {
             .iter()
             .any(|entry| { matches!(entry.click, NavClick::QuickRename) && entry.highlightable })
     );
-    assert!(entries.iter().any(|entry| {
-        matches!(
-            entry.click,
-            NavClick::Overlay(ToolsOverlay::CollectionDiscovery)
-        )
-    }));
 }
 
 #[test]

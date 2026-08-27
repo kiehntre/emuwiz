@@ -3229,6 +3229,15 @@ enum MainView {
     Health,
     Duplicates,
     Sources,
+    /// Collection Discovery's content, dispatched as the "Discovery" tab of
+    /// the consolidated Sources destination - see `sources_tab_for_main_view`.
+    /// Was previously `ToolsOverlay::CollectionDiscovery`, a completely
+    /// separate rendering mechanism reached only from its own now-removed
+    /// sidebar row; folding it into `MainView` lets it share Sources' tab
+    /// chrome like `DatSources`/`CheatSources` already do. The underlying
+    /// renderer (`collection_discovery_page::show_collection_discovery_panel`)
+    /// is unchanged.
+    SourcesDiscovery,
     LibraryViews,
     Mount,
     Selected,
@@ -3424,6 +3433,54 @@ fn problems_repair_tab_for_main_view(view: MainView) -> Option<ProblemsRepairTab
     }
 }
 
+/// The four tabs of the consolidated "Sources" destination - see
+/// `MainView::Sources`'s sibling variants below and `sources_page`'s module
+/// doc. Mirrors `LibraryTab`/`ProblemsRepairTab` exactly: `ArchiveFsApp::view`
+/// remains the single source of truth; `ArchiveFsApp::sources_tab` is a
+/// *derived* projection of it via `sources_tab_for_main_view`, reconciled
+/// once per frame (`reconcile_sources_tab`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+enum SourcesTab {
+    #[default]
+    Libraries,
+    Dats,
+    Cheats,
+    Discovery,
+}
+
+/// The `MainView` destination that currently renders `tab`'s content - the
+/// inverse of `sources_tab_for_main_view`. Used by
+/// `ArchiveFsApp::navigate_to_sources_tab`.
+fn main_view_for_sources_tab(tab: SourcesTab) -> MainView {
+    match tab {
+        SourcesTab::Libraries => MainView::Sources,
+        SourcesTab::Dats => MainView::DatSources,
+        SourcesTab::Cheats => MainView::CheatSources,
+        SourcesTab::Discovery => MainView::SourcesDiscovery,
+    }
+}
+
+/// Which `SourcesTab` (if any) `view` corresponds to.
+fn sources_tab_for_main_view(view: MainView) -> Option<SourcesTab> {
+    match view {
+        MainView::Sources => Some(SourcesTab::Libraries),
+        MainView::DatSources => Some(SourcesTab::Dats),
+        MainView::CheatSources => Some(SourcesTab::Cheats),
+        MainView::SourcesDiscovery => Some(SourcesTab::Discovery),
+        _ => None,
+    }
+}
+
+/// The label the Sources tab selector shows for `tab`.
+fn sources_tab_label(tab: SourcesTab) -> &'static str {
+    match tab {
+        SourcesTab::Libraries => "Libraries",
+        SourcesTab::Dats => "DATs",
+        SourcesTab::Cheats => "Cheats",
+        SourcesTab::Discovery => "Discovery",
+    }
+}
+
 /// The unified Library shell's chrome: the shared "Library" heading and
 /// the five-tab selector, rendered identically regardless of which tab is
 /// selected. Content dispatch (`match self.library_tab { ... }`) stays in
@@ -3473,11 +3530,6 @@ enum ToolsOverlay {
     DatabaseStatus,
     DoctorChecks,
     ArchiveInspector,
-    /// Collection Health / Discovery Visibility: a plain-language summary
-    /// of the most recent scan's universal ingestion results (see
-    /// `collection_discovery_page`) - what was found, what needs
-    /// attention, and what to do about it.
-    CollectionDiscovery,
 }
 
 /// The Archive Inspector's column/sort choices - path (its exact stored
@@ -3577,6 +3629,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Health => "Health",
         MainView::Duplicates => "Duplicates",
         MainView::Sources => "Sources",
+        MainView::SourcesDiscovery => "Collection Discovery",
         MainView::LibraryViews => "Library Views",
         MainView::Mount => "Mount",
         MainView::Selected => "Selected",
@@ -3609,6 +3662,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Health
         | MainView::Duplicates
         | MainView::Sources
+        | MainView::SourcesDiscovery
         | MainView::LibraryViews
         | MainView::HistoryLogs
         | MainView::RepairHistory
@@ -3656,6 +3710,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
         MainView::Home
             | MainView::Selected
             | MainView::Sources
+            | MainView::SourcesDiscovery
             | MainView::CheatSources
             | MainView::DatSources
             | MainView::IdentifyRename
@@ -4087,6 +4142,10 @@ struct ArchiveFsApp {
     /// `ProblemsRepairTab`'s doc comment for the synchronization rule with
     /// `view`, identical to `library_tab`'s.
     problems_repair_tab: ProblemsRepairTab,
+    /// The last "Sources" tab the user was on - see `SourcesTab`'s doc
+    /// comment for the synchronization rule with `view`, identical to
+    /// `library_tab`'s.
+    sources_tab: SourcesTab,
     /// Which "Tools" screen (if any) is showing in front of `view` - see
     /// `ToolsOverlay`'s doc comment.
     tools_overlay: ToolsOverlay,
@@ -4525,6 +4584,7 @@ impl ArchiveFsApp {
             view: MainView::default(),
             library_tab: LibraryTab::default(),
             problems_repair_tab: ProblemsRepairTab::default(),
+            sources_tab: SourcesTab::default(),
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
@@ -4631,6 +4691,13 @@ impl ArchiveFsApp {
         self.tools_overlay = ToolsOverlay::None;
     }
 
+    /// `SourcesTab`'s exact counterpart to `navigate_to_library_tab`.
+    fn navigate_to_sources_tab(&mut self, tab: SourcesTab) {
+        self.view = main_view_for_sources_tab(tab);
+        self.sources_tab = tab;
+        self.tools_overlay = ToolsOverlay::None;
+    }
+
     /// The one sanctioned way to change `self.view` in response to a user
     /// action (a sidebar click, a Home card, a menu item) - shared so
     /// every navigation source applies the same special cases
@@ -4651,6 +4718,10 @@ impl ArchiveFsApp {
             // a second time should not reset Diagnostics/Repair progress
             // back to Overview.
             self.navigate_to_problems_repair_tab(self.problems_repair_tab);
+        } else if target == MainView::Sources {
+            // Restores whichever Sources tab was last selected, exactly
+            // like `Library`/`Problems` above.
+            self.navigate_to_sources_tab(self.sources_tab);
         } else {
             self.view = target;
             self.tools_overlay = ToolsOverlay::None;
@@ -4690,6 +4761,14 @@ impl ArchiveFsApp {
     fn reconcile_problems_repair_tab(&mut self) {
         if let Some(tab) = problems_repair_tab_for_main_view(self.view) {
             self.problems_repair_tab = tab;
+        }
+    }
+
+    /// `SourcesTab`'s exact counterpart to `reconcile_library_tab`, called
+    /// alongside it every frame.
+    fn reconcile_sources_tab(&mut self) {
+        if let Some(tab) = sources_tab_for_main_view(self.view) {
+            self.sources_tab = tab;
         }
     }
 
@@ -5889,6 +5968,201 @@ impl ArchiveFsApp {
             dolphin: dolphin_context,
             pcsx2: pcsx2_context,
         }
+    }
+
+    /// The consolidated "Sources" destination - one sidebar entry over
+    /// Libraries/DATs/Cheats/Discovery tabs (`SourcesTab`). Renders the
+    /// shared heading and tab row, then dispatches to whichever tab
+    /// `self.sources_tab` currently names. Each arm calls exactly the same
+    /// rendering this destination used before consolidation
+    /// (`show_sources_libraries_tab`, `self.show_dat_sources_page`,
+    /// `self.show_cheat_sources_page`, `show_sources_discovery_tab`) -
+    /// nothing here re-implements source management, DAT handling, cheat
+    /// provisioning, or collection discovery.
+    fn show_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui, tab: SourcesTab) {
+        if let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
+            self.navigate_to_sources_tab(clicked);
+        }
+        match tab {
+            SourcesTab::Libraries => self.show_sources_libraries_tab(context, ui),
+            SourcesTab::Dats => self.show_dat_sources_page(ui),
+            SourcesTab::Cheats => self.show_cheat_sources_page(context, ui),
+            SourcesTab::Discovery => {
+                sources_page::show_sources_discovery_tab(ui, &self.database_state)
+            }
+        }
+    }
+
+    /// The "Libraries" tab: source-folder configuration, the RetroArch
+    /// cheat-database catalogue manager, BSFree provisioning, and RomM -
+    /// exactly the content `MainView::Sources` rendered before
+    /// consolidation, unchanged apart from the outer page header now being
+    /// `show_sources_page`'s shared one.
+    fn show_sources_libraries_tab(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
+        let sources = self
+            .database_state
+            .snapshot()
+            .map(|snapshot| snapshot.source_views.as_slice())
+            .unwrap_or(&[]);
+        let archives = self
+            .database_state
+            .snapshot()
+            .map(|snapshot| snapshot.archives.as_slice())
+            .unwrap_or(&[]);
+        let mount_root = match &self.state {
+            LoadState::Ready(data) => Some(data.mount_root.as_path()),
+            LoadState::Loading { .. } | LoadState::Error(_) => None,
+        };
+
+        show_sources_overview(
+            ui,
+            sources,
+            &self.catalogue_manager,
+            self.catalogue_retrieval.as_ref(),
+        );
+        ui.add_space(theme::SECTION_GAP);
+
+        if let Some(last_scan) = &self.sources_last_scan
+            && show_sources_last_scan_banner(ui, last_scan)
+        {
+            self.show_skipped_files = true;
+            self.skipped_files_filter = None;
+        }
+        ui.add_space(theme::SECTION_GAP);
+
+        let sources_action = show_sources_page(
+            ui,
+            sources,
+            archives,
+            mount_root,
+            self.source_action.is_some(),
+            &mut self.sources_add_dialog,
+            &mut self.sources_remove_dialog,
+            &mut self.clipboard,
+        );
+        if let Some(sources_action) = sources_action {
+            match sources_action {
+                SourcesPageAction::AddFolder(path) => {
+                    self.start_source_action(context.clone(), SourceAction::Add(path));
+                }
+                SourcesPageAction::ScanOne(path) => {
+                    self.start_source_action(context.clone(), SourceAction::ScanOne(path));
+                }
+                SourcesPageAction::ScanAll => {
+                    self.start_source_action(context.clone(), SourceAction::ScanAll);
+                }
+                SourcesPageAction::RefreshStatus => {
+                    self.start_database_action(context.clone(), false);
+                }
+                SourcesPageAction::AssignPlatform { path, platform } => {
+                    self.start_source_action(
+                        context.clone(),
+                        SourceAction::AssignPlatform { path, platform },
+                    );
+                }
+                SourcesPageAction::SetEnabled { path, enabled } => {
+                    self.start_source_action(
+                        context.clone(),
+                        SourceAction::SetEnabled { path, enabled },
+                    );
+                }
+                SourcesPageAction::ConfirmRemove {
+                    path,
+                    keep_catalogue,
+                } => {
+                    self.start_source_action(
+                        context.clone(),
+                        SourceAction::Remove {
+                            path,
+                            keep_catalogue,
+                        },
+                    );
+                }
+                SourcesPageAction::ViewInLibrary(path) => {
+                    self.navigate_to_library_tab(LibraryTab::Archives);
+                    self.library_source_filter = Some(Some(path));
+                }
+            }
+        }
+
+        ui.add_space(theme::SECTION_GAP);
+        widgets::section_header(
+            ui,
+            "Database and sources",
+            Some(
+                "Download, update, or verify the trusted cheat database EmuWiz uses for cheat setup.",
+            ),
+        );
+        let catalogue_action = show_retroarch_catalogue_manager(
+            ui,
+            &self.catalogue_manager,
+            self.catalogue_review.as_ref(),
+            self.catalogue_retrieval.as_ref(),
+            self.catalogue_last_result.as_ref(),
+            &mut self.clipboard,
+        );
+        if let Some(catalogue_action) = catalogue_action {
+            self.handle_catalogue_manager_action(context, catalogue_action);
+        }
+
+        ui.add_space(theme::SECTION_GAP);
+        if let Some(operation) = show_bsfree_source_card(
+            ui,
+            &self.bsfree_manager,
+            self.bsfree_operation.is_some(),
+            &mut self.bsfree_ui,
+            &mut self.clipboard,
+        ) {
+            self.start_bsfree_operation(context.clone(), operation);
+        }
+
+        ui.add_space(theme::SECTION_GAP);
+        let romm_view = romm_source::build_card_view(
+            self.romm_snapshot.as_deref(),
+            self.romm_operation
+                .as_ref()
+                .map(|running| &running.operation),
+            self.romm_operation
+                .as_ref()
+                .is_some_and(|running| running.cancellation_requested),
+        );
+        let romm_progress = self
+            .romm_operation
+            .as_ref()
+            .and_then(|running| running.progress.as_ref())
+            .cloned();
+        if let Some(request) = romm_source::show_romm_source_card(
+            ui,
+            &romm_view,
+            &mut self.romm_ui,
+            romm_progress.as_ref(),
+        ) {
+            match request {
+                RommCardRequest::Start(operation) => {
+                    // Declines when something is already running, which
+                    // is what makes a double click harmless.
+                    self.start_romm_operation(context.clone(), operation);
+                }
+                RommCardRequest::Cancel => self.cancel_romm_operation(),
+                RommCardRequest::OpenConfigure => self.open_romm_configuration(),
+                RommCardRequest::OpenBrowse(view) => self.open_romm_browse(view),
+            }
+        }
+
+        if let Some(request) = self.show_romm_configuration_window(context) {
+            self.handle_romm_config_request(context, request);
+        }
+
+        // Drawn as a window rather than appended here - see
+        // `show_romm_browse_window`. Appending it below the source
+        // card put it past the bottom of the viewport, so clicking
+        // "Browse records" looked like it did nothing at all.
+        if let Some(request) = self.show_romm_browse_window(context) {
+            self.handle_romm_browse_request(context, request);
+        }
+
+        ui.add_space(theme::SECTION_GAP);
+        show_sources_recent_activity(ui, &self.history);
     }
 
     fn show_cheat_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
@@ -15199,6 +15473,7 @@ impl ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.reconcile_library_tab();
         self.reconcile_problems_repair_tab();
+        self.reconcile_sources_tab();
         self.poll_platform_artwork_task(context);
         self.poll_shared_history();
         // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
@@ -15686,35 +15961,6 @@ impl ArchiveFsApp {
                                 }
                             }
                         }
-                        ToolsOverlay::CollectionDiscovery => {
-                            if widgets::show_tools_overlay_header(ui, "Collection Discovery") {
-                                self.tools_overlay = ToolsOverlay::None;
-                            }
-                            let summary = match &self.database_state {
-                                DatabaseState::Ready {
-                                    last_scan_summary, ..
-                                } => last_scan_summary.as_ref(),
-                                _ => None,
-                            };
-                            // Prefer the persisted database's own record of
-                            // the most recent *completed* scan over the
-                            // session-local `last_scan_summary` - this run
-                            // id survives an app restart, so paging keeps
-                            // working even when the summary above is
-                            // `None` (nothing scanned yet this session).
-                            let discovery_run = match &self.database_state {
-                                DatabaseState::Ready { snapshot, .. } => snapshot
-                                    .last_completed_scan
-                                    .as_ref()
-                                    .map(|scan| (snapshot.database_path.as_path(), scan.scan_run_id)),
-                                _ => None,
-                            };
-                            collection_discovery_page::show_collection_discovery_panel(
-                                ui,
-                                summary,
-                                discovery_run,
-                            );
-                        }
                         // The original `DoctorReport` checks, unchanged. The
                         // Doctor *page* now shows the shared read-only
                         // findings instead (see `show_doctor_page`), so this
@@ -15985,183 +16231,8 @@ impl ArchiveFsApp {
                     }
                 }
 
-                if self.view == MainView::Sources {
-                    let sources = self
-                        .database_state
-                        .snapshot()
-                        .map(|snapshot| snapshot.source_views.as_slice())
-                        .unwrap_or(&[]);
-                    let archives = self
-                        .database_state
-                        .snapshot()
-                        .map(|snapshot| snapshot.archives.as_slice())
-                        .unwrap_or(&[]);
-                    let mount_root = match &self.state {
-                        LoadState::Ready(data) => Some(data.mount_root.as_path()),
-                        LoadState::Loading { .. } | LoadState::Error(_) => None,
-                    };
-
-                    widgets::page_header_with_icon(
-                        ui,
-                        crate::ui::icons::SOURCES,
-                        "Sources",
-                        "Manage the configured folders EmuWiz scans for archives, and keep the trusted cheat database up to date.",
-                    );
-                    show_sources_overview(
-                        ui,
-                        sources,
-                        &self.catalogue_manager,
-                        self.catalogue_retrieval.as_ref(),
-                    );
-                    ui.add_space(theme::SECTION_GAP);
-
-                    if let Some(last_scan) = &self.sources_last_scan
-                        && show_sources_last_scan_banner(ui, last_scan)
-                    {
-                        self.show_skipped_files = true;
-                        self.skipped_files_filter = None;
-                    }
-                    ui.add_space(theme::SECTION_GAP);
-
-                    let sources_action = show_sources_page(
-                        ui,
-                        sources,
-                        archives,
-                        mount_root,
-                        self.source_action.is_some(),
-                        &mut self.sources_add_dialog,
-                        &mut self.sources_remove_dialog,
-                        &mut self.clipboard,
-                    );
-                    if let Some(sources_action) = sources_action {
-                        match sources_action {
-                            SourcesPageAction::AddFolder(path) => {
-                                self.start_source_action(context.clone(), SourceAction::Add(path));
-                            }
-                            SourcesPageAction::ScanOne(path) => {
-                                self.start_source_action(
-                                    context.clone(),
-                                    SourceAction::ScanOne(path),
-                                );
-                            }
-                            SourcesPageAction::ScanAll => {
-                                self.start_source_action(context.clone(), SourceAction::ScanAll);
-                            }
-                            SourcesPageAction::RefreshStatus => {
-                                self.start_database_action(context.clone(), false);
-                            }
-                            SourcesPageAction::AssignPlatform { path, platform } => {
-                                self.start_source_action(
-                                    context.clone(),
-                                    SourceAction::AssignPlatform { path, platform },
-                                );
-                            }
-                            SourcesPageAction::SetEnabled { path, enabled } => {
-                                self.start_source_action(
-                                    context.clone(),
-                                    SourceAction::SetEnabled { path, enabled },
-                                );
-                            }
-                            SourcesPageAction::ConfirmRemove {
-                                path,
-                                keep_catalogue,
-                            } => {
-                                self.start_source_action(
-                                    context.clone(),
-                                    SourceAction::Remove {
-                                        path,
-                                        keep_catalogue,
-                                    },
-                                );
-                            }
-                            SourcesPageAction::ViewInLibrary(path) => {
-                                self.navigate_to_library_tab(LibraryTab::Archives);
-                                self.library_source_filter = Some(Some(path));
-                            }
-                        }
-                    }
-
-                    ui.add_space(theme::SECTION_GAP);
-                    widgets::section_header(
-                        ui,
-                        "Database and sources",
-                        Some(
-                            "Download, update, or verify the trusted cheat database EmuWiz uses for cheat setup.",
-                        ),
-                    );
-                    let catalogue_action = show_retroarch_catalogue_manager(
-                        ui,
-                        &self.catalogue_manager,
-                        self.catalogue_review.as_ref(),
-                        self.catalogue_retrieval.as_ref(),
-                        self.catalogue_last_result.as_ref(),
-                        &mut self.clipboard,
-                    );
-                    if let Some(catalogue_action) = catalogue_action {
-                        self.handle_catalogue_manager_action(context, catalogue_action);
-                    }
-
-                    ui.add_space(theme::SECTION_GAP);
-                    if let Some(operation) = show_bsfree_source_card(
-                        ui,
-                        &self.bsfree_manager,
-                        self.bsfree_operation.is_some(),
-                        &mut self.bsfree_ui,
-                        &mut self.clipboard,
-                    ) {
-                        self.start_bsfree_operation(context.clone(), operation);
-                    }
-
-                    ui.add_space(theme::SECTION_GAP);
-                    let romm_view = romm_source::build_card_view(
-                        self.romm_snapshot.as_deref(),
-                        self.romm_operation.as_ref().map(|running| &running.operation),
-                        self.romm_operation
-                            .as_ref()
-                            .is_some_and(|running| running.cancellation_requested),
-                    );
-                    let romm_progress = self
-                        .romm_operation
-                        .as_ref()
-                        .and_then(|running| running.progress.as_ref())
-                        .cloned();
-                    if let Some(request) = romm_source::show_romm_source_card(
-                        ui,
-                        &romm_view,
-                        &mut self.romm_ui,
-                        romm_progress.as_ref(),
-                    ) {
-                        match request {
-                            RommCardRequest::Start(operation) => {
-                                // Declines when something is already running, which
-                                // is what makes a double click harmless.
-                                self.start_romm_operation(context.clone(), operation);
-                            }
-                            RommCardRequest::Cancel => self.cancel_romm_operation(),
-                            RommCardRequest::OpenConfigure => self.open_romm_configuration(),
-                            RommCardRequest::OpenBrowse(view) => self.open_romm_browse(view),
-                        }
-                    }
-
-                    if let Some(request) = self.show_romm_configuration_window(context) {
-                        self.handle_romm_config_request(context, request);
-                    }
-
-                    // Drawn as a window rather than appended here - see
-                    // `show_romm_browse_window`. Appending it below the source
-                    // card put it past the bottom of the viewport, so clicking
-                    // "Browse records" looked like it did nothing at all.
-                    if let Some(request) = self.show_romm_browse_window(context) {
-                        self.handle_romm_browse_request(context, request);
-                    }
-
-                    ui.add_space(theme::SECTION_GAP);
-                    show_sources_recent_activity(ui, &self.history);
-                    return;
-                }
-
-                if self.view == MainView::CheatSources {
-                    self.show_cheat_sources_page(context, ui);
+                if let Some(tab) = sources_tab_for_main_view(self.view) {
+                    self.show_sources_page(context, ui, tab);
                     return;
                 }
 
@@ -16177,11 +16248,6 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::LibraryViewHistory {
                     self.show_library_view_history_page(ui);
-                    return;
-                }
-
-                if self.view == MainView::DatSources {
-                    self.show_dat_sources_page(ui);
                     return;
                 }
 

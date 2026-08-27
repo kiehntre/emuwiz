@@ -1150,6 +1150,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         view: MainView::default(),
         library_tab: LibraryTab::default(),
         problems_repair_tab: ProblemsRepairTab::default(),
+        sources_tab: SourcesTab::default(),
         tools_overlay: ToolsOverlay::default(),
         show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
         show_about: false,
