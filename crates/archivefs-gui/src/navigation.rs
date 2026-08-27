@@ -14,10 +14,9 @@
 
 use super::*;
 
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 16] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 15] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
-    (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::CheatSources, "Cheat Sources"),
     (MainView::RepairReview, "Repair Review"),
@@ -148,7 +147,6 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
         heading: Some("LIBRARY"),
         entries: &[
             nav_view(MainView::Library, "Library"),
-            nav_view(MainView::Selected, "Selected"),
             nav_quick_rename("Quick Rename"),
             nav_view(MainView::CanonicalOrganisation, "Library Organisation"),
         ],

@@ -10312,7 +10312,7 @@ impl ArchiveFsApp {
 
     /// Phase 5: "Review" on a Gamer View game whose platform couldn't be
     /// confidently identified. Keeps the exact same game selected (so
-    /// Advanced View's Selected page opens already showing its real
+    /// Library's Game Details area opens already showing its real
     /// identity/evidence detail, not a blank/generic page) while
     /// switching to the mode that can actually render it - the identical
     /// select-then-switch shape `open_cheats_mods_workspace` and the
@@ -10321,7 +10321,124 @@ impl ArchiveFsApp {
         self.archive_context.select_only(archive_path);
         self.ui_mode = GuiMode::AdvancedView;
         save_gui_mode(self.ui_mode);
-        self.view = MainView::Selected;
+        self.navigate_to_library_tab(LibraryTab::Archives);
+    }
+
+    /// Render the focused archive's complete Game Details surface.  Library
+    /// owns the selection now; this method is shared with the retained
+    /// internal Selected compatibility route so there is still only one
+    /// renderer and one set of readiness/evidence actions.
+    fn show_game_details(
+        &mut self,
+        context: &egui::Context,
+        ui: &mut egui::Ui,
+        archive_actions_blocked: bool,
+        archive_action_block_reason: Option<&'static str>,
+    ) -> Option<MountPageAction> {
+        if matches!(
+            self.dolphin_local_profiles,
+            DolphinLocalProfilesState::NotScanned
+        ) {
+            self.start_dolphin_local_profile_scan(context.clone());
+        }
+        if matches!(
+            self.pcsx2_launch_profiles,
+            Pcsx2LaunchProfilesState::NotScanned
+        ) {
+            self.start_pcsx2_launch_profile_scan(context.clone());
+        }
+        if matches!(
+            self.pcsx2_firmware_evidence,
+            Pcsx2FirmwareEvidenceState::NotLoaded
+        ) {
+            self.start_pcsx2_firmware_evidence_load(context.clone());
+        }
+        let live = match &self.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            _ => None,
+        };
+        let action = show_selected_page(
+            ui,
+            live,
+            SelectedPageViewState {
+                selected_archive: self.archive_context.focused.as_deref(),
+                selected_count: self.archive_context.selected.len(),
+                retroarch_profiles: &self.retroarch_profiles,
+                busy: archive_actions_blocked,
+                block_reason: archive_action_block_reason,
+            },
+        );
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        self.show_romm_game_panel(context, ui);
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        let evidence_action = selected_evidence_page::show_selected_evidence_panel(
+            ui,
+            self.ui_mode == GuiMode::AdvancedView,
+            self.archive_context.focused.as_deref(),
+            &self.selected_evidence,
+        );
+        self.handle_selected_evidence_action(context, evidence_action);
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        let live_for_launch_readiness = match &self.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            _ => None,
+        };
+        let launch_readiness_input = self.build_launch_readiness_input(live_for_launch_readiness);
+        if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
+            ui.ctx().request_repaint();
+        }
+        if self.launch_dolphin.poll() || self.launch_dolphin.is_active() {
+            ui.ctx().request_repaint();
+        }
+        if self.launch_pcsx2.poll() || self.launch_pcsx2.is_active() {
+            ui.ctx().request_repaint();
+        }
+        launch_readiness_page::show_launch_readiness_panel(
+            ui,
+            &launch_readiness_input,
+            &mut self.launch_retroarch,
+            &mut self.launch_dolphin,
+            &mut self.launch_pcsx2,
+        );
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        let identity_sources_action = identity_sources_page::show_identity_sources_panel(
+            ui,
+            self.ui_mode == GuiMode::AdvancedView,
+            &self.identity_sources,
+        );
+        self.handle_identity_sources_action(context, identity_sources_action);
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        let plan_preview_action = plan_preview_page::show_plan_preview_panel(
+            ui,
+            self.ui_mode == GuiMode::AdvancedView,
+            self.archive_context.focused.as_deref(),
+            &self.plan_preview,
+        );
+        self.handle_plan_preview_action(context, plan_preview_action);
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        let rpcs3_action = rpcs3_page::show_rpcs3_panel(
+            ui,
+            self.ui_mode == GuiMode::AdvancedView,
+            None,
+            &self.rpcs3_status,
+        );
+        self.handle_rpcs3_action(context, rpcs3_action);
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        let focused_archive = self.archive_context.focused.clone();
+        self.invalidate_pcsx2_status_if_selection_changed(focused_archive.as_deref());
+        let verified_ps2_serial = self
+            .cheat_workflow
+            .as_ref()
+            .and_then(pcsx2_identity_for_workflow)
+            .and_then(|id| id.serial);
+        let pcsx2_action = pcsx2_page::show_pcsx2_panel(
+            ui,
+            self.ui_mode == GuiMode::AdvancedView,
+            verified_ps2_serial.as_deref(),
+            &self.pcsx2_status,
+        );
+        self.handle_pcsx2_action(context, pcsx2_action);
+        Some(action).flatten()
     }
 
     fn review_cheat_apply(&mut self) {
@@ -16415,125 +16532,12 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::Selected {
-                    // `NotScanned` only (never retried on `Error` here) -
-                    // this branch runs every frame the Selected page is
-                    // shown, so retrying on `Error` each frame would spin
-                    // up a new discovery thread every frame forever.
-                    if matches!(
-                        self.dolphin_local_profiles,
-                        DolphinLocalProfilesState::NotScanned
-                    ) {
-                        self.start_dolphin_local_profile_scan(context.clone());
-                    }
-                    if matches!(
-                        self.pcsx2_launch_profiles,
-                        Pcsx2LaunchProfilesState::NotScanned
-                    ) {
-                        self.start_pcsx2_launch_profile_scan(context.clone());
-                    }
-                    if matches!(
-                        self.pcsx2_firmware_evidence,
-                        Pcsx2FirmwareEvidenceState::NotLoaded
-                    ) {
-                        self.start_pcsx2_firmware_evidence_load(context.clone());
-                    }
-                    let live = match &self.state {
-                        LoadState::Ready(data) => Some(data.as_ref()),
-                        _ => None,
-                    };
-                    let action = show_selected_page(
+                    let action = self.show_game_details(
+                        context,
                         ui,
-                        live,
-                        SelectedPageViewState {
-                            selected_archive: self.archive_context.focused.as_deref(),
-                            selected_count: self.archive_context.selected.len(),
-                            retroarch_profiles: &self.retroarch_profiles,
-                            busy: archive_actions_blocked,
-                            block_reason: archive_action_block_reason,
-                        },
+                        archive_actions_blocked,
+                        archive_action_block_reason,
                     );
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    self.show_romm_game_panel(context, ui);
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    let evidence_action = selected_evidence_page::show_selected_evidence_panel(
-                        ui,
-                        self.ui_mode == GuiMode::AdvancedView,
-                        self.archive_context.focused.as_deref(),
-                        &self.selected_evidence,
-                    );
-                    self.handle_selected_evidence_action(context, evidence_action);
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    let live_for_launch_readiness = match &self.state {
-                        LoadState::Ready(data) => Some(data.as_ref()),
-                        _ => None,
-                    };
-                    let launch_readiness_input =
-                        self.build_launch_readiness_input(live_for_launch_readiness);
-                    // Drained before the panel renders, and unconditionally
-                    // (not just while a match displays), so a tracked
-                    // launch is still reaped after the user selects a
-                    // different game - see `launch_retroarch`'s own doc
-                    // comment.
-                    if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
-                        ui.ctx().request_repaint();
-                    }
-                    // Same reasoning as `launch_retroarch` above: drained
-                    // unconditionally so a tracked Dolphin launch is still
-                    // reaped even after the user selects a different game.
-                    if self.launch_dolphin.poll() || self.launch_dolphin.is_active() {
-                        ui.ctx().request_repaint();
-                    }
-                    // Same reasoning as `launch_retroarch` above: drained
-                    // unconditionally so a tracked PCSX2 launch is still
-                    // reaped even after the user selects a different game.
-                    if self.launch_pcsx2.poll() || self.launch_pcsx2.is_active() {
-                        ui.ctx().request_repaint();
-                    }
-                    launch_readiness_page::show_launch_readiness_panel(
-                        ui,
-                        &launch_readiness_input,
-                        &mut self.launch_retroarch,
-                        &mut self.launch_dolphin,
-                        &mut self.launch_pcsx2,
-                    );
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    let identity_sources_action = identity_sources_page::show_identity_sources_panel(
-                        ui,
-                        self.ui_mode == GuiMode::AdvancedView,
-                        &self.identity_sources,
-                    );
-                    self.handle_identity_sources_action(context, identity_sources_action);
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    let plan_preview_action = plan_preview_page::show_plan_preview_panel(
-                        ui,
-                        self.ui_mode == GuiMode::AdvancedView,
-                        self.archive_context.focused.as_deref(),
-                        &self.plan_preview,
-                    );
-                    self.handle_plan_preview_action(context, plan_preview_action);
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    let rpcs3_action = rpcs3_page::show_rpcs3_panel(
-                        ui,
-                        self.ui_mode == GuiMode::AdvancedView,
-                        None,
-                        &self.rpcs3_status,
-                    );
-                    self.handle_rpcs3_action(context, rpcs3_action);
-                    ui.add_space(crate::ui::theme::SECTION_GAP);
-                    let focused_archive = self.archive_context.focused.clone();
-                    self.invalidate_pcsx2_status_if_selection_changed(focused_archive.as_deref());
-                    let verified_ps2_serial = self
-                        .cheat_workflow
-                        .as_ref()
-                        .and_then(pcsx2_identity_for_workflow)
-                        .and_then(|id| id.serial);
-                    let pcsx2_action = pcsx2_page::show_pcsx2_panel(
-                        ui,
-                        self.ui_mode == GuiMode::AdvancedView,
-                        verified_ps2_serial.as_deref(),
-                        &self.pcsx2_status,
-                    );
-                    self.handle_pcsx2_action(context, pcsx2_action);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -17018,6 +17022,18 @@ impl ArchiveFsApp {
                                 library_platform_query: &mut self.library_platform_query,
                             },
                         );
+                        if self.library_tab == LibraryTab::Archives
+                            && self.archive_context.focused.is_some()
+                        {
+                            ui.add_space(crate::ui::theme::SECTION_GAP);
+                            let game_details_action = self.show_game_details(
+                                context,
+                                ui,
+                                archive_actions_blocked,
+                                archive_action_block_reason,
+                            );
+                            self.handle_mount_page_action(context, game_details_action);
+                        }
                     }
                 }
             });
@@ -21521,6 +21537,7 @@ fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
         IdentityImageFormat::Rvz => "This RVZ file",
         IdentityImageFormat::Ciso => "This CISO file",
         IdentityImageFormat::Wbfs => "This WBFS file",
+        IdentityImageFormat::Chd => "This disc image format",
         IdentityImageFormat::Deferred => "This disc image format",
         IdentityImageFormat::LooseCartridgeRom
         | IdentityImageFormat::Xex

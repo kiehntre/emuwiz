@@ -144,11 +144,11 @@ fn opening_cheats_mods_from_gamer_view_actually_switches_mode() {
     assert_eq!(app.view, MainView::CheatsMods);
 }
 
-/// Phase 5: "Review" on an unresolved-platform game must land on
-/// Advanced View's Selected page with that exact game still selected -
-/// not a generic page with no context (requirement 6's journey test).
+/// Phase 5: "Review" on an unresolved-platform game must land in the
+/// Library's Game Details area with that exact game still selected - not a
+/// generic page with no context.
 #[test]
-fn review_identity_lands_on_selected_page_with_the_same_game_still_selected() {
+fn review_identity_lands_in_library_game_details_with_the_same_game_still_selected() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::GamerView;
     let archive_path = PathBuf::from("/roms/Mystery Game.bin");
@@ -156,7 +156,8 @@ fn review_identity_lands_on_selected_page_with_the_same_game_still_selected() {
     app.review_identity(archive_path.clone());
 
     assert_eq!(app.ui_mode, GuiMode::AdvancedView);
-    assert_eq!(app.view, MainView::Selected);
+    assert_eq!(app.view, MainView::Library);
+    assert_eq!(app.library_tab, LibraryTab::Archives);
     assert_eq!(
         app.archive_context.focused.as_deref(),
         Some(archive_path.as_path())
@@ -3505,10 +3506,10 @@ fn cheats_mods_is_a_primary_active_navigation_destination() {
         .expect("Cheats & Mods must be in the primary workflow navigation");
     let selected_position = PRIMARY_NAVIGATION_DESTINATIONS
         .iter()
-        .position(|(view, _)| *view == MainView::Selected)
+        .position(|(view, _)| *view == MainView::Mount)
         .unwrap();
 
-    assert_eq!(position, selected_position + 1);
+    assert!(position > selected_position);
     assert!(navigation_destination_selected(
         MainView::CheatsMods,
         MainView::CheatsMods

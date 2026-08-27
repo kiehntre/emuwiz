@@ -3268,6 +3268,25 @@ fn quick_rename_is_the_single_sidebar_entry_for_the_rename_workflow() {
     }));
 }
 
+#[test]
+fn selected_is_internal_only_and_library_is_the_game_details_destination() {
+    let entries: Vec<&NavEntry> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .collect();
+    assert!(!entries.iter().any(|entry| {
+        entry.label == "Selected" || matches!(entry.click, NavClick::View(MainView::Selected))
+    }));
+    assert!(navigation_destination_selected(
+        MainView::Library,
+        MainView::Library
+    ));
+    assert!(!navigation_destination_selected(
+        MainView::Library,
+        MainView::Selected
+    ));
+}
+
 /// Renders the sidebar alone, the way `SidePanel::left("app_navigation")`
 /// does, at a screen height short enough that the full nav list cannot fit
 /// unclipped (`ADVANCED_NAV_GROUPS` has grown past what 1536x864 and
