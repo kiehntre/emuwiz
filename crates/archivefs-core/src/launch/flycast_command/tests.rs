@@ -236,8 +236,8 @@ fn mounted_or_archive_content_is_rejected() {
 }
 
 #[test]
-fn gdi_and_cdi_are_never_accepted() {
-    for extension in ["gdi", "cdi"] {
+fn cdi_is_never_accepted() {
+    for extension in ["cdi"] {
         let plan = build_flycast_command_plan(
             &resolved(),
             Some("T-8109N"),
@@ -253,8 +253,8 @@ fn gdi_and_cdi_are_never_accepted() {
 }
 
 #[test]
-fn direct_iso_cue_and_chd_are_all_accepted() {
-    for extension in ["iso", "cue", "chd"] {
+fn direct_iso_cue_gdi_and_chd_are_all_accepted() {
+    for extension in ["iso", "cue", "gdi", "chd"] {
         let plan = build_flycast_command_plan(
             &resolved(),
             Some("T-8109N"),

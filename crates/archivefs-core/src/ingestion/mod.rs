@@ -40,6 +40,7 @@ pub mod container;
 pub mod content_registry;
 pub mod cue_bin;
 pub mod discovery;
+pub mod gdi;
 
 #[cfg(test)]
 mod tests;

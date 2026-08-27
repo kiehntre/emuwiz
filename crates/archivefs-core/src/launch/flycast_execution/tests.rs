@@ -136,6 +136,49 @@ fn fresh_identity_revalidates_a_real_dreamcast_iso() {
 }
 
 #[test]
+fn fresh_identity_revalidates_a_real_dreamcast_gdi() {
+    // The GDI-specific counterpart to `fresh_identity_revalidates_a_real_
+    // dreamcast_iso` above - proves a real `.gdi` descriptor (with its own
+    // low-density and high-density tracks) reaches this same fresh
+    // identity revalidation stage through `resolve_gdi_data_track`, one
+    // level below the BIOS-gated full preflight (see this file's own
+    // notes on why a full "reaches strict Ready" test needs real BIOS
+    // bytes this repo never commits).
+    let root = fixture_root("gdi-identity-revalidation");
+    let executable = root.join("bin/flycast");
+    write_executable(&executable, b"#!/bin/sh\nexit 0\n");
+    let games = root.join("games");
+    std::fs::create_dir_all(&games).unwrap();
+    std::fs::write(games.join("track01.bin"), vec![0_u8; 2352]).unwrap();
+    std::fs::write(games.join("track02.raw"), vec![0_u8; 2352]).unwrap();
+    std::fs::write(games.join("track03.iso"), dreamcast_iso_bytes("T-8109N")).unwrap();
+    let content_path = games.join("game.gdi");
+    std::fs::write(
+        &content_path,
+        "3\n\
+         1 0 4 2352 track01.bin 0\n\
+         2 600 0 2352 track02.raw 0\n\
+         3 45000 4 2048 track03.iso 0\n",
+    )
+    .unwrap();
+
+    let roots = flycast_roots(&root, executable.clone());
+    let profile = discovered_profile(&roots);
+    let request = FlycastLaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: "Dreamcast".to_string(),
+        expected_game_key: "T-8109N".to_string(),
+        expected_dreamcast_product_code: "T-8109N".to_string(),
+        profile_id: profile.profile_id.clone(),
+        expected_executable: executable,
+    };
+    let result = fresh_identity_status(&request.selected_content_path, &request).unwrap();
+    assert!(matches!(result.0, CanonicalIdentityStatus::Resolved(_)));
+    assert_eq!(result.2, "T-8109N");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn fresh_identity_rejects_a_mismatched_real_product_code() {
     let root = fixture_root("identity-mismatch");
     let content_path = root.join("games/game.iso");
@@ -206,9 +249,9 @@ fn malformed_dreamcast_media_fails_closed() {
 }
 
 #[test]
-fn gdi_and_cdi_are_refused_at_the_content_gate() {
-    let root = fixture_root("gdi-cdi-refused");
-    for extension in ["gdi", "cdi"] {
+fn cdi_is_refused_at_the_content_gate() {
+    let root = fixture_root("cdi-refused");
+    for extension in ["cdi"] {
         let content_path = root.join(format!("games/game.{extension}"));
         std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
         std::fs::write(&content_path, dreamcast_iso_bytes("T-8109N")).unwrap();
@@ -219,6 +262,18 @@ fn gdi_and_cdi_are_refused_at_the_content_gate() {
             "{extension} must be refused"
         );
     }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn gdi_passes_the_content_gate() {
+    let root = fixture_root("gdi-content-gate");
+    let content_path = root.join("games/game.gdi");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(&content_path, b"1\n1 45000 4 2352 track01.bin 0\n").unwrap();
+    // The content-format gate only inspects the extension/mount-input
+    // classification, not the descriptor's own contents.
+    assert!(inspect_and_capture_content_identity(&content_path).is_ok());
     let _ = std::fs::remove_dir_all(root);
 }
 

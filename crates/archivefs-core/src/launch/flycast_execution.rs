@@ -18,12 +18,12 @@
 //! - `Dreamcast` only - the only platform
 //!   [`crate::launch::flycast_command::FLYCAST_SUPPORTED_PLATFORM_ID`] names
 //!   in this phase.
-//! - One direct loose regular `.iso`, `.cue`, or `.chd` file - no archive
-//!   members, no mounted content, no GDI/CDI, no multi-track GD-ROM. See
-//!   `flycast_command`'s own module doc comment for exactly why these three
-//!   formats (and only these three) are accepted: they are exactly what
-//!   [`crate::game_identity`]'s Dreamcast IP.BIN identity check already
-//!   verifies authoritatively.
+//! - One direct loose regular `.iso`, `.cue`, `.gdi`, or `.chd` file - no
+//!   archive members, no mounted content, no CDI, no multi-track CHD
+//!   GD-ROM. See `flycast_command`'s own module doc comment for exactly
+//!   why these four formats (and only these four) are accepted: they are
+//!   exactly what [`crate::game_identity`]'s Dreamcast IP.BIN identity
+//!   check already verifies authoritatively.
 //! - A verified Dreamcast product code is always required.
 //! - Strictly [`LaunchReadiness::Ready`] - `ReadyWithWarnings` and
 //!   `Blocked` are both refused, never silently accepted. Because
@@ -59,7 +59,7 @@
 //! - It never fabricates firmware evidence: Flycast has no hash-verified
 //!   BIOS state today, so unlike DuckStation's execution slice this module
 //!   takes no `firmware_evidence` parameter at all.
-//! - It never implements GDI/CDI parsing or multi-track GD-ROM support.
+//! - It never implements CDI parsing or multi-track CHD GD-ROM support.
 
 use std::ffi::OsString;
 use std::fs;
@@ -142,8 +142,8 @@ pub enum FlycastLaunchPreflightErrorKind {
     /// (zip/7z/rar) - an outer archive path is never a runnable content
     /// path in this module.
     ContentRequiresMount,
-    /// The requested content path is not a direct `.iso`/`.cue`/`.chd`
-    /// file - includes GDI/CDI and any other non-supported extension.
+    /// The requested content path is not a direct `.iso`/`.cue`/`.gdi`/
+    /// `.chd` file - includes CDI and any other non-supported extension.
     ContentFormatUnsupported,
     /// Fresh re-inspection produced `Unknown` or `Conflicting` identity -
     /// never resolved to one trustworthy answer.
@@ -262,8 +262,8 @@ impl From<FlycastLaunchSpawnError> for FlycastLaunchExecutionError {
 ///
 /// 1. `request.selected_content_path` must be absolute.
 /// 2. The content must exist, not be a symlink, be a regular file, not be
-///    an outer archive/mount-input path, and have a `.iso`, `.cue`, or
-///    `.chd` extension.
+///    an outer archive/mount-input path, and have a `.iso`, `.cue`,
+///    `.gdi`, or `.chd` extension.
 /// 3. A [`CapturedFileIdentity`] is captured from the content's current
 ///    metadata.
 /// 4. The content is freshly re-identified via
@@ -475,8 +475,8 @@ fn inspect_and_capture_content_identity(
     if !direct_dreamcast_extension(path) {
         return Err(preflight_error(
             FlycastLaunchPreflightErrorKind::ContentFormatUnsupported,
-            "only a direct .iso, .cue, or .chd file is supported by this native Flycast launch \
-             slice",
+            "only a direct .iso, .cue, .gdi, or .chd file is supported by this native Flycast \
+             launch slice",
         ));
     }
     Ok(CapturedFileIdentity::capture(&metadata))

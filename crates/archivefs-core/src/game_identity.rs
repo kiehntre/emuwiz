@@ -19,6 +19,7 @@ use crate::disc_evidence_collector::{
 };
 use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
+use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::playstation_boot_evidence::{
@@ -293,6 +294,12 @@ pub enum IdentityImageFormat {
     /// other CHD (other platforms, specialist-optical-backend media,
     /// non-ISO9660 content) still reports [`Self::Deferred`].
     Chd,
+    /// A Dreamcast `.gdi` descriptor's own high-density data track,
+    /// resolved via [`crate::ingestion::gdi::resolve_gdi_data_track`] and
+    /// read through the existing bounded raw/cooked CD logical-media
+    /// readers - the same standard [`Self::Iso`]/CUE Dreamcast identity
+    /// already meets. GDI is Dreamcast-only: PS1/Saturn never used GD-ROM.
+    Gdi,
     Deferred,
     Unsupported,
 }
@@ -545,6 +552,9 @@ fn inspect_game_identity_with_platform_trust(
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
+        "gdi" if platform == IdentityPlatform::Dreamcast => {
+            inspect_gdi(&mut report, trusted);
+        }
         "cue"
             if matches!(
                 platform,
@@ -877,6 +887,45 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
                 }
             }
         }
+    };
+    inspect_iso_source(report, &mut source, None, None);
+    report.bytes_read = source.bytes_read();
+}
+
+/// Authoritative Dreamcast identity from a `.gdi` descriptor's own
+/// high-density data track - the same [`inspect_iso_source`]/
+/// [`inspect_dreamcast_source`] standard [`inspect_cue`] already meets for
+/// CUE, reached through [`resolve_gdi_data_track`] instead of
+/// [`resolve_data_track`]. No IP.BIN/product-code logic is duplicated here;
+/// only the container-opening step differs from `inspect_cue`.
+fn inspect_gdi(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::Gdi;
+    let track = match resolve_gdi_data_track(&report.archive_path) {
+        Ok(track) => track,
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("GDI data track could not be resolved: {error}"),
+            );
+            return;
+        }
+    };
+    let mut source = match track.mode {
+        GdiDataTrackMode::Cooked2048 => match open_cooked_cd_file_logical_media(&track.path) {
+            Ok(media) => CueMediaSource::Cooked(MediaSource::new(media)),
+            Err(error) => {
+                add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        },
+        GdiDataTrackMode::Raw2352 => match open_raw_cd_file_logical_media(&track.path) {
+            Ok(media) => CueMediaSource::Raw(MediaSource::new(media)),
+            Err(error) => {
+                add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        },
     };
     inspect_iso_source(report, &mut source, None, None);
     report.bytes_read = source.bytes_read();
@@ -4599,6 +4648,260 @@ mod tests {
 
         let path = write_fixture(&directory, "missing-product.iso", &dreamcast_iso(b""));
         let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    /// A normal 3-track Dreamcast GDI: a small low-density track (ignored),
+    /// an audio track (ignored, never opened as identity evidence), and the
+    /// real high-density data track at/after the documented GD-ROM
+    /// boundary - selected by metadata alone.
+    fn dreamcast_gdi_descriptor(data_filename: &str, sector_size: u32) -> String {
+        format!(
+            "3\n\
+             1 0 4 2352 track01.bin 0\n\
+             2 600 0 2352 track02.raw 0\n\
+             3 45000 4 {sector_size} {data_filename} 0\n"
+        )
+    }
+
+    #[test]
+    fn dreamcast_gdi_raw_2352_data_track_verifies_product_code() {
+        let directory = FixtureDir::new("dreamcast-gdi-raw");
+        let iso = dreamcast_iso(b"T-8109N");
+        fs::write(
+            directory.0.join("track01.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("track02.raw"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(directory.0.join("game.bin"), ps1_raw_bin(&iso)).unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "unrelated-name.gdi",
+            dreamcast_gdi_descriptor("game.bin", 2352).as_bytes(),
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.platform, IdentityPlatform::Dreamcast);
+        assert_eq!(report.format, IdentityImageFormat::Gdi);
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_cooked_2048_data_track_verifies_product_code() {
+        let directory = FixtureDir::new("dreamcast-gdi-cooked");
+        let iso = dreamcast_iso(b"T-8109N");
+        fs::write(
+            directory.0.join("track01.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("track02.raw"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(directory.0.join("game.iso"), &iso).unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "game.gdi",
+            dreamcast_gdi_descriptor("game.iso", 2048).as_bytes(),
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_filename_disagreement_is_irrelevant() {
+        let directory = FixtureDir::new("dreamcast-gdi-filename-disagreement");
+        let iso = dreamcast_iso(b"T-8109N");
+        fs::write(
+            directory.0.join("track01.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("track02.raw"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("totally_unrelated_name.dat"),
+            ps1_raw_bin(&iso),
+        )
+        .unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "Some Other Game Title.gdi",
+            dreamcast_gdi_descriptor("totally_unrelated_name.dat", 2352).as_bytes(),
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+    }
+
+    #[test]
+    fn dreamcast_gdi_malformed_descriptor_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-malformed");
+        let gdi_path = write_fixture(&directory, "malformed.gdi", b"not-a-track-count\n");
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Gdi);
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_missing_track_file_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-missing-track");
+        let gdi_path = write_fixture(
+            &directory,
+            "missing.gdi",
+            b"1\n1 45000 4 2352 does_not_exist.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_traversal_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-traversal");
+        let gdi_path = write_fixture(
+            &directory,
+            "traversal.gdi",
+            b"1\n1 45000 4 2352 ../outside.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dreamcast_gdi_symlink_escape_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-symlink");
+        let iso = dreamcast_iso(b"T-8109N");
+        let outside = directory
+            .0
+            .parent()
+            .unwrap()
+            .join(format!("gdi-outside-{}", std::process::id()));
+        fs::write(&outside, ps1_raw_bin(&iso)).unwrap();
+        std::os::unix::fs::symlink(&outside, directory.0.join("escape.bin")).unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "symlink.gdi",
+            b"1\n1 45000 4 2352 escape.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn dreamcast_gdi_duplicate_track_number_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-duplicate-number");
+        fs::write(
+            directory.0.join("a.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES],
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("b.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES * 2],
+        )
+        .unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "duplicate.gdi",
+            b"2\n1 0 4 2352 a.bin 0\n1 45000 4 2352 b.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_ambiguous_data_tracks_fail_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-ambiguous");
+        fs::write(
+            directory.0.join("a.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES * 2],
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("b.bin"),
+            vec![0_u8; crate::raw_cd_sector::RAW_SECTOR_BYTES * 2],
+        )
+        .unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "ambiguous.gdi",
+            b"2\n1 45000 4 2352 a.bin 0\n2 50000 4 2352 b.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_unsupported_sector_size_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-bad-sector-size");
+        fs::write(directory.0.join("a.bin"), vec![0_u8; 2336 * 2]).unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "bad-sector-size.gdi",
+            b"1\n1 45000 4 2336 a.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_truncated_data_track_fails_closed() {
+        let directory = FixtureDir::new("dreamcast-gdi-truncated");
+        // A `.bin` claiming 2352-byte sectors but truncated mid-sector.
+        fs::write(directory.0.join("game.bin"), vec![0_u8; 2352 + 100]).unwrap();
+        let gdi_path = write_fixture(
+            &directory,
+            "truncated.gdi",
+            b"1\n1 45000 4 2352 game.bin 0\n",
+        );
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_gdi_non_dreamcast_platform_is_unsupported_not_verified() {
+        let directory = FixtureDir::new("dreamcast-gdi-wrong-platform");
+        let iso = dreamcast_iso(b"T-8109N");
+        fs::write(directory.0.join("game.bin"), ps1_raw_bin(&iso)).unwrap();
+        let gdi_path = write_fixture(&directory, "game.gdi", b"1\n1 45000 4 2352 game.bin 0\n");
+        let report = inspect_game_identity(&gdi_path, Some("PlayStation"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert_ne!(report.format, IdentityImageFormat::Gdi);
+    }
+
+    #[test]
+    fn dreamcast_gdi_non_dreamcast_content_does_not_verify() {
+        let directory = FixtureDir::new("dreamcast-gdi-non-dreamcast-content");
+        // Valid ISO9660 content but no Dreamcast IP.BIN signature at all.
+        let mut not_dreamcast = vec![0_u8; 24 * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        not_dreamcast[pvd] = 1;
+        not_dreamcast[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        not_dreamcast[pvd + 6] = 1;
+        fs::write(directory.0.join("game.bin"), ps1_raw_bin(&not_dreamcast)).unwrap();
+        let gdi_path = write_fixture(&directory, "game.gdi", b"1\n1 45000 4 2352 game.bin 0\n");
+        let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
         assert_eq!(report.verified_dreamcast_product_code(), None);
         assert!(!report.complete);
     }

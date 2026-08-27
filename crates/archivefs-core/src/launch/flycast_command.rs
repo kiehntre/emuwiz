@@ -11,18 +11,20 @@
 //! # Scope
 //!
 //! Only the first supported native Flycast launch slice: `Dreamcast`
-//! platform, a direct regular `.iso`, `.cue`, or `.chd` file, a verified
-//! Dreamcast product code, and an exact eligible
-//! [`FlycastNativeLaunchBinding`]. Mounted/archive content, GDI/CDI, and
-//! multi-track GD-ROM images are all refused here - never silently widened.
+//! platform, a direct regular `.iso`, `.cue`, `.gdi`, or `.chd` file, a
+//! verified Dreamcast product code, and an exact eligible
+//! [`FlycastNativeLaunchBinding`]. Mounted/archive content, CDI, and
+//! multi-track CHD GD-ROM images are all refused here - never silently
+//! widened.
 //!
-//! `.iso`, `.cue`, and `.chd` are exactly the formats
+//! `.iso`, `.cue`, `.gdi`, and `.chd` are exactly the formats
 //! [`crate::game_identity`]'s Dreamcast IP.BIN identity check already
 //! verifies authoritatively (see `inspect_dreamcast_source`'s dispatch in
-//! that module) - this slice never accepts a format the identity layer
-//! could not already prove. GDI/CDI/multi-track GD-ROM have no such
-//! authoritative identity path today and remain deferred, matching the
-//! task's own explicit scope boundary.
+//! that module, and [`crate::ingestion::gdi`] for how `.gdi`'s own
+//! high-density data track is resolved) - this slice never accepts a
+//! format the identity layer could not already prove. CDI and multi-track
+//! CHD GD-ROM have no such authoritative identity path today and remain
+//! deferred, matching the task's own explicit scope boundary.
 //!
 //! # Argv contract
 //!
@@ -54,9 +56,9 @@ pub const FLYCAST_SUPPORTED_PLATFORM_ID: &str = "Dreamcast";
 
 /// The only direct content extensions this slice supports (lowercase, no
 /// dot) - exactly the formats [`crate::game_identity`]'s Dreamcast IP.BIN
-/// identity check already verifies authoritatively. GDI/CDI and other
-/// multi-track GD-ROM representations are deliberately absent.
-const FLYCAST_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "cue", "chd"];
+/// identity check already verifies authoritatively. CDI and multi-track
+/// GD-ROM representations are deliberately absent.
+const FLYCAST_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "cue", "gdi", "chd"];
 
 /// The executable invocation data for a Flycast launch that has passed every
 /// fail-closed check. This is data only: no type in this module implements
@@ -218,8 +220,8 @@ pub fn build_flycast_command_plan(
         } else if !direct_dreamcast_extension(path) {
             blockers.push(blocker(
                 LaunchBlockerKind::FlycastContentFormatUnsupported,
-                "only a direct .iso, .cue, or .chd file is supported by this native Flycast \
-                 launch slice; GDI/CDI and multi-track GD-ROM are not supported",
+                "only a direct .iso, .cue, .gdi, or .chd file is supported by this native \
+                 Flycast launch slice; CDI and multi-track CHD GD-ROM are not supported",
             ));
         }
     }
