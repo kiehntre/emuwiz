@@ -112,6 +112,35 @@ fn verified_ps1_serial_resolves_to_duckstation_fact() {
 }
 
 #[test]
+fn verified_saturn_product_number_resolves_to_saturn_fact() {
+    let source = report(
+        IdentityPlatform::Saturn,
+        vec![evidence(
+            IdentityKind::SaturnProductNumber,
+            IdentityStatus::Verified,
+            Some("T-7101G"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Saturn".to_string(),
+            game_key: "T-7101G".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::SaturnProductCode(
+            "T-7101G".to_string()
+        )]
+    );
+}
+
+#[test]
 fn conflicting_ps1_serials_never_produce_a_duckstation_fact() {
     let source = report(
         IdentityPlatform::PlayStation,

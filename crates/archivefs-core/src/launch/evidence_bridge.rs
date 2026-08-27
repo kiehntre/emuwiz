@@ -73,6 +73,7 @@ fn is_identity_conferring(kind: IdentityKind) -> bool {
         kind,
         IdentityKind::Ps1Serial
             | IdentityKind::Ps2Serial
+            | IdentityKind::SaturnProductNumber
             | IdentityKind::Pcsx2ExecutableCrc
             | IdentityKind::DolphinGameId
             | IdentityKind::LooseRomSha256
@@ -128,6 +129,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
     match platform {
         IdentityPlatform::PlayStation => Some("PSX"),
         IdentityPlatform::PlayStation2 => Some("PS2"),
+        IdentityPlatform::Saturn => Some("Saturn"),
         IdentityPlatform::GameCube => Some("GameCube"),
         IdentityPlatform::Wii => Some("Wii"),
         IdentityPlatform::MegaDrive => Some("MegaDrive"),
@@ -172,6 +174,16 @@ fn resolved_identity_for_platform(
                 facts.push(VerifiedIdentityFact::Ps2ExecutableCrc(crc.to_string()));
             }
             Some((platform_id, game_key, facts))
+        }
+        IdentityPlatform::Saturn => {
+            let product_number = find_value(resolved, IdentityKind::SaturnProductNumber)?;
+            Some((
+                platform_id,
+                product_number.to_string(),
+                vec![VerifiedIdentityFact::SaturnProductCode(
+                    product_number.to_string(),
+                )],
+            ))
         }
         IdentityPlatform::GameCube => {
             let game_id = find_value(resolved, IdentityKind::DolphinGameId)?;

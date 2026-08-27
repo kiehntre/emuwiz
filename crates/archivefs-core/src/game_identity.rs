@@ -26,6 +26,7 @@ use crate::playstation_boot_evidence::{
 use crate::raw_cd_logical_media::{
     open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
 };
+use crate::saturn_boot_evidence::{SATURN_SYSTEM_ID_BYTES, parse_saturn_system_id};
 
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
 pub const MAX_ARCHIVE_MEMBERS: usize = 4_096;
@@ -164,6 +165,7 @@ pub enum IdentityKind {
     Platform,
     Ps1Serial,
     Ps2Serial,
+    SaturnProductNumber,
     Pcsx2ExecutableCrc,
     DolphinGameId,
     DolphinRevision,
@@ -182,6 +184,7 @@ impl fmt::Display for IdentityKind {
             Self::Platform => "Platform",
             Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
+            Self::SaturnProductNumber => "Saturn product number",
             Self::Pcsx2ExecutableCrc => "PCSX2 executable CRC",
             Self::DolphinGameId => "Dolphin Game ID",
             Self::DolphinRevision => "Dolphin revision",
@@ -212,6 +215,7 @@ pub enum IdentityConfidence {
 pub enum IdentityPlatform {
     PlayStation,
     PlayStation2,
+    Saturn,
     GameCube,
     Wii,
     MegaDrive,
@@ -227,6 +231,7 @@ impl IdentityPlatform {
             "playstation" | "playstation 1" | "playstation1" | "psx" | "ps1"
             | "sony playstation" => Self::PlayStation,
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
+            "saturn" | "sega saturn" | "sega saturn console" => Self::Saturn,
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" => Self::GameCube,
             "wii" | "nintendo wii" => Self::Wii,
             "megadrive" | "mega drive" | "genesis" | "sega mega drive" | "sega genesis" => {
@@ -246,6 +251,7 @@ impl IdentityPlatform {
         match self {
             Self::PlayStation => "PlayStation",
             Self::PlayStation2 => "PlayStation 2",
+            Self::Saturn => "Sega Saturn",
             Self::GameCube => "GameCube",
             Self::Wii => "Wii",
             Self::MegaDrive => "Mega Drive / Genesis",
@@ -395,6 +401,10 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::Ps1Serial)
     }
 
+    pub fn verified_saturn_product_number(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::SaturnProductNumber)
+    }
+
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
         self.verified_value(IdentityKind::LooseRomSha256)
     }
@@ -525,8 +535,13 @@ fn inspect_game_identity_with_platform_trust(
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
-        "cue" if platform == IdentityPlatform::PlayStation => {
-            inspect_ps1_cue(&mut report, trusted);
+        "cue"
+            if matches!(
+                platform,
+                IdentityPlatform::PlayStation | IdentityPlatform::Saturn
+            ) =>
+        {
+            inspect_cue(&mut report, trusted);
         }
         "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => {
             inspect_direct_iso(&mut report, trusted)
@@ -543,8 +558,13 @@ fn inspect_game_identity_with_platform_trust(
         "wbfs" if platform == IdentityPlatform::Wii => {
             inspect_wbfs(&mut report, trusted);
         }
-        "chd" if platform == IdentityPlatform::PlayStation => {
-            inspect_ps1_chd(&mut report, trusted);
+        "chd"
+            if matches!(
+                platform,
+                IdentityPlatform::PlayStation | IdentityPlatform::Saturn
+            ) =>
+        {
+            inspect_disc_chd(&mut report, trusted);
         }
         "chd" | "cso" | "rvz" | "wbfs" | "ciso" | "gcz" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
@@ -814,7 +834,7 @@ fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.bytes_read = source.bytes_read;
 }
 
-fn inspect_ps1_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
     let track = match resolve_data_track(&report.archive_path) {
         Ok(track) => track,
         Err(error) => {
@@ -938,6 +958,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         }
         IdentityPlatform::PlayStation
         | IdentityPlatform::PlayStation2
+        | IdentityPlatform::Saturn
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Xbox360
@@ -1303,6 +1324,9 @@ fn inspect_iso_source(
 ) {
     match report.platform {
         IdentityPlatform::PlayStation => inspect_ps1_iso(report, source, member_path, member_index),
+        IdentityPlatform::Saturn => {
+            inspect_saturn_source(report, source, member_path, member_index)
+        }
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -1314,6 +1338,93 @@ fn inspect_iso_source(
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => {}
     }
+}
+
+/// Authoritative Saturn identity from the fixed System ID at logical sector
+/// zero. The source may be a plain ISO, a CUE/BIN logical view, a ZIP member,
+/// or another already-opened bounded logical medium; media/container parsing
+/// remains outside this identity check.
+fn inspect_saturn_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut header = [0_u8; SATURN_SYSTEM_ID_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut header) {
+        push_with_source(
+            report,
+            IdentityKind::SaturnProductNumber,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Saturn System ID bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(fact) = parse_saturn_system_id(&header) else {
+        push_with_source(
+            report,
+            IdentityKind::SaturnProductNumber,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Saturn System ID parse",
+            "Saturn System ID is truncated or malformed",
+        );
+        return;
+    };
+    if !fact.hardware_id_recognized {
+        push_with_source(
+            report,
+            IdentityKind::SaturnProductNumber,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Saturn System ID hardware signature",
+            "disc does not contain the verified SEGA SEGASATURN boot signature",
+        );
+        return;
+    }
+    if fact.product_number.is_empty()
+        || !fact
+            .product_number
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+    {
+        push_with_source(
+            report,
+            IdentityKind::SaturnProductNumber,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Saturn System ID product number",
+            "Saturn System ID has no valid printable product number",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::SaturnProductNumber,
+        IdentityStatus::Verified,
+        Some(fact.product_number),
+        IdentityConfidence::ExactBytes,
+        member_path,
+        member_index,
+        "Saturn System ID product number",
+        "product number read from a verified SEGA SEGASATURN System ID",
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
 }
 
 /// `header_offset` is the absolute byte offset of the 0x20-byte Dolphin
@@ -2347,12 +2458,12 @@ fn inspect_ps1_iso(
 /// duplicated here; only the control flow that turns their results into
 /// [`IdentityStatus`] values is (necessarily) written twice, once per
 /// underlying media abstraction.
-fn inspect_ps1_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
     report.format = IdentityImageFormat::Chd;
     let bytes = match read_bounded_chd_bytes(&report.archive_path) {
         Ok(bytes) => bytes,
         Err(refusal) => {
-            push_ps1_chd_refusal(report, &refusal);
+            push_disc_chd_refusal(report, &refusal);
             return;
         }
     };
@@ -2360,10 +2471,17 @@ fn inspect_ps1_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
     let (media, filesystem) = match open_chd_iso9660(&bytes) {
         Ok(pair) => pair,
         Err(refusal) => {
-            push_ps1_chd_refusal(report, &refusal);
+            push_disc_chd_refusal(report, &refusal);
             return;
         }
     };
+
+    if report.platform == IdentityPlatform::Saturn {
+        let mut source = MediaSource::new(media);
+        inspect_saturn_source(report, &mut source, None, None);
+        report.bytes_read = report.bytes_read.max(source.bytes_read());
+        return;
+    }
 
     report.metadata_paths_inspected += 1;
     let cnf = match find_path(&media, &filesystem, "SYSTEM.CNF") {
@@ -2575,7 +2693,7 @@ fn inspect_ps1_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
 /// Maps a [`DiscCollectionRefusal`] from opening/decoding a `.chd` into the
 /// honest [`IdentityStatus`] for that failure - never `Verified`, and never
 /// a guess at what the content might have been.
-fn push_ps1_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollectionRefusal) {
+fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollectionRefusal) {
     let status = match refusal {
         DiscCollectionRefusal::TooLarge { .. } => IdentityStatus::ResourceLimitReached,
         DiscCollectionRefusal::NoLogicalReaderAvailable => IdentityStatus::Unsupported,
@@ -2588,7 +2706,10 @@ fn push_ps1_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollectio
     };
     push_with_source(
         report,
-        IdentityKind::Ps1Serial,
+        match report.platform {
+            IdentityPlatform::Saturn => IdentityKind::SaturnProductNumber,
+            _ => IdentityKind::Ps1Serial,
+        },
         status,
         None,
         IdentityConfidence::Unavailable,
@@ -3067,6 +3188,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::PlayStation2 => {
             &[IdentityKind::Ps2Serial, IdentityKind::Pcsx2ExecutableCrc]
         }
+        IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -3148,7 +3270,10 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
                 }
             }
         }
-        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => {}
+        IdentityPlatform::Saturn
+        | IdentityPlatform::MegaDrive
+        | IdentityPlatform::Snes
+        | IdentityPlatform::Other => {}
     }
 }
 
@@ -3323,6 +3448,31 @@ mod tests {
         iso[cursor] = 0;
         let cnf_offset = 21 * ISO_SECTOR_SIZE as usize;
         iso[cnf_offset..cnf_offset + cnf.len()].copy_from_slice(cnf);
+        iso
+    }
+
+    fn saturn_iso(product_number: &[u8]) -> Vec<u8> {
+        let mut iso = vec![0_u8; 24 * ISO_SECTOR_SIZE as usize];
+        let mut system_id = vec![b' '; SATURN_SYSTEM_ID_BYTES];
+        system_id[..16].copy_from_slice(b"SEGA SEGASATURN ");
+        system_id[0x10..0x20].copy_from_slice(b"SEGA ENTERPRISES");
+        let product_len = product_number.len().min(10);
+        system_id[0x20..0x20 + product_len].copy_from_slice(&product_number[..product_len]);
+        system_id[0x2a..0x30].copy_from_slice(b"V1.004");
+        system_id[0x30..0x38].copy_from_slice(b"19961117");
+        system_id[0x38..0x40].copy_from_slice(b"CD-1/1  ");
+        iso[..SATURN_SYSTEM_ID_BYTES].copy_from_slice(&system_id);
+
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
         iso
     }
 
@@ -4228,6 +4378,49 @@ mod tests {
         let report = inspect_game_identity(&cue_path, Some("PSX"));
         assert_eq!(report.verified_ps1_serial(), Some("SLUS-12345"));
         assert!(report.complete);
+    }
+
+    #[test]
+    fn saturn_iso_cue_and_chd_verify_the_system_id_product_number() {
+        let directory = FixtureDir::new("saturn-identity");
+        let iso = saturn_iso(b"T-7101G");
+        let iso_path = write_fixture(&directory, "unrelated-name.iso", &iso);
+        let report = inspect_game_identity(&iso_path, Some("Sega Saturn"));
+        assert_eq!(report.platform, IdentityPlatform::Saturn);
+        assert_eq!(report.verified_saturn_product_number(), Some("T-7101G"));
+        assert!(report.complete);
+
+        let bin_path = directory.0.join("actual-disc.bin");
+        fs::write(&bin_path, ps1_raw_bin(&iso)).unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "unrelated-title.cue",
+            b"FILE \"actual-disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("Saturn"));
+        assert_eq!(report.verified_saturn_product_number(), Some("T-7101G"));
+        assert!(report.complete);
+
+        let chd_path = write_fixture(&directory, "unrelated-title.chd", &ps1_chd(&iso));
+        let report = inspect_game_identity(&chd_path, Some("Saturn"));
+        assert_eq!(report.verified_saturn_product_number(), Some("T-7101G"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn saturn_identity_fails_closed_for_wrong_signature_or_missing_product() {
+        let directory = FixtureDir::new("saturn-invalid");
+        let mut wrong = saturn_iso(b"T-7101G");
+        wrong[..16].copy_from_slice(b"NOT A SATURN    ");
+        let path = write_fixture(&directory, "wrong.iso", &wrong);
+        let report = inspect_game_identity(&path, Some("Saturn"));
+        assert_eq!(report.verified_saturn_product_number(), None);
+        assert!(!report.complete);
+
+        let path = write_fixture(&directory, "missing-product.iso", &saturn_iso(b""));
+        let report = inspect_game_identity(&path, Some("Saturn"));
+        assert_eq!(report.verified_saturn_product_number(), None);
+        assert!(!report.complete);
     }
 
     #[test]

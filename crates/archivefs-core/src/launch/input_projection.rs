@@ -85,6 +85,8 @@ pub enum VerifiedIdentityFact {
     WiiGameId(String),
     /// A verified Dreamcast product code.
     DreamcastProductCode(String),
+    /// A verified Sega Saturn product number.
+    SaturnProductCode(String),
     /// A verified Atari ST title, matching
     /// [`crate::patch_manager::HatariSelectedGameRequest::verified_title`].
     AtariStTitle(String),
