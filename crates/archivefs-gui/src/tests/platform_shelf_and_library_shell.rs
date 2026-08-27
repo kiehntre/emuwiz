@@ -274,12 +274,13 @@ fn legacy_library_destinations_still_have_a_title_and_width_policy() {
 }
 
 #[test]
-fn library_tab_for_main_view_covers_exactly_the_four_library_destinations() {
+fn library_tab_for_main_view_covers_all_five_library_destinations() {
     let library_destinations = [
         (MainView::Library, LibraryTab::Archives),
         (MainView::Health, LibraryTab::Health),
         (MainView::Duplicates, LibraryTab::Duplicates),
         (MainView::LibraryViews, LibraryTab::Views),
+        (MainView::RecentlyFound, LibraryTab::RecentlyFound),
     ];
     for (view, expected_tab) in library_destinations {
         assert_eq!(
@@ -289,11 +290,9 @@ fn library_tab_for_main_view_covers_exactly_the_four_library_destinations() {
         );
     }
 
-    // Every other destination, including RecentlyFound (its own
-    // primary destination, not one of the four unified tabs), must
-    // map to None rather than silently picking a tab.
+    // Every other destination must map to None rather than silently picking
+    // a Library tab.
     let non_library_destinations = [
-        MainView::RecentlyFound,
         MainView::Sources,
         MainView::Mount,
         MainView::Selected,
@@ -320,6 +319,7 @@ fn main_view_for_library_tab_round_trips_with_library_tab_for_main_view() {
         LibraryTab::Health,
         LibraryTab::Duplicates,
         LibraryTab::Views,
+        LibraryTab::RecentlyFound,
     ] {
         let view = main_view_for_library_tab(tab);
         assert_eq!(
@@ -337,11 +337,21 @@ fn library_tab_label_is_distinct_and_non_empty_for_every_tab() {
         LibraryTab::Health,
         LibraryTab::Duplicates,
         LibraryTab::Views,
+        LibraryTab::RecentlyFound,
     ]
     .into_iter()
     .map(library_tab_label)
     .collect();
-    assert_eq!(labels, vec!["Archives", "Health", "Duplicates", "Views"]);
+    assert_eq!(
+        labels,
+        vec![
+            "Archives",
+            "Health",
+            "Duplicates",
+            "Views",
+            "Recently Found"
+        ]
+    );
     let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
     assert_eq!(
         unique.len(),
@@ -492,14 +502,21 @@ fn views_configuration_survives_a_library_tab_switch() {
 }
 
 #[test]
-fn library_shell_header_shows_all_four_tab_labels() {
+fn library_shell_header_shows_all_five_tab_labels() {
     let ctx = egui::Context::default();
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let _ = show_library_shell_header(ui, LibraryTab::Archives);
         });
     });
-    for expected in ["My Games", "Archives", "Health", "Duplicates", "Views"] {
+    for expected in [
+        "My Games",
+        "Archives",
+        "Health",
+        "Duplicates",
+        "Views",
+        "Recently Found",
+    ] {
         assert!(
             rendered_text_contains(&output, expected),
             "the Library shell header did not render {expected:?}"
@@ -515,6 +532,7 @@ fn library_shell_header_tabs_are_reachable_via_a_real_click() {
         LibraryTab::Health,
         LibraryTab::Duplicates,
         LibraryTab::Views,
+        LibraryTab::RecentlyFound,
     ] {
         let discovery_output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -560,6 +578,7 @@ fn library_shell_header_marks_the_current_tab_selected() {
         LibraryTab::Health,
         LibraryTab::Duplicates,
         LibraryTab::Views,
+        LibraryTab::RecentlyFound,
     ] {
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -590,18 +609,11 @@ fn library_is_the_only_sidebar_destination_for_the_library_area() {
             "{absent:?} must not be a separate sidebar destination any more"
         );
     }
-    // The Library area contributes exactly one destination. Counting only
-    // those, rather than the whole sidebar, is what this test is actually
-    // about: pinning the total meant any unrelated page added elsewhere
-    // failed a Library-consolidation test, which says nothing about
-    // Library. Cheat Sources was the first such page.
-    let library_area_destinations = PRIMARY_NAVIGATION_DESTINATIONS
-        .iter()
-        .filter(|(view, _)| library_tab_for_main_view(*view).is_some())
-        .count();
-    assert_eq!(
-        library_area_destinations, 1,
-        "sidebar consolidation must leave Library as the area's only destination"
+    assert!(
+        !PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .any(|(view, _)| *view == MainView::RecentlyFound),
+        "Recently Found must be a Library tab, not a sidebar destination"
     );
 }
 
@@ -612,13 +624,14 @@ fn library_sidebar_button_is_selected_on_every_library_tab() {
         MainView::Health,
         MainView::Duplicates,
         MainView::LibraryViews,
+        MainView::RecentlyFound,
     ] {
         assert!(
             navigation_destination_selected(view, MainView::Library),
             "the Library sidebar button must render selected while on {view:?}"
         );
     }
-    for view in [MainView::Mount, MainView::Settings, MainView::RecentlyFound] {
+    for view in [MainView::Mount, MainView::Settings] {
         assert!(
             !navigation_destination_selected(view, MainView::Library),
             "the Library sidebar button must not render selected while on {view:?}"

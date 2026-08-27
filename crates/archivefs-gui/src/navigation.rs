@@ -14,7 +14,7 @@
 
 use super::*;
 
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 16] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
@@ -26,7 +26,6 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
     (MainView::DatSources, "DAT Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
-    (MainView::RecentlyFound, "Recently Found"),
     (MainView::Sources, "Sources"),
     (MainView::Doctor, "Doctor"),
     (MainView::HistoryLogs, "History & Logs"),
@@ -149,7 +148,6 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
         heading: Some("LIBRARY"),
         entries: &[
             nav_view(MainView::Library, "Library"),
-            nav_view(MainView::RecentlyFound, "Recently Found"),
             nav_view(MainView::Selected, "Selected"),
             nav_quick_rename("Quick Rename"),
             nav_view(MainView::CanonicalOrganisation, "Library Organisation"),
@@ -211,17 +209,14 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
 /// judged sufficient for now - see docs/GUI_SIMPLIFICATION.md). Kept
 /// correct and ready rather than deleted and potentially reinvented.
 pub(crate) fn navigation_destination_enabled(view: MainView, has_database: bool) -> bool {
-    !matches!(
-        view,
-        MainView::Health | MainView::Duplicates | MainView::RecentlyFound
-    ) || has_database
+    !matches!(view, MainView::Health | MainView::Duplicates) || has_database
 }
 
 /// Whether the sidebar button for `candidate` should render as selected
 /// given the currently active `current` view. Ordinary destinations use
 /// exact equality; `MainView::Library`'s button is the sole sidebar entry
 /// point into the unified Library shell, so it renders selected whenever
-/// `current` is *any* of the four Library-related destinations
+/// `current` is *any* of the five Library-related destinations
 /// (`library_tab_for_main_view(current).is_some()`), not just
 /// `MainView::Library` itself - otherwise the sidebar would show no
 /// selected destination at all while on the Health, Duplicates, or Views

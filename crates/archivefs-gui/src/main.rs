@@ -3266,12 +3266,12 @@ enum MainView {
     About,
 }
 
-/// The four lenses onto Library data, now visibly unified as tabs of one
+/// The five lenses onto Library data, now visibly unified as tabs of one
 /// Library page (see docs/GUI_SIMPLIFICATION.md's "Library IA migration"
 /// section) even though each still has its own `MainView` variant and
 /// render function underneath, retained for compatibility - see
-/// `ArchiveFsApp::update`'s central-panel dispatch, where all four are
-/// rendered from one block instead of four separate ones. `Archives`
+/// `ArchiveFsApp::update`'s central-panel dispatch, where all five are
+/// rendered from one block instead of five separate ones. `Archives`
 /// corresponds to `MainView::Library` (the archive table); `Views`
 /// corresponds to `MainView::LibraryViews` (saved library views) - named
 /// differently from its `MainView` variant because "Library Views" would
@@ -3284,7 +3284,7 @@ enum MainView {
 /// `ArchiveFsApp::library_tab` (`LibraryTab`) is a *derived* projection of
 /// it: once per frame, before anything renders,
 /// `library_tab_for_main_view(self.view)` is consulted, and if `self.view`
-/// is one of the four Library-related destinations, `self.library_tab` is
+/// is one of the five Library-related destinations, `self.library_tab` is
 /// set to match. If `self.view` is anything else (Mount, Settings, ...),
 /// `self.library_tab` is left untouched, so it keeps remembering the last
 /// Library tab visited. The unified Library shell then reads
@@ -3305,6 +3305,7 @@ enum LibraryTab {
     Health,
     Duplicates,
     Views,
+    RecentlyFound,
 }
 
 /// The `MainView` destination that currently renders `tab`'s content -
@@ -3336,20 +3337,18 @@ fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
         LibraryTab::Health => MainView::Health,
         LibraryTab::Duplicates => MainView::Duplicates,
         LibraryTab::Views => MainView::LibraryViews,
+        LibraryTab::RecentlyFound => MainView::RecentlyFound,
     }
 }
 
-/// Which `LibraryTab` (if any) `view` corresponds to - `None` for every
-/// non-Library destination (Mount, Settings, ...) and, deliberately, for
-/// `MainView::RecentlyFound` too: Recently Found is its own primary
-/// destination with its own place in the sidebar, not one of the four
-/// tabs this milestone is unifying.
+/// Which `LibraryTab` (if any) `view` corresponds to.
 fn library_tab_for_main_view(view: MainView) -> Option<LibraryTab> {
     match view {
         MainView::Library => Some(LibraryTab::Archives),
         MainView::Health => Some(LibraryTab::Health),
         MainView::Duplicates => Some(LibraryTab::Duplicates),
         MainView::LibraryViews => Some(LibraryTab::Views),
+        MainView::RecentlyFound => Some(LibraryTab::RecentlyFound),
         _ => None,
     }
 }
@@ -3364,11 +3363,12 @@ fn library_tab_label(tab: LibraryTab) -> &'static str {
         LibraryTab::Health => "Health",
         LibraryTab::Duplicates => "Duplicates",
         LibraryTab::Views => "Views",
+        LibraryTab::RecentlyFound => "Recently Found",
     }
 }
 
 /// The unified Library shell's chrome: the shared "Library" heading and
-/// the four-tab selector, rendered identically regardless of which tab is
+/// the five-tab selector, rendered identically regardless of which tab is
 /// selected. Content dispatch (`match self.library_tab { ... }`) stays in
 /// `ArchiveFsApp::update`'s central-panel closure, since each arm needs
 /// direct `&mut self` field access the existing per-page renderers
@@ -3386,7 +3386,7 @@ fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Opti
         "My Games",
         "Browse and manage your game library.",
     );
-    let tab_options: [(LibraryTab, &str); 4] = [
+    let tab_options: [(LibraryTab, &str); 5] = [
         (
             LibraryTab::Archives,
             library_tab_label(LibraryTab::Archives),
@@ -3397,6 +3397,10 @@ fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Opti
             library_tab_label(LibraryTab::Duplicates),
         ),
         (LibraryTab::Views, library_tab_label(LibraryTab::Views)),
+        (
+            LibraryTab::RecentlyFound,
+            library_tab_label(LibraryTab::RecentlyFound),
+        ),
     ];
     let clicked = widgets::tab_row(ui, &tab_options, current_tab);
     ui.add_space(8.0);
@@ -3568,7 +3572,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
 ///
 /// # The unified Library shell's scrolling rule
 ///
-/// All four Library-related destinations (`Library`, `Health`,
+/// All five Library-related destinations (`Library`, `Health`,
 /// `Duplicates`, `LibraryViews`) are `false` here - no outer page scroll.
 /// Three of them (Library's archive table, Health's issue list,
 /// Duplicates' group list) already manage their own internal
@@ -3584,7 +3588,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
 /// which are separate `egui::Window`s with their own scroll areas) is
 /// short, fixed-height content that was never actually at risk of
 /// overflowing. So flipping it to `false` - the smallest change that
-/// makes the shell's scroll behaviour consistent across all four tabs,
+/// makes the shell's scroll behaviour consistent across all five tabs,
 /// with the tab row always pinned above whichever scroll area (if any) a
 /// tab owns - loses no reachable content and does not clip anything.
 fn main_view_uses_page_scroll(view: MainView) -> bool {
@@ -15387,8 +15391,7 @@ impl ArchiveFsApp {
                                         self.start_database_action(context.clone(), true);
                                     }
                                     DatabasePanelAction::ViewRecentlyFound => {
-                                        self.tools_overlay = ToolsOverlay::None;
-                                        self.view = MainView::RecentlyFound;
+                                        self.navigate_to_library_tab(LibraryTab::RecentlyFound);
                                     }
                                     DatabasePanelAction::RefreshStatus
                                     | DatabasePanelAction::RetryLoad => {
@@ -16712,18 +16715,16 @@ impl ArchiveFsApp {
                 }
 
                 // The unified Library shell: one heading and one tab
-                // selector shared by all four Library-related
+                // selector shared by all five Library-related
                 // destinations, dispatching to each tab's existing,
                 // otherwise-unmodified content. `library_tab_for_main_view`
-                // covers exactly MainView::Library/Health/Duplicates/
-                // LibraryViews (see its doc comment), so this replaces what
-                // used to be four separate `if self.view == MainView::X`
-                // blocks with one.
+                // covers the Library-related MainView variants (see its doc
+                // comment), so this replaces what
+                // used to be separate `if self.view == MainView::X` blocks.
                 //
                 // The Archives arm deliberately does *not* `return`:
                 // falling through to the existing `match &self.state`
-                // block below (shared with MainView::RecentlyFound,
-                // unchanged) is exactly how MainView::Library already
+                // block below is exactly how MainView::Library already
                 // reached it before this shell existed. The other three
                 // arms `return` after rendering, exactly as their own
                 // standalone `if` blocks used to.
@@ -16827,6 +16828,7 @@ impl ArchiveFsApp {
                             }
                             return;
                         }
+                        LibraryTab::RecentlyFound => {}
                     }
                 }
 
@@ -17008,14 +17010,14 @@ impl ArchiveFsApp {
                                 library_column_widths: &mut self.library_column_widths,
                                 library_views_configured: !self.library_views.is_empty(),
                                 library_view_last_plan: self.library_view_last_plan.as_ref(),
-                                recent_scan: if self.view == MainView::RecentlyFound {
+                                recent_scan: if self.library_tab == LibraryTab::RecentlyFound {
                                     self.database_state
                                         .snapshot()
                                         .and_then(|snapshot| snapshot.recently_found.as_ref())
                                 } else {
                                     None
                                 },
-                                recent_view: self.view == MainView::RecentlyFound,
+                                recent_view: self.library_tab == LibraryTab::RecentlyFound,
                                 library_platform_query: &mut self.library_platform_query,
                             },
                         );

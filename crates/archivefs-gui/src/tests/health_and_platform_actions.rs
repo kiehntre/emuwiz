@@ -2675,7 +2675,7 @@ fn archives_tab_shows_exactly_one_library_heading() {
 }
 
 #[test]
-fn recently_found_still_shows_its_own_heading_with_no_library_duplicate() {
+fn recently_found_tab_keeps_its_content_inside_the_library_shell() {
     let ctx = egui::Context::default();
     let data = empty_loaded_data("/mnt/library");
     let mut filter = String::new();
@@ -2789,14 +2789,18 @@ fn recently_found_still_shows_its_own_heading_with_no_library_duplicate() {
         });
     });
 
-    assert!(
-        rendered_text_contains(&output, "Recently Found"),
-        "Recently Found must keep its own heading"
-    );
+    let shell_output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_library_shell_header(ui, LibraryTab::RecentlyFound);
+        });
+    });
+    assert!(rendered_text_contains(&shell_output, "My Games"));
+    assert!(rendered_text_contains(&shell_output, "Recently Found"));
+    assert!(rendered_text_contains(&output, "Recently Found"));
     assert_eq!(
         count_exact_text_occurrences(&output, "Library"),
         0,
-        "Recently Found must never render a bare 'Library' heading"
+        "the shared table renderer must not add a duplicate Library heading"
     );
 }
 
