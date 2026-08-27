@@ -16,18 +16,21 @@
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_duckstation_launch_input,
-    project_pcsx2_launch_input, project_ppsspp_launch_input, project_xenia_launch_input,
+    project_flycast_launch_input, project_pcsx2_launch_input, project_ppsspp_launch_input,
+    project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
     StandaloneProfileInput, build_launch_plan,
 };
 use crate::launch::readiness::{
-    duckstation_firmware_readiness, pcsx2_firmware_readiness, ppsspp_firmware_readiness,
+    duckstation_firmware_readiness, flycast_firmware_readiness, pcsx2_firmware_readiness,
+    ppsspp_firmware_readiness,
 };
 use crate::patch_manager::{
-    DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, Pcsx2BiosVerification,
-    Pcsx2GameInspection, Pcsx2Profile, PpssppProfile, XeniaProfile,
+    DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
+    FlycastProfile, FlycastSystemFileState, Pcsx2BiosVerification, Pcsx2GameInspection,
+    Pcsx2Profile, PpssppProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -57,6 +60,10 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Xenia {
         profile: &'a XeniaProfile,
     },
+    Flycast {
+        profile: &'a FlycastProfile,
+        bios: FlycastSystemFileState,
+    },
 }
 
 impl<'a> DiscoveredStandaloneProfile<'a> {
@@ -83,6 +90,13 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn xenia(profile: &'a XeniaProfile) -> Self {
         Self::Xenia { profile }
+    }
+
+    pub fn flycast(profile: &'a FlycastProfile, inspection: &FlycastGameInspection) -> Self {
+        Self::Flycast {
+            profile,
+            bios: inspection.health.system.dreamcast_bios,
+        }
     }
 }
 
@@ -143,6 +157,17 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware: ppsspp_firmware_readiness(),
+                })
+            }
+            DiscoveredStandaloneProfile::Flycast { profile, bios }
+                if authorized(project_flycast_launch_input(input.verified_identity_facts)) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "flycast",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: flycast_firmware_readiness(*bios),
                 })
             }
             DiscoveredStandaloneProfile::Xenia { profile } => {
@@ -310,6 +335,26 @@ mod tests {
         }
     }
 
+    fn flycast_profile() -> FlycastProfile {
+        let root = PathBuf::from("/profiles/flycast");
+        FlycastProfile {
+            profile_id: "flycast-native".to_string(),
+            installation_type: crate::patch_manager::FlycastInstallationType::Native,
+            configuration_path: root.join("config"),
+            data_path: root.join("data"),
+            eligible: true,
+            blocker: None,
+            executable_candidates: Vec::new(),
+            config_path: root.join("config/emu.cfg"),
+            system_path: root.join("data/data"),
+            game_settings_path: root.join("data/mappings"),
+            cheats_path: root.join("data/cheats"),
+            textures_path: root.join("data/tex"),
+            vmu_path: root.join("data/vmu"),
+            save_states_path: root.join("data/states"),
+        }
+    }
+
     fn pcsx2_profile() -> Pcsx2Profile {
         let root = PathBuf::from("/profiles/pcsx2");
         Pcsx2Profile {
@@ -437,6 +482,106 @@ mod tests {
         let plan = plan(
             &identity,
             &[VerifiedIdentityFact::Ps1Serial("SLUS-12345".to_string())],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.summary.blocked, 1);
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::RequiredFirmwareMissing)
+        );
+    }
+
+    #[test]
+    fn dreamcast_flycast_uses_the_existing_bios_projection() {
+        let identity = resolved("Dreamcast", "T-8109N");
+        let profile = flycast_profile();
+        let profiles = [DiscoveredStandaloneProfile::Flycast {
+            profile: &profile,
+            bios: FlycastSystemFileState::PresentUnverified,
+        }];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::DreamcastProductCode(
+                "T-8109N".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.summary.ready_with_warnings, 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "flycast",
+                ..
+            }
+        ));
+    }
+
+    /// Unknown Flycast system state is deliberately not enough for strict
+    /// readiness. A real hash-verified boot ROM is the only successful path.
+    #[test]
+    fn dreamcast_flycast_unconfigured_bios_is_not_strict_ready() {
+        let identity = resolved("Dreamcast", "T-8109N");
+        let profile = flycast_profile();
+        let profiles = [DiscoveredStandaloneProfile::Flycast {
+            profile: &profile,
+            bios: FlycastSystemFileState::Unknown,
+        }];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::DreamcastProductCode(
+                "T-8109N".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.summary.ready_with_warnings, 1);
+        assert_eq!(
+            plan.candidates[0].readiness,
+            LaunchReadiness::ReadyWithWarnings
+        );
+    }
+
+    #[test]
+    fn dreamcast_flycast_verified_bios_reaches_strict_ready() {
+        let identity = resolved("Dreamcast", "T-8109N");
+        let profile = flycast_profile();
+        let profiles = [DiscoveredStandaloneProfile::Flycast {
+            profile: &profile,
+            bios: FlycastSystemFileState::Verified,
+        }];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::DreamcastProductCode(
+                "T-8109N".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.summary.ready, 1);
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn dreamcast_flycast_missing_firmware_is_blocked() {
+        let identity = resolved("Dreamcast", "T-8109N");
+        let profile = flycast_profile();
+        let profiles = [DiscoveredStandaloneProfile::Flycast {
+            profile: &profile,
+            bios: FlycastSystemFileState::Missing,
+        }];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::DreamcastProductCode(
+                "T-8109N".to_string(),
+            )],
             &resolved_content(),
             &profiles,
             &empty_retroarch(),

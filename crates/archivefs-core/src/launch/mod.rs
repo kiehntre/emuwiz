@@ -69,6 +69,8 @@ pub mod duckstation_execution;
 pub mod es_de_export;
 pub mod evidence_bridge;
 pub mod execution;
+pub mod flycast_command;
+pub mod flycast_execution;
 pub mod input_projection;
 pub mod integration;
 pub mod pcsx2_command;
@@ -115,6 +117,16 @@ pub use execution::{
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
     LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
     preflight_retroarch_launch, spawn_retroarch,
+};
+pub use flycast_command::{
+    FLYCAST_SUPPORTED_PLATFORM_ID, FlycastCommand, FlycastCommandPlan, FlycastCommandSelection,
+    build_flycast_command_plan,
+};
+pub use flycast_execution::{
+    FlycastLaunchCommandFacts, FlycastLaunchExecutionError, FlycastLaunchExitReport,
+    FlycastLaunchPreflightError, FlycastLaunchPreflightErrorKind, FlycastLaunchRequest,
+    FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
+    preflight_flycast_launch, spawn_flycast,
 };
 pub use input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,

@@ -372,11 +372,12 @@ pub use flycast_local::{
     FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES, FLYCAST_MAX_TEXTURE_DEPTH,
     FLYCAST_MAX_TEXTURE_FILES, FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext,
     FlycastDiscoveryError, FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping,
-    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastPlatform, FlycastProfile,
+    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker,
+    FlycastLaunchBlockerKind, FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile,
     FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, FlycastSaveStateInventory,
     FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
     FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
-    inspect_flycast_game, parse_flycast_version,
+    inspect_flycast_game, parse_flycast_version, resolve_flycast_native_launch_binding,
 };
 pub use gamehacking_gamecube_install_plan::{
     GameCubeCheatSelection, GameCubeCheatSelectionEntry, GameCubeGameHackingInstallPreview,

@@ -12,9 +12,12 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 
+use crate::dat::firmware_evidence::{ComputedFirmwareDigests, hash_firmware_file};
 use crate::platform_evidence_fusion::evidence_lineage::{ClaimType, Representation};
 
 pub const FLYCAST_MAX_PROFILES: usize = 16;
@@ -209,6 +212,9 @@ pub struct FlycastConfigInspection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlycastSystemFileState {
+    /// The complete file content matches the pinned Dreamcast firmware
+    /// record below. Presence or a filename alone never produces this state.
+    Verified,
     PresentUnverified,
     Missing,
     Unreadable,
@@ -658,8 +664,14 @@ fn flatten(settings: &FlycastSettings) -> BTreeMap<String, String> {
 }
 
 fn inspect_system(profile: &FlycastProfile) -> FlycastSystemHealth {
-    let bios = state(&profile.system_path.join("dc_boot.bin"));
-    let flash = state(&profile.system_path.join("dc_flash.bin"));
+    let bios = state(
+        &profile.system_path.join("dc_boot.bin"),
+        TRUSTED_DC_BOOT_BIN,
+    );
+    let flash = state(
+        &profile.system_path.join("dc_flash.bin"),
+        TRUSTED_DC_FLASH_BIN,
+    );
     let arcade = if is_real_directory(&profile.system_path) {
         FlycastSystemFileState::Unknown
     } else {
@@ -671,15 +683,99 @@ fn inspect_system(profile: &FlycastProfile) -> FlycastSystemHealth {
         arcade_system_roms: arcade,
     }
 }
-fn state(path: &Path) -> FlycastSystemFileState {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => FlycastSystemFileState::Unreadable,
-        Ok(metadata) if metadata.is_file() => FlycastSystemFileState::PresentUnverified,
-        Ok(_) => FlycastSystemFileState::Unreadable,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => FlycastSystemFileState::Missing,
+/// The trusted content identities used by Flycast's own public system-file
+/// documentation/catalogue. These are metadata only; EmuWiz never bundles or
+/// downloads firmware bytes. The two sources agree on these complete
+/// size/CRC32/MD5/SHA-1 identities:
+///
+/// - libretro/docs `docs/library/flycast.md` (Dreamcast BIOS table)
+/// - libretro/retroarch_system (Dreamcast BIOS catalogue)
+///
+/// `dc_boot.bin` is the strict launch requirement for this adapter. Flycast
+/// documents the Dreamcast BIOS as optional because HLE/no-BIOS operation is
+/// possible, but EmuWiz's verified native-launch path intentionally requires
+/// the real boot ROM. `dc_flash.bin` is verified when present for diagnostics;
+/// its absence does not block this path because Flycast does not require it to
+/// start a Dreamcast title.
+const TRUSTED_DC_BOOT_BIN: TrustedFlycastFirmware = TrustedFlycastFirmware {
+    size_bytes: 2_097_152,
+    crc32: "89f2b1a1",
+    md5: "e10c53c2f8b90bab96ead2d368858623",
+    sha1: "8951d1bb219ab2ff8583033d2119c899cc81f18c",
+};
+
+const TRUSTED_DC_FLASH_BIN: TrustedFlycastFirmware = TrustedFlycastFirmware {
+    size_bytes: 131_072,
+    crc32: "c611b498",
+    md5: "0a93f7940c455905bea6e392dfde92a4",
+    sha1: "94d44d7f9529ec1642ba3771ed3c5f756d5bc872",
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustedFlycastFirmware {
+    size_bytes: u64,
+    crc32: &'static str,
+    md5: &'static str,
+    sha1: &'static str,
+}
+
+fn state(path: &Path, trusted: TrustedFlycastFirmware) -> FlycastSystemFileState {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return FlycastSystemFileState::Unreadable;
+        }
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return FlycastSystemFileState::Unreadable,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return FlycastSystemFileState::Missing;
+        }
+        Err(_) => return FlycastSystemFileState::Unreadable,
+    };
+
+    match hash_firmware_file(path, 16 * 1024 * 1024, 256 * 1024) {
+        Ok(digests) if matches_trusted_firmware(&digests, trusted) => {
+            FlycastSystemFileState::Verified
+        }
+        Ok(_) => FlycastSystemFileState::PresentUnverified,
+        Err(_) if metadata.is_file() => FlycastSystemFileState::PresentUnverified,
         Err(_) => FlycastSystemFileState::Unreadable,
     }
 }
+
+fn matches_trusted_firmware(
+    digests: &ComputedFirmwareDigests,
+    trusted: TrustedFlycastFirmware,
+) -> bool {
+    digests.size_bytes == trusted.size_bytes
+        && digests.crc32.eq_ignore_ascii_case(trusted.crc32)
+        && digests.md5.eq_ignore_ascii_case(trusted.md5)
+        && digests.sha1.eq_ignore_ascii_case(trusted.sha1)
+}
+
+#[cfg(test)]
+fn trusted_digests_fixture(trusted: TrustedFlycastFirmware) -> ComputedFirmwareDigests {
+    ComputedFirmwareDigests {
+        size_bytes: trusted.size_bytes,
+        crc32: trusted.crc32.to_string(),
+        md5: trusted.md5.to_string(),
+        sha1: trusted.sha1.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn state_from_digests(
+    digests: Result<ComputedFirmwareDigests, ()>,
+    trusted: TrustedFlycastFirmware,
+) -> FlycastSystemFileState {
+    match digests {
+        Ok(digests) if matches_trusted_firmware(&digests, trusted) => {
+            FlycastSystemFileState::Verified
+        }
+        Ok(_) => FlycastSystemFileState::PresentUnverified,
+        Err(()) => FlycastSystemFileState::Unreadable,
+    }
+}
+
 fn inspect_cheats(path: &Path) -> FlycastCheatInventory {
     let exists = path.exists();
     let mut warnings = Vec::new();
@@ -920,6 +1016,148 @@ fn warn(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Native launch binding
+// ---------------------------------------------------------------------------
+//
+// Deliberately narrower than `duckstation_local`'s own binding resolver: this
+// makes no claim at all about which configuration directory a bare Flycast
+// invocation will read (DuckStation's resolver exists specifically to prove
+// that, because DuckStation's current CLI has no directory-override flag and
+// silently resolves a single implicit user directory - see that module's own
+// "Native launch binding" doc comment for the proven upstream rule). No
+// equivalent upstream research exists in this codebase for Flycast, and
+// fabricating one would be worse than not claiming it: this resolver only
+// ever asserts "this exact profile is eligible and exactly one safe
+// executable is associated with it", never anything about where Flycast
+// itself will read its configuration from at runtime.
+
+/// Facts identifying exactly which local Flycast executable a launch would
+/// use - never a command line. Unlike
+/// [`crate::patch_manager::DuckStationNativeLaunchBinding`], there is no
+/// `user_directory_mode` field: see this section's own doc comment for why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlycastNativeLaunchBinding {
+    pub executable: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlycastLaunchBlockerKind {
+    /// The profile itself reports `eligible: false`.
+    ProfileIneligible,
+    /// No discovered executable is associated with this profile's
+    /// installation type.
+    ExecutableMissing,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// A candidate executable exists but is a symlink, not a regular file,
+    /// or is not an absolute path.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlycastLaunchBlocker {
+    pub kind: FlycastLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn flycast_launch_blocker(
+    kind: FlycastLaunchBlockerKind,
+    detail: impl Into<String>,
+) -> FlycastLaunchBlocker {
+    FlycastLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` and either proves a launch binding or
+/// returns a structured blocker. Pure and read-only: inspects only
+/// filesystem metadata, never spawns a process or writes configuration.
+/// Safe - and intended - to call again at future launch time.
+pub fn resolve_flycast_native_launch_binding(
+    profile: &FlycastProfile,
+) -> Result<FlycastNativeLaunchBinding, FlycastLaunchBlocker> {
+    if !profile.eligible {
+        return Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ProfileIneligible,
+            "profile is not eligible",
+        ));
+    }
+    let matching: Vec<&FlycastExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == profile.installation_type)
+        .collect();
+    if matching.is_empty() {
+        return Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ExecutableMissing,
+            "no discovered executable is associated with this profile's installation type",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_flycast_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(FlycastNativeLaunchBinding {
+            executable: valid.into_iter().next().expect("length checked above"),
+        }),
+        count => Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable executables match this profile and none is distinguished as \
+                 authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_flycast_executable(path: &Path) -> Result<(), FlycastLaunchBlocker> {
+    if !path.is_absolute() {
+        return Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is a symlink", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(flycast_launch_blocker(
+            FlycastLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,5 +1387,246 @@ mod tests {
         let i = inspect_flycast_game(&profile(root), &verified("T-8109N"));
         assert_eq!(i.cheats.unwrap().entries, 0);
         assert!(!i.textures.unwrap().complete)
+    }
+
+    // -----------------------------------------------------------------
+    // Native launch binding
+    // -----------------------------------------------------------------
+
+    fn binding_fixture_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "archivefs-flycast-binding-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn make_native_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn flycast_executable(
+        path: PathBuf,
+        installation_type: FlycastInstallationType,
+    ) -> FlycastExecutable {
+        FlycastExecutable {
+            path,
+            installation_type,
+            version: None,
+        }
+    }
+
+    /// A minimal, hand-built, eligible native profile - no config file is
+    /// required to exist on disk (unlike DuckStation's `settings.ini`
+    /// requirement): this resolver never checks configuration evidence,
+    /// only `profile.eligible` and the executable candidates.
+    fn native_flycast_profile(
+        root: &Path,
+        executable_candidates: Vec<FlycastExecutable>,
+    ) -> FlycastProfile {
+        FlycastProfile {
+            profile_id: "test-native".to_string(),
+            installation_type: FlycastInstallationType::Native,
+            configuration_path: root.join("config"),
+            data_path: root.join("data"),
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            config_path: root.join("config/emu.cfg"),
+            system_path: root.join("data/data"),
+            game_settings_path: root.join("data/mappings"),
+            cheats_path: root.join("data/cheats"),
+            textures_path: root.join("data/tex"),
+            vmu_path: root.join("data/vmu"),
+            save_states_path: root.join("data/states"),
+        }
+    }
+
+    #[test]
+    fn valid_native_flycast_binding() {
+        let root = binding_fixture_root("valid");
+        let bin = root.join("bin/flycast");
+        make_native_executable(&bin);
+        let profile = native_flycast_profile(
+            &root,
+            vec![flycast_executable(
+                bin.clone(),
+                FlycastInstallationType::Native,
+            )],
+        );
+        let binding = resolve_flycast_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, bin);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ineligible_profile_is_blocked() {
+        let root = binding_fixture_root("ineligible");
+        let bin = root.join("bin/flycast");
+        make_native_executable(&bin);
+        let mut profile = native_flycast_profile(
+            &root,
+            vec![flycast_executable(bin, FlycastInstallationType::Native)],
+        );
+        profile.eligible = false;
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, FlycastLaunchBlockerKind::ProfileIneligible);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_matching_executable_candidate_is_blocked() {
+        let root = binding_fixture_root("no-candidate");
+        let profile = native_flycast_profile(&root, Vec::new());
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, FlycastLaunchBlockerKind::ExecutableMissing);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_executable_is_blocked() {
+        let root = binding_fixture_root("missing-exe");
+        let bin = root.join("bin/flycast");
+        let profile = native_flycast_profile(
+            &root,
+            vec![flycast_executable(bin, FlycastInstallationType::Native)],
+        );
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, FlycastLaunchBlockerKind::ExecutableMissing);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn symlinked_executable_is_blocked() {
+        let root = binding_fixture_root("symlink");
+        let real = root.join("bin/real-flycast");
+        make_native_executable(&real);
+        let link = root.join("bin/flycast");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let profile = native_flycast_profile(
+            &root,
+            vec![flycast_executable(link, FlycastInstallationType::Native)],
+        );
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, FlycastLaunchBlockerKind::ExecutableUnsafe);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_executable_bit_is_blocked() {
+        let root = binding_fixture_root("not-executable");
+        let bin = root.join("bin/flycast");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+        let profile = native_flycast_profile(
+            &root,
+            vec![flycast_executable(bin, FlycastInstallationType::Native)],
+        );
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            FlycastLaunchBlockerKind::ExecutableNotExecutable
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ambiguous_executable_candidates_are_blocked() {
+        let root = binding_fixture_root("ambiguous");
+        let first = root.join("bin/flycast-1");
+        let second = root.join("bin/flycast-2");
+        make_native_executable(&first);
+        make_native_executable(&second);
+        let profile = native_flycast_profile(
+            &root,
+            vec![
+                flycast_executable(first, FlycastInstallationType::Native),
+                flycast_executable(second, FlycastInstallationType::Native),
+            ],
+        );
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, FlycastLaunchBlockerKind::AmbiguousExecutable);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_from_a_different_installation_type_is_ignored() {
+        let root = binding_fixture_root("wrong-install-type");
+        let bin = root.join("bin/flycast");
+        make_native_executable(&bin);
+        let profile = native_flycast_profile(
+            &root,
+            vec![flycast_executable(
+                bin,
+                FlycastInstallationType::FlatpakUser,
+            )],
+        );
+        let blocker = resolve_flycast_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, FlycastLaunchBlockerKind::ExecutableMissing);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trusted_flycast_firmware_records_produce_verified_state() {
+        assert_eq!(
+            state_from_digests(
+                Ok(trusted_digests_fixture(TRUSTED_DC_BOOT_BIN)),
+                TRUSTED_DC_BOOT_BIN
+            ),
+            FlycastSystemFileState::Verified
+        );
+        assert_eq!(
+            state_from_digests(
+                Ok(trusted_digests_fixture(TRUSTED_DC_FLASH_BIN)),
+                TRUSTED_DC_FLASH_BIN
+            ),
+            FlycastSystemFileState::Verified
+        );
+    }
+
+    #[test]
+    fn altered_or_incomplete_flycast_firmware_stays_unverified() {
+        let mut altered = trusted_digests_fixture(TRUSTED_DC_BOOT_BIN);
+        altered.sha1.replace_range(..2, "00");
+        assert_eq!(
+            state_from_digests(Ok(altered), TRUSTED_DC_BOOT_BIN),
+            FlycastSystemFileState::PresentUnverified
+        );
+        assert_eq!(
+            state_from_digests(Err(()), TRUSTED_DC_BOOT_BIN),
+            FlycastSystemFileState::Unreadable
+        );
+    }
+
+    #[test]
+    fn missing_and_present_unknown_flycast_files_keep_honest_states() {
+        let t = TempDir::new().unwrap();
+        assert_eq!(
+            state(&t.path().join("missing.bin"), TRUSTED_DC_BOOT_BIN),
+            FlycastSystemFileState::Missing
+        );
+        let present = t.path().join("present.bin");
+        fs::write(&present, b"not a Dreamcast BIOS").unwrap();
+        assert_eq!(
+            state(&present, TRUSTED_DC_BOOT_BIN),
+            FlycastSystemFileState::PresentUnverified
+        );
     }
 }

@@ -162,6 +162,25 @@ pub enum LaunchBlockerKind {
     /// profile - see the blocker detail for the underlying
     /// [`crate::patch_manager::DuckStationLaunchBlockerKind`].
     DuckStationBindingUnavailable,
+    /// A Flycast command-plan request was given a non-Flycast-standalone
+    /// launch candidate.
+    FlycastCandidateRequired,
+    /// The canonical identity this Flycast plan was built for does not
+    /// target `Dreamcast` - the only platform this native launch slice
+    /// supports.
+    FlycastPlatformMismatch,
+    /// The content is not a direct, non-mounted `.iso`/`.cue`/`.chd` file -
+    /// no archive member, no mount-input container, no GDI/CDI/multi-track
+    /// GD-ROM (deliberately out of scope for this native launch slice).
+    FlycastContentFormatUnsupported,
+    /// No verified Dreamcast product code is available for this content -
+    /// this native launch slice always requires one.
+    FlycastProductCodeMissing,
+    /// [`crate::patch_manager::resolve_flycast_native_launch_binding`]
+    /// itself refused to produce a launch binding for the candidate's
+    /// profile - see the blocker detail for the underlying
+    /// [`crate::patch_manager::FlycastLaunchBlockerKind`].
+    FlycastBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
@@ -268,17 +287,19 @@ pub fn xemu_firmware_readiness(state: XemuSystemFileState) -> FirmwareReadiness 
     }
 }
 
-/// Projects [`FlycastSystemFileState`] onto [`FirmwareReadiness`]. Flycast's
-/// own enum has no `Verified` variant at all (its name is already
-/// `PresentUnverified`), so `Verified` is never reachable through this
-/// projection.
+/// Projects [`FlycastSystemFileState`] onto [`FirmwareReadiness`]. Unknown or
+/// unreadable Flycast system files are deliberately treated like
+/// `PresentUnverified`: neither state may be more launchable than a file whose
+/// contents are known not to match the trusted firmware record. Only a real
+/// hash match reaches strict `Verified`.
 pub fn flycast_firmware_readiness(state: FlycastSystemFileState) -> FirmwareReadiness {
     match state {
+        FlycastSystemFileState::Verified => FirmwareReadiness::Verified,
         FlycastSystemFileState::PresentUnverified => FirmwareReadiness::PresentUnverified,
         FlycastSystemFileState::Missing => FirmwareReadiness::Missing,
         FlycastSystemFileState::Unreadable
         | FlycastSystemFileState::NotConfigured
-        | FlycastSystemFileState::Unknown => FirmwareReadiness::Unknown,
+        | FlycastSystemFileState::Unknown => FirmwareReadiness::PresentUnverified,
     }
 }
 
@@ -395,14 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn flycast_never_reports_verified() {
+    fn flycast_verified_and_uncertain_states_are_distinct() {
+        assert_eq!(
+            flycast_firmware_readiness(FlycastSystemFileState::Verified),
+            FirmwareReadiness::Verified
+        );
         assert_eq!(
             flycast_firmware_readiness(FlycastSystemFileState::PresentUnverified),
             FirmwareReadiness::PresentUnverified
         );
         assert_eq!(
             flycast_firmware_readiness(FlycastSystemFileState::Unknown),
-            FirmwareReadiness::Unknown
+            FirmwareReadiness::PresentUnverified
         );
     }
 
