@@ -5384,7 +5384,8 @@ fn dat_acquisition_entry_point_exposes_existing_safe_provider_paths_without_auto
         "Get evidence for your library"
     ));
     assert!(rendered_text_contains(&output, "No-Intro — cartridge ROMs"));
-    assert!(rendered_text_contains(&output, "Choose No-Intro DAT…"));
+    assert!(rendered_text_contains(&output, "Open DAT-o-MATIC"));
+    assert!(rendered_text_contains(&output, "Choose downloaded ZIP…"));
     assert!(rendered_text_contains(&output, "WHDLoad — Amiga packages"));
     assert!(rendered_text_contains(&output, "Choose WHDLoad DAT…"));
     assert!(rendered_text_contains(&output, "TOSEC — vintage systems"));
@@ -7247,5 +7248,43 @@ fn hide_settled_history_never_deletes_a_journal() {
             .iter()
             .any(|transaction| transaction.transaction_id == "settled-to-hide"),
         "the durable journal must still be discoverable by Repair History's own independent read"
+    );
+}
+
+#[test]
+fn no_intro_pack_selection_is_mutation_free_and_uses_only_the_homepage() {
+    let fixture = Fixture::new();
+    let pack = fixture.root.join("downloaded-pack.zip");
+    std::fs::write(&pack, b"not imported yet").unwrap();
+    let mut page = fixture.page();
+
+    page.apply(DatSourcesPageAction::ChooseNoIntroPack { path: pack.clone() });
+    let view = page.view();
+    assert_eq!(
+        view.no_intro_selected_pack.as_ref().unwrap().0,
+        "downloaded-pack.zip"
+    );
+    assert!(view.no_intro_inspection.is_none());
+    assert!(view.no_intro_installed.is_none());
+    assert!(!fixture.root.join("state.json").exists());
+    assert_eq!(
+        archivefs_core::identity_source::no_intro::NO_INTRO_DATOMATIC_DOWNLOAD_PAGE,
+        "https://datomatic.no-intro.org/"
+    );
+}
+
+#[test]
+fn no_intro_variant_labels_do_not_conflate_aftermarket_with_standard() {
+    assert_eq!(
+        no_intro_classification_label(
+            archivefs_core::identity_source::no_intro::NoIntroPackClassification::Aftermarket
+        ),
+        "Aftermarket / Love Pack"
+    );
+    assert_eq!(
+        no_intro_classification_label(
+            archivefs_core::identity_source::no_intro::NoIntroPackClassification::Standard
+        ),
+        "Standard No-Intro"
     );
 }

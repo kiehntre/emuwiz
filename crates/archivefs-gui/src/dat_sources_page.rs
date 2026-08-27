@@ -88,6 +88,11 @@ use archivefs_core::dat::updates::{
     ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy, RedumpBiosSystem,
     RedumpGameSystem, check_managed_dat_update, managed_dat_root, update_managed_dat,
 };
+use archivefs_core::identity_source::no_intro::{
+    NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
+    NoIntroPackInspection, import_no_intro_pack, inspect_no_intro_pack,
+    load_current_no_intro_pack_summary,
+};
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
@@ -491,6 +496,11 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) tosec_load_error: Option<String>,
     pub(crate) tosec_action_error: Option<String>,
     pub(crate) tosec_last_apply: Option<TosecApplyView>,
+    pub(crate) no_intro_selected_pack: Option<(String, u64)>,
+    pub(crate) no_intro_inspection: Option<NoIntroPackInspection>,
+    pub(crate) no_intro_installed: Option<NoIntroPackInspection>,
+    pub(crate) no_intro_action_error: Option<String>,
+    pub(crate) no_intro_import_status: Option<NoIntroPackImportStatus>,
     pub(crate) unresolved: Vec<UnresolvedDatRowView>,
     /// Problems found while reading the file that this build could not act on
     /// (an unusable ID, a second entry claiming one ID).
@@ -1114,6 +1124,12 @@ pub(crate) enum DatSourcesPageAction {
     AddWHDLoadDat {
         path: PathBuf,
     },
+    OpenNoIntroDownloadPage,
+    ChooseNoIntroPack {
+        path: PathBuf,
+    },
+    InspectNoIntroPack,
+    ImportNoIntroPack,
     AddFolder {
         path: PathBuf,
     },
@@ -1892,6 +1908,11 @@ pub(crate) struct DatSourcesPageState {
     tosec_load_error: Option<String>,
     tosec_action_error: Option<String>,
     tosec_last_apply: Option<TosecApplyView>,
+    no_intro_selected_pack: Option<PathBuf>,
+    no_intro_inspection: Option<NoIntroPackInspection>,
+    no_intro_installed: Option<NoIntroPackInspection>,
+    no_intro_action_error: Option<String>,
+    no_intro_import_status: Option<NoIntroPackImportStatus>,
     /// Existing EmuWiz catalogue to enrich after a completed audit. Absent
     /// in injected tests and when no catalogue exists.
     database_path: Option<PathBuf>,
@@ -1998,14 +2019,16 @@ impl DatSourcesPageState {
             .unwrap_or_else(|_| config_path.with_file_name("managed_dat_sources.toml"));
         let managed_root =
             managed_dat_root().unwrap_or_else(|_| config_path.with_file_name("managed-dats"));
-        Self::load_with_transaction_dir_and_managed_paths(
+        let mut state = Self::load_with_transaction_dir_and_managed_paths(
             config_path,
             library_folders,
             trusted,
             transaction_dir,
             managed_config_path,
             managed_root,
-        )
+        );
+        state.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
+        state
     }
 
     /// [`Self::load`] with the rename-transaction journal directory injected,
@@ -2096,6 +2119,11 @@ impl DatSourcesPageState {
             tosec_load_error,
             tosec_action_error: None,
             tosec_last_apply: None,
+            no_intro_selected_pack: None,
+            no_intro_inspection: None,
+            no_intro_installed: None,
+            no_intro_action_error: None,
+            no_intro_import_status: None,
             database_path: None,
             saved,
             draft,
@@ -2521,6 +2549,17 @@ impl DatSourcesPageState {
         match action {
             DatSourcesPageAction::AddFile { path } => self.add(path, DatSourceKind::File),
             DatSourcesPageAction::AddWHDLoadDat { path } => self.add_whdload_catalogue(path),
+            DatSourcesPageAction::OpenNoIntroDownloadPage => {
+                self.no_intro_action_error = open_no_intro_download_page();
+            }
+            DatSourcesPageAction::ChooseNoIntroPack { path } => {
+                self.no_intro_selected_pack = Some(path);
+                self.no_intro_inspection = None;
+                self.no_intro_action_error = None;
+                self.no_intro_import_status = None;
+            }
+            DatSourcesPageAction::InspectNoIntroPack => self.inspect_no_intro_pack(),
+            DatSourcesPageAction::ImportNoIntroPack => self.import_no_intro_pack(),
             DatSourcesPageAction::AddFolder { path } => self.add(path, DatSourceKind::Folder),
             DatSourcesPageAction::SetEnabled { id, enabled } => {
                 if let Some(entry) = self.draft.get_mut(&id) {
@@ -3101,6 +3140,71 @@ impl DatSourcesPageState {
         };
         if let Err(error) = self.draft.add(entry) {
             self.action_error = Some(error.to_string());
+        }
+    }
+
+    fn inspect_no_intro_pack(&mut self) {
+        self.no_intro_action_error = None;
+        let Some(path) = self.no_intro_selected_pack.as_deref() else {
+            self.no_intro_action_error = Some("Choose a No-Intro ZIP first.".to_string());
+            return;
+        };
+        match inspect_no_intro_pack(path) {
+            Ok(inspection) => self.no_intro_inspection = Some(inspection),
+            Err(error) => self.no_intro_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn import_no_intro_pack(&mut self) {
+        self.no_intro_action_error = None;
+        let Some(path) = self.no_intro_selected_pack.as_deref() else {
+            self.no_intro_action_error = Some("Choose a No-Intro ZIP first.".to_string());
+            return;
+        };
+        match import_no_intro_pack(path) {
+            Ok(report) => {
+                self.no_intro_import_status = Some(report.status);
+                self.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
+                self.no_intro_inspection = None;
+                let old_pack_ids: Vec<String> = self
+                    .draft
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        entry.origin.as_deref() == Some("browser-assisted No-Intro pack import")
+                    })
+                    .map(|entry| entry.id.clone())
+                    .collect();
+                for id in old_pack_ids {
+                    let _ = self.draft.remove(&id);
+                }
+                for source in report.accepted {
+                    if self
+                        .draft
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.path == source.artifact_path)
+                    {
+                        continue;
+                    }
+                    let entry = DatSourceEntry {
+                        display_name: format!("No-Intro: {}", source.system_name),
+                        origin: Some("browser-assisted No-Intro pack import".to_string()),
+                        ..DatSourceEntry::new(
+                            self.draft.suggest_id(&source.artifact_path),
+                            format!("No-Intro: {}", source.system_name),
+                            source.artifact_path,
+                            DatSourceKind::File,
+                        )
+                    };
+                    if let Err(error) = self.draft.add(entry) {
+                        self.no_intro_action_error = Some(error.to_string());
+                        break;
+                    }
+                }
+                self.save();
+            }
+            Err(error) => self.no_intro_action_error = Some(error.to_string()),
         }
     }
 
@@ -3904,6 +4008,20 @@ impl DatSourcesPageState {
             tosec_load_error: self.tosec_load_error.clone(),
             tosec_action_error: self.tosec_action_error.clone(),
             tosec_last_apply: self.tosec_last_apply.clone(),
+            no_intro_selected_pack: self.no_intro_selected_pack.as_ref().and_then(|path| {
+                std::fs::metadata(path).ok().map(|metadata| {
+                    (
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "selected ZIP".to_string()),
+                        metadata.len(),
+                    )
+                })
+            }),
+            no_intro_inspection: self.no_intro_inspection.clone(),
+            no_intro_installed: self.no_intro_installed.clone(),
+            no_intro_action_error: self.no_intro_action_error.clone(),
+            no_intro_import_status: self.no_intro_import_status,
             unresolved: self
                 .draft
                 .unresolved_settings()
@@ -5451,22 +5569,46 @@ fn show_evidence_acquisition_section(
             ui.label(egui::RichText::new("No-Intro — cartridge ROMs").strong());
             ui.label(
                 egui::RichText::new(
-                    "Managed download is not available: DAT-o-MATIC requires an interactive request flow. Import an official DAT from it; EmuWiz verifies the internal header, not the filename.",
+                    "Download a pack manually from DAT-o-MATIC, then inspect it here. EmuWiz validates each DAT's internal metadata; the ZIP filename is never treated as authority.",
                 )
                 .color(theme::muted(ui))
                 .small(),
             );
             if widgets::action_button(
                 ui,
-                "Choose No-Intro DAT…",
+                "Open DAT-o-MATIC",
+                widgets::ActionStyle::Secondary,
+                !view.background_busy,
+            )
+            .clicked()
+            {
+                action = Some(DatSourcesPageAction::OpenNoIntroDownloadPage);
+            }
+            if widgets::action_button(
+                ui,
+                "Choose downloaded ZIP…",
                 widgets::ActionStyle::Primary,
                 !view.background_busy,
             )
             .clicked()
                 && action.is_none()
-                && let Some(path) = choose_local_dat_file("Choose a No-Intro DAT")
+                && let Some(path) = choose_no_intro_pack()
             {
-                action = Some(DatSourcesPageAction::AddFile { path });
+                action = Some(DatSourcesPageAction::ChooseNoIntroPack { path });
+            }
+            if let Some((path, bytes)) = &view.no_intro_selected_pack {
+                ui.label(format!("Selected: {path} ({})", format_bytes(*bytes)));
+                if widgets::action_button(
+                    ui,
+                    "Inspect / validate pack",
+                    widgets::ActionStyle::Quiet,
+                    !view.background_busy,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(DatSourcesPageAction::InspectNoIntroPack);
+                }
             }
         });
 
@@ -5550,7 +5692,110 @@ fn show_evidence_acquisition_section(
             }
         });
     });
+    if let Some(error) = &view.no_intro_action_error {
+        widgets::banner(
+            ui,
+            "No-Intro pack action failed",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    if let Some(inspection) = &view.no_intro_inspection {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("No-Intro pack inspection").strong());
+            ui.label(format!(
+                "Validated as {} from DAT metadata. {} valid DAT(s), {} rejected member(s).",
+                no_intro_classification_label(inspection.classification),
+                inspection.accepted.len(),
+                inspection.rejected.len()
+            ));
+            for member in &inspection.accepted {
+                ui.label(format!(
+                    "• {} · {:?} · version {}",
+                    member.system_name,
+                    member.variant,
+                    member.upstream_version.as_deref().unwrap_or("unknown")
+                ));
+            }
+            if !inspection.rejected.is_empty() {
+                ui.collapsing("Rejected or unsupported members", |ui| {
+                    for member in &inspection.rejected {
+                        ui.label(format!("{} — {}", member.member, member.reason));
+                    }
+                });
+            }
+            ui.label(egui::RichText::new(
+                "Inspection is read-only. Nothing is installed until you explicitly import this pack.",
+            ).color(theme::muted(ui)).small());
+            if widgets::action_button(
+                ui,
+                "Import validated pack",
+                widgets::ActionStyle::Primary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                action = Some(DatSourcesPageAction::ImportNoIntroPack);
+            }
+        });
+    }
+    if let Some(installed) = &view.no_intro_installed {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Installed No-Intro snapshot").strong());
+            ui.label(format!(
+                "{} · {} valid DAT(s) · snapshot hash {}…",
+                no_intro_classification_label(installed.classification),
+                installed.accepted.len(),
+                installed.pack_sha256.chars().take(12).collect::<String>()
+            ));
+            ui.label("This is evidence metadata only; it does not imply a complete commercial-game collection.");
+            if view.no_intro_import_status == Some(NoIntroPackImportStatus::Unchanged) {
+                ui.label("The selected pack is already installed (Unchanged).");
+            }
+        });
+    }
     action
+}
+
+fn choose_no_intro_pack() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Choose downloaded No-Intro pack ZIP")
+        .add_filter("No-Intro pack ZIP", &["zip"])
+        .pick_file()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+fn no_intro_classification_label(classification: NoIntroPackClassification) -> &'static str {
+    match classification {
+        NoIntroPackClassification::Standard => "Standard No-Intro",
+        NoIntroPackClassification::Aftermarket => "Aftermarket / Love Pack",
+        NoIntroPackClassification::Bios => "No-Intro BIOS",
+        NoIntroPackClassification::Mixed => "Mixed No-Intro pack",
+        NoIntroPackClassification::Unknown => "No-Intro pack with unknown variant",
+    }
+}
+
+fn open_no_intro_download_page() -> Option<String> {
+    match std::process::Command::new("xdg-open")
+        .arg(NO_INTRO_DATOMATIC_DOWNLOAD_PAGE)
+        .status()
+    {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(format!("Could not open DAT-o-MATIC (status {status}).")),
+        Err(error) => Some(format!("Could not open DAT-o-MATIC: {error}")),
+    }
 }
 
 fn choose_local_dat_file(title: &str) -> Option<PathBuf> {
