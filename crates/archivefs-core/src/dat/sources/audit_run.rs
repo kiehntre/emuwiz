@@ -19,8 +19,8 @@
 //! # Bounded and cancellable
 //!
 //! - The walk stops at [`MAX_SCAN_DEPTH`] directories deep and
-//!   [`MAX_SCAN_FILES`] files, reporting that it truncated rather than
-//!   pretending it saw everything.
+//!   [`MAX_SCAN_ENTRIES_EXAMINED`] directory entries. Files are hashed in
+//!   [`MAX_SCAN_FILES`] sized chunks, so large libraries are not partial.
 //! - Files are hashed in fixed chunks, so memory is flat regardless of how big
 //!   a disc image is.
 //! - The cancellation flag is checked before every file and inside every chunk,
@@ -81,12 +81,11 @@ use crate::safe_read::TrustedRoots;
 /// keeping the walk finite on a tree that has been made pathological.
 pub const MAX_SCAN_DEPTH: usize = 8;
 
-/// How many files one audit run will take.
+/// How many files are processed in one bounded hashing chunk.
 ///
-/// This is the memory bound: each file contributes one [`KnownFileEvidence`]
-/// (a handful of short strings) and one [`crate::dat::audit::AuditEntry`], so
-/// the ceiling is what keeps a run over an enormous tree from growing without
-/// limit. Exceeding it truncates the run and says so.
+/// This is no longer a whole-audit ceiling: every chunk contributes to one
+/// deterministic logical result. The final report retains one row per
+/// candidate for planning, while active hashing work remains bounded.
 pub const MAX_SCAN_FILES: usize = 25_000;
 
 /// How many directory entries the walk will examine, DAT-relevant or not.
@@ -660,64 +659,68 @@ fn collect_loose_file_evidence(
     let mut known = Vec::with_capacity(total);
     let mut unhashed = Vec::new();
     let mut bytes_hashed = 0_u64;
-    for (position, path) in scan.files.iter().enumerate() {
-        if cancelled(cancel) {
-            return Err(DatAuditError::Cancelled);
-        }
-        let defer_container = is_chd_path(path)
-            || is_rar_path(path)
-            || (!include_archive_outers && (is_zip_path(path) || is_sevenz_path(path)));
-        if defer_container {
+    for (chunk_start, chunk) in scan_chunks(&scan.files).enumerate() {
+        let chunk_start = chunk_start * MAX_SCAN_FILES;
+        for (offset, path) in chunk.iter().enumerate() {
+            let position = chunk_start + offset;
+            if cancelled(cancel) {
+                return Err(DatAuditError::Cancelled);
+            }
+            let defer_container = is_chd_path(path)
+                || is_rar_path(path)
+                || (!include_archive_outers && (is_zip_path(path) || is_sevenz_path(path)));
+            if defer_container {
+                let file_name = file_name_of(path);
+                if !include_archive_outers {
+                    let detail = if is_zip_path(path) || is_sevenz_path(path) {
+                        "Outer container bytes are not identity evidence; decoded member evidence is checked separately."
+                    } else {
+                        "Combined evidence does not yet merge this container's specialised identity path; it was left non-actionable."
+                    };
+                    unhashed.push(UnhashedFile {
+                        path: path.to_string_lossy().into_owned(),
+                        file_name: file_name.clone(),
+                        code: "combined-container-deferred".to_string(),
+                        detail: detail.to_string(),
+                    });
+                    // Retain a physical-file row. With no digest it can reach at
+                    // most FilenameOnly and the rename planner never promotes
+                    // that weak result to an action.
+                    known.push(KnownFileEvidence::new(
+                        path.to_string_lossy().into_owned(),
+                        file_name,
+                    ));
+                }
+                continue;
+            }
             let file_name = file_name_of(path);
-            if !include_archive_outers {
-                let detail = if is_zip_path(path) || is_sevenz_path(path) {
-                    "Outer container bytes are not identity evidence; decoded member evidence is checked separately."
-                } else {
-                    "Combined evidence does not yet merge this container's specialised identity path; it was left non-actionable."
-                };
-                unhashed.push(UnhashedFile {
-                    path: path.to_string_lossy().into_owned(),
-                    file_name: file_name.clone(),
-                    code: "combined-container-deferred".to_string(),
-                    detail: detail.to_string(),
-                });
-                // Retain a physical-file row. With no digest it can reach at
-                // most FilenameOnly and the rename planner never promotes
-                // that weak result to an action.
-                known.push(KnownFileEvidence::new(
-                    path.to_string_lossy().into_owned(),
-                    file_name,
-                ));
-            }
-            continue;
-        }
-        let file_name = file_name_of(path);
-        on_progress(DatAuditProgress::Hashing {
-            index: position + 1,
-            total,
-            file_name: file_name.clone(),
-        });
-        let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
-        match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
-            Ok(hashes) => {
-                bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
-                known.push(
-                    evidence
-                        .with_size(hashes.fingerprint.size_bytes)
-                        .with_crc32(hashes.crc32)
-                        .with_md5(hashes.md5)
-                        .with_sha1(hashes.sha1),
-                );
-            }
-            Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
-            Err(refusal) => {
-                unhashed.push(UnhashedFile {
-                    path: path.to_string_lossy().into_owned(),
-                    file_name,
-                    code: refusal.code().to_string(),
-                    detail: refusal.detail(),
-                });
-                known.push(evidence);
+            on_progress(DatAuditProgress::Hashing {
+                index: position + 1,
+                total,
+                file_name: file_name.clone(),
+            });
+            let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
+            match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
+                Ok(hashes) => {
+                    bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
+                    known.push(
+                        evidence
+                            .with_size(hashes.fingerprint.size_bytes)
+                            .with_crc32(hashes.crc32)
+                            .with_md5(hashes.md5)
+                            .with_sha1(hashes.sha1),
+                    );
+                }
+                Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
+                Err(refusal) => {
+                    unhashed.push(UnhashedFile {
+                        path: path.to_string_lossy().into_owned(),
+                        file_name,
+                        code: refusal.code().to_string(),
+                        detail: refusal.detail(),
+                    });
+                    known.push(evidence);
+                }
             }
         }
     }
@@ -1909,9 +1912,9 @@ fn matched_refs_for_verdict(
 
 struct LocalScan {
     files: Vec<PathBuf>,
-    /// The scan hit a configured ceiling ([`MAX_SCAN_DEPTH`],
-    /// [`MAX_SCAN_FILES`], or [`MAX_SCAN_ENTRIES_EXAMINED`]) and stopped
-    /// early by design.
+    /// The scan hit a configured traversal ceiling (`MAX_SCAN_DEPTH` or
+    /// `MAX_SCAN_ENTRIES_EXAMINED`) and stopped early by design. The file
+    /// chunk size is not a scan ceiling.
     truncated: bool,
     /// The scan encountered a traversal error - an unreadable directory, a
     /// directory-entry read failure, or a `file_type()` failure - and
@@ -2034,11 +2037,7 @@ fn scan_local_files_impl(
                     truncated = true;
                 }
             } else if file_type.is_file() || file_type.is_symlink() {
-                if files.len() >= MAX_SCAN_FILES {
-                    truncated = true;
-                } else {
-                    files.push(path);
-                }
+                files.push(path);
             }
         }
 
@@ -2053,7 +2052,7 @@ fn scan_local_files_impl(
             files_found: files.len(),
             current_dir: Some(directory.to_string_lossy().into_owned()),
         });
-        if truncated && files.len() >= MAX_SCAN_FILES {
+        if truncated && examined >= MAX_SCAN_ENTRIES_EXAMINED {
             break;
         }
     }
@@ -2070,6 +2069,10 @@ fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn scan_chunks(files: &[PathBuf]) -> impl Iterator<Item = &[PathBuf]> {
+    files.chunks(MAX_SCAN_FILES)
 }
 
 fn cancelled(cancel: &AtomicBool) -> bool {
@@ -2205,6 +2208,25 @@ mod local_scan_traversal_tests {
         assert_eq!(scan.files, vec![file]);
         assert!(scan.scan_complete);
         assert!(!scan.truncated);
+    }
+
+    #[test]
+    fn more_than_one_chunk_is_processed_without_duplicates_or_omissions() {
+        let files: Vec<PathBuf> = (0..(MAX_SCAN_FILES * 2 + 17))
+            .map(|index| PathBuf::from(format!("/synthetic/{index:05}.rom")))
+            .collect();
+
+        let chunks: Vec<&[PathBuf]> = scan_chunks(&files).collect();
+        let flattened: Vec<PathBuf> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().cloned())
+            .collect();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), MAX_SCAN_FILES);
+        assert_eq!(chunks[1].len(), MAX_SCAN_FILES);
+        assert_eq!(chunks[2].len(), 17);
+        assert_eq!(flattened, files);
     }
 }
 
