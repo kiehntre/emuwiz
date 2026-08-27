@@ -67,6 +67,7 @@ pub mod dolphin_execution;
 pub mod duckstation_command;
 pub mod duckstation_execution;
 pub mod es_de_export;
+pub mod es_de_publish;
 pub mod evidence_bridge;
 pub mod execution;
 pub mod flycast_command;
