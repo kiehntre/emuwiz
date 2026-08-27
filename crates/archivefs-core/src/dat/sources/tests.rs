@@ -24,7 +24,8 @@ use tempfile::TempDir;
 
 use super::audit_cache::AuditCacheConfig;
 use super::audit_run::{
-    DatAuditError, DatAuditOutcome, DatAuditProgress, DatAuditRequest,
+    CombinedDatAuditRequest, CombinedDatAuditSource, DatAuditError, DatAuditOutcome,
+    DatAuditProgress, DatAuditRequest, run_combined_dat_audit_with_cache,
     run_dat_audit_with_cache as production_run_dat_audit,
 };
 use super::config::{
@@ -3108,5 +3109,374 @@ fn a_verified_rar_member_alongside_an_unverified_sibling_never_reaches_set_compl
             .all(|set| set.state != crate::dat::set::SetState::Complete),
         "the set cannot Complete off a partial archive pass: {:?}",
         outcome.sets
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Combined multi-catalogue audit: RAR integration
+//
+// `run_dat_audit`'s own RAR tests above prove the single-catalogue seam
+// (`RarProvider`/`RarArchiveSource`, envelope refusals, set completeness).
+// These prove `run_combined_dat_audit` now reuses that exact same seam - see
+// `audit_run::audit_combined_archives`'s own doc comment - rather than any
+// new RAR handling.
+// ---------------------------------------------------------------------------
+
+fn run_combined_dat_audit(
+    request: &CombinedDatAuditRequest,
+) -> Result<DatAuditOutcome, DatAuditError> {
+    run_combined_dat_audit_with_cache(
+        request,
+        &TrustedRoots::none(),
+        &no_cancel(),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+}
+
+fn combined_source(id: &str, dat_path: PathBuf) -> CombinedDatAuditSource {
+    CombinedDatAuditSource {
+        source_id: id.to_string(),
+        source_display_name: id.to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        platform: None,
+    }
+}
+
+#[test]
+fn combined_audit_verifies_a_supported_rar5_member_and_proposes_a_canonical_rename() {
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("random-name.rar");
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        &archive_path,
+    )
+    .unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("rar-set", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(outcome.archives[0].members.len(), 1);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Hello World (Demo)"
+    ));
+    assert!(!outcome.archives[0].members[0].evidence_sources.is_empty());
+
+    let identity = outcome.archives[0].combined_identity.as_ref().expect(
+        "a single verified member with agreeing combined evidence must produce a combined identity",
+    );
+    assert_eq!(identity.game_name, "Hello World (Demo)");
+    assert_eq!(identity.member_name, "helloworld.txt");
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    let proposal = &plan.proposals[0];
+    assert!(proposal.is_outer_archive);
+    assert_eq!(
+        proposal.proposed_basename.as_deref(),
+        Some("Hello World (Demo).rar")
+    );
+    assert_ne!(
+        proposal.proposed_basename.as_deref(),
+        Some("helloworld.txt"),
+        "the RAR member's own filename must never become the rename target"
+    );
+    assert_ne!(
+        proposal.proposed_basename.as_deref().unwrap(),
+        "random-name.rar",
+        "the archive's own prior name must not leak into the proposal"
+    );
+}
+
+#[test]
+fn combined_audit_reports_an_already_canonical_rar_as_no_rename_needed() {
+    use crate::dat::rename_plan::{ProposalState, RenamePlanContext, build_rename_plan};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("Hello World (Demo).rar"),
+    )
+    .unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("rar-set", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+    assert!(outcome.archives[0].combined_identity.is_some());
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    assert_eq!(plan.proposals[0].state, ProposalState::AlreadyCanonical);
+    assert_eq!(plan.proposals[0].proposed_basename, None);
+}
+
+#[test]
+fn combined_audit_conflicting_catalogue_evidence_is_ambiguous_and_non_actionable() {
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+
+    let dir = temp();
+    let dat_a = write(
+        dir.path(),
+        "a.dat",
+        &format!(
+            r#"<datafile><header><name>Catalogue A</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let dat_b = write(
+        dir.path(),
+        "b.dat",
+        &format!(
+            r#"<datafile><header><name>Catalogue B</name></header>
+<game name="Something Else Entirely">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![
+            combined_source("catalogue-a", dat_a),
+            combined_source("catalogue-b", dat_b),
+        ],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+
+    assert_eq!(outcome.archives[0].members.len(), 1);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(AuditVerdict::Ambiguous { .. })
+    ));
+    assert!(outcome.archives[0].combined_identity.is_none());
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.iter().all(|proposal| !proposal.actionable),
+        "conflicting catalogue evidence must never become an actionable rename"
+    );
+}
+
+#[test]
+fn combined_audit_unsupported_rar_shapes_remain_non_actionable() {
+    for fixture_name in [
+        "test_read_format_rar_compress_best.rar",
+        "test_read_format_rar5_solid.rar",
+        "test_read_format_rar5_encrypted.rar",
+        "test_read_format_rar5_multiarchive.part01.rar",
+    ] {
+        let dir = temp();
+        let dat_path = write(
+            dir.path(),
+            "rar.dat",
+            r#"<datafile><header><name>Any catalogue</name></header>
+<game name="Irrelevant"><rom name="irrelevant.bin" size="1" sha1="356a192b7913b04c54574d18c28d46e6395428ab"/></game>
+</datafile>"#,
+        );
+        let roms = dir.path().join("roms");
+        std::fs::create_dir(&roms).unwrap();
+        std::fs::copy(rar_fixture(fixture_name), roms.join("collection.rar")).unwrap();
+
+        let request = CombinedDatAuditRequest {
+            sources: vec![combined_source("unsupported-shape", dat_path)],
+            scan_root: roms,
+            limits: DatLimits::default(),
+        };
+        let outcome = run_combined_dat_audit(&request).unwrap();
+
+        assert_eq!(outcome.archives.len(), 1, "{fixture_name}");
+        assert_eq!(outcome.archives[0].format, "rar", "{fixture_name}");
+        assert_ne!(
+            outcome.archives[0].completion,
+            crate::dat::archive::ArchivePassCompletion::Complete,
+            "{fixture_name} must never report a complete pass"
+        );
+        assert!(
+            outcome.archives[0].combined_identity.is_none(),
+            "{fixture_name} must never gain a combined identity"
+        );
+    }
+}
+
+#[test]
+fn combined_audit_cache_still_hashes_and_caches_loose_files_around_a_deferred_rar() {
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "mixed.dat",
+        &format!(
+            r#"<datafile><header><name>Mixed catalogue</name></header>
+<game name="Super Game (World)">
+<rom name="super.bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+</game>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("super.bin"), SUPER_BIN_CONTENTS).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let cache_path = dir.path().join("audit-cache.json");
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("mixed", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+
+    let first = run_combined_dat_audit_with_cache(
+        &request,
+        &TrustedRoots::none(),
+        &no_cancel(),
+        &|_| {},
+        AuditCacheConfig::At(cache_path.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        first.cache.cache_eligible, 1,
+        "only the loose super.bin is cache-eligible; the .rar is deferred exactly as before"
+    );
+    assert_eq!(first.cache.files_hashed, 1);
+    assert_eq!(first.cache.cache_hits, 0);
+    assert!(
+        first
+            .unhashed
+            .iter()
+            .any(|entry| entry.file_name == "collection.rar"
+                && entry.code == "combined-container-deferred")
+    );
+
+    let second = run_combined_dat_audit_with_cache(
+        &request,
+        &TrustedRoots::none(),
+        &no_cancel(),
+        &|_| {},
+        AuditCacheConfig::At(cache_path),
+    )
+    .unwrap();
+    assert_eq!(
+        second.cache.cache_hits, 1,
+        "the persisted cache from the first run must be reused for the loose file"
+    );
+    assert_eq!(second.cache.files_hashed, 0);
+    assert_eq!(second.archives[0].format, "rar");
+}
+
+#[test]
+fn combined_audit_zip_member_identity_and_rename_are_unaffected_by_rar_support() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "zip.dat",
+        r#"<datafile><header><name>ZIP catalogue</name></header>
+<game name="Game (World)"><rom name="game.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("random-name.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+    writer
+        .start_file(
+            "game.rom",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(b"test").unwrap();
+    writer.finish().unwrap();
+
+    let request = CombinedDatAuditRequest {
+        sources: vec![combined_source("zip-set", dat_path)],
+        scan_root: roms,
+        limits: DatLimits::default(),
+    };
+    let outcome = run_combined_dat_audit(&request).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "zip");
+    let identity = outcome.archives[0]
+        .combined_identity
+        .as_ref()
+        .expect("a single verified ZIP member must still produce a combined identity");
+    assert_eq!(identity.game_name, "Game (World)");
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    assert_eq!(
+        plan.proposals[0].proposed_basename.as_deref(),
+        Some("Game (World).zip")
     );
 }

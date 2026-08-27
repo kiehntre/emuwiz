@@ -705,7 +705,11 @@ fn collect_loose_file_evidence(
             if defer_container {
                 let file_name = file_name_of(path);
                 if !include_archive_outers {
-                    let detail = if is_zip_path(path) || is_sevenz_path(path) {
+                    // RAR joined ZIP/7z here once `audit_combined_archives`
+                    // gained its own RAR member pass (see that function's doc);
+                    // only CHD's dedicated disk-evidence path remains genuinely
+                    // unmerged into combined evidence.
+                    let detail = if is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path) {
                         "Outer container bytes are not identity evidence; decoded member evidence is checked separately."
                     } else {
                         "Combined evidence does not yet merge this container's specialised identity path; it was left non-actionable."
@@ -1043,6 +1047,50 @@ fn load_combined_catalogue(
     })
 }
 
+/// Builds the `index` [`RarArchiveSource::open`] needs to resolve each
+/// member's verification candidate, for a combined multi-catalogue audit.
+///
+/// `RarArchiveSource::open` pre-resolves one expected-hash candidate per
+/// member *by filename* up front (see `dat::archive::rar::candidate_hashes_for`,
+/// which calls only [`DatIndex::lookup_filename`]) - a member with no
+/// candidate is never hashed at all and reports `NotVerified`, never a
+/// fabricated match. A single-catalogue audit already has one natural index
+/// to pass; a combined audit has several. Opening (and hashing) the archive
+/// once per catalogue would be needlessly expensive and would not change
+/// correctness, so this merges every catalogue's `by_filename` entries into
+/// one index instead - only `by_filename` is populated, because that is the
+/// only lookup RAR's candidate resolution ever performs.
+///
+/// This cannot manufacture a false match: `candidate_hashes_for` already
+/// refuses to pick a candidate when a filename's matches disagree on
+/// checksums (see its own doc), so a filename that exists in two catalogues
+/// with *different* expected hashes for the same name still safely resolves
+/// to no candidate (`NotVerified`) exactly as it would be ambiguous within
+/// one oversized DAT file. A filename that agrees across every catalogue
+/// gets hashed, and the per-member exact-agreement merge below
+/// (`merge_combined_evidence`) then independently re-checks that computed
+/// hash against each catalogue's own index, unaffected by this merge.
+fn combined_rar_candidate_index(catalogues: &[LoadedCombinedCatalogue]) -> DatIndex {
+    let mut merged = DatIndex {
+        by_crc32: std::collections::HashMap::new(),
+        by_md5: std::collections::HashMap::new(),
+        by_sha1: std::collections::HashMap::new(),
+        by_sha256: std::collections::HashMap::new(),
+        by_filename: std::collections::HashMap::new(),
+        game_clone_of: std::collections::HashMap::new(),
+    };
+    for catalogue in catalogues {
+        for (filename, refs) in &catalogue.index.by_filename {
+            merged
+                .by_filename
+                .entry(filename.clone())
+                .or_default()
+                .extend(refs.iter().cloned());
+        }
+    }
+    merged
+}
+
 struct CombinedEvidenceResult {
     verdict: AuditVerdict,
     evidence: Vec<DatAuditEvidenceSource>,
@@ -1194,17 +1242,25 @@ fn combined_content_match(
     })
 }
 
-/// Runs the existing bounded ZIP/7z member readers once, then applies the
-/// same exact-agreement merge used for loose files to each decoded member.
+/// Runs the existing bounded ZIP/7z/RAR member readers once, then applies
+/// the same exact-agreement merge used for loose files to each decoded
+/// member.
 ///
-/// RAR intentionally remains outside this combined slice: its existing
-/// provider is useful, but can require an external capability probe and has
-/// different operational behaviour. LHA similarly uses the optional,
-/// fd-pinned local 7-Zip backend. It is opened only when an exact whole-LHA
+/// RAR reuses its existing single-catalogue seam entirely unchanged - the
+/// same [`RarProvider`] discovery, the same [`RarArchiveSource::open`], the
+/// same [`RAR_OPEN_TIMEOUT`]/[`RAR_MEMBER_TIMEOUT`] envelopes, the same
+/// refusal rules (RAR4, solid, encrypted, multivolume, split members, SFX,
+/// symlinks/hardlinks, duplicate paths, alternate streams, zero-size
+/// members, malformed listing all still refuse inside `rar.rs` itself,
+/// completely untouched by this function). The one difference from the
+/// single-catalogue path is what `RarArchiveSource::open`'s `index`
+/// parameter is built from: see [`combined_rar_candidate_index`] for why a
+/// merged, filename-only index is safe here. LHA uses the optional,
+/// fd-pinned local 7-Zip backend and is opened only when an exact whole-LHA
 /// catalogue record already matched, or when an enabled catalogue explicitly
-/// contains `.slave` records for the optional internal-evidence path. ZIP and
-/// 7z are fully in-process; every accepted format nevertheless implements the
-/// same [`ArchiveMemberSource`] safety contract.
+/// contains `.slave` records for the optional internal-evidence path. ZIP
+/// and 7z are fully in-process; every accepted format nevertheless
+/// implements the same [`ArchiveMemberSource`] safety contract.
 fn audit_combined_archives(
     files: &[PathBuf],
     trusted: &TrustedRoots,
@@ -1216,6 +1272,8 @@ fn audit_combined_archives(
     let mut bytes_hashed = 0_u64;
     let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
 
+    let mut rar_provider: Option<Result<RarProvider, RarError>> = None;
+    let mut rar_candidate_index: Option<DatIndex> = None;
     let mut lha_provider: Option<Result<LhaProvider, LhaError>> = None;
     let may_match_lha_slave = catalogues
         .iter()
@@ -1223,6 +1281,7 @@ fn audit_combined_archives(
     for path in files.iter().filter(|path| {
         is_zip_path(path)
             || is_sevenz_path(path)
+            || is_rar_path(path)
             || (is_lha_path(path) && (exact_lha_paths.contains(*path) || may_match_lha_slave))
     }) {
         if cancelled(cancel) {
@@ -1232,9 +1291,17 @@ fn audit_combined_archives(
             "zip"
         } else if is_sevenz_path(path) {
             "7z"
+        } else if is_rar_path(path) {
+            "rar"
         } else {
             "lha"
         };
+        if is_rar_path(path) && rar_provider.is_none() {
+            rar_provider = Some(RarProvider::discover(RAR_DISCOVERY_TIMEOUT));
+        }
+        if is_rar_path(path) && rar_candidate_index.is_none() {
+            rar_candidate_index = Some(combined_rar_candidate_index(catalogues));
+        }
         if is_lha_path(path) && lha_provider.is_none() {
             lha_provider = Some(LhaProvider::discover(LHA_DISCOVERY_TIMEOUT));
         }
@@ -1245,6 +1312,26 @@ fn audit_combined_archives(
         } else if is_sevenz_path(path) {
             SevenZArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel)
                 .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+        } else if is_rar_path(path) {
+            match rar_provider.as_ref() {
+                Some(Ok(provider)) => RarArchiveSource::open(
+                    path,
+                    provider,
+                    rar_candidate_index
+                        .as_ref()
+                        .expect("rar_candidate_index is populated above whenever is_rar_path"),
+                    ArchiveLimits::default(),
+                    RAR_OPEN_TIMEOUT,
+                    RAR_MEMBER_TIMEOUT,
+                )
+                .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>),
+                Some(Err(error)) => Err(ArchiveMemberSourceError::Unsupported {
+                    detail: format!("no capable RAR backend is available: {error}"),
+                }),
+                None => Err(ArchiveMemberSourceError::Unsupported {
+                    detail: "RAR backend was not probed for this run".to_string(),
+                }),
+            }
         } else {
             match lha_provider.as_ref() {
                 Some(Ok(provider)) => provider
