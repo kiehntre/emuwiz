@@ -1,37 +1,14 @@
 //! Tests for native DuckStation launch execution.
 //!
-//! # Why this suite is narrower than PCSX2's/Dolphin's own execution tests
+//! The execution tests cover the native command and its fresh, authoritative
+//! identity revalidation without duplicating the identity reader.
 //!
-//! [`preflight_duckstation_launch`]'s step 4 ("freshly inspect game
-//! identity") calls
-//! [`crate::game_identity::inspect_catalogued_game_identity`] exactly the
-//! way PCSX2's/Dolphin's own preflight already do - but unlike `PS2`
-//! (`IdentityPlatform::PlayStation2`, wired through `BOOT2=` SYSTEM.CNF
-//! parsing) or `GameCube`/`Wii`, **`game_identity.rs`'s `IdentityPlatform`
-//! enum has no PlayStation/PSX variant, and `IdentityKind` has no
-//! `Ps1Serial` variant** - confirmed by reading both enums directly, and by
-//! `VerifiedIdentityFact::Ps1Serial` never being constructed anywhere in
-//! this crate outside test fixtures. Fresh, live PS1 disc-serial
-//! verification from real bytes genuinely does not exist yet at the
-//! `game_identity` layer this preflight is required to call.
-//!
-//! This is a real, external, structural prerequisite - not a bug in this
-//! module. `preflight_duckstation_launch` is written, complete, and
-//! correct (mirroring the exact proven PCSX2 architecture); it is simply
-//! unable to get past its own step 4 for *any* real PS1 disc today,
-//! because the identity layer it must freshly re-verify against cannot yet
-//! answer "what PS1 serial does this disc have" at all. It will start
-//! working the moment that prerequisite lands, with zero changes needed
-//! here.
-//!
-//! What *is* provable and tested today, independent of that gap:
+//! What is provable and tested here:
 //! - [`spawn_duckstation`] and the shared [`crate::launch::process_spawn`]
 //!   watcher mechanics, exercised directly against a hand-built
 //!   [`DuckStationCommand`] (spawning never touches identity at all).
-//! - That [`preflight_duckstation_launch`] fails safely (never panics) and
-//!   reports exactly [`DuckStationLaunchPreflightErrorKind::IdentityUnresolved`]
-//!   for a real, well-formed PS1 disc today - a regression guard that
-//!   documents the exact gap rather than silently working around it.
+//! - [`preflight_duckstation_launch`] revalidates a real PS1 disc's serial
+//!   before producing a command.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -259,19 +236,21 @@ fn ps1_iso_bytes() -> Vec<u8> {
 
     let cnf_offset = 21 * ISO_SECTOR_SIZE;
     iso[cnf_offset..cnf_offset + cnf.len()].copy_from_slice(cnf);
+    let executable_name = b"SLUS_123.45;1";
+    let executable_record = directory_record(executable_name, 22, 12, false);
+    let executable_record_offset = root_offset + cnf_record.len();
+    iso[executable_record_offset..executable_record_offset + executable_record.len()]
+        .copy_from_slice(&executable_record);
+    let executable_offset = 22 * ISO_SECTOR_SIZE;
+    iso[executable_offset..executable_offset + 12].copy_from_slice(b"PS-X EXE\0\0\0\0");
     iso
 }
 
 #[test]
-fn preflight_fails_closed_with_identity_unresolved_for_a_real_ps1_disc_today() {
-    // This test exists to *document and guard* the exact external gap this
-    // module's own doc comment explains, not to validate desired behavior.
-    // When PS1 disc-serial identity support lands in `game_identity.rs`,
-    // this test's expectation should change to `Ok(_)` (matching
-    // `valid_native_ps1_iso_succeeds` in PCSX2's own execution test suite) -
-    // and that is the intended, expected outcome of fixing the
-    // prerequisite, not a signal something here is broken.
-    let root = fixture_root("identity-gap");
+fn fresh_identity_revalidates_a_real_ps1_disc() {
+    // The fixture is a directly inspectable PS1 image; this test isolates the
+    // fresh identity revalidation stage from later profile-binding checks.
+    let root = fixture_root("identity-revalidation");
     let executable = root.join("bin/duckstation-qt");
     write_executable(&executable, b"#!/bin/sh\nexit 0\n");
     let profile_root = root.join("config/duckstation");
@@ -308,10 +287,31 @@ fn preflight_fails_closed_with_identity_unresolved_for_a_real_ps1_disc_today() {
     let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
     assert_eq!(
         error.kind,
-        DuckStationLaunchPreflightErrorKind::IdentityUnresolved,
-        "if this now fails differently (or succeeds), the PS1 identity prerequisite this \
-         module's doc comment names has changed - update this test and the wider execution \
-         test suite to match PCSX2's own, not just this assertion"
+        DuckStationLaunchPreflightErrorKind::BindingUnavailable
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fresh_identity_rejects_a_mismatched_real_ps1_serial() {
+    let root = fixture_root("identity-mismatch");
+    let content_path = root.join("games/game.iso");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(&content_path, ps1_iso_bytes()).unwrap();
+    let request = DuckStationLaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: "PSX".to_string(),
+        expected_game_key: "SLUS-12345".to_string(),
+        expected_ps1_serial: "SLES-23456".to_string(),
+        profile_id: "duckstation:test".to_string(),
+        expected_executable: root.join("duckstation-qt"),
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+    };
+
+    let error = fresh_identity_status(&request.selected_content_path, &request).unwrap_err();
+    assert_eq!(
+        error.kind,
+        DuckStationLaunchPreflightErrorKind::Ps1SerialMismatch
     );
     std::fs::remove_dir_all(root).unwrap();
 }

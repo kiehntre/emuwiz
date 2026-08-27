@@ -85,6 +85,58 @@ fn verified_ps2_serial_resolves_with_a_matching_fact() {
 }
 
 #[test]
+fn verified_ps1_serial_resolves_to_duckstation_fact() {
+    let source = report(
+        IdentityPlatform::PlayStation,
+        vec![evidence(
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Verified,
+            Some("SLUS-12345"),
+            IdentityConfidence::StructuredMetadata,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PSX".to_string(),
+            game_key: "SLUS-12345".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::Ps1Serial("SLUS-12345".to_string())]
+    );
+}
+
+#[test]
+fn conflicting_ps1_serials_never_produce_a_duckstation_fact() {
+    let source = report(
+        IdentityPlatform::PlayStation,
+        vec![
+            evidence(
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Verified,
+                Some("SLUS-12345"),
+                IdentityConfidence::StructuredMetadata,
+            ),
+            evidence(
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Verified,
+                Some("SLES-23456"),
+                IdentityConfidence::StructuredMetadata,
+            ),
+        ],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+    assert_eq!(status, CanonicalIdentityStatus::Conflicting);
+    assert!(facts.is_empty());
+}
+
+#[test]
 fn verified_ps2_serial_and_crc_resolve_with_both_facts() {
     let source = report(
         IdentityPlatform::PlayStation2,

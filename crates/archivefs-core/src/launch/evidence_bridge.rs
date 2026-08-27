@@ -71,7 +71,8 @@ use crate::{ArchiveKind, ArchiveRecord, MountState};
 fn is_identity_conferring(kind: IdentityKind) -> bool {
     matches!(
         kind,
-        IdentityKind::Ps2Serial
+        IdentityKind::Ps1Serial
+            | IdentityKind::Ps2Serial
             | IdentityKind::Pcsx2ExecutableCrc
             | IdentityKind::DolphinGameId
             | IdentityKind::LooseRomSha256
@@ -125,6 +126,7 @@ fn find_value(resolved: &[(IdentityKind, String)], kind: IdentityKind) -> Option
 /// the platforms [`GameIdentityReport`] can identify - never invented here.
 fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
     match platform {
+        IdentityPlatform::PlayStation => Some("PSX"),
         IdentityPlatform::PlayStation2 => Some("PS2"),
         IdentityPlatform::GameCube => Some("GameCube"),
         IdentityPlatform::Wii => Some("Wii"),
@@ -150,6 +152,14 @@ fn resolved_identity_for_platform(
 ) -> Option<(&'static str, String, Vec<VerifiedIdentityFact>)> {
     let platform_id = launch_platform_id(platform)?;
     match platform {
+        IdentityPlatform::PlayStation => {
+            let serial = find_value(resolved, IdentityKind::Ps1Serial)?;
+            Some((
+                platform_id,
+                serial.to_string(),
+                vec![VerifiedIdentityFact::Ps1Serial(serial.to_string())],
+            ))
+        }
         IdentityPlatform::PlayStation2 => {
             let serial = find_value(resolved, IdentityKind::Ps2Serial);
             let crc = find_value(resolved, IdentityKind::Pcsx2ExecutableCrc);

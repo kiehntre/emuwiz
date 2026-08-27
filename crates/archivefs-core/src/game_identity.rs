@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
+use crate::playstation_boot_evidence::{
+    PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
+};
+
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
 pub const MAX_ARCHIVE_MEMBERS: usize = 4_096;
 pub const MAX_METADATA_PATHS: usize = 32;
@@ -149,6 +153,7 @@ impl fmt::Display for IdentityStatus {
 #[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
     Platform,
+    Ps1Serial,
     Ps2Serial,
     Pcsx2ExecutableCrc,
     DolphinGameId,
@@ -166,6 +171,7 @@ impl fmt::Display for IdentityKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Platform => "Platform",
+            Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
             Self::Pcsx2ExecutableCrc => "PCSX2 executable CRC",
             Self::DolphinGameId => "Dolphin Game ID",
@@ -195,6 +201,7 @@ pub enum IdentityConfidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityPlatform {
+    PlayStation,
     PlayStation2,
     GameCube,
     Wii,
@@ -208,6 +215,8 @@ impl IdentityPlatform {
     pub fn from_catalogue(value: Option<&str>) -> Self {
         let value = value.unwrap_or_default().trim().to_ascii_lowercase();
         match value.as_str() {
+            "playstation" | "playstation 1" | "playstation1" | "psx" | "ps1"
+            | "sony playstation" => Self::PlayStation,
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" => Self::GameCube,
             "wii" | "nintendo wii" => Self::Wii,
@@ -226,6 +235,7 @@ impl IdentityPlatform {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::PlayStation => "PlayStation",
             Self::PlayStation2 => "PlayStation 2",
             Self::GameCube => "GameCube",
             Self::Wii => "Wii",
@@ -363,6 +373,10 @@ impl GameIdentityReport {
 
     pub fn verified_ps2_serial(&self) -> Option<&str> {
         self.verified_value(IdentityKind::Ps2Serial)
+    }
+
+    pub fn verified_ps1_serial(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::Ps1Serial)
     }
 
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
@@ -866,7 +880,8 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             member_size.min(DOLPHIN_HEADER_BYTES as u64)
         }
-        IdentityPlatform::PlayStation2
+        IdentityPlatform::PlayStation
+        | IdentityPlatform::PlayStation2
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Xbox360
@@ -1231,6 +1246,7 @@ fn inspect_iso_source(
     member_index: Option<usize>,
 ) {
     match report.platform {
+        IdentityPlatform::PlayStation => inspect_ps1_iso(report, source, member_path, member_index),
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -2028,6 +2044,235 @@ fn inspect_ps2_iso(
     report.complete = true;
 }
 
+fn inspect_ps1_iso(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let root = match iso_root(source) {
+        Ok(root) => root,
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "ISO 9660 primary volume descriptor",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    report.metadata_paths_inspected += 1;
+    let cnf = match find_iso_path(source, root, &[b"SYSTEM.CNF"]) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "ISO 9660 root directory lookup",
+                "SYSTEM.CNF is missing",
+            );
+            return;
+        }
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "ISO 9660 root directory lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    if cnf.size > MAX_SYSTEM_CNF_BYTES {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::ResourceLimitReached,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "SYSTEM.CNF bounded read",
+            "SYSTEM.CNF exceeds 64 KiB",
+        );
+        return;
+    }
+    let cnf_bytes = match read_iso_record(source, cnf) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                source_error_status(&error),
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "SYSTEM.CNF bounded read",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let boot = match parse_system_cnf_boot(&cnf_bytes) {
+        Some(fact) if fact.boot_key == "BOOT" => fact,
+        Some(_) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "SYSTEM.CNF BOOT assignment",
+                "SYSTEM.CNF contains BOOT2, which is not a PS1 boot key",
+            );
+            return;
+        }
+        None => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "SYSTEM.CNF BOOT assignment",
+                "SYSTEM.CNF has no valid BOOT assignment",
+            );
+            return;
+        }
+    };
+    let Some(serial) = boot.serial_candidate.clone() else {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "SYSTEM.CNF BOOT executable name",
+            "BOOT executable does not contain a valid PS1 product code",
+        );
+        return;
+    };
+    if !is_supported_ps1_serial(&serial) {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "SYSTEM.CNF BOOT product-code family",
+            "BOOT executable contains an unsupported PS1 product-code family",
+        );
+        return;
+    }
+    let Some(executable_path) = boot.executable_path else {
+        return;
+    };
+    let components: Vec<&[u8]> = executable_path
+        .split(|character| character == '\\' || character == '/')
+        .map(str::as_bytes)
+        .collect();
+    report.metadata_paths_inspected += 1;
+    let executable = match find_iso_path(source, root, &components) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "SYSTEM.CNF BOOT ISO lookup",
+                "BOOT executable is missing",
+            );
+            return;
+        }
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "SYSTEM.CNF BOOT ISO lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    let header_len = (executable.size as usize).min(PSX_EXECUTABLE_HEADER_BYTES);
+    let mut header = vec![0_u8; header_len];
+    if let Err(error) = read_iso_record_prefix(source, executable, &mut header) {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "bounded PS-X EXE header read",
+            &error.to_string(),
+        );
+        return;
+    }
+    if !looks_like_psx_exe(&header) {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PS-X EXE signature validation",
+            "BOOT executable is not a PS-X EXE",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::Ps1Serial,
+        IdentityStatus::Verified,
+        Some(serial),
+        IdentityConfidence::StructuredMetadata,
+        member_path,
+        member_index,
+        "SYSTEM.CNF BOOT plus PS-X EXE on ISO 9660",
+        "serial derived from the exact boot executable path and corroborated by its PS-X EXE header",
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
 pub fn parse_system_cnf_boot2(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.len() as u64 > MAX_SYSTEM_CNF_BYTES {
         return Err("SYSTEM.CNF exceeds 64 KiB".to_string());
@@ -2091,6 +2336,13 @@ pub fn serial_from_boot_path(path: &[u8]) -> Option<String> {
         return None;
     }
     Some(format!("{}-{}{}", &name[..4], &name[5..8], &name[9..11]))
+}
+
+fn is_supported_ps1_serial(serial: &str) -> bool {
+    matches!(
+        serial.get(..4),
+        Some("SLUS" | "SCUS" | "SLES" | "SCES" | "SLPS" | "SLPM")
+    )
 }
 
 /// PCSX2's executable "CRC": XOR each complete little-endian 32-bit ELF word.
@@ -2261,6 +2513,23 @@ fn read_iso_record(source: &mut dyn ByteSource, record: IsoRecord) -> io::Result
     Ok(bytes)
 }
 
+fn read_iso_record_prefix(
+    source: &mut dyn ByteSource,
+    record: IsoRecord,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    if record.directory || buffer.len() as u64 > record.size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "ISO record is smaller than requested prefix",
+        ));
+    }
+    let offset = u64::from(record.extent)
+        .checked_mul(ISO_SECTOR_SIZE)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ISO extent overflow"))?;
+    source.read_exact_at(offset, buffer)
+}
+
 trait ByteSource {
     fn len(&self) -> u64;
     fn bytes_read(&self) -> u64;
@@ -2408,6 +2677,7 @@ fn push_with_source(
 
 fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diagnostic: &str) {
     let kinds: &[IdentityKind] = match report.platform {
+        IdentityPlatform::PlayStation => &[IdentityKind::Ps1Serial],
         IdentityPlatform::PlayStation2 => {
             &[IdentityKind::Ps2Serial, IdentityKind::Pcsx2ExecutableCrc]
         }
@@ -2456,7 +2726,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
                 }
             }
         }
-        IdentityPlatform::PlayStation2 => {
+        IdentityPlatform::PlayStation | IdentityPlatform::PlayStation2 => {
             let bytes = stem.as_bytes();
             for start in 0..bytes.len() {
                 if let Some(serial) = bytes
@@ -2632,6 +2902,37 @@ mod tests {
             let elf_offset = 22 * ISO_SECTOR_SIZE as usize;
             iso[elf_offset..elf_offset + 12]
                 .copy_from_slice(&[0x7f, b'E', b'L', b'F', 1, 2, 3, 4, 5, 6, 7, 8]);
+        }
+        iso[cursor] = 0;
+        let cnf_offset = 21 * ISO_SECTOR_SIZE as usize;
+        iso[cnf_offset..cnf_offset + cnf.len()].copy_from_slice(cnf);
+        iso
+    }
+
+    fn ps1_iso(serial_name: &[u8], cnf: &[u8], include_executable: bool) -> Vec<u8> {
+        const SECTORS: usize = 24;
+        let mut iso = vec![0_u8; SECTORS * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+
+        let root_offset = 20 * ISO_SECTOR_SIZE as usize;
+        let cnf_record = directory_record(b"SYSTEM.CNF;1", 21, cnf.len() as u32, false);
+        iso[root_offset..root_offset + cnf_record.len()].copy_from_slice(&cnf_record);
+        let mut cursor = root_offset + cnf_record.len();
+        if include_executable {
+            let executable_record = directory_record(serial_name, 22, 12, false);
+            iso[cursor..cursor + executable_record.len()].copy_from_slice(&executable_record);
+            let executable_offset = 22 * ISO_SECTOR_SIZE as usize;
+            iso[executable_offset..executable_offset + 12].copy_from_slice(b"PS-X EXE\0\0\0\0");
+            cursor += executable_record.len();
         }
         iso[cursor] = 0;
         let cnf_offset = 21 * ISO_SECTOR_SIZE as usize;
@@ -3298,6 +3599,132 @@ mod tests {
         );
         assert_eq!(report.verified_pcsx2_crc(), Some(expected.as_str()));
         assert!(report.complete);
+    }
+
+    #[test]
+    fn ps1_iso_verifies_boot_serial_and_psx_executable() {
+        let directory = FixtureDir::new("ps1");
+        let path = write_fixture(
+            &directory,
+            "unrelated-name.iso",
+            &ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true),
+        );
+        let report = inspect_game_identity(&path, Some("PSX"));
+
+        assert_eq!(report.platform, IdentityPlatform::PlayStation);
+        assert_eq!(report.verified_ps1_serial(), Some("SLUS-12345"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn ps1_identity_fails_closed_without_system_cnf_or_psx_executable() {
+        let directory = FixtureDir::new("ps1-fail-closed");
+        let missing_cnf = write_fixture(
+            &directory,
+            "missing-cnf.iso",
+            &ps1_iso(b"SLUS_123.45;1", b"", true),
+        );
+        let report = inspect_game_identity(&missing_cnf, Some("PlayStation"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+
+        let missing_executable = write_fixture(
+            &directory,
+            "missing-executable.iso",
+            &ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\n", false),
+        );
+        let report = inspect_game_identity(&missing_executable, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_serial_families_are_normalized_and_unsupported_families_rejected() {
+        let directory = FixtureDir::new("ps1-families");
+        for (index, (family, expected)) in [
+            ("SLUS", "SLUS-12345"),
+            ("SCUS", "SCUS-12345"),
+            ("SLES", "SLES-23456"),
+            ("SCES", "SCES-23456"),
+            ("SLPS", "SLPS-34567"),
+            ("SLPM", "SLPM-34567"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let code = if family == "SLUS" || family == "SCUS" {
+                format!("{family}_123.45")
+            } else if family == "SLES" || family == "SCES" {
+                format!("{family}_234.56")
+            } else {
+                format!("{family}_345.67")
+            };
+            let path = write_fixture(
+                &directory,
+                &format!("family-{index}.iso"),
+                &ps1_iso(
+                    format!("{code};1").as_bytes(),
+                    format!("BOOT=cdrom:\\{code};1\n").as_bytes(),
+                    true,
+                ),
+            );
+            let report = inspect_game_identity(&path, Some("PS1"));
+            assert_eq!(report.verified_ps1_serial(), Some(expected));
+        }
+
+        let unsupported = write_fixture(
+            &directory,
+            "unsupported-family.iso",
+            &ps1_iso(b"ABCD_123.45;1", b"BOOT=cdrom:\\ABCD_123.45;1\n", true),
+        );
+        let report = inspect_game_identity(&unsupported, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_malformed_boot_data_and_non_psx_executable_fail_closed() {
+        let directory = FixtureDir::new("ps1-malformed");
+        for (name, cnf) in [
+            ("malformed.iso", b"BOOT cdrom:\\SLUS_123.45;1\n".as_slice()),
+            ("missing-boot.iso", b"TCB=4\n".as_slice()),
+            (
+                "boot2-only.iso",
+                b"BOOT2=cdrom0:\\SLUS_123.45;1\n".as_slice(),
+            ),
+            (
+                "malformed-target.iso",
+                b"BOOT=cdrom:\\..\\SLUS_123.45;1\n".as_slice(),
+            ),
+        ] {
+            let path = write_fixture(&directory, name, &ps1_iso(b"SLUS_123.45;1", cnf, true));
+            let report = inspect_game_identity(&path, Some("PS1"));
+            assert_eq!(report.verified_ps1_serial(), None, "{name}");
+            assert!(!report.complete, "{name}");
+        }
+
+        let mut wrong_executable = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\n", true);
+        wrong_executable[22 * ISO_SECTOR_SIZE as usize..22 * ISO_SECTOR_SIZE as usize + 8]
+            .copy_from_slice(b"NOT-PSX!");
+        let path = write_fixture(&directory, "wrong-executable.iso", &wrong_executable);
+        let report = inspect_game_identity(&path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_chd_and_bin_cue_formats_remain_non_authoritative() {
+        let chd = inspect_game_identity(Path::new("/games/game.chd"), Some("PS1"));
+        assert_eq!(chd.format, IdentityImageFormat::Deferred);
+        assert_eq!(chd.verified_ps1_serial(), None);
+
+        let bin = inspect_game_identity(Path::new("/games/game.bin"), Some("PS1"));
+        assert_eq!(bin.format, IdentityImageFormat::Unsupported);
+        assert_eq!(bin.verified_ps1_serial(), None);
+
+        let cue = inspect_game_identity(Path::new("/games/game.cue"), Some("PS1"));
+        assert_eq!(cue.format, IdentityImageFormat::Unsupported);
+        assert_eq!(cue.verified_ps1_serial(), None);
     }
 
     #[test]
