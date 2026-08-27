@@ -1149,6 +1149,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         clipboard: NativeClipboard::new(),
         view: MainView::default(),
         library_tab: LibraryTab::default(),
+        problems_repair_tab: ProblemsRepairTab::default(),
         tools_overlay: ToolsOverlay::default(),
         show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
         show_about: false,

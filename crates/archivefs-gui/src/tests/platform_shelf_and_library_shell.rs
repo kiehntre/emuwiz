@@ -3219,7 +3219,18 @@ fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
         // `About` is deliberately reached only through the Help menu, never
         // the sidebar (see `main.rs`'s Help-menu handler) - it is not a
         // sidebar regression for it to be absent here.
-        if view == MainView::About {
+        //
+        // `Doctor`/`RepairReview`/`RepairHistory` are deliberately reached
+        // only through the consolidated `MainView::Problems` ("Problems &
+        // Repair") entry's own tabs now, not through a sidebar row of their
+        // own - see `navigation::ADVANCED_NAV_GROUPS`'s "GUI consolidation"
+        // doc note. `problems_repair_still_covers_every_consolidated_view`
+        // below is the real regression check for these three; skipping them
+        // here is not a silent gap.
+        if matches!(
+            view,
+            MainView::About | MainView::Doctor | MainView::RepairReview | MainView::RepairHistory
+        ) {
             continue;
         }
         assert!(
@@ -3227,6 +3238,10 @@ fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
             "{label} ({view:?}) is a primary destination but has no sidebar entry"
         );
     }
+    assert!(
+        sidebar_views.contains(&MainView::Problems),
+        "the consolidated Problems & Repair destination must have a sidebar entry"
+    );
     let has_quick_rename = ADVANCED_NAV_GROUPS
         .iter()
         .flat_map(|group| group.entries)
@@ -3235,6 +3250,48 @@ fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
         has_quick_rename,
         "Quick Rename must still have a sidebar entry"
     );
+}
+
+/// The GUI consolidation regression check `every_primary_destination_and_
+/// quick_rename_still_has_a_sidebar_entry` above defers to: every one of
+/// the three destinations that lost its own standalone sidebar row
+/// (`Doctor`, `RepairReview`, `RepairHistory`) must still be reachable
+/// through the consolidated `MainView::Problems` entry's tab projection
+/// (`problems_repair_tab_for_main_view`), and `Problems` itself must be
+/// the sole sidebar-visible entry among the four - never two of them
+/// visible at once, which would recreate the exact "choose between Doctor
+/// and Repair" problem the consolidation removed.
+#[test]
+fn problems_repair_still_covers_every_consolidated_view() {
+    for view in [
+        MainView::Problems,
+        MainView::Doctor,
+        MainView::RepairReview,
+        MainView::RepairHistory,
+    ] {
+        assert!(
+            problems_repair_tab_for_main_view(view).is_some(),
+            "{view:?} must map to a Problems & Repair tab"
+        );
+    }
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    for view in [
+        MainView::Doctor,
+        MainView::RepairReview,
+        MainView::RepairHistory,
+    ] {
+        assert!(
+            !sidebar_views.contains(&view),
+            "{view:?} must not have its own standalone sidebar entry any more - it is only reachable through Problems & Repair's tabs"
+        );
+    }
 }
 
 #[test]

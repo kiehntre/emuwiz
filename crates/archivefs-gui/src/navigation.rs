@@ -14,11 +14,12 @@
 
 use super::*;
 
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 15] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 16] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::CheatSources, "Cheat Sources"),
+    (MainView::Problems, "Problems & Repair"),
     (MainView::RepairReview, "Repair Review"),
     (MainView::RepairHistory, "Repair History"),
     (MainView::LibraryViewHistory, "Library View History"),
@@ -138,6 +139,25 @@ pub(crate) struct NavGroup {
 /// - `RepairReview` sits with Diagnostics (reviewing found problems before
 ///   deciding to fix them); `RepairHistory` sits with History & Journals
 ///   (§3.2's own "Rollback / journal detail" child) - it is exactly that.
+///
+/// # GUI consolidation: one "Problems & Repair" destination
+///
+/// A later pass (`MainView::Problems`) folded the three separate sidebar
+/// rows above (`Doctor`, `RepairReview`, `RepairHistory`) into one visible
+/// entry, `nav_view(MainView::Problems, "Problems & Repair")`, so a user no
+/// longer has to choose between "Doctor" and "Repair" before knowing which
+/// one applies. This changes routing and presentation only - it does not
+/// revisit the "cannot be merged without losing capability" finding above:
+/// `MainView::Doctor`/`RepairReview`/`RepairHistory` still exist, still
+/// render their own genuinely different data through their own unchanged
+/// engines, and are still individually reachable (by deep-link, and as
+/// tabs/sections inside the one consolidated page - see
+/// `problems_repair_page`'s module doc). `ToolsOverlay::DoctorChecks`
+/// ("Automatic health report") is deliberately left as its own overlay
+/// entry: it is a third, orthogonal mechanism the same Phase 1 finding
+/// already decided to keep separate, and this task's own scope is the
+/// Doctor-vs-Repair top-level destination choice, not the overlay/page
+/// distinction.
 pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     NavGroup {
         heading: None,
@@ -177,16 +197,14 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
         heading: Some("HISTORY & JOURNALS"),
         entries: &[
             nav_view(MainView::HistoryLogs, "History & Logs"),
-            nav_view(MainView::RepairHistory, "Repair History"),
             nav_view(MainView::LibraryViewHistory, "Library View History"),
         ],
     },
     NavGroup {
         heading: Some("DIAGNOSTICS"),
         entries: &[
-            nav_view(MainView::Doctor, "Doctor (manual scan & repair)"),
+            nav_view(MainView::Problems, "Problems & Repair"),
             nav_overlay(ToolsOverlay::DoctorChecks, "Automatic health report"),
-            nav_view(MainView::RepairReview, "Repair Review"),
         ],
     },
     NavGroup {
@@ -219,9 +237,19 @@ pub(crate) fn navigation_destination_enabled(view: MainView, has_database: bool)
 /// `MainView::Library` itself - otherwise the sidebar would show no
 /// selected destination at all while on the Health, Duplicates, or Views
 /// tab.
+///
+/// `MainView::Problems` follows the identical rule for the consolidated
+/// "Problems & Repair" destination: it renders selected while `current` is
+/// `Problems` itself or any of the destinations its own tabs cover
+/// (`Doctor`, `RepairReview`, `RepairHistory` - see
+/// `problems_repair_tab_for_main_view`), so a deep-link that lands directly
+/// on, say, `MainView::RepairReview` still shows the one sidebar button
+/// selected rather than none.
 pub(crate) fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
     if candidate == MainView::Library {
         library_tab_for_main_view(current).is_some()
+    } else if candidate == MainView::Problems {
+        problems_repair_tab_for_main_view(current).is_some()
     } else {
         current == candidate
     }

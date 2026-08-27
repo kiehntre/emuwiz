@@ -3218,3 +3218,171 @@ fn unknown_platform_rows_are_needs_attention_in_the_list_too() {
         "Ready to play"
     );
 }
+
+// --- Problems & Repair consolidation ---------------------------------------
+//
+// `MainView::Doctor`/`RepairReview`/`RepairHistory` still exist and still
+// render through their own unchanged engines (proven throughout this file
+// already, via `show_doctor_page` and elsewhere); what these tests prove is
+// the *new* consolidated destination built on top of them: one sidebar
+// entry, a shared tab row, correct per-tab dispatch, and that navigating to
+// any of the three underlying `MainView`s still lands on real content.
+
+fn problems_repair_screen_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1400.0, 1600.0),
+        )),
+        ..Default::default()
+    }
+}
+
+fn render_problems_repair_app(app: &mut ArchiveFsApp) -> egui::FullOutput {
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    ctx.run(problems_repair_screen_input(), |ctx| {
+        app.update(ctx, &mut frame)
+    })
+}
+
+#[test]
+fn problems_repair_tab_covers_every_consolidated_view() {
+    for view in [
+        MainView::Problems,
+        MainView::Doctor,
+        MainView::RepairReview,
+        MainView::RepairHistory,
+    ] {
+        assert!(
+            problems_repair_tab_for_main_view(view).is_some(),
+            "{view:?} must map to a Problems & Repair tab"
+        );
+    }
+    assert_eq!(
+        problems_repair_tab_for_main_view(MainView::Problems),
+        Some(ProblemsRepairTab::Overview)
+    );
+    assert_eq!(
+        problems_repair_tab_for_main_view(MainView::Doctor),
+        Some(ProblemsRepairTab::Diagnostics)
+    );
+    assert_eq!(
+        problems_repair_tab_for_main_view(MainView::RepairReview),
+        Some(ProblemsRepairTab::Repair)
+    );
+    assert_eq!(
+        problems_repair_tab_for_main_view(MainView::RepairHistory),
+        Some(ProblemsRepairTab::Repair)
+    );
+    // Every other destination is unaffected.
+    assert_eq!(problems_repair_tab_for_main_view(MainView::Home), None);
+}
+
+#[test]
+fn navigate_to_problems_repair_tab_sets_the_matching_view_and_remembers_it() {
+    let mut app = app_for_operation_tests();
+    app.navigate_to_problems_repair_tab(ProblemsRepairTab::Diagnostics);
+    assert_eq!(app.view, MainView::Doctor);
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Diagnostics);
+
+    // Clicking the one sidebar entry again restores the last tab rather
+    // than resetting to Overview - the same rule `MainView::Library`
+    // already follows.
+    app.navigate_to_main_view(MainView::Problems);
+    assert_eq!(app.view, MainView::Doctor);
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Diagnostics);
+}
+
+#[test]
+fn reconcile_problems_repair_tab_follows_a_direct_view_assignment() {
+    // Mirrors how a deep-link (e.g. Home's "Check Setup" card) still just
+    // sets `self.view` directly - `reconcile_problems_repair_tab` (called
+    // every frame) is what keeps `problems_repair_tab` truthful afterwards.
+    let mut app = app_for_operation_tests();
+    app.view = MainView::RepairReview;
+    app.reconcile_problems_repair_tab();
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
+}
+
+#[test]
+fn problems_repair_overview_renders_the_tab_row_and_a_summary() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::Problems;
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Problems & Repair"));
+    assert!(rendered_text_contains(&output, "Overview"));
+    assert!(rendered_text_contains(&output, "Diagnostics"));
+    assert!(rendered_text_contains(&output, "Repair / Recovery"));
+    assert!(rendered_text_contains(&output, "Not checked yet"));
+}
+
+#[test]
+fn problems_repair_diagnostics_tab_still_renders_doctor_content() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::Doctor;
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(
+        rendered_text_contains(&output, DOCTOR_READ_ONLY_NOTICE),
+        "Diagnostics must still render Doctor's own safety notice"
+    );
+    assert!(rendered_text_contains(&output, "Run Doctor"));
+}
+
+#[test]
+fn problems_repair_repair_tab_renders_review_and_history_together() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::RepairReview;
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(
+        rendered_text_contains(&output, "No repair plan loaded"),
+        "Repair Review's own content must still render"
+    );
+    assert!(
+        rendered_text_contains(&output, "Repair History"),
+        "Repair History must render alongside Review, not require a separate destination"
+    );
+}
+
+#[test]
+fn problems_repair_history_deep_link_also_renders_both_sections() {
+    // A deep-link landing directly on `MainView::RepairHistory` (rather
+    // than `RepairReview`) must still reach the same consolidated content -
+    // there is no separate "History" destination to fall through to.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::RepairHistory;
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "No repair plan loaded"));
+    assert!(rendered_text_contains(&output, "Repair History"));
+}
+
+#[test]
+fn problems_repair_is_the_only_sidebar_entry_for_doctor_and_repair() {
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    assert!(sidebar_views.contains(&MainView::Problems));
+    for view in [
+        MainView::Doctor,
+        MainView::RepairReview,
+        MainView::RepairHistory,
+    ] {
+        assert!(
+            !sidebar_views.contains(&view),
+            "{view:?} must not have its own sidebar entry any more"
+        );
+    }
+}
