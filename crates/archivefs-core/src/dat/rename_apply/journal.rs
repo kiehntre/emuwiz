@@ -159,6 +159,35 @@ pub fn journal_exists(dir: &Path, transaction_id: &str) -> bool {
     journal_path(dir, transaction_id).is_some_and(|path| std::fs::symlink_metadata(&path).is_ok())
 }
 
+/// Persists the user's choice to leave an interrupted transaction
+/// untouched: reads the current journal, records
+/// [`RecoveryResolution::LeaveUntouched`] and when, and writes the whole
+/// transaction back durably via [`write_journal`]. `state` and every
+/// [`crate::dat::rename_apply::model::TransactionEntry`] are read back and
+/// written out completely unchanged - this never claims a rename happened,
+/// never rolls anything back, and never removes the journal.
+///
+/// Idempotent: resolving an already-resolved transaction again just
+/// re-records the same choice (and a newer timestamp), which is harmless.
+/// Returns the updated transaction so a caller can refresh its own
+/// in-memory view without a second read.
+pub fn resolve_leave_untouched(
+    dir: &Path,
+    transaction_id: &str,
+) -> Result<RenameTransaction, ArchiveFsError> {
+    let path = journal_path(dir, transaction_id).ok_or_else(|| {
+        ArchiveFsError::Config(format!(
+            "transaction id '{transaction_id}' cannot name a journal file"
+        ))
+    })?;
+    let mut transaction = read_journal(&path)?;
+    transaction.recovery_resolution =
+        Some(crate::dat::rename_apply::model::RecoveryResolution::LeaveUntouched);
+    transaction.recovery_resolved_at_unix = Some(crate::dat::sources::now_unix());
+    write_journal(dir, &transaction)?;
+    Ok(transaction)
+}
+
 /// Removes a transaction's journal. Used only after a transaction is fully
 /// settled and the user has dismissed it from recovery.
 pub fn remove_journal(dir: &Path, transaction_id: &str) -> Result<(), ArchiveFsError> {
@@ -319,6 +348,8 @@ mod tests {
             state,
             entries: vec![entry("/tmp/roms/a.bin", "/tmp/roms/A.bin")],
             created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
             unknown: Default::default(),
         }
     }

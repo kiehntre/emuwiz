@@ -4465,6 +4465,7 @@ fn fixture_recovery_transaction(
         total_count: 1,
         human_summary: human_summary.to_string(),
         source_scan_root: String::new(),
+        resolution: None,
     }
 }
 
@@ -4510,6 +4511,7 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
             ),
         ],
         journal_dir: "/journal".to_string(),
+        recovery_resolution_error: None,
     };
     let plan = RenamePlanView {
         generation: 1,
@@ -4884,6 +4886,8 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(
@@ -4957,6 +4961,8 @@ fn a_transaction_stuck_applying_with_an_applied_entry_loads_as_applied_after_res
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(&journal, &tx).unwrap();
@@ -6279,6 +6285,8 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &settled).unwrap();
@@ -6316,6 +6324,8 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &interrupted).unwrap();
@@ -6632,6 +6642,8 @@ fn quick_rename_reset_clears_only_session_state_and_preserves_config_and_history
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &unrelated_settled).unwrap();
@@ -6741,6 +6753,8 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
                 unknown: Default::default(),
             }],
             created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
             unknown: Default::default(),
         }
     }
@@ -6770,6 +6784,117 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
     );
 }
 
+/// Requested tests, combined: "Quick Rename no longer blocks on
+/// acknowledged Leave untouched", "unresolved/unacknowledged transaction
+/// still blocks", and "rollback capability remains correct" for a resolved
+/// transaction that still has applied entries.
+#[test]
+fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(1);
+    let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
+    let roms_str = roms.to_string_lossy().into_owned();
+
+    let interrupted = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "current-library-interrupted".to_string(),
+        plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
+        created_at_unix: 1,
+        source_scan_root: roms_str.clone(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
+            source_path: roms.join("a.bin"),
+            destination_path: roms.join("alpha.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "alpha.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: false,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Planned,
+            failure_reason: None,
+            applied_at_unix: None,
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &interrupted).unwrap();
+    page.refresh_recovery();
+
+    // Unresolved: still blocks.
+    {
+        let view = page.view();
+        let mut ui_state = DatSourcesPageUi::default();
+        let output = render_quick_rename(&view, &mut ui_state);
+        assert!(
+            rendered_text_contains(&output, "An interrupted rename transaction was found"),
+            "an unresolved, unacknowledged transaction for this library must still block"
+        );
+    }
+
+    page.apply(DatSourcesPageAction::RecoveryChoice {
+        id: "current-library-interrupted".to_string(),
+        choice: RecoveryChoice::LeaveUntouched,
+    });
+
+    let view = page.view();
+    assert!(
+        view.rename_apply.recovery_resolution_error.is_none(),
+        "the choice must have persisted without error"
+    );
+
+    // Resolved: no longer blocks Quick Rename, but stays reachable.
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_quick_rename(&view, &mut ui_state);
+    assert!(
+        !rendered_text_contains(&output, "An interrupted rename transaction was found"),
+        "an acknowledged Leave untouched must no longer block Quick Rename"
+    );
+    assert!(
+        rendered_text_contains(&output, "View recovery/history (1)"),
+        "the resolved transaction must remain reachable, not vanish"
+    );
+
+    // Rollback capability must remain correct: the resolved transaction
+    // still has an applied entry, so acknowledging the prompt must never
+    // silently take away the ability to undo it from the advanced view.
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0));
+    let mut adv_ui_state = DatSourcesPageUi::default();
+    let adv_output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_rename_apply_section(ui, &view.rename_apply, &mut adv_ui_state);
+            });
+        },
+    );
+    assert!(
+        rendered_text_contains(&adv_output, "Roll back transaction"),
+        "a still-rollbackable transaction must keep its rollback control after acknowledgement"
+    );
+    assert!(
+        rendered_text_contains(&adv_output, "left untouched by user"),
+        "the advanced view must show the resolution, never hide it"
+    );
+}
+
 /// Requested test: "choosing Leave untouched resolves/removes Needs
 /// attention state". This is the exact regression the fix targets:
 /// `refresh_recovery` reloads from disk on every `poll()`, so the choice
@@ -6777,7 +6902,7 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
 /// in-memory list for one frame.
 #[test]
 fn leave_untouched_removes_needs_attention_state_across_subsequent_polls() {
-    let (_fixture, roms, mut page) = page_with_apply_plan(0);
+    let (fixture, roms, mut page) = page_with_apply_plan(0);
     let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
     let tx = archivefs_core::dat::rename_apply::RenameTransaction {
         transaction_id: "leave-untouched-test".to_string(),
@@ -6812,34 +6937,205 @@ fn leave_untouched_removes_needs_attention_state_across_subsequent_polls() {
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &tx).unwrap();
     page.refresh_recovery();
     assert_eq!(page.view().rename_apply.recovery.len(), 1);
+    let before = &page.view().rename_apply.recovery[0];
+    assert!(
+        before.resolution.is_none(),
+        "an unresolved interrupted transaction initially shows Needs attention"
+    );
+    assert_eq!(before.state, TransactionState::Applying);
 
     page.apply(DatSourcesPageAction::RecoveryChoice {
         id: "leave-untouched-test".to_string(),
         choice: RecoveryChoice::LeaveUntouched,
     });
-    assert!(
-        page.view().rename_apply.recovery.is_empty(),
-        "must be gone immediately"
+
+    // It remains visible (inspectable), just no longer unresolved - this is
+    // the persistent-resolution replacement for the old session-only
+    // "vanishes from the list immediately" behavior.
+    let view = page.view();
+    assert_eq!(view.rename_apply.recovery.len(), 1);
+    let resolved = &view.rename_apply.recovery[0];
+    assert_eq!(
+        resolved.resolution,
+        Some(archivefs_core::dat::rename_apply::RecoveryResolution::LeaveUntouched)
+    );
+    // The original `TransactionState` remains truthful: still `Applying`
+    // (interrupted), never rewritten to `Applied` or anything else.
+    assert_eq!(
+        resolved.state,
+        TransactionState::Applying,
+        "the original interrupted state must never be overwritten by a resolution"
     );
 
-    // The regression: simulate the next frame's poll, which reloads
-    // straight from disk (the journal is untouched, so a naive reload
-    // would resurrect it).
+    // Requested test: "restarting/reloading state does not resurrect
+    // Needs attention" - simulate the next frame's poll (which reloads
+    // straight from disk) AND a fresh, independent `DatSourcesPageState`
+    // load (which simulates an EmuWiz restart, not just another frame of
+    // the same process).
     page.poll();
-    assert!(
-        page.view().rename_apply.recovery.is_empty(),
-        "Leave untouched must survive a subsequent poll/refresh, not just one frame"
+    let after_poll = &page.view().rename_apply.recovery[0];
+    assert_eq!(
+        after_poll.resolution,
+        Some(archivefs_core::dat::rename_apply::RecoveryResolution::LeaveUntouched),
+        "the resolution must survive a subsequent poll/refresh, not just one frame"
     );
 
-    // The journal itself was never touched or deleted.
+    let restarted = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::from_paths([&roms]),
+        journal_dir.clone(),
+    );
+    let restarted_recovery = &restarted.view().rename_apply.recovery;
+    assert_eq!(restarted_recovery.len(), 1);
+    assert_eq!(
+        restarted_recovery[0].resolution,
+        Some(archivefs_core::dat::rename_apply::RecoveryResolution::LeaveUntouched),
+        "a completely fresh load (simulating an EmuWiz restart) must not resurrect Needs \
+         attention for an already-resolved transaction"
+    );
+
+    // Requested test: "journal file still exists" / "no accidental
+    // deletion" - and it was persisted, not just held in memory: read it
+    // back directly from disk, independent of `DatSourcesPageState`.
     assert!(
         archivefs_core::dat::rename_apply::journal_exists(&journal_dir, "leave-untouched-test"),
         "Leave untouched must never delete the journal"
+    );
+    let on_disk = archivefs_core::dat::rename_apply::read_journal(
+        &archivefs_core::dat::rename_apply::journal_path(&journal_dir, "leave-untouched-test")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        on_disk.recovery_resolution,
+        Some(archivefs_core::dat::rename_apply::RecoveryResolution::LeaveUntouched),
+        "the resolution must be durably persisted to the journal file itself"
+    );
+    assert_eq!(
+        on_disk.state,
+        TransactionState::Applying,
+        "the journal's own state field must remain truthful on disk too"
+    );
+}
+
+/// Requested test: "old journal without resolution field still loads".
+/// Backward compatibility: a journal written before `recovery_resolution`
+/// existed has no such key in its JSON at all - `#[serde(default)]` must
+/// decode that as `None`, not fail to parse.
+#[test]
+fn old_journal_without_resolution_field_still_loads() {
+    let fixture = Fixture::new();
+    let journal_dir = fixture.dir("journal");
+    let transaction_id = "pre-resolution-journal";
+    // Hand-written JSON with no `recovery_resolution`/`recovery_resolved_at_unix`
+    // key at all, exactly what a journal written before this feature existed
+    // looks like on disk.
+    let raw = serde_json::json!({
+        "transaction_id": transaction_id,
+        "plan_generation": 1,
+        "created_at_unix": 1,
+        "source_scan_root": "/tmp/roms",
+        "state": "applying",
+        "entries": [{
+            "source_path": "/tmp/roms/a.bin",
+            "destination_path": "/tmp/roms/alpha.bin",
+            "original_basename": "a.bin",
+            "proposed_basename": "alpha.bin",
+            "identity": {
+                "size_bytes": 1,
+                "modified_unix": 1,
+                "kind": "regular_file"
+            },
+            "state": "planned"
+        }]
+    });
+    std::fs::write(
+        archivefs_core::dat::rename_apply::journal_path(&journal_dir, transaction_id).unwrap(),
+        serde_json::to_string_pretty(&raw).unwrap(),
+    )
+    .unwrap();
+
+    let transaction = archivefs_core::dat::rename_apply::read_journal(
+        &archivefs_core::dat::rename_apply::journal_path(&journal_dir, transaction_id).unwrap(),
+    )
+    .expect("an old journal with no resolution field must still parse");
+    assert_eq!(transaction.recovery_resolution, None);
+    assert_eq!(transaction.recovery_resolved_at_unix, None);
+    assert_eq!(transaction.state, TransactionState::Applying);
+    assert!(
+        transaction.needs_attention(),
+        "an old, unresolved journal must still show Needs attention"
+    );
+}
+
+/// Requested test: "Applied journals unchanged" - resolving (or failing to
+/// resolve) has nothing to do with settled `Applied` transactions; they are
+/// never offered the Leave-untouched prompt in the first place, and nothing
+/// about their journal changes.
+#[test]
+fn applied_journals_are_never_touched_by_recovery_resolution() {
+    let fixture = Fixture::new();
+    let journal_dir = fixture.dir("journal");
+    let applied = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "already-applied".to_string(),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 1,
+        source_scan_root: "/tmp/roms".to_string(),
+        state: TransactionState::Applied,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            operation: Default::default(),
+            source_path: PathBuf::from("/tmp/roms/a.bin"),
+            destination_path: PathBuf::from("/tmp/roms/alpha.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "alpha.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Applied,
+            failure_reason: None,
+            applied_at_unix: Some(1),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &applied).unwrap();
+    assert!(
+        !applied.needs_attention(),
+        "a settled transaction never needs attention"
+    );
+    assert!(
+        applied.is_rollbackable(),
+        "rollback eligibility must be unaffected by recovery_resolution"
+    );
+
+    let reread = archivefs_core::dat::rename_apply::read_journal(
+        &archivefs_core::dat::rename_apply::journal_path(&journal_dir, "already-applied").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reread, applied,
+        "an Applied journal must be byte-for-byte unchanged"
     );
 }
 
@@ -6910,6 +7206,8 @@ fn hide_settled_history_never_deletes_a_journal() {
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &settled).unwrap();

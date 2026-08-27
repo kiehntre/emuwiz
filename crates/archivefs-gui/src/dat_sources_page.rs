@@ -786,6 +786,9 @@ pub(crate) struct RenameApplyView {
     pub(crate) recovery: Vec<RecoveryTransactionView>,
     /// The journal directory, shown for transparency.
     pub(crate) journal_dir: String,
+    /// The error from the last failed attempt to persist a "Leave
+    /// untouched" resolution, if any.
+    pub(crate) recovery_resolution_error: Option<String>,
 }
 
 /// The review a user must confirm before any rename.
@@ -859,6 +862,12 @@ pub(crate) struct RecoveryTransactionView {
     /// right now" apart from "this is some other, unrelated library" -
     /// see `transaction_targets_root`.
     pub(crate) source_scan_root: String,
+    /// The user's persisted decision about this transaction's
+    /// crash-recovery prompt, if any - see
+    /// [`archivefs_core::dat::rename_apply::RecoveryResolution`]. `None`
+    /// means it still genuinely needs a decision (or was never interrupted
+    /// in the first place, for a settled `Applied` transaction).
+    pub(crate) resolution: Option<archivefs_core::dat::rename_apply::RecoveryResolution>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1950,13 +1959,22 @@ pub(crate) struct DatSourcesPageState {
     /// batches (eligible for rollback after a restart) and interrupted batches
     /// (offered for crash recovery). `RolledBack` journals are neither.
     recovery_transactions: Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
-    /// Transaction ids the user chose "Leave untouched" for. Session-only:
-    /// no `TransactionState` honestly means "the user chose not to act on
-    /// this", so nothing is written to the journal - see
-    /// `handle_recovery_choice`. Filtered out of `recovery_transactions` on
-    /// every reload so the choice sticks for the rest of this session
+    /// The error from the last failed attempt to persist a "Leave
+    /// untouched" resolution to a journal (disk I/O, an unreadable
+    /// journal, …). `None` on success or before any attempt.
+    recovery_resolution_error: Option<String>,
+    /// Transaction ids dismissed from Quick Rename's own "View
+    /// recovery/history" list via "Hide settled history". Deliberately
+    /// session-only and deliberately *not* used for "Leave untouched"
+    /// (that is now a durable, per-transaction `recovery_resolution` on the
+    /// journal itself - see `handle_recovery_choice` and
+    /// `RenameTransaction::needs_attention`): "Hide settled history" is a
+    /// temporary display preference about already-settled, already-safe
+    /// history, not a decision about an unresolved transaction, and the two
+    /// must not be conflated. Filtered out of `recovery_transactions` on
+    /// every reload so the hide sticks for the rest of this session
     /// (`refresh_recovery` reloads from disk on every poll and would
-    /// otherwise silently re-surface it next frame).
+    /// otherwise re-surface it next frame).
     dismissed_recovery_ids: std::collections::BTreeSet<String>,
     /// History & Logs records produced by apply/rollback outcomes, drained by
     /// the shell. No private paths are included.
@@ -2113,6 +2131,7 @@ impl DatSourcesPageState {
             rollback_error: None,
             apply_job: None,
             recovery_transactions,
+            recovery_resolution_error: None,
             dismissed_recovery_ids: std::collections::BTreeSet::new(),
             history_records: Vec::new(),
         }
@@ -2953,15 +2972,32 @@ impl DatSourcesPageState {
         match choice {
             RecoveryChoice::RollBack => self.start_rollback(id),
             RecoveryChoice::LeaveUntouched => {
-                // The journal stays on disk untouched; the user chose not to
-                // act now. Recorded in `dismissed_recovery_ids` (session-only
-                // - see its doc) so it stays gone across the next poll's
-                // `refresh_recovery`, not just this one frame; the immediate
-                // `retain` below is only for this frame's own render, before
-                // the next poll would otherwise re-apply the same filter.
-                self.dismissed_recovery_ids.insert(id.clone());
-                self.recovery_transactions
-                    .retain(|transaction| transaction.transaction_id != id);
+                // Persisted durably to the journal itself
+                // (`recovery_resolution`) so the choice survives a restart -
+                // no journal is written to lie about `state`, and nothing is
+                // deleted. See `RenameTransaction::needs_attention` for how
+                // this is told apart from "genuinely still needs a
+                // decision" without touching the truthful `state` field at
+                // all.
+                match archivefs_core::dat::rename_apply::resolve_leave_untouched(
+                    &self.transaction_dir,
+                    &id,
+                ) {
+                    Ok(updated) => {
+                        self.recovery_resolution_error = None;
+                        if let Some(existing) = self
+                            .recovery_transactions
+                            .iter_mut()
+                            .find(|transaction| transaction.transaction_id == id)
+                        {
+                            *existing = updated;
+                        }
+                    }
+                    Err(error) => {
+                        self.recovery_resolution_error =
+                            Some(format!("your choice could not be saved: {error}"));
+                    }
+                }
             }
         }
     }
@@ -4263,6 +4299,7 @@ impl DatSourcesPageState {
                 total_count: transaction.entries.len(),
                 human_summary: rename_transaction_human_summary(&transaction.entries),
                 source_scan_root: transaction.source_scan_root.clone(),
+                resolution: transaction.recovery_resolution,
             })
             .collect();
         RenameApplyView {
@@ -4276,6 +4313,7 @@ impl DatSourcesPageState {
             rollback_running: self.rollback_running,
             recovery,
             journal_dir: self.transaction_dir.to_string_lossy().into_owned(),
+            recovery_resolution_error: self.recovery_resolution_error.clone(),
         }
     }
 
@@ -5770,7 +5808,13 @@ pub(crate) fn show_quick_rename_page(
         let mut blocking = Vec::new();
         let mut other = Vec::new();
         for recovery in &view.rename_apply.recovery {
-            if recovery.state != TransactionState::Applied
+            // Truthfully interrupted (`state.needs_recovery()`) AND not
+            // already resolved (`resolution.is_none()`) AND for this
+            // folder: only that combination genuinely still needs a
+            // decision right now. An acknowledged "Leave untouched" moves
+            // here regardless of folder, exactly like settled history.
+            if recovery.state.needs_recovery()
+                && recovery.resolution.is_none()
                 && current_root
                     .is_none_or(|root| transaction_targets_root(&recovery.source_scan_root, root))
             {
@@ -5822,6 +5866,15 @@ pub(crate) fn show_quick_rename_page(
                         action = Some(recovery_action);
                     }
                 });
+        }
+        if let Some(error) = &view.rename_apply.recovery_resolution_error {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "Your choice could not be saved",
+                error,
+                widgets::StatusTone::Blocked,
+            );
         }
     }
 
@@ -8350,28 +8403,30 @@ fn show_recovery_transactions(
                     ));
                 },
             );
-            let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
-                (
-                    "A completed rename transaction is still applied and can be rolled \
-                         back.",
-                    "Roll back transaction",
-                )
-            } else {
-                (
-                    "An interrupted rename transaction was found. EmuWiz will never \
-                         resume it automatically.",
-                    "Roll back completed steps",
-                )
-            };
-            ui.label(
-                egui::RichText::new(explanation)
+            if let Some(resolution) = recovery.resolution {
+                // Already resolved: `state` still truthfully says
+                // "interrupted" (never rewritten - see
+                // `RecoveryResolution`'s own doc), so this must never be
+                // presented as settled/Applied. The user is not asked to
+                // decide again, but rollback stays offered on exactly the
+                // same terms as it would for an unresolved interrupted
+                // transaction (matching `RenameTransaction::is_rollbackable`,
+                // which depends only on `state.needs_recovery()` here, never
+                // on `applied_count` or on whether a resolution exists) -
+                // acknowledging the prompt must never quietly take away the
+                // ability to undo it.
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Interrupted - {}",
+                        resolution.label().to_ascii_lowercase()
+                    ))
                     .color(theme::muted(ui))
                     .small(),
-            );
-            ui.horizontal(|ui| {
+                );
+                ui.add_space(4.0);
                 if widgets::action_button(
                     ui,
-                    rollback_label,
+                    "Roll back transaction",
                     widgets::ActionStyle::Destructive,
                     !rollback_running,
                 )
@@ -8382,20 +8437,54 @@ fn show_recovery_transactions(
                         choice: RecoveryChoice::RollBack,
                     });
                 }
-                if widgets::action_button(
-                    ui,
-                    "Leave untouched",
-                    widgets::ActionStyle::Quiet,
-                    !rollback_running,
-                )
-                .clicked()
-                {
-                    action = Some(DatSourcesPageAction::RecoveryChoice {
-                        id: recovery.transaction_id.clone(),
-                        choice: RecoveryChoice::LeaveUntouched,
-                    });
-                }
-            });
+            } else {
+                let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
+                    (
+                        "A completed rename transaction is still applied and can be rolled \
+                             back.",
+                        "Roll back transaction",
+                    )
+                } else {
+                    (
+                        "An interrupted rename transaction was found. EmuWiz will never \
+                             resume it automatically.",
+                        "Roll back completed steps",
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(explanation)
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        rollback_label,
+                        widgets::ActionStyle::Destructive,
+                        !rollback_running,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::RecoveryChoice {
+                            id: recovery.transaction_id.clone(),
+                            choice: RecoveryChoice::RollBack,
+                        });
+                    }
+                    if widgets::action_button(
+                        ui,
+                        "Leave untouched",
+                        widgets::ActionStyle::Quiet,
+                        !rollback_running,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::RecoveryChoice {
+                            id: recovery.transaction_id.clone(),
+                            choice: RecoveryChoice::LeaveUntouched,
+                        });
+                    }
+                });
+            }
             ui.add_space(6.0);
         }
     });
@@ -8429,6 +8518,15 @@ fn show_rename_apply_section(
             show_recovery_transactions(ui, &apply.recovery, apply.rollback_running)
         {
             action = Some(recovery_action);
+        }
+        if let Some(error) = &apply.recovery_resolution_error {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "Your choice could not be saved",
+                error,
+                widgets::StatusTone::Blocked,
+            );
         }
     }
 

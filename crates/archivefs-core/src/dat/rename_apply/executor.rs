@@ -151,6 +151,8 @@ pub fn build_transaction(
         state: TransactionState::Planned,
         entries,
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     })
 }

@@ -1354,6 +1354,8 @@ fn transaction_stub() -> archivefs_core::dat::rename_apply::RenameTransaction {
         state: archivefs_core::dat::rename_apply::TransactionState::ApplyFailed,
         entries: Vec::new(),
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     }
 }

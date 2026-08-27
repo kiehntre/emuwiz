@@ -866,6 +866,8 @@ fn journaled_transaction(state: TransactionState) -> RenameTransaction {
         state,
         entries: Vec::new(),
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     }
 }

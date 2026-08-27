@@ -50,11 +50,12 @@ pub use identity::{capture_identity, classify_at, identity_matches};
 pub use journal::{
     RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir, find_recovery_transactions,
     find_rollbackable_transactions, journal_exists, journal_path, list_journals,
-    new_transaction_id, read_journal, remove_journal, rename_transaction_dir_in, write_journal,
+    new_transaction_id, read_journal, remove_journal, rename_transaction_dir_in,
+    resolve_leave_untouched, write_journal,
 };
 pub use model::{
-    EntryState, ObjectIdentity, ObjectKind, RenameTransaction, RollbackResult, RollbackStatus,
-    TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
+    EntryState, ObjectIdentity, ObjectKind, RecoveryResolution, RenameTransaction, RollbackResult,
+    RollbackStatus, TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{

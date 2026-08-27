@@ -1078,6 +1078,8 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     write_journal(&journal, &tx).unwrap();
@@ -1106,6 +1108,8 @@ fn crash_after_first_of_n_renames_is_recoverable() {
         state: TransactionState::Applying,
         entries: Vec::new(),
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     let mk = |source: &str, state: EntryState| TransactionEntry {
@@ -1161,6 +1165,8 @@ fn recovery_never_auto_resumes() {
         state: TransactionState::Applying,
         entries: Vec::new(),
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
     write_journal(&journal, &tx).unwrap();
@@ -2083,6 +2089,8 @@ fn stress_crash_recovery_fixtures_are_detected() {
             state: TransactionState::Applying,
             entries: Vec::new(),
             created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
             unknown: Default::default(),
         };
         tx.entries.push(TransactionEntry {

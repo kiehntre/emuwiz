@@ -455,6 +455,41 @@ fn the_clear_history_button_and_dialog_render_with_plain_wording() {
     assert!(rendered_text_contains(&output, "Clear completed history"));
 }
 
+#[test]
+fn repair_history_shows_resolved_status_without_claiming_applied() {
+    let dir = TestDir::new("resolved-render");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let mut interrupted = bare_transaction(
+        "interrupted-resolved",
+        TransactionState::ApplyFailed,
+        EntryState::Applied,
+    );
+    interrupted.recovery_resolution =
+        Some(archivefs_core::dat::rename_apply::RecoveryResolution::LeaveUntouched);
+    interrupted.recovery_resolved_at_unix = Some(123);
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &interrupted).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    let output = render(&mut state);
+    // The user's decision is shown alongside the row...
+    assert!(rendered_text_contains(
+        &output,
+        "Resolved: Left untouched by user"
+    ));
+    // ...but the truthful, unrewritten state badge must still say what
+    // actually happened - a resolution is never allowed to rewrite it into
+    // a settled "Applied" transaction's own label.
+    assert!(rendered_text_contains(
+        &output,
+        TransactionState::ApplyFailed.label()
+    ));
+    assert_ne!(
+        TransactionState::ApplyFailed.label(),
+        TransactionState::Applied.label()
+    );
+}
+
 /// A minimal, hand-built transaction for enable-rule tests that do not need
 /// a real applied file on disk.
 fn bare_transaction(
@@ -495,6 +530,8 @@ fn bare_transaction(
             unknown: Default::default(),
         }],
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     }
 }
@@ -550,6 +587,8 @@ fn bare_transaction_with_entries(
         state: tx_state,
         entries,
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     }
 }

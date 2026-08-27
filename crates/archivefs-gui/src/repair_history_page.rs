@@ -683,6 +683,17 @@ fn show_transaction_row(
                 .small()
                 .color(theme::muted(ui)),
         );
+        // The status badge above stays exactly what `state` truthfully says
+        // (never rewritten to "Applied" or anything else) - this line adds
+        // the user's own decision about the recovery prompt alongside it,
+        // never in place of it.
+        if let Some(resolution) = transaction.recovery_resolution {
+            ui.label(
+                egui::RichText::new(resolution.label())
+                    .small()
+                    .color(theme::SUCCESS),
+            );
+        }
 
         // Reverify: the headline never says just "missing" - see
         // `reverify_summary`'s doc comment for why that reads as

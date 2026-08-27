@@ -73,6 +73,35 @@ impl TransactionState {
     }
 }
 
+/// A user's explicit decision about the crash-recovery prompt an
+/// interrupted transaction (`TransactionState::needs_recovery`) shows,
+/// persisted durably so it survives a restart.
+///
+/// This is deliberately a decision *about the prompt*, never a claim about
+/// what happened to any file - `TransactionState` and every
+/// [`TransactionEntry::state`] remain the one truthful record of that,
+/// completely unchanged by a resolution. Recording `LeaveUntouched` must
+/// never be confused with, or substitute for, marking a transaction
+/// `Applied`: an unresolved batch that is later acknowledged is still
+/// exactly as interrupted as it always was; the user has only said "stop
+/// asking me to decide right now."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryResolution {
+    /// The user was offered "Roll back completed steps" / "Leave
+    /// untouched" and chose to leave it. Nothing was rolled back and
+    /// nothing was applied as a result of this choice alone.
+    LeaveUntouched,
+}
+
+impl RecoveryResolution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LeaveUntouched => "Resolved: Left untouched by user",
+        }
+    }
+}
+
 /// The per-entry state of a transaction step.
 ///
 /// `Skipped` records an entry the batch deliberately did not rename (a hard
@@ -237,6 +266,16 @@ pub struct RenameTransaction {
     /// a pre-existing user directory is never recorded here and never removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_directories: Vec<PathBuf>,
+    /// The user's explicit decision about this transaction's crash-recovery
+    /// prompt, if any - see [`RecoveryResolution`]'s own doc for why this is
+    /// kept entirely separate from `state`. `None` for every journal written
+    /// before this field existed (backward compatible via `#[serde(default)]`)
+    /// and for every transaction never offered the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_resolution: Option<RecoveryResolution>,
+    /// When `recovery_resolution` was recorded, for provenance only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_resolved_at_unix: Option<u64>,
     /// Keys a future build wrote that this one does not understand, kept
     /// verbatim so reading a journal never discards them.
     #[serde(flatten)]
@@ -245,6 +284,17 @@ pub struct RenameTransaction {
 }
 
 impl RenameTransaction {
+    /// Whether this transaction still genuinely needs a user decision right
+    /// now: it is interrupted (`state.needs_recovery()`) and has not
+    /// already been resolved. Unlike `state.needs_recovery()` itself, this
+    /// is affected by `recovery_resolution` - callers that mean "was this
+    /// batch interrupted, ever" (an honest audit trail question) must keep
+    /// using `state.needs_recovery()` directly; this is only for "should
+    /// this still nag the user right now".
+    pub fn needs_attention(&self) -> bool {
+        self.state.needs_recovery() && self.recovery_resolution.is_none()
+    }
+
     pub fn applied_count(&self) -> usize {
         self.entries
             .iter()

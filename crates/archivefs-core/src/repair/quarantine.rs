@@ -507,6 +507,8 @@ pub fn build_quarantine_transaction(
         // time, so a pre-existing directory can never be journalled as
         // EmuWiz's to remove.
         created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
         unknown: Default::default(),
     })
 }
