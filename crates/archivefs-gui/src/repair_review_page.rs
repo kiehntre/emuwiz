@@ -46,6 +46,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use archivefs_core::Config;
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::rename_apply::model::EntryState;
+use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 use archivefs_core::dat::sources::{
     DatSourceEntry, DatSourceRegistry, default_dat_sources_config_path,
     load_dat_sources_config_from,
@@ -485,6 +486,17 @@ pub(crate) struct RepairReviewPageState {
     /// `RepairExecutionOptions::journal_dir` the production path already
     /// threads through unchanged.
     pub(crate) journal_dir_override: Option<PathBuf>,
+    /// Overrides the [`AuditCacheConfig`] both [`Self::start_scan`] (a fresh
+    /// whole-library scan) and [`Self::spawn_apply`] (the authoritative
+    /// re-scan [`apply_saved_plan_selected`] runs) use, exactly mirroring
+    /// [`Self::journal_dir_override`]'s own doc: `None` (the `Default`, and
+    /// always the case in production) means both resolve
+    /// [`AuditCacheConfig::Default`] exactly as before, so a live scan or
+    /// re-scan still benefits from the persistent audit cache. `Some(config)`
+    /// exists only so a test can point a real `start_scan` or
+    /// `confirm_apply` -> `spawn_apply` run at an isolated or disabled cache
+    /// instead of the developer's real EmuWiz application-data cache.
+    pub(crate) audit_cache_override: Option<AuditCacheConfig>,
     /// The pending "Scan library for repairs" setup dialog. `None` means the
     /// dialog is closed; opening it loads the DAT registry and configured
     /// library folders once, up front (see [`ScanSetupState`]).
@@ -648,6 +660,13 @@ impl RepairReviewPageState {
             scan_root,
             limits: DatLimits::default(),
             profile: RepairProfile::CanonicalInPlace,
+            // `None` in production: resolves `AuditCacheConfig::Default`,
+            // same as every other audit path - see
+            // `audit_cache_override`'s doc.
+            audit_cache: self
+                .audit_cache_override
+                .clone()
+                .unwrap_or(AuditCacheConfig::Default),
         };
         let trusted = TrustedRoots::from_paths([&request.scan_root]);
         let cancel = AtomicBool::new(false);
@@ -900,9 +919,17 @@ impl RepairReviewPageState {
             archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
                 .unwrap_or_else(|_| PathBuf::from("rename-transactions"))
         });
+        // `None` in production: resolves `AuditCacheConfig::Default`, same as
+        // every other audit path. `Some(config)` only in tests - see
+        // `audit_cache_override`'s doc.
+        let audit_cache = self
+            .audit_cache_override
+            .clone()
+            .unwrap_or(AuditCacheConfig::Default);
         let options = RepairExecutionOptions {
             trusted,
             journal_dir,
+            audit_cache,
         };
         // Never exposed to cancellation in this slice (see `RepairApplyJob`);
         // still required by `apply_saved_plan_selected`'s signature.

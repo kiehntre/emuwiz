@@ -1142,6 +1142,7 @@ mod tests {
             }),
             content: Default::default(),
             platform,
+            cache: Default::default(),
         }
     }
 

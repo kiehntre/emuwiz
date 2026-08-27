@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::rename_apply::{EntryState, RollbackResult, TransactionState};
 use archivefs_core::dat::sources::DatSourceKind;
+use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 use archivefs_core::repair::execute::{RepairExecutionOptions, RepairTransactionResult};
 use archivefs_core::repair::library::{
     LibraryScanRequest, RepairProfile, apply_saved_plan_selected, plan_file_from_scan,
@@ -95,6 +96,7 @@ fn scan_and_apply(dir: &Path) -> (PathBuf, PathBuf, RepairTransactionResult) {
         scan_root: roms.clone(),
         limits: DatLimits::default(),
         profile: RepairProfile::CanonicalInPlace,
+        audit_cache: AuditCacheConfig::Disabled,
     };
     let outcome = run_library_scan(&request, &TrustedRoots::none(), &no_cancel(), &|_| {})
         .expect("the fixture scan runs");
@@ -112,6 +114,7 @@ fn scan_and_apply(dir: &Path) -> (PathBuf, PathBuf, RepairTransactionResult) {
     let options = RepairExecutionOptions {
         trusted: TrustedRoots::from_paths([&roms]),
         journal_dir: journal_dir.clone(),
+        audit_cache: AuditCacheConfig::Disabled,
     };
     let result = apply_saved_plan_selected(
         &plan,

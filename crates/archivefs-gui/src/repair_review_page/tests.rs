@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind};
 use archivefs_core::repair::execute::RepairReverifyOutcome;
 use archivefs_core::repair::library::{
@@ -686,6 +687,7 @@ fn scan_apply_fixture(dat: &std::path::Path, roms: &std::path::Path) -> LibraryR
         scan_root: roms.to_path_buf(),
         limits: DatLimits::default(),
         profile: RepairProfile::CanonicalInPlace,
+        audit_cache: AuditCacheConfig::Disabled,
     };
     let outcome = run_library_scan(
         &request,
@@ -740,6 +742,11 @@ fn isolated_state(plan: LibraryRepairPlan, journal_dir: PathBuf) -> RepairReview
     RepairReviewPageState {
         plan: Some(plan),
         journal_dir_override: Some(journal_dir),
+        // Never the production default here either - see
+        // `RepairReviewPageState::audit_cache_override`'s doc: a real
+        // `confirm_apply` -> `spawn_apply` run in this test must never read
+        // or write the developer's real EmuWiz application-data cache.
+        audit_cache_override: Some(AuditCacheConfig::Disabled),
         ..RepairReviewPageState::default()
     }
 }
@@ -1885,6 +1892,11 @@ fn scan_action_runs_the_existing_planner_path() {
 
     let mut state = RepairReviewPageState {
         scan_setup: Some(scan_setup_fixture(&dat, &roms)),
+        // Never the production default here - see
+        // `RepairReviewPageState::audit_cache_override`'s doc: a real
+        // `start_scan` run in this test must never read or write the
+        // developer's real EmuWiz application-data cache.
+        audit_cache_override: Some(AuditCacheConfig::Disabled),
         ..RepairReviewPageState::default()
     };
     state.start_scan();
@@ -1913,6 +1925,11 @@ fn successful_scan_loads_the_plan_into_repair_review_state() {
 
     let mut state = RepairReviewPageState {
         scan_setup: Some(scan_setup_fixture(&dat, &roms)),
+        // Never the production default here - see
+        // `RepairReviewPageState::audit_cache_override`'s doc: a real
+        // `start_scan` run in this test must never read or write the
+        // developer's real EmuWiz application-data cache.
+        audit_cache_override: Some(AuditCacheConfig::Disabled),
         ..RepairReviewPageState::default()
     };
     state.start_scan();
@@ -1950,6 +1967,9 @@ fn a_successful_scan_clears_a_stale_load_error() {
     let bad_plan_path = dir.path().join("not-a-plan.json");
     std::fs::write(&bad_plan_path, b"not valid json").unwrap();
     let mut state = RepairReviewPageState::default();
+    // Never the production default here - see
+    // `RepairReviewPageState::audit_cache_override`'s doc.
+    state.audit_cache_override = Some(AuditCacheConfig::Disabled);
     state.load_plan(bad_plan_path);
     assert!(
         state.error.is_some(),
@@ -1986,6 +2006,9 @@ fn failed_scan_leaves_no_stale_plan_when_none_was_loaded() {
     std::fs::create_dir_all(&roms).unwrap();
 
     let mut state = RepairReviewPageState::default();
+    // Never the production default here - see
+    // `RepairReviewPageState::audit_cache_override`'s doc.
+    state.audit_cache_override = Some(AuditCacheConfig::Disabled);
     assert!(state.plan.is_none());
     state.scan_setup = Some(scan_setup_fixture(&missing_dat, &roms));
     state.start_scan();
@@ -2011,6 +2034,9 @@ fn failed_scan_never_replaces_an_already_loaded_plan() {
     let good_plan = scan_apply_fixture(&dat, &roms);
 
     let mut state = RepairReviewPageState::default();
+    // Never the production default here - see
+    // `RepairReviewPageState::audit_cache_override`'s doc.
+    state.audit_cache_override = Some(AuditCacheConfig::Disabled);
     state.adopt_loaded_plan(good_plan.clone(), None, CountsAvailability::CURRENT);
     assert!(state.plan.is_some());
 
@@ -2046,6 +2072,11 @@ fn scan_action_never_invokes_apply_or_mutates_the_library() {
 
     let mut state = RepairReviewPageState {
         scan_setup: Some(scan_setup_fixture(&dat, &roms)),
+        // Never the production default here - see
+        // `RepairReviewPageState::audit_cache_override`'s doc: a real
+        // `start_scan` run in this test must never read or write the
+        // developer's real EmuWiz application-data cache.
+        audit_cache_override: Some(AuditCacheConfig::Disabled),
         ..RepairReviewPageState::default()
     };
     state.start_scan();

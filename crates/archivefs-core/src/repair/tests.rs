@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
 use crate::dat::rename_apply::journal::write_journal;
 use crate::dat::rename_apply::model::{RenameTransaction, TransactionState};
+use crate::dat::sources::audit_cache::AuditCacheConfig;
 use crate::repair::adapter::{repair_plan_from_rename_plan, repair_proposal_from_suggested_rename};
 use crate::repair::execute::{
     RepairExecutionError, RepairExecutionOptions, RepairReverifyOutcome, apply_repair_transaction,
@@ -78,6 +79,10 @@ fn options(journal_dir: &Path) -> RepairExecutionOptions {
     RepairExecutionOptions {
         trusted: TrustedRoots::from_paths([journal_dir]),
         journal_dir: journal_dir.to_path_buf(),
+        // This module never scans/audits (see the file doc comment); the
+        // value is unread by anything exercised here, but `Disabled` is the
+        // honest choice regardless - never the real application-data cache.
+        audit_cache: AuditCacheConfig::Disabled,
     }
 }
 

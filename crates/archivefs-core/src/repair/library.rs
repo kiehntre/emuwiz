@@ -41,8 +41,9 @@ use crate::dat::rename_plan::{
 };
 use crate::dat::set::SetState;
 use crate::dat::sources::DatSourceKind;
+use crate::dat::sources::audit_cache::AuditCacheConfig;
 use crate::dat::sources::audit_run::{
-    DatAuditError, DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
+    DatAuditError, DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit_with_cache,
 };
 use crate::dat::sources::now_unix;
 use crate::safe_read::TrustedRoots;
@@ -97,6 +98,13 @@ impl RepairProfile {
 }
 
 /// What a whole-library scan needs: the library root and a DAT catalogue.
+///
+/// `audit_cache` configures the persistent loose-file hash cache the
+/// underlying audit uses. Production callers must pass
+/// [`AuditCacheConfig::Default`] so a real scan benefits from the cache like
+/// every other audit path; tests must pass `Disabled` or an explicit temp
+/// path so a test run never reads or writes the real EmuWiz application-data
+/// cache.
 #[derive(Debug, Clone)]
 pub struct LibraryScanRequest {
     pub source_id: String,
@@ -106,6 +114,7 @@ pub struct LibraryScanRequest {
     pub scan_root: PathBuf,
     pub limits: DatLimits,
     pub profile: RepairProfile,
+    pub audit_cache: AuditCacheConfig,
 }
 
 /// Why a whole-library scan could not complete.
@@ -328,8 +337,14 @@ pub fn run_library_scan(
         policy: None,
         platform: None,
     };
-    let audit = run_dat_audit(&audit_request, trusted, cancel, on_progress)
-        .map_err(LibraryScanError::Audit)?;
+    let audit = run_dat_audit_with_cache(
+        &audit_request,
+        trusted,
+        cancel,
+        on_progress,
+        request.audit_cache.clone(),
+    )
+    .map_err(LibraryScanError::Audit)?;
 
     let rename_plan = build_rename_plan(&audit, &RenamePlanContext { generation }, cancel)
         .map_err(LibraryScanError::Plan)?;
@@ -879,8 +894,15 @@ pub fn apply_saved_plan(
 ) -> Result<RepairTransactionResult, ApplySavedPlanError> {
     // Re-run the authoritative scan over the trusted inputs. The trusted roots
     // come from `options`, never from the saved plan.
-    let fresh = rescan_for_saved_plan(saved, root, dat, &options.trusted, cancel)
-        .map_err(ApplySavedPlanError::Scan)?;
+    let fresh = rescan_for_saved_plan(
+        saved,
+        root,
+        dat,
+        &options.trusted,
+        options.audit_cache.clone(),
+        cancel,
+    )
+    .map_err(ApplySavedPlanError::Scan)?;
 
     // Re-prove: the saved plan must be independently reproducible.
     re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanError::NotAuthorized)?;
@@ -1035,8 +1057,15 @@ pub fn apply_saved_plan_selected(
     options: &RepairExecutionOptions,
     cancel: &AtomicBool,
 ) -> Result<CombinedApplyResult, ApplySavedPlanSelectedError> {
-    let fresh = rescan_for_saved_plan(saved, root, dat, &options.trusted, cancel)
-        .map_err(ApplySavedPlanSelectedError::Scan)?;
+    let fresh = rescan_for_saved_plan(
+        saved,
+        root,
+        dat,
+        &options.trusted,
+        options.audit_cache.clone(),
+        cancel,
+    )
+    .map_err(ApplySavedPlanSelectedError::Scan)?;
 
     re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanSelectedError::NotAuthorized)?;
 
@@ -1157,6 +1186,7 @@ fn rescan_for_saved_plan(
     root: &Path,
     dat: &Path,
     trusted: &TrustedRoots,
+    audit_cache: AuditCacheConfig,
     cancel: &AtomicBool,
 ) -> Result<LibraryScanOutcome, LibraryScanError> {
     let dat_kind = if std::fs::metadata(dat).is_ok_and(|meta| meta.is_dir()) {
@@ -1172,6 +1202,7 @@ fn rescan_for_saved_plan(
         scan_root: root.to_path_buf(),
         limits: DatLimits::default(),
         profile: RepairProfile::CanonicalInPlace,
+        audit_cache,
     };
     run_library_scan(&request, trusted, cancel, &|_| {})
 }

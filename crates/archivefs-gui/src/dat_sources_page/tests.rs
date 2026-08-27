@@ -2865,6 +2865,7 @@ fn minimal_outcome() -> DatAuditOutcome {
         policy: None,
         content: Default::default(),
         platform: None,
+        cache: Default::default(),
     }
 }
 

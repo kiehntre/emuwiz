@@ -36,6 +36,7 @@
 //! preferences file, through the shared durable-write path. Removing a source
 //! removes a registry entry and nothing else.
 
+pub mod audit_cache;
 pub mod audit_run;
 pub mod config;
 pub mod validation;

@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use super::audit_cache::{AuditCacheConfig, AuditCacheMetrics, AuditHashCache};
 use super::{DatSourceKind, validation};
 use crate::dat::archive::lha::{LhaError, LhaProvider};
 use crate::dat::archive::limits::{ArchiveLimits, MAX_ARCHIVE_RUN_LOGICAL_BYTES};
@@ -274,6 +275,8 @@ pub struct DatAuditOutcome {
     /// The audited source's canonical platform id, when assigned and
     /// recognised. Provenance for consumers like the rename plan.
     pub platform: Option<String>,
+    #[serde(default)]
+    pub cache: AuditCacheMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -397,6 +400,22 @@ pub fn run_dat_audit(
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
 ) -> Result<DatAuditOutcome, DatAuditError> {
+    run_dat_audit_with_cache(
+        request,
+        trusted,
+        cancel,
+        on_progress,
+        AuditCacheConfig::Default,
+    )
+}
+
+pub fn run_dat_audit_with_cache(
+    request: &DatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+    cache_config: AuditCacheConfig,
+) -> Result<DatAuditOutcome, DatAuditError> {
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
     }
@@ -500,8 +519,15 @@ pub fn run_dat_audit(
     });
 
     // ---- 2-3. Walk and hash once ----------------------------------------
-    let hashed =
-        collect_loose_file_evidence(&request.scan_root, trusted, cancel, on_progress, true)?;
+    let mut cache = AuditHashCache::from_config(&cache_config);
+    let hashed = collect_loose_file_evidence(
+        &request.scan_root,
+        trusted,
+        cancel,
+        on_progress,
+        true,
+        &mut cache,
+    )?;
     let scan = hashed.scan;
     let known = hashed.known;
     let unhashed = hashed.unhashed;
@@ -589,7 +615,7 @@ pub fn run_dat_audit(
         )
     });
 
-    Ok(DatAuditOutcome {
+    let outcome = DatAuditOutcome {
         source_id: request.source_id.clone(),
         source_display_name: request.source_display_name.clone(),
         dat_path: request.dat_path.to_string_lossy().into_owned(),
@@ -614,7 +640,12 @@ pub fn run_dat_audit(
         archive_bytes_hashed,
         policy,
         platform: request.platform.clone(),
-    })
+        cache: {
+            let _ = cache.save();
+            cache.metrics.clone()
+        },
+    };
+    Ok(outcome)
 }
 
 /// The one shared local scan/hash pass used by both one-catalogue and
@@ -643,6 +674,7 @@ fn collect_loose_file_evidence(
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
     include_archive_outers: bool,
+    cache: &mut AuditHashCache,
 ) -> Result<HashedLocalScan, DatAuditError> {
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
@@ -656,6 +688,7 @@ fn collect_loose_file_evidence(
     }
 
     let total = scan.files.len();
+    cache.metrics.scanned_candidates = total;
     let mut known = Vec::with_capacity(total);
     let mut unhashed = Vec::new();
     let mut bytes_hashed = 0_u64;
@@ -694,33 +727,50 @@ fn collect_loose_file_evidence(
                 continue;
             }
             let file_name = file_name_of(path);
+            cache.metrics.cache_eligible += 1;
             on_progress(DatAuditProgress::Hashing {
                 index: position + 1,
                 total,
                 file_name: file_name.clone(),
             });
             let evidence = KnownFileEvidence::new(path.to_string_lossy().into_owned(), &file_name);
-            match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
-                Ok(hashes) => {
-                    bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
-                    known.push(
-                        evidence
-                            .with_size(hashes.fingerprint.size_bytes)
-                            .with_crc32(hashes.crc32)
-                            .with_md5(hashes.md5)
-                            .with_sha1(hashes.sha1),
-                    );
-                }
-                Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
-                Err(refusal) => {
-                    unhashed.push(UnhashedFile {
-                        path: path.to_string_lossy().into_owned(),
-                        file_name,
-                        code: refusal.code().to_string(),
-                        detail: refusal.detail(),
-                    });
-                    known.push(evidence);
-                }
+            match cache.lookup(path) {
+                Some(hashes) => known.push(
+                    evidence
+                        .with_size(hashes.size_bytes)
+                        .with_crc32(hashes.crc32)
+                        .with_md5(hashes.md5)
+                        .with_sha1(hashes.sha1),
+                ),
+                None => match hash_file_reporting(path, trusted, Some(cancel), &|_| {}) {
+                    Ok(hashes) => {
+                        bytes_hashed = bytes_hashed.saturating_add(hashes.bytes_hashed);
+                        cache.metrics.files_hashed += 1;
+                        cache.insert(
+                            path,
+                            hashes.crc32.clone(),
+                            hashes.md5.clone(),
+                            hashes.sha1.clone(),
+                        );
+                        known.push(
+                            evidence
+                                .with_size(hashes.fingerprint.size_bytes)
+                                .with_crc32(hashes.crc32)
+                                .with_md5(hashes.md5)
+                                .with_sha1(hashes.sha1),
+                        );
+                    }
+                    Err(HashRefusal::Cancelled) => return Err(DatAuditError::Cancelled),
+                    Err(refusal) => {
+                        unhashed.push(UnhashedFile {
+                            path: path.to_string_lossy().into_owned(),
+                            file_name,
+                            code: refusal.code().to_string(),
+                            detail: refusal.detail(),
+                        });
+                        known.push(evidence);
+                    }
+                },
             }
         }
     }
@@ -743,6 +793,22 @@ pub fn run_combined_dat_audit(
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<DatAuditOutcome, DatAuditError> {
+    run_combined_dat_audit_with_cache(
+        request,
+        trusted,
+        cancel,
+        on_progress,
+        AuditCacheConfig::Default,
+    )
+}
+
+pub fn run_combined_dat_audit_with_cache(
+    request: &CombinedDatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+    cache_config: AuditCacheConfig,
 ) -> Result<DatAuditOutcome, DatAuditError> {
     if request.sources.is_empty() {
         return Err(DatAuditError::NoCatalogue(
@@ -779,8 +845,15 @@ pub fn run_combined_dat_audit(
         entries: catalogue_entries,
         roms: catalogue_roms,
     });
-    let hashed =
-        collect_loose_file_evidence(&request.scan_root, trusted, cancel, on_progress, false)?;
+    let mut cache = AuditHashCache::from_config(&cache_config);
+    let hashed = collect_loose_file_evidence(
+        &request.scan_root,
+        trusted,
+        cancel,
+        on_progress,
+        false,
+        &mut cache,
+    )?;
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
     }
@@ -858,7 +931,7 @@ pub fn run_combined_dat_audit(
         entries,
     };
 
-    Ok(DatAuditOutcome {
+    let outcome = DatAuditOutcome {
         source_id: "combined-enabled-dat-sources".to_string(),
         source_display_name: "All enabled evidence catalogues".to_string(),
         dat_path: "multiple local and managed DAT catalogues".to_string(),
@@ -883,7 +956,12 @@ pub fn run_combined_dat_audit(
         truncated: hashed.scan.truncated,
         policy: None,
         platform: None,
-    })
+        cache: {
+            let _ = cache.save();
+            cache.metrics.clone()
+        },
+    };
+    Ok(outcome)
 }
 
 struct LoadedCombinedCatalogue {
@@ -2312,7 +2390,10 @@ game (
     }
 
     fn run(sources: Vec<CombinedDatAuditSource>, root: PathBuf) -> DatAuditOutcome {
-        run_combined_dat_audit(
+        // `Disabled`, never `Default`: this helper backs most of this
+        // module's combined-audit tests, and must never read or write the
+        // real EmuWiz application-data cache.
+        run_combined_dat_audit_with_cache(
             &CombinedDatAuditRequest {
                 sources,
                 scan_root: root,
@@ -2321,8 +2402,65 @@ game (
             &TrustedRoots::none(),
             &AtomicBool::new(false),
             &|_| {},
+            AuditCacheConfig::Disabled,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn combined_audit_reuses_persistent_cache_without_changing_evidence() {
+        let tree = tempfile::tempdir().unwrap();
+        let dat_path = tree.path().join("fixture.dat");
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let game_path = games.join("game.rom");
+        let cache_path = tree.path().join("audit-cache.json");
+        let bytes = b"test";
+        std::fs::write(&dat_path, dat_entries(&[("Game", "game.rom", bytes)])).unwrap();
+        std::fs::write(&game_path, bytes).unwrap();
+        let request = CombinedDatAuditRequest {
+            sources: vec![source(dat_path, "fixture")],
+            scan_root: games,
+            limits: DatLimits::default(),
+        };
+
+        let first = run_combined_dat_audit_with_cache(
+            &request,
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+            AuditCacheConfig::At(cache_path.clone()),
+        )
+        .unwrap();
+        assert_eq!(first.cache.cache_eligible, 1);
+        assert_eq!(first.cache.cache_hits, 0);
+        assert_eq!(first.cache.files_hashed, 1);
+        assert!(cache_path.exists());
+
+        let second = run_combined_dat_audit_with_cache(
+            &request,
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+            AuditCacheConfig::At(cache_path),
+        )
+        .unwrap();
+        assert_eq!(second.cache.cache_eligible, 1);
+        assert_eq!(second.cache.cache_hits, 1);
+        assert_eq!(second.cache.files_hashed, 0);
+        assert_eq!(first.report, second.report);
+        assert_eq!(first.evidence_sources, second.evidence_sources);
+
+        let disabled = run_combined_dat_audit_with_cache(
+            &request,
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+            AuditCacheConfig::Disabled,
+        )
+        .unwrap();
+        assert_eq!(first.report, disabled.report);
+        assert_eq!(first.evidence_sources, disabled.evidence_sources);
     }
 
     fn write_zip(path: &Path, members: &[(&str, &[u8])]) {

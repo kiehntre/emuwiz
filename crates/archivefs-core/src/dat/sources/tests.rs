@@ -8,13 +8,25 @@
 //! config tests do, so parallel tests that do read `HOME` are unaffected).
 //! Nothing reads a real ROM or DAT collection, and nothing here opens a socket:
 //! the code under test has no network surface at all.
+//!
+//! This module's own `run_dat_audit` below shadows
+//! [`super::audit_run::run_dat_audit`] with a thin wrapper that always passes
+//! [`AuditCacheConfig::Disabled`], for the same reason: the audited *paths*
+//! being inside a temp dir says nothing about where the persistent audit
+//! cache itself lives - that resolves from real `HOME` unless a config says
+//! otherwise - so every one of this file's many `run_dat_audit(...)` call
+//! sites needs exactly one fix here, not thirty.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tempfile::TempDir;
 
-use super::audit_run::{DatAuditError, DatAuditRequest, run_dat_audit};
+use super::audit_cache::AuditCacheConfig;
+use super::audit_run::{
+    DatAuditError, DatAuditOutcome, DatAuditProgress, DatAuditRequest,
+    run_dat_audit_with_cache as production_run_dat_audit,
+};
 use super::config::{
     DatSourceConfigEntry, DatSourcesConfig, dat_sources_config_path_in,
     load_dat_sources_config_from, save_dat_sources_config_to,
@@ -26,6 +38,26 @@ use crate::dat::model::DatFormat;
 use crate::dat::parser::DiagnosticSeverity;
 use crate::dat::parsers::parse_dat_file;
 use crate::safe_read::TrustedRoots;
+
+/// Shadows [`super::audit_run::run_dat_audit`] for every test in this file:
+/// identical signature, but always `AuditCacheConfig::Disabled` so none of
+/// this module's audits can read or write the real EmuWiz application-data
+/// cache. See the module doc above for why the audited path being inside a
+/// temp dir does not already guarantee that on its own.
+fn run_dat_audit(
+    request: &DatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<DatAuditOutcome, DatAuditError> {
+    production_run_dat_audit(
+        request,
+        trusted,
+        cancel,
+        on_progress,
+        AuditCacheConfig::Disabled,
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures

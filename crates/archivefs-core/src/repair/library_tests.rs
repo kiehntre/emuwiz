@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use crate::dat::limits::DatLimits;
 use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::sources::DatSourceKind;
+use crate::dat::sources::audit_cache::AuditCacheConfig;
 use crate::repair::execute::{RepairExecutionError, RepairExecutionOptions, RepairReverifyOutcome};
 use crate::repair::library::{
     ApplySavedPlanError, ApplySavedPlanSelectedError, LibraryRepairPlan, LibraryScanRequest,
@@ -50,6 +51,10 @@ fn request(dat: &Path, roms: &Path) -> LibraryScanRequest {
         scan_root: roms.to_path_buf(),
         limits: DatLimits::default(),
         profile: RepairProfile::CanonicalInPlace,
+        // Never the real EmuWiz application-data audit cache - every test in
+        // this module runs inside its own `TempDir` (see the file doc
+        // comment) and must never read or write real machine state.
+        audit_cache: AuditCacheConfig::Disabled,
     }
 }
 
@@ -69,6 +74,10 @@ fn options(dir: &Path) -> RepairExecutionOptions {
     RepairExecutionOptions {
         trusted: TrustedRoots::from_paths([dir]),
         journal_dir,
+        // Same isolation rule as `request()` above: this drives
+        // `apply_saved_plan`/`apply_saved_plan_selected`'s own internal
+        // re-scan, which must never touch the real application-data cache.
+        audit_cache: AuditCacheConfig::Disabled,
     }
 }
 

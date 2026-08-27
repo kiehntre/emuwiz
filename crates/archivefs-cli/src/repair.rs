@@ -40,6 +40,7 @@ use archivefs_core::dat::rename_apply::{
     EntryState, RenameTransaction, RollbackResult, TransactionSummary, journal_path, list_journals,
     read_journal, reconcile_recovery, rollback_transaction,
 };
+use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 use archivefs_core::dat::sources::{DatSourceKind, suggest_display_name};
 use archivefs_core::repair::QUARANTINE_DIRECTORY_NAME;
 use archivefs_core::repair::execute::{
@@ -117,6 +118,7 @@ fn run_scan(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         scan_root: root.clone(),
         limits: DatLimits::default(),
         profile,
+        audit_cache: AuditCacheConfig::Default,
     };
 
     eprintln!(
@@ -205,6 +207,7 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let options = RepairExecutionOptions {
         trusted,
         journal_dir,
+        audit_cache: AuditCacheConfig::Default,
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
 

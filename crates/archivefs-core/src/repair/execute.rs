@@ -105,10 +105,21 @@ impl std::error::Error for RepairExecutionError {}
 
 /// What the Repair Center needs to execute a batch: the trusted roots and the
 /// journal directory (reusing the rename transaction journal).
+///
+/// `audit_cache` is only read by [`crate::repair::library::apply_saved_plan`]
+/// and [`crate::repair::library::apply_saved_plan_selected`], which use it to
+/// configure the authoritative re-scan they run before re-proving a saved
+/// plan - it has no effect on [`execute_repair_plan`] itself, which never
+/// audits anything. Production callers must pass
+/// [`crate::dat::sources::audit_cache::AuditCacheConfig::Default`] here so a
+/// live re-scan benefits from the persistent cache exactly like every other
+/// audit; tests must pass `Disabled` or an explicit temp path so they never
+/// touch the real EmuWiz application-data cache.
 #[derive(Debug, Clone)]
 pub struct RepairExecutionOptions {
     pub trusted: TrustedRoots,
     pub journal_dir: PathBuf,
+    pub audit_cache: crate::dat::sources::audit_cache::AuditCacheConfig,
 }
 
 /// The outcome of one repair batch, including the reused transaction model and

@@ -9626,6 +9626,7 @@ mod tests {
             policy: None,
             content: Default::default(),
             platform: Some("PSP".to_string()),
+            cache: Default::default(),
         };
 
         let summary = database
