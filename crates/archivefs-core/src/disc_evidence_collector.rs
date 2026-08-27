@@ -167,6 +167,39 @@ pub fn open_chd_iso9660(
     Ok((media, filesystem))
 }
 
+/// Whether `bytes` (not yet known to be readable by [`open_chd_iso9660`])
+/// is a multi-track GD-ROM CHD whose real game data lives in a
+/// high-density track beyond the low-density track
+/// [`select_candidate_data_track`] would pick - see
+/// [`needs_specialist_optical_backend`]'s own doc comment for exactly what
+/// this detects.
+///
+/// This performs the identical header/metadata parsing steps
+/// [`open_chd_iso9660`] itself already does before its own specialist-
+/// backend refusal (`looks_like_chd`, `observe_chd_identity`,
+/// `needs_specialist_optical_backend`) - `open_chd_iso9660` is completely
+/// unchanged by this function existing; it still refuses this shape
+/// outright, exactly as before. This is exposed so a caller with a genuine
+/// alternative reader for that shape ([`crate::chd_optical_specialist`],
+/// when the optional `chd-optical-specialist` build feature is enabled)
+/// can try that instead of treating a GD-ROM CHD the same as any other
+/// unreadable one.
+///
+/// `Ok(false)` (never an error) whenever the bytes are not recognizable
+/// CHD metadata at all - that case is `open_chd_iso9660`'s own refusal to
+/// diagnose, not this predicate's.
+pub fn chd_needs_specialist_optical_backend(bytes: &[u8]) -> Result<bool, DiscCollectionRefusal> {
+    if !looks_like_chd(bytes) {
+        return Err(DiscCollectionRefusal::NotRecognizedContainer);
+    }
+    let observation = observe_chd_identity(bytes)
+        .map_err(|error| DiscCollectionRefusal::ChdHeaderDidNotParse(error.to_string()))?;
+    let ChdMetadataOutcome::Observed(chd_metadata) = &observation.metadata else {
+        return Ok(false);
+    };
+    Ok(needs_specialist_optical_backend(chd_metadata))
+}
+
 /// Collects evidence from a plain, uncompressed ISO9660 image - refuses
 /// anything above `max_bytes` before ever reading it (milestone section
 /// 24). `max_bytes` is the caller's choice: this collector applies no

@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::disc_evidence_collector::{
-    DiscCollectionRefusal, open_chd_iso9660, read_bounded_chd_bytes,
+    DiscCollectionRefusal, chd_needs_specialist_optical_backend, open_chd_iso9660,
+    read_bounded_chd_bytes,
 };
 use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
@@ -2621,6 +2622,24 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         }
     };
     report.bytes_read = report.bytes_read.max(bytes.len() as u64);
+
+    if report.platform == IdentityPlatform::Dreamcast {
+        match chd_needs_specialist_optical_backend(&bytes) {
+            Ok(true) => {
+                inspect_dreamcast_gdrom_chd(report);
+                return;
+            }
+            Ok(false) => {
+                // Falls through to the existing single-track path below,
+                // exactly as before this branch existed.
+            }
+            Err(refusal) => {
+                push_disc_chd_refusal(report, &refusal);
+                return;
+            }
+        }
+    }
+
     let (media, filesystem) = match open_chd_iso9660(&bytes) {
         Ok(pair) => pair,
         Err(refusal) => {
@@ -2848,6 +2867,65 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         "serial derived from the exact boot executable path and corroborated by its PS-X EXE header",
     );
     report.complete = true;
+}
+
+/// Authoritative Dreamcast identity for a multi-track GD-ROM `.chd` - a
+/// shape the pure-Rust [`open_chd_iso9660`] path always refuses (its own
+/// [`crate::chd_identity::select_candidate_data_track`] would otherwise
+/// silently pick the small low-density warning-text track, never the real
+/// game - see that function's own doc comment), reached only when
+/// [`chd_needs_specialist_optical_backend`] has already confirmed this
+/// disc genuinely has high-density data beyond it.
+///
+/// This never re-implements GD-ROM addressing: the optional
+/// [`crate::chd_optical_specialist`] backend (present only when the
+/// `chd-optical-specialist` build feature is enabled - see this function's
+/// `#[cfg(not(...))]` twin below for the honest fail-closed behavior when
+/// it is not) already does the absolute-LBA-to-physical-track rebasing and
+/// exposes plain 2048-byte logical sectors; from there this calls the
+/// exact same [`inspect_dreamcast_source`] the single-track ISO/CUE/GDI/
+/// CHD paths already use, so a GD-ROM CHD and a plain Dreamcast disc
+/// produce equivalent `DreamcastProductCode` authority. No IP.BIN/
+/// product-code logic is duplicated here.
+#[cfg(feature = "chd-optical-specialist")]
+fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
+    let media =
+        match crate::chd_optical_specialist::open_chd_optical_specialist(&report.archive_path) {
+            Ok(media) => media,
+            Err(error) => {
+                push_with_source(
+                    report,
+                    IdentityKind::DreamcastProductCode,
+                    IdentityStatus::Invalid,
+                    None,
+                    IdentityConfidence::Unavailable,
+                    None,
+                    None,
+                    "Dreamcast GD-ROM specialist optical backend",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+    let mut source = MediaSource::new(media);
+    inspect_dreamcast_source(report, &mut source, None, None);
+}
+
+/// The fail-closed twin of the function above for builds where the
+/// optional `chd-optical-specialist` feature is not compiled in (the
+/// default - see this crate's `Cargo.toml`). Never falls back to the
+/// pure-Rust single-track reader for this shape (that would silently read
+/// the wrong, low-density track) and never guesses a product code from a
+/// filename - the honest answer is that this build cannot read this disc.
+#[cfg(not(feature = "chd-optical-specialist"))]
+fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
+    add_unavailable(
+        report,
+        IdentityStatus::Unsupported,
+        "this CHD is a multi-track Dreamcast GD-ROM; reading its high-density data area \
+         requires the optional chd-optical-specialist build feature, which is not enabled in \
+         this build",
+    );
 }
 
 /// Maps a [`DiscCollectionRefusal`] from opening/decoding a `.chd` into the
@@ -4904,6 +4982,159 @@ mod tests {
         let report = inspect_game_identity(&gdi_path, Some("Dreamcast"));
         assert_eq!(report.verified_dreamcast_product_code(), None);
         assert!(!report.complete);
+    }
+
+    /// A metadata-only synthetic CHD shaped like a real multi-track
+    /// Dreamcast GD-ROM (mirrors the real Jet Set Radio / Mr. Driller
+    /// layout `chd_identity.rs`'s own
+    /// `real_world_shaped_gd_rom_needs_a_specialist_backend` test and
+    /// `disc_evidence_collector`'s own local mirror both use): track 1
+    /// (low-density, small), track 2 (audio), track 3 (high-density game
+    /// data, past frame 45000). No real hunk/sector data is included -
+    /// sufficient to drive the *routing* decision
+    /// (`chd_needs_specialist_optical_backend`), not a real decode, which
+    /// this crate's own `chd_optical_specialist` tests document as
+    /// requiring genuine `chdman`-produced bytes this repo never commits.
+    fn gdrom_chd_bytes() -> Vec<u8> {
+        use crate::chd_identity::{CHD_METADATA_HEADER_BYTES, meta_tag};
+        use crate::dat::archive::chd::CHD_MAGIC;
+
+        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+        }
+
+        let mut data = vec![0u8; 124];
+        data[0..8].copy_from_slice(CHD_MAGIC);
+        put_u32(&mut data, 8, 124);
+        put_u32(&mut data, 12, 5);
+        put_u64(&mut data, 32, 0x1234_5678_0000_0000);
+        put_u32(&mut data, 56, 0x0002_0000);
+        put_u32(&mut data, 60, 0x0000_0800);
+
+        let entries: [(u32, &[u8]); 3] = [
+            (
+                meta_tag::GDROM_TRACK,
+                b"TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:6835 PAD:0 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+            ),
+            (
+                meta_tag::GDROM_TRACK,
+                b"TRACK:2 TYPE:AUDIO SUBTYPE:NONE FRAMES:38165 PAD:0 PREGAP:150 PGTYPE:SILENCE PGSUB:NONE POSTGAP:0",
+            ),
+            (
+                meta_tag::GDROM_TRACK,
+                b"TRACK:3 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:504150 PAD:0 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+            ),
+        ];
+        let meta_start = data.len() as u64;
+        let mut offsets = Vec::with_capacity(entries.len());
+        let mut cursor = meta_start;
+        for (_, payload) in &entries {
+            offsets.push(cursor);
+            cursor += CHD_METADATA_HEADER_BYTES as u64 + payload.len() as u64;
+        }
+        for (index, (tag, payload)) in entries.iter().enumerate() {
+            let next = offsets.get(index + 1).copied().unwrap_or(0);
+            data.extend_from_slice(&tag.to_be_bytes());
+            data.push(0);
+            let length = payload.len() as u32;
+            data.extend_from_slice(&length.to_be_bytes()[1..]);
+            data.extend_from_slice(&next.to_be_bytes());
+            data.extend_from_slice(payload);
+        }
+        put_u64(&mut data, 48, meta_start);
+        data
+    }
+
+    #[test]
+    fn dreamcast_multi_track_gdrom_chd_routes_to_the_specialist_backend() {
+        let directory = FixtureDir::new("dreamcast-gdrom-chd-routing");
+        let path = write_fixture(&directory, "game.chd", &gdrom_chd_bytes());
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+        // Without the `chd-optical-specialist` feature this is the exact,
+        // specific refusal reason - proves the *new* routing branch (not
+        // the old generic `open_chd_iso9660` refusal) was taken.
+        #[cfg(not(feature = "chd-optical-specialist"))]
+        {
+            let evidence = report
+                .evidence
+                .iter()
+                .find(|item| item.kind == IdentityKind::DreamcastProductCode)
+                .expect("a DreamcastProductCode evidence item must exist");
+            assert!(
+                evidence.diagnostic.contains("chd-optical-specialist"),
+                "expected the specialist-backend-unavailable message, got: {}",
+                evidence.diagnostic
+            );
+        }
+    }
+
+    #[cfg(feature = "chd-optical-specialist")]
+    #[test]
+    fn dreamcast_multi_track_gdrom_chd_with_the_feature_enabled_calls_the_real_specialist_backend()
+    {
+        // No genuine hunk/sector data exists in this metadata-only
+        // fixture, so `libchdman-rs` itself refuses it - this proves the
+        // *wiring* reaches the real backend (a distinct error path from
+        // the feature-off "not compiled in" message above), not that a
+        // full real GD-ROM decode succeeds - see `chd_optical_specialist`'s
+        // own module doc for why that needs a genuine `chdman`-produced
+        // file this repo never commits.
+        let directory = FixtureDir::new("dreamcast-gdrom-chd-feature-enabled");
+        let path = write_fixture(&directory, "game.chd", &gdrom_chd_bytes());
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+        let evidence = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::DreamcastProductCode)
+            .expect("a DreamcastProductCode evidence item must exist");
+        assert!(
+            !evidence.diagnostic.contains("chd-optical-specialist"),
+            "the feature-enabled path must not report the feature as unavailable, got: {}",
+            evidence.diagnostic
+        );
+    }
+
+    #[test]
+    fn saturn_hinted_gdrom_shaped_chd_keeps_the_existing_generic_refusal() {
+        // Saturn/PS1 semantics are untouched: the new routing branch is
+        // gated to `IdentityPlatform::Dreamcast` only, so a non-Dreamcast
+        // platform hint over the identical GD-ROM-shaped metadata still
+        // takes the exact old `open_chd_iso9660` refusal path.
+        let directory = FixtureDir::new("saturn-gdrom-shaped-chd");
+        let path = write_fixture(&directory, "game.chd", &gdrom_chd_bytes());
+        let report = inspect_game_identity(&path, Some("Saturn"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert!(!report.complete);
+        let evidence = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::SaturnProductNumber);
+        if let Some(evidence) = evidence {
+            assert!(!evidence.diagnostic.contains("chd-optical-specialist"));
+        }
+    }
+
+    #[test]
+    fn existing_single_track_dreamcast_chd_is_unaffected_by_gdrom_routing() {
+        // Regression: the plain single-track Dreamcast CHD path (already
+        // covered by `dreamcast_iso_cue_and_chd_verify_ip_bin_product_code`
+        // above) must still take the pure-Rust `open_chd_iso9660` path,
+        // never the new specialist branch, since
+        // `chd_needs_specialist_optical_backend` is `false` for it.
+        let directory = FixtureDir::new("dreamcast-single-track-chd-unaffected");
+        let iso = dreamcast_iso(b"T-8109N");
+        let path = write_fixture(&directory, "unrelated-title.chd", &ps1_chd(&iso));
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
     }
 
     #[test]
