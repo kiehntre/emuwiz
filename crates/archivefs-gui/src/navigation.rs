@@ -14,7 +14,7 @@
 
 use super::*;
 
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 18] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
@@ -24,7 +24,6 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 18] = [
     (MainView::RepairHistory, "Repair History"),
     (MainView::LibraryViewHistory, "Library View History"),
     (MainView::DatSources, "DAT Sources"),
-    (MainView::IdentifyRename, "Identify & Rename"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::RecentlyFound, "Recently Found"),
@@ -58,7 +57,7 @@ pub(crate) struct NavEntry {
     /// Whether this entry may render as "selected" when its destination is
     /// active. Almost always `true`; `false` only for a second entry that
     /// routes to a destination another entry already owns for highlighting
-    /// purposes (see `nav_view_shortcut`) - without this, both entries would
+    /// purposes - without this, two entries would
     /// highlight simultaneously and look like a bug, since the sidebar has
     /// no way to tell "the same page, reached two ways" from "two different
     /// pages that happen to both be active".
@@ -70,20 +69,6 @@ pub(crate) const fn nav_view(view: MainView, label: &'static str) -> NavEntry {
         click: NavClick::View(view),
         label,
         highlightable: true,
-    }
-}
-
-/// A sidebar entry that routes to the same destination as another, already
-///-highlightable `nav_view` entry elsewhere in `ADVANCED_NAV_GROUPS` (for
-/// example Batch Tools' "Mount All / Unmount All", which leads to the same
-/// `MainView::Mount` page as "Mount queue" under Mount & Active Mounts).
-/// Still fully clickable and navigable; simply never shown as selected, so
-/// exactly one sidebar entry highlights for that destination at a time.
-pub(crate) const fn nav_view_shortcut(view: MainView, label: &'static str) -> NavEntry {
-    NavEntry {
-        click: NavClick::View(view),
-        label,
-        highlightable: false,
     }
 }
 
@@ -99,7 +84,7 @@ pub(crate) const fn nav_quick_rename(label: &'static str) -> NavEntry {
     NavEntry {
         click: NavClick::QuickRename,
         label,
-        highlightable: false,
+        highlightable: true,
     }
 }
 
@@ -124,9 +109,9 @@ pub(crate) struct NavGroup {
 /// confusing labels for the advanced audience, by giving related pages a
 /// visible group heading instead of a flat list").
 ///
-/// `PRIMARY_NAVIGATION_DESTINATIONS` above is kept exactly as it was and
-/// is not rendered directly any more - it remains the canonical "which
-/// `MainView`s are genuinely reachable primary destinations" registry a
+/// `PRIMARY_NAVIGATION_DESTINATIONS` above is not rendered directly any more -
+/// it remains the canonical "which `MainView`s are genuinely reachable
+/// primary destinations" registry a
 /// number of existing, unrelated tests already assert against (title/width
 /// policy coverage, Home-card destination mapping, Library-consolidation
 /// counting), and continuing to use it for that keeps all of that
@@ -155,12 +140,6 @@ pub(crate) struct NavGroup {
 /// - `RepairReview` sits with Diagnostics (reviewing found problems before
 ///   deciding to fix them); `RepairHistory` sits with History & Journals
 ///   (§3.2's own "Rollback / journal detail" child) - it is exactly that.
-/// - "Batch Tools" is represented as its own labelled group per §3.2, but
-///   its entry still routes to the existing `MainView::Mount` page, where
-///   Mount All/Unmount All's already-implemented typed-count safety gate
-///   (§2.4, already built) actually lives - extracting Batch Tools into
-///   its own dedicated page is real page-splitting work, deferred (see
-///   the Phase 2 report).
 pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     NavGroup {
         heading: None,
@@ -173,23 +152,15 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
             nav_view(MainView::RecentlyFound, "Recently Found"),
             nav_view(MainView::Selected, "Selected"),
             nav_quick_rename("Quick Rename"),
-            nav_view(MainView::IdentifyRename, "Identify & Rename"),
             nav_view(MainView::CanonicalOrganisation, "Library Organisation"),
         ],
     },
     NavGroup {
         heading: Some("MOUNT & ACTIVE MOUNTS"),
         entries: &[
-            nav_view(MainView::Mount, "Mount queue"),
+            nav_view(MainView::Mount, "Mounts"),
             nav_view(MainView::ActiveMounts, "Active mounts"),
         ],
-    },
-    NavGroup {
-        heading: Some("BATCH TOOLS"),
-        entries: &[nav_view_shortcut(
-            MainView::Mount,
-            "Mount All / Unmount All",
-        )],
     },
     NavGroup {
         heading: Some("CHEATS & MODS"),
@@ -320,7 +291,7 @@ pub(crate) fn show_primary_navigation(
                         NavClick::Overlay(overlay) => {
                             (true, entry.highlightable && current_overlay == overlay)
                         }
-                        NavClick::QuickRename => (true, false),
+                        NavClick::QuickRename => (true, entry.highlightable),
                     };
                     let button = egui::Button::selectable(selected, entry.label)
                         .min_size(egui::vec2(ui.available_width(), 30.0));

@@ -185,7 +185,6 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::DatSources, "Open DAT Sources"),
         (HomeCard::Settings, "Open Settings"),
         (HomeCard::BuildLibrary, "Open Sources"),
-        (HomeCard::CleanUpLibrary, "Identify files"),
         (HomeCard::QuickRename, "Choose a library"),
         (HomeCard::RomM, "Open Sources"),
     ];
@@ -371,13 +370,14 @@ fn rename_and_organise_are_discoverable_from_home() {
         organise.secondary,
         Some((HomeCard::QuickRename, "Quick Rename"))
     );
-    let clean = view
-        .cards
-        .iter()
-        .find(|c| c.card == HomeCard::CleanUpLibrary)
-        .unwrap();
-    assert_eq!(clean.title, "Identify & Rename");
-    assert_eq!(clean.action_label, "Identify files");
+    assert_eq!(
+        view.cards
+            .iter()
+            .filter(|c| c.title == "Identify & Rename")
+            .count(),
+        0,
+        "the duplicate Identify & Rename Home card must be absent"
+    );
 }
 
 #[test]
@@ -398,7 +398,6 @@ fn every_home_card_shows_its_icon_alongside_its_title() {
         crate::ui::icons::CHECK,
         crate::ui::icons::SETTINGS,
         crate::ui::icons::CHEATS,
-        "Identify & Rename",
         "Organise",
         "My Games",
     ] {
@@ -446,7 +445,6 @@ fn all_destinations_remain_and_six_are_primary() {
         HomeCard::BrowseGames,
         HomeCard::CheatsAndMods,
         HomeCard::CanonicalOrganisation,
-        HomeCard::CleanUpLibrary,
         HomeCard::QuickRename,
         HomeCard::DatSources,
         HomeCard::RomM,
@@ -454,7 +452,10 @@ fn all_destinations_remain_and_six_are_primary() {
         HomeCard::Settings,
     ];
     expected.sort_by_key(|c| format!("{c:?}"));
-    assert_eq!(all, expected, "no destination is removed");
+    assert_eq!(
+        all, expected,
+        "only the duplicate cleanup destination is removed"
+    );
     assert_eq!(
         view.cards
             .iter()

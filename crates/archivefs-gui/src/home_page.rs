@@ -28,7 +28,7 @@ use crate::ui::{components as widgets, theme};
 use archivefs_core::{SetupDiagnostic, SetupDiagnosticStatus};
 use eframe::egui;
 
-/// One of the seven task-oriented destinations Home can send a user to.
+/// One of the task-oriented destinations Home can send a user to.
 /// `main.rs` maps each variant to the `MainView` (and, for the two that
 /// need it, the extra dispatch logic) its sidebar button already uses -
 /// Home never invents a second way to reach a destination.
@@ -38,7 +38,6 @@ pub(crate) enum HomeCard {
     BrowseGames,
     CheatsAndMods,
     CanonicalOrganisation,
-    CleanUpLibrary,
     QuickRename,
     CheatSources,
     DatSources,
@@ -337,17 +336,6 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             accent: None,
             readiness: Some(library_readiness),
             action_label: "Open Sources",
-            secondary: None,
-        },
-        HomeCardView {
-            card: HomeCard::CleanUpLibrary,
-            icon: crate::ui::icons::CLEAN_UP,
-            title: "Identify & Rename",
-            explanation: "Identify files with cryptographic DAT evidence, review canonical names, then rename only what you approve.",
-            tier: HomeCardTier::Secondary,
-            accent: None,
-            readiness: None,
-            action_label: "Identify files",
             secondary: None,
         },
         HomeCardView {

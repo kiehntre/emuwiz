@@ -3107,11 +3107,8 @@ fn cheats_mods_opened_from_gamer_view_has_an_obvious_back_to_games_button() {
     );
 }
 
-/// Regression test for a live-QA bug: two different `ADVANCED_NAV_GROUPS`
-/// entries under "MOUNT & ACTIVE MOUNTS" and "BATCH TOOLS" both route to
-/// `MainView::Mount`, so "Mount queue" and "Mount All / Unmount All" used to
-/// both render selected simultaneously whenever the Mount page was active.
-/// Only one entry per destination may be `highlightable` now.
+/// There is one primary sidebar route for the Mount page. Active Mounts is a
+/// separate page and remains available alongside it.
 #[test]
 fn only_one_sidebar_entry_highlights_for_a_shared_destination() {
     use std::collections::HashMap;
@@ -3132,9 +3129,6 @@ fn only_one_sidebar_entry_highlights_for_a_shared_destination() {
         );
     }
 
-    // The specific case reported live: Mount queue is the highlightable
-    // owner of MainView::Mount; the Batch Tools shortcut to the same page
-    // must not also claim the highlight.
     let mount_entries: Vec<&NavEntry> = ADVANCED_NAV_GROUPS
         .iter()
         .flat_map(|group| group.entries)
@@ -3142,13 +3136,19 @@ fn only_one_sidebar_entry_highlights_for_a_shared_destination() {
         .collect();
     assert_eq!(
         mount_entries.len(),
-        2,
-        "expected both the Mount queue and Batch Tools entries to still exist"
+        1,
+        "the Mount page must have one primary sidebar route"
     );
     let highlightable_count = mount_entries.iter().filter(|e| e.highlightable).count();
     assert_eq!(
         highlightable_count, 1,
-        "exactly one of the two Mount-page sidebar entries may highlight"
+        "the Mount page route must remain highlightable"
+    );
+    assert!(
+        ADVANCED_NAV_GROUPS
+            .iter()
+            .flat_map(|group| group.entries)
+            .any(|entry| entry.label == "Mounts")
     );
 }
 
@@ -3222,6 +3222,37 @@ fn every_primary_destination_and_quick_rename_still_has_a_sidebar_entry() {
         has_quick_rename,
         "Quick Rename must still have a sidebar entry"
     );
+}
+
+#[test]
+fn quick_rename_is_the_single_sidebar_entry_for_the_rename_workflow() {
+    let entries: Vec<&NavEntry> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .collect();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.label == "Quick Rename")
+            .count(),
+        1
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.label == "Identify & Rename")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| { matches!(entry.click, NavClick::QuickRename) && entry.highlightable })
+    );
+    assert!(entries.iter().any(|entry| {
+        matches!(
+            entry.click,
+            NavClick::Overlay(ToolsOverlay::CollectionDiscovery)
+        )
+    }));
 }
 
 /// Renders the sidebar alone, the way `SidePanel::left("app_navigation")`

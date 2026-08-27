@@ -3322,7 +3322,6 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         home_page::HomeCard::BrowseGames => MainView::Library,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
-        home_page::HomeCard::CleanUpLibrary => MainView::IdentifyRename,
         home_page::HomeCard::QuickRename => MainView::IdentifyRename,
         home_page::HomeCard::CheatSources => MainView::CheatSources,
         home_page::HomeCard::DatSources => MainView::DatSources,
