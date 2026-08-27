@@ -12,7 +12,7 @@
 //! # Scope
 //!
 //! Only the first supported native DuckStation launch slice: `PSX`
-//! platform, a direct regular `.iso` or `.chd` file, a verified PS1 serial,
+//! platform, a direct regular `.iso`, `.cue`, or `.chd` file, a verified PS1 serial,
 //! and an exact eligible [`DuckStationNativeLaunchBinding`]. Mounted/archive
 //! content, Flatpak, Portable/AppImage, and `Explicit` installs are all
 //! refused here - never silently widened.
@@ -24,7 +24,7 @@
 //! maps both `"iso"` and `"chd"` to it, so both already resolve through
 //! [`crate::launch::evidence_bridge::launch_content_ref_from_archive_record`]
 //! as [`LaunchContainerKind::PlainFile`] with `requires_mount: false`. Other
-//! formats DuckStation itself can read directly (`.cue`/`.bin`, `.pbp`,
+//! formats DuckStation itself can read directly (`.bin`, `.pbp`,
 //! `.ecm`, `.mds`/`.mdf`, `.ccd`) are not yet classified by that registry at
 //! all, so they are refused here rather than guessed at.
 //!
@@ -59,10 +59,9 @@ use crate::patch_manager::{
 pub const DUCKSTATION_SUPPORTED_PLATFORM_ID: &str = "PSX";
 
 /// The only direct content extensions this slice supports (lowercase, no
-/// dot) - see the module doc comment for exactly why `.chd` is included
-/// alongside `.iso` while `.cue`/`.bin` and other DuckStation-readable
-/// formats are not.
-const DUCKSTATION_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "chd"];
+/// dot). A CUE is the launch target for a safely resolved CUE/BIN set; a lone
+/// `.bin` remains refused because its track geometry is not authoritative.
+const DUCKSTATION_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "cue", "chd"];
 
 /// The executable invocation data for a DuckStation launch that has passed
 /// every fail-closed check. This is data only: no type in this module
@@ -228,7 +227,7 @@ pub fn build_duckstation_command_plan(
         } else if !direct_ps1_extension(path) {
             blockers.push(blocker(
                 LaunchBlockerKind::DuckStationContentFormatUnsupported,
-                "only a direct .iso or .chd file is supported by this native DuckStation launch \
+                "only a direct .iso, .cue, or .chd file is supported by this native DuckStation launch \
                  slice",
             ));
         }

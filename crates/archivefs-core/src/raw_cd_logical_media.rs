@@ -56,6 +56,11 @@
 //!   [`crate::logical_media::LogicalMediaError::DecodeFailed`], never a
 //!   silently wrong 2048 bytes (see [`crate::raw_cd_sector::extract_user_data`]).
 
+use std::cell::RefCell;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
 use crate::raw_cd_sector::{
     LOGICAL_BLOCK_BYTES, RAW_SECTOR_BYTES, RawCdSectorMode, detect_sector_mode, extract_user_data,
@@ -178,6 +183,164 @@ pub fn looks_like_raw_cd(data: &[u8]) -> bool {
     match (detect_sector_mode(first), detect_sector_mode(second)) {
         (Some(first_mode), Some(second_mode)) => first_mode == second_mode,
         _ => false,
+    }
+}
+
+/// A bounded file-backed raw-sector view.  This is the same logical-sector
+/// seam as [`RawCdLogicalMedia`], but reads one physical sector at a time so
+/// a CUE/BIN identity inspection never buffers an entire BIN image.
+#[derive(Debug)]
+pub struct RawCdFileLogicalMedia {
+    file: RefCell<File>,
+    physical_len: u64,
+    sector_mode: RawCdSectorMode,
+}
+
+/// Opens a regular 2352-byte-sector file after corroborating its first two
+/// sectors.  The file remains read-only and all later reads are bounds-checked.
+pub fn open_raw_cd_file_logical_media(
+    path: &Path,
+) -> Result<RawCdFileLogicalMedia, RawCdLogicalMediaError> {
+    let file = File::open(path).map_err(|_| RawCdLogicalMediaError::TooShort { len: 0 })?;
+    let physical_len = file
+        .metadata()
+        .map_err(|_| RawCdLogicalMediaError::TooShort { len: 0 })?
+        .len();
+    if physical_len < (RAW_SECTOR_BYTES * 2) as u64 {
+        return Err(RawCdLogicalMediaError::TooShort {
+            len: physical_len as usize,
+        });
+    }
+    if !physical_len.is_multiple_of(RAW_SECTOR_BYTES as u64) {
+        return Err(RawCdLogicalMediaError::NotASectorMultiple {
+            len: physical_len as usize,
+        });
+    }
+    let mut sectors = [[0_u8; RAW_SECTOR_BYTES]; 2];
+    let mut reader = &file;
+    reader
+        .read_exact(&mut sectors[0])
+        .and_then(|_| reader.read_exact(&mut sectors[1]))
+        .map_err(|_| RawCdLogicalMediaError::TooShort {
+            len: physical_len as usize,
+        })?;
+    let first = detect_sector_mode(&sectors[0]);
+    let second = detect_sector_mode(&sectors[1]);
+    let Some(sector_mode) = first.filter(|mode| Some(*mode) == second) else {
+        return Err(RawCdLogicalMediaError::UnrecognizedSectorLayout);
+    };
+    Ok(RawCdFileLogicalMedia {
+        file: RefCell::new(file),
+        physical_len,
+        sector_mode,
+    })
+}
+
+impl RawCdFileLogicalMedia {
+    pub fn sector_mode(&self) -> RawCdSectorMode {
+        self.sector_mode
+    }
+}
+
+impl LogicalMedia for RawCdFileLogicalMedia {
+    fn len(&self) -> u64 {
+        (self.physical_len / RAW_SECTOR_BYTES as u64) * LOGICAL_BLOCK_BYTES as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LogicalMediaError> {
+        let end =
+            offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| LogicalMediaError::OutOfBounds {
+                    offset,
+                    requested_len: buf.len(),
+                    media_len: self.len(),
+                })?;
+        if end > self.len() {
+            return Err(LogicalMediaError::OutOfBounds {
+                offset,
+                requested_len: buf.len(),
+                media_len: self.len(),
+            });
+        }
+        let mut file = self.file.borrow_mut();
+        let mut sector = [0_u8; RAW_SECTOR_BYTES];
+        let mut filled = 0;
+        while filled < buf.len() {
+            let absolute = offset + filled as u64;
+            let sector_index = absolute / LOGICAL_BLOCK_BYTES as u64;
+            let within = (absolute % LOGICAL_BLOCK_BYTES as u64) as usize;
+            file.seek(SeekFrom::Start(sector_index * RAW_SECTOR_BYTES as u64))
+                .and_then(|_| file.read_exact(&mut sector))
+                .map_err(|error| LogicalMediaError::DecodeFailed {
+                    detail: error.to_string(),
+                })?;
+            if detect_sector_mode(&sector) != Some(self.sector_mode) {
+                return Err(LogicalMediaError::DecodeFailed {
+                    detail: "raw CD sector layout changed within the data track".to_string(),
+                });
+            }
+            let user_data = extract_user_data(&sector, self.sector_mode)
+                .map_err(|detail| LogicalMediaError::DecodeFailed { detail })?;
+            let take = (LOGICAL_BLOCK_BYTES - within).min(buf.len() - filled);
+            buf[filled..filled + take].copy_from_slice(&user_data[within..within + take]);
+            filled += take;
+        }
+        Ok(())
+    }
+}
+
+/// A bounded file-backed cooked 2048-byte-sector view for CUE `MODE1/2048`.
+#[derive(Debug)]
+pub struct CookedCdFileLogicalMedia {
+    file: RefCell<File>,
+    len: u64,
+}
+
+pub fn open_cooked_cd_file_logical_media(
+    path: &Path,
+) -> Result<CookedCdFileLogicalMedia, std::io::Error> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 || !len.is_multiple_of(LOGICAL_BLOCK_BYTES as u64) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cooked CD image is not a non-empty 2048-byte-sector stream",
+        ));
+    }
+    Ok(CookedCdFileLogicalMedia {
+        file: RefCell::new(file),
+        len,
+    })
+}
+
+impl LogicalMedia for CookedCdFileLogicalMedia {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LogicalMediaError> {
+        let end =
+            offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| LogicalMediaError::OutOfBounds {
+                    offset,
+                    requested_len: buf.len(),
+                    media_len: self.len,
+                })?;
+        if end > self.len {
+            return Err(LogicalMediaError::OutOfBounds {
+                offset,
+                requested_len: buf.len(),
+                media_len: self.len,
+            });
+        }
+        let mut file = self.file.borrow_mut();
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(buf))
+            .map_err(|error| LogicalMediaError::DecodeFailed {
+                detail: error.to_string(),
+            })
     }
 }
 

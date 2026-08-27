@@ -190,13 +190,10 @@ fn spawn_failure_is_reported() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// --- honest documentation of the current identity-layer gap --------------------------------------
+// --- bounded real-media identity fixtures --------------------------------------------------------
 
 /// A structurally valid, minimal PS1 ISO9660 image with a real
-/// `SYSTEM.CNF`/`BOOT = cdrom:\...;1` entry - proves the *content* this
-/// preflight is given is genuinely well-formed; the failure below comes
-/// only from the identity layer's current lack of PS1 support, never from
-/// a malformed fixture.
+/// `SYSTEM.CNF`/`BOOT = cdrom:\...;1` entry.
 fn ps1_iso_bytes() -> Vec<u8> {
     const ISO_SECTOR_SIZE: usize = 2_048;
     const SECTORS: usize = 24;
@@ -244,6 +241,24 @@ fn ps1_iso_bytes() -> Vec<u8> {
     let executable_offset = 22 * ISO_SECTOR_SIZE;
     iso[executable_offset..executable_offset + 12].copy_from_slice(b"PS-X EXE\0\0\0\0");
     iso
+}
+
+fn ps1_raw_bin_bytes(image: &[u8]) -> Vec<u8> {
+    use crate::raw_cd_sector::{
+        LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, RAW_SECTOR_BYTES, SYNC_PATTERN,
+    };
+
+    image
+        .chunks_exact(LOGICAL_BLOCK_BYTES)
+        .flat_map(|logical| {
+            let mut sector = [0_u8; RAW_SECTOR_BYTES];
+            sector[..SYNC_PATTERN.len()].copy_from_slice(&SYNC_PATTERN);
+            sector[15] = 1;
+            sector[MODE1_USER_DATA_OFFSET..MODE1_USER_DATA_OFFSET + LOGICAL_BLOCK_BYTES]
+                .copy_from_slice(logical);
+            sector
+        })
+        .collect()
 }
 
 /// Wraps `ps1_iso_bytes()`-shaped ISO9660 content into a genuine,
@@ -436,6 +451,91 @@ fn fresh_identity_revalidates_a_real_ps1_disc() {
     assert_eq!(
         error.kind,
         DuckStationLaunchPreflightErrorKind::BindingUnavailable
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn preflight_revalidates_a_real_ps1_cue_bin_disc() {
+    let root = fixture_root("identity-revalidation-cue-bin");
+    let executable = root.join("bin/duckstation-qt");
+    write_executable(&executable, b"#!/bin/sh\nexit 0\n");
+    let profile_root = root.join("config/duckstation");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    std::fs::write(
+        profile_root.join("settings.ini"),
+        b"[BIOS]\nBIOSFilename=scph1001.bin\n",
+    )
+    .unwrap();
+    let content_path = root.join("games/unrelated-title.cue");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        content_path.with_file_name("actual-disc.bin"),
+        ps1_raw_bin_bytes(&ps1_iso_bytes()),
+    )
+    .unwrap();
+    std::fs::write(
+        &content_path,
+        b"FILE \"actual-disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+
+    let roots = DuckStationProfileDiscoveryRoots {
+        home: root.join("home"),
+        xdg_config_home: root.join("config"),
+        xdg_data_home: root.join("data"),
+        xdg_config_home_explicit: true,
+        explicit_configuration_roots: Vec::new(),
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: vec![executable.clone()],
+        known_version_outputs: std::collections::BTreeMap::new(),
+        appimage_directory: None,
+    };
+    let request = DuckStationLaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: "PSX".to_string(),
+        expected_game_key: "SLUS-12345".to_string(),
+        expected_ps1_serial: "SLUS-12345".to_string(),
+        profile_id: format!("duckstation:{}", profile_root.display()),
+        expected_executable: executable,
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+    };
+    let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
+    assert_eq!(
+        error.kind,
+        DuckStationLaunchPreflightErrorKind::BindingUnavailable
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fresh_identity_rejects_a_mismatched_real_ps1_cue_bin_serial() {
+    let root = fixture_root("identity-mismatch-cue-bin");
+    let content_path = root.join("games/game.cue");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        content_path.with_file_name("disc.bin"),
+        ps1_raw_bin_bytes(&ps1_iso_bytes()),
+    )
+    .unwrap();
+    std::fs::write(
+        &content_path,
+        b"FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let request = DuckStationLaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: "PSX".to_string(),
+        expected_game_key: "SLUS-12345".to_string(),
+        expected_ps1_serial: "SLES-23456".to_string(),
+        profile_id: "duckstation:test".to_string(),
+        expected_executable: root.join("duckstation-qt"),
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+    };
+    let error = fresh_identity_status(&request.selected_content_path, &request).unwrap_err();
+    assert_eq!(
+        error.kind,
+        DuckStationLaunchPreflightErrorKind::Ps1SerialMismatch
     );
     std::fs::remove_dir_all(root).unwrap();
 }

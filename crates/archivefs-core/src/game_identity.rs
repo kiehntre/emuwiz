@@ -17,10 +17,14 @@ use zip::ZipArchive;
 use crate::disc_evidence_collector::{
     DiscCollectionRefusal, open_chd_iso9660, read_bounded_chd_bytes,
 };
+use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
+};
+use crate::raw_cd_logical_media::{
+    open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
 };
 
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
@@ -521,6 +525,9 @@ fn inspect_game_identity_with_platform_trust(
         .unwrap_or_default()
         .to_ascii_lowercase();
     match extension.as_str() {
+        "cue" if platform == IdentityPlatform::PlayStation => {
+            inspect_ps1_cue(&mut report, trusted);
+        }
         "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => {
             inspect_direct_iso(&mut report, trusted)
         }
@@ -805,6 +812,40 @@ fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     };
     inspect_iso_source(report, &mut source, None, None);
     report.bytes_read = source.bytes_read;
+}
+
+fn inspect_ps1_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+    let track = match resolve_data_track(&report.archive_path) {
+        Ok(track) => track,
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("CUE data track could not be resolved: {error}"),
+            );
+            return;
+        }
+    };
+    let mut source = match track.mode {
+        CueDataTrackMode::Mode1_2048 => match open_cooked_cd_file_logical_media(&track.path) {
+            Ok(media) => CueMediaSource::Cooked(MediaSource::new(media)),
+            Err(error) => {
+                add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        },
+        CueDataTrackMode::Mode1_2352 | CueDataTrackMode::Mode2_2352 => {
+            match open_raw_cd_file_logical_media(&track.path) {
+                Ok(media) => CueMediaSource::Raw(MediaSource::new(media)),
+                Err(error) => {
+                    add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                    return;
+                }
+            }
+        }
+    };
+    inspect_iso_source(report, &mut source, None, None);
+    report.bytes_read = source.bytes_read();
 }
 
 fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
@@ -2821,6 +2862,66 @@ trait ByteSource {
     fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()>;
 }
 
+struct MediaSource<M> {
+    media: M,
+    bytes_read: u64,
+}
+
+enum CueMediaSource {
+    Cooked(MediaSource<crate::raw_cd_logical_media::CookedCdFileLogicalMedia>),
+    Raw(MediaSource<crate::raw_cd_logical_media::RawCdFileLogicalMedia>),
+}
+
+impl ByteSource for CueMediaSource {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Cooked(source) => source.len(),
+            Self::Raw(source) => source.len(),
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        match self {
+            Self::Cooked(source) => source.bytes_read(),
+            Self::Raw(source) => source.bytes_read(),
+        }
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        match self {
+            Self::Cooked(source) => source.read_exact_at(offset, buffer),
+            Self::Raw(source) => source.read_exact_at(offset, buffer),
+        }
+    }
+}
+
+impl<M> MediaSource<M> {
+    fn new(media: M) -> Self {
+        Self {
+            media,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl<M: crate::logical_media::LogicalMedia> ByteSource for MediaSource<M> {
+    fn len(&self) -> u64 {
+        self.media.len()
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        self.media
+            .read_at(offset, buffer)
+            .map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error.to_string()))?;
+        self.bytes_read = self.bytes_read.saturating_add(buffer.len() as u64);
+        Ok(())
+    }
+}
+
 struct FileSource {
     file: File,
     len: u64,
@@ -3314,6 +3415,24 @@ mod tests {
         put_u64(&mut data, 40, map_offset);
         put_u64(&mut data, 48, meta_offset);
         data
+    }
+
+    fn ps1_raw_bin(image: &[u8]) -> Vec<u8> {
+        use crate::raw_cd_sector::{
+            LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, RAW_SECTOR_BYTES, SYNC_PATTERN,
+        };
+
+        image
+            .chunks_exact(LOGICAL_BLOCK_BYTES)
+            .flat_map(|logical| {
+                let mut sector = [0_u8; RAW_SECTOR_BYTES];
+                sector[..SYNC_PATTERN.len()].copy_from_slice(&SYNC_PATTERN);
+                sector[15] = 1;
+                sector[MODE1_USER_DATA_OFFSET..MODE1_USER_DATA_OFFSET + LOGICAL_BLOCK_BYTES]
+                    .copy_from_slice(logical);
+                sector
+            })
+            .collect()
     }
 
     fn write_fixture(directory: &FixtureDir, name: &str, bytes: &[u8]) -> PathBuf {
@@ -4089,16 +4208,66 @@ mod tests {
     }
 
     #[test]
-    fn ps1_bin_cue_formats_remain_non_authoritative() {
-        // Unaffected by PS1 CHD identity landing: BIN/CUE still has no
-        // existing safe bounded reader in EmuWiz, so it stays Unsupported.
-        let bin = inspect_game_identity(Path::new("/games/game.bin"), Some("PS1"));
-        assert_eq!(bin.format, IdentityImageFormat::Unsupported);
-        assert_eq!(bin.verified_ps1_serial(), None);
+    fn ps1_bin_cue_identity_uses_the_data_track_not_the_filename() {
+        let directory = FixtureDir::new("ps1-cue");
+        let bin_path = directory.0.join("actual-disc.bin");
+        fs::write(
+            &bin_path,
+            ps1_raw_bin(&ps1_iso(
+                b"SLUS_123.45;1",
+                b"BOOT=cdrom:\\SLUS_123.45;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "unrelated-title.cue",
+            b"FILE \"actual-disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PSX"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLUS-12345"));
+        assert!(report.complete);
+    }
 
-        let cue = inspect_game_identity(Path::new("/games/game.cue"), Some("PS1"));
-        assert_eq!(cue.format, IdentityImageFormat::Unsupported);
-        assert_eq!(cue.verified_ps1_serial(), None);
+    #[test]
+    fn ps1_mode1_2048_cue_identity_is_supported() {
+        let directory = FixtureDir::new("ps1-cue-2048");
+        let bin_path = directory.0.join("data.bin");
+        fs::write(
+            &bin_path,
+            ps1_iso(b"SLES_234.56;1", b"BOOT=cdrom:\\SLES_234.56;1\r\n", true),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PlayStation"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLES-23456"));
+    }
+
+    #[test]
+    fn ps1_multi_bin_cue_selects_the_unambiguous_data_track() {
+        let directory = FixtureDir::new("ps1-cue-multi-bin");
+        fs::write(directory.0.join("audio.bin"), vec![0_u8; 2352 * 2]).unwrap();
+        fs::write(
+            directory.0.join("data.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SLPS_345.67;1",
+                b"BOOT=cdrom:\\SLPS_345.67;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "multi.cue",
+            b"FILE \"audio.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nFILE \"data.bin\" BINARY\nTRACK 02 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLPS-34567"));
     }
 
     #[test]

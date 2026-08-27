@@ -11,7 +11,7 @@
 //! - `PSX` only - the only platform
 //!   [`crate::launch::duckstation_command::DUCKSTATION_SUPPORTED_PLATFORM_ID`]
 //!   names in this phase.
-//! - One direct loose regular `.iso` or `.chd` file - no archive members,
+//! - One direct loose regular `.iso`, `.cue`, or `.chd` file - no archive members,
 //!   no mounted content. See `duckstation_command`'s own module doc
 //!   comment for exactly why `.chd` is included alongside `.iso` here
 //!   (unlike PCSX2's PS2 slice) while `.cue`/`.bin` and other
@@ -275,7 +275,7 @@ impl From<DuckStationLaunchSpawnError> for DuckStationLaunchExecutionError {
 ///
 /// 1. `request.selected_content_path` must be absolute.
 /// 2. The content must exist, not be a symlink, be a regular file, not be
-///    an outer archive/mount-input path, and have a `.iso`/`.chd`
+///    an outer archive/mount-input path, and have a `.iso`, `.cue`, or `.chd`
 ///    extension.
 /// 3. A [`CapturedFileIdentity`] is captured from the content's current
 ///    metadata.
@@ -509,7 +509,7 @@ fn inspect_and_capture_content_identity(
     if !direct_ps1_extension(path) {
         return Err(preflight_error(
             DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
-            "only a direct .iso or .chd file is supported by this native DuckStation launch \
+            "only a direct .iso, .cue, or .chd file is supported by this native DuckStation launch \
              slice",
         ));
     }
