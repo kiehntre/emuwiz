@@ -301,6 +301,13 @@ pub enum IdentityImageFormat {
     /// readers - the same standard [`Self::Iso`]/CUE Dreamcast identity
     /// already meets. GDI is Dreamcast-only: PS1/Saturn never used GD-ROM.
     Gdi,
+    /// A Dreamcast DiscJuggler `.cdi` image's own selected data track
+    /// (see [`crate::dreamcast_cdi::open_dreamcast_cdi_logical_media`]),
+    /// read through the same standard [`Self::Iso`]/CUE/GDI Dreamcast
+    /// identity path. CDI is Dreamcast-only, exactly like [`Self::Gdi`].
+    /// Requires the `dreamcast-cdi` build feature (default-on); without
+    /// it, this reports [`Self::Unsupported`] instead, never a guess.
+    Cdi,
     Deferred,
     Unsupported,
 }
@@ -555,6 +562,9 @@ fn inspect_game_identity_with_platform_trust(
     match extension.as_str() {
         "gdi" if platform == IdentityPlatform::Dreamcast => {
             inspect_gdi(&mut report, trusted);
+        }
+        "cdi" if platform == IdentityPlatform::Dreamcast => {
+            inspect_disc_cdi(&mut report);
         }
         "cue"
             if matches!(
@@ -2928,6 +2938,53 @@ fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
     );
 }
 
+/// Authoritative Dreamcast identity for a DiscJuggler `.cdi` image. Never
+/// duplicates Dreamcast identity logic: the selected data track from
+/// [`crate::dreamcast_cdi::open_dreamcast_cdi_logical_media`] is wrapped
+/// in the same [`MediaSource`] and fed to the exact same
+/// [`inspect_dreamcast_source`] every other Dreamcast source (ISO, CUE,
+/// GDI, GD-ROM CHD) already uses.
+#[cfg(feature = "dreamcast-cdi")]
+fn inspect_disc_cdi(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::Cdi;
+    let media = match crate::dreamcast_cdi::open_dreamcast_cdi_logical_media(&report.archive_path) {
+        Ok(media) => media,
+        Err(error) => {
+            push_with_source(
+                report,
+                IdentityKind::DreamcastProductCode,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "Dreamcast CDI data track resolution",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let mut source = MediaSource::new(media);
+    inspect_dreamcast_source(report, &mut source, None, None);
+}
+
+/// The fail-closed twin of the function above for builds where the
+/// `dreamcast-cdi` feature (default-on) is disabled. CDI parsing depends
+/// on the same optional `opticaldiscs` dependency that feature gates -
+/// see [`crate::dreamcast_cdi`]'s module documentation. Never scans for a
+/// magic string or guesses a product code from a filename as a
+/// substitute.
+#[cfg(not(feature = "dreamcast-cdi"))]
+fn inspect_disc_cdi(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::Cdi;
+    add_unavailable(
+        report,
+        IdentityStatus::Unsupported,
+        "this is a Dreamcast DiscJuggler CDI image; reading it requires the optional \
+         dreamcast-cdi build feature, which is not enabled in this build",
+    );
+}
+
 /// Maps a [`DiscCollectionRefusal`] from opening/decoding a `.chd` into the
 /// honest [`IdentityStatus`] for that failure - never `Verified`, and never
 /// a guess at what the content might have been.
@@ -5135,6 +5192,166 @@ mod tests {
         let report = inspect_game_identity(&path, Some("Dreamcast"));
         assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
         assert!(report.complete);
+    }
+
+    /// Mirrors `crate::dreamcast_cdi`'s own private test-fixture builder
+    /// exactly (private to that module's own test mod, so re-derived here
+    /// per this crate's established per-file-fixture convention).
+    /// `sessions[i]` is a list of `(track_mode, read_mode, start_address,
+    /// track_length, pregap)`; only cooked (`read_mode == 0`) tracks are
+    /// used here since these tests need real, correctly-placed IP.BIN
+    /// content, not just structural parsing.
+    fn cdi_bytes(sessions: &[Vec<(u32, u32, u32, u32, u32)>]) -> Vec<u8> {
+        fn push_track(
+            desc: &mut Vec<u8>,
+            track_mode: u32,
+            read_mode: u32,
+            start_address: u32,
+            track_length: u32,
+            pregap: u32,
+        ) {
+            desc.extend_from_slice(&[0u8; 16]);
+            desc.push(0);
+            desc.extend_from_slice(&[0u8; 29]);
+            desc.extend_from_slice(&[0u8; 2]);
+            desc.extend_from_slice(&2u16.to_le_bytes());
+            desc.extend_from_slice(&pregap.to_le_bytes());
+            desc.extend_from_slice(&(track_length - pregap).to_le_bytes());
+            desc.extend_from_slice(&0u32.to_le_bytes());
+            desc.extend_from_slice(&[0u8; 2]);
+            desc.extend_from_slice(&track_mode.to_le_bytes());
+            desc.extend_from_slice(&[0u8; 4]);
+            desc.extend_from_slice(&0u32.to_le_bytes());
+            desc.extend_from_slice(&0u32.to_le_bytes());
+            desc.extend_from_slice(&start_address.to_le_bytes());
+            desc.extend_from_slice(&track_length.to_le_bytes());
+            desc.extend_from_slice(&[0u8; 16]);
+            desc.extend_from_slice(&read_mode.to_le_bytes());
+            desc.extend_from_slice(&0u32.to_le_bytes());
+            desc.extend_from_slice(&[0u8; 9]);
+            desc.extend_from_slice(&[0u8; 12]);
+            desc.extend_from_slice(&0u32.to_le_bytes());
+            desc.extend_from_slice(&[0u8; 99]);
+        }
+        let mut total_bytes = 0u64;
+        for session in sessions {
+            for &(_, _read_mode, _, length, _) in session {
+                total_bytes += 2048u64 * u64::from(length); // cooked-only fixture
+            }
+        }
+        let mut desc = Vec::new();
+        desc.push(sessions.len() as u8);
+        for session in sessions {
+            desc.push(0);
+            desc.push(session.len() as u8);
+            desc.extend_from_slice(&[0u8; 13]);
+            for &(track_mode, read_mode, start_address, length, pregap) in session {
+                push_track(
+                    &mut desc,
+                    track_mode,
+                    read_mode,
+                    start_address,
+                    length,
+                    pregap,
+                );
+            }
+        }
+        desc.push(0);
+        desc.push(0);
+        desc.extend_from_slice(&[0u8; 13]);
+        let dlen = (desc.len() + 4) as u32;
+        let mut file = vec![0u8; total_bytes as usize];
+        file.extend_from_slice(&desc);
+        file.extend_from_slice(&dlen.to_le_bytes());
+        file
+    }
+
+    /// Stamps a recognised Dreamcast IP.BIN hardware signature plus a
+    /// non-copyrightable synthetic product code at the start of a cooked
+    /// data region, matching `dreamcast_cdi`'s own test helper.
+    #[cfg(feature = "dreamcast-cdi")]
+    fn stamp_cdi_ip_bin(data: &mut [u8], product_code: &[u8; 10]) {
+        data[0..16].copy_from_slice(b"SEGA SEGAKATANA ");
+        data[0x40..0x4A].copy_from_slice(product_code);
+    }
+
+    #[test]
+    #[cfg(feature = "dreamcast-cdi")]
+    fn dreamcast_single_session_cdi_verifies_product_code_and_reaches_the_evidence_bridge() {
+        let directory = FixtureDir::new("dreamcast-cdi-single-session");
+        let mut bytes = cdi_bytes(&[vec![(1, 0, 0, 4, 0)]]);
+        stamp_cdi_ip_bin(&mut bytes[..4 * 2048], b"TEST00001 ");
+        let path = write_fixture(&directory, "game.cdi", &bytes);
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Cdi);
+        assert_eq!(report.verified_dreamcast_product_code(), Some("TEST00001"));
+        assert!(report.complete);
+
+        // The existing format-agnostic evidence bridge and Flycast input
+        // projection reuse this verified fact unchanged.
+        let (_status, facts) =
+            crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                crate::launch::input_projection::VerifiedIdentityFact::DreamcastProductCode(code)
+                    if code == "TEST00001"
+            )),
+            "expected a DreamcastProductCode(\"TEST00001\") fact, got: {facts:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dreamcast-cdi")]
+    fn dreamcast_multi_session_gdrom_cdi_selects_the_high_density_track() {
+        let directory = FixtureDir::new("dreamcast-cdi-multi-session");
+        let mut bytes = cdi_bytes(&[vec![(1, 0, 0, 4, 0)], vec![(1, 0, 45000, 4, 0)]]);
+        stamp_cdi_ip_bin(&mut bytes[..4 * 2048], b"WRONGCODE0");
+        stamp_cdi_ip_bin(&mut bytes[4 * 2048..8 * 2048], b"TEST00002 ");
+        let path = write_fixture(&directory, "game.cdi", &bytes);
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), Some("TEST00002"));
+    }
+
+    #[test]
+    fn dreamcast_cdi_extension_alone_is_insufficient() {
+        let directory = FixtureDir::new("dreamcast-cdi-extension-alone");
+        let path = write_fixture(&directory, "game.cdi", b"not a real discjuggler image");
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Cdi);
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn non_dreamcast_cdi_fails_closed() {
+        let directory = FixtureDir::new("non-dreamcast-cdi");
+        let bytes = cdi_bytes(&[vec![(1, 0, 0, 4, 0)]]);
+        let path = write_fixture(&directory, "game.cdi", &bytes);
+        let report = inspect_game_identity(&path, Some("PlayStation"));
+        assert_ne!(report.format, IdentityImageFormat::Cdi);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    #[cfg(not(feature = "dreamcast-cdi"))]
+    fn dreamcast_cdi_without_the_specialist_feature_fails_closed_with_a_specific_message() {
+        let directory = FixtureDir::new("dreamcast-cdi-feature-off");
+        let bytes = cdi_bytes(&[vec![(1, 0, 0, 4, 0)]]);
+        let path = write_fixture(&directory, "game.cdi", &bytes);
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Cdi);
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        let evidence = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::DreamcastProductCode)
+            .expect("a DreamcastProductCode evidence item must exist");
+        assert!(
+            evidence.diagnostic.contains("dreamcast-cdi"),
+            "expected the specialist-backend-unavailable message, got: {}",
+            evidence.diagnostic
+        );
     }
 
     #[test]

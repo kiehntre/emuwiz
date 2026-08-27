@@ -91,17 +91,28 @@ tar = { version = "0.4", default-features = false }
 # (see docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md §12).
 sevenz-rust2 = { version = "0.21.4", default-features = false }
 chd = "0.3.4"
-# Optional specialist optical-disc backend (crate::chd_optical_specialist),
-# behind the `chd-optical-specialist` feature - see that module's own doc
-# comment. Unlike `chd` above (pure Rust), this pulls in `libchdman-rs`,
-# which links a native build of MAME's own `chd_file`/`cdrom_file` C++ core
-# (BSD-3-Clause) - by default via a prebuilt static archive fetched at build
-# time, not compiled from source. Only enabled explicitly; every other path
-# in this crate (including the pure-Rust `chd_logical_media` reader) builds
-# and passes its own tests with this feature off.
-opticaldiscs = { version = "0.15", default-features = false, features = [
-    "chd",
-], optional = true }
+# Backs two independent features - see `[features]` below and each
+# feature's own module doc comment (`crate::dreamcast_cdi`,
+# `crate::chd_optical_specialist`):
+#
+# - `dreamcast-cdi` (default-on): pure-Rust Dreamcast DiscJuggler `.cdi`
+#   identity support via `opticaldiscs::discjuggler`, which carries no
+#   feature gate of its own inside `opticaldiscs` and pulls in no
+#   native/C++ code.
+# - `chd-optical-specialist` (opt-in): additionally turns on
+#   `opticaldiscs`'s own `chd` feature, which pulls in `libchdman-rs` - a
+#   native build of MAME's own `chd_file`/`cdrom_file` C++ core
+#   (BSD-3-Clause), by default via a prebuilt static archive fetched at
+#   build time, not compiled from source.
+#
+# No `features = [...]` is hardcoded here deliberately: which of
+# `opticaldiscs`'s own features get enabled is controlled entirely by
+# which of *our* features below are active, via Cargo's normal
+# dependency-feature unification (`"opticaldiscs/chd"`), so the two stay
+# fully independent. Every other path in this crate (including the
+# pure-Rust `chd_logical_media` reader) builds and passes its own tests
+# with `chd-optical-specialist` off.
+opticaldiscs = { version = "0.15", default-features = false, optional = true }
 # GameCube/Wii disc structure (game ID, disc header, partition table, FST,
 # apploader, main.dol) - pure Rust, no native/C dependency with default
 # features disabled. Reused rather than hand-writing a GC/Wii optical
@@ -143,7 +154,17 @@ xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std
 affs-read = "0.4.1"
 
 [features]
-chd-optical-specialist = ["dep:opticaldiscs"]
+default = ["dreamcast-cdi"]
+# Pure-Rust Dreamcast DiscJuggler `.cdi` identity support - see
+# `crate::dreamcast_cdi`'s module documentation and the `opticaldiscs`
+# dependency comment above. No native/C++ dependency.
+dreamcast-cdi = ["dep:opticaldiscs"]
+# Optional specialist optical-disc backend (crate::chd_optical_specialist) -
+# multi-track/GD-ROM CHD via opticaldiscs's own `chd` feature (native
+# libchdman-rs/MAME core). Independent of `dreamcast-cdi`: enabling this
+# alone does not enable CDI, and enabling `dreamcast-cdi` alone pulls in
+# no native code.
+chd-optical-specialist = ["dep:opticaldiscs", "opticaldiscs/chd"]
 
 [dev-dependencies]
 # Same crate, fuller feature set: only test fixtures need to *write* 7z

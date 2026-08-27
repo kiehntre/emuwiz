@@ -179,6 +179,14 @@ pub mod raw_cd_logical_media;
 #[cfg(feature = "chd-optical-specialist")]
 pub mod chd_optical_specialist;
 
+/// Dreamcast DiscJuggler `.cdi` identity support, behind the
+/// `dreamcast-cdi` feature (default-on). Independent of
+/// `chd-optical-specialist`: unlike [`chd_optical_specialist`], this pulls
+/// in no native/C++ code - `opticaldiscs::discjuggler` is pure Rust, and
+/// this feature does not enable `opticaldiscs`'s own `chd` feature.
+#[cfg(feature = "dreamcast-cdi")]
+pub mod dreamcast_cdi;
+
 /// Pure, read-only PlayStation-style boot evidence (`SYSTEM.CNF`, PS-X EXE
 /// magic) - neutral [`content_evidence`] facts, never a platform.
 pub mod playstation_boot_evidence;
