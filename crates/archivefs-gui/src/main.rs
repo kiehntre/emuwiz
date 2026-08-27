@@ -156,6 +156,7 @@ pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
+pub(crate) mod playing_library_page;
 pub(crate) mod repair_history_page;
 pub(crate) mod repair_review_page;
 pub(crate) mod rom_organisation_page;

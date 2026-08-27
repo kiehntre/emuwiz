@@ -24,7 +24,9 @@
 //! independently mergeable without touching `rename_apply`,
 //! `rom_organisation`, or any GUI page.
 
+pub mod apply_adapter;
 pub mod evidence;
+pub mod matching;
 pub mod model;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,6 +35,8 @@ use std::path::{Path, PathBuf};
 use crate::dat::dependency::graph::{DependencyGraph, SetRef};
 use crate::dat::model::ParsedDat;
 
+pub use apply_adapter::build_playing_library_transaction;
+pub use matching::match_loose_files_against_dat;
 pub use model::{
     DestinationConflict, ElectedGame, ElectionExplanation, ExcludedCandidate,
     LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan, PlayingLibraryPolicy,

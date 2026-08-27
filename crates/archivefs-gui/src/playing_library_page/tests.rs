@@ -1,0 +1,771 @@
+//! Focused tests for the Build Playing Library page.
+//!
+//! Every DAT/source fixture is a real temp file/folder; `preview()` and
+//! `confirm_apply()` run the real core planner and the real shared
+//! `rename_apply` executor - nothing here is a render-only mock.
+
+use std::path::PathBuf;
+
+use archivefs_core::dat::rename_apply::model::TransactionState;
+
+use super::*;
+
+/// SHA-1 of `b"test"` (4 bytes).
+const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
+/// SHA-1 of `b"abc"` (3 bytes).
+const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+
+struct Fixture {
+    dir: PathBuf,
+}
+
+impl Fixture {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "archivefs-gui-playing-library-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture root");
+        Self { dir }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn write_dat(fixture: &Fixture, name: &str, body: &str) -> PathBuf {
+    let path = fixture.path(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+fn base_state(fixture: &Fixture) -> PlayingLibraryPageState {
+    let journal_dir = fixture.path("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let mut state = PlayingLibraryPageState::with_journal_dir(journal_dir);
+    state.exclude_beta = false;
+    state.exclude_proto = false;
+    state.exclude_demo = false;
+    state.exclude_sample = false;
+    state.prefer_newest_revision = false;
+    state.prefer_parent = false;
+    state.preferred_regions_draft.clear();
+    state
+}
+
+// --- real-widget render/interaction helpers -----------------------------
+//
+// These drive the page exactly the way a real frame loop would: a single
+// `egui::Context` persists across multiple `run()` calls (so focus memory
+// set in one frame survives into the next, the same as a real app), text is
+// typed by giving a field's stable id keyboard focus and then sending
+// `egui::Event::Text` (the same pattern this crate's own
+// `set_text_edit_caret`/`apply_select_all` in `main.rs` already use to drive
+// a `TextEdit` programmatically), and a click is one `PointerMoved` +
+// press + release batch at the exact center of the target's own rendered
+// text, located from the previous frame's real output - never by mutating
+// page state directly.
+
+fn screen() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0))
+}
+
+fn render(
+    ctx: &egui::Context,
+    state: &mut PlayingLibraryPageState,
+    input: egui::RawInput,
+) -> (egui::FullOutput, Option<PlayingLibraryPageAction>) {
+    let mut action = None;
+    let output = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            action = show_playing_library_page(ui, state);
+        });
+    });
+    (output, action)
+}
+
+fn base_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(screen()),
+        ..Default::default()
+    }
+}
+
+fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+    fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+            egui::Shape::Vec(nested) => nested.iter().any(|shape| shape_contains(shape, needle)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|clipped| shape_contains(&clipped.shape, needle))
+}
+
+fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+            egui::Shape::Vec(nested) => nested.iter().find_map(|s| find_in_shape(s, needle)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+}
+
+fn click_event(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        },
+    ]
+}
+
+/// Clicks on the rendered widget whose own text is exactly `needle` (a
+/// button label or a checkbox's label), from a fresh render. Panics if
+/// nothing renders that exact text - a test relying on this should already
+/// know the widget is on screen.
+fn click_text(
+    ctx: &egui::Context,
+    state: &mut PlayingLibraryPageState,
+    needle: &str,
+) -> (egui::FullOutput, Option<PlayingLibraryPageAction>) {
+    let (before, _) = render(ctx, state, base_input());
+    let pos = find_exact_text_center(&before, needle)
+        .unwrap_or_else(|| panic!("expected to find rendered text {needle:?} to click"));
+    render(
+        ctx,
+        state,
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            events: click_event(pos),
+            ..Default::default()
+        },
+    )
+}
+
+/// Types `text` into the field with widget id `field_id` by giving it
+/// keyboard focus and then sending it as a real `egui::Event::Text` -
+/// exactly what a physical keyboard would produce, never a direct field
+/// assignment.
+fn type_into_field(
+    ctx: &egui::Context,
+    state: &mut PlayingLibraryPageState,
+    field_id: &str,
+    text: &str,
+) {
+    let _ = render(ctx, state, base_input());
+    ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(field_id)));
+    let _ = render(
+        ctx,
+        state,
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            events: vec![egui::Event::Text(text.to_string())],
+            ..Default::default()
+        },
+    );
+}
+
+// --- source/destination selection --------------------------------------
+
+#[test]
+fn preview_requires_a_source_folder() {
+    let fixture = Fixture::new("no-source");
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+
+    state.preview();
+
+    assert!(state.plan().is_none());
+    assert!(state.error().unwrap().contains("source"));
+}
+
+#[test]
+fn preview_requires_an_absolute_destination() {
+    let fixture = Fixture::new("relative-dest");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = "playing".to_string(); // relative, on purpose
+
+    state.preview();
+
+    assert!(state.plan().is_none());
+    assert!(state.error().unwrap().contains("absolute"));
+}
+
+// --- policy building (region/language/revision/parent/exclusions) ------
+
+#[test]
+fn region_preference_order_is_preserved_in_declaration_order() {
+    let fixture = Fixture::new("region-order");
+    let mut state = base_state(&fixture);
+    state.preferred_regions_draft = "Japan, Europe, USA".to_string();
+
+    let policy = state.build_policy();
+
+    assert_eq!(policy.preferred_regions, vec!["Japan", "Europe", "USA"]);
+}
+
+#[test]
+fn language_preference_translates_plain_english_to_the_recognized_code() {
+    let fixture = Fixture::new("language-pref");
+    let mut state = base_state(&fixture);
+    state.preferred_languages_draft = "English, Fr".to_string();
+
+    let policy = state.build_policy();
+
+    assert_eq!(policy.preferred_languages, vec!["en", "Fr"]);
+}
+
+#[test]
+fn revision_toggle_maps_directly_to_the_policy_flag() {
+    let fixture = Fixture::new("revision-toggle");
+    let mut state = base_state(&fixture);
+    assert!(!state.build_policy().prefer_newest_revision);
+    state.prefer_newest_revision = true;
+    assert!(state.build_policy().prefer_newest_revision);
+}
+
+#[test]
+fn parent_toggle_maps_directly_to_the_policy_flag() {
+    let fixture = Fixture::new("parent-toggle");
+    let mut state = base_state(&fixture);
+    assert!(!state.build_policy().prefer_parent);
+    state.prefer_parent = true;
+    assert!(state.build_policy().prefer_parent);
+}
+
+#[test]
+fn release_class_exclusions_map_one_to_one() {
+    let fixture = Fixture::new("exclusions");
+    let mut state = base_state(&fixture);
+    state.exclude_beta = true;
+    state.exclude_sample = true;
+
+    let policy = state.build_policy();
+
+    assert_eq!(
+        policy.excluded_release_classes,
+        vec![
+            archivefs_core::playing_library::ReleaseClass::Beta,
+            archivefs_core::playing_library::ReleaseClass::Sample
+        ]
+    );
+}
+
+// --- preview uses the real core planner ---------------------------------
+
+#[test]
+fn preview_uses_the_real_core_planner() {
+    let fixture = Fixture::new("real-planner");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("europe.bin"), b"test").unwrap();
+    std::fs::write(source.join("usa.bin"), b"abc").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Sonic (USA)" cloneof="Sonic (Europe)"><rom name="usa.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+    state.preferred_regions_draft = "Europe, USA".to_string();
+
+    state.preview();
+
+    let plan = state.plan().expect("a real plan from the core planner");
+    assert_eq!(plan.archives_examined, 2);
+    assert_eq!(plan.families_examined, 1);
+    assert_eq!(plan.elected_games.len(), 1);
+    assert_eq!(plan.elected_games[0].dat_entry_name, "Sonic (Europe)");
+    // Nothing was written: preview only reads the DAT and hashes candidates.
+    assert!(!fixture.path("playing").exists());
+}
+
+#[test]
+fn unresolved_groups_remain_unresolved_in_the_preview() {
+    let fixture = Fixture::new("unresolved");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.bin"), b"test").unwrap();
+    std::fs::write(source.join("b.bin"), b"abc").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Tetris (Japan)"><rom name="a.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Tetris (Asia)" cloneof="Tetris (Japan)"><rom name="b.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+    // No preferences configured at all: nothing can distinguish the tie.
+
+    state.preview();
+
+    let plan = state.plan().expect("plan");
+    assert!(plan.elected_games.is_empty());
+    assert_eq!(plan.unresolved_groups.len(), 1);
+    assert_eq!(plan.unresolved_groups[0].tied_candidates.len(), 2);
+}
+
+#[test]
+fn a_destination_conflict_blocks_that_operation_from_applying() {
+    let fixture = Fixture::new("conflict");
+    let source_a = fixture.path("a");
+    let source_b = fixture.path("b");
+    std::fs::create_dir_all(&source_a).unwrap();
+    std::fs::create_dir_all(&source_b).unwrap();
+    std::fs::write(source_a.join("game.bin"), b"test").unwrap();
+    std::fs::write(source_b.join("game.bin"), b"abc").unwrap();
+    // A single flat source folder is what the page actually scans; nest
+    // both same-named files under it so the resulting elections collide on
+    // one destination basename exactly like the core-level conflict test.
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(source.join("a")).unwrap();
+    std::fs::create_dir_all(source.join("b")).unwrap();
+    std::fs::write(source.join("a").join("game.bin"), b"test").unwrap();
+    std::fs::write(source.join("b").join("game.bin"), b"abc").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Family One (Europe)"><rom name="game.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Family Two (Japan)"><rom name="game.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+
+    state.preview();
+
+    let plan = state.plan().expect("plan");
+    assert_eq!(plan.elected_games.len(), 2);
+    assert_eq!(plan.conflicts.len(), 1);
+    assert!(plan.operations.is_empty());
+
+    state.request_apply();
+    state.confirm_apply();
+
+    assert!(
+        state.apply_error().unwrap().contains("conflict"),
+        "applying while a conflict remains must be refused: {:?}",
+        state.apply_error()
+    );
+    assert!(state.applied().is_none());
+    assert!(!fixture.path("playing").exists());
+}
+
+// --- apply through the existing linked-library transaction seam --------
+
+fn preview_a_single_election(fixture: &Fixture) -> (PlayingLibraryPageState, PathBuf, PathBuf) {
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    let original = source.join("europe.bin");
+    std::fs::write(&original, b"test").unwrap();
+    let dat = write_dat(
+        fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+</datafile>"#
+        ),
+    );
+    let destination = fixture.path("playing");
+    let mut state = base_state(fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = destination.display().to_string();
+    state.preview();
+    assert_eq!(
+        state.plan().expect("plan").elected_games.len(),
+        1,
+        "fixture must produce exactly one election"
+    );
+    (state, original, destination)
+}
+
+#[test]
+fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
+    let fixture = Fixture::new("apply-seam");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+
+    state.request_apply();
+    state.confirm_apply(); // below the typed-confirmation threshold
+
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    let transaction = state.applied().expect("an applied transaction");
+    assert_eq!(transaction.state, TransactionState::Applied);
+    assert_eq!(transaction.applied_count(), 1);
+
+    // The journal this produced is a real, ordinary rename_apply journal,
+    // readable through the same public API every other apply path uses -
+    // proof this ran through the existing engine, not a new one.
+    let on_disk = archivefs_core::dat::rename_apply::read_journal(
+        &archivefs_core::dat::rename_apply::journal_path(
+            &state.journal_dir,
+            &transaction.transaction_id,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(on_disk.state, TransactionState::Applied);
+
+    let link = destination.join("europe.bin");
+    assert!(link.is_symlink());
+    assert_eq!(std::fs::read_link(&link).unwrap(), original);
+}
+
+#[test]
+fn original_source_files_remain_untouched_after_apply() {
+    let fixture = Fixture::new("untouched");
+    let (mut state, original, _destination) = preview_a_single_election(&fixture);
+
+    state.request_apply();
+    state.confirm_apply();
+
+    assert!(state.apply_error().is_none());
+    assert!(original.exists(), "the original file must still exist");
+    assert!(
+        !original.is_symlink(),
+        "the original must remain a real file, never converted to a link"
+    );
+    assert_eq!(std::fs::read(&original).unwrap(), b"test");
+}
+
+#[test]
+fn successful_apply_creates_symlinks_only_nothing_else_under_destination() {
+    let fixture = Fixture::new("symlinks-only");
+    let (mut state, _original, destination) = preview_a_single_election(&fixture);
+
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().is_none());
+
+    let entries: Vec<_> = std::fs::read_dir(&destination)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "exactly one destination entry: {entries:?}"
+    );
+    let metadata = std::fs::symlink_metadata(&entries[0]).unwrap();
+    assert!(
+        metadata.is_symlink(),
+        "the sole destination entry must be a symlink"
+    );
+}
+
+#[test]
+fn rollback_uses_the_existing_journal_backed_rollback_path() {
+    let fixture = Fixture::new("rollback");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.request_apply();
+    state.confirm_apply();
+    assert!(state.apply_error().is_none());
+    let link = destination.join("europe.bin");
+    assert!(link.is_symlink());
+
+    state.rollback_last();
+
+    assert!(state.apply_error().is_none(), "{:?}", state.apply_error());
+    assert!(!link.exists(), "rollback must remove the created symlink");
+    assert!(original.exists(), "rollback must never touch the original");
+    assert_eq!(std::fs::read(&original).unwrap(), b"test");
+
+    // The rollback is recorded in the very same journal file apply wrote -
+    // the existing rename_apply journal path, not a second bookkeeping
+    // system.
+    let transaction_id = state.applied().unwrap().transaction_id.clone();
+    let on_disk = archivefs_core::dat::rename_apply::read_journal(
+        &archivefs_core::dat::rename_apply::journal_path(&state.journal_dir, &transaction_id)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(on_disk.state, TransactionState::RolledBack);
+}
+
+// --- explanation reuses ElectionExplanation, invents nothing new --------
+
+#[test]
+fn selecting_a_family_exposes_its_own_election_explanation_unmodified() {
+    let fixture = Fixture::new("explanation");
+    let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+    let name = state.plan().unwrap().elected_games[0]
+        .dat_entry_name
+        .clone();
+
+    assert!(state.selected_family().is_none());
+    state.select_family(Some(name.clone()));
+    assert_eq!(state.selected_family(), Some(name.as_str()));
+    state.select_family(None);
+    assert!(state.selected_family().is_none());
+}
+
+// --- real widget interaction: driven through the rendered page, not by ---
+// --- mutating state directly in test setup -------------------------------
+
+#[test]
+fn the_dat_path_field_can_be_edited_through_the_real_text_widget() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(&ctx, &mut state, DAT_PATH_FIELD_ID, "/tmp/library.dat");
+
+    assert_eq!(state.dat_path_draft, "/tmp/library.dat");
+}
+
+#[test]
+fn the_source_path_field_can_be_edited_through_the_real_text_widget() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(&ctx, &mut state, SOURCE_ROOT_FIELD_ID, "/tmp/roms");
+
+    assert_eq!(state.source_root_draft, "/tmp/roms");
+}
+
+#[test]
+fn the_destination_path_field_can_be_edited_through_the_real_text_widget() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(&ctx, &mut state, DESTINATION_ROOT_FIELD_ID, "/tmp/playing");
+
+    assert_eq!(state.destination_root_draft, "/tmp/playing");
+}
+
+#[test]
+fn the_revision_checkbox_toggles_through_a_real_click() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+    assert!(state.prefer_newest_revision, "default is on");
+
+    click_text(&ctx, &mut state, "Prefer newest verified revision");
+    assert!(!state.prefer_newest_revision);
+
+    click_text(&ctx, &mut state, "Prefer newest verified revision");
+    assert!(state.prefer_newest_revision);
+}
+
+#[test]
+fn the_parent_checkbox_toggles_through_a_real_click() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+    assert!(state.prefer_parent, "default is on");
+
+    click_text(&ctx, &mut state, "Prefer declared parent");
+    assert!(!state.prefer_parent);
+}
+
+#[test]
+fn each_release_class_exclusion_checkbox_toggles_through_a_real_click() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+    assert!(
+        state.exclude_beta && state.exclude_proto && state.exclude_demo && state.exclude_sample
+    );
+
+    click_text(&ctx, &mut state, "Beta");
+    assert!(!state.exclude_beta);
+    click_text(&ctx, &mut state, "Proto");
+    assert!(!state.exclude_proto);
+    click_text(&ctx, &mut state, "Demo");
+    assert!(!state.exclude_demo);
+    click_text(&ctx, &mut state, "Sample");
+    assert!(!state.exclude_sample);
+
+    assert!(
+        !state.exclude_beta && !state.exclude_proto && !state.exclude_demo && !state.exclude_sample
+    );
+}
+
+#[test]
+fn editing_the_region_field_through_the_widget_updates_the_built_policy() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+    // The field defaults to a non-empty draft ("Europe, USA, Japan");
+    // clear it first so typing produces an exact, predictable result to
+    // assert on, rather than testing the unrelated "typing appends at the
+    // cursor" behaviour every ordinary text field already has.
+    state.preferred_regions_draft.clear();
+
+    type_into_field(
+        &ctx,
+        &mut state,
+        PREFERRED_REGIONS_FIELD_ID,
+        "Japan, Europe",
+    );
+
+    assert_eq!(
+        state.build_policy().preferred_regions,
+        vec!["Japan", "Europe"]
+    );
+}
+
+#[test]
+fn editing_the_language_field_through_the_widget_updates_the_built_policy() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(&ctx, &mut state, PREFERRED_LANGUAGES_FIELD_ID, "English");
+
+    assert_eq!(state.build_policy().preferred_languages, vec!["en"]);
+}
+
+#[test]
+fn preview_is_disabled_until_every_required_field_is_filled_then_becomes_clickable() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    // Nothing filled in yet: clicking where the button is must not produce
+    // an action, and the disabled hint must be visible.
+    let (output, action) = click_text(&ctx, &mut state, "Preview Playing Library");
+    assert!(action.is_none(), "a disabled button must never click");
+    assert!(rendered_text_contains(
+        &output,
+        "Choose a DAT catalogue, a source, and a destination first."
+    ));
+
+    type_into_field(&ctx, &mut state, DAT_PATH_FIELD_ID, "/tmp/library.dat");
+    type_into_field(&ctx, &mut state, SOURCE_ROOT_FIELD_ID, "/tmp/roms");
+    type_into_field(&ctx, &mut state, DESTINATION_ROOT_FIELD_ID, "/tmp/playing");
+
+    let (output, action) = click_text(&ctx, &mut state, "Preview Playing Library");
+    assert!(
+        !rendered_text_contains(
+            &output,
+            "Choose a DAT catalogue, a source, and a destination first."
+        ),
+        "the disabled hint must disappear once every required field is filled"
+    );
+    assert!(
+        matches!(action, Some(PlayingLibraryPageAction::Preview)),
+        "an enabled button must click"
+    );
+}
+
+#[test]
+fn an_invalid_dat_path_shows_a_plain_inline_error() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(
+        &ctx,
+        &mut state,
+        DAT_PATH_FIELD_ID,
+        "/definitely/does/not/exist.dat",
+    );
+    let (output, _) = render(&ctx, &mut state, base_input());
+
+    assert!(rendered_text_contains(&output, "This file was not found."));
+}
+
+#[test]
+fn an_invalid_source_folder_shows_a_plain_inline_error() {
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(
+        &ctx,
+        &mut state,
+        SOURCE_ROOT_FIELD_ID,
+        "/definitely/does/not/exist/roms",
+    );
+    let (output, _) = render(&ctx, &mut state, base_input());
+
+    assert!(rendered_text_contains(
+        &output,
+        "This folder was not found."
+    ));
+}
+
+#[test]
+fn a_real_existing_path_shows_no_inline_error() {
+    let fixture = Fixture::new("valid-path-render");
+    let ctx = egui::Context::default();
+    let mut state = PlayingLibraryPageState::default();
+
+    type_into_field(
+        &ctx,
+        &mut state,
+        SOURCE_ROOT_FIELD_ID,
+        &fixture.dir.display().to_string(),
+    );
+    let (output, _) = render(&ctx, &mut state, base_input());
+
+    assert!(!rendered_text_contains(
+        &output,
+        "This folder was not found."
+    ));
+}

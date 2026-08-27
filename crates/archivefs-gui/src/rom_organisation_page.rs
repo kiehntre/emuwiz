@@ -72,6 +72,14 @@ pub(crate) struct RomOrganisationPageState {
     /// "preferences keep disappearing" footgun never recurs. Cleared on every
     /// successful save / load.
     approval_persistence_warning: Option<String>,
+    /// Whether "Build Playing Library" is showing instead of the ordinary
+    /// organisation flow above. A page-local view toggle, not a separate
+    /// `OrganisationMode` - the playing-library planner is a genuinely
+    /// different (DAT-election-based) pipeline, so it gets its own state
+    /// rather than being squeezed into the classification-based modes this
+    /// page otherwise offers. Deliberately not a new sidebar destination.
+    pub(crate) showing_playing_library: bool,
+    pub(crate) playing_library: crate::playing_library_page::PlayingLibraryPageState,
 }
 
 /// Batches larger than this require typing the exact confirmation phrase
@@ -173,6 +181,8 @@ impl Default for RomOrganisationPageState {
             confirm_text: String::new(),
             pending_preview: false,
             approval_persistence_warning: None,
+            showing_playing_library: false,
+            playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         }
     }
 }
@@ -632,7 +642,7 @@ impl RomOrganisationPageState {
 /// paths: regular files and symlink *objects*. Symlinked directories are
 /// collected as link objects but never traversed, so a symlink loop cannot
 /// recurse. Read-only.
-fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     const MAX_DEPTH: usize = 4;
     const MAX_FILES: usize = 2_000;
     let mut out = Vec::new();
@@ -775,6 +785,21 @@ fn load_romm_cache() -> Option<archivefs_core::identity_source::cache::IdentityC
 
 /// Draws the page and returns the confirmation request when the user clicks
 /// Apply (the caller must confirm before any mutation happens).
+fn apply_playing_library_action(
+    state: &mut crate::playing_library_page::PlayingLibraryPageState,
+    action: crate::playing_library_page::PlayingLibraryPageAction,
+) {
+    use crate::playing_library_page::PlayingLibraryPageAction;
+    match action {
+        PlayingLibraryPageAction::Preview => state.preview(),
+        PlayingLibraryPageAction::SelectFamily(name) => state.select_family(name),
+        PlayingLibraryPageAction::RequestApply => state.request_apply(),
+        PlayingLibraryPageAction::CancelApply => state.cancel_apply(),
+        PlayingLibraryPageAction::ConfirmApply => state.confirm_apply(),
+        PlayingLibraryPageAction::RollbackLast => state.rollback_last(),
+    }
+}
+
 pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
     // See `RomOrganisationPageState::pending_preview`: this runs the actual
     // plan generation one frame after the click that requested it, so the
@@ -789,6 +814,35 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         "Organise",
         "Preview how your games can be renamed or organised. Nothing moves until you approve it.",
     );
+
+    ui.horizontal(|ui| {
+        if state.showing_playing_library {
+            if widgets::action_button(ui, "< Back to Organise", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                state.showing_playing_library = false;
+            }
+        } else if widgets::action_button(
+            ui,
+            "Build Playing Library",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            state.showing_playing_library = true;
+        }
+    });
+    ui.add_space(8.0);
+
+    if state.showing_playing_library {
+        if let Some(action) =
+            crate::playing_library_page::show_playing_library_page(ui, &mut state.playing_library)
+        {
+            apply_playing_library_action(&mut state.playing_library, action);
+        }
+        return;
+    }
 
     if state.mode == OrganisationMode::BuildLinkedLibrary {
         // Linked-library mode plans into an explicitly chosen destination
