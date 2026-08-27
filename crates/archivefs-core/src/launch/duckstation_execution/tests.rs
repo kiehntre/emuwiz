@@ -246,6 +246,154 @@ fn ps1_iso_bytes() -> Vec<u8> {
     iso
 }
 
+/// Wraps `ps1_iso_bytes()`-shaped ISO9660 content into a genuine,
+/// `open_chd_track_logical_media`-openable uncompressed CHD v5 file. Mirrors
+/// `crate::game_identity::tests::ps1_chd` (which cannot be imported across
+/// module boundaries, being private to that module's own test mod) - not a
+/// second CHD reader, only a second CHD test-fixture writer.
+fn ps1_chd_bytes(image: &[u8]) -> Vec<u8> {
+    use crate::dat::archive::chd::CHD_MAGIC;
+    use crate::raw_cd_sector::{LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, RAW_SECTOR_BYTES};
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    let mut image = image.to_vec();
+    let pvd = 16 * LOGICAL_BLOCK_BYTES;
+    image[pvd + 128..pvd + 130].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_le_bytes());
+    image[pvd + 130..pvd + 132].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_be_bytes());
+
+    let sectors: Vec<[u8; RAW_SECTOR_BYTES]> = image
+        .chunks(LOGICAL_BLOCK_BYTES)
+        .map(|block| {
+            let mut sector = [0u8; RAW_SECTOR_BYTES];
+            sector[MODE1_USER_DATA_OFFSET..MODE1_USER_DATA_OFFSET + block.len()]
+                .copy_from_slice(block);
+            sector
+        })
+        .collect();
+    let frames = sectors.len() as u32;
+    let frames_per_hunk = frames.max(1);
+    let unit_bytes = RAW_SECTOR_BYTES as u32;
+    let hunk_bytes = unit_bytes * frames_per_hunk;
+    let logical_bytes = frames as u64 * unit_bytes as u64;
+
+    let mut data = vec![0u8; 124];
+    data[0..8].copy_from_slice(CHD_MAGIC);
+    put_u32(&mut data, 8, 124);
+    put_u32(&mut data, 12, 5);
+    put_u64(&mut data, 32, logical_bytes);
+    put_u32(&mut data, 56, hunk_bytes);
+    put_u32(&mut data, 60, unit_bytes);
+
+    let meta_offset = data.len() as u64;
+    let payload = format!(
+        "TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:{frames} PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0"
+    )
+    .into_bytes();
+    data.extend_from_slice(&u32::from_be_bytes(*b"CHT2").to_be_bytes());
+    data.push(0);
+    let length = payload.len() as u32;
+    data.extend_from_slice(&length.to_be_bytes()[1..]);
+    data.extend_from_slice(&0u64.to_be_bytes());
+    data.extend_from_slice(&payload);
+
+    let hunk_count = logical_bytes.div_ceil(hunk_bytes as u64) as u32;
+    let map_offset = data.len() as u64;
+    let map_end = map_offset + hunk_count as u64 * 4;
+    let hunk_data_start = map_end.div_ceil(hunk_bytes as u64).max(1) * hunk_bytes as u64;
+    let base_index = hunk_data_start / hunk_bytes as u64;
+    for index in 0..hunk_count {
+        let value = (base_index + index as u64) as u32;
+        data.extend_from_slice(&value.to_be_bytes());
+    }
+
+    data.resize(hunk_data_start as usize, 0);
+    for sector in &sectors {
+        data.extend_from_slice(sector);
+    }
+
+    put_u64(&mut data, 40, map_offset);
+    put_u64(&mut data, 48, meta_offset);
+    data
+}
+
+#[test]
+fn fresh_identity_revalidates_a_real_ps1_chd() {
+    let root = fixture_root("identity-revalidation-chd");
+    let executable = root.join("bin/duckstation-qt");
+    write_executable(&executable, b"#!/bin/sh\nexit 0\n");
+    let profile_root = root.join("config/duckstation");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    std::fs::write(
+        profile_root.join("settings.ini"),
+        b"[BIOS]\nBIOSFilename=scph1001.bin\n",
+    )
+    .unwrap();
+    let content_path = root.join("games/game.chd");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(&content_path, ps1_chd_bytes(&ps1_iso_bytes())).unwrap();
+
+    let roots = DuckStationProfileDiscoveryRoots {
+        home: root.join("home"),
+        xdg_config_home: root.join("config"),
+        xdg_data_home: root.join("data"),
+        xdg_config_home_explicit: true,
+        explicit_configuration_roots: Vec::new(),
+        portable_configuration_roots: Vec::new(),
+        explicit_executables: vec![executable.clone()],
+        known_version_outputs: std::collections::BTreeMap::new(),
+        appimage_directory: None,
+    };
+    let request = DuckStationLaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: "PSX".to_string(),
+        expected_game_key: "SLUS-12345".to_string(),
+        expected_ps1_serial: "SLUS-12345".to_string(),
+        profile_id: format!("duckstation:{}", profile_root.display()),
+        expected_executable: executable,
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+    };
+    // Identity itself must succeed for the CHD, exactly as it does for the
+    // equivalent ISO above - reaching the later BindingUnavailable failure
+    // (not IdentityUnresolved/Ps1SerialUnavailable) proves fresh CHD
+    // identity revalidation, not just that the file was readable.
+    let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
+    assert_eq!(
+        error.kind,
+        DuckStationLaunchPreflightErrorKind::BindingUnavailable
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fresh_identity_rejects_a_mismatched_real_ps1_chd_serial() {
+    let root = fixture_root("identity-mismatch-chd");
+    let content_path = root.join("games/game.chd");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(&content_path, ps1_chd_bytes(&ps1_iso_bytes())).unwrap();
+    let request = DuckStationLaunchRequest {
+        selected_content_path: content_path,
+        expected_platform_id: "PSX".to_string(),
+        expected_game_key: "SLUS-12345".to_string(),
+        expected_ps1_serial: "SLES-23456".to_string(),
+        profile_id: "duckstation:test".to_string(),
+        expected_executable: root.join("duckstation-qt"),
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+    };
+
+    let error = fresh_identity_status(&request.selected_content_path, &request).unwrap_err();
+    assert_eq!(
+        error.kind,
+        DuckStationLaunchPreflightErrorKind::Ps1SerialMismatch
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn fresh_identity_revalidates_a_real_ps1_disc() {
     // The fixture is a directly inspectable PS1 image; this test isolates the

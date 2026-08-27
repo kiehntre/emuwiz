@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
+use crate::disc_evidence_collector::{
+    DiscCollectionRefusal, open_chd_iso9660, read_bounded_chd_bytes,
+};
+use crate::iso9660::find_path;
+use crate::logical_media::LogicalMedia as _;
 use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
@@ -265,6 +270,13 @@ pub enum IdentityImageFormat {
     /// Wii disc header at the start of the single occupied disc slot. Its
     /// bounded mapping table is validated; mapped disc data is never read.
     Wbfs,
+    /// A `.chd` decoded through the existing bounded pure-Rust track reader
+    /// (see [`crate::disc_evidence_collector::open_chd_iso9660`]) and
+    /// recognised as an ISO 9660 PS1 disc - currently the only CHD case
+    /// this module resolves authoritatively rather than deferring; every
+    /// other CHD (other platforms, specialist-optical-backend media,
+    /// non-ISO9660 content) still reports [`Self::Deferred`].
+    Chd,
     Deferred,
     Unsupported,
 }
@@ -523,6 +535,9 @@ fn inspect_game_identity_with_platform_trust(
         }
         "wbfs" if platform == IdentityPlatform::Wii => {
             inspect_wbfs(&mut report, trusted);
+        }
+        "chd" if platform == IdentityPlatform::PlayStation => {
+            inspect_ps1_chd(&mut report, trusted);
         }
         "chd" | "cso" | "rvz" | "wbfs" | "ciso" | "gcz" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
@@ -2273,6 +2288,276 @@ fn inspect_ps1_iso(
     report.complete = true;
 }
 
+/// Authoritative PS1 identity for a `.chd` - the exact same standard as
+/// [`inspect_ps1_iso`] (valid `BOOT=` serial, a supported PS1 product-code
+/// family, the referenced executable present, and a valid PS-X EXE header),
+/// reached through the *existing* bounded CHD reader
+/// ([`read_bounded_chd_bytes`]/[`open_chd_iso9660`] in
+/// [`crate::disc_evidence_collector`]) and the *existing* ISO 9660 filesystem
+/// reader ([`find_path`] in [`crate::iso9660`]) instead of this module's own
+/// `ByteSource`/[`iso_root`] pair - `inspect_ps1_iso` reads a plain ISO via a
+/// byte-offset abstraction because a plain ISO *is* just bytes at an offset;
+/// a CHD is compressed, so it is decoded through
+/// [`crate::chd_logical_media::ChdTrackLogicalMedia`] instead, but every
+/// actual PS1-content check below - [`parse_system_cnf_boot`],
+/// [`is_supported_ps1_serial`], [`looks_like_psx_exe`] - is the identical
+/// function call `inspect_ps1_iso` makes, so a CHD and an ISO of the same
+/// disc produce equivalent `Ps1Serial` authority. No CHD/ISO 9660 parsing is
+/// duplicated here; only the control flow that turns their results into
+/// [`IdentityStatus`] values is (necessarily) written twice, once per
+/// underlying media abstraction.
+fn inspect_ps1_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::Chd;
+    let bytes = match read_bounded_chd_bytes(&report.archive_path) {
+        Ok(bytes) => bytes,
+        Err(refusal) => {
+            push_ps1_chd_refusal(report, &refusal);
+            return;
+        }
+    };
+    report.bytes_read = report.bytes_read.max(bytes.len() as u64);
+    let (media, filesystem) = match open_chd_iso9660(&bytes) {
+        Ok(pair) => pair,
+        Err(refusal) => {
+            push_ps1_chd_refusal(report, &refusal);
+            return;
+        }
+    };
+
+    report.metadata_paths_inspected += 1;
+    let cnf = match find_path(&media, &filesystem, "SYSTEM.CNF") {
+        Ok(Some(entry)) if !entry.is_directory => entry,
+        Ok(_) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "CHD ISO 9660 root directory lookup",
+                "SYSTEM.CNF is missing",
+            );
+            return;
+        }
+        Err(error) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "CHD ISO 9660 root directory lookup",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    if cnf.size as u64 > MAX_SYSTEM_CNF_BYTES {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::ResourceLimitReached,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "SYSTEM.CNF bounded read",
+            "SYSTEM.CNF exceeds 64 KiB",
+        );
+        return;
+    }
+    let cnf_offset = cnf.extent_lba as u64 * filesystem.logical_block_size as u64;
+    let mut cnf_bytes = vec![0_u8; cnf.size as usize];
+    if media.read_at(cnf_offset, &mut cnf_bytes).is_err() {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "SYSTEM.CNF bounded read",
+            "SYSTEM.CNF could not be read from the decoded CHD track",
+        );
+        return;
+    }
+    let boot = match parse_system_cnf_boot(&cnf_bytes) {
+        Some(fact) if fact.boot_key == "BOOT" => fact,
+        Some(_) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "SYSTEM.CNF BOOT assignment",
+                "SYSTEM.CNF contains BOOT2, which is not a PS1 boot key",
+            );
+            return;
+        }
+        None => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "SYSTEM.CNF BOOT assignment",
+                "SYSTEM.CNF has no valid BOOT assignment",
+            );
+            return;
+        }
+    };
+    let Some(serial) = boot.serial_candidate.clone() else {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "SYSTEM.CNF BOOT executable name",
+            "BOOT executable does not contain a valid PS1 product code",
+        );
+        return;
+    };
+    if !is_supported_ps1_serial(&serial) {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "SYSTEM.CNF BOOT product-code family",
+            "BOOT executable contains an unsupported PS1 product-code family",
+        );
+        return;
+    }
+    let Some(executable_path) = boot.executable_path else {
+        return;
+    };
+    // `find_path` (unlike this module's own `find_iso_path`) splits only on
+    // `/`; a `BOOT=cdrom:\SLUS_014.18;1`-shaped value normalizes to a
+    // backslash-separated path, so it is translated here rather than
+    // teaching `find_path` a second separator convention for this one
+    // caller.
+    let lookup_path = executable_path.replace('\\', "/");
+    report.metadata_paths_inspected += 1;
+    let executable = match find_path(&media, &filesystem, &lookup_path) {
+        Ok(Some(entry)) if !entry.is_directory => entry,
+        Ok(_) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "SYSTEM.CNF BOOT CHD ISO 9660 lookup",
+                "BOOT executable is missing",
+            );
+            return;
+        }
+        Err(error) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps1Serial,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                None,
+                None,
+                "SYSTEM.CNF BOOT CHD ISO 9660 lookup",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let header_len = (executable.size as usize).min(PSX_EXECUTABLE_HEADER_BYTES);
+    let executable_offset = executable.extent_lba as u64 * filesystem.logical_block_size as u64;
+    let mut header = vec![0_u8; header_len];
+    if media.read_at(executable_offset, &mut header).is_err() {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "bounded PS-X EXE header read",
+            "BOOT executable header could not be read from the decoded CHD track",
+        );
+        return;
+    }
+    if !looks_like_psx_exe(&header) {
+        push_with_source(
+            report,
+            IdentityKind::Ps1Serial,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "PS-X EXE signature validation",
+            "BOOT executable is not a PS-X EXE",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::Ps1Serial,
+        IdentityStatus::Verified,
+        Some(serial),
+        IdentityConfidence::StructuredMetadata,
+        None,
+        None,
+        "SYSTEM.CNF BOOT plus PS-X EXE on CHD-decoded ISO 9660",
+        "serial derived from the exact boot executable path and corroborated by its PS-X EXE header",
+    );
+    report.complete = true;
+}
+
+/// Maps a [`DiscCollectionRefusal`] from opening/decoding a `.chd` into the
+/// honest [`IdentityStatus`] for that failure - never `Verified`, and never
+/// a guess at what the content might have been.
+fn push_ps1_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollectionRefusal) {
+    let status = match refusal {
+        DiscCollectionRefusal::TooLarge { .. } => IdentityStatus::ResourceLimitReached,
+        DiscCollectionRefusal::NoLogicalReaderAvailable => IdentityStatus::Unsupported,
+        DiscCollectionRefusal::NotReadable(_)
+        | DiscCollectionRefusal::NotRecognizedContainer
+        | DiscCollectionRefusal::ChdHeaderDidNotParse(_)
+        | DiscCollectionRefusal::NotIso9660
+        | DiscCollectionRefusal::Iso9660DidNotParse(_) => IdentityStatus::Invalid,
+        DiscCollectionRefusal::NotGcOrWii(_) => IdentityStatus::Invalid,
+    };
+    push_with_source(
+        report,
+        IdentityKind::Ps1Serial,
+        status,
+        None,
+        IdentityConfidence::Unavailable,
+        None,
+        None,
+        "CHD container/ISO 9660 opening",
+        &format!("{refusal:?}"),
+    );
+}
+
 pub fn parse_system_cnf_boot2(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if bytes.len() as u64 > MAX_SYSTEM_CNF_BYTES {
         return Err("SYSTEM.CNF exceeds 64 KiB".to_string());
@@ -2938,6 +3223,97 @@ mod tests {
         let cnf_offset = 21 * ISO_SECTOR_SIZE as usize;
         iso[cnf_offset..cnf_offset + cnf.len()].copy_from_slice(cnf);
         iso
+    }
+
+    /// Wraps an ISO9660 image (e.g. from [`ps1_iso`]) into a genuine,
+    /// `open_chd_track_logical_media`-openable uncompressed CHD v5 file, so
+    /// PS1 CHD identity tests exercise the real bounded CHD decode path
+    /// rather than a shortcut. This deliberately re-derives the same
+    /// minimal CHD v5 header/metadata/map/hunk-data layout that
+    /// `chd_logical_media`'s own private test-only `build_uncompressed_chd`
+    /// uses (that helper cannot be imported across module boundaries) - it
+    /// is not a second CHD *reader*, only a second CHD *test fixture
+    /// writer*, mirroring one that already exists and is already trusted.
+    /// Each `LOGICAL_BLOCK_BYTES` (2048-byte) block of `image` becomes one
+    /// `RAW_SECTOR_BYTES` (2352-byte) MODE1_RAW sector, matching
+    /// `chd_logical_media`'s own `mode1_sectors_for` test helper.
+    fn ps1_chd(image: &[u8]) -> Vec<u8> {
+        use crate::dat::archive::chd::CHD_MAGIC;
+        use crate::raw_cd_sector::{LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, RAW_SECTOR_BYTES};
+
+        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+        }
+
+        // `ps1_iso` never fills in the PVD's logical-block-size field
+        // because the plain-ISO `ByteSource` reader (`find_iso_path`) never
+        // reads it - it works purely off fixed 2048-byte offsets. The CHD
+        // path instead goes through `crate::iso9660::observe_iso9660`,
+        // which - correctly, for a real disc - insists this field says
+        // 2048 both-endian. Patching it here is completing a real ISO9660
+        // field the shared fixture happens to leave zeroed, not working
+        // around a bug.
+        let mut image = image.to_vec();
+        let pvd = 16 * LOGICAL_BLOCK_BYTES;
+        image[pvd + 128..pvd + 130].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_le_bytes());
+        image[pvd + 130..pvd + 132].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_be_bytes());
+
+        let sectors: Vec<[u8; RAW_SECTOR_BYTES]> = image
+            .chunks(LOGICAL_BLOCK_BYTES)
+            .map(|block| {
+                let mut sector = [0u8; RAW_SECTOR_BYTES];
+                sector[MODE1_USER_DATA_OFFSET..MODE1_USER_DATA_OFFSET + block.len()]
+                    .copy_from_slice(block);
+                sector
+            })
+            .collect();
+        let frames = sectors.len() as u32;
+        let frames_per_hunk = frames.max(1);
+        let unit_bytes = RAW_SECTOR_BYTES as u32;
+        let hunk_bytes = unit_bytes * frames_per_hunk;
+        let logical_bytes = frames as u64 * unit_bytes as u64;
+
+        let mut data = vec![0u8; 124];
+        data[0..8].copy_from_slice(CHD_MAGIC);
+        put_u32(&mut data, 8, 124);
+        put_u32(&mut data, 12, 5);
+        put_u64(&mut data, 32, logical_bytes);
+        put_u32(&mut data, 56, hunk_bytes);
+        put_u32(&mut data, 60, unit_bytes);
+
+        let meta_offset = data.len() as u64;
+        let payload = format!(
+            "TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:{frames} PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0"
+        )
+        .into_bytes();
+        data.extend_from_slice(&u32::from_be_bytes(*b"CHT2").to_be_bytes());
+        data.push(0);
+        let length = payload.len() as u32;
+        data.extend_from_slice(&length.to_be_bytes()[1..]);
+        data.extend_from_slice(&0u64.to_be_bytes());
+        data.extend_from_slice(&payload);
+
+        let hunk_count = logical_bytes.div_ceil(hunk_bytes as u64) as u32;
+        let map_offset = data.len() as u64;
+        let map_end = map_offset + hunk_count as u64 * 4;
+        let hunk_data_start = map_end.div_ceil(hunk_bytes as u64).max(1) * hunk_bytes as u64;
+        let base_index = hunk_data_start / hunk_bytes as u64;
+        for index in 0..hunk_count {
+            let value = (base_index + index as u64) as u32;
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+
+        data.resize(hunk_data_start as usize, 0);
+        for sector in &sectors {
+            data.extend_from_slice(sector);
+        }
+
+        put_u64(&mut data, 40, map_offset);
+        put_u64(&mut data, 48, meta_offset);
+        data
     }
 
     fn write_fixture(directory: &FixtureDir, name: &str, bytes: &[u8]) -> PathBuf {
@@ -3713,11 +4089,9 @@ mod tests {
     }
 
     #[test]
-    fn ps1_chd_and_bin_cue_formats_remain_non_authoritative() {
-        let chd = inspect_game_identity(Path::new("/games/game.chd"), Some("PS1"));
-        assert_eq!(chd.format, IdentityImageFormat::Deferred);
-        assert_eq!(chd.verified_ps1_serial(), None);
-
+    fn ps1_bin_cue_formats_remain_non_authoritative() {
+        // Unaffected by PS1 CHD identity landing: BIN/CUE still has no
+        // existing safe bounded reader in EmuWiz, so it stays Unsupported.
         let bin = inspect_game_identity(Path::new("/games/game.bin"), Some("PS1"));
         assert_eq!(bin.format, IdentityImageFormat::Unsupported);
         assert_eq!(bin.verified_ps1_serial(), None);
@@ -3725,6 +4099,181 @@ mod tests {
         let cue = inspect_game_identity(Path::new("/games/game.cue"), Some("PS1"));
         assert_eq!(cue.format, IdentityImageFormat::Unsupported);
         assert_eq!(cue.verified_ps1_serial(), None);
+    }
+
+    #[test]
+    fn ps1_chd_is_no_longer_categorically_deferred_but_a_missing_file_still_fails_closed() {
+        // A nonexistent path can no longer be *guessed* Verified just
+        // because the extension is `.chd` - it must fail closed on the
+        // concrete "file not readable" reason, never on the old blanket
+        // "format has no existing safe bounded reader" deferral.
+        let chd = inspect_game_identity(Path::new("/games/does-not-exist.chd"), Some("PS1"));
+        assert_eq!(chd.format, IdentityImageFormat::Chd);
+        assert_eq!(chd.verified_ps1_serial(), None);
+        assert!(
+            chd.evidence.iter().any(|item| {
+                item.kind == IdentityKind::Ps1Serial && item.status != IdentityStatus::Verified
+            }),
+            "a missing CHD must never be silently reported Verified"
+        );
+    }
+
+    #[test]
+    fn ps1_chd_for_a_non_playstation_platform_hint_still_defers() {
+        // Format/platform guarding: a `.chd` is only ever authoritatively
+        // inspected when the platform hint itself says PlayStation - this
+        // task must not make every CHD look like a PS1 disc.
+        let chd = inspect_game_identity(Path::new("/games/game.chd"), Some("PS2"));
+        assert_eq!(chd.format, IdentityImageFormat::Deferred);
+    }
+
+    #[test]
+    fn valid_ps1_chd_produces_a_verified_serial_matching_iso_authority() {
+        let directory = FixtureDir::new("ps1-chd-valid");
+        let image = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let path = write_fixture(&directory, "unrelated-name.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.platform, IdentityPlatform::PlayStation);
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_ps1_serial(), Some("SLUS-12345"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn ps1_chd_serial_shapes_remain_valid_across_regions() {
+        for (serial_name, cnf, expected) in [
+            (
+                b"SLUS_123.45;1".as_slice(),
+                b"BOOT=cdrom:\\SLUS_123.45;1\r\n".as_slice(),
+                "SLUS-12345",
+            ),
+            (
+                b"SLES_123.45;1".as_slice(),
+                b"BOOT=cdrom:\\SLES_123.45;1\r\n".as_slice(),
+                "SLES-12345",
+            ),
+            (
+                b"SLPS_123.45;1".as_slice(),
+                b"BOOT=cdrom:\\SLPS_123.45;1\r\n".as_slice(),
+                "SLPS-12345",
+            ),
+        ] {
+            let directory = FixtureDir::new("ps1-chd-regions");
+            let image = ps1_iso(serial_name, cnf, true);
+            let path = write_fixture(&directory, "game.chd", &ps1_chd(&image));
+
+            let report = inspect_game_identity(&path, Some("PS1"));
+
+            assert_eq!(report.verified_ps1_serial(), Some(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn ps1_chd_verification_ignores_filename() {
+        let directory = FixtureDir::new("ps1-chd-filename-disagreement");
+        let image = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let path = write_fixture(&directory, "Totally Unrelated Title.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.verified_ps1_serial(), Some("SLUS-12345"));
+    }
+
+    #[test]
+    fn ps1_chd_with_missing_system_cnf_fails_closed() {
+        let directory = FixtureDir::new("ps1-chd-no-cnf");
+        // No SYSTEM.CNF directory record at all - only the root directory.
+        let mut image = vec![0u8; 24 * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        image[pvd] = 1;
+        image[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        image[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        image[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        image[terminator] = 255;
+        image[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        image[terminator + 6] = 1;
+        let path = write_fixture(&directory, "no-cnf.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_ps1_serial(), None);
+    }
+
+    #[test]
+    fn ps1_chd_with_malformed_boot_line_fails_closed() {
+        let directory = FixtureDir::new("ps1-chd-malformed-boot");
+        let image = ps1_iso(b"SLUS_123.45;1", b"NOT-A-BOOT-LINE\r\n", true);
+        let path = write_fixture(&directory, "game.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_chd_with_invalid_psx_executable_header_fails_closed() {
+        let directory = FixtureDir::new("ps1-chd-bad-exe");
+        let mut image = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let executable_offset = 22 * ISO_SECTOR_SIZE as usize;
+        image[executable_offset..executable_offset + 8].copy_from_slice(b"NOT-PSX!");
+        let path = write_fixture(&directory, "game.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_chd_with_unsupported_serial_prefix_fails_closed() {
+        let directory = FixtureDir::new("ps1-chd-unsupported-prefix");
+        let image = ps1_iso(b"ABCD_123.45;1", b"BOOT=cdrom:\\ABCD_123.45;1\r\n", true);
+        let path = write_fixture(&directory, "game.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.verified_ps1_serial(), None);
+    }
+
+    #[test]
+    fn ps1_chd_with_non_iso9660_content_does_not_become_verified_ps1() {
+        let directory = FixtureDir::new("ps1-chd-non-iso9660");
+        // Valid CHD wrapping content that is not ISO9660 at all - identity
+        // must not fabricate PS1 evidence from unreadable disc content.
+        let image = vec![0xAB_u8; 24 * ISO_SECTOR_SIZE as usize];
+        let path = write_fixture(&directory, "game.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS1"));
+
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn evidence_bridge_emits_ps1_serial_for_verified_chd_identity() {
+        let directory = FixtureDir::new("ps1-chd-evidence-bridge");
+        let image = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let path = write_fixture(&directory, "game.chd", &ps1_chd(&image));
+        let report = inspect_game_identity(&path, Some("PSX"));
+
+        let (status, facts) =
+            crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+
+        assert!(matches!(
+            status,
+            crate::launch::planning::CanonicalIdentityStatus::Resolved(_)
+        ));
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            crate::launch::input_projection::VerifiedIdentityFact::Ps1Serial(serial)
+                if serial == "SLUS-12345"
+        )));
     }
 
     #[test]

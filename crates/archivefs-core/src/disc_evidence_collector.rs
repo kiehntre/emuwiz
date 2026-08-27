@@ -50,7 +50,7 @@ use crate::chd_identity::{
     ChdMetadataOutcome, looks_like_chd, needs_specialist_optical_backend, observe_chd_identity,
     select_candidate_data_track,
 };
-use crate::chd_logical_media::open_chd_track_logical_media;
+use crate::chd_logical_media::{ChdTrackLogicalMedia, open_chd_track_logical_media};
 use crate::content_detector::ContentDetector as _;
 use crate::content_evidence::ContentEvidence;
 use crate::dreamcast_boot_evidence::{
@@ -111,6 +111,17 @@ pub enum DiscCollectionRefusal {
 /// specialist optical backend; a CHD [`needs_specialist_optical_backend`]
 /// is refused rather than silently read incompletely).
 pub fn collect_chd_evidence(path: &Path) -> Result<Vec<ContentEvidence>, DiscCollectionRefusal> {
+    let bytes = read_bounded_chd_bytes(path)?;
+    let (media, filesystem) = open_chd_iso9660(&bytes)?;
+    Ok(collect_disc_boot_evidence(&media, &filesystem))
+}
+
+/// Reads a `.chd`'s whole bytes into memory, refusing anything above
+/// [`MAX_CHD_BYTES`] from filesystem metadata alone, before ever reading -
+/// the same size-first discipline every caller of this module relies on.
+/// Exposed so [`crate::game_identity`]'s authoritative PS1 CHD path can
+/// share this exact bound rather than declaring its own.
+pub fn read_bounded_chd_bytes(path: &Path) -> Result<Vec<u8>, DiscCollectionRefusal> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| DiscCollectionRefusal::NotReadable(error.to_string()))?;
     if metadata.len() > MAX_CHD_BYTES {
@@ -119,12 +130,25 @@ pub fn collect_chd_evidence(path: &Path) -> Result<Vec<ContentEvidence>, DiscCol
             maximum: MAX_CHD_BYTES,
         });
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| DiscCollectionRefusal::NotReadable(error.to_string()))?;
-    if !looks_like_chd(&bytes) {
+    std::fs::read(path).map_err(|error| DiscCollectionRefusal::NotReadable(error.to_string()))
+}
+
+/// Opens already-read `.chd` bytes as ISO 9660 [`LogicalMedia`] - the exact
+/// container-opening sequence [`collect_chd_evidence`] itself uses (CHD
+/// header/metadata validation, the specialist-optical-backend refusal, the
+/// pure-Rust track decoder, then ISO 9660 filesystem recognition), factored
+/// out so a caller needing more than a flat evidence list (for example,
+/// [`crate::game_identity`]'s authoritative PS1 serial inspection, which
+/// needs the located `SYSTEM.CNF`/executable directory entries themselves,
+/// not just derived evidence strings) can reach the same decoded media
+/// without a second CHD/ISO 9660 reader.
+pub fn open_chd_iso9660(
+    bytes: &[u8],
+) -> Result<(ChdTrackLogicalMedia<'_>, DiscFilesystemObservation), DiscCollectionRefusal> {
+    if !looks_like_chd(bytes) {
         return Err(DiscCollectionRefusal::NotRecognizedContainer);
     }
-    let observation = observe_chd_identity(&bytes)
+    let observation = observe_chd_identity(bytes)
         .map_err(|error| DiscCollectionRefusal::ChdHeaderDidNotParse(error.to_string()))?;
     let ChdMetadataOutcome::Observed(chd_metadata) = &observation.metadata else {
         return Err(DiscCollectionRefusal::NoLogicalReaderAvailable);
@@ -133,14 +157,14 @@ pub fn collect_chd_evidence(path: &Path) -> Result<Vec<ContentEvidence>, DiscCol
         return Err(DiscCollectionRefusal::NoLogicalReaderAvailable);
     }
     let _ = select_candidate_data_track(chd_metadata);
-    let media = open_chd_track_logical_media(&bytes)
+    let media = open_chd_track_logical_media(bytes)
         .map_err(|_| DiscCollectionRefusal::NoLogicalReaderAvailable)?;
     if !looks_like_iso9660(&media) {
         return Err(DiscCollectionRefusal::NotIso9660);
     }
     let filesystem = observe_iso9660(&media)
         .map_err(|error| DiscCollectionRefusal::Iso9660DidNotParse(error.to_string()))?;
-    Ok(collect_disc_boot_evidence(&media, &filesystem))
+    Ok((media, filesystem))
 }
 
 /// Collects evidence from a plain, uncompressed ISO9660 image - refuses
