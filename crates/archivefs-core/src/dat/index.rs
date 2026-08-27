@@ -438,8 +438,8 @@ impl DatIndex {
 mod tests {
     use super::*;
     use crate::dat::model::{
-        DatDataAreaEntry, DatEcosystem, DatFormat, DatGameEntry, DatPartEntry, DatRomEntry,
-        DatSource, ParsedDat,
+        DatDataAreaEntry, DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatPartEntry,
+        DatRomEntry, DatSource, ParsedDat,
     };
 
     fn make_dat() -> ParsedDat {
@@ -457,6 +457,7 @@ mod tests {
                 entry_count: 2,
                 rom_count: 2,
                 parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
             },
             games: vec![
                 DatGameEntry {

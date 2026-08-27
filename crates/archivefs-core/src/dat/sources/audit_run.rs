@@ -67,7 +67,7 @@ use crate::dat::dependency::resolve::{CollectionEvidence, resolve_collection};
 use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
 use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation};
 use crate::dat::limits::DatLimits;
-use crate::dat::model::{DatGameEntry, ParsedDat};
+use crate::dat::model::{DatGameEntry, DatPackingPolicy, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
 use crate::dat::policy::candidate::candidate_for_rom;
 use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
@@ -206,6 +206,14 @@ pub enum DatAuditError {
     NoCatalogue(String),
     /// There was nothing to compare.
     NothingToAudit(String),
+    /// A DAT declared a packing-policy marker (e.g. RomVault's
+    /// `<romvault forcepacking="..." />`) this crate does not recognise.
+    /// Refused rather than guessed - see [`DatPackingPolicy::Unrecognized`].
+    UnrecognizedPackingPolicy(String),
+    /// Two or more DAT files merged into one source (a folder source)
+    /// declared different, incompatible packing policies. Refused rather
+    /// than picking one arbitrarily.
+    ConflictingPackingPolicy,
     Cancelled,
 }
 
@@ -216,6 +224,16 @@ impl std::fmt::Display for DatAuditError {
             Self::ScanPath(detail) => write!(f, "the folder could not be read: {detail}"),
             Self::NoCatalogue(detail) => write!(f, "no usable catalogue: {detail}"),
             Self::NothingToAudit(detail) => write!(f, "{detail}"),
+            Self::UnrecognizedPackingPolicy(value) => write!(
+                f,
+                "DAT declares an unrecognised packing policy (forcepacking=\"{value}\"); \
+                 an explicit manual choice is required before auditing"
+            ),
+            Self::ConflictingPackingPolicy => write!(
+                f,
+                "the DAT files in this source declare conflicting packing policies; \
+                 an explicit manual choice is required before auditing"
+            ),
             Self::Cancelled => write!(f, "the audit was cancelled"),
         }
     }
@@ -443,6 +461,13 @@ pub fn run_dat_audit_with_cache(
     let mut catalogue_names = Vec::new();
     let mut unreadable_catalogues = Vec::new();
     let mut merged: Option<ParsedDat> = None;
+    // One packing policy per DAT file that parsed - resolved to a single
+    // effective policy below, once every file in this source has been
+    // read. Kept separate from `merged.source.packing_policy` because a
+    // folder source can merge several DAT files, and this crate must
+    // never silently pick one of several declared policies (see
+    // `DatAuditError::ConflictingPackingPolicy`).
+    let mut packing_policies: Vec<DatPackingPolicy> = Vec::new();
 
     for path in &dat_files {
         if cancelled(cancel) {
@@ -462,6 +487,7 @@ pub fn run_dat_audit_with_cache(
                         .clone()
                         .unwrap_or_else(|| file_name.clone()),
                 );
+                packing_policies.push(parsed.dat.source.packing_policy.clone());
                 match merged.as_mut() {
                     // Several DAT files in one folder source become one index:
                     // the user registered the folder as a single source, so a
@@ -487,6 +513,24 @@ pub fn run_dat_audit_with_cache(
                 unreadable_catalogues.push(format!("{file_name}: {error}"));
             }
         }
+    }
+
+    // Resolve one effective packing policy for the whole source, failing
+    // closed rather than guessing - see requirement 4 of this feature's
+    // design: unknown or conflicting packing metadata must never be
+    // silently treated as `Standard` (or any other policy).
+    let effective_packing_policy = match packing_policies.split_first() {
+        None => DatPackingPolicy::Standard,
+        Some((first, rest)) => {
+            if rest.iter().all(|policy| policy == first) {
+                first.clone()
+            } else {
+                return Err(DatAuditError::ConflictingPackingPolicy);
+            }
+        }
+    };
+    if let DatPackingPolicy::Unrecognized(value) = &effective_packing_policy {
+        return Err(DatAuditError::UnrecognizedPackingPolicy(value.clone()));
     }
 
     let Some(mut catalogue) = merged else {
@@ -560,16 +604,30 @@ pub fn run_dat_audit_with_cache(
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
-    let (archives, archive_bytes_hashed, mut sets) = audit_archives(
-        &scan.files,
-        trusted,
-        cancel,
-        &index,
-        &disk_evidence,
-        disk_scan_complete,
-        &catalogue_games,
-        &request.source_id,
-    )?;
+    // `forcepacking="fileonly"` (see `DatPackingPolicy::FileOnly`): the
+    // archive file itself is the hashed DAT item, already matched above
+    // through `known`/`report` (loose-file evidence already includes each
+    // ZIP/7z outer file's own whole-file hash - see
+    // `collect_loose_file_evidence`'s `include_archive_outers = true` a
+    // few lines up). Member enumeration must never run for this policy -
+    // not merely "no matches expected", but actually skipped, so a
+    // fileonly archive's members are never opened for identity/audit
+    // matching at all.
+    let (archives, archive_bytes_hashed, mut sets) =
+        if effective_packing_policy == DatPackingPolicy::FileOnly {
+            (Vec::new(), 0_u64, Vec::new())
+        } else {
+            audit_archives(
+                &scan.files,
+                trusted,
+                cancel,
+                &index,
+                &disk_evidence,
+                disk_scan_complete,
+                &catalogue_games,
+                &request.source_id,
+            )?
+        };
 
     // ---- 4b. Resolve dependencies (Stage 2d) -----------------------------
     // Runs only now, because a dependency is satisfied by evidence that may

@@ -207,7 +207,7 @@ mod tests {
 
     use super::*;
     use crate::dat::model::{
-        DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatSource, ParsedDat,
+        DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatSource, ParsedDat,
     };
 
     const RAW_SHA1: [u8; 20] = [0x11; 20];
@@ -275,6 +275,7 @@ mod tests {
                 entry_count: games.len(),
                 rom_count: 0,
                 parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
             },
             games: games
                 .into_iter()

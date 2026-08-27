@@ -356,7 +356,7 @@ fn build_summary(entries: &[AuditEntry]) -> AuditSummary {
 mod tests {
     use super::*;
     use crate::dat::model::{
-        DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+        DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource, ParsedDat,
     };
 
     fn make_index() -> DatIndex {
@@ -374,6 +374,7 @@ mod tests {
                 entry_count: 1,
                 rom_count: 1,
                 parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
             },
             games: vec![DatGameEntry {
                 name: "Super Game".into(),

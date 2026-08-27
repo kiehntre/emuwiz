@@ -26,7 +26,7 @@ use super::super::classification::{DatContentClassification, DatOriginalMetadata
 use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
 use super::super::limits::DatLimits;
 use super::super::model::{
-    DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+    DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource, ParsedDat,
 };
 use super::super::parser::{DiagnosticSeverity, ParseError, ParseOutcome, ParseWarning};
 use encoding_rs::WINDOWS_1252;
@@ -453,6 +453,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         entry_count: games.len(),
         rom_count: games.iter().map(|g| g.roms.len()).sum(),
         parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        packing_policy: DatPackingPolicy::Standard,
     };
 
     Ok(ParseOutcome {

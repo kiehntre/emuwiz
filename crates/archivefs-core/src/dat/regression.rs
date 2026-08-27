@@ -212,6 +212,7 @@ fn dat_with(roms: Vec<(&str, DatRomEntry)>) -> ParsedDat {
             entry_count: roms.len(),
             rom_count: roms.len(),
             parse_warnings: Vec::new(),
+            packing_policy: super::model::DatPackingPolicy::Standard,
         },
         games: roms
             .into_iter()

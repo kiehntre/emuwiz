@@ -16,6 +16,7 @@ fn dat_with_games(games: Vec<DatGameEntry>) -> ParsedDat {
             entry_count: games.len(),
             rom_count: games.iter().map(|g| g.roms.len()).sum(),
             parse_warnings: Vec::new(),
+            packing_policy: crate::dat::model::DatPackingPolicy::Standard,
         },
         games,
     }

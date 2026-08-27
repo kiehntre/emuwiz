@@ -530,7 +530,7 @@ fn evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dat::model::{DatFormat, DatRomEntry, DatSource};
+    use crate::dat::model::{DatFormat, DatPackingPolicy, DatRomEntry, DatSource};
 
     fn dat(ecosystem: DatEcosystem, source_name: &str, names: &[&str]) -> ParsedDat {
         ParsedDat {
@@ -547,6 +547,7 @@ mod tests {
                 entry_count: names.len(),
                 rom_count: names.len(),
                 parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
             },
             games: names
                 .iter()

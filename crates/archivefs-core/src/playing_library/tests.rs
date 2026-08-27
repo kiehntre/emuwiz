@@ -34,6 +34,7 @@ fn synthetic_dat(games: Vec<DatGameEntry>) -> ParsedDat {
             entry_count: games.len(),
             rom_count: 0,
             parse_warnings: Vec::new(),
+            packing_policy: crate::dat::model::DatPackingPolicy::Standard,
         },
         games,
     }

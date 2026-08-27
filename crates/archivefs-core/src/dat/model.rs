@@ -77,6 +77,55 @@ pub struct DatSource {
     pub entry_count: usize,
     pub rom_count: usize,
     pub parse_warnings: Vec<String>,
+    /// Explicit packing-policy metadata declared by the DAT itself (e.g.
+    /// RomVault's `<romvault forcepacking="..." />` header extension) -
+    /// see [`DatPackingPolicy`]. Always [`DatPackingPolicy::Standard`] for
+    /// a DAT that declares no such marker; never inferred from filename,
+    /// description, provider, or archive extension.
+    pub packing_policy: DatPackingPolicy,
+}
+
+/// Explicit archive-packing policy declared by a DAT file's own structural
+/// metadata - never guessed from filename, description, provider, or
+/// archive extension.
+///
+/// This is a whole-DAT (header-level) policy, matching where RomVault's own
+/// `<romvault forcepacking="..." />` extension lives: one DAT file declares
+/// one policy for every game it contains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatPackingPolicy {
+    /// No explicit packing-policy marker - the existing member-based
+    /// archive inspection applies unchanged. This is the default for
+    /// every DAT that does not carry the marker, and for every non-Logiqx
+    /// format (the marker is a Logiqx header extension).
+    Standard,
+    /// RomVault `<romvault forcepacking="fileonly" />` (or its `"file"`
+    /// alias): the archive file itself is the hashed DAT item. Its
+    /// members must never be inspected for identity/audit matching -
+    /// see `crate::dat::sources::audit_run`'s consumption of this policy.
+    FileOnly,
+    /// RomVault `<romvault forcepacking="unzip" />`: a structured loose
+    /// collection - files are stored individually, preserving the
+    /// path/group structure the DAT declares, never packed into an
+    /// archive. Recognised at parse time; audit execution currently
+    /// treats this the same as `Standard` (loose files are already
+    /// matched by content hash regardless of DAT type) - see this
+    /// variant's own module-level design note for why broader
+    /// path/group-aware execution was left out of this pass.
+    StructuredLoose,
+    /// A `<romvault forcepacking="...">` marker was present but its value
+    /// is not one this crate recognises. Carries the raw, unmodified
+    /// attribute value for diagnostics. Fails closed at audit time
+    /// (`crate::dat::sources::audit_run::DatAuditError`) rather than
+    /// guessing `Standard` or `FileOnly`.
+    Unrecognized(String),
+}
+
+impl Default for DatPackingPolicy {
+    fn default() -> Self {
+        Self::Standard
+    }
 }
 
 /// A checksum algorithm as it appears in a DAT file.

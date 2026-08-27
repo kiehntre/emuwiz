@@ -1618,6 +1618,253 @@ fn zip_members_are_matched_individually_but_never_enter_rename_planning() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// RomVault `forcepacking="fileonly"` packing policy.
+// ---------------------------------------------------------------------------
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Writes a two-member ZIP and returns its path plus the SHA-1 of the whole
+/// file (the outer container's own bytes) - not any member's.
+fn write_two_member_zip(dir: &Path, name: &str) -> (PathBuf, String) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let path = dir.join(name);
+    let mut writer = ZipWriter::new(std::fs::File::create(&path).unwrap());
+    for (member_name, contents) in [("a.rom", b"aaaa".as_slice()), ("b.rom", b"bbbb".as_slice())] {
+        writer
+            .start_file(
+                member_name,
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(contents).unwrap();
+    }
+    writer.finish().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    (path, sha1_hex(&bytes))
+}
+
+#[test]
+fn fileonly_hashes_matches_the_outer_zip_and_never_inspects_members() {
+    use crate::dat::audit::AuditVerdict;
+
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let (archive, outer_sha1) = write_two_member_zip(&roms, "collection.zip");
+    let archive_len = std::fs::metadata(&archive).unwrap().len();
+
+    let dat = write(
+        dir.path(),
+        "fileonly.dat",
+        &format!(
+            r#"<datafile><header><name>RomVault fileonly set</name><romvault forcepacking="fileonly" /></header>
+<game name="Collection"><rom name="collection.zip" size="{archive_len}" sha1="{outer_sha1}"/></game>
+</datafile>"#
+        ),
+    );
+
+    let request = DatAuditRequest {
+        source_id: "fileonly".to_string(),
+        source_display_name: "RomVault fileonly set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.archives.len(),
+        0,
+        "fileonly must never run member-level archive inspection"
+    );
+    assert_eq!(outcome.report.entries.len(), 1);
+    assert!(
+        matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Exact { ref game_name, .. } if game_name == "Collection"
+        ),
+        "the outer ZIP's own hash must match the fileonly DAT item: {:?}",
+        outcome.report.entries[0].verdict
+    );
+}
+
+#[test]
+fn fileonly_never_matches_an_inner_member_even_when_a_member_hash_would_coincidentally_fit() {
+    // The DAT's only rom entry is the *member*'s hash, never declared as
+    // the outer's - if fileonly enumerated members anyway, this member
+    // would falsely "match". It must not: fileonly never runs the member
+    // pass at all, so this can only ever surface as `NotInDat` for the
+    // outer whole-file hash (which does not equal the member's hash).
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let (archive, _outer_sha1) = write_two_member_zip(&roms, "collection.zip");
+    let member_sha1 = sha1_hex(b"aaaa");
+    let _ = &archive;
+
+    let dat = write(
+        dir.path(),
+        "fileonly.dat",
+        &format!(
+            r#"<datafile><header><name>RomVault fileonly set</name><romvault forcepacking="fileonly" /></header>
+<game name="Collection"><rom name="a.rom" size="4" sha1="{member_sha1}"/></game>
+</datafile>"#
+        ),
+    );
+
+    let request = DatAuditRequest {
+        source_id: "fileonly-decoy".to_string(),
+        source_display_name: "RomVault fileonly set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 0);
+    assert_eq!(outcome.report.entries.len(), 1);
+    assert!(
+        !matches!(
+            outcome.report.entries[0].verdict,
+            crate::dat::audit::AuditVerdict::Exact { .. }
+        ),
+        "the outer ZIP's whole-file hash must not equal an inner member's hash by policy \
+         confusion: {:?}",
+        outcome.report.entries[0].verdict
+    );
+}
+
+#[test]
+fn ordinary_dat_with_no_forcepacking_marker_retains_member_based_archive_inspection() {
+    use crate::dat::audit::AuditVerdict;
+
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let (archive, _outer_sha1) = write_two_member_zip(&roms, "collection.zip");
+    let _ = &archive;
+    let member_sha1 = sha1_hex(b"aaaa");
+
+    let dat = write(
+        dir.path(),
+        "standard.dat",
+        &format!(
+            r#"<datafile><header><name>Ordinary set</name></header>
+<game name="Alpha"><rom name="a.rom" size="4" sha1="{member_sha1}"/></game>
+</datafile>"#
+        ),
+    );
+
+    let request = DatAuditRequest {
+        source_id: "standard".to_string(),
+        source_display_name: "Ordinary set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.archives.len(),
+        1,
+        "a standard DAT must still open the archive for member inspection"
+    );
+    assert_eq!(outcome.archives[0].members.len(), 2);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Alpha"
+    ));
+}
+
+#[test]
+fn unrecognized_forcepacking_value_fails_closed_at_audit_time() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let dat = write(
+        dir.path(),
+        "weird.dat",
+        r#"<datafile><header><name>Weird set</name><romvault forcepacking="something-nobody-invented" /></header>
+<game name="Game"><rom name="game.rom" size="4" crc="deadbeef"/></game>
+</datafile>"#,
+    );
+
+    let request = DatAuditRequest {
+        source_id: "weird".to_string(),
+        source_display_name: "Weird set".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let error = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {})
+        .expect_err("an unrecognised packing policy must fail closed, not default to Standard");
+    assert!(
+        matches!(error, DatAuditError::UnrecognizedPackingPolicy(ref value) if value == "something-nobody-invented")
+    );
+}
+
+#[test]
+fn conflicting_packing_policies_across_a_merged_folder_source_fail_closed() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let dat_dir = dir.path().join("dats");
+    std::fs::create_dir(&dat_dir).unwrap();
+    write(
+        &dat_dir,
+        "standard.dat",
+        r#"<datafile><header><name>Standard part</name></header>
+<game name="A"><rom name="a.rom" size="4" crc="deadbeef"/></game>
+</datafile>"#,
+    );
+    write(
+        &dat_dir,
+        "fileonly.dat",
+        r#"<datafile><header><name>Fileonly part</name><romvault forcepacking="fileonly" /></header>
+<game name="B"><rom name="b.zip" size="4" crc="cafef00d"/></game>
+</datafile>"#,
+    );
+
+    let request = DatAuditRequest {
+        source_id: "mixed".to_string(),
+        source_display_name: "Mixed folder".to_string(),
+        dat_path: dat_dir,
+        dat_kind: DatSourceKind::Folder,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let error = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {})
+        .expect_err("conflicting packing policies across merged DAT files must fail closed");
+    assert_eq!(error, DatAuditError::ConflictingPackingPolicy);
+}
+
 /// Builds a syntactically valid 124-byte CHD v5 header with the given
 /// `overall_sha1`, mirroring the fixture in `dat::disk_audit`'s own tests.
 fn synthetic_chd_header(overall_sha1: [u8; 20]) -> Vec<u8> {

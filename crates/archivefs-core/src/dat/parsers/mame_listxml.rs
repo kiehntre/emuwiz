@@ -11,8 +11,8 @@ use crate::dat::classification::{DatContentClassification, DatOriginalMetadata};
 use crate::dat::hash::{normalise_crc32, normalise_md5, normalise_sha1};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{
-    DatDeviceRefEntry, DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource,
-    ParsedDat,
+    DatDeviceRefEntry, DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy,
+    DatRomEntry, DatSource, ParsedDat,
 };
 use crate::dat::parser::{ParseError, ParseOutcome, ParseWarning};
 
@@ -160,6 +160,7 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
                 entry_count: games.len(),
                 rom_count: games.iter().map(|g| g.roms.len()).sum(),
                 parse_warnings: warnings.into_iter().map(|w| w.to_string()).collect(),
+                packing_policy: DatPackingPolicy::Standard,
             },
             games,
         },

@@ -48,6 +48,7 @@ fn index_with_entries(entries: &[(&str, &KnownFileEvidence)]) -> DatIndex {
             entry_count: entries.len(),
             rom_count: entries.len(),
             parse_warnings: Vec::new(),
+            packing_policy: crate::dat::model::DatPackingPolicy::Standard,
         },
         games,
     };

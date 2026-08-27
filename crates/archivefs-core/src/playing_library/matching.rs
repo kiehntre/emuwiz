@@ -74,6 +74,7 @@ mod tests {
                 entry_count: 1,
                 rom_count: 1,
                 parse_warnings: Vec::new(),
+                packing_policy: crate::dat::model::DatPackingPolicy::Standard,
             },
             games: vec![DatGameEntry {
                 name: "Game (Europe)".to_string(),

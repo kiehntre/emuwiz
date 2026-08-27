@@ -30,8 +30,8 @@ use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normali
 use super::super::limits::DatLimits;
 use super::super::model::{
     DatBiosSetEntry, DatDataAreaEntry, DatDeviceRefEntry, DatDiskAreaEntry, DatDiskEntry,
-    DatEcosystem, DatFormat, DatGameEntry, DatPartEntry, DatRomEntry, DatSampleEntry, DatSource,
-    ParsedDat,
+    DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatPartEntry, DatRomEntry,
+    DatSampleEntry, DatSource, ParsedDat,
 };
 use super::super::parser::{ParseError, ParseOutcome, ParseWarning};
 use super::super::trusted_dtd::{self, classify_doctype, describe_doctype_outcome};
@@ -64,7 +64,15 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut version: Option<String> = None;
     let mut author: Option<String> = None;
     let mut homepage: Option<String> = None;
+    let mut url: Option<String> = None;
     let mut clrmamepro_header: Option<String> = None;
+    // RomVault `<romvault forcepacking="..." />` header extension - a
+    // self-closing element with only an attribute, so it is captured in
+    // the `Event::Empty` handler below (`homepage`/`url`/`clrmamepro`
+    // above are captured in the `Event::End` handler instead, since they
+    // carry text content). See `DatPackingPolicy`'s own doc comment for
+    // the recognised values.
+    let mut packing_policy = DatPackingPolicy::Standard;
 
     let mut games: Vec<DatGameEntry> = Vec::new();
     let mut current_game_name: Option<String> = None;
@@ -626,6 +634,9 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     "homepage" if !in_game_element => {
                         homepage = Some(trimmed(&text_buf));
                     }
+                    "url" if !in_game_element => {
+                        url = Some(trimmed(&text_buf));
+                    }
                     "clrmamepro" if !in_game_element => {
                         clrmamepro_header = Some(trimmed(&text_buf));
                     }
@@ -970,6 +981,48 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         "device" => current_game_unsupported_structure = true,
                         _ => {}
                     }
+                } else if tag == "romvault" {
+                    // RomVault's own header extension: a self-closing
+                    // element carrying only an attribute, never text
+                    // content - see `DatPackingPolicy`'s doc comment for
+                    // the recognised values. Parsed only at header level
+                    // (never inside a `<game>`), and only from this exact
+                    // explicit structural marker - never inferred from
+                    // filename, description, provider, or extension.
+                    let raw = attr_str_opt(
+                        empty_bytes,
+                        b"forcepacking",
+                        &mut warnings,
+                        limits.max_warnings,
+                    );
+                    packing_policy = match raw.as_deref().map(str::trim) {
+                        None | Some("") => DatPackingPolicy::Standard,
+                        Some(value) if value.eq_ignore_ascii_case("zip") => {
+                            DatPackingPolicy::Standard
+                        }
+                        Some(value)
+                            if value.eq_ignore_ascii_case("fileonly")
+                                || value.eq_ignore_ascii_case("file") =>
+                        {
+                            DatPackingPolicy::FileOnly
+                        }
+                        Some(value) if value.eq_ignore_ascii_case("unzip") => {
+                            DatPackingPolicy::StructuredLoose
+                        }
+                        Some(other) => {
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                "unrecognized_forcepacking",
+                                format!(
+                                    "<romvault forcepacking=\"{other}\"> is not a recognised \
+                                     packing policy; the DAT will fail closed at audit time \
+                                     rather than guess"
+                                ),
+                            );
+                            DatPackingPolicy::Unrecognized(other.to_string())
+                        }
+                    };
                 }
                 text_buf.clear();
             }
@@ -1115,8 +1168,15 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut games,
     );
 
-    let ecosystem =
-        detect_logiqx_ecosystem(is_software_list, &name, &author, &description, &version);
+    let ecosystem = detect_logiqx_ecosystem(
+        is_software_list,
+        &name,
+        &author,
+        &description,
+        &version,
+        &homepage,
+        &url,
+    );
 
     let source = DatSource {
         format: DatFormat::Logiqx,
@@ -1146,6 +1206,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
             })
             .sum(),
         parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        packing_policy,
     };
 
     Ok(ParseOutcome {
@@ -1536,6 +1597,8 @@ fn detect_logiqx_ecosystem(
     author: &Option<String>,
     description: &Option<String>,
     version: &Option<String>,
+    homepage: &Option<String>,
+    url: &Option<String>,
 ) -> DatEcosystem {
     // The root element is a structural declaration, unlike the free-form
     // header text below. A software list is MAME data even when its list name
@@ -1547,14 +1610,39 @@ fn detect_logiqx_ecosystem(
     // filename.  Publishers vary which header field carries their name, so
     // inspect every standard internal text field the parser preserves.
     let fields = [name, author, description, version];
+    // Substring match, not whole-word: real DAT fields commonly carry
+    // these as part of a larger token (e.g. `<author>Redump.org</author>`),
+    // unlike the stricter, whole-value No-Intro checks below, which need
+    // exactness precisely because "no-intro" is common as a substring of
+    // unrelated text and already has its own dedicated logic.
     let contains = |needle: &str| {
         fields
             .iter()
             .filter_map(|field| field.as_deref())
             .any(|field| field.to_ascii_lowercase().contains(needle))
     };
+    let official_no_intro_url = url.as_deref().is_some_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        ["http://www.no-intro.org", "https://www.no-intro.org"]
+            .iter()
+            .any(|prefix| value == *prefix || value == format!("{prefix}/"))
+    });
+    let official_no_intro_homepage = homepage
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("no-intro"));
+    let legacy_no_intro_marker = fields
+        .iter()
+        .filter_map(|field| field.as_deref())
+        .any(|field| {
+            let value = field.trim();
+            value.eq_ignore_ascii_case("No-Intro")
+                || value.eq_ignore_ascii_case("No-Intro Team")
+                || value
+                    .strip_prefix("No-Intro ")
+                    .is_some_and(|rest| !rest.is_empty())
+        });
 
-    if contains("no-intro") {
+    if (official_no_intro_homepage && official_no_intro_url) || legacy_no_intro_marker {
         return DatEcosystem::NoIntro;
     }
     if contains("redump") {
@@ -2526,5 +2614,170 @@ mod tests {
         assert_eq!(game.samples.len(), 1);
         assert_eq!(game.bios_sets.len(), 1);
         assert_eq!(game.parts.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // RomVault `<romvault forcepacking="..." />` header extension.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_explicit_romvault_forcepacking_fileonly() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>RomVault fileonly set</name>
+        <romvault forcepacking="fileonly" />
+    </header>
+    <game name="Game"><rom name="game.zip" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::FileOnly
+        );
+    }
+
+    #[test]
+    fn ordinary_dat_with_no_romvault_element_retains_standard_packing() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header><name>Ordinary set</name></header>
+    <game name="Game"><rom name="game.rom" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::Standard
+        );
+    }
+
+    #[test]
+    fn explicit_forcepacking_zip_is_standard() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Explicit zip set</name>
+        <romvault forcepacking="zip" />
+    </header>
+    <game name="Game"><rom name="game.zip" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::Standard
+        );
+    }
+
+    #[test]
+    fn forcepacking_unzip_is_structured_loose() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Loose set</name>
+        <romvault forcepacking="unzip" />
+    </header>
+    <game name="Game"><rom name="game.rom" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::StructuredLoose
+        );
+    }
+
+    #[test]
+    fn malformed_unknown_forcepacking_value_fails_closed_not_silently_standard() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Weird set</name>
+        <romvault forcepacking="something-nobody-invented" />
+    </header>
+    <game name="Game"><rom name="game.rom" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::Unrecognized("something-nobody-invented".to_string())
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.code() == "unrecognized_forcepacking")
+        );
+    }
+
+    #[test]
+    fn a_romvault_element_inside_a_game_is_not_the_header_marker() {
+        // Structural scoping: `<romvault>` only means anything at header
+        // level. One appearing inside `<game>` (malformed/unexpected) must
+        // never be mistaken for the DAT-wide policy.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header><name>Set</name></header>
+    <game name="Game">
+        <rom name="game.zip" size="4" crc="abcd1234"/>
+        <romvault forcepacking="fileonly" />
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::Standard
+        );
+    }
+
+    #[test]
+    fn filename_description_and_provider_never_activate_fileonly() {
+        // Requirement: never guess packing policy from filename,
+        // description, provider, or archive extension - only the explicit
+        // `<romvault forcepacking="...">` marker may set it.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>fileonly RomVault Eggmansworld Special (fileonly).zip</name>
+        <description>This set uses fileonly packing per RomVault, honest</description>
+        <author>fileonly</author>
+        <homepage>fileonly</homepage>
+    </header>
+    <game name="Game"><rom name="game.zip" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::Standard
+        );
+    }
+
+    #[test]
+    fn romvault_header_extension_does_not_disturb_other_header_fields_or_ecosystem_detection() {
+        // Round-trip/regression guard: adding `<romvault>` parsing must not
+        // perturb `name`/`description`/`author`/`homepage`/`url` capture or
+        // ecosystem detection, which live in the separate `Event::End`
+        // handler this feature does not touch.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <header>
+        <name>Regression set</name>
+        <description>Some description</description>
+        <author>Some Author</author>
+        <homepage>no-intro</homepage>
+        <url>https://www.no-intro.org</url>
+        <romvault forcepacking="fileonly" />
+    </header>
+    <game name="Game"><rom name="game.zip" size="4" crc="abcd1234"/></game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.name.as_deref(), Some("Regression set"));
+        assert_eq!(
+            outcome.dat.source.description.as_deref(),
+            Some("Some description")
+        );
+        assert_eq!(outcome.dat.source.author.as_deref(), Some("Some Author"));
+        assert_eq!(
+            outcome.dat.source.packing_policy,
+            DatPackingPolicy::FileOnly
+        );
     }
 }

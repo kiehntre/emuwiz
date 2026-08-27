@@ -1129,6 +1129,7 @@ mod archive_dat_set_identity_tests {
                 entry_count: 1,
                 rom_count: 1,
                 parse_warnings: Vec::new(),
+                packing_policy: crate::dat::model::DatPackingPolicy::Standard,
             },
             games: vec![DatGameEntry {
                 name: game_name.to_string(),

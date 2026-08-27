@@ -337,6 +337,7 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
                 entry_count: 0,
                 rom_count: 0,
                 parse_warnings: vec!["file failed to parse".to_string()],
+                packing_policy: archivefs_core::dat::model::DatPackingPolicy::Standard,
             };
             let dat = archivefs_core::dat::model::ParsedDat {
                 source,
