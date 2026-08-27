@@ -17,6 +17,7 @@ use zip::ZipArchive;
 use crate::disc_evidence_collector::{
     DiscCollectionRefusal, open_chd_iso9660, read_bounded_chd_bytes,
 };
+use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
@@ -166,6 +167,7 @@ pub enum IdentityKind {
     Ps1Serial,
     Ps2Serial,
     SaturnProductNumber,
+    DreamcastProductCode,
     Pcsx2ExecutableCrc,
     DolphinGameId,
     DolphinRevision,
@@ -185,6 +187,7 @@ impl fmt::Display for IdentityKind {
             Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
             Self::SaturnProductNumber => "Saturn product number",
+            Self::DreamcastProductCode => "Dreamcast product code",
             Self::Pcsx2ExecutableCrc => "PCSX2 executable CRC",
             Self::DolphinGameId => "Dolphin Game ID",
             Self::DolphinRevision => "Dolphin revision",
@@ -216,6 +219,7 @@ pub enum IdentityPlatform {
     PlayStation,
     PlayStation2,
     Saturn,
+    Dreamcast,
     GameCube,
     Wii,
     MegaDrive,
@@ -232,6 +236,7 @@ impl IdentityPlatform {
             | "sony playstation" => Self::PlayStation,
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
             "saturn" | "sega saturn" | "sega saturn console" => Self::Saturn,
+            "dreamcast" | "sega dreamcast" => Self::Dreamcast,
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" => Self::GameCube,
             "wii" | "nintendo wii" => Self::Wii,
             "megadrive" | "mega drive" | "genesis" | "sega mega drive" | "sega genesis" => {
@@ -252,6 +257,7 @@ impl IdentityPlatform {
             Self::PlayStation => "PlayStation",
             Self::PlayStation2 => "PlayStation 2",
             Self::Saturn => "Sega Saturn",
+            Self::Dreamcast => "Sega Dreamcast",
             Self::GameCube => "GameCube",
             Self::Wii => "Wii",
             Self::MegaDrive => "Mega Drive / Genesis",
@@ -405,6 +411,10 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::SaturnProductNumber)
     }
 
+    pub fn verified_dreamcast_product_code(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::DreamcastProductCode)
+    }
+
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
         self.verified_value(IdentityKind::LooseRomSha256)
     }
@@ -538,7 +548,9 @@ fn inspect_game_identity_with_platform_trust(
         "cue"
             if matches!(
                 platform,
-                IdentityPlatform::PlayStation | IdentityPlatform::Saturn
+                IdentityPlatform::PlayStation
+                    | IdentityPlatform::Saturn
+                    | IdentityPlatform::Dreamcast
             ) =>
         {
             inspect_cue(&mut report, trusted);
@@ -561,7 +573,9 @@ fn inspect_game_identity_with_platform_trust(
         "chd"
             if matches!(
                 platform,
-                IdentityPlatform::PlayStation | IdentityPlatform::Saturn
+                IdentityPlatform::PlayStation
+                    | IdentityPlatform::Saturn
+                    | IdentityPlatform::Dreamcast
             ) =>
         {
             inspect_disc_chd(&mut report, trusted);
@@ -959,6 +973,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         IdentityPlatform::PlayStation
         | IdentityPlatform::PlayStation2
         | IdentityPlatform::Saturn
+        | IdentityPlatform::Dreamcast
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Xbox360
@@ -1327,6 +1342,9 @@ fn inspect_iso_source(
         IdentityPlatform::Saturn => {
             inspect_saturn_source(report, source, member_path, member_index)
         }
+        IdentityPlatform::Dreamcast => {
+            inspect_dreamcast_source(report, source, member_path, member_index)
+        }
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -1422,6 +1440,92 @@ fn inspect_saturn_source(
         member_index,
         "Saturn System ID product number",
         "product number read from a verified SEGA SEGASATURN System ID",
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
+/// Authoritative Dreamcast identity from the existing fixed IP.BIN metadata
+/// area at logical offset zero. Container and sector decoding stay in the
+/// caller's already-opened bounded logical source.
+fn inspect_dreamcast_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut header = [0_u8; IP_BIN_META_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut header) {
+        push_with_source(
+            report,
+            IdentityKind::DreamcastProductCode,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Dreamcast IP.BIN bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(fact) = parse_ip_bin_meta(&header) else {
+        push_with_source(
+            report,
+            IdentityKind::DreamcastProductCode,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Dreamcast IP.BIN parse",
+            "IP.BIN metadata is truncated or malformed",
+        );
+        return;
+    };
+    if !fact.hardware_id_recognized {
+        push_with_source(
+            report,
+            IdentityKind::DreamcastProductCode,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Dreamcast IP.BIN hardware signature",
+            "disc does not contain a recognised Sega Dreamcast boot signature",
+        );
+        return;
+    }
+    if fact.product_number.is_empty()
+        || !fact
+            .product_number
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+    {
+        push_with_source(
+            report,
+            IdentityKind::DreamcastProductCode,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Dreamcast IP.BIN product code",
+            "IP.BIN has no valid printable product code",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::DreamcastProductCode,
+        IdentityStatus::Verified,
+        Some(fact.product_number),
+        IdentityConfidence::ExactBytes,
+        member_path,
+        member_index,
+        "Dreamcast IP.BIN product code",
+        "product code read from a recognised Sega Dreamcast IP.BIN boot structure",
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -2476,9 +2580,16 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         }
     };
 
-    if report.platform == IdentityPlatform::Saturn {
+    if matches!(
+        report.platform,
+        IdentityPlatform::Saturn | IdentityPlatform::Dreamcast
+    ) {
         let mut source = MediaSource::new(media);
-        inspect_saturn_source(report, &mut source, None, None);
+        if report.platform == IdentityPlatform::Saturn {
+            inspect_saturn_source(report, &mut source, None, None);
+        } else {
+            inspect_dreamcast_source(report, &mut source, None, None);
+        }
         report.bytes_read = report.bytes_read.max(source.bytes_read());
         return;
     }
@@ -2708,6 +2819,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
         report,
         match report.platform {
             IdentityPlatform::Saturn => IdentityKind::SaturnProductNumber,
+            IdentityPlatform::Dreamcast => IdentityKind::DreamcastProductCode,
             _ => IdentityKind::Ps1Serial,
         },
         status,
@@ -3189,6 +3301,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             &[IdentityKind::Ps2Serial, IdentityKind::Pcsx2ExecutableCrc]
         }
         IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
+        IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -3271,6 +3384,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
             }
         }
         IdentityPlatform::Saturn
+        | IdentityPlatform::Dreamcast
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Other => {}
@@ -3462,6 +3576,31 @@ mod tests {
         system_id[0x30..0x38].copy_from_slice(b"19961117");
         system_id[0x38..0x40].copy_from_slice(b"CD-1/1  ");
         iso[..SATURN_SYSTEM_ID_BYTES].copy_from_slice(&system_id);
+
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+        iso
+    }
+
+    fn dreamcast_iso(product_code: &[u8]) -> Vec<u8> {
+        let mut iso = vec![0_u8; 24 * ISO_SECTOR_SIZE as usize];
+        let mut ip_bin = vec![b' '; IP_BIN_META_BYTES];
+        ip_bin[..16].copy_from_slice(b"SEGA SEGAKATANA ");
+        ip_bin[0x10..0x20].copy_from_slice(b"SEGA ENTERPRISES");
+        let product_len = product_code.len().min(10);
+        ip_bin[0x40..0x40 + product_len].copy_from_slice(&product_code[..product_len]);
+        ip_bin[0x4a..0x50].copy_from_slice(b"V1.000");
+        ip_bin[0x50..0x60].copy_from_slice(b"20000915        ");
+        ip_bin[0x60..0x70].copy_from_slice(b"1ST_READ.BIN    ");
+        iso[..IP_BIN_META_BYTES].copy_from_slice(&ip_bin);
 
         let pvd = 16 * ISO_SECTOR_SIZE as usize;
         iso[pvd] = 1;
@@ -4420,6 +4559,47 @@ mod tests {
         let path = write_fixture(&directory, "missing-product.iso", &saturn_iso(b""));
         let report = inspect_game_identity(&path, Some("Saturn"));
         assert_eq!(report.verified_saturn_product_number(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn dreamcast_iso_cue_and_chd_verify_ip_bin_product_code() {
+        let directory = FixtureDir::new("dreamcast-identity");
+        let iso = dreamcast_iso(b"T-8109N");
+        let iso_path = write_fixture(&directory, "unrelated-name.iso", &iso);
+        let report = inspect_game_identity(&iso_path, Some("Sega Dreamcast"));
+        assert_eq!(report.platform, IdentityPlatform::Dreamcast);
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
+
+        let bin_path = directory.0.join("actual-disc.bin");
+        fs::write(&bin_path, ps1_raw_bin(&iso)).unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "unrelated-title.cue",
+            b"FILE \"actual-disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+
+        let chd_path = write_fixture(&directory, "unrelated-title.chd", &ps1_chd(&iso));
+        let report = inspect_game_identity(&chd_path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+    }
+
+    #[test]
+    fn dreamcast_identity_fails_closed_without_signature_or_product_code() {
+        let directory = FixtureDir::new("dreamcast-invalid");
+        let mut wrong = dreamcast_iso(b"T-8109N");
+        wrong[..16].copy_from_slice(b"NOT A DREAMCAST ");
+        let path = write_fixture(&directory, "wrong.iso", &wrong);
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
+        assert!(!report.complete);
+
+        let path = write_fixture(&directory, "missing-product.iso", &dreamcast_iso(b""));
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.verified_dreamcast_product_code(), None);
         assert!(!report.complete);
     }
 

@@ -141,6 +141,60 @@ fn verified_saturn_product_number_resolves_to_saturn_fact() {
 }
 
 #[test]
+fn verified_dreamcast_product_code_resolves_to_flycast_fact() {
+    let source = report(
+        IdentityPlatform::Dreamcast,
+        vec![evidence(
+            IdentityKind::DreamcastProductCode,
+            IdentityStatus::Verified,
+            Some("T-8109N"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Dreamcast".to_string(),
+            game_key: "T-8109N".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::DreamcastProductCode(
+            "T-8109N".to_string()
+        )]
+    );
+}
+
+#[test]
+fn conflicting_dreamcast_product_codes_never_produce_a_flycast_fact() {
+    let source = report(
+        IdentityPlatform::Dreamcast,
+        vec![
+            evidence(
+                IdentityKind::DreamcastProductCode,
+                IdentityStatus::Verified,
+                Some("T-8109N"),
+                IdentityConfidence::ExactBytes,
+            ),
+            evidence(
+                IdentityKind::DreamcastProductCode,
+                IdentityStatus::Verified,
+                Some("T-9999N"),
+                IdentityConfidence::ExactBytes,
+            ),
+        ],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+    assert_eq!(status, CanonicalIdentityStatus::Conflicting);
+    assert!(facts.is_empty());
+}
+
+#[test]
 fn conflicting_ps1_serials_never_produce_a_duckstation_fact() {
     let source = report(
         IdentityPlatform::PlayStation,

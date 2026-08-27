@@ -582,6 +582,23 @@ mod tests {
     }
 
     #[test]
+    fn flycast_projection_accepts_verified_dreamcast_product_code() {
+        let facts = vec![VerifiedIdentityFact::DreamcastProductCode(
+            "T-8109N".to_string(),
+        )];
+        let LaunchInputProjection::Authorized(request) = project_flycast_launch_input(&facts)
+        else {
+            panic!("verified Dreamcast product code must authorize Flycast input")
+        };
+        assert_eq!(request.canonical_platform.as_deref(), Some("Dreamcast"));
+        assert_eq!(request.flycast_platform, Some(FlycastPlatform::Dreamcast));
+        assert_eq!(
+            request.verified_dreamcast_product_code.as_deref(),
+            Some("T-8109N")
+        );
+    }
+
+    #[test]
     fn pcsx2_accepts_serial_and_crc_independently() {
         let serial_only = vec![VerifiedIdentityFact::Ps2Serial("SLUS-98765".to_string())];
         let LaunchInputProjection::Authorized(request) = project_pcsx2_launch_input(&serial_only)
