@@ -16444,13 +16444,10 @@ impl ArchiveFsApp {
                     let action = show_selected_page(
                         ui,
                         live,
-                        self.mount_all_result.as_ref(),
                         SelectedPageViewState {
                             selected_archive: self.archive_context.focused.as_deref(),
                             selected_count: self.archive_context.selected.len(),
                             retroarch_profiles: &self.retroarch_profiles,
-                            queue: &mut self.mount_queue,
-                            confirm: &mut self.confirm_mount_queue,
                             busy: archive_actions_blocked,
                             block_reason: archive_action_block_reason,
                         },
@@ -20272,8 +20269,8 @@ fn mount_row_matches(record: &ArchiveRecord, filter: &str) -> bool {
 enum MountPageAction {
     MountQueue,
     Refresh,
-    /// Navigate to the Mount page (the Selected page's empty-queue
-    /// affordance).
+    /// Navigate to the Mount page (the Selected page's plain "Open Mounts"
+    /// shortcut into the real mount-queue workflow).
     GoToMount,
     /// Open the first-class Cheats & Mods workspace for this exact
     /// archive (the Selected page's entry point).
@@ -20289,8 +20286,9 @@ enum QueueConfirmChoice {
     Cancel,
 }
 
-/// The inline "mount the queue" confirmation strip shared by the Mount
-/// and Selected pages, so their wording and gating can never drift.
+/// The inline "mount the queue" confirmation strip, used by the Mount
+/// page's own queue review (`show_mount_page`). The Selected page no longer
+/// renders any mount queue at all, so this is not shared with it anymore.
 fn show_mount_queue_confirmation(
     ui: &mut egui::Ui,
     attempted: usize,
@@ -20327,39 +20325,34 @@ fn show_mount_queue_confirmation(
     choice
 }
 
-/// The design's "Planned Action" label for a queued archive - what the
-/// batch engine will do with it, derived purely from `MountState` (the
-/// action-verb counterpart of `mount_validation_label`).
-fn planned_action_label(state: MountState) -> &'static str {
-    match state {
-        MountState::Pending => "Mount",
-        MountState::Mounted => "Skip — already mounted",
-        MountState::MountPathExists => "Skip — destination already exists",
-        MountState::NotMountable => "Skip — loose ROM needs no mount",
-    }
-}
+/// The Selected page's own view state - a game-details/review surface, not a
+/// mount-queue screen. Queue review, manipulation, and the mount-queue
+/// confirmation flow live only on the Mount page (`show_mount_page`,
+/// `administration_pages.rs`), which already owns that machinery end to end;
+/// this page never re-implements or duplicates it, and offers only a plain
+/// "Open Mounts" shortcut into the real workflow.
 struct SelectedPageViewState<'a> {
     selected_archive: Option<&'a Path>,
     selected_count: usize,
     retroarch_profiles: &'a RetroArchProfilesState,
-    queue: &'a mut Vec<PathBuf>,
-    confirm: &'a mut bool,
     busy: bool,
     block_reason: Option<&'a str>,
 }
 
+/// Renders the Selected page: a focused game-details/review surface (Cheats
+/// & Mods entry point here; identity evidence, launch readiness, identity
+/// sources, plan preview, and RPCS3/PCSX2 panels rendered by the caller
+/// immediately after this returns). Never renders or manipulates the mount
+/// queue - see `SelectedPageViewState`'s own doc.
 fn show_selected_page(
     ui: &mut egui::Ui,
     live: Option<&LoadedData>,
-    mount_all_result: Option<&MountAllResult>,
     view_state: SelectedPageViewState<'_>,
 ) -> Option<MountPageAction> {
     let SelectedPageViewState {
         selected_archive,
         selected_count,
         retroarch_profiles,
-        queue,
-        confirm,
         busy,
         block_reason,
     } = view_state;
@@ -20367,13 +20360,9 @@ fn show_selected_page(
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::SELECTED,
-        "Selected",
-        "Review queued archives and their validated destinations before mounting.",
+        "Game Details",
+        "Review identity, launch readiness and available actions for this game.",
     );
-    if let Some(result) = mount_all_result {
-        show_mount_all_result(ui, result);
-        ui.separator();
-    }
 
     widgets::section_header(
         ui,
@@ -20408,6 +20397,12 @@ fn show_selected_page(
         {
             action = Some(MountPageAction::OpenCheatsMods(path.to_path_buf()));
         }
+        // The only mount-related affordance this page offers: a plain
+        // shortcut into the real Mount page/workflow. No queue is reviewed,
+        // built, or confirmed here.
+        if widgets::action_button(ui, "Open Mounts", widgets::ActionStyle::Quiet, !busy).clicked() {
+            action = Some(MountPageAction::GoToMount);
+        }
         if matches!(
             retroarch_profiles,
             RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
@@ -20425,169 +20420,9 @@ fn show_selected_page(
     if let Some(reason) = entry_blocker {
         widgets::banner(ui, "Unavailable", reason, widgets::StatusTone::Pending);
     }
-    ui.separator();
-
-    let Some(data) = live else {
-        ui.label("Live mount state is not loaded yet.");
-        return action;
-    };
-    prune_mount_queue(queue, &data.records);
-    if queue.is_empty() {
-        if widgets::empty_state(
-            ui,
-            "No archives queued",
-            "Choose archives on the Mount page, then return here to review them.",
-            Some("Choose archives"),
-        ) {
-            action = Some(MountPageAction::GoToMount);
-        }
-        return action;
-    }
-    let attempted = queued_pending_paths(queue, &data.records);
-
-    widgets::section_header(
-        ui,
-        "Mount queue",
-        Some(
-            "Ready entries will be mounted; blocked entries remain visible and are skipped safely.",
-        ),
-    );
-    widgets::card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            if queue.len() == 1 {
-                ui.label("1 archive queued.");
-            } else {
-                ui.label(format!("{} archives queued.", queue.len()));
-            }
-            if attempted.len() < queue.len() {
-                ui.label(format!(
-                    "{} will be skipped (already mounted or destination exists).",
-                    queue.len() - attempted.len()
-                ));
-            }
-            if widgets::action_button(
-                ui,
-                "Clear queue",
-                widgets::ActionStyle::Quiet,
-                !queue.is_empty(),
-            )
-            .clicked()
-            {
-                queue.clear();
-                *confirm = false;
-            }
-            let mount_enabled = !busy && !attempted.is_empty() && !*confirm;
-            if widgets::action_button(
-                ui,
-                format!("Mount queue ({})", attempted.len()),
-                widgets::ActionStyle::Primary,
-                mount_enabled,
-            )
-            .clicked()
-            {
-                *confirm = true;
-            }
-        })
-        .inner
-    });
     if busy && let Some(reason) = block_reason {
         ui.label(reason);
     }
-    if *confirm {
-        match show_mount_queue_confirmation(ui, attempted.len(), busy) {
-            Some(QueueConfirmChoice::Mount) => {
-                action = Some(MountPageAction::MountQueue);
-                *confirm = false;
-            }
-            Some(QueueConfirmChoice::Cancel) => *confirm = false,
-            None => {}
-        }
-    }
-    ui.separator();
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let mut remove: Option<PathBuf> = None;
-            for ready in [true, false] {
-                let count = queue
-                    .iter()
-                    .filter(|path| {
-                        data.records.iter().any(|record| {
-                            record.mount_plan.archive.path == ***path
-                                && (record.mount_state == MountState::Pending) == ready
-                        })
-                    })
-                    .count();
-                if count == 0 {
-                    continue;
-                }
-                ui.label(
-                    egui::RichText::new(if ready { "READY" } else { "BLOCKED / SKIPPED" })
-                        .small()
-                        .strong()
-                        .color(theme::muted(ui)),
-                );
-                for path in queue.iter() {
-                    let Some(record) = data
-                        .records
-                        .iter()
-                        .find(|record| record.mount_plan.archive.path == *path)
-                    else {
-                        continue;
-                    };
-                    if (record.mount_state == MountState::Pending) != ready {
-                        continue;
-                    }
-                    widgets::card(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(&record.identity.display_name)
-                                    .size(17.0)
-                                    .strong(),
-                            );
-                            widgets::status_badge(
-                                ui,
-                                record.identity.platform.as_deref().unwrap_or("Unknown"),
-                                widgets::StatusTone::Info,
-                            );
-                            widgets::status_badge(
-                                ui,
-                                planned_action_label(record.mount_state),
-                                if ready {
-                                    widgets::StatusTone::Success
-                                } else {
-                                    widgets::StatusTone::Blocked
-                                },
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if widgets::action_button(
-                                        ui,
-                                        "Remove",
-                                        widgets::ActionStyle::Quiet,
-                                        true,
-                                    )
-                                    .clicked()
-                                    {
-                                        remove = Some(path.clone());
-                                    }
-                                },
-                            );
-                        });
-                        if widgets::path_value(ui, "Destination", &record.mount_plan.mount_path) {
-                            ui.ctx()
-                                .copy_text(record.mount_plan.mount_path.display().to_string());
-                        }
-                    });
-                    ui.add_space(6.0);
-                }
-            }
-            if let Some(path) = remove {
-                queue.retain(|queued_path| *queued_path != path);
-            }
-        });
     action
 }
 

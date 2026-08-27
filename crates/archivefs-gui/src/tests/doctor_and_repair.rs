@@ -705,19 +705,6 @@ fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
 }
 
 #[test]
-fn planned_action_labels_distinguish_mount_from_both_skip_reasons() {
-    assert_eq!(planned_action_label(MountState::Pending), "Mount");
-    assert_eq!(
-        planned_action_label(MountState::Mounted),
-        "Skip — already mounted"
-    );
-    assert_eq!(
-        planned_action_label(MountState::MountPathExists),
-        "Skip — destination already exists"
-    );
-}
-
-#[test]
 fn preview_match_strength_presentation_covers_every_variant_with_a_distinct_honest_explanation() {
     let all = [
         PreviewMatchStrength::VerifiedExact,

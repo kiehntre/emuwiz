@@ -3082,8 +3082,6 @@ fn one_library_selection_is_the_same_context_on_selected_and_cheats_mods() {
     assert_eq!(app.archive_context.selected.len(), 1);
 
     let ctx = egui::Context::default();
-    let mut queue = Vec::new();
-    let mut confirm = false;
     let live = match &app.state {
         LoadState::Ready(data) => Some(data.as_ref()),
         _ => None,
@@ -3093,13 +3091,10 @@ fn one_library_selection_is_the_same_context_on_selected_and_cheats_mods() {
             let _ = show_selected_page(
                 ui,
                 live,
-                None,
                 SelectedPageViewState {
                     selected_archive: app.archive_context.focused.as_deref(),
                     selected_count: app.archive_context.selected.len(),
                     retroarch_profiles: &app.retroarch_profiles,
-                    queue: &mut queue,
-                    confirm: &mut confirm,
                     busy: false,
                     block_reason: None,
                 },

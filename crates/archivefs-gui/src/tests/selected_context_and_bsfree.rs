@@ -1405,8 +1405,13 @@ fn library_sub_tab_headings_match_their_own_tab_bar_labels() {
     );
 }
 
+/// The Mount page owns the queue button; Selected no longer duplicates it at
+/// all. Reworked from this file's earlier
+/// `mount_and_selected_pages_use_identical_mount_queue_button_wording`,
+/// which asserted the old (now removed) duplication - see the Selected/Mount
+/// split that removed `SelectedPageViewState::queue`/`confirm`.
 #[test]
-fn mount_and_selected_pages_use_identical_mount_queue_button_wording() {
+fn mount_page_owns_the_queue_button_and_selected_no_longer_duplicates_it() {
     let ctx = egui::Context::default();
     let records = vec![record("/roms/pending.zip", MountState::Pending)];
     let data = loaded_data_with_records("/mnt/archivefs", records.clone());
@@ -1432,20 +1437,15 @@ fn mount_and_selected_pages_use_identical_mount_queue_button_wording() {
     });
     assert!(rendered_text_contains(&mount_output, "Mount queue (1)"));
 
-    let mut selected_queue = vec![PathBuf::from("/roms/pending.zip")];
-    let mut selected_confirm = false;
     let selected_output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let _ = show_selected_page(
                 ui,
                 Some(&data),
-                None,
                 SelectedPageViewState {
                     selected_archive: None,
                     selected_count: 0,
                     retroarch_profiles: &RetroArchProfilesState::NotScanned,
-                    queue: &mut selected_queue,
-                    confirm: &mut selected_confirm,
                     busy: false,
                     block_reason: None,
                 },
@@ -1453,13 +1453,13 @@ fn mount_and_selected_pages_use_identical_mount_queue_button_wording() {
         });
     });
     assert!(
-        rendered_text_contains(&selected_output, "Mount queue (1)"),
-        "the Selected page's own queue button must use the same wording as the Mount page's"
+        !rendered_text_contains(&selected_output, "Mount queue"),
+        "Selected must never render the Mount page's queue button or section again"
     );
-    assert!(!rendered_text_contains(
-        &selected_output,
-        "Mount ready archives"
-    ));
+    assert!(
+        rendered_text_contains(&selected_output, "Open Mounts"),
+        "Selected keeps only a plain shortcut into the real Mount workflow"
+    );
 }
 
 #[test]

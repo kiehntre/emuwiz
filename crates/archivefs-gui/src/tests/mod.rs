@@ -280,6 +280,7 @@ mod mounts_and_history;
 mod platform_shelf_and_library_shell;
 mod selected;
 mod selected_context_and_bsfree;
+mod selected_page_mount_removal;
 mod transactions;
 
 // -- Hoisted shared test fixtures ------------------------------------
