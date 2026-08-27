@@ -20814,6 +20814,7 @@ fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
         IdentityImageFormat::Chd => "This disc image format",
         IdentityImageFormat::Deferred => "This disc image format",
         IdentityImageFormat::Gdi
+        | IdentityImageFormat::Cdi
         | IdentityImageFormat::LooseCartridgeRom
         | IdentityImageFormat::Xex
         | IdentityImageFormat::ZipContainingXex
