@@ -87,12 +87,23 @@ pub enum VerifiedIdentityFact {
     DreamcastProductCode(String),
     /// A verified Sega Saturn product number.
     SaturnProductCode(String),
+    /// A verified Sega CD/Mega-CD Disc ID product code.
+    SegaCdProductCode(String),
     /// A verified Atari ST title, matching
     /// [`crate::patch_manager::HatariSelectedGameRequest::verified_title`].
     AtariStTitle(String),
     /// A verified Amiga/WHDLoad identity string, matching
     /// [`crate::patch_manager::AmigaGameRequest::verified_amiga_identity`].
     AmigaIdentity(String),
+}
+
+/// The minimal request carried by the Sega CD RetroArch projection. The
+/// generic RetroArch planner still selects the configured core; this request
+/// preserves the independently verified on-disc product identity for adapter
+/// consumers without inventing a Sega-CD-specific emulator engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegaCdGameRequest {
+    pub verified_product_code: String,
 }
 
 fn find_ps1_serial(facts: &[VerifiedIdentityFact]) -> Option<String> {
@@ -154,6 +165,13 @@ fn find_wii_game_id(facts: &[VerifiedIdentityFact]) -> Option<String> {
 fn find_dreamcast_product_code(facts: &[VerifiedIdentityFact]) -> Option<String> {
     facts.iter().find_map(|fact| match fact {
         VerifiedIdentityFact::DreamcastProductCode(value) => Some(value.clone()),
+        _ => None,
+    })
+}
+
+fn find_sega_cd_product_code(facts: &[VerifiedIdentityFact]) -> Option<String> {
+    facts.iter().find_map(|fact| match fact {
+        VerifiedIdentityFact::SegaCdProductCode(value) => Some(value.clone()),
         _ => None,
     })
 }
@@ -325,6 +343,22 @@ pub fn project_flycast_launch_input(
         }),
         None => LaunchInputProjection::Unavailable {
             detail: "no verified Dreamcast product code among the supplied identity facts",
+        },
+    }
+}
+
+/// Projects a verified Sega CD product code for the existing RetroArch
+/// launch path. This does not select or install a core; core selection and
+/// command construction remain the generic reviewed RetroArch machinery.
+pub fn project_sega_cd_launch_input(
+    facts: &[VerifiedIdentityFact],
+) -> LaunchInputProjection<SegaCdGameRequest> {
+    match find_sega_cd_product_code(facts) {
+        Some(verified_product_code) => LaunchInputProjection::Authorized(SegaCdGameRequest {
+            verified_product_code,
+        }),
+        None => LaunchInputProjection::Unavailable {
+            detail: "no verified Sega CD product code among the supplied identity facts",
         },
     }
 }
@@ -596,6 +630,24 @@ mod tests {
             request.verified_dreamcast_product_code.as_deref(),
             Some("T-8109N")
         );
+    }
+
+    #[test]
+    fn sega_cd_projection_accepts_only_verified_sega_cd_product_code() {
+        let facts = vec![VerifiedIdentityFact::SegaCdProductCode(
+            "GM T-12345-00".to_string(),
+        )];
+        let LaunchInputProjection::Authorized(request) = project_sega_cd_launch_input(&facts)
+        else {
+            panic!("verified Sega CD product code must authorize the projection")
+        };
+        assert_eq!(request.verified_product_code, "GM T-12345-00");
+        assert!(matches!(
+            project_sega_cd_launch_input(&[VerifiedIdentityFact::DreamcastProductCode(
+                "T-8109N".to_string()
+            )]),
+            LaunchInputProjection::Unavailable { .. }
+        ));
     }
 
     #[test]

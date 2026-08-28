@@ -75,6 +75,7 @@ fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::Ps2Serial
             | IdentityKind::SaturnProductNumber
             | IdentityKind::DreamcastProductCode
+            | IdentityKind::SegaCdProductCode
             | IdentityKind::Pcsx2ExecutableCrc
             | IdentityKind::DolphinGameId
             | IdentityKind::LooseRomSha256
@@ -132,6 +133,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::PlayStation2 => Some("PS2"),
         IdentityPlatform::Saturn => Some("Saturn"),
         IdentityPlatform::Dreamcast => Some("Dreamcast"),
+        IdentityPlatform::SegaCd => Some("Sega CD"),
         IdentityPlatform::GameCube => Some("GameCube"),
         IdentityPlatform::Wii => Some("Wii"),
         IdentityPlatform::MegaDrive => Some("MegaDrive"),
@@ -193,6 +195,16 @@ fn resolved_identity_for_platform(
                 platform_id,
                 product_code.to_string(),
                 vec![VerifiedIdentityFact::DreamcastProductCode(
+                    product_code.to_string(),
+                )],
+            ))
+        }
+        IdentityPlatform::SegaCd => {
+            let product_code = find_value(resolved, IdentityKind::SegaCdProductCode)?;
+            Some((
+                platform_id,
+                product_code.to_string(),
+                vec![VerifiedIdentityFact::SegaCdProductCode(
                     product_code.to_string(),
                 )],
             ))

@@ -130,10 +130,11 @@ pub use flycast_execution::{
     preflight_flycast_launch, spawn_flycast,
 };
 pub use input_projection::{
-    LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
-    project_dolphin_gamecube_launch_input, project_dolphin_wii_launch_input,
-    project_duckstation_launch_input, project_flycast_launch_input, project_hatari_launch_input,
-    project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
+    LaunchInputProjection, SegaCdGameRequest, VerifiedIdentityFact,
+    project_amiga_whdload_launch_input, project_dolphin_gamecube_launch_input,
+    project_dolphin_wii_launch_input, project_duckstation_launch_input,
+    project_flycast_launch_input, project_hatari_launch_input, project_pcsx2_launch_input,
+    project_ppsspp_launch_input, project_rpcs3_launch_input, project_sega_cd_launch_input,
     project_xemu_launch_input, project_xenia_launch_input,
 };
 pub use integration::{

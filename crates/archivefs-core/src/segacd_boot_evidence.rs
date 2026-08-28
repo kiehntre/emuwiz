@@ -2,19 +2,14 @@
 //!
 //! # Deliberately narrow scope
 //!
-//! Unlike [`crate::saturn_boot_evidence`]/[`crate::dreamcast_boot_evidence`],
-//! this module recognises **only** the `SEGADISCSYSTEM` boot identifier at
-//! the start of the volume header - it does not extract product number,
-//! version, or region. Sega's own official Mega-CD Disc Format
+//! This module recognises the `SEGADISCSYSTEM` boot identifier and the
+//! documented Disc ID product field. Sega's own official Mega-CD Disc Format
 //! Specification PDF (referenced from `segaretro.org`) blocks automated
-//! fetches, and no independently-corroborated primary source for the
-//! CD-specific product/version/region field offsets was found during this
-//! chunk's research (as distinct from the *cartridge* Mega Drive ROM
-//! header at `$100`-`$1FF`, a different, well-documented structure that
-//! some Sega CD boot sectors also embed, but at an offset this module has
-//! not independently verified for the CD context specifically). Rather
-//! than guess at those offsets, this module stops at the one fact that is
-//! solidly, independently corroborated across multiple sources:
+//! fetches. The Sega specification places the product/version field at `$180`,
+//! so this module reads that fixed field only after validating the Sega CD
+//! system identifier. See the public transcription of the Mega-CD Disc Format
+//! Specification, Fig. A-3:
+//! <https://gist.github.com/akiyan/a90d1e7d41ce89c532f29cafc356ccc2>.
 //!
 //! - `https://www.retrodev.com/segacd.html`
 //! - the SpritesMind.Net Mega-CD development forum
@@ -37,6 +32,15 @@ use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
 
 pub const SEGA_CD_BOOT_SIGNATURE: &[u8; 14] = b"SEGADISCSYSTEM";
+pub const SEGA_CD_PRODUCT_FIELD_OFFSET: usize = 0x180;
+pub const SEGA_CD_PRODUCT_FIELD_BYTES: usize = 14;
+pub const SEGA_CD_DISC_ID_BYTES: usize = 0x200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegaCdProductFact {
+    pub raw_product_code: String,
+    pub product_code: String,
+}
 
 pub fn looks_like_sega_cd_boot_sector(bytes: &[u8]) -> bool {
     bytes.len() >= SEGA_CD_BOOT_SIGNATURE.len()
@@ -55,6 +59,44 @@ pub fn observe_segacd_evidence(bytes: &[u8]) -> Vec<ContentEvidence> {
         ContentEvidenceConfidence::Strong,
         "Sega CD/Mega-CD volume header boot identifier present at offset 0",
     )]
+}
+
+/// Parses the fixed Disc ID product/version field. The documented example is
+/// `GM T-12345-00`; padding between product number and version is normalised
+/// to the stable form `GM T-12345-00`. The raw field is retained for
+/// diagnostics, while the validated normalized value is suitable as identity.
+pub fn parse_segacd_product_code(bytes: &[u8]) -> Option<SegaCdProductFact> {
+    if !looks_like_sega_cd_boot_sector(bytes) || bytes.len() < SEGA_CD_DISC_ID_BYTES {
+        return None;
+    }
+    let raw = bytes.get(
+        SEGA_CD_PRODUCT_FIELD_OFFSET..SEGA_CD_PRODUCT_FIELD_OFFSET + SEGA_CD_PRODUCT_FIELD_BYTES,
+    )?;
+    if !raw
+        .iter()
+        .all(|byte| *byte == b' ' || byte.is_ascii_graphic())
+    {
+        return None;
+    }
+    let raw_product_code = String::from_utf8(raw.to_vec()).ok()?;
+    let fields: Vec<&str> = raw_product_code.split_whitespace().collect();
+    if fields.len() < 2 || !matches!(fields[0], "GM" | "AI") {
+        return None;
+    }
+    let code = fields[1..].concat();
+    if code.is_empty()
+        || !code.contains('-')
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return None;
+    }
+    let product_code = format!("{} {code}", fields[0]);
+    Some(SegaCdProductFact {
+        raw_product_code,
+        product_code,
+    })
 }
 
 pub struct SegaCdBootDetector;
@@ -118,5 +160,26 @@ mod tests {
         for item in observe_segacd_evidence(SEGA_CD_BOOT_SIGNATURE.as_slice()) {
             assert_eq!(item.kind, ContentEvidenceKind::BootStructure);
         }
+    }
+
+    #[test]
+    fn product_code_is_read_from_the_documented_disc_id_field() {
+        let mut data = vec![b' '; SEGA_CD_DISC_ID_BYTES];
+        data[..SEGA_CD_BOOT_SIGNATURE.len()].copy_from_slice(SEGA_CD_BOOT_SIGNATURE);
+        data[SEGA_CD_PRODUCT_FIELD_OFFSET..SEGA_CD_PRODUCT_FIELD_OFFSET + 14]
+            .copy_from_slice(b"GM T-12345 -00");
+        let fact = parse_segacd_product_code(&data).unwrap();
+        assert_eq!(fact.product_code, "GM T-12345-00");
+        assert_eq!(fact.raw_product_code, "GM T-12345 -00");
+    }
+
+    #[test]
+    fn missing_or_malformed_product_code_fails_closed() {
+        let mut data = vec![b' '; SEGA_CD_DISC_ID_BYTES];
+        data[..SEGA_CD_BOOT_SIGNATURE.len()].copy_from_slice(SEGA_CD_BOOT_SIGNATURE);
+        assert_eq!(parse_segacd_product_code(&data), None);
+        data[SEGA_CD_PRODUCT_FIELD_OFFSET..SEGA_CD_PRODUCT_FIELD_OFFSET + 14]
+            .copy_from_slice(b"NO PRODUCT    ");
+        assert_eq!(parse_segacd_product_code(&data), None);
     }
 }

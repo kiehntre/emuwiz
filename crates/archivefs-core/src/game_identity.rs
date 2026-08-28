@@ -30,6 +30,7 @@ use crate::raw_cd_logical_media::{
     open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
 };
 use crate::saturn_boot_evidence::{SATURN_SYSTEM_ID_BYTES, parse_saturn_system_id};
+use crate::segacd_boot_evidence::{SEGA_CD_DISC_ID_BYTES, parse_segacd_product_code};
 
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
 pub const MAX_ARCHIVE_MEMBERS: usize = 4_096;
@@ -170,6 +171,7 @@ pub enum IdentityKind {
     Ps2Serial,
     SaturnProductNumber,
     DreamcastProductCode,
+    SegaCdProductCode,
     Pcsx2ExecutableCrc,
     DolphinGameId,
     DolphinRevision,
@@ -190,6 +192,7 @@ impl fmt::Display for IdentityKind {
             Self::Ps2Serial => "PS2 serial",
             Self::SaturnProductNumber => "Saturn product number",
             Self::DreamcastProductCode => "Dreamcast product code",
+            Self::SegaCdProductCode => "Sega CD product code",
             Self::Pcsx2ExecutableCrc => "PCSX2 executable CRC",
             Self::DolphinGameId => "Dolphin Game ID",
             Self::DolphinRevision => "Dolphin revision",
@@ -222,6 +225,7 @@ pub enum IdentityPlatform {
     PlayStation2,
     Saturn,
     Dreamcast,
+    SegaCd,
     GameCube,
     Wii,
     MegaDrive,
@@ -239,6 +243,7 @@ impl IdentityPlatform {
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
             "saturn" | "sega saturn" | "sega saturn console" => Self::Saturn,
             "dreamcast" | "sega dreamcast" => Self::Dreamcast,
+            "sega cd" | "sega-cd" | "segacd" | "mega cd" | "mega-cd" | "megacd" => Self::SegaCd,
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" => Self::GameCube,
             "wii" | "nintendo wii" => Self::Wii,
             "megadrive" | "mega drive" | "genesis" | "sega mega drive" | "sega genesis" => {
@@ -260,6 +265,7 @@ impl IdentityPlatform {
             Self::PlayStation2 => "PlayStation 2",
             Self::Saturn => "Sega Saturn",
             Self::Dreamcast => "Sega Dreamcast",
+            Self::SegaCd => "Sega Mega-CD / Sega CD",
             Self::GameCube => "GameCube",
             Self::Wii => "Wii",
             Self::MegaDrive => "Mega Drive / Genesis",
@@ -430,6 +436,10 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::DreamcastProductCode)
     }
 
+    pub fn verified_sega_cd_product_code(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::SegaCdProductCode)
+    }
+
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
         self.verified_value(IdentityKind::LooseRomSha256)
     }
@@ -572,6 +582,7 @@ fn inspect_game_identity_with_platform_trust(
                 IdentityPlatform::PlayStation
                     | IdentityPlatform::Saturn
                     | IdentityPlatform::Dreamcast
+                    | IdentityPlatform::SegaCd
             ) =>
         {
             inspect_cue(&mut report, trusted);
@@ -597,6 +608,7 @@ fn inspect_game_identity_with_platform_trust(
                 IdentityPlatform::PlayStation
                     | IdentityPlatform::Saturn
                     | IdentityPlatform::Dreamcast
+                    | IdentityPlatform::SegaCd
             ) =>
         {
             inspect_disc_chd(&mut report, trusted);
@@ -1034,6 +1046,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::PlayStation2
         | IdentityPlatform::Saturn
         | IdentityPlatform::Dreamcast
+        | IdentityPlatform::SegaCd
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Xbox360
@@ -1405,6 +1418,9 @@ fn inspect_iso_source(
         IdentityPlatform::Dreamcast => {
             inspect_dreamcast_source(report, source, member_path, member_index)
         }
+        IdentityPlatform::SegaCd => {
+            inspect_sega_cd_source(report, source, member_path, member_index)
+        }
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -1586,6 +1602,63 @@ fn inspect_dreamcast_source(
         member_index,
         "Dreamcast IP.BIN product code",
         "product code read from a recognised Sega Dreamcast IP.BIN boot structure",
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
+/// Authoritative Sega CD identity from the fixed Disc ID product field at
+/// `$180` in the validated `SEGADISCSYSTEM` boot sector. The caller supplies
+/// an already-decoded 2048-byte logical sector view, so ISO, CUE/BIN, and the
+/// existing simple-track CHD reader use exactly the same bounded check.
+fn inspect_sega_cd_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut header = [0_u8; SEGA_CD_DISC_ID_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut header) {
+        push_with_source(
+            report,
+            IdentityKind::SegaCdProductCode,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Sega CD Disc ID bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(fact) = parse_segacd_product_code(&header) else {
+        push_with_source(
+            report,
+            IdentityKind::SegaCdProductCode,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Sega CD Disc ID product field",
+            "logical sector zero is not a valid Sega CD system area with a product code",
+        );
+        return;
+    };
+    push_with_source(
+        report,
+        IdentityKind::SegaCdProductCode,
+        IdentityStatus::Verified,
+        Some(fact.product_code),
+        IdentityConfidence::ExactBytes,
+        member_path,
+        member_index,
+        "Sega CD Disc ID product field",
+        &format!(
+            "product code read from SEGADISCSYSTEM Disc ID; raw field {:?}",
+            fact.raw_product_code
+        ),
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -2660,13 +2733,15 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
 
     if matches!(
         report.platform,
-        IdentityPlatform::Saturn | IdentityPlatform::Dreamcast
+        IdentityPlatform::Saturn | IdentityPlatform::Dreamcast | IdentityPlatform::SegaCd
     ) {
         let mut source = MediaSource::new(media);
         if report.platform == IdentityPlatform::Saturn {
             inspect_saturn_source(report, &mut source, None, None);
-        } else {
+        } else if report.platform == IdentityPlatform::Dreamcast {
             inspect_dreamcast_source(report, &mut source, None, None);
+        } else {
+            inspect_sega_cd_source(report, &mut source, None, None);
         }
         report.bytes_read = report.bytes_read.max(source.bytes_read());
         return;
@@ -3004,6 +3079,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
         match report.platform {
             IdentityPlatform::Saturn => IdentityKind::SaturnProductNumber,
             IdentityPlatform::Dreamcast => IdentityKind::DreamcastProductCode,
+            IdentityPlatform::SegaCd => IdentityKind::SegaCdProductCode,
             _ => IdentityKind::Ps1Serial,
         },
         status,
@@ -3486,6 +3562,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         }
         IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
         IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
+        IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -3569,6 +3646,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         }
         IdentityPlatform::Saturn
         | IdentityPlatform::Dreamcast
+        | IdentityPlatform::SegaCd
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Other => {}
@@ -3622,6 +3700,9 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segacd_boot_evidence::{
+        SEGA_CD_BOOT_SIGNATURE, SEGA_CD_PRODUCT_FIELD_BYTES, SEGA_CD_PRODUCT_FIELD_OFFSET,
+    };
     use std::fs;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3785,6 +3866,26 @@ mod tests {
         ip_bin[0x50..0x60].copy_from_slice(b"20000915        ");
         ip_bin[0x60..0x70].copy_from_slice(b"1ST_READ.BIN    ");
         iso[..IP_BIN_META_BYTES].copy_from_slice(&ip_bin);
+
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+        iso
+    }
+
+    fn sega_cd_iso(product_code: &[u8]) -> Vec<u8> {
+        let mut iso = vec![0_u8; 24 * ISO_SECTOR_SIZE as usize];
+        iso[..SEGA_CD_BOOT_SIGNATURE.len()].copy_from_slice(SEGA_CD_BOOT_SIGNATURE);
+        iso[SEGA_CD_PRODUCT_FIELD_OFFSET
+            ..SEGA_CD_PRODUCT_FIELD_OFFSET + SEGA_CD_PRODUCT_FIELD_BYTES]
+            .copy_from_slice(product_code);
 
         let pvd = 16 * ISO_SECTOR_SIZE as usize;
         iso[pvd] = 1;
@@ -4769,6 +4870,62 @@ mod tests {
         let chd_path = write_fixture(&directory, "unrelated-title.chd", &ps1_chd(&iso));
         let report = inspect_game_identity(&chd_path, Some("Dreamcast"));
         assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+    }
+
+    #[test]
+    fn sega_cd_iso_cue_and_chd_verify_disc_id_product_code() {
+        let directory = FixtureDir::new("sega-cd-identity");
+        let iso = sega_cd_iso(b"GM T-12345 -00");
+        let iso_path = write_fixture(&directory, "filename-does-not-matter.iso", &iso);
+        let report = inspect_game_identity(&iso_path, Some("Sega CD"));
+        assert_eq!(report.platform, IdentityPlatform::SegaCd);
+        assert_eq!(
+            report.verified_sega_cd_product_code(),
+            Some("GM T-12345-00")
+        );
+        assert!(report.complete);
+
+        let bin_path = directory.0.join("content.bin");
+        fs::write(&bin_path, ps1_raw_bin(&iso)).unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "unrelated-title.cue",
+            b"FILE \"content.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("Mega CD"));
+        assert_eq!(
+            report.verified_sega_cd_product_code(),
+            Some("GM T-12345-00")
+        );
+        assert!(report.complete);
+
+        let chd_path = write_fixture(&directory, "unrelated-title.chd", &ps1_chd(&iso));
+        let report = inspect_game_identity(&chd_path, Some("Sega CD"));
+        assert_eq!(
+            report.verified_sega_cd_product_code(),
+            Some("GM T-12345-00")
+        );
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn sega_cd_identity_rejects_wrong_signature_or_product_field() {
+        let directory = FixtureDir::new("sega-cd-invalid");
+        let mut wrong = sega_cd_iso(b"GM T-12345 -00");
+        wrong[..SEGA_CD_BOOT_SIGNATURE.len()].copy_from_slice(b"NOTASEGACDSIGN");
+        let path = write_fixture(&directory, "wrong.iso", &wrong);
+        let report = inspect_game_identity(&path, Some("Sega CD"));
+        assert_eq!(report.verified_sega_cd_product_code(), None);
+        assert!(!report.complete);
+
+        let path = write_fixture(
+            &directory,
+            "missing-product.iso",
+            &sega_cd_iso(b"              "),
+        );
+        let report = inspect_game_identity(&path, Some("Sega CD"));
+        assert_eq!(report.verified_sega_cd_product_code(), None);
+        assert!(!report.complete);
     }
 
     #[test]

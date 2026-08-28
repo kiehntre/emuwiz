@@ -21,7 +21,7 @@ use crate::emulator_environment::retroarch::{
     RetroArchEnvironmentReport, RetroArchProfile,
 };
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
-use crate::launch::platform_map::retroarch_platform_candidate;
+use crate::launch::platform_map::retroarch_platform_matches;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 
 /// The executable invocation data for a launch that has passed every
@@ -148,7 +148,7 @@ fn selected_core<'a>(
         }
     };
 
-    if retroarch_platform_candidate(&core.info) != Some(platform_id) {
+    if !retroarch_platform_matches(&core.info, platform_id) {
         blockers.push(blocker(
             LaunchBlockerKind::RetroArchCoreMismatch,
             format!("the selected RetroArch core `{stem}` no longer resolves to the candidate platform `{platform_id}`"),
@@ -342,6 +342,14 @@ mod tests {
     }
 
     fn core(stem: &str, system_name: Option<&str>) -> CoreFinding {
+        core_with_database(stem, system_name, None)
+    }
+
+    fn core_with_database(
+        stem: &str,
+        system_name: Option<&str>,
+        database: Option<&str>,
+    ) -> CoreFinding {
         CoreFinding {
             file_name: EncodedPath::from_path(&PathBuf::from(format!("{stem}_libretro.so"))),
             full_path: EncodedPath::from_path(&PathBuf::from(format!(
@@ -356,7 +364,7 @@ mod tests {
                 core_name: Some(stem.to_string()),
                 manufacturer: None,
                 categories: None,
-                database: None,
+                database: database.map(str::to_string),
                 firmware: Vec::new(),
             },
         }
@@ -425,6 +433,45 @@ mod tests {
 
     fn has_blocker(plan: &RetroArchCommandPlan, kind: LaunchBlockerKind) -> bool {
         plan.blockers.iter().any(|blocker| blocker.kind == kind)
+    }
+
+    #[test]
+    fn genesis_plus_gx_metadata_plans_a_sega_cd_command_without_changing_content_path() {
+        let mut selected = candidate(Some(PathBuf::from("/games/actual-title.cue")));
+        selected.target = LaunchTarget::RetroArchCore {
+            profile: profile_ref(),
+            core_stem: "genesis_plus_gx".to_string(),
+            platform_id: "Sega CD",
+        };
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Sega CD".to_string(),
+            game_key: "GM T-12345-00".to_string(),
+        });
+        let plan = build_retroarch_command_plan(
+            &identity,
+            &selected,
+            &report(
+                vec!["/usr/bin/retroarch"],
+                vec![core_with_database(
+                    "genesis_plus_gx",
+                    Some("Sega - MS/GG/MD/CD"),
+                    Some(
+                        "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis",
+                    ),
+                )],
+            ),
+        );
+        let command = plan.command.expect("reviewed Sega CD core should plan");
+        assert!(plan.blockers.is_empty());
+        assert_eq!(command.selection.platform_id, "Sega CD");
+        assert_eq!(
+            command.arguments,
+            vec![
+                OsString::from("-L"),
+                OsString::from("/retroarch/cores/genesis_plus_gx_libretro.so"),
+                OsString::from("/games/actual-title.cue"),
+            ]
+        );
     }
 
     #[test]

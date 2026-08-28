@@ -401,6 +401,29 @@ fn alias_resolvable_systemname_becomes_a_candidate() {
 }
 
 #[test]
+fn genesis_plus_gx_can_plan_a_sega_cd_candidate_from_reviewed_metadata() {
+    let plan = build_launch_plan(
+        &resolved("Sega CD"),
+        &resolved_content(),
+        &[],
+        &retroarch_environment_with_cores(vec![core_finding(
+            "genesis_plus_gx",
+            Some("Sega - MS/GG/MD/CD"),
+            Some(
+                "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis",
+            ),
+        )]),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 1);
+    assert!(matches!(
+        plan.candidates[0].target,
+        LaunchTarget::RetroArchCore { .. }
+    ));
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+}
+
+#[test]
 fn alias_resolvable_database_becomes_a_candidate_when_systemname_absent() {
     let plan = build_launch_plan(
         &resolved("NES"),

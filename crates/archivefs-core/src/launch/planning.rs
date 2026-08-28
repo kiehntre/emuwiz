@@ -30,9 +30,7 @@ use std::path::PathBuf;
 use crate::emulator_environment::retroarch::{
     CoreInfoFinding, ProfileRef, RetroArchEnvironmentReport,
 };
-use crate::launch::platform_map::{
-    launch_compatibility_for_platform, retroarch_platform_candidate,
-};
+use crate::launch::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
 use crate::launch::readiness::{
     FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchReadiness, LaunchWarning,
     LaunchWarningKind, retroarch_core_firmware_readiness,
@@ -327,7 +325,7 @@ fn matching_retroarch_cores(
     let mut matches = Vec::new();
     for profile in &environment.profiles {
         for core in &profile.cores {
-            if retroarch_platform_candidate(&core.info) == Some(platform_id) {
+            if retroarch_platform_matches(&core.info, platform_id) {
                 matches.push(RetroArchCoreMatch {
                     profile: ProfileRef {
                         profile_kind: profile.profile_kind,

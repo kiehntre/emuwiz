@@ -170,6 +170,60 @@ fn verified_dreamcast_product_code_resolves_to_flycast_fact() {
 }
 
 #[test]
+fn verified_sega_cd_product_code_resolves_to_retroarch_fact() {
+    let source = report(
+        IdentityPlatform::SegaCd,
+        vec![evidence(
+            IdentityKind::SegaCdProductCode,
+            IdentityStatus::Verified,
+            Some("GM T-12345-00"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Sega CD".to_string(),
+            game_key: "GM T-12345-00".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::SegaCdProductCode(
+            "GM T-12345-00".to_string()
+        )]
+    );
+}
+
+#[test]
+fn conflicting_sega_cd_product_codes_never_produce_a_retroarch_fact() {
+    let source = report(
+        IdentityPlatform::SegaCd,
+        vec![
+            evidence(
+                IdentityKind::SegaCdProductCode,
+                IdentityStatus::Verified,
+                Some("GM T-12345-00"),
+                IdentityConfidence::ExactBytes,
+            ),
+            evidence(
+                IdentityKind::SegaCdProductCode,
+                IdentityStatus::Verified,
+                Some("GM T-99999-00"),
+                IdentityConfidence::ExactBytes,
+            ),
+        ],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+    assert_eq!(status, CanonicalIdentityStatus::Conflicting);
+    assert!(facts.is_empty());
+}
+
+#[test]
 fn conflicting_dreamcast_product_codes_never_produce_a_flycast_fact() {
     let source = report(
         IdentityPlatform::Dreamcast,

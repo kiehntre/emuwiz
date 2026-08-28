@@ -135,6 +135,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "Sega CD",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["genesis_plus_gx"],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "AtariST",
         standalone_adapters: &["hatari"],
         retroarch_core_hints: &["hatari"],
@@ -238,6 +244,28 @@ pub fn retroarch_platform_candidate(info: &CoreInfoFinding) -> Option<&'static s
         .or_else(|| database.as_deref().and_then(resolve_info_text))
 }
 
+/// Whether a core's reviewed `.info` metadata explicitly names `platform_id`.
+///
+/// Genesis Plus GX advertises its shared hardware family in `systemname` as
+/// `Sega - MS/GG/MD/CD`, whose first resolvable segment is Game Gear. Its
+/// database field separately names the exact `Sega - Mega-CD - Sega CD`
+/// database. The Sega CD launch path therefore checks that exact database
+/// field as an additional, platform-specific match without changing the
+/// existing single-candidate behaviour for other platforms.
+pub fn retroarch_platform_matches(info: &CoreInfoFinding, platform_id: &str) -> bool {
+    if retroarch_platform_candidate(info) == Some(platform_id) {
+        return true;
+    }
+    platform_id == "Sega CD"
+        && matches!(
+            info,
+            CoreInfoFinding::Found { database: Some(database), .. }
+                if database
+                    .split('|')
+                    .any(|alternative| resolve_info_text(alternative) == Some("Sega CD"))
+        )
+}
+
 /// Whether `extension` (already lowercased, no dot) is plausible content
 /// for `platform_id` at all, per the platform registry's own
 /// `strong_extensions`/`weak_extensions`. This never creates or authorizes
@@ -333,6 +361,24 @@ mod tests {
         // `emulator_environment::retroarch`'s own tests.
         let info = found(Some("Nintendo - SNES / SFC"), None);
         assert_eq!(retroarch_platform_candidate(&info), Some("SNES"));
+    }
+
+    #[test]
+    fn reviewed_genesis_plus_gx_sega_cd_metadata_resolves_to_sega_cd() {
+        let info = found(
+            Some("Sega - MS/GG/MD/CD"),
+            Some(
+                "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis",
+            ),
+        );
+        assert_eq!(retroarch_platform_candidate(&info), Some("GameGear"));
+        assert!(retroarch_platform_matches(&info, "Sega CD"));
+        assert!(
+            launch_compatibility_for_platform("Sega CD")
+                .expect("Sega CD has a reviewed RetroArch mapping")
+                .retroarch_core_hints
+                .contains(&"genesis_plus_gx")
+        );
     }
 
     #[test]
