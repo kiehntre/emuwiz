@@ -8,6 +8,10 @@ use std::path::PathBuf;
 
 use archivefs_core::dat::identity::{DatPlatformConfidence, DatPlatformIdentity};
 use archivefs_core::dat::rename_apply::model::TransactionState;
+use archivefs_core::emulator_environment::es_de::{
+    DiscoveryEnvironment, discover_es_de_environment,
+};
+use archivefs_core::playing_library::{RetroDeckVisibility, build_retrodeck_projection};
 
 use super::*;
 
@@ -518,6 +522,178 @@ fn preview_a_single_election(fixture: &Fixture) -> (PlayingLibraryPageState, Pat
     (state, original, destination)
 }
 
+fn retrodeck_profile(
+    fixture: &Fixture,
+) -> archivefs_core::emulator_environment::es_de::EsDeProfile {
+    let home = fixture.path("retrodeck-home");
+    std::fs::create_dir_all(home.join("ES-DE/custom_systems")).unwrap();
+    let systems = format!(
+        "<systemList><system><name>psx</name><fullname>PlayStation</fullname><path>{}/roms/psx</path><extension>.cue .bin</extension><platform>psx</platform><theme>psx</theme></system></systemList>",
+        home.display()
+    );
+    std::fs::write(home.join("ES-DE/custom_systems/es_systems.xml"), systems).unwrap();
+    discover_es_de_environment(
+        &archivefs_core::emulator_environment::HostReadOnlyFilesystem,
+        &DiscoveryEnvironment {
+            home: Some(home.into_os_string()),
+            path: Some("".into()),
+            explicit_bundled_systems_files: vec![],
+            appimage_search_roots: vec![],
+            explicit_root: None,
+            explicit_appimages: vec![],
+            explicit_portables: vec![],
+        },
+    )
+    .unwrap()
+    .profiles
+    .into_iter()
+    .find(|profile| !profile.system_data.is_empty())
+    .unwrap()
+}
+
+fn install_retrodeck_projection(
+    state: &mut PlayingLibraryPageState,
+    fixture: &Fixture,
+    visibility: RetroDeckVisibility,
+) {
+    let plan = state.plan.clone().unwrap();
+    let identity = state.dat_platform_identity.clone().unwrap();
+    let profile = retrodeck_profile(fixture);
+    let gamelist = PathBuf::from(
+        &profile
+            .system_data
+            .iter()
+            .find(|entry| entry.system_name == "psx")
+            .unwrap()
+            .gamelist_file
+            .path
+            .display,
+    );
+    std::fs::create_dir_all(gamelist.parent().unwrap()).unwrap();
+    std::fs::write(&gamelist, "<gameList>\n<!-- keep -->\n</gameList>\n").unwrap();
+    state.retrodeck_projection = Some(
+        build_retrodeck_projection(
+            &plan,
+            &identity,
+            fixture.path("retrodeck-destination"),
+            visibility,
+            &profile,
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
+    let fixture = Fixture::new("retrodeck-gui-success");
+    let (mut state, original, _destination) = preview_a_single_election(&fixture);
+    state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+        platform: "PSX".into(),
+        machine_key: None,
+        confidence: DatPlatformConfidence::Strong,
+        evidence: Vec::new(),
+    });
+    install_retrodeck_projection(
+        &mut state,
+        &fixture,
+        RetroDeckVisibility::verified_same_path_bind(
+            fixture.path("roms"),
+            fixture.path("retrodeck-destination"),
+        )
+        .unwrap(),
+    );
+    let (gamelist, destinations) = {
+        let projection = state.retrodeck_projection.as_ref().unwrap();
+        assert_eq!(projection.es_de_publication.added.len(), 1);
+        (
+            projection.es_de_publication.gamelist_path.clone(),
+            projection
+                .playing_library_plan
+                .operations
+                .iter()
+                .map(|op| op.destination_path.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    state.request_retrodeck_apply();
+    assert!(state.retrodeck_pending_apply);
+    assert!(!destinations.iter().any(|path| path.exists()));
+    state.confirm_retrodeck_apply();
+    assert!(
+        state.retrodeck_error.is_none(),
+        "{:?}",
+        state.retrodeck_error
+    );
+    assert!(state.retrodeck_applied.is_some());
+    assert!(
+        std::fs::read_to_string(&gamelist)
+            .unwrap()
+            .contains("<game>")
+    );
+    assert_eq!(std::fs::read(&original).unwrap(), b"test");
+    let ctx = egui::Context::default();
+    let (output, _) = render(&ctx, &mut state, base_input());
+    assert!(rendered_text_contains(&output, "RetroDECK library created"));
+    state.rollback_retrodeck();
+    assert_eq!(
+        std::fs::read_to_string(&gamelist).unwrap(),
+        "<gameList>\n<!-- keep -->\n</gameList>\n"
+    );
+    assert!(!destinations.iter().any(|path| path.exists()));
+    let (output, _) = render(&ctx, &mut state, base_input());
+    assert!(rendered_text_contains(
+        &output,
+        "RetroDECK library rolled back"
+    ));
+}
+
+#[test]
+fn retrodeck_gui_cancel_and_publication_failure_make_no_false_success() {
+    let fixture = Fixture::new("retrodeck-gui-failure");
+    let (mut state, original, _destination) = preview_a_single_election(&fixture);
+    state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+        platform: "PSX".into(),
+        machine_key: None,
+        confidence: DatPlatformConfidence::Strong,
+        evidence: Vec::new(),
+    });
+    install_retrodeck_projection(
+        &mut state,
+        &fixture,
+        RetroDeckVisibility::verified_same_path_bind(
+            fixture.path("roms"),
+            fixture.path("retrodeck-destination"),
+        )
+        .unwrap(),
+    );
+    let (gamelist, destinations) = {
+        let projection = state.retrodeck_projection.as_ref().unwrap();
+        (
+            projection.es_de_publication.gamelist_path.clone(),
+            projection
+                .playing_library_plan
+                .operations
+                .iter()
+                .map(|op| op.destination_path.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    state.request_retrodeck_apply();
+    state.cancel_retrodeck_apply();
+    assert!(state.retrodeck_applied.is_none());
+    assert!(!destinations.iter().any(|path| path.exists()));
+    let parent = gamelist.parent().unwrap().to_path_buf();
+    std::fs::remove_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+    std::fs::write(&parent, b"blocking file").unwrap();
+    state.request_retrodeck_apply();
+    state.confirm_retrodeck_apply();
+    assert!(state.retrodeck_applied.is_none());
+    assert!(state.retrodeck_error.is_some());
+    assert!(!destinations.iter().any(|path| path.exists()));
+    assert_eq!(std::fs::read(&original).unwrap(), b"test");
+}
+
 #[test]
 fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
     let fixture = Fixture::new("apply-seam");
@@ -614,6 +790,31 @@ fn romm_preview_shows_slug_counts_visibility_and_keeps_details_collapsed() {
     assert!(rendered_text_contains(&output, "Visibility: Unverified"));
     assert!(rendered_text_contains(&output, "Apply is blocked"));
     assert!(!rendered_text_contains(&output, "Launcher:"));
+}
+
+#[test]
+fn retrodeck_preview_card_is_visible_and_unverified_apply_is_blocked() {
+    let fixture = Fixture::new("retrodeck-preview");
+    let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+    state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+        platform: "PSX".to_string(),
+        machine_key: None,
+        confidence: DatPlatformConfidence::Strong,
+        evidence: Vec::new(),
+    });
+    let ctx = egui::Context::default();
+    let (output, action) = render(&ctx, &mut state, base_input());
+    assert!(action.is_none());
+    assert!(rendered_text_contains(&output, "Build RetroDECK Library"));
+    assert!(rendered_text_contains(
+        &output,
+        "RetroDECK destination root:"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Sandbox-visible source root:"
+    ));
+    assert!(!rendered_text_contains(&output, "Create RetroDECK Library"));
 }
 
 #[test]

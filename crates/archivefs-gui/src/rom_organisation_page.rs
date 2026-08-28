@@ -812,6 +812,11 @@ fn apply_playing_library_action(
         PlayingLibraryPageAction::CancelRommApply => state.cancel_romm_apply(),
         PlayingLibraryPageAction::ConfirmRommApply => state.confirm_romm_apply(),
         PlayingLibraryPageAction::RollbackRomm => state.rollback_romm_last(),
+        PlayingLibraryPageAction::PreviewRetroDeck => state.preview_retrodeck(),
+        PlayingLibraryPageAction::RequestRetroDeckApply => state.request_retrodeck_apply(),
+        PlayingLibraryPageAction::CancelRetroDeckApply => state.cancel_retrodeck_apply(),
+        PlayingLibraryPageAction::ConfirmRetroDeckApply => state.confirm_retrodeck_apply(),
+        PlayingLibraryPageAction::RollbackRetroDeck => state.rollback_retrodeck(),
     }
 }
 

@@ -28,6 +28,7 @@ pub mod apply_adapter;
 pub mod evidence;
 pub mod matching;
 pub mod model;
+pub mod retrodeck_projection;
 pub mod romm_projection;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +44,10 @@ pub use model::{
     ExcludedCandidate, LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan,
     PlayingLibraryPolicy, RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber,
     UnresolvedGroup,
+};
+pub use retrodeck_projection::{
+    RetroDeckProjectedGame, RetroDeckProjectionPlan, RetroDeckVisibility,
+    build_retrodeck_projection, build_retrodeck_projection_transaction,
 };
 pub use romm_projection::{
     RommLibraryProjectionPlan, RommProjectedGame, RommVisibility, build_romm_projection,

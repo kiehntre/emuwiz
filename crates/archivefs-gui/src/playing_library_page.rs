@@ -37,9 +37,11 @@ use archivefs_core::launch::es_de_publish::{
 };
 use archivefs_core::playing_library::{
     CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest,
-    ReleaseClass, RommLibraryProjectionPlan, RommVisibility, build_playing_library_plan,
-    build_playing_library_transaction, build_romm_projection_transaction,
-    build_romm_projection_with_visibility, match_loose_files_against_dat,
+    ReleaseClass, RetroDeckProjectionPlan, RetroDeckVisibility, RommLibraryProjectionPlan,
+    RommVisibility, build_playing_library_plan, build_playing_library_transaction,
+    build_retrodeck_projection, build_retrodeck_projection_transaction,
+    build_romm_projection_transaction, build_romm_projection_with_visibility,
+    match_loose_files_against_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -91,6 +93,14 @@ pub(crate) struct PlayingLibraryPageState {
     romm_error: Option<String>,
     romm_visibility_verified: bool,
     romm_visible_source_root_draft: String,
+    retrodeck_projection: Option<RetroDeckProjectionPlan>,
+    retrodeck_error: Option<String>,
+    retrodeck_visibility_verified: bool,
+    retrodeck_visible_source_root_draft: String,
+    retrodeck_destination_root_draft: String,
+    retrodeck_pending_apply: bool,
+    retrodeck_confirm_text: String,
+    retrodeck_applied: Option<RenameTransaction>,
     /// The plan that produced `applied`, kept (instead of dropped like
     /// `plan` is) purely so "Publish to ES-DE" - offered only once a
     /// library has actually been created - can still name which elections
@@ -162,6 +172,14 @@ impl Default for PlayingLibraryPageState {
             romm_error: None,
             romm_visibility_verified: false,
             romm_visible_source_root_draft: String::new(),
+            retrodeck_projection: None,
+            retrodeck_error: None,
+            retrodeck_visibility_verified: false,
+            retrodeck_visible_source_root_draft: String::new(),
+            retrodeck_destination_root_draft: String::new(),
+            retrodeck_pending_apply: false,
+            retrodeck_confirm_text: String::new(),
+            retrodeck_applied: None,
             applied_plan: None,
             apply_error: None,
             journal_dir: default_rename_transaction_dir()
@@ -380,6 +398,158 @@ impl PlayingLibraryPageState {
         ) {
             Ok(projection) => self.romm_projection = Some(projection),
             Err(error) => self.romm_error = Some(error),
+        }
+    }
+
+    pub(crate) fn preview_retrodeck(&mut self) {
+        self.retrodeck_projection = None;
+        self.retrodeck_error = None;
+        let (Some(plan), Some(identity)) = (&self.plan, &self.dat_platform_identity) else {
+            self.retrodeck_error = Some("build a Playing Library preview first".into());
+            return;
+        };
+        let destination = PathBuf::from(self.retrodeck_destination_root_draft.trim());
+        let source = self.source_root_draft_path();
+        let visible = PathBuf::from(self.retrodeck_visible_source_root_draft.trim());
+        let visibility = if self.retrodeck_visibility_verified && visible == source {
+            RetroDeckVisibility::verified_same_path_bind(source, destination.clone())
+                .unwrap_or_else(|_| RetroDeckVisibility::unverified(None, None, None, None))
+        } else {
+            RetroDeckVisibility::unverified(
+                Some(source),
+                (!visible.as_os_str().is_empty()).then_some(visible),
+                Some(destination.clone()),
+                None,
+            )
+        };
+        let report = match self.discover_esde_report() {
+            Ok(report) => report,
+            Err(error) => {
+                self.retrodeck_error = Some(error);
+                return;
+            }
+        };
+        let Some(platform_id) = identity.platform() else {
+            self.retrodeck_error = Some("platform evidence is not resolved".into());
+            return;
+        };
+        let Some(profile) = report.profiles.into_iter().find(|profile| {
+            es_de_system_for_platform(platform_id).is_some()
+                && profile.system_data.iter().any(|system| {
+                    system.system_name
+                        == es_de_system_for_platform(platform_id).unwrap().es_de_system
+                })
+        }) else {
+            self.retrodeck_error =
+                Some("no configured ES-DE system was found for this verified platform".into());
+            return;
+        };
+        match build_retrodeck_projection(plan, identity, destination, visibility, &profile) {
+            Ok(projection) => self.retrodeck_projection = Some(projection),
+            Err(error) => self.retrodeck_error = Some(error),
+        }
+    }
+
+    pub(crate) fn request_retrodeck_apply(&mut self) {
+        if self.retrodeck_projection.is_some() {
+            self.retrodeck_pending_apply = true;
+            self.retrodeck_confirm_text.clear();
+        }
+    }
+    pub(crate) fn cancel_retrodeck_apply(&mut self) {
+        self.retrodeck_pending_apply = false;
+        self.retrodeck_confirm_text.clear();
+    }
+    pub(crate) fn confirm_retrodeck_apply(&mut self) {
+        let Some(projection) = &self.retrodeck_projection else {
+            return;
+        };
+        if projection.total_files > TYPED_CONFIRMATION_THRESHOLD
+            && self.retrodeck_confirm_text.trim()
+                != playing_library_confirmation_phrase(projection.total_files)
+        {
+            self.retrodeck_error = Some("the typed confirmation did not match".into());
+            return;
+        }
+        let mut transaction =
+            match build_retrodeck_projection_transaction(projection, self.plan_generation) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.retrodeck_error = Some(error);
+                    return;
+                }
+            };
+        if let Err(error) = std::fs::create_dir_all(&projection.retrodeck_rom_root) {
+            self.retrodeck_error = Some(error.to_string());
+            return;
+        }
+        if let Err(error) = write_journal(&self.journal_dir, &transaction) {
+            self.retrodeck_error = Some(error.to_string());
+            return;
+        }
+        let approved_paths = transaction
+            .entries
+            .iter()
+            .map(|entry| entry.source_path.to_string_lossy().into_owned())
+            .collect();
+        let trusted = TrustedRoots::from_paths([
+            projection.retrodeck_rom_root.clone(),
+            self.source_root_draft_path(),
+        ]);
+        let result = apply_transaction(&mut ApplyExecution {
+            transaction: &mut transaction,
+            approved_paths,
+            current_generation: self.plan_generation,
+            trusted,
+            journal_dir: self.journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        });
+        self.retrodeck_pending_apply = false;
+        match result {
+            Ok(mut outcome) => {
+                if let Err(error) =
+                    archivefs_core::launch::es_de_publish::apply_es_de_gamelist_publication(
+                        &projection.es_de_publication,
+                    )
+                {
+                    let rollback_error = rollback_transaction(
+                        &mut outcome.transaction,
+                        &self.journal_dir,
+                        &AtomicBool::new(false),
+                    )
+                    .err();
+                    self.retrodeck_error = Some(match rollback_error {
+                        Some(rollback) => format!(
+                            "ES-DE publication failed: {error}; link rollback also failed: {rollback}"
+                        ),
+                        None => error.to_string(),
+                    });
+                } else {
+                    self.retrodeck_applied = Some(outcome.transaction);
+                }
+            }
+            Err(error) => self.retrodeck_error = Some(error.to_string()),
+        }
+    }
+
+    pub(crate) fn rollback_retrodeck(&mut self) {
+        if let Some(projection) = &self.retrodeck_projection
+            && let Err(error) =
+                archivefs_core::launch::es_de_publish::rollback_es_de_gamelist_publication(
+                    &projection.es_de_publication,
+                )
+        {
+            self.retrodeck_error = Some(error.to_string());
+            return;
+        }
+        if let Some(transaction) = &mut self.retrodeck_applied
+            && let Err(error) =
+                rollback_transaction(transaction, &self.journal_dir, &AtomicBool::new(false))
+        {
+            self.retrodeck_error = Some(error);
         }
     }
 
@@ -875,6 +1045,11 @@ pub(crate) enum PlayingLibraryPageAction {
     CancelRommApply,
     ConfirmRommApply,
     RollbackRomm,
+    PreviewRetroDeck,
+    RequestRetroDeckApply,
+    CancelRetroDeckApply,
+    ConfirmRetroDeckApply,
+    RollbackRetroDeck,
 }
 
 /// Stable, absolute widget ids for the text fields a test needs to drive
@@ -1048,6 +1223,7 @@ pub(crate) fn show_playing_library_page(
         show_preview_summary(ui, plan, state, &mut action);
         ui.add_space(10.0);
         show_romm_projection_summary(ui, state, &mut action);
+        show_retrodeck_projection_summary(ui, state, &mut action);
     }
 
     if let Some(transaction) = state.applied() {
@@ -1270,6 +1446,157 @@ fn show_romm_projection_summary(
                             "  Companion: {} -> {}",
                             companion.destination_path.display(),
                             companion.source_path.display()
+                        ));
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn show_retrodeck_projection_summary(
+    ui: &mut egui::Ui,
+    state: &mut PlayingLibraryPageState,
+    action: &mut Option<PlayingLibraryPageAction>,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(ui, "Build RetroDECK Library", None);
+        ui.label("Create a separate RetroDECK/ES-DE library of verified releases. Source files are never changed.");
+        ui.horizontal(|ui| {
+            ui.label("RetroDECK destination root:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.retrodeck_destination_root_draft)
+                    .desired_width(320.0)
+                    .hint_text("e.g. /mnt/roms/RetroDECK"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Sandbox-visible source root:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.retrodeck_visible_source_root_draft)
+                    .desired_width(320.0)
+                    .hint_text("same absolute path for a reviewed bind"),
+            );
+        });
+        if ui
+            .checkbox(
+                &mut state.retrodeck_visibility_verified,
+                "I have verified RetroDECK can see these paths at the same absolute locations",
+            )
+            .changed()
+        {
+            state.retrodeck_projection = None;
+        }
+        if widgets::action_button(
+            ui,
+            "Preview RetroDECK Library",
+            widgets::ActionStyle::Secondary,
+            state.plan.is_some(),
+        )
+        .clicked()
+        {
+            *action = Some(PlayingLibraryPageAction::PreviewRetroDeck);
+        }
+        if let Some(error) = &state.retrodeck_error {
+            ui.label(egui::RichText::new(error).color(theme::WARNING));
+        }
+        if let Some(projection) = &state.retrodeck_projection {
+            ui.label(format!(
+                "Destination: {}",
+                projection.retrodeck_rom_root.display()
+            ));
+            ui.label(format!(
+                "{} game(s), {} file(s), ES-DE system `{}`",
+                projection.games.len(),
+                projection.total_files,
+                projection.es_de_system
+            ));
+            let companions: usize = projection
+                .games
+                .iter()
+                .map(|game| game.companions.len())
+                .sum();
+            ui.label(format!(
+                "{companions} companion file(s) kept with their launchers"
+            ));
+            ui.label(format!(
+                "Visibility: {}",
+                projection.visibility.description()
+            ));
+            if !projection.visibility.is_verified() {
+                ui.label(egui::RichText::new("Apply is blocked until source and destination visibility is explicitly verified.").color(theme::WARNING));
+            }
+            if !state.retrodeck_pending_apply
+                && state.retrodeck_applied.is_none()
+                && widgets::action_button(
+                    ui,
+                    "Create RetroDECK Library",
+                    widgets::ActionStyle::Primary,
+                    projection.visibility.is_verified(),
+                )
+                .clicked()
+            {
+                *action = Some(PlayingLibraryPageAction::RequestRetroDeckApply);
+            }
+            if state.retrodeck_pending_apply {
+                if projection.total_files > TYPED_CONFIRMATION_THRESHOLD {
+                    ui.label(format!(
+                        "Type \"{}\" to confirm:",
+                        playing_library_confirmation_phrase(projection.total_files)
+                    ));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.retrodeck_confirm_text)
+                            .desired_width(260.0),
+                    );
+                }
+                if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Destructive, true)
+                    .clicked()
+                {
+                    *action = Some(PlayingLibraryPageAction::ConfirmRetroDeckApply);
+                }
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
+                    *action = Some(PlayingLibraryPageAction::CancelRetroDeckApply);
+                }
+            }
+            if let Some(transaction) = &state.retrodeck_applied {
+                if transaction.state == TransactionState::RolledBack {
+                    ui.label(
+                        egui::RichText::new(
+                            "RetroDECK library rolled back; generated links were removed.",
+                        )
+                        .color(theme::SUCCESS),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "RetroDECK library created: {} link(s)",
+                            transaction.applied_count()
+                        ))
+                        .color(theme::SUCCESS),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Roll back RetroDECK Library",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::RollbackRetroDeck);
+                    }
+                }
+            }
+            widgets::technical_details(ui, "playing_library_retrodeck_files", |ui| {
+                for game in &projection.games {
+                    ui.label(format!(
+                        "Launcher: {}",
+                        game.launcher.destination_path.display()
+                    ));
+                    for companion in &game.companions {
+                        ui.label(format!(
+                            "Companion: {}",
+                            companion.destination_path.display()
                         ));
                     }
                 }
