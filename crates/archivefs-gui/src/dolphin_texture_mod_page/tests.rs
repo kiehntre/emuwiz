@@ -18,11 +18,12 @@ use archivefs_core::game_identity::{
 };
 use archivefs_core::patch_manager::{
     DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DolphinInstallationType, DolphinProfileScope,
-    DolphinSettingsDirectoryState, DolphinTextureModIdentity, DolphinTexturePackFile,
-    DolphinTexturePackManifest, DolphinTexturePackPreviewRequest, EmulatorDestinationDirectories,
-    EmulatorInstallationType, EmulatorProfileConfidence, PreviewAdapter, ResolvedEmulatorProfile,
-    SharedApplyContext, SharedApplyEntry, SharedApplyOutcome, SharedApplyResult, SharedApplyStatus,
-    SharedPlanEntry, SharedPreviewReport, SharedTransactionPath, SharedTransactionStage,
+    DolphinSettingsDirectoryState, DolphinTextureModIdentity, DolphinTexturePackBuildRequest,
+    DolphinTexturePackFile, DolphinTexturePackManifest, DolphinTexturePackPreviewRequest,
+    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
+    PreviewAdapter, ResolvedEmulatorProfile, SharedApplyContext, SharedApplyEntry,
+    SharedApplyOutcome, SharedApplyResult, SharedApplyStatus, SharedPlanEntry, SharedPreviewReport,
+    SharedTransactionPath, SharedTransactionStage, build_dolphin_texture_pack_manifest,
     build_dolphin_texture_pack_preview,
 };
 use tempfile::TempDir;
@@ -199,6 +200,7 @@ fn sample_pack_plan() -> (TempDir, DolphinTexturePackPlan) {
         source_root: source_root.clone(),
         files: vec![DolphinTexturePackFile {
             source_path: source,
+            source_relative_path: PathBuf::from("menu with unicode.png"),
             destination_filename: "menu.png".to_string(),
             size_bytes: 1,
             sha256: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".to_string(),
@@ -216,6 +218,55 @@ fn sample_pack_plan() -> (TempDir, DolphinTexturePackPlan) {
     })
     .unwrap();
     (dir, plan)
+}
+
+#[test]
+fn builder_preview_shows_verified_target_and_accepted_files_without_installing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pack");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("texture.png");
+    std::fs::write(&source, b"texture").unwrap();
+    let identity = DolphinTextureModIdentity {
+        game_id: "GALE01".to_string(),
+        platform: IdentityPlatform::GameCube,
+    };
+    let preview = build_dolphin_texture_pack_manifest(&DolphinTexturePackBuildRequest {
+        source_root: root.clone(),
+        identity: identity.clone(),
+        name: "Builder Pack".to_string(),
+        version: Some("2".to_string()),
+    })
+    .unwrap();
+    assert!(preview.complete);
+    let before = std::fs::read(&source).unwrap();
+    let output = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_pack_builder_preview(
+                ui,
+                &mut DolphinTextureModPageState::default(),
+                preview.clone(),
+                root.clone(),
+                PathBuf::from("/library/game.iso"),
+                identity.clone(),
+                dir.path().join("dest"),
+            )
+        });
+    });
+    assert!(rendered_text_contains(&output, "GALE01"));
+    assert!(rendered_text_contains(&output, "Accepted PNG files: 1"));
+    assert_eq!(std::fs::read(source).unwrap(), before);
+}
+
+#[test]
+fn saving_manifest_never_overwrites_existing_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pack.json");
+    std::fs::write(&path, b"existing").unwrap();
+    let (_, plan) = sample_pack_plan();
+    let error = save_pack_manifest(&path, &plan.manifest).unwrap_err();
+    assert!(error.contains("overwrite"));
+    assert_eq!(std::fs::read(path).unwrap(), b"existing");
 }
 
 // --- blocked prerequisites ----------------------------------------------------

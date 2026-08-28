@@ -46,6 +46,8 @@ mod tests;
 pub const DOLPHIN_TEXTURE_PACK_SOURCE_MODE: &str = "dolphin_texture_pack";
 pub const DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT: &str = "emuwiz.dolphin_texture_pack.v1";
 pub const DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+pub const DOLPHIN_TEXTURE_PACK_MAX_TOTAL_SOURCE_BYTES: u64 =
+    super::shared_transaction::SHARED_MAX_TOTAL_WRITTEN_BYTES;
 const MAX_PACK_FILES: usize = 256;
 const MAX_PACK_NAME_BYTES: usize = 256;
 const MAX_PACK_VERSION_BYTES: usize = 128;
@@ -54,6 +56,9 @@ const MAX_PACK_VERSION_BYTES: usize = 128;
 #[serde(deny_unknown_fields)]
 pub struct DolphinTexturePackFile {
     pub source_path: PathBuf,
+    /// The source path relative to the explicitly selected pack root.
+    #[serde(default)]
+    pub source_relative_path: PathBuf,
     /// A single filename beneath `<verified GameID>`, not an arbitrary path.
     pub destination_filename: String,
     pub size_bytes: u64,
@@ -79,6 +84,28 @@ pub struct DolphinTexturePackPreviewRequest {
     pub destination_root: PathBuf,
     pub source_root: PathBuf,
     pub manifest: DolphinTexturePackManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinTexturePackBuildRequest {
+    pub source_root: PathBuf,
+    pub identity: DolphinTextureModIdentity,
+    pub name: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinTexturePackRejectedFile {
+    pub relative_path: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinTexturePackBuildPreview {
+    pub manifest: DolphinTexturePackManifest,
+    pub rejected: Vec<DolphinTexturePackRejectedFile>,
+    pub total_bytes: u64,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +281,18 @@ pub fn validate_dolphin_texture_pack_manifest(
     })?;
     let mut destinations = BTreeSet::new();
     for file in &manifest.files {
+        if !file.source_relative_path.as_os_str().is_empty()
+            && (file.source_relative_path.is_absolute()
+                || file
+                    .source_relative_path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir | Component::CurDir)))
+        {
+            return Err(pack_error(
+                DolphinTextureModErrorKind::SourceOutsideApprovedScope,
+                "texture pack source-relative path is unsafe",
+            ));
+        }
         if !valid_sha256(&file.sha256) {
             return Err(pack_error(
                 DolphinTextureModErrorKind::SourceChanged,
@@ -304,6 +343,184 @@ pub fn validate_dolphin_texture_pack_manifest(
         }
     }
     Ok(())
+}
+
+fn collect_pack_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+    rejected: &mut Vec<DolphinTexturePackRejectedFile>,
+) -> Result<(), DolphinTextureModError> {
+    let mut children = fs::read_dir(current)
+        .map_err(|error| {
+            pack_error(
+                DolphinTextureModErrorKind::SourceNotFound,
+                error.to_string(),
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            pack_error(
+                DolphinTextureModErrorKind::SourceNotFound,
+                error.to_string(),
+            )
+        })?;
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                pack_error(
+                    DolphinTextureModErrorKind::SourceOutsideApprovedScope,
+                    "source escaped selected root",
+                )
+            })?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            pack_error(
+                DolphinTextureModErrorKind::SourceNotFound,
+                error.to_string(),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            rejected.push(DolphinTexturePackRejectedFile {
+                relative_path: relative,
+                reason: "symlink source is not accepted".to_string(),
+            });
+        } else if metadata.is_dir() {
+            collect_pack_files(root, &path, files, rejected)?;
+        } else if metadata.is_file() {
+            files.push((path, relative));
+        } else {
+            rejected.push(DolphinTexturePackRejectedFile {
+                relative_path: relative,
+                reason: "special files are not accepted".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Scans one explicitly selected, already-expanded texture-pack directory.
+/// Only root-level PNG files are accepted by the current flat destination
+/// contract; nested files are reported as deferred rather than guessed into
+/// Dolphin's texture namespace. This function never writes to the source.
+pub fn build_dolphin_texture_pack_manifest(
+    request: &DolphinTexturePackBuildRequest,
+) -> Result<DolphinTexturePackBuildPreview, DolphinTextureModError> {
+    if !matches!(
+        request.identity.platform,
+        IdentityPlatform::GameCube | IdentityPlatform::Wii
+    ) || request.identity.game_id.is_empty()
+    {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::IdentityUnverified,
+            "a verified GameCube/Wii GameID is required to build a texture-pack manifest",
+        ));
+    }
+    if !request.source_root.is_absolute() {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::ProfileRootUnsafe,
+            "texture-pack source root must be absolute",
+        ));
+    }
+    let canonical_root = fs::canonicalize(&request.source_root).map_err(|error| {
+        pack_error(
+            DolphinTextureModErrorKind::SourceNotFound,
+            error.to_string(),
+        )
+    })?;
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+    collect_pack_files(
+        &request.source_root,
+        &request.source_root,
+        &mut candidates,
+        &mut rejected,
+    )?;
+    candidates.sort_by(|left, right| left.1.cmp(&right.1));
+    let mut accepted = Vec::new();
+    let mut total_bytes = 0_u64;
+    for (path, relative) in candidates {
+        if relative
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            rejected.push(DolphinTexturePackRejectedFile {
+                relative_path: relative,
+                reason: "nested texture paths are not supported by the current manifest contract"
+                    .to_string(),
+            });
+            continue;
+        }
+        let source = match validate_dolphin_texture_source(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                rejected.push(DolphinTexturePackRejectedFile {
+                    relative_path: relative,
+                    reason: error.detail,
+                });
+                continue;
+            }
+        };
+        let canonical_source = fs::canonicalize(&path).map_err(|error| {
+            pack_error(
+                DolphinTextureModErrorKind::SourceNotFound,
+                error.to_string(),
+            )
+        })?;
+        if canonical_source.strip_prefix(&canonical_root).is_err() {
+            rejected.push(DolphinTexturePackRejectedFile {
+                relative_path: relative,
+                reason: "source resolves outside the selected root".to_string(),
+            });
+            continue;
+        }
+        let (size, digest) = sha256_file(&path)?;
+        if accepted.len() >= MAX_PACK_FILES {
+            rejected.push(DolphinTexturePackRejectedFile {
+                relative_path: relative,
+                reason: "texture-pack file-count safety limit reached".to_string(),
+            });
+            continue;
+        }
+        if total_bytes.saturating_add(size) > DOLPHIN_TEXTURE_PACK_MAX_TOTAL_SOURCE_BYTES {
+            rejected.push(DolphinTexturePackRejectedFile {
+                relative_path: relative,
+                reason: "texture-pack total source-size safety limit reached".to_string(),
+            });
+            continue;
+        }
+        total_bytes += size;
+        accepted.push(DolphinTexturePackFile {
+            source_path: source.path,
+            source_relative_path: relative,
+            destination_filename: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            size_bytes: size,
+            sha256: digest,
+        });
+    }
+    accepted.sort_by(|left, right| left.source_relative_path.cmp(&right.source_relative_path));
+    rejected.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let complete = rejected.is_empty() && !accepted.is_empty();
+    Ok(DolphinTexturePackBuildPreview {
+        manifest: DolphinTexturePackManifest {
+            format: DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT.to_string(),
+            name: request.name.clone(),
+            version: request.version.clone(),
+            target_game_id: request.identity.game_id.clone(),
+            source_root: request.source_root.clone(),
+            files: accepted,
+        },
+        rejected,
+        total_bytes,
+        complete,
+    })
 }
 
 /// Builds a read-only multi-file preview through the existing shared preview

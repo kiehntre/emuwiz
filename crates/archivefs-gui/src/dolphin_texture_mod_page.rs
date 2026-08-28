@@ -43,10 +43,11 @@ use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::patch_manager::{
     DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES, DolphinProfile,
     DolphinTextureModIdentity, DolphinTextureModPlan, DolphinTextureModPreviewRequest,
-    DolphinTexturePackApplyResult, DolphinTexturePackManifest, DolphinTexturePackPlan,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyOutcome, SharedApplyResult,
-    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
-    SharedRollbackResult, SharedTransactionPlan, build_dolphin_texture_mod_preview,
+    DolphinTexturePackApplyResult, DolphinTexturePackBuildPreview, DolphinTexturePackBuildRequest,
+    DolphinTexturePackManifest, DolphinTexturePackPlan, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyOutcome, SharedApplyResult, SharedApplyStatus,
+    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
+    SharedTransactionPlan, build_dolphin_texture_mod_preview, build_dolphin_texture_pack_manifest,
     build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     dolphin_texture_mod_destination_root, execute_dolphin_texture_pack_apply, execute_shared_apply,
@@ -82,6 +83,28 @@ enum DolphinTextureModStage {
         archive_path: PathBuf,
         identity: DolphinTextureModIdentity,
         destination_root: PathBuf,
+    },
+    PickingPackDirectory {
+        receiver: Receiver<Option<PathBuf>>,
+        archive_path: PathBuf,
+        identity: DolphinTextureModIdentity,
+        destination_root: PathBuf,
+    },
+    PackBuilderForm {
+        source_root: PathBuf,
+        archive_path: PathBuf,
+        identity: DolphinTextureModIdentity,
+        destination_root: PathBuf,
+    },
+    PackBuilderPreview {
+        preview: DolphinTexturePackBuildPreview,
+        source_root: PathBuf,
+        archive_path: PathBuf,
+        identity: DolphinTextureModIdentity,
+        destination_root: PathBuf,
+    },
+    PackManifestSaved {
+        path: PathBuf,
     },
     PreviewReady {
         plan: DolphinTextureModPlan,
@@ -124,12 +147,16 @@ enum DolphinTextureModStage {
 pub(crate) struct DolphinTextureModPageState {
     key: Option<DolphinTextureModKey>,
     stage: Option<DolphinTextureModStage>,
+    builder_name: String,
+    builder_version: String,
 }
 
 impl DolphinTextureModPageState {
     fn reset(&mut self) {
         self.key = None;
         self.stage = None;
+        self.builder_name.clear();
+        self.builder_version.clear();
     }
 
     /// Resets to the idle starting point whenever `key` no longer matches
@@ -139,6 +166,8 @@ impl DolphinTextureModPageState {
         if self.key.as_ref() != Some(&key) {
             self.key = Some(key);
             self.stage = None;
+            self.builder_name.clear();
+            self.builder_version.clear();
         }
     }
 
@@ -150,6 +179,7 @@ impl DolphinTextureModPageState {
             Some(
                 DolphinTextureModStage::PickingFile { .. }
                     | DolphinTextureModStage::PickingPackManifest { .. }
+                    | DolphinTextureModStage::PickingPackDirectory { .. }
                     | DolphinTextureModStage::Applying { .. }
                     | DolphinTextureModStage::PackApplying { .. }
                     | DolphinTextureModStage::RollingBack { .. }
@@ -217,6 +247,39 @@ impl DolphinTextureModPageState {
                 }
                 Err(TryRecvError::Empty) => {
                     self.stage = Some(DolphinTextureModStage::PickingPackManifest {
+                        receiver,
+                        archive_path,
+                        identity,
+                        destination_root,
+                    });
+                    false
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.stage = None;
+                    true
+                }
+            },
+            Some(DolphinTextureModStage::PickingPackDirectory {
+                receiver,
+                archive_path,
+                identity,
+                destination_root,
+            }) => match receiver.try_recv() {
+                Ok(Some(source_root)) => {
+                    self.stage = Some(DolphinTextureModStage::PackBuilderForm {
+                        source_root,
+                        archive_path,
+                        identity,
+                        destination_root,
+                    });
+                    true
+                }
+                Ok(None) => {
+                    self.stage = None;
+                    true
+                }
+                Err(TryRecvError::Empty) => {
+                    self.stage = Some(DolphinTextureModStage::PickingPackDirectory {
                         receiver,
                         archive_path,
                         identity,
@@ -469,6 +532,66 @@ pub(crate) fn show_dolphin_texture_mod_panel(
                 destination_root,
             });
         }
+        Some(DolphinTextureModStage::PickingPackDirectory {
+            receiver,
+            archive_path,
+            identity,
+            destination_root,
+        }) => {
+            widgets::card(ui, |ui| {
+                ui.label("Waiting for texture-pack directory selection…");
+            });
+            state.stage = Some(DolphinTextureModStage::PickingPackDirectory {
+                receiver,
+                archive_path,
+                identity,
+                destination_root,
+            });
+        }
+        Some(DolphinTextureModStage::PackBuilderForm {
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        }) => show_pack_builder_form(
+            ui,
+            state,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        ),
+        Some(DolphinTextureModStage::PackBuilderPreview {
+            preview,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        }) => show_pack_builder_preview(
+            ui,
+            state,
+            preview,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        ),
+        Some(DolphinTextureModStage::PackManifestSaved { path }) => {
+            let mut done = false;
+            widgets::card(ui, |ui| {
+                widgets::status_badge(ui, "Manifest saved", widgets::StatusTone::Success);
+                widgets::path_value(ui, "Manifest", &path);
+                ui.label(
+                    "Use Choose texture-pack manifest when you are ready to preview installation.",
+                );
+                if widgets::action_button(ui, "Done", widgets::ActionStyle::Quiet, true).clicked() {
+                    done = true;
+                }
+            });
+            if !done {
+                state.stage = Some(DolphinTextureModStage::PackManifestSaved { path });
+            }
+        }
         Some(DolphinTextureModStage::PreviewReady {
             plan,
             source_parent,
@@ -587,7 +710,213 @@ fn show_idle(
                 destination_root: destination_root.to_path_buf(),
             });
         }
+        if widgets::action_button(
+            ui,
+            "Build texture-pack manifest",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let picked = rfd::FileDialog::new().pick_folder();
+                let _ = sender.send(picked);
+            });
+            state.stage = Some(DolphinTextureModStage::PickingPackDirectory {
+                receiver,
+                archive_path: archive_path.to_path_buf(),
+                identity: identity.clone(),
+                destination_root: destination_root.to_path_buf(),
+            });
+        }
     });
+}
+
+fn show_pack_builder_form(
+    ui: &mut egui::Ui,
+    state: &mut DolphinTextureModPageState,
+    source_root: PathBuf,
+    archive_path: PathBuf,
+    identity: DolphinTextureModIdentity,
+    destination_root: PathBuf,
+) {
+    let mut scan = false;
+    let mut cancel = false;
+    widgets::card(ui, |ui| {
+        ui.strong("Build a texture-pack manifest");
+        widgets::path_value(ui, "Source directory", &source_root);
+        ui.label(format!("Verified target GameID: {}", identity.game_id));
+        ui.horizontal(|ui| {
+            ui.label("Pack name");
+            ui.text_edit_singleline(&mut state.builder_name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Version (optional)");
+            ui.text_edit_singleline(&mut state.builder_version);
+        });
+        if state.builder_name.trim().is_empty() {
+            ui.label("Enter a pack name before scanning.");
+        }
+        if widgets::action_button(
+            ui,
+            "Scan directory",
+            widgets::ActionStyle::Primary,
+            !state.builder_name.trim().is_empty(),
+        )
+        .clicked()
+        {
+            scan = true;
+        }
+        if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+            cancel = true;
+        }
+    });
+    if cancel {
+        state.stage = None;
+    }
+    if scan {
+        let request = DolphinTexturePackBuildRequest {
+            source_root: source_root.clone(),
+            identity: identity.clone(),
+            name: state.builder_name.trim().to_string(),
+            version: (!state.builder_version.trim().is_empty())
+                .then(|| state.builder_version.trim().to_string()),
+        };
+        match build_dolphin_texture_pack_manifest(&request) {
+            Ok(preview) => {
+                state.stage = Some(DolphinTextureModStage::PackBuilderPreview {
+                    preview,
+                    source_root,
+                    archive_path,
+                    identity,
+                    destination_root,
+                })
+            }
+            Err(error) => {
+                state.stage = Some(DolphinTextureModStage::Failed {
+                    detail: error.detail,
+                })
+            }
+        }
+    }
+}
+
+fn show_pack_builder_preview(
+    ui: &mut egui::Ui,
+    state: &mut DolphinTextureModPageState,
+    preview: DolphinTexturePackBuildPreview,
+    source_root: PathBuf,
+    archive_path: PathBuf,
+    identity: DolphinTextureModIdentity,
+    destination_root: PathBuf,
+) {
+    let mut save = false;
+    let mut back = false;
+    widgets::card(ui, |ui| {
+        ui.strong(format!("Manifest preview: {}", preview.manifest.name));
+        if let Some(version) = &preview.manifest.version {
+            ui.label(format!("Version: {version}"));
+        }
+        ui.label(format!(
+            "Verified target GameID: {}",
+            preview.manifest.target_game_id
+        ));
+        ui.label(format!(
+            "Accepted PNG files: {} · Total bytes: {}",
+            preview.manifest.files.len(),
+            preview.total_bytes
+        ));
+        if preview.rejected.is_empty() {
+            widgets::status_badge(ui, "Ready to save", widgets::StatusTone::Success);
+        } else {
+            widgets::banner(
+                ui,
+                "Some files were not accepted",
+                &format!(
+                    "{} file(s) rejected; nested paths and unsupported files are listed below.",
+                    preview.rejected.len()
+                ),
+                widgets::StatusTone::Pending,
+            );
+            for item in preview.rejected.iter().take(10) {
+                ui.label(format!(
+                    "{} — {}",
+                    item.relative_path.display(),
+                    item.reason
+                ));
+            }
+        }
+        if widgets::action_button(
+            ui,
+            "Save manifest",
+            widgets::ActionStyle::Primary,
+            preview.complete,
+        )
+        .clicked()
+        {
+            save = true;
+        }
+        if widgets::action_button(ui, "Back", widgets::ActionStyle::Quiet, true).clicked() {
+            back = true;
+        }
+    });
+    if back {
+        state.stage = Some(DolphinTextureModStage::PackBuilderForm {
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        });
+    }
+    if save {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Dolphin texture-pack manifest", &["json"])
+            .save_file()
+        {
+            match save_pack_manifest(&path, &preview.manifest) {
+                Ok(()) => state.stage = Some(DolphinTextureModStage::PackManifestSaved { path }),
+                Err(error) => {
+                    state.stage = Some(DolphinTextureModStage::Failed {
+                        detail: format!("could not save manifest: {error}"),
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn save_pack_manifest(path: &Path, manifest: &DolphinTexturePackManifest) -> Result<(), String> {
+    if path.exists() {
+        return Err("refusing to overwrite an existing manifest".to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "manifest has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let data = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("manifest"),
+        now_unix_seconds()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    file.write_all(&data).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&temp);
+        return Err("refusing to overwrite an existing manifest".to_string());
+    }
+    let result = std::fs::hard_link(&temp, path).map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&temp);
+    result
 }
 
 fn build_pack_preview_stage(

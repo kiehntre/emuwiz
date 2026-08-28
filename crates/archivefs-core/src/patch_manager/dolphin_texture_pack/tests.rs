@@ -55,6 +55,7 @@ fn file(root: &Path, name: &str, destination: &str, bytes: &[u8]) -> DolphinText
     std::fs::write(&source_path, bytes).unwrap();
     DolphinTexturePackFile {
         source_path,
+        source_relative_path: PathBuf::from(name),
         destination_filename: destination.to_string(),
         size_bytes: bytes.len() as u64,
         sha256: sha256(bytes),
@@ -352,4 +353,96 @@ fn unknown_identity_cannot_become_a_pack_target() {
             .kind,
         DolphinTextureModErrorKind::IdentityUnverified
     );
+}
+
+#[test]
+fn builder_accepts_only_root_pngs_and_is_deterministic() {
+    let dir = TestDir::new("builder");
+    let root = dir.0.join("pack with spaces");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::write(root.join("z.png"), b"z").unwrap();
+    std::fs::write(root.join("a.PNG"), b"a").unwrap();
+    std::fs::write(root.join("readme.txt"), b"not a texture").unwrap();
+    std::fs::write(root.join("nested/n.png"), b"nested").unwrap();
+    let request = DolphinTexturePackBuildRequest {
+        source_root: root.clone(),
+        identity: identity("GALE01"),
+        name: "Local Pack".to_string(),
+        version: Some("1.0".to_string()),
+    };
+    let first = build_dolphin_texture_pack_manifest(&request).unwrap();
+    let second = build_dolphin_texture_pack_manifest(&request).unwrap();
+    assert_eq!(first, second);
+    assert!(!first.complete);
+    assert_eq!(first.manifest.files.len(), 2);
+    assert_eq!(
+        first.manifest.files[0].source_relative_path,
+        PathBuf::from("a.PNG")
+    );
+    assert_eq!(
+        first.manifest.files[1].source_relative_path,
+        PathBuf::from("z.png")
+    );
+    assert_eq!(first.total_bytes, 2);
+    assert!(
+        first
+            .rejected
+            .iter()
+            .any(|item| item.relative_path == PathBuf::from("readme.txt"))
+    );
+    assert!(
+        first
+            .rejected
+            .iter()
+            .any(|item| item.relative_path == PathBuf::from("nested/n.png"))
+    );
+}
+
+#[test]
+fn builder_requires_verified_dolphin_identity() {
+    let dir = TestDir::new("builder-identity");
+    std::fs::write(dir.0.join("a.png"), b"a").unwrap();
+    let mut request = DolphinTexturePackBuildRequest {
+        source_root: dir.0.clone(),
+        identity: identity("GALE01"),
+        name: "Pack".to_string(),
+        version: None,
+    };
+    request.identity.platform = IdentityPlatform::PlayStation;
+    assert_eq!(
+        build_dolphin_texture_pack_manifest(&request)
+            .unwrap_err()
+            .kind,
+        DolphinTextureModErrorKind::IdentityUnverified
+    );
+    request.identity.platform = IdentityPlatform::GameCube;
+    request.identity.game_id.clear();
+    assert_eq!(
+        build_dolphin_texture_pack_manifest(&request)
+            .unwrap_err()
+            .kind,
+        DolphinTextureModErrorKind::IdentityUnverified
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn builder_rejects_symlink_sources_without_mutating_source() {
+    use std::os::unix::fs::symlink;
+    let dir = TestDir::new("builder-symlink");
+    let root = dir.0.join("root");
+    let outside = dir.0.join("outside.png");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, root.join("escape.png")).unwrap();
+    let request = DolphinTexturePackBuildRequest {
+        source_root: root.clone(),
+        identity: identity("GALE01"),
+        name: "Pack".to_string(),
+        version: None,
+    };
+    let preview = build_dolphin_texture_pack_manifest(&request).unwrap();
+    assert!(preview.manifest.files.is_empty());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    assert!(preview.rejected[0].reason.contains("symlink"));
 }
