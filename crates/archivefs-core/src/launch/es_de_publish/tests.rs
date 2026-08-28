@@ -82,6 +82,7 @@ fn plan_with_operations(
             explanation: ElectionExplanation {
                 steps: Vec::new(),
                 rejected: Vec::new(),
+                winner_evidence: crate::playing_library::CandidateEvidenceSummary::unknown(),
             },
             launcher_operation: operation.clone(),
             companion_operations: Vec::new(),
@@ -345,6 +346,7 @@ fn destination_not_in_operations_is_never_published() {
                 explanation: ElectionExplanation {
                     steps: Vec::new(),
                     rejected: Vec::new(),
+                    winner_evidence: crate::playing_library::CandidateEvidenceSummary::unknown(),
                 },
                 launcher_operation: conflicted_operation.clone(),
                 companion_operations: Vec::new(),
@@ -355,6 +357,7 @@ fn destination_not_in_operations_is_never_published() {
                 explanation: ElectionExplanation {
                     steps: Vec::new(),
                     rejected: Vec::new(),
+                    winner_evidence: crate::playing_library::CandidateEvidenceSummary::unknown(),
                 },
                 launcher_operation: clean_operation.clone(),
                 companion_operations: Vec::new(),
@@ -780,6 +783,7 @@ fn publication_points_at_the_launcher_file_never_a_companion() {
             explanation: ElectionExplanation {
                 steps: Vec::new(),
                 rejected: Vec::new(),
+                winner_evidence: crate::playing_library::CandidateEvidenceSummary::unknown(),
             },
             launcher_operation,
             companion_operations,

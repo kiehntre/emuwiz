@@ -142,6 +142,7 @@ mod tests {
                 explanation: ElectionExplanation {
                     steps: Vec::new(),
                     rejected: Vec::new(),
+                    winner_evidence: crate::playing_library::CandidateEvidenceSummary::unknown(),
                 },
                 launcher_operation: operation.clone(),
                 companion_operations: Vec::new(),
@@ -284,6 +285,7 @@ mod tests {
                 explanation: ElectionExplanation {
                     steps: Vec::new(),
                     rejected: Vec::new(),
+                    winner_evidence: crate::playing_library::CandidateEvidenceSummary::unknown(),
                 },
                 launcher_operation,
                 companion_operations,

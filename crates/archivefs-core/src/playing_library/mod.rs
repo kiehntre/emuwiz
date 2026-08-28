@@ -38,9 +38,10 @@ use crate::dat::model::ParsedDat;
 pub use apply_adapter::build_playing_library_transaction;
 pub use matching::match_loose_files_against_dat;
 pub use model::{
-    DestinationConflict, ElectedGame, ElectionExplanation, ExcludedCandidate,
-    LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan, PlayingLibraryPolicy,
-    RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber, UnresolvedGroup,
+    CandidateEvidenceSummary, DestinationConflict, ElectedGame, ElectionExplanation,
+    ExcludedCandidate, LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan,
+    PlayingLibraryPolicy, RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber,
+    UnresolvedGroup,
 };
 
 /// How far a clone chain may be walked while resolving one family root.
@@ -472,6 +473,19 @@ fn record_election(
     mut steps: Vec<String>,
     reasons: &[Vec<String>],
 ) {
+    let evidence_summary_of = |position: usize| -> CandidateEvidenceSummary {
+        let member = &members[position];
+        let entry = &request.dat.games[member.dat_entry_index];
+        let release_evidence = evidence::dat_release_evidence(&entry.name);
+        CandidateEvidenceSummary {
+            regions: release_evidence.regions,
+            languages: release_evidence.languages,
+            revision: release_evidence.revision.as_ref().map(format_revision),
+            is_declared_parent: member.dat_entry_index == root_index,
+            is_declared_clone: entry.clone_of.is_some(),
+            companion_file_count: member.companion_paths.len(),
+        }
+    };
     let rejected = (0..members.len())
         .filter(|position| *position != winner_position && !reasons[*position].is_empty())
         .map(|position| RejectedCandidate {
@@ -480,8 +494,10 @@ fn record_election(
                 .clone(),
             source_path: members[position].archive_path.clone(),
             reasons: reasons[position].clone(),
+            evidence: evidence_summary_of(position),
         })
         .collect();
+    let winner_evidence = evidence_summary_of(winner_position);
     let member = &members[winner_position];
     let launcher_operation = LinkedLibraryOperation {
         source_path: member.archive_path.clone(),
@@ -506,7 +522,11 @@ fn record_election(
     plan.elected_games.push(ElectedGame {
         dat_entry_name: request.dat.games[member.dat_entry_index].name.clone(),
         family_root_name: request.dat.games[root_index].name.clone(),
-        explanation: ElectionExplanation { steps, rejected },
+        explanation: ElectionExplanation {
+            steps,
+            rejected,
+            winner_evidence,
+        },
         launcher_operation,
         companion_operations,
     });

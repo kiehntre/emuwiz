@@ -760,3 +760,105 @@ fn a_companion_destination_collision_excludes_the_whole_release_not_just_the_fil
     // handling covers the whole release atomically.
     assert!(plan.operations.is_empty(), "{:?}", plan.operations);
 }
+
+#[test]
+fn stable_tie_break_is_independent_of_input_order() {
+    // Same family, same policy, but the caller's match list arrives in a
+    // different order each time (as a real filesystem scan might return
+    // them). The result - including which candidate wins and every
+    // narrated reason - must not depend on that order at all.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![
+        game("F-Zero (Japan)", None),
+        game("F-Zero (Europe)", Some("F-Zero (Japan)")),
+        game("F-Zero (USA)", Some("F-Zero (Japan)")),
+        game("F-Zero (Europe) (Rev 1)", Some("F-Zero (Japan)")),
+    ]);
+    let forward = auto_matches(&dat.games, temp.path());
+    let mut reversed = forward.clone();
+    reversed.reverse();
+    let mut shuffled = forward.clone();
+    shuffled.swap(0, 3);
+    shuffled.swap(1, 2);
+
+    let build = |matches: Vec<DatArchiveMatch>| {
+        build_playing_library_plan(&PlayingLibraryRequest {
+            dat: &dat,
+            matches,
+            destination_root: temp.path().join("playing"),
+            policy: default_policy(),
+        })
+        .expect("plan")
+    };
+
+    let from_forward = build(forward);
+    let from_reversed = build(reversed);
+    let from_shuffled = build(shuffled);
+
+    assert_eq!(from_forward, from_reversed);
+    assert_eq!(from_forward, from_shuffled);
+    assert_eq!(
+        elected_names(&from_forward),
+        vec!["F-Zero (Europe) (Rev 1)"]
+    );
+}
+
+#[test]
+fn winner_and_loser_explanations_come_from_the_actual_election_values() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![
+        game("Sonic the Hedgehog (Europe)", None),
+        game(
+            "Sonic the Hedgehog (USA)",
+            Some("Sonic the Hedgehog (Europe)"),
+        ),
+    ]);
+    let matches = auto_matches(&dat.games, temp.path());
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches,
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).expect("plan");
+
+    assert_eq!(plan.elected_games.len(), 1);
+    let elected = &plan.elected_games[0];
+    assert_eq!(elected.dat_entry_name, "Sonic the Hedgehog (Europe)");
+    // The winner's structured evidence is the real, verified region this
+    // candidate's own catalogue name carries - not a placeholder.
+    assert_eq!(elected.explanation.winner_evidence.regions, vec!["Europe"]);
+    assert!(elected.explanation.winner_evidence.is_declared_parent);
+    assert!(!elected.explanation.winner_evidence.is_declared_clone);
+
+    assert_eq!(elected.explanation.rejected.len(), 1);
+    let loser = &elected.explanation.rejected[0];
+    assert_eq!(loser.dat_entry_name, "Sonic the Hedgehog (USA)");
+    assert_eq!(loser.evidence.regions, vec!["USA"]);
+    assert!(!loser.evidence.is_declared_parent);
+    assert!(loser.evidence.is_declared_clone);
+    assert!(!loser.reasons.is_empty());
+}
+
+#[test]
+fn unknown_metadata_is_reported_as_unknown_not_inferred() {
+    // Neither entry carries any recognised region/language/revision token
+    // at all - the winner's own evidence must say so explicitly rather
+    // than defaulting to some inferred value.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![game("Untitled Game", None)]);
+    let matches = auto_matches(&dat.games, temp.path());
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches,
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).expect("plan");
+
+    assert_eq!(plan.elected_games.len(), 1);
+    let evidence = &plan.elected_games[0].explanation.winner_evidence;
+    assert!(evidence.regions.is_empty());
+    assert!(evidence.languages.is_empty());
+    assert_eq!(evidence.revision, None);
+}

@@ -77,6 +77,7 @@ use serde::Serialize;
 
 use super::set::{NeedsReviewReason, SetState};
 
+pub mod clone_report;
 pub mod graph;
 pub mod resolve;
 

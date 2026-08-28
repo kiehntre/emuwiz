@@ -37,6 +37,7 @@ pub mod audit;
 pub mod classification;
 pub mod dependency;
 pub mod disk_audit;
+pub mod divergence;
 pub mod firmware_evidence;
 pub mod hash;
 pub mod identity;

@@ -136,6 +136,52 @@ pub struct PlayingLibraryPolicy {
     pub excluded_release_classes: Vec<ReleaseClass>,
 }
 
+/// The exact structured evidence one candidate carried into election,
+/// generated from the same values [`super::elect_family`]'s comparison
+/// tiers themselves read to decide - never reconstructed afterward from
+/// prose narration. An empty/`None` field is a real, explicit "unknown":
+/// this crate never infers a region, language, revision, or relationship
+/// from a filename or any other untrusted convenience, so absence of
+/// trusted evidence is reported as absence, not guessed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateEvidenceSummary {
+    /// Recognized provider-region tokens from the canonical DAT entry
+    /// name. Empty means unknown - no recognized region evidence exists.
+    pub regions: Vec<String>,
+    /// Recognized language tokens from the canonical DAT entry name.
+    /// Empty means unknown.
+    pub languages: Vec<String>,
+    /// The strictly-parsed `(Rev N)` marker, formatted for display.
+    /// `None` means unknown - no revision marker was declared.
+    pub revision: Option<String>,
+    /// Whether this entry is the declared parent of its family (the
+    /// family root itself), per the catalogue's own `cloneof` chain.
+    pub is_declared_parent: bool,
+    /// Whether this entry declares itself a clone of another entry.
+    pub is_declared_clone: bool,
+    /// How many companion files (BIN/audio tracks, GDI tracks, M3U discs)
+    /// this release requires alongside its launcher. Zero for an ordinary
+    /// single-file release.
+    pub companion_file_count: usize,
+}
+
+impl CandidateEvidenceSummary {
+    /// The explicit "nothing was gathered" value - every field an honest
+    /// unknown, never inferred. Used only where no election has actually
+    /// run (for example a hand-built test fixture that predates this
+    /// field), never in place of a real, empty scan result.
+    pub fn unknown() -> Self {
+        Self {
+            regions: Vec::new(),
+            languages: Vec::new(),
+            revision: None,
+            is_declared_parent: false,
+            is_declared_clone: false,
+            companion_file_count: 0,
+        }
+    }
+}
+
 /// Why one candidate was rejected during election.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectedCandidate {
@@ -144,6 +190,9 @@ pub struct RejectedCandidate {
     pub source_path: PathBuf,
     /// Explicit human-readable reasons, one per decisive fact.
     pub reasons: Vec<String>,
+    /// The exact evidence this candidate carried - the same values that
+    /// produced `reasons`, not a re-derivation of them.
+    pub evidence: CandidateEvidenceSummary,
 }
 
 /// How the elected candidate won, without any opaque number.
@@ -155,6 +204,9 @@ pub struct ElectionExplanation {
     pub steps: Vec<String>,
     /// Every other candidate with its explicit rejection reason(s).
     pub rejected: Vec<RejectedCandidate>,
+    /// The winner's own structured evidence - the same values the tiers
+    /// above compared to reach this result.
+    pub winner_evidence: CandidateEvidenceSummary,
 }
 
 /// One elected representative of one game family.

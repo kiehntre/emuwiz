@@ -423,6 +423,70 @@ fn a_destination_conflict_blocks_that_operation_from_applying() {
     assert!(!fixture.path("playing").exists());
 }
 
+// --- plain-English election explanation ---------------------------------
+
+#[test]
+fn the_page_shows_a_plain_winner_explanation_and_why_the_loser_lost_with_technical_detail_hidden() {
+    let fixture = Fixture::new("explanation");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("europe.bin"), b"test").unwrap();
+    std::fs::write(source.join("usa.bin"), b"abc").unwrap();
+    let dat = write_dat(
+        &fixture,
+        "one.dat",
+        &format!(
+            r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Sonic (USA)" cloneof="Sonic (Europe)"><rom name="usa.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    );
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = dat.display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
+    state.preferred_regions_draft = "Europe".to_string();
+    state.preview();
+    assert_eq!(state.plan().expect("plan").elected_games.len(), 1);
+
+    let ctx = egui::Context::default();
+    let (output, action) = click_text(&ctx, &mut state, "Why this one?");
+    if let Some(PlayingLibraryPageAction::SelectFamily(family)) = action {
+        state.select_family(family);
+    }
+    let (expanded, _) = render(&ctx, &mut state, base_input());
+    let _ = output;
+
+    assert!(rendered_text_contains(&expanded, "Selected because:"));
+    assert!(rendered_text_contains(&expanded, "Not selected:"));
+    assert!(rendered_text_contains(
+        &expanded,
+        "Sonic (USA) - not selected because:"
+    ));
+    // The plain-English evidence line is always visible...
+    assert!(
+        rendered_text_contains(&expanded, "region: Europe")
+            || rendered_text_contains(
+                &expanded,
+                "region: Europe - language: unknown - revision: unknown - declared parent"
+            )
+    );
+    // ...but the raw structured debug dump stays behind "Technical details"
+    // until that header is expanded.
+    assert!(rendered_text_contains(&expanded, "Technical details"));
+    assert!(!rendered_text_contains(
+        &expanded,
+        "CandidateEvidenceSummary {"
+    ));
+
+    let (with_technical_detail, _) = click_text(&ctx, &mut state, "Technical details");
+    assert!(rendered_text_contains(
+        &with_technical_detail,
+        "CandidateEvidenceSummary {"
+    ));
+}
+
 // --- apply through the existing linked-library transaction seam --------
 
 fn preview_a_single_election(fixture: &Fixture) -> (PlayingLibraryPageState, PathBuf, PathBuf) {

@@ -35,8 +35,9 @@ use archivefs_core::launch::es_de_publish::{
     recover_es_de_gamelist_publication,
 };
 use archivefs_core::playing_library::{
-    PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest, ReleaseClass,
-    build_playing_library_plan, build_playing_library_transaction, match_loose_files_against_dat,
+    CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest,
+    ReleaseClass, build_playing_library_plan, build_playing_library_transaction,
+    match_loose_files_against_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -957,6 +958,34 @@ pub(crate) fn show_playing_library_page(
 /// directory. An empty draft is never "missing" - that is the separate
 /// "choose one first" state the Preview button's own disabled hint already
 /// covers, not a bad-path error.
+/// One plain-English line summarising a candidate's structured evidence -
+/// region/language/revision/parent-clone status - reusing exactly the
+/// values `crate::playing_library`'s own election produced
+/// ([`archivefs_core::playing_library::CandidateEvidenceSummary`]), never
+/// re-derived from a name or a filename here. Absent evidence reads as
+/// "unknown", never as a blank or an inferred guess.
+fn evidence_summary_line(evidence: &CandidateEvidenceSummary) -> String {
+    let region = if evidence.regions.is_empty() {
+        "unknown".to_string()
+    } else {
+        evidence.regions.join(", ")
+    };
+    let language = if evidence.languages.is_empty() {
+        "unknown".to_string()
+    } else {
+        evidence.languages.join(", ")
+    };
+    let revision = evidence.revision.as_deref().unwrap_or("unknown");
+    let relationship = if evidence.is_declared_parent {
+        "declared parent"
+    } else if evidence.is_declared_clone {
+        "declared clone"
+    } else {
+        "no declared relationship"
+    };
+    format!("region: {region} - language: {language} - revision: {revision} - {relationship}")
+}
+
 fn path_looks_missing(draft: &str, must_be_dir: bool) -> bool {
     let trimmed = draft.trim();
     if trimmed.is_empty() {
@@ -1039,19 +1068,46 @@ fn show_preview_summary(
                 }
             });
             if state.selected_family() == Some(elected.dat_entry_name.as_str()) {
-                ui.label(egui::RichText::new("Why:").strong());
+                ui.label(egui::RichText::new("Selected because:").strong());
                 if elected.explanation.steps.is_empty() {
                     ui.label("- the only election-eligible release in its family");
                 }
                 for step in &elected.explanation.steps {
                     ui.label(format!("- {step}"));
                 }
+                ui.label(evidence_summary_line(&elected.explanation.winner_evidence));
+
                 if !elected.explanation.rejected.is_empty() {
-                    ui.label("Other verified releases:");
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Not selected:").strong());
                     for rejected in &elected.explanation.rejected {
-                        ui.label(format!("- {}", rejected.dat_entry_name));
+                        ui.label(format!(
+                            "{} - not selected because:",
+                            rejected.dat_entry_name
+                        ));
+                        for reason in &rejected.reasons {
+                            ui.label(format!("  - {reason}"));
+                        }
+                        ui.label(format!("  {}", evidence_summary_line(&rejected.evidence)));
                     }
                 }
+
+                widgets::technical_details(
+                    ui,
+                    (
+                        "playing_library_election_evidence",
+                        elected.dat_entry_name.as_str(),
+                    ),
+                    |ui| {
+                        ui.label(format!("winner: {:?}", elected.explanation.winner_evidence));
+                        for rejected in &elected.explanation.rejected {
+                            ui.label(format!(
+                                "{}: {:?}",
+                                rejected.dat_entry_name, rejected.evidence
+                            ));
+                        }
+                    },
+                );
             }
         }
     });
