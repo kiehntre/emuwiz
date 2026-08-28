@@ -3386,3 +3386,168 @@ fn problems_repair_is_the_only_sidebar_entry_for_doctor_and_repair() {
         );
     }
 }
+
+// --- Exact Duplicate Review navigation --------------------------------
+//
+// Proves the page is genuinely reachable through the real application
+// dispatch, not merely callable from its own isolated test module (see
+// `exact_duplicate_review_page::tests` for the page's own behaviour tests -
+// these prove reachability, not re-test the page itself).
+
+#[test]
+fn exact_duplicate_review_maps_to_the_repair_tab_like_history_does() {
+    assert_eq!(
+        problems_repair_tab_for_main_view(MainView::ExactDuplicateReview),
+        Some(ProblemsRepairTab::Repair)
+    );
+    // It never gets a sidebar entry of its own - reached only from inside
+    // the existing Problems & Repair destination.
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    assert!(!sidebar_views.contains(&MainView::ExactDuplicateReview));
+}
+
+// --- 1: the navigation destination is visible -------------------------
+
+#[test]
+fn the_exact_duplicates_link_is_visible_on_the_repair_tab() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::RepairReview;
+
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Exact duplicates"));
+}
+
+// --- 2: selecting it reaches the Exact Duplicate Review page -----------
+
+#[test]
+fn selecting_exact_duplicates_reaches_the_page() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::RepairReview;
+
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let before = ctx.run(problems_repair_screen_input(), |ctx| {
+        app.update(ctx, &mut frame)
+    });
+    let pos = find_exact_text_center(&before, "Exact duplicates")
+        .expect("the Exact duplicates link must be clickable");
+    let click = vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        },
+    ];
+    let _ = ctx.run(
+        egui::RawInput {
+            events: click,
+            ..problems_repair_screen_input()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+
+    assert_eq!(app.view, MainView::ExactDuplicateReview);
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
+
+    let output = ctx.run(problems_repair_screen_input(), |ctx| {
+        app.update(ctx, &mut frame)
+    });
+    assert!(
+        rendered_text_contains(&output, "Find exact copies"),
+        "the Exact Duplicate Review page's own content must be visible"
+    );
+    // Review/History are replaced, not stacked underneath, when this
+    // destination is selected.
+    assert!(!rendered_text_contains(&output, "Repair History"));
+}
+
+// --- 3: the page starts in its safe empty state -------------------------
+
+#[test]
+fn the_page_starts_in_its_safe_empty_state() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::ExactDuplicateReview;
+
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Source folder:"));
+    assert!(
+        app.exact_duplicate_review_page
+            .as_ref()
+            .is_none_or(|page| page.report().is_none()),
+        "no scan has run just from navigating here"
+    );
+}
+
+// --- 4: leaving and returning preserves state, per existing convention -
+
+#[test]
+fn leaving_and_returning_preserves_the_draft_source_folder() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::ExactDuplicateReview;
+    let _ = render_problems_repair_app(&mut app);
+    app.exact_duplicate_review_page
+        .as_mut()
+        .expect("lazily created on first visit")
+        .source_root_draft = "/tmp/example".to_string();
+
+    // Leave for another tab, then come back - exactly like
+    // `RepairReviewPageState` is never reset by switching tabs.
+    app.view = MainView::Doctor;
+    let _ = render_problems_repair_app(&mut app);
+    app.view = MainView::ExactDuplicateReview;
+    let _ = render_problems_repair_app(&mut app);
+
+    assert_eq!(
+        app.exact_duplicate_review_page
+            .as_ref()
+            .unwrap()
+            .source_root_draft,
+        "/tmp/example"
+    );
+}
+
+// --- 5: navigation alone performs no scan or filesystem mutation --------
+
+#[test]
+fn navigating_to_the_page_never_scans_or_mutates_anything() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a.bin"), b"hello").unwrap();
+    std::fs::write(temp.path().join("b.bin"), b"hello").unwrap();
+
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::ExactDuplicateReview;
+    let _ = render_problems_repair_app(&mut app);
+    let _ = render_problems_repair_app(&mut app);
+
+    let page = app.exact_duplicate_review_page.as_ref().unwrap();
+    assert!(page.report().is_none(), "navigation alone must never scan");
+    assert!(temp.path().join("a.bin").exists());
+    assert!(temp.path().join("b.bin").exists());
+}
+
+// --- 7: existing Repair Review navigation remains unchanged -------------
+// (already proven by `problems_repair_repair_tab_renders_review_and_history_together`
+// and `problems_repair_history_deep_link_also_renders_both_sections` above,
+// re-run unmodified as part of this same test binary.)

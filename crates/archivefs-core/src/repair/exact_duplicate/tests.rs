@@ -1077,3 +1077,92 @@ fn a_retained_copy_mutated_after_preview_also_blocks_apply() {
     assert!(live.redundant.exists());
     assert!(live.retained.exists());
 }
+
+// --- apply_user_choice: the GUI's honest path out of RequiresUserChoice ----
+
+#[test]
+fn a_user_choice_on_an_undecided_group_becomes_safe_and_labelled_as_chosen() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("aaa.bin");
+    let z = temp.path().join("zzz.bin");
+    std::fs::write(&a, b"tied bytes, no evidence").unwrap();
+    std::fs::write(&z, b"tied bytes, no evidence").unwrap();
+    let trusted = trusted_for(temp.path());
+    let report = scan_exact_duplicates(
+        &[a.clone(), z.clone()],
+        &trusted,
+        &[],
+        &BTreeSet::new(),
+        None,
+    );
+    assert_eq!(
+        report.groups[0].recommendation,
+        CanonicalRecommendation::RequiresUserChoice
+    );
+
+    let chosen = apply_user_choice(&report.groups[0], &z).expect("valid choice");
+    assert_eq!(
+        chosen.recommendation,
+        CanonicalRecommendation::UserChosen(z.clone())
+    );
+    assert!(chosen.recommendation.reason().contains("chosen"));
+    assert_eq!(chosen.redundant_paths, vec![a]);
+    assert_eq!(chosen.readiness, GroupQuarantineReadiness::Safe);
+}
+
+#[test]
+fn a_user_choice_naming_a_path_outside_the_group_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let a = temp.path().join("aaa.bin");
+    let z = temp.path().join("zzz.bin");
+    let outsider = temp.path().join("not_in_group.bin");
+    std::fs::write(&a, b"tied bytes, no evidence").unwrap();
+    std::fs::write(&z, b"tied bytes, no evidence").unwrap();
+    let trusted = trusted_for(temp.path());
+    let report = scan_exact_duplicates(&[a, z], &trusted, &[], &BTreeSet::new(), None);
+
+    let result = apply_user_choice(&report.groups[0], &outsider);
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_user_choice_on_a_blocked_multi_file_group_stays_blocked() {
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("shared_track.bin");
+    std::fs::write(&shared, b"shared-track-bytes").unwrap();
+    let cue1 = temp.path().join("one.cue");
+    std::fs::write(&cue1, "FILE \"shared_track.bin\" BINARY\n").unwrap();
+    let cue2 = temp.path().join("two.cue");
+    std::fs::write(&cue2, "FILE \"shared_track.bin\" BINARY\n").unwrap();
+    let trusted_dir = temp.path().join("trusted");
+    std::fs::create_dir_all(&trusted_dir).unwrap();
+    let shared_dup = trusted_dir.join("shared_track_copy.bin");
+    std::fs::write(&shared_dup, b"shared-track-bytes").unwrap();
+    let trusted = trusted_for(temp.path());
+
+    let report = scan_exact_duplicates(
+        &[shared.clone(), cue1, cue2, shared_dup.clone()],
+        &trusted,
+        &[trusted_dir],
+        &BTreeSet::new(),
+        None,
+    );
+    let group = report
+        .groups
+        .iter()
+        .find(|g| g.members.iter().any(|m| m.path == shared))
+        .expect("shared-track group present");
+    // This group is already Blocked by multi-file protection, not merely
+    // NeedsReview - a manual choice must never bypass that safety check.
+    assert!(matches!(
+        group.readiness,
+        GroupQuarantineReadiness::Blocked(_)
+    ));
+
+    let chosen = apply_user_choice(group, &shared_dup).expect("valid choice");
+    assert!(
+        matches!(chosen.readiness, GroupQuarantineReadiness::Blocked(_)),
+        "{:?}",
+        chosen.readiness
+    );
+}

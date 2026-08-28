@@ -155,6 +155,7 @@ pub(crate) mod doctor_page;
 // still calls its own items unqualified regardless of this re-export.
 use doctor_page::*;
 pub(crate) mod dolphin_texture_mod_page;
+pub(crate) mod exact_duplicate_review_page;
 pub(crate) mod game_metadata;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
@@ -3265,6 +3266,18 @@ enum MainView {
     /// directory), with reverify status and safe undo when the core proves
     /// a transaction is reversible.
     RepairHistory,
+    /// Exact Duplicate Review: a DAT-independent, byte-identical-only
+    /// duplicate scan (`archivefs_core::repair::exact_duplicate`) with
+    /// evidence-backed canonical-copy selection and multi-file (CUE/GDI/
+    /// M3U) protection, quarantined through the same transaction/journal/
+    /// rollback engine every other repair flow already uses. Reachable
+    /// from inside the `ProblemsRepairTab::Repair` tab exactly like
+    /// `RepairHistory` is - see `ArchiveFsApp::show_problems_repair_page`.
+    /// Deliberately a separate destination from `MainView::Duplicates`
+    /// (a read-only Library-tab duplicate viewer over a different,
+    /// DAT-relative notion of "duplicate") - the two are unrelated and
+    /// never share state.
+    ExactDuplicateReview,
     /// Library View History: a read-only view of the durable, append-only
     /// Library View apply/remove history
     /// (`archivefs_core::library_view_history`), re-read from disk on every
@@ -3428,7 +3441,9 @@ fn problems_repair_tab_for_main_view(view: MainView) -> Option<ProblemsRepairTab
     match view {
         MainView::Problems => Some(ProblemsRepairTab::Overview),
         MainView::Doctor => Some(ProblemsRepairTab::Diagnostics),
-        MainView::RepairReview | MainView::RepairHistory => Some(ProblemsRepairTab::Repair),
+        MainView::RepairReview | MainView::RepairHistory | MainView::ExactDuplicateReview => {
+            Some(ProblemsRepairTab::Repair)
+        }
         _ => None,
     }
 }
@@ -3639,6 +3654,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::IdentifyRename => "Identify & Rename",
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
+        MainView::ExactDuplicateReview => "Exact duplicates",
         MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
@@ -3666,6 +3682,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::LibraryViews
         | MainView::HistoryLogs
         | MainView::RepairHistory
+        | MainView::ExactDuplicateReview
         | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
@@ -3726,6 +3743,10 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             // page scroll or content past the viewport is simply clipped
             // with no way to reach it.
             | MainView::RepairHistory
+            // Exact Duplicate Review renders the same shape of plain
+            // top-down group-card list as Repair History, with no
+            // internal `ScrollArea` of its own.
+            | MainView::ExactDuplicateReview
             // Library View History renders the same shape of plain
             // top-down record-card list as Repair History, with no
             // internal `ScrollArea` of its own.
@@ -4040,6 +4061,10 @@ struct ArchiveFsApp {
     /// transactions journaled through the Repair Center, re-read from disk
     /// on every refresh.
     repair_history_page: Option<repair_history_page::RepairHistoryPageState>,
+    /// The Exact Duplicate Review page, loaded lazily on first visit:
+    /// starts with no source folder chosen and no scan run, exactly like
+    /// `RepairReviewPageState::default()` starts with no plan loaded.
+    exact_duplicate_review_page: Option<exact_duplicate_review_page::ExactDuplicateReviewPageState>,
     /// The Library View History page, loaded lazily on first visit:
     /// durable Library View apply/remove records, re-read from disk on
     /// every refresh. Distinct from `history` (`OperationHistory`) below,
@@ -4483,6 +4508,7 @@ impl ArchiveFsApp {
             rom_organisation_page: None,
             repair_review_page: None,
             repair_history_page: None,
+            exact_duplicate_review_page: None,
             library_view_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
@@ -5670,6 +5696,16 @@ impl ArchiveFsApp {
         repair_history_page::show_repair_history_page(ui, page, &mut self.clipboard);
     }
 
+    fn show_exact_duplicate_review_page(&mut self, ui: &mut egui::Ui) {
+        let page = self.exact_duplicate_review_page.get_or_insert_with(
+            exact_duplicate_review_page::ExactDuplicateReviewPageState::default,
+        );
+        if page.poll_scan() || page.is_scan_running() {
+            ui.ctx().request_repaint();
+        }
+        exact_duplicate_review_page::show_exact_duplicate_review_page(ui, page);
+    }
+
     /// The consolidated "Problems & Repair" destination - see
     /// `problems_repair_page`'s module doc. Renders the shared tab chrome,
     /// then dispatches to whichever tab `self.problems_repair_tab` currently
@@ -5735,11 +5771,43 @@ impl ArchiveFsApp {
                 // existing deep-link (either MainView value) landing on
                 // visible, correct content without inventing a third tab
                 // layer this task's UX sketch does not ask for.
-                self.show_repair_review_page(ui);
+                //
+                // Exact Duplicate Review is the one exception: it is a
+                // genuinely separate task (a DAT-independent scan, its own
+                // source-folder setup, its own scan/apply state) rather
+                // than another lens over the same repair plan, so it
+                // replaces Review+History when specifically selected -
+                // reached via the "Exact duplicates" link below, and left
+                // via the ordinary "Repair" tab button (which always lands
+                // back on `MainView::RepairReview`, exactly like every
+                // other tab button's normal back/navigation behaviour).
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Exact duplicates",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .on_hover_text(
+                        "Find byte-identical files, keep one copy, and move the others into a \
+                         recoverable quarantine. Nothing is permanently deleted.",
+                    )
+                    .clicked()
+                    {
+                        self.view = MainView::ExactDuplicateReview;
+                    }
+                });
                 ui.add_space(theme::SECTION_GAP);
-                ui.separator();
-                ui.add_space(theme::SECTION_GAP);
-                self.show_repair_history_page(ui);
+
+                if self.view == MainView::ExactDuplicateReview {
+                    self.show_exact_duplicate_review_page(ui);
+                } else {
+                    self.show_repair_review_page(ui);
+                    ui.add_space(theme::SECTION_GAP);
+                    ui.separator();
+                    ui.add_space(theme::SECTION_GAP);
+                    self.show_repair_history_page(ui);
+                }
             }
         }
     }

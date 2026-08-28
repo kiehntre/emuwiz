@@ -254,12 +254,21 @@ pub enum CanonicalRecommendation {
     /// unique member. Never resolved by path order, mtime, or any other
     /// invented tie-break - the user must choose.
     RequiresUserChoice,
+    /// A person explicitly chose this copy, via [`apply_user_choice`],
+    /// because no automatic evidence distinguished one. Never produced by
+    /// [`select_canonical_copy`] itself - this is the one honest way a
+    /// `RequiresUserChoice` group becomes quarantine-ready, and it is
+    /// always labelled as a person's own decision, never presented as
+    /// trusted-root or elected-library evidence it does not have.
+    UserChosen(PathBuf),
 }
 
 impl CanonicalRecommendation {
     pub fn retained_path(&self) -> Option<&Path> {
         match self {
-            Self::TrustedRoot(path) | Self::ElectedLibrary(path) => Some(path),
+            Self::TrustedRoot(path) | Self::ElectedLibrary(path) | Self::UserChosen(path) => {
+                Some(path)
+            }
             Self::RequiresUserChoice => None,
         }
     }
@@ -279,8 +288,56 @@ impl CanonicalRecommendation {
                  the user must choose which copy to keep"
                     .to_string()
             }
+            Self::UserChosen(path) => {
+                format!("'{}' was chosen to keep by the user", path.display())
+            }
         }
     }
+}
+
+/// Re-derives an [`ExactDuplicateGroup`] after a person has chosen which
+/// member to keep, for a group [`select_canonical_copy`] itself left as
+/// [`CanonicalRecommendation::RequiresUserChoice`]. `chosen` must be one of
+/// `group.members` - never a path the scan never actually saw. Recomputes
+/// `redundant_paths`, `reclaimable_bytes`, and `readiness` from the same
+/// rules [`scan_exact_duplicates`] itself applies (a blocked multi-file
+/// relationship still blocks the group; nothing about a manual choice
+/// overrides that safety check).
+pub fn apply_user_choice(
+    group: &ExactDuplicateGroup,
+    chosen: &Path,
+) -> Result<ExactDuplicateGroup, String> {
+    if !group.members.iter().any(|member| member.path == chosen) {
+        return Err(format!(
+            "'{}' is not a member of this exact-duplicate group",
+            chosen.display()
+        ));
+    }
+    let recommendation = CanonicalRecommendation::UserChosen(chosen.to_path_buf());
+    let redundant_paths: Vec<PathBuf> = group
+        .members
+        .iter()
+        .map(|member| member.path.clone())
+        .filter(|path| path.as_path() != chosen)
+        .collect();
+    let reclaimable_bytes = group.size_bytes * redundant_paths.len() as u64;
+    let readiness = match &group.multi_file {
+        MultiFileProtection::Blocked(reason) => GroupQuarantineReadiness::Blocked(reason.clone()),
+        _ => GroupQuarantineReadiness::Safe,
+    };
+    Ok(ExactDuplicateGroup {
+        size_bytes: group.size_bytes,
+        sha256: group.sha256.clone(),
+        legacy_crc32: group.legacy_crc32.clone(),
+        legacy_md5: group.legacy_md5.clone(),
+        legacy_sha1: group.legacy_sha1.clone(),
+        members: group.members.clone(),
+        recommendation,
+        redundant_paths,
+        reclaimable_bytes,
+        multi_file: group.multi_file.clone(),
+        readiness,
+    })
 }
 
 /// Deterministically recommends which member of an already-proven

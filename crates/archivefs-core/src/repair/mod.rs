@@ -60,7 +60,7 @@ pub use duplicate_scan::{
 pub use exact_duplicate::{
     CanonicalRecommendation, EXACT_DUPLICATE_SCAN_VERSION, ExactDuplicateGroup,
     ExactDuplicateMember, ExactDuplicateScanReport, ExcludedCandidate, FullFileIdentity,
-    FullHashRefusal, GroupQuarantineReadiness, MultiFileProtection,
+    FullHashRefusal, GroupQuarantineReadiness, MultiFileProtection, apply_user_choice,
     build_exact_duplicate_group_proposals, exact_bytes_match, hash_full_file_sha256,
     scan_exact_duplicates, select_canonical_copy,
 };
