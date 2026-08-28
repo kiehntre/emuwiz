@@ -79,6 +79,7 @@ pub mod pcsx2_execution;
 pub mod planning;
 pub mod platform_map;
 pub mod ppsspp_command;
+pub mod ppsspp_execution;
 pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
@@ -168,6 +169,12 @@ pub use platform_map::{
 pub use ppsspp_command::{
     PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, PpssppCommandPlan, PpssppCommandSelection,
     build_ppsspp_command_plan,
+};
+pub use ppsspp_execution::{
+    LaunchedPpssppProcess, PpssppLaunchCommandFacts, PpssppLaunchExecutionError,
+    PpssppLaunchExitReport, PpssppLaunchPreflightError, PpssppLaunchPreflightErrorKind,
+    PpssppLaunchRequest, PpssppLaunchSpawnError, preflight_and_launch_ppsspp,
+    preflight_ppsspp_launch, spawn_ppsspp,
 };
 pub use readiness::{
     FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchReadiness, LaunchWarning,
