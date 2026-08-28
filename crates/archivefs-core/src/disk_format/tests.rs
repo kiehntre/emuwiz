@@ -1167,14 +1167,18 @@ fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
     assert_eq!(report.confidence, DetectionConfidence::Confirmed);
 }
 
-/// Test 45: the schema is untouched. This milestone adds no migration, so the
-/// version and the migration list must be exactly what they were.
+/// Test 45: this milestone (Atari ST/STX detection) adds no migration of
+/// its own. The migration list is still pinned exactly, so an *unrelated*
+/// future change that quietly adds one here is still caught; migration
+/// 0007 (`migrations/0007_discovery_details.sql`) is already accounted for
+/// as a legitimately accepted, unrelated addition (Collection Discovery
+/// paging - see `database.rs`), not something this milestone introduced.
 #[test]
 fn the_database_schema_and_migrations_are_unchanged() {
     let versions = crate::database::migration_versions_for_tests();
     assert_eq!(
         versions,
-        vec![1_i64, 2, 3, 4, 5, 6],
-        "migrations must remain exactly 0001 through 0006"
+        vec![1_i64, 2, 3, 4, 5, 6, 7],
+        "migrations must remain exactly 0001 through 0007"
     );
 }

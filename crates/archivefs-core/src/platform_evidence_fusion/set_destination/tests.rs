@@ -124,9 +124,19 @@ fn single_file_is_never_forced_into_a_nested_folder() {
     }];
     let report = plan_library(&inputs, &context);
     // Confirm the flat, un-nested shape from build_organisation_plan is
-    // untouched by this module for a lone file.
+    // untouched by this module for a lone file. The destination folder
+    // name comes from the neutral EmuWiz platform layout identity (the
+    // canonical `Platform::display_name`, "Sony PlayStation" for "PSX") -
+    // see `plan_library`'s own doc comment: "No RomM lookup happens here."
+    // `slug_for_platform`/`romm_slug` (the "ps" closure above) is a later,
+    // separate annotation reported alongside each item for RomM mapping
+    // purposes only; it never feeds destination-path construction, so it
+    // plays no part in this assertion.
     let flat_destination = report.items[0].organisation.destination_path.clone();
-    assert_eq!(flat_destination, root.join("ps").join("game.bin"));
+    assert_eq!(
+        flat_destination,
+        root.join("Sony PlayStation").join("game.bin")
+    );
 
     let plan = plan_set_destinations(&report, &[], &[]);
     assert!(plan.sets.is_empty());
