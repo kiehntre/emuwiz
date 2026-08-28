@@ -272,7 +272,15 @@ pub fn build_retrodeck_projection_transaction(
                 .to_string(),
         );
     }
-    build_playing_library_transaction(&projection.playing_library_plan, generation)
+    let transaction =
+        build_playing_library_transaction(&projection.playing_library_plan, generation)?;
+    if transaction.entries.len() != projection.playing_library_plan.operations.len() {
+        return Err(
+            "RetroDECK apply is blocked: one or more launcher/companion files are missing or no longer regular files"
+                .to_string(),
+        );
+    }
+    Ok(transaction)
 }
 
 #[cfg(test)]
@@ -338,7 +346,10 @@ mod tests {
         std::fs::create_dir_all(home.join("ES-DE/custom_systems")).unwrap();
         let systems = r#"<systemList>
 <system><name>psx</name><fullname>Sony PlayStation</fullname><path>/tmp/retrodeck-test-roms/psx</path><extension>.cue .bin</extension><platform>psx</platform><theme>psx</theme></system>
+<system><name>ps2</name><fullname>Sony PlayStation 2</fullname><path>/tmp/retrodeck-test-roms/ps2</path><extension>.iso</extension><platform>ps2</platform><theme>ps2</theme></system>
 <system><name>dreamcast</name><fullname>Sega Dreamcast</fullname><path>/tmp/retrodeck-test-roms/dreamcast</path><extension>.gdi .bin</extension><platform>dreamcast</platform><theme>dreamcast</theme></system>
+<system><name>saturn</name><fullname>Sega Saturn</fullname><path>/tmp/retrodeck-test-roms/saturn</path><extension>.cue .bin</extension><platform>saturn</platform><theme>saturn</theme></system>
+<system><name>segacd</name><fullname>Sega CD</fullname><path>/tmp/retrodeck-test-roms/segacd</path><extension>.cue .bin .m3u</extension><platform>segacd</platform><theme>segacd</theme></system>
 <system><name>gb</name><fullname>Game Boy</fullname><path>/tmp/retrodeck-test-roms/gb</path><extension>.gb</extension><platform>gb</platform><theme>gb</theme></system>
 <system><name>gba</name><fullname>Game Boy Advance</fullname><path>/tmp/retrodeck-test-roms/gba</path><extension>.gba</extension><platform>gba</platform><theme>gba</theme></system>
 </systemList>"#;
@@ -367,7 +378,12 @@ mod tests {
     fn reviewed_game_boy_and_gba_mappings_are_consumed() {
         let root = Path::new("/playing");
         let fixture = tempfile::tempdir().unwrap();
-        for (platform, expected) in [("PSX", "psx"), ("Dreamcast", "dreamcast")] {
+        for (platform, expected) in [
+            ("PS2", "ps2"),
+            ("Saturn", "saturn"),
+            ("Dreamcast", "dreamcast"),
+            ("Sega CD", "segacd"),
+        ] {
             let result = build_retrodeck_projection(
                 &plan(root, "game.rom", &[]),
                 &identity(platform),
@@ -397,9 +413,10 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let esde = profile(fixture.path());
         for (platform, launcher, companions) in [
-            ("PSX", "game.cue", vec!["track01.bin", "track02.bin"]),
+            ("PS2", "game.iso", vec![]),
+            ("Saturn", "game.cue", vec!["track01.bin"]),
             ("Dreamcast", "game.gdi", vec!["track01.bin", "track02.raw"]),
-            ("PSX", "game.m3u", vec!["disc1.cue", "disc2.cue"]),
+            ("Sega CD", "game.m3u", vec!["disc1.cue", "disc2.cue"]),
         ] {
             let names: Vec<&str> = companions;
             let result = build_retrodeck_projection(
@@ -451,6 +468,51 @@ mod tests {
         )
         .unwrap();
         assert!(build_retrodeck_projection_transaction(&verified, 1).is_ok());
+    }
+
+    #[test]
+    fn missing_companion_is_refused_before_retrodeck_mutation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let destination = fixture.path().join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("game.gdi"), b"gdi").unwrap();
+        let projection = build_retrodeck_projection(
+            &plan(&source, "game.gdi", &["missing.bin"]),
+            &identity("Dreamcast"),
+            destination.clone(),
+            RetroDeckVisibility::verified_same_path_bind(source, destination).unwrap(),
+            &profile(fixture.path()),
+        )
+        .unwrap();
+        assert!(build_retrodeck_projection_transaction(&projection, 1).is_err());
+        assert!(!projection.retrodeck_rom_root.join("game.gdi").exists());
+    }
+
+    #[test]
+    fn projected_parent_traversal_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("game.iso"), b"iso").unwrap();
+        let mut unsafe_plan = plan(&source, "game.iso", &[]);
+        unsafe_plan.elected_games[0]
+            .launcher_operation
+            .destination_path = source.join("../outside/game.iso");
+        unsafe_plan.operations = unsafe_plan.elected_games[0]
+            .all_operations()
+            .cloned()
+            .collect();
+        assert!(
+            build_retrodeck_projection(
+                &unsafe_plan,
+                &identity("PS2"),
+                fixture.path().join("destination"),
+                RetroDeckVisibility::unverified(None, None, None, None),
+                &profile(fixture.path()),
+            )
+            .is_err()
+        );
     }
 
     #[test]

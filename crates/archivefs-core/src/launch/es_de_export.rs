@@ -155,6 +155,16 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_fullname: "Sega Dreamcast",
     },
     EsDeSystemMapping {
+        platform_id: "Saturn",
+        es_de_system: "saturn",
+        es_de_fullname: "Sega Saturn",
+    },
+    EsDeSystemMapping {
+        platform_id: "Sega CD",
+        es_de_system: "segacd",
+        es_de_fullname: "Sega CD",
+    },
+    EsDeSystemMapping {
         platform_id: "AtariST",
         es_de_system: "atarist",
         es_de_fullname: "Atari ST",
@@ -434,6 +444,8 @@ mod tests {
             "GameCube",
             "Wii",
             "Dreamcast",
+            "Saturn",
+            "Sega CD",
             "AtariST",
             "Amiga",
             "NES",
@@ -507,11 +519,15 @@ mod tests {
 
     #[test]
     fn unmapped_platform_produces_no_entry_never_a_guess() {
-        let outcome = build_es_de_entry_plan(&resolved("Saturn"), &usable_content(), None);
+        let outcome = build_es_de_entry_plan(
+            &resolved("Not a reviewed platform"),
+            &usable_content(),
+            None,
+        );
         assert_eq!(
             outcome,
             EsDeExportOutcome::NoEntry(NoEntryReason::PlatformUnmapped {
-                platform_id: "Saturn".to_string()
+                platform_id: "Not a reviewed platform".to_string()
             })
         );
     }
