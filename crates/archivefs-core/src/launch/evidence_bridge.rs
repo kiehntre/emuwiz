@@ -138,6 +138,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::Wii => Some("Wii"),
         IdentityPlatform::MegaDrive => Some("MegaDrive"),
         IdentityPlatform::Snes => Some("SNES"),
+        IdentityPlatform::Nes => Some("NES"),
         IdentityPlatform::Xbox360 => Some("Xbox360"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
@@ -225,7 +226,7 @@ fn resolved_identity_for_platform(
                 vec![VerifiedIdentityFact::WiiGameId(game_id.to_string())],
             ))
         }
-        IdentityPlatform::MegaDrive | IdentityPlatform::Snes => {
+        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Nes => {
             // A verified full-file SHA-256 is a genuine opaque game key, but
             // `VerifiedIdentityFact` has no cartridge-hash variant - no
             // adapter-request projector reads a generic hash today, so

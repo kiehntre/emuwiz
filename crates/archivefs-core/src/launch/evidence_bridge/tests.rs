@@ -394,6 +394,34 @@ fn verified_loose_rom_sha256_resolves_with_no_fabricated_fact() {
     );
 }
 
+#[test]
+fn nes_verified_loose_rom_sha256_resolves_with_no_fabricated_fact() {
+    let source = report(
+        IdentityPlatform::Nes,
+        vec![evidence(
+            IdentityKind::LooseRomSha256,
+            IdentityStatus::Verified,
+            Some("bb".repeat(32).as_str()),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "NES".to_string(),
+            game_key: "bb".repeat(32),
+        })
+    );
+    assert!(
+        facts.is_empty(),
+        "no VerifiedIdentityFact variant exists for a generic cartridge hash - the bridge must \
+         not invent one"
+    );
+}
+
 // --- unknown stays Unknown ---------------------------------------------------
 
 #[test]

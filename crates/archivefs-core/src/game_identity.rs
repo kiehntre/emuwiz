@@ -230,6 +230,7 @@ pub enum IdentityPlatform {
     Wii,
     MegaDrive,
     Snes,
+    Nes,
     Xbox360,
     Other,
 }
@@ -254,6 +255,7 @@ impl IdentityPlatform {
             | "super nintendo entertainment system"
             | "nintendo super nintendo entertainment system"
             | "super famicom" => Self::Snes,
+            "nes" | "nintendo entertainment system" | "famicom" | "nintendo famicom" => Self::Nes,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             _ => Self::Other,
         }
@@ -270,6 +272,7 @@ impl IdentityPlatform {
             Self::Wii => "Wii",
             Self::MegaDrive => "Mega Drive / Genesis",
             Self::Snes => "SNES",
+            Self::Nes => "NES",
             Self::Xbox360 => "Xbox 360",
             Self::Other => "Unsupported platform",
         }
@@ -545,7 +548,7 @@ fn inspect_game_identity_with_platform_trust(
 
     if matches!(
         platform,
-        IdentityPlatform::MegaDrive | IdentityPlatform::Snes
+        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Nes
     ) {
         inspect_loose_rom(&mut report, trusted_platform, trusted);
         return report;
@@ -639,6 +642,7 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::MegaDrive, "bin") => Some("bin"),
         (IdentityPlatform::Snes, "sfc") => Some("sfc"),
         (IdentityPlatform::Snes, "smc") => Some("smc"),
+        (IdentityPlatform::Nes, "nes") => Some("nes"),
         _ => None,
     }
 }
@@ -1077,6 +1081,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::SegaCd
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
+        | IdentityPlatform::Nes
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
@@ -1457,6 +1462,7 @@ fn inspect_iso_source(
         }
         IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
+        | IdentityPlatform::Nes
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => {}
     }
@@ -3595,7 +3601,10 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
         IdentityPlatform::Xbox360 => &[IdentityKind::XexTitleId, IdentityKind::XexMediaId],
-        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Other => &[],
+        IdentityPlatform::MegaDrive
+        | IdentityPlatform::Snes
+        | IdentityPlatform::Nes
+        | IdentityPlatform::Other => &[],
     };
     for kind in kinds {
         report.evidence.push(evidence(
@@ -3677,6 +3686,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::SegaCd
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
+        | IdentityPlatform::Nes
         | IdentityPlatform::Other => {}
     }
 }
@@ -6133,6 +6143,64 @@ mod tests {
             let expected = sha256_hex(&bytes);
             assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
         }
+    }
+
+    #[test]
+    fn nes_loose_format_receives_verified_local_byte_identity() {
+        let directory = FixtureDir::new("loose-nes");
+        let bytes = b"synthetic-nes-bytes".to_vec();
+        let path = write_fixture(&directory, "Mega Man (USA).nes", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("NES"));
+        assert_eq!(report.platform, IdentityPlatform::Nes);
+        assert_eq!(report.format, IdentityImageFormat::LooseCartridgeRom);
+        assert_eq!(report.bytes_read, bytes.len() as u64);
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256
+                && item.diagnostic.contains("not a known-good dump claim")
+        }));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn nes_platform_hint_recognizes_every_catalogue_synonym() {
+        for hint in ["NES", "Nintendo Entertainment System", "Famicom", "nes"] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(hint)),
+                IdentityPlatform::Nes,
+                "{hint} must resolve to IdentityPlatform::Nes"
+            );
+        }
+    }
+
+    #[test]
+    fn nes_loose_rom_requires_trusted_exact_platform_evidence() {
+        // The mirror of `contextual_bin_requires_trusted_exact_platform_evidence`
+        // for NES: an *uncatalogued* platform hint (a scanner guess, not a
+        // trusted/manual assignment) must never authorize a verified local
+        // hash - filename/context guessing alone is never identity.
+        let directory = FixtureDir::new("loose-nes-untrusted");
+        let path = write_fixture(&directory, "Mystery Game.nes", b"bytes");
+        let candidate = inspect_game_identity(&path, Some("NES"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert!(candidate.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Ambiguous
+        }));
+        assert!(!candidate.complete);
+    }
+
+    #[test]
+    fn nes_wrong_extension_is_unsupported_not_guessed() {
+        let directory = FixtureDir::new("loose-nes-wrong-ext");
+        let path = write_fixture(&directory, "Mystery Game.bin", b"bytes");
+        let report = inspect_catalogued_game_identity(&path, Some("NES"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+        }));
     }
 
     #[test]
