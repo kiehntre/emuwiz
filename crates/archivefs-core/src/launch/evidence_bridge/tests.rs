@@ -110,6 +110,33 @@ fn verified_psp_disc_id_resolves_to_ppsspp_fact() {
 }
 
 #[test]
+fn verified_ps3_title_id_resolves_to_rpcs3_fact() {
+    let source = report(
+        IdentityPlatform::PlayStation3,
+        vec![evidence(
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::Verified,
+            Some("BLUS30000"),
+            IdentityConfidence::StructuredMetadata,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PS3".to_string(),
+            game_key: "BLUS30000".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::Ps3TitleId("BLUS30000".to_string())]
+    );
+}
+
+#[test]
 fn verified_ps1_serial_resolves_to_duckstation_fact() {
     let source = report(
         IdentityPlatform::PlayStation,

@@ -19,6 +19,7 @@ use crate::disc_evidence_collector::{
     read_bounded_chd_bytes,
 };
 use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
+use crate::executable_signatures::looks_like_self;
 use crate::gb_header_evidence::{GB_HEADER_BYTES, GbColorSupport, parse_gb_header};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
@@ -29,6 +30,7 @@ use crate::param_sfo::parse_param_sfo;
 use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
+use crate::ps3_disc_evidence::observe_ps3_directory;
 use crate::raw_cd_logical_media::{
     open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
 };
@@ -173,6 +175,7 @@ pub enum IdentityKind {
     Ps1Serial,
     Ps2Serial,
     PspDiscId,
+    Ps3TitleId,
     SaturnProductNumber,
     DreamcastProductCode,
     SegaCdProductCode,
@@ -201,6 +204,7 @@ impl fmt::Display for IdentityKind {
             Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
             Self::PspDiscId => "PSP disc ID",
+            Self::Ps3TitleId => "PS3 title ID",
             Self::SaturnProductNumber => "Saturn product number",
             Self::DreamcastProductCode => "Dreamcast product code",
             Self::SegaCdProductCode => "Sega CD product code",
@@ -236,6 +240,7 @@ pub enum IdentityPlatform {
     PlayStation,
     PlayStation2,
     Psp,
+    PlayStation3,
     Saturn,
     Dreamcast,
     SegaCd,
@@ -260,6 +265,7 @@ impl IdentityPlatform {
             | "sony playstation" => Self::PlayStation,
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
             "psp" | "playstation portable" | "sony playstation portable" => Self::Psp,
+            "playstation 3" | "playstation3" | "ps3" | "sony playstation 3" => Self::PlayStation3,
             "saturn" | "sega saturn" | "sega saturn console" => Self::Saturn,
             "dreamcast" | "sega dreamcast" => Self::Dreamcast,
             "sega cd" | "sega-cd" | "segacd" | "mega cd" | "mega-cd" | "megacd" => Self::SegaCd,
@@ -288,6 +294,7 @@ impl IdentityPlatform {
             Self::PlayStation => "PlayStation",
             Self::PlayStation2 => "PlayStation 2",
             Self::Psp => "PlayStation Portable",
+            Self::PlayStation3 => "PlayStation 3",
             Self::Saturn => "Sega Saturn",
             Self::Dreamcast => "Sega Dreamcast",
             Self::SegaCd => "Sega Mega-CD / Sega CD",
@@ -458,6 +465,10 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::PspDiscId)
     }
 
+    pub fn verified_ps3_title_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::Ps3TitleId)
+    }
+
     pub fn verified_ps1_serial(&self) -> Option<&str> {
         self.verified_value(IdentityKind::Ps1Serial)
     }
@@ -609,6 +620,13 @@ fn inspect_game_identity_with_platform_trust(
             "shared identity inspection currently supports PS2, GameCube, and Wii",
             "platform eligibility",
         ));
+        return report;
+    }
+
+    if platform == IdentityPlatform::PlayStation3
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    {
+        inspect_ps3_directory_identity(&mut report);
         return report;
     }
 
@@ -1255,6 +1273,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         IdentityPlatform::PlayStation
         | IdentityPlatform::PlayStation2
         | IdentityPlatform::Psp
+        | IdentityPlatform::PlayStation3
         | IdentityPlatform::Saturn
         | IdentityPlatform::Dreamcast
         | IdentityPlatform::SegaCd
@@ -1620,6 +1639,332 @@ fn inspect_xex_header(
     report.complete = true;
 }
 
+/// Authoritative PS3 identity from an ISO9660 disc. The existing PS3 evidence
+/// standard is deliberately strict: the PS3_GAME layout, a bounded
+/// PARAM.SFO TITLE_ID, and a valid SELF header in USRDIR/EBOOT.BIN must all
+/// agree before a title ID becomes verified.
+fn inspect_ps3_iso(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let root = match iso_root(source) {
+        Ok(root) => root,
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps3TitleId,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "ISO 9660 primary volume descriptor",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    report.metadata_paths_inspected += 1;
+    let has_game_dir =
+        matches!(find_iso_path(source, root, &[b"PS3_GAME"]), Ok(Some(record)) if record.directory);
+    if !has_game_dir {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PS3 disc layout validation",
+            "PS3_GAME directory is missing",
+        );
+        return;
+    }
+    let sfo = match find_iso_path(source, root, &[b"PS3_GAME", b"PARAM.SFO"]) {
+        Ok(Some(record)) if !record.directory => record,
+        Ok(_) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps3TitleId,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PS3 PARAM.SFO lookup",
+                "PS3_GAME/PARAM.SFO is missing",
+            );
+            return;
+        }
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps3TitleId,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PS3 PARAM.SFO lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    if sfo.size > crate::param_sfo::MAX_SFO_BYTES as u64 {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::ResourceLimitReached,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "bounded PARAM.SFO read",
+            "PARAM.SFO exceeds the bounded PS3 metadata size",
+        );
+        return;
+    }
+    let bytes = match read_iso_record(source, sfo) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps3TitleId,
+                source_error_status(&error),
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "bounded PARAM.SFO read",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let Some(sfo) = crate::param_sfo::parse_param_sfo(&bytes) else {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PARAM.SFO validation",
+            "PARAM.SFO is malformed",
+        );
+        return;
+    };
+    let Some(raw_title_id) = sfo.get_text("TITLE_ID") else {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PARAM.SFO TITLE_ID lookup",
+            "TITLE_ID is missing",
+        );
+        return;
+    };
+    let title_id = raw_title_id.trim().to_ascii_uppercase();
+    if !valid_ps3_title_id(&title_id) {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PARAM.SFO TITLE_ID validation",
+            "TITLE_ID is malformed",
+        );
+        return;
+    }
+    let eboot = match find_iso_path(source, root, &[b"PS3_GAME", b"USRDIR", b"EBOOT.BIN"]) {
+        Ok(Some(record)) if !record.directory && record.size >= 4 => record,
+        Ok(_) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps3TitleId,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PS3 SELF lookup",
+                "PS3_GAME/USRDIR/EBOOT.BIN is missing or too small",
+            );
+            return;
+        }
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::Ps3TitleId,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PS3 SELF lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    let mut header = [0_u8; 4];
+    if let Err(error) = read_iso_record_prefix(source, eboot, &mut header) {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "bounded PS3 SELF header read",
+            &error.to_string(),
+        );
+        return;
+    }
+    if !looks_like_self(&header) {
+        push_with_source(
+            report,
+            IdentityKind::Ps3TitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PS3 SELF validation",
+            "EBOOT.BIN does not have the PS3 SELF magic",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::Ps3TitleId,
+        IdentityStatus::Verified,
+        Some(title_id),
+        IdentityConfidence::StructuredMetadata,
+        member_path,
+        member_index,
+        "PS3_GAME/PARAM.SFO TITLE_ID plus PS3 SELF EBOOT",
+        "verified from PS3 disc content",
+    );
+    report.complete = true;
+}
+
+fn valid_ps3_title_id(value: &str) -> bool {
+    value.len() == 9
+        && value.as_bytes()[..4]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase())
+        && value.as_bytes()[4..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+}
+
+fn inspect_ps3_directory_identity(report: &mut GameIdentityReport) {
+    let root = &report.archive_path;
+    if !ps3_directory_paths_are_regular(root) {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "PS3 directory contains an unsafe path component or symlink",
+        );
+        return;
+    }
+    let observation = observe_ps3_directory(root);
+    let Some(raw_title_id) = observation.layout.title_id() else {
+        add_unavailable(
+            report,
+            IdentityStatus::Missing,
+            "PS3 PARAM.SFO TITLE_ID is missing",
+        );
+        return;
+    };
+    let title_id = raw_title_id.trim().to_ascii_uppercase();
+    if !valid_ps3_title_id(&title_id) {
+        add_unavailable(report, IdentityStatus::Invalid, "PS3 TITLE_ID is malformed");
+        return;
+    }
+    if !observation.layout.ps3_game_dir_present
+        || !observation.layout.usrdir_present
+        || !observation.layout.eboot_bin_present
+        || observation.layout.eboot_self_magic_present != Some(true)
+    {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "PS3_GAME, USRDIR/EBOOT.BIN, and valid SELF magic are required",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::Ps3TitleId,
+        IdentityStatus::Verified,
+        Some(title_id),
+        IdentityConfidence::StructuredMetadata,
+        None,
+        None,
+        "PS3_GAME/PARAM.SFO TITLE_ID plus PS3 SELF EBOOT",
+        "verified from PS3 folder content",
+    );
+    report.complete = true;
+}
+
+fn ps3_directory_paths_are_regular(root: &Path) -> bool {
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return false;
+    }
+    let game_dir = if root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("PS3_GAME"))
+    {
+        root.to_path_buf()
+    } else {
+        root.join("PS3_GAME")
+    };
+    let paths = [
+        root.to_path_buf(),
+        game_dir.clone(),
+        game_dir.join("USRDIR"),
+        game_dir.join("PARAM.SFO"),
+        game_dir.join("USRDIR").join("EBOOT.BIN"),
+    ];
+    let mut component_path = PathBuf::new();
+    let components_safe = root.components().all(|component| {
+        component_path.push(component.as_os_str());
+        std::fs::symlink_metadata(&component_path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+    });
+    components_safe
+        && paths.iter().all(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                !metadata.file_type().is_symlink()
+                    && ((path.extension().is_some() && metadata.is_file())
+                        || (path.extension().is_none() && metadata.is_dir()))
+            })
+        })
+}
+
 fn inspect_iso_source(
     report: &mut GameIdentityReport,
     source: &mut dyn ByteSource,
@@ -1629,6 +1974,9 @@ fn inspect_iso_source(
     match report.platform {
         IdentityPlatform::PlayStation => inspect_ps1_iso(report, source, member_path, member_index),
         IdentityPlatform::Psp => inspect_psp_iso(report, source, member_path, member_index),
+        IdentityPlatform::PlayStation3 => {
+            inspect_ps3_iso(report, source, member_path, member_index)
+        }
         IdentityPlatform::Saturn => {
             inspect_saturn_source(report, source, member_path, member_index)
         }
@@ -3951,6 +4299,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             &[IdentityKind::Ps2Serial, IdentityKind::Pcsx2ExecutableCrc]
         }
         IdentityPlatform::Psp => &[IdentityKind::PspDiscId],
+        IdentityPlatform::PlayStation3 => &[IdentityKind::Ps3TitleId],
         IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
         IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
         IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
@@ -4046,6 +4395,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         IdentityPlatform::Saturn
         | IdentityPlatform::Dreamcast
         | IdentityPlatform::SegaCd
+        | IdentityPlatform::PlayStation3
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
@@ -4133,6 +4483,165 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn ps3_sfo(title_id: &str) -> Vec<u8> {
+        let key = b"TITLE_ID\0";
+        let mut value = title_id.as_bytes().to_vec();
+        value.push(0);
+        let key_start = 36_u32;
+        let data_start = key_start + key.len() as u32;
+        let mut bytes = vec![0_u8; data_start as usize + value.len()];
+        bytes[..4].copy_from_slice(crate::param_sfo::SFO_MAGIC);
+        bytes[4..8].copy_from_slice(&0x0001_0100_u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&key_start.to_le_bytes());
+        bytes[12..16].copy_from_slice(&data_start.to_le_bytes());
+        bytes[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[20..22].copy_from_slice(&0_u16.to_le_bytes());
+        bytes[22..24].copy_from_slice(&0x0204_u16.to_le_bytes());
+        bytes[24..28].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes[28..32].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes[32..36].copy_from_slice(&0_u32.to_le_bytes());
+        bytes[key_start as usize..data_start as usize].copy_from_slice(key);
+        bytes[data_start as usize..].copy_from_slice(&value);
+        bytes
+    }
+
+    fn ps3_folder(root: &Path, title_id: &str, self_magic: bool) {
+        let game = root.join("PS3_GAME");
+        fs::create_dir_all(game.join("USRDIR")).unwrap();
+        fs::write(game.join("PARAM.SFO"), ps3_sfo(title_id)).unwrap();
+        let eboot: &[u8] = if self_magic {
+            b"SCE\0valid"
+        } else {
+            b"not-self"
+        };
+        fs::write(game.join("USRDIR").join("EBOOT.BIN"), eboot).unwrap();
+    }
+
+    fn ps3_iso(title_id: &str) -> Vec<u8> {
+        let mut iso = vec![0_u8; 25 * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+
+        let root_offset = 20 * ISO_SECTOR_SIZE as usize;
+        let game = directory_record(b"PS3_GAME", 21, ISO_SECTOR_SIZE as u32, true);
+        iso[root_offset..root_offset + game.len()].copy_from_slice(&game);
+
+        let game_offset = 21 * ISO_SECTOR_SIZE as usize;
+        let dot = directory_record(&[0], 21, ISO_SECTOR_SIZE as u32, true);
+        let parent = directory_record(&[1], 20, ISO_SECTOR_SIZE as u32, true);
+        let sfo = directory_record(b"PARAM.SFO", 22, ps3_sfo(title_id).len() as u32, false);
+        let usrdir = directory_record(b"USRDIR", 23, ISO_SECTOR_SIZE as u32, true);
+        let mut cursor = game_offset;
+        for record in [&dot, &parent, &sfo, &usrdir] {
+            iso[cursor..cursor + record.len()].copy_from_slice(record);
+            cursor += record.len();
+        }
+        let usrdir_offset = 23 * ISO_SECTOR_SIZE as usize;
+        iso[usrdir_offset..usrdir_offset + dot.len()].copy_from_slice(&dot);
+        iso[usrdir_offset + dot.len()..usrdir_offset + dot.len() + parent.len()]
+            .copy_from_slice(&parent);
+        let eboot = directory_record(b"EBOOT.BIN", 24, 9, false);
+        let eboot_start = usrdir_offset + dot.len() + parent.len();
+        iso[eboot_start..eboot_start + eboot.len()].copy_from_slice(&eboot);
+        let sfo_bytes = ps3_sfo(title_id);
+        iso[22 * ISO_SECTOR_SIZE as usize..22 * ISO_SECTOR_SIZE as usize + sfo_bytes.len()]
+            .copy_from_slice(&sfo_bytes);
+        iso[24 * ISO_SECTOR_SIZE as usize..24 * ISO_SECTOR_SIZE as usize + 9]
+            .copy_from_slice(b"SCE\0valid");
+        iso
+    }
+
+    #[test]
+    fn ps3_folder_resolves_title_id_from_content_and_bridge() {
+        let directory = FixtureDir::new("ps3 – 日本語");
+        ps3_folder(&directory.0, "BLUS30000", true);
+        let report = inspect_game_identity(&directory.0, Some("PS3"));
+        assert_eq!(report.platform, IdentityPlatform::PlayStation3);
+        assert_eq!(report.verified_ps3_title_id(), Some("BLUS30000"));
+        let (status, facts) =
+            crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+        assert!(matches!(
+            status,
+            crate::launch::planning::CanonicalIdentityStatus::Resolved(_)
+        ));
+        assert_eq!(
+            facts,
+            vec![
+                crate::launch::input_projection::VerifiedIdentityFact::Ps3TitleId(
+                    "BLUS30000".to_string()
+                )
+            ]
+        );
+        let wrong_platform = inspect_game_identity(&directory.0, Some("PS2"));
+        assert_eq!(wrong_platform.verified_ps3_title_id(), None);
+
+        let iso_path = write_fixture(
+            &directory,
+            "PS3 content – BLUS30000.iso",
+            &ps3_iso("BLUS30000"),
+        );
+        let iso_report = inspect_game_identity(&iso_path, Some("PS3"));
+        assert_eq!(iso_report.verified_ps3_title_id(), Some("BLUS30000"));
+    }
+
+    #[test]
+    fn ps3_folder_rejects_missing_malformed_or_non_self_content() {
+        let directory = FixtureDir::new("ps3-invalid");
+        ps3_folder(&directory.0, "BLUS30000", false);
+        assert_eq!(
+            inspect_game_identity(&directory.0, Some("PS3")).verified_ps3_title_id(),
+            None
+        );
+        let missing = FixtureDir::new("ps3-missing");
+        ps3_folder(&missing.0, "not-a-title", true);
+        assert_eq!(
+            inspect_game_identity(&missing.0, Some("PS3")).verified_ps3_title_id(),
+            None
+        );
+        let filename_only = write_fixture(&directory, "BLUS30000", b"not a PS3 folder");
+        assert_eq!(
+            inspect_game_identity(&filename_only, Some("PS3")).verified_ps3_title_id(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ps3_folder_rejects_symlinked_content() {
+        use std::os::unix::fs::symlink;
+        let directory = FixtureDir::new("ps3-symlink");
+        let outside = FixtureDir::new("ps3-outside");
+        ps3_folder(&outside.0, "BLUS30000", true);
+        fs::create_dir(directory.0.join("PS3_GAME")).unwrap();
+        symlink(
+            outside.0.join("PS3_GAME").join("PARAM.SFO"),
+            directory.0.join("PS3_GAME").join("PARAM.SFO"),
+        )
+        .unwrap();
+        fs::create_dir(directory.0.join("PS3_GAME").join("USRDIR")).unwrap();
+        fs::write(
+            directory
+                .0
+                .join("PS3_GAME")
+                .join("USRDIR")
+                .join("EBOOT.BIN"),
+            b"SCE\0",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_game_identity(&directory.0, Some("PS3")).verified_ps3_title_id(),
+            None
+        );
     }
 
     fn dolphin_fixture(platform: IdentityPlatform, id: &[u8; 6], revision: u8) -> Vec<u8> {

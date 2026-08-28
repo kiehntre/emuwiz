@@ -74,6 +74,7 @@ fn is_identity_conferring(kind: IdentityKind) -> bool {
         IdentityKind::Ps1Serial
             | IdentityKind::Ps2Serial
             | IdentityKind::PspDiscId
+            | IdentityKind::Ps3TitleId
             | IdentityKind::SaturnProductNumber
             | IdentityKind::DreamcastProductCode
             | IdentityKind::SegaCdProductCode
@@ -134,6 +135,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::PlayStation => Some("PSX"),
         IdentityPlatform::PlayStation2 => Some("PS2"),
         IdentityPlatform::Psp => Some("PSP"),
+        IdentityPlatform::PlayStation3 => Some("PS3"),
         IdentityPlatform::Saturn => Some("Saturn"),
         IdentityPlatform::Dreamcast => Some("Dreamcast"),
         IdentityPlatform::SegaCd => Some("Sega CD"),
@@ -193,6 +195,14 @@ fn resolved_identity_for_platform(
                 platform_id,
                 disc_id.to_string(),
                 vec![VerifiedIdentityFact::PspDiscId(disc_id.to_string())],
+            ))
+        }
+        IdentityPlatform::PlayStation3 => {
+            let title_id = find_value(resolved, IdentityKind::Ps3TitleId)?;
+            Some((
+                platform_id,
+                title_id.to_string(),
+                vec![VerifiedIdentityFact::Ps3TitleId(title_id.to_string())],
             ))
         }
         IdentityPlatform::Saturn => {
