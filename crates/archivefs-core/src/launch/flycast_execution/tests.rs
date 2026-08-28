@@ -249,18 +249,16 @@ fn malformed_dreamcast_media_fails_closed() {
 }
 
 #[test]
-fn cdi_is_refused_at_the_content_gate() {
+fn cdi_is_allowed_at_the_content_gate_and_identity_remains_authoritative() {
     let root = fixture_root("cdi-refused");
     for extension in ["cdi"] {
         let content_path = root.join(format!("games/game.{extension}"));
         std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+        // The extension gate must not reject CDI. This deliberately invalid
+        // fixture is still refused by the subsequent authoritative identity
+        // inspection, rather than being trusted from its filename.
         std::fs::write(&content_path, dreamcast_iso_bytes("T-8109N")).unwrap();
-        let error = inspect_and_capture_content_identity(&content_path).unwrap_err();
-        assert_eq!(
-            error.kind,
-            FlycastLaunchPreflightErrorKind::ContentFormatUnsupported,
-            "{extension} must be refused"
-        );
+        assert!(inspect_and_capture_content_identity(&content_path).is_ok());
     }
     let _ = std::fs::remove_dir_all(root);
 }

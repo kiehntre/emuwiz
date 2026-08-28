@@ -236,7 +236,7 @@ fn mounted_or_archive_content_is_rejected() {
 }
 
 #[test]
-fn cdi_is_never_accepted() {
+fn verified_direct_cdi_is_accepted_by_the_native_gate() {
     for extension in ["cdi"] {
         let plan = build_flycast_command_plan(
             &resolved(),
@@ -244,17 +244,13 @@ fn cdi_is_never_accepted() {
             &candidate(Some(PathBuf::from(format!("/games/game.{extension}")))),
             &native_binding("/usr/bin/flycast"),
         );
-        assert!(plan.command.is_none(), "{extension} must never be accepted");
-        assert!(has_blocker(
-            &plan,
-            LaunchBlockerKind::FlycastContentFormatUnsupported
-        ));
+        assert!(plan.command.is_some(), "{extension} should be accepted");
     }
 }
 
 #[test]
-fn direct_iso_cue_gdi_and_chd_are_all_accepted() {
-    for extension in ["iso", "cue", "gdi", "chd"] {
+fn direct_supported_flycast_media_are_accepted() {
+    for extension in ["iso", "cue", "gdi", "chd", "cdi"] {
         let plan = build_flycast_command_plan(
             &resolved(),
             Some("T-8109N"),
