@@ -20,6 +20,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +40,11 @@ use super::shared_transaction::{
     execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
 };
 use crate::game_identity::IdentityPlatform;
+
+const DOLPHIN_TEXTURE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const DOLPHIN_TEXTURE_ARCHIVE_MAX_MEMBERS: usize = 10_000;
+const DOLPHIN_TEXTURE_ARCHIVE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const DOLPHIN_TEXTURE_ARCHIVE_MAX_COMPRESSION_RATIO: u64 = 1_000;
 
 #[cfg(test)]
 mod tests;
@@ -106,6 +112,17 @@ pub struct DolphinTexturePackBuildPreview {
     pub rejected: Vec<DolphinTexturePackRejectedFile>,
     pub total_bytes: u64,
     pub complete: bool,
+}
+
+/// Read-only result of inspecting a ZIP texture pack.  `staging_root` is a
+/// private, EmuWiz-owned temporary directory containing only validated ZIP
+/// members; callers must retain it until the manifest is installed and then
+/// remove it.  It is never the emulator destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinTexturePackArchivePreview {
+    pub archive_path: PathBuf,
+    pub staging_root: PathBuf,
+    pub build: DolphinTexturePackBuildPreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +538,202 @@ pub fn build_dolphin_texture_pack_manifest(
         total_bytes,
         complete,
     })
+}
+
+/// Inspects an explicitly selected ZIP and turns its one unambiguous
+/// `Load/Textures/<GameID>` root (or an archive containing only direct PNGs)
+/// into the existing versioned manifest representation.  The ZIP is decoded
+/// only into a fresh temporary staging directory; no emulator destination is
+/// touched and no installation is implied.
+pub fn inspect_dolphin_texture_pack_zip(
+    archive_path: &Path,
+    identity: &DolphinTextureModIdentity,
+    name: String,
+    version: Option<String>,
+) -> Result<DolphinTexturePackArchivePreview, DolphinTextureModError> {
+    if !archive_path.is_absolute() {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::SourceOutsideApprovedScope,
+            "texture-pack archive path must be absolute",
+        ));
+    }
+    if !matches!(
+        identity.platform,
+        IdentityPlatform::GameCube | IdentityPlatform::Wii
+    ) || identity.game_id.is_empty()
+    {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::IdentityUnverified,
+            "a verified GameCube/Wii GameID is required to inspect a texture-pack archive",
+        ));
+    }
+    let archive_meta = fs::symlink_metadata(archive_path).map_err(|error| {
+        pack_error(
+            DolphinTextureModErrorKind::SourceNotFound,
+            format!("{}: {error}", archive_path.display()),
+        )
+    })?;
+    if !archive_meta.is_file() || archive_meta.file_type().is_symlink() {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::SourceNotRegularFile,
+            "texture-pack archive must be a regular, non-symlink file",
+        ));
+    }
+    if archive_meta.len() > DOLPHIN_TEXTURE_ARCHIVE_MAX_BYTES {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::SourceTooLarge,
+            "texture-pack ZIP exceeds the 512 MiB compressed-size limit",
+        ));
+    }
+
+    let staging_root = std::env::temp_dir().join(format!(
+        "archivefs-dolphin-texture-archive-{}-{}",
+        std::process::id(),
+        next_archive_stage_id()
+    ));
+    fs::create_dir(&staging_root).map_err(|error| {
+        pack_error(
+            DolphinTextureModErrorKind::PreviewFailed,
+            format!("could not create archive staging directory: {error}"),
+        )
+    })?;
+    let trusted = crate::safe_read::TrustedRoots::from_paths(archive_path.parent().into_iter());
+    let limits = crate::dat::archive::limits::ArchiveLimits {
+        max_members: DOLPHIN_TEXTURE_ARCHIVE_MAX_MEMBERS,
+        max_member_logical_bytes: super::shared_transaction::SHARED_MAX_SOURCE_BYTES,
+        max_archive_logical_bytes: DOLPHIN_TEXTURE_ARCHIVE_MAX_TOTAL_BYTES,
+        max_solid_decode_bytes: crate::dat::archive::limits::MAX_SOLID_DECODE_BYTES,
+        max_dictionary_bytes: crate::dat::archive::limits::MAX_7Z_DICTIONARY_BYTES,
+        max_compression_ratio: DOLPHIN_TEXTURE_ARCHIVE_MAX_COMPRESSION_RATIO,
+        max_header_bytes: crate::dat::archive::limits::MAX_7Z_HEADER_BYTES,
+        max_zip_central_directory_bytes:
+            crate::dat::archive::limits::MAX_ZIP_CENTRAL_DIRECTORY_BYTES,
+        max_aggregate_decoder_memory_bytes:
+            crate::dat::archive::limits::MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES,
+        max_coders_per_folder: crate::dat::archive::limits::MAX_7Z_CODERS_PER_FOLDER,
+    };
+    let cancel = AtomicBool::new(false);
+    let extracted = match crate::dat::archive::zip::extract_zip_members_to(
+        archive_path,
+        &trusted,
+        &limits,
+        &cancel,
+        &staging_root,
+    ) {
+        Ok(extracted) => extracted,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(pack_error(
+                DolphinTextureModErrorKind::PreviewFailed,
+                format!("texture-pack ZIP refused: {error:?}"),
+            ));
+        }
+    };
+
+    let roots = texture_roots_from_archive(&extracted, &staging_root, &identity.game_id)?;
+    let source_root = if roots.len() == 1 {
+        roots.into_iter().next().unwrap()
+    } else if roots.is_empty()
+        && !extracted.is_empty()
+        && extracted.iter().all(|member| {
+            member
+                .relative_path
+                .parent()
+                .is_none_or(|parent| parent.as_os_str().is_empty())
+                && member
+                    .relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+        })
+    {
+        staging_root.clone()
+    } else {
+        let _ = fs::remove_dir_all(&staging_root);
+        return Err(pack_error(
+            DolphinTextureModErrorKind::PreviewFailed,
+            if roots.is_empty() {
+                "ZIP does not contain one supported Dolphin texture-pack root"
+            } else {
+                "ZIP contains multiple ambiguous Dolphin texture-pack roots"
+            },
+        ));
+    };
+    let build = build_dolphin_texture_pack_manifest(&DolphinTexturePackBuildRequest {
+        source_root,
+        identity: identity.clone(),
+        name,
+        version,
+    })?;
+    if !build.complete {
+        // Keep the staging directory available for preview diagnostics; no
+        // install path can be constructed from an incomplete build.
+    }
+    Ok(DolphinTexturePackArchivePreview {
+        archive_path: archive_path.to_path_buf(),
+        staging_root,
+        build,
+    })
+}
+
+fn texture_roots_from_archive(
+    extracted: &[crate::dat::archive::zip::ZipExtractedMember],
+    staging_root: &Path,
+    game_id: &str,
+) -> Result<BTreeSet<PathBuf>, DolphinTextureModError> {
+    let mut roots = BTreeSet::new();
+    for member in extracted {
+        if member
+            .relative_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("png"))
+        {
+            continue;
+        }
+        let components: Vec<_> = member.relative_path.components().collect();
+        if components.len() < 4 {
+            continue;
+        }
+        for index in 0..=components.len() - 4 {
+            let matches = [
+                Component::Normal(std::ffi::OsStr::new("Load")),
+                Component::Normal(std::ffi::OsStr::new("Textures")),
+                Component::Normal(std::ffi::OsStr::new(game_id)),
+            ];
+            if components[index..index + 3]
+                .iter()
+                .zip(matches.iter())
+                .all(|(actual, expected)| actual == expected)
+                && matches!(components[index + 3], Component::Normal(_))
+                && index + 4 == components.len()
+            {
+                let prefix = components[..index]
+                    .iter()
+                    .fold(staging_root.to_path_buf(), |path, component| {
+                        path.join(component.as_os_str())
+                    });
+                roots.insert(prefix.join("Load/Textures").join(game_id));
+            }
+        }
+    }
+    Ok(roots)
+}
+
+#[cfg(not(test))]
+fn next_archive_stage_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn next_archive_stage_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Builds a read-only multi-file preview through the existing shared preview

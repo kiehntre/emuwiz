@@ -36,6 +36,11 @@ pub struct ZipPreflightEntry {
     pub data_end: u64,
     pub name_raw: Vec<u8>,
     pub is_directory: bool,
+    /// External attributes from the central directory.  These are retained
+    /// so safe extraction callers can reject Unix symlink entries instead of
+    /// materialising them as ordinary files.
+    pub external_attributes: u32,
+    pub version_made_by: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +146,8 @@ pub fn preflight_zip<R: Read + Seek>(
         let comment_len = usize::from(le_u16(&fixed[32..34]));
         let disk_start_16 = le_u16(&fixed[34..36]);
         let local_offset_32 = le_u32(&fixed[42..46]);
+        let version_made_by = le_u16(&fixed[4..6]);
+        let external_attributes = le_u32(&fixed[38..42]);
 
         cursor = cursor
             .checked_add(46)
@@ -196,6 +203,8 @@ pub fn preflight_zip<R: Read + Seek>(
             data_end,
             is_directory: name_raw.ends_with(b"/"),
             name_raw,
+            external_attributes,
+            version_made_by,
         });
     }
     if cursor != central_end {

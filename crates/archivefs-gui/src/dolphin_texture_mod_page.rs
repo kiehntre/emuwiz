@@ -51,8 +51,8 @@ use archivefs_core::patch_manager::{
     build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     dolphin_texture_mod_destination_root, execute_dolphin_texture_pack_apply, execute_shared_apply,
-    execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
-    validate_dolphin_texture_source, verified_dolphin_texture_identity,
+    execute_shared_rollback, generate_shared_operation_id, inspect_dolphin_texture_pack_zip,
+    preview_shared_rollback, validate_dolphin_texture_source, verified_dolphin_texture_identity,
 };
 use eframe::egui;
 
@@ -84,6 +84,12 @@ enum DolphinTextureModStage {
         identity: DolphinTextureModIdentity,
         destination_root: PathBuf,
     },
+    PickingPackArchive {
+        receiver: Receiver<Option<PathBuf>>,
+        archive_path: PathBuf,
+        identity: DolphinTextureModIdentity,
+        destination_root: PathBuf,
+    },
     PickingPackDirectory {
         receiver: Receiver<Option<PathBuf>>,
         archive_path: PathBuf,
@@ -97,6 +103,13 @@ enum DolphinTextureModStage {
         destination_root: PathBuf,
     },
     PackBuilderPreview {
+        preview: DolphinTexturePackBuildPreview,
+        source_root: PathBuf,
+        archive_path: PathBuf,
+        identity: DolphinTextureModIdentity,
+        destination_root: PathBuf,
+    },
+    PackArchivePreview {
         preview: DolphinTexturePackBuildPreview,
         source_root: PathBuf,
         archive_path: PathBuf,
@@ -179,6 +192,7 @@ impl DolphinTextureModPageState {
             Some(
                 DolphinTextureModStage::PickingFile { .. }
                     | DolphinTextureModStage::PickingPackManifest { .. }
+                    | DolphinTextureModStage::PickingPackArchive { .. }
                     | DolphinTextureModStage::PickingPackDirectory { .. }
                     | DolphinTextureModStage::Applying { .. }
                     | DolphinTextureModStage::PackApplying { .. }
@@ -247,6 +261,39 @@ impl DolphinTextureModPageState {
                 }
                 Err(TryRecvError::Empty) => {
                     self.stage = Some(DolphinTextureModStage::PickingPackManifest {
+                        receiver,
+                        archive_path,
+                        identity,
+                        destination_root,
+                    });
+                    false
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.stage = None;
+                    true
+                }
+            },
+            Some(DolphinTextureModStage::PickingPackArchive {
+                receiver,
+                archive_path,
+                identity,
+                destination_root,
+            }) => match receiver.try_recv() {
+                Ok(Some(path)) => {
+                    self.stage = Some(build_pack_archive_preview_stage(
+                        &path,
+                        &archive_path,
+                        &identity,
+                        &destination_root,
+                    ));
+                    true
+                }
+                Ok(None) => {
+                    self.stage = None;
+                    true
+                }
+                Err(TryRecvError::Empty) => {
+                    self.stage = Some(DolphinTextureModStage::PickingPackArchive {
                         receiver,
                         archive_path,
                         identity,
@@ -548,6 +595,22 @@ pub(crate) fn show_dolphin_texture_mod_panel(
                 destination_root,
             });
         }
+        Some(DolphinTextureModStage::PickingPackArchive {
+            receiver,
+            archive_path,
+            identity,
+            destination_root,
+        }) => {
+            widgets::card(ui, |ui| {
+                ui.label("Waiting for texture-pack archive selection…");
+            });
+            state.stage = Some(DolphinTextureModStage::PickingPackArchive {
+                receiver,
+                archive_path,
+                identity,
+                destination_root,
+            });
+        }
         Some(DolphinTextureModStage::PackBuilderForm {
             source_root,
             archive_path,
@@ -562,6 +625,21 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             destination_root,
         ),
         Some(DolphinTextureModStage::PackBuilderPreview {
+            preview,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        }) => show_pack_builder_preview(
+            ui,
+            state,
+            preview,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+        ),
+        Some(DolphinTextureModStage::PackArchivePreview {
             preview,
             source_root,
             archive_path,
@@ -704,6 +782,28 @@ fn show_idle(
                 let _ = sender.send(picked);
             });
             state.stage = Some(DolphinTextureModStage::PickingPackManifest {
+                receiver,
+                archive_path: archive_path.to_path_buf(),
+                identity: identity.clone(),
+                destination_root: destination_root.to_path_buf(),
+            });
+        }
+        if widgets::action_button(
+            ui,
+            "Choose texture-pack archive (ZIP)",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("Dolphin texture-pack archive", &["zip"])
+                    .pick_file();
+                let _ = sender.send(picked);
+            });
+            state.stage = Some(DolphinTextureModStage::PickingPackArchive {
                 receiver,
                 archive_path: archive_path.to_path_buf(),
                 identity: identity.clone(),
@@ -951,6 +1051,35 @@ fn build_pack_preview_stage(
             plan,
             manifest_path: manifest_path.to_path_buf(),
         },
+        Err(error) => DolphinTextureModStage::Failed {
+            detail: error.detail,
+        },
+    }
+}
+
+fn build_pack_archive_preview_stage(
+    selected_archive: &Path,
+    game_archive: &Path,
+    identity: &DolphinTextureModIdentity,
+    destination_root: &Path,
+) -> DolphinTextureModStage {
+    let name = selected_archive
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Imported texture pack")
+        .to_string();
+    match inspect_dolphin_texture_pack_zip(selected_archive, identity, name, None) {
+        Ok(preview) => {
+            let source_root = preview.build.manifest.source_root.clone();
+            DolphinTextureModStage::PackArchivePreview {
+                preview: preview.build,
+                source_root,
+                archive_path: game_archive.to_path_buf(),
+                identity: identity.clone(),
+                destination_root: destination_root.to_path_buf(),
+            }
+        }
         Err(error) => DolphinTextureModStage::Failed {
             detail: error.detail,
         },

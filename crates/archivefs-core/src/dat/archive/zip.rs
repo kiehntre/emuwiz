@@ -1,7 +1,7 @@
 //! Bounded, read-only ZIP-member hashing.
 
 use std::fs::{File, Metadata};
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -383,6 +383,154 @@ pub enum ZipExtractError {
     Refused(&'static str),
     Corrupt(String),
     Cancelled,
+}
+
+/// One safely materialised ZIP member.  The path is relative to the caller's
+/// staging directory; no archive member is ever allowed to choose an
+/// absolute or escaping destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipExtractedMember {
+    pub relative_path: PathBuf,
+    pub logical_size: u64,
+}
+
+/// Extracts every regular, non-directory member of a ZIP into an already
+/// dedicated staging directory.  It reuses the same central-directory
+/// preflight and bounded decoder as the archive audit reader.  The caller
+/// remains responsible for deciding which extracted members are meaningful;
+/// this function only provides the format-neutral path and resource safety
+/// boundary.
+pub fn extract_zip_members_to(
+    path: &Path,
+    trusted: &crate::safe_read::TrustedRoots,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    destination: &Path,
+) -> Result<Vec<ZipExtractedMember>, ZipExtractError> {
+    let safe = open_bounded_read(path, trusted).map_err(|error| {
+        ZipExtractError::Open(format!("read policy refused the ZIP: {error:?}"))
+    })?;
+    let file_len = safe.len();
+    let mut file = safe.into_file();
+    let preflight =
+        preflight_zip(&mut file, file_len, limits, cancel).map_err(ZipExtractError::Preflight)?;
+
+    std::fs::create_dir_all(destination)
+        .map_err(|error| ZipExtractError::Open(error.to_string()))?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut members = Vec::new();
+    let mut total = 0_u64;
+    for entry in &preflight.entries {
+        let raw = &entry.name_raw;
+        let name = std::str::from_utf8(raw)
+            .map_err(|_| ZipExtractError::Refused("member name is not UTF-8"))?;
+        let relative = PathBuf::from(name.trim_end_matches('/'));
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Err(ZipExtractError::Refused("unsafe member path"));
+        }
+        if !names.insert(name.to_lowercase()) {
+            return Err(ZipExtractError::Refused(
+                "duplicate or case-colliding member path",
+            ));
+        }
+        if entry.is_directory {
+            continue;
+        }
+        // Unix creator metadata identifies symbolic links by the file-type
+        // bits in the high half of external attributes.  Refuse them even if
+        // a ZIP library would otherwise expose them as regular bytes.
+        if (entry.version_made_by >> 8) == 3
+            && ((entry.external_attributes >> 16) & 0xf000) == 0xa000
+        {
+            return Err(ZipExtractError::Refused("symbolic-link member"));
+        }
+        if entry.logical_size > limits.max_member_logical_bytes {
+            return Err(ZipExtractError::Refused("member size"));
+        }
+        total = total
+            .checked_add(entry.logical_size)
+            .ok_or(ZipExtractError::Refused("archive logical size"))?;
+        if total > limits.max_archive_logical_bytes {
+            return Err(ZipExtractError::Refused("archive logical size"));
+        }
+        if entry.flags & ((1 << 0) | (1 << 6) | (1 << 13)) != 0 {
+            return Err(ZipExtractError::Refused("encrypted member"));
+        }
+        if entry.flags & ((1 << 4) | (1 << 5)) != 0 || !matches!(entry.method, 0 | 8) {
+            return Err(ZipExtractError::Refused("unsupported ZIP feature"));
+        }
+        if ratio_exceeded(
+            entry.logical_size,
+            entry.compressed_size,
+            limits.max_compression_ratio,
+        ) {
+            return Err(ZipExtractError::Refused("compression ratio"));
+        }
+        members.push(ZipExtractedMember {
+            relative_path: relative,
+            logical_size: entry.logical_size,
+        });
+    }
+
+    // All metadata and safety checks complete before the first output write.
+    // A fresh staging directory can therefore be removed wholesale by the
+    // caller on any decode or write error.
+    let mut output = Vec::with_capacity(members.len());
+    for entry in preflight.entries.iter().filter(|entry| !entry.is_directory) {
+        check_cancel_extract(cancel)?;
+        let name = std::str::from_utf8(&entry.name_raw)
+            .map_err(|_| ZipExtractError::Refused("member name is not UTF-8"))?;
+        let relative = PathBuf::from(name.trim_end_matches('/'));
+        let target = destination.join(&relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| ZipExtractError::Open(error.to_string()))?;
+        }
+        file.seek(std::io::SeekFrom::Start(entry.data_start))
+            .map_err(|error| ZipExtractError::Corrupt(error.to_string()))?;
+        let packed = (&mut file).take(entry.compressed_size);
+        let (bytes, read, crc) = if entry.method == 0 {
+            read_bounded_with_crc(packed, entry.logical_size, cancel)?
+        } else {
+            let decoder = flate2::read::DeflateDecoder::new(packed);
+            read_bounded_with_crc(decoder, entry.logical_size, cancel)?
+        };
+        if read != entry.logical_size || crc != entry.crc32 {
+            return Err(ZipExtractError::Corrupt(
+                "decoded size or CRC32 disagreed".to_string(),
+            ));
+        }
+        let mut created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| ZipExtractError::Open(error.to_string()))?;
+        created
+            .write_all(&bytes)
+            .and_then(|_| created.sync_all())
+            .map_err(|error| ZipExtractError::Open(error.to_string()))?;
+        output.push(ZipExtractedMember {
+            relative_path: relative,
+            logical_size: entry.logical_size,
+        });
+    }
+    Ok(output)
+}
+
+fn check_cancel_extract(cancel: &AtomicBool) -> Result<(), ZipExtractError> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(ZipExtractError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Extracts the raw decoded bytes of the single non-directory member in the

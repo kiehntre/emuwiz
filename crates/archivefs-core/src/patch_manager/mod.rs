@@ -338,11 +338,12 @@ pub use dolphin_texture_mod::{
 pub use dolphin_texture_pack::{
     DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES,
     DOLPHIN_TEXTURE_PACK_SOURCE_MODE, DolphinTexturePackApplyResult,
-    DolphinTexturePackBuildPreview, DolphinTexturePackBuildRequest, DolphinTexturePackFile,
-    DolphinTexturePackManifest, DolphinTexturePackPlan, DolphinTexturePackPreviewRequest,
-    DolphinTexturePackRejectedFile, build_dolphin_texture_pack_manifest,
-    build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
-    execute_dolphin_texture_pack_apply, validate_dolphin_texture_pack_manifest,
+    DolphinTexturePackArchivePreview, DolphinTexturePackBuildPreview,
+    DolphinTexturePackBuildRequest, DolphinTexturePackFile, DolphinTexturePackManifest,
+    DolphinTexturePackPlan, DolphinTexturePackPreviewRequest, DolphinTexturePackRejectedFile,
+    build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
+    build_dolphin_texture_pack_transaction_plan, execute_dolphin_texture_pack_apply,
+    inspect_dolphin_texture_pack_zip, validate_dolphin_texture_pack_manifest,
 };
 pub use duckstation_firmware::{
     DuckStationBiosVerificationOutcome, DuckStationGameInspectionWithFirmware, DuckStationRegion,

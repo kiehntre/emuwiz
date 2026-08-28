@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -445,4 +446,101 @@ fn builder_rejects_symlink_sources_without_mutating_source() {
     assert!(preview.manifest.files.is_empty());
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
     assert!(preview.rejected[0].reason.contains("symlink"));
+}
+
+fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, bytes) in entries {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+#[test]
+fn zip_archive_builds_existing_manifest_from_one_wrapper_root() {
+    let dir = TestDir::new("archive-wrapper");
+    let archive = dir.0.join("pack with spaces.zip");
+    write_zip(
+        &archive,
+        &[
+            ("Some Pack/Load/Textures/GALE01/z.png", b"z"),
+            ("Some Pack/Load/Textures/GALE01/a.PNG", b"a"),
+            ("Some Pack/README.txt", b"ignored metadata"),
+        ],
+    );
+    let before = std::fs::read(&archive).unwrap();
+    let preview = inspect_dolphin_texture_pack_zip(
+        &archive,
+        &identity("GALE01"),
+        "Archive Pack".to_string(),
+        Some("1".to_string()),
+    )
+    .unwrap();
+    assert!(preview.build.complete);
+    assert_eq!(preview.build.manifest.files.len(), 2);
+    assert_eq!(
+        preview.build.manifest.files[0].source_relative_path,
+        PathBuf::from("a.PNG")
+    );
+    assert_eq!(preview.build.total_bytes, 2);
+    assert!(preview.staging_root.exists());
+    assert_eq!(std::fs::read(&archive).unwrap(), before);
+    let _ = std::fs::remove_dir_all(preview.staging_root);
+}
+
+#[test]
+fn zip_archive_rejects_traversal_before_staging_output() {
+    let dir = TestDir::new("archive-traversal");
+    let archive = dir.0.join("bad.zip");
+    write_zip(&archive, &[("../GALE01/escape.png", b"x")]);
+    let error =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "Bad".to_string(), None)
+            .unwrap_err();
+    assert!(error.detail.contains("refused"));
+}
+
+#[test]
+fn zip_archive_rejects_absolute_member_paths() {
+    let dir = TestDir::new("archive-absolute");
+    let archive = dir.0.join("bad.zip");
+    write_zip(&archive, &[("/GALE01/escape.png", b"x")]);
+    let error =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "Bad".to_string(), None)
+            .unwrap_err();
+    assert!(error.detail.contains("refused"));
+}
+
+#[test]
+fn zip_archive_does_not_use_a_different_game_id_in_its_root() {
+    let dir = TestDir::new("archive-wrong-game");
+    let archive = dir.0.join("wrong.zip");
+    write_zip(&archive, &[("Load/Textures/GLEE01/texture.png", b"x")]);
+    let error =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "Wrong".to_string(), None)
+            .unwrap_err();
+    assert!(error.detail.contains("does not contain"));
+}
+
+#[test]
+fn zip_archive_rejects_ambiguous_texture_roots() {
+    let dir = TestDir::new("archive-ambiguous");
+    let archive = dir.0.join("ambiguous.zip");
+    write_zip(
+        &archive,
+        &[
+            ("One/Load/Textures/GALE01/a.png", b"a"),
+            ("Two/Load/Textures/GALE01/b.png", b"b"),
+        ],
+    );
+    let error = inspect_dolphin_texture_pack_zip(
+        &archive,
+        &identity("GALE01"),
+        "Ambiguous".to_string(),
+        None,
+    )
+    .unwrap_err();
+    assert!(error.detail.contains("multiple ambiguous"));
 }
