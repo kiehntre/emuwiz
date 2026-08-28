@@ -17,20 +17,20 @@ use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_duckstation_launch_input,
     project_flycast_launch_input, project_pcsx2_launch_input, project_ppsspp_launch_input,
-    project_rpcs3_launch_input, project_xenia_launch_input,
+    project_rpcs3_launch_input, project_xemu_launch_input, project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
     StandaloneProfileInput, build_launch_plan,
 };
 use crate::launch::readiness::{
-    duckstation_firmware_readiness, flycast_firmware_readiness, pcsx2_firmware_readiness,
-    ppsspp_firmware_readiness, rpcs3_firmware_readiness,
+    FirmwareReadiness, duckstation_firmware_readiness, flycast_firmware_readiness,
+    pcsx2_firmware_readiness, ppsspp_firmware_readiness, rpcs3_firmware_readiness,
 };
 use crate::patch_manager::{
     DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
     FlycastProfile, FlycastSystemFileState, Pcsx2BiosVerification, Pcsx2GameInspection,
-    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XeniaProfile,
+    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -67,6 +67,17 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Rpcs3 {
         profile: &'a Rpcs3Profile,
         inspection: &'a Rpcs3GameInspection,
+    },
+    /// xemu's own four-way system-file health (MCPX/flash BIOS/EEPROM/HDD)
+    /// does not reduce to one shared [`FirmwareReadiness`] value, so it is
+    /// deliberately not carried here at all - it is checked directly, from a
+    /// freshly re-inspected [`crate::patch_manager::XemuHealth`], inside
+    /// [`crate::launch::xemu_command::build_xemu_command_plan`]. Projecting
+    /// [`FirmwareReadiness::NotRequired`] below only tells the *generic*
+    /// planner not to raise its own, single-value firmware blocker for xemu
+    /// candidates - it never claims xemu itself needs no firmware.
+    Xemu {
+        profile: &'a XemuProfile,
     },
 }
 
@@ -108,6 +119,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
             profile,
             inspection,
         }
+    }
+
+    pub fn xemu(profile: &'a XemuProfile) -> Self {
+        Self::Xemu { profile }
     }
 }
 
@@ -191,6 +206,17 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware: rpcs3_firmware_readiness(&inspection.health.firmware),
+                })
+            }
+            DiscoveredStandaloneProfile::Xemu { profile }
+                if authorized(project_xemu_launch_input(input.verified_identity_facts)) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "xemu",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
                 })
             }
             DiscoveredStandaloneProfile::Xenia { profile } => {

@@ -84,6 +84,7 @@ pub mod readiness;
 pub mod retroarch_command;
 pub mod rpcs3_command;
 pub mod xemu_command;
+pub mod xemu_execution;
 pub mod xenia_command;
 
 #[cfg(test)]
@@ -185,6 +186,11 @@ pub use rpcs3_command::{
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,
     build_xemu_command_plan,
+};
+pub use xemu_execution::{
+    LaunchedXemuProcess, XemuLaunchCommandFacts, XemuLaunchExecutionError, XemuLaunchExitReport,
+    XemuLaunchPreflightError, XemuLaunchPreflightErrorKind, XemuLaunchRequest,
+    XemuLaunchSpawnError, preflight_and_launch_xemu, preflight_xemu_launch, spawn_xemu,
 };
 pub use xenia_command::{
     XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, XeniaCommandPlan, XeniaCommandSelection,
