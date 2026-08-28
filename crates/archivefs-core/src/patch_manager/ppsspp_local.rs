@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 
@@ -297,6 +299,126 @@ pub struct PpssppGameInspection {
     pub textures: Option<PpssppTextureInventory>,
     pub savedata: Option<PpssppSaveDataInventory>,
     pub health: PpssppHealth,
+}
+
+// ---------------------------------------------------------------------------
+// Native launch binding
+// ---------------------------------------------------------------------------
+
+/// A freshly checked native PPSSPP executable.  PPSSPP's application accepts
+/// a game path as a positional argument; this binding deliberately contains
+/// only the executable fact and never a shell command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PpssppNativeLaunchBinding {
+    pub executable: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PpssppLaunchBlockerKind {
+    UnsupportedInstallationType,
+    ProfileIneligible,
+    AmbiguousExecutable,
+    ExecutableMissing,
+    ExecutableUnsafe,
+    ExecutableNotExecutable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PpssppLaunchBlocker {
+    pub kind: PpssppLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(kind: PpssppLaunchBlockerKind, detail: impl Into<String>) -> PpssppLaunchBlocker {
+    PpssppLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Revalidates one discovered profile and proves exactly one safe native
+/// executable.  Flatpak, portable, and explicit profiles are intentionally
+/// not bound here: only native Linux invocation is reviewed by this launch
+/// slice, and no sandbox/configuration override is invented.
+pub fn resolve_ppsspp_native_launch_binding(
+    profile: &PpssppProfile,
+) -> Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            PpssppLaunchBlockerKind::ProfileIneligible,
+            "profile is not eligible",
+        ));
+    }
+    if profile.installation_type != PpssppInstallationType::Native {
+        return Err(launch_blocker(
+            PpssppLaunchBlockerKind::UnsupportedInstallationType,
+            format!(
+                "only native PPSSPP installations are supported, got {:?}",
+                profile.installation_type
+            ),
+        ));
+    }
+    let matching: Vec<&PpssppExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == PpssppInstallationType::Native)
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            PpssppLaunchBlockerKind::ExecutableMissing,
+            "no native PPSSPP executable was discovered for this profile",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_ppsspp_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(PpssppNativeLaunchBinding {
+            executable: valid.into_iter().next().expect("length checked above"),
+        }),
+        count => Err(launch_blocker(
+            PpssppLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable native PPSSPP executables match this profile and none is distinguished as authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_ppsspp_executable(path: &Path) -> Result<(), PpssppLaunchBlocker> {
+    if !path.is_absolute() {
+        return Err(launch_blocker(
+            PpssppLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            PpssppLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(launch_blocker(
+            PpssppLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular non-symlink file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            PpssppLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1500,5 +1622,43 @@ mod tests {
         assert!(!inspection.health.textures_directory_available);
         assert!(inspection.cheats.is_none());
         assert!(inspection.textures.is_none());
+    }
+
+    #[test]
+    fn native_launch_binding_requires_one_safe_executable() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        let root = profile_root(&roots);
+        write_global(&root, "");
+        let executable = temp.path().join("ppsspp");
+        fs::write(&executable, b"native executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut profile = eligible(root);
+        profile.executable_candidates = vec![PpssppExecutable {
+            path: executable.clone(),
+            installation_type: PpssppInstallationType::Native,
+            version: None,
+        }];
+        let binding = resolve_ppsspp_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, executable);
+    }
+
+    #[test]
+    fn native_launch_binding_refuses_ambiguous_or_non_native_profiles() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        let root = profile_root(&roots);
+        write_global(&root, "");
+        let mut profile = eligible(root);
+        profile.installation_type = PpssppInstallationType::FlatpakUser;
+        let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            PpssppLaunchBlockerKind::UnsupportedInstallationType
+        );
     }
 }

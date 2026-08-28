@@ -511,10 +511,12 @@ pub use ppsspp_local::{
     PPSSPP_MAX_ENTRIES_VISITED, PPSSPP_MAX_PROFILES, PPSSPP_MAX_TEXTURE_DEPTH,
     PPSSPP_MAX_TEXTURE_FILES, PpssppCheatInventory, PpssppDiscoveryError, PpssppExecutable,
     PpssppGameIdMapping, PpssppGameInspection, PpssppGameRequest, PpssppGlobalConfig, PpssppHealth,
-    PpssppInspectionWarning, PpssppInspectionWarningKind, PpssppInstallationType, PpssppProfile,
+    PpssppInspectionWarning, PpssppInspectionWarningKind, PpssppInstallationType,
+    PpssppLaunchBlocker, PpssppLaunchBlockerKind, PpssppNativeLaunchBinding, PpssppProfile,
     PpssppProfileBlocker, PpssppProfileBlockerKind, PpssppProfileDiscovery,
     PpssppProfileDiscoveryRoots, PpssppProfileScope, PpssppSaveDataInventory, PpssppSettings,
     PpssppTextureInventory, discover_ppsspp_profiles, inspect_ppsspp_game, parse_ppsspp_version,
+    resolve_ppsspp_native_launch_binding,
 };
 pub use resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,

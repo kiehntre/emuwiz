@@ -177,6 +177,17 @@ pub enum LaunchBlockerKind {
     Rpcs3FirmwareUnavailable,
     /// The RPCS3 profile/executable binding could not be safely resolved.
     Rpcs3BindingUnavailable,
+    /// A command-plan request was given a non-PPSSPP-standalone launch
+    /// candidate.
+    PpssppCandidateRequired,
+    /// The canonical identity does not target PSP.
+    PpssppPlatformMismatch,
+    /// The content is not a direct, non-mounted PSP ISO.
+    PpssppContentFormatUnsupported,
+    /// No verified PSP disc ID is available for this content.
+    PpssppDiscIdMissing,
+    /// The PPSSPP profile/executable binding could not be safely resolved.
+    PpssppBindingUnavailable,
     /// A Flycast command-plan request was given a non-Flycast-standalone
     /// launch candidate.
     FlycastCandidateRequired,

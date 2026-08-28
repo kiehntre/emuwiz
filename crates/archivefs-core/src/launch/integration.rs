@@ -683,6 +683,35 @@ mod tests {
     }
 
     #[test]
+    fn multiple_eligible_ppsspp_profiles_remain_undetermined() {
+        let identity = resolved("PSP", "ULUS-10000");
+        let profile_a = ppsspp_profile();
+        let mut profile_b = profile_a.clone();
+        profile_b.profile_id = "ppsspp-second".to_string();
+        let profiles = [
+            DiscoveredStandaloneProfile::ppsspp(&profile_a),
+            DiscoveredStandaloneProfile::ppsspp(&profile_b),
+        ];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::PspDiscId("ULUS-10000".to_string())],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 2);
+        assert!(plan.candidates.iter().all(|candidate| {
+            candidate.preference == crate::launch::CandidatePreference::Undetermined
+                && candidate.warnings.iter().any(|warning| {
+                    matches!(
+                        warning.kind,
+                        crate::launch::LaunchWarningKind::MultipleEligibleProfiles
+                    )
+                })
+        }));
+    }
+
+    #[test]
     fn installed_retroarch_core_becomes_a_candidate() {
         let identity = resolved("PSX", "SLUS-12345");
         let plan = plan(

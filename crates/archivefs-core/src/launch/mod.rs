@@ -78,6 +78,7 @@ pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;
 pub mod platform_map;
+pub mod ppsspp_command;
 pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
@@ -161,6 +162,10 @@ pub use platform_map::{
     LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,
     launch_compatibility_for_platform, platforms_for_standalone_adapter,
     retroarch_platform_candidate,
+};
+pub use ppsspp_command::{
+    PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, PpssppCommandPlan, PpssppCommandSelection,
+    build_ppsspp_command_plan,
 };
 pub use readiness::{
     FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchReadiness, LaunchWarning,
