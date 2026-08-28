@@ -807,6 +807,11 @@ fn apply_playing_library_action(
         PlayingLibraryPageAction::RequestEsdeRecovery => state.request_esde_recovery(),
         PlayingLibraryPageAction::CancelEsdeRecovery => state.cancel_esde_recovery(),
         PlayingLibraryPageAction::ConfirmEsdeRecovery => state.confirm_esde_recovery(),
+        PlayingLibraryPageAction::PreviewRomm => state.preview_romm(),
+        PlayingLibraryPageAction::RequestRommApply => state.request_romm_apply(),
+        PlayingLibraryPageAction::CancelRommApply => state.cancel_romm_apply(),
+        PlayingLibraryPageAction::ConfirmRommApply => state.confirm_romm_apply(),
+        PlayingLibraryPageAction::RollbackRomm => state.rollback_romm_last(),
     }
 }
 

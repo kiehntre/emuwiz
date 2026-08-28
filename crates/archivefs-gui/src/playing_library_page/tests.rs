@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use archivefs_core::dat::identity::{DatPlatformConfidence, DatPlatformIdentity};
 use archivefs_core::dat::rename_apply::model::TransactionState;
 
 use super::*;
@@ -588,6 +589,84 @@ fn successful_apply_creates_symlinks_only_nothing_else_under_destination() {
         metadata.is_symlink(),
         "the sole destination entry must be a symlink"
     );
+}
+
+#[test]
+fn romm_preview_shows_slug_counts_visibility_and_keeps_details_collapsed() {
+    let fixture = Fixture::new("romm-preview");
+    let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+    state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+        platform: "Game Boy Advance".to_string(),
+        machine_key: None,
+        confidence: DatPlatformConfidence::Strong,
+        evidence: Vec::new(),
+    });
+    state.preview_romm();
+    let ctx = egui::Context::default();
+    let (output, action) = render(&ctx, &mut state, base_input());
+    assert!(action.is_none());
+    assert!(rendered_text_contains(&output, "Destination:"));
+    assert!(rendered_text_contains(
+        &output,
+        "reviewed RomM platform `gba`"
+    ));
+    assert!(rendered_text_contains(&output, "1 game(s), 1 file(s)"));
+    assert!(rendered_text_contains(&output, "Visibility: Unverified"));
+    assert!(rendered_text_contains(&output, "Apply is blocked"));
+    assert!(!rendered_text_contains(&output, "Launcher:"));
+}
+
+#[test]
+fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
+    let fixture = Fixture::new("romm-apply");
+    let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
+        platform: "Game Boy Advance".to_string(),
+        machine_key: None,
+        confidence: DatPlatformConfidence::Strong,
+        evidence: Vec::new(),
+    });
+    state.preview_romm();
+    state.request_romm_apply();
+    state.confirm_romm_apply();
+    assert!(state.romm_applied.is_none());
+    assert!(
+        state
+            .romm_error
+            .as_deref()
+            .unwrap()
+            .contains("not verified visible"),
+        "unexpected RomM error: {:?}",
+        state.romm_error
+    );
+
+    state.romm_visibility_verified = true;
+    state.romm_visible_source_root_draft = state.source_root_draft.clone();
+    state.preview_romm();
+    state.request_romm_apply();
+    state.confirm_romm_apply();
+    assert!(state.romm_error.is_none(), "{:?}", state.romm_error);
+    let transaction = state.romm_applied.as_ref().expect("RomM transaction");
+    assert_eq!(transaction.state, TransactionState::Applied);
+    let link = destination.join("roms/gba/europe.bin");
+    assert!(link.is_symlink());
+    assert_eq!(std::fs::read_link(&link).unwrap(), original);
+    assert_eq!(std::fs::read(&original).unwrap(), b"test");
+    let ctx = egui::Context::default();
+    let (applied_output, _) = render(&ctx, &mut state, base_input());
+    assert!(rendered_text_contains(
+        &applied_output,
+        "RomM library created: 1 link(s)"
+    ));
+
+    state.rollback_romm_last();
+    assert!(!link.exists());
+    assert_eq!(std::fs::read(&original).unwrap(), b"test");
+    let (rolled_back_output, _) = render(&ctx, &mut state, base_input());
+    assert!(rendered_text_contains(
+        &rolled_back_output,
+        "RomM library rolled back; no generated links remain."
+    ));
 }
 
 #[test]

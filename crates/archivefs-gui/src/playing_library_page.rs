@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use archivefs_core::dat::identity::{DatPlatformIdentity, identify_dat_source};
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::dat::rename_apply::executor::{
@@ -36,8 +37,9 @@ use archivefs_core::launch::es_de_publish::{
 };
 use archivefs_core::playing_library::{
     CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest,
-    ReleaseClass, build_playing_library_plan, build_playing_library_transaction,
-    match_loose_files_against_dat,
+    ReleaseClass, RommLibraryProjectionPlan, RommVisibility, build_playing_library_plan,
+    build_playing_library_transaction, build_romm_projection_transaction,
+    build_romm_projection_with_visibility, match_loose_files_against_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -73,6 +75,7 @@ pub(crate) struct PlayingLibraryPageState {
     pub(crate) exclude_demo: bool,
     pub(crate) exclude_sample: bool,
     plan: Option<PlayingLibraryPlan>,
+    dat_platform_identity: Option<DatPlatformIdentity>,
     plan_generation: u64,
     error: Option<String>,
     /// The elected family currently shown in "Why this one?", identified by
@@ -81,6 +84,13 @@ pub(crate) struct PlayingLibraryPageState {
     pending_apply: Option<usize>,
     confirm_text: String,
     applied: Option<RenameTransaction>,
+    romm_projection: Option<RommLibraryProjectionPlan>,
+    romm_pending_apply: bool,
+    romm_confirm_text: String,
+    romm_applied: Option<RenameTransaction>,
+    romm_error: Option<String>,
+    romm_visibility_verified: bool,
+    romm_visible_source_root_draft: String,
     /// The plan that produced `applied`, kept (instead of dropped like
     /// `plan` is) purely so "Publish to ES-DE" - offered only once a
     /// library has actually been created - can still name which elections
@@ -138,12 +148,20 @@ impl Default for PlayingLibraryPageState {
             exclude_demo: true,
             exclude_sample: true,
             plan: None,
+            dat_platform_identity: None,
             plan_generation: 0,
             error: None,
             selected_family: None,
             pending_apply: None,
             confirm_text: String::new(),
             applied: None,
+            romm_projection: None,
+            romm_pending_apply: false,
+            romm_confirm_text: String::new(),
+            romm_applied: None,
+            romm_error: None,
+            romm_visibility_verified: false,
+            romm_visible_source_root_draft: String::new(),
             applied_plan: None,
             apply_error: None,
             journal_dir: default_rename_transaction_dir()
@@ -262,6 +280,10 @@ impl PlayingLibraryPageState {
     /// nothing is written, moved, or created.
     pub(crate) fn preview(&mut self) {
         self.plan = None;
+        self.dat_platform_identity = None;
+        self.romm_projection = None;
+        self.romm_error = None;
+        self.romm_visibility_verified = false;
         self.error = None;
         self.selected_family = None;
         self.plan_generation += 1;
@@ -289,6 +311,7 @@ impl PlayingLibraryPageState {
                 return;
             }
         };
+        self.dat_platform_identity = Some(identify_dat_source(&outcome.dat));
 
         let candidates = collect_source_files(std::slice::from_ref(&source_root));
         let trusted = TrustedRoots::from_paths([&source_root]);
@@ -326,6 +349,115 @@ impl PlayingLibraryPageState {
     pub(crate) fn cancel_apply(&mut self) {
         self.pending_apply = None;
         self.confirm_text.clear();
+    }
+
+    pub(crate) fn preview_romm(&mut self) {
+        self.romm_projection = None;
+        self.romm_error = None;
+        let (Some(plan), Some(identity)) = (&self.plan, &self.dat_platform_identity) else {
+            self.romm_error = Some("build a Playing Library preview first".to_string());
+            return;
+        };
+        let source_root = self.source_root_draft_path();
+        let visible_root = PathBuf::from(self.romm_visible_source_root_draft.trim());
+        let visibility = if self.romm_visibility_verified
+            && !visible_root.as_os_str().is_empty()
+            && visible_root == source_root
+        {
+            RommVisibility::verified_same_path_bind(source_root)
+                .unwrap_or_else(|_| RommVisibility::unverified(None, None))
+        } else {
+            RommVisibility::unverified(
+                Some(source_root),
+                (!visible_root.as_os_str().is_empty()).then_some(visible_root),
+            )
+        };
+        match build_romm_projection_with_visibility(
+            plan,
+            identity,
+            PathBuf::from(self.destination_root_draft.trim()),
+            visibility,
+        ) {
+            Ok(projection) => self.romm_projection = Some(projection),
+            Err(error) => self.romm_error = Some(error),
+        }
+    }
+
+    pub(crate) fn request_romm_apply(&mut self) {
+        if self.romm_projection.is_some() {
+            self.romm_pending_apply = true;
+            self.romm_confirm_text.clear();
+            self.romm_error = None;
+        }
+    }
+
+    pub(crate) fn cancel_romm_apply(&mut self) {
+        self.romm_pending_apply = false;
+        self.romm_confirm_text.clear();
+    }
+
+    pub(crate) fn confirm_romm_apply(&mut self) {
+        let Some(projection) = &self.romm_projection else {
+            return;
+        };
+        let count = projection.total_files;
+        if count > TYPED_CONFIRMATION_THRESHOLD
+            && self.romm_confirm_text.trim() != playing_library_confirmation_phrase(count)
+        {
+            self.romm_error = Some("the typed confirmation did not match".to_string());
+            return;
+        }
+        let mut transaction =
+            match build_romm_projection_transaction(projection, self.plan_generation) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    self.romm_error = Some(error);
+                    return;
+                }
+            };
+        if let Err(error) = std::fs::create_dir_all(&projection.romm_root) {
+            self.romm_error = Some(format!("could not create the RomM destination: {error}"));
+            return;
+        }
+        if let Err(error) = write_journal(&self.journal_dir, &transaction) {
+            self.romm_error = Some(format!("could not journal the RomM transaction: {error}"));
+            return;
+        }
+        let approved_paths = transaction
+            .entries
+            .iter()
+            .map(|entry| entry.source_path.to_string_lossy().into_owned())
+            .collect();
+        let trusted =
+            TrustedRoots::from_paths([projection.romm_root.clone(), self.source_root_draft_path()]);
+        let result = apply_transaction(&mut ApplyExecution {
+            transaction: &mut transaction,
+            approved_paths,
+            current_generation: self.plan_generation,
+            trusted,
+            journal_dir: self.journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        });
+        self.romm_pending_apply = false;
+        self.romm_confirm_text.clear();
+        match result {
+            Ok(outcome) => self.romm_applied = Some(outcome.transaction),
+            Err(error) => self.romm_error = Some(error.to_string()),
+        }
+    }
+
+    pub(crate) fn rollback_romm_last(&mut self) {
+        let Some(transaction) = &mut self.romm_applied else {
+            return;
+        };
+        if let Err(error) =
+            rollback_transaction(transaction, &self.journal_dir, &AtomicBool::new(false))
+        {
+            self.romm_error = Some(error);
+        }
     }
 
     /// Builds the transaction from the current plan and runs it through the
@@ -738,6 +870,11 @@ pub(crate) enum PlayingLibraryPageAction {
     RequestEsdeRecovery,
     CancelEsdeRecovery,
     ConfirmEsdeRecovery,
+    PreviewRomm,
+    RequestRommApply,
+    CancelRommApply,
+    ConfirmRommApply,
+    RollbackRomm,
 }
 
 /// Stable, absolute widget ids for the text fields a test needs to drive
@@ -909,6 +1046,8 @@ pub(crate) fn show_playing_library_page(
     if let Some(plan) = state.plan() {
         ui.add_space(10.0);
         show_preview_summary(ui, plan, state, &mut action);
+        ui.add_space(10.0);
+        show_romm_projection_summary(ui, state, &mut action);
     }
 
     if let Some(transaction) = state.applied() {
@@ -951,6 +1090,192 @@ pub(crate) fn show_playing_library_page(
     }
 
     action
+}
+
+fn show_romm_projection_summary(
+    ui: &mut egui::Ui,
+    state: &mut PlayingLibraryPageState,
+    action: &mut Option<PlayingLibraryPageAction>,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(ui, "Build RomM Library", None);
+        ui.label(
+            egui::RichText::new(
+                "Create a separate RomM-readable symlink library. Source files are never moved, renamed, or copied.",
+            )
+            .color(theme::muted(ui)),
+        );
+        if state.romm_projection.is_none() {
+            if widgets::action_button(
+                ui,
+                "Preview RomM Library",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                *action = Some(PlayingLibraryPageAction::PreviewRomm);
+            }
+        }
+        if let Some(error) = &state.romm_error {
+            ui.label(egui::RichText::new(error).color(theme::WARNING));
+        }
+        let visibility_changed = ui
+            .checkbox(
+                &mut state.romm_visibility_verified,
+                "I have verified RomM sees the source root at the same absolute path",
+            )
+            .changed();
+        if visibility_changed {
+            state.romm_projection = None;
+        }
+        if !state.romm_visibility_verified {
+            ui.label(
+                egui::RichText::new(
+                    "Apply is blocked until Docker/bind-mount visibility is explicitly verified.",
+                )
+                .color(theme::WARNING),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("RomM-visible source root:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.romm_visible_source_root_draft)
+                    .desired_width(300.0)
+                    .hint_text("e.g. /mnt/usbdrive/games"),
+            );
+        });
+        if let Some(projection) = &state.romm_projection {
+            ui.label(format!("Destination: {}", projection.romm_root.display()));
+            ui.label(format!(
+                "{} game(s), {} file(s), reviewed RomM platform `{}`",
+                projection.games.len(),
+                projection.total_files,
+                projection.romm_platform_slug
+            ));
+            ui.label(format!(
+                "{} election exclusion(s), {} unresolved, {} refused multi-file release(s)",
+                projection.excluded_elections,
+                projection.unresolved_elections,
+                projection.rejected_launchers
+            ));
+            let companion_count: usize = projection
+                .games
+                .iter()
+                .map(|game| game.companions.len())
+                .sum();
+            ui.label(format!(
+                "{companion_count} companion file(s) kept with their launchers"
+            ));
+            ui.label(format!(
+                "Visibility: {}",
+                projection.visibility.description()
+            ));
+            match &projection.visibility {
+                RommVisibility::VerifiedVisible {
+                    host_root,
+                    romm_root,
+                }
+                | RommVisibility::Unverified {
+                    host_root: Some(host_root),
+                    romm_root: Some(romm_root),
+                } => {
+                    ui.label(format!(
+                        "Link targets: host {} -> RomM {}",
+                        host_root.display(),
+                        romm_root.display()
+                    ));
+                }
+                _ => {
+                    ui.label("Link targets: no verified host/container mapping");
+                }
+            }
+            if !state.romm_pending_apply
+                && state.romm_applied.is_none()
+                && widgets::action_button(
+                    ui,
+                    "Create RomM Library",
+                    widgets::ActionStyle::Primary,
+                    projection.visibility.is_verified(),
+                )
+                .clicked()
+            {
+                *action = Some(PlayingLibraryPageAction::RequestRommApply);
+            }
+            if state.romm_pending_apply {
+                if projection.total_files > TYPED_CONFIRMATION_THRESHOLD {
+                    ui.label(format!(
+                        "Type \"{}\" to confirm:",
+                        playing_library_confirmation_phrase(projection.total_files)
+                    ));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.romm_confirm_text)
+                            .desired_width(260.0)
+                            .hint_text(playing_library_confirmation_phrase(projection.total_files)),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Confirm",
+                        widgets::ActionStyle::Destructive,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::ConfirmRommApply);
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::CancelRommApply);
+                    }
+                });
+            }
+            if let Some(transaction) = &state.romm_applied {
+                if transaction.state == TransactionState::RolledBack {
+                    ui.label(
+                        egui::RichText::new("RomM library rolled back; no generated links remain.")
+                            .color(theme::SUCCESS),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "RomM library created: {} link(s)",
+                            transaction.applied_count()
+                        ))
+                        .color(theme::SUCCESS),
+                    );
+                    if widgets::action_button(
+                        ui,
+                        "Roll back RomM Library",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        *action = Some(PlayingLibraryPageAction::RollbackRomm);
+                    }
+                }
+            }
+            widgets::technical_details(ui, "playing_library_romm_files", |ui| {
+                for game in &projection.games {
+                    ui.label(format!(
+                        "Launcher: {} -> {}",
+                        game.launcher.destination_path.display(),
+                        game.launcher.source_path.display()
+                    ));
+                    for companion in &game.companions {
+                        ui.label(format!(
+                            "  Companion: {} -> {}",
+                            companion.destination_path.display(),
+                            companion.source_path.display()
+                        ));
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Whether `draft` names something that plainly is not there yet: non-empty

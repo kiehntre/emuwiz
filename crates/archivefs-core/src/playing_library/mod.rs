@@ -28,6 +28,7 @@ pub mod apply_adapter;
 pub mod evidence;
 pub mod matching;
 pub mod model;
+pub mod romm_projection;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -42,6 +43,10 @@ pub use model::{
     ExcludedCandidate, LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan,
     PlayingLibraryPolicy, RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber,
     UnresolvedGroup,
+};
+pub use romm_projection::{
+    RommLibraryProjectionPlan, RommProjectedGame, RommVisibility, build_romm_projection,
+    build_romm_projection_transaction, build_romm_projection_with_visibility,
 };
 
 /// How far a clone chain may be walked while resolving one family root.
