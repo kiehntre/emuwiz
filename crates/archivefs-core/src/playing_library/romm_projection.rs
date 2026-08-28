@@ -266,7 +266,15 @@ pub fn build_romm_projection_transaction(
                 .to_string(),
         );
     }
-    build_playing_library_transaction(&projection.playing_library_plan, generation)
+    let transaction =
+        build_playing_library_transaction(&projection.playing_library_plan, generation)?;
+    if transaction.entries.len() != projection.playing_library_plan.operations.len() {
+        return Err(
+            "RomM apply is blocked: one or more launcher/companion files are missing or no longer regular files"
+                .to_string(),
+        );
+    }
+    Ok(transaction)
 }
 
 #[cfg(test)]
@@ -381,6 +389,58 @@ mod tests {
     }
 
     #[test]
+    fn modern_console_platforms_project_to_reviewed_slugs() {
+        let root = Path::new("/playing");
+        for (platform, slug) in [
+            ("PSP", "psp"),
+            ("PS3", "ps3"),
+            ("Xbox", "xbox"),
+            ("Xbox360", "xbox360"),
+        ] {
+            let projection = build_romm_projection(
+                &plan(root, Path::new("/source/game")),
+                &strong(platform),
+                PathBuf::from("/romm"),
+            )
+            .unwrap();
+            assert_eq!(projection.romm_platform_slug, slug);
+            assert!(projection.romm_root.ends_with(slug));
+            assert_eq!(
+                projection.games[0].launcher.destination_path.file_name(),
+                Some(std::ffi::OsStr::new("game.cue"))
+            );
+        }
+    }
+
+    #[test]
+    fn ps3_nested_unicode_and_spaced_layout_is_preserved() {
+        let source_root = Path::new("/source/Éditions & tests");
+        let playing_root = Path::new("/playing");
+        let mut source_plan = plan(playing_root, &source_root.join("PS3_GAME/EBOOT.BIN"));
+        source_plan.elected_games[0]
+            .launcher_operation
+            .destination_path = playing_root.join("PS3_GAME/EBOOT.BIN");
+        source_plan.elected_games[0]
+            .companion_operations
+            .push(LinkedLibraryOperation {
+                source_path: source_root.join("PS3_GAME/PARAM.SFO"),
+                destination_path: playing_root.join("PS3_GAME/PARAM.SFO"),
+            });
+        let projection =
+            build_romm_projection(&source_plan, &strong("PS3"), PathBuf::from("/romm library"))
+                .unwrap();
+        assert_eq!(projection.romm_platform_slug, "ps3");
+        assert_eq!(
+            projection.games[0].launcher.destination_path,
+            PathBuf::from("/romm library/roms/ps3/PS3_GAME/EBOOT.BIN")
+        );
+        assert_eq!(
+            projection.games[0].companions[0].destination_path,
+            PathBuf::from("/romm library/roms/ps3/PS3_GAME/PARAM.SFO")
+        );
+    }
+
+    #[test]
     fn unknown_platform_fails_closed() {
         let result = build_romm_projection(
             &plan(Path::new("/p"), Path::new("/s/a")),
@@ -420,6 +480,30 @@ mod tests {
             PathBuf::from("/romm"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wrong_or_ambiguous_platform_evidence_fails_closed_for_modern_targets() {
+        for platform in ["PSP", "PS3", "Xbox", "Xbox360"] {
+            let wrong = build_romm_projection(
+                &plan(Path::new("/playing"), Path::new("/source/game")),
+                &DatPlatformIdentity::Unknown,
+                PathBuf::from("/romm"),
+            );
+            assert!(wrong.is_err(), "unresolved identity authorized {platform}");
+
+            let ambiguous = build_romm_projection(
+                &plan(Path::new("/playing"), Path::new("/source/game")),
+                &DatPlatformIdentity::Ambiguous {
+                    candidates: Vec::new(),
+                },
+                PathBuf::from("/romm"),
+            );
+            assert!(
+                ambiguous.is_err(),
+                "ambiguous identity authorized {platform}"
+            );
+        }
     }
 
     #[test]
@@ -710,6 +794,23 @@ mod tests {
         );
         assert_eq!(std::fs::read(&blocked).unwrap(), b"unrelated");
         assert!(!source.is_symlink());
+    }
+
+    #[test]
+    fn disappearing_source_is_refused_before_romm_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("game.iso");
+        std::fs::write(&source, b"game").unwrap();
+        let projection = build_romm_projection_with_visibility(
+            &plan(temp.path(), &source),
+            &strong("PS3"),
+            temp.path().join("romm"),
+            RommVisibility::verified_same_path_bind(temp.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert!(build_romm_projection_transaction(&projection, 1).is_err());
+        assert!(!projection.romm_root.join("game.iso").exists());
     }
 
     #[test]

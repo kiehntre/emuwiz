@@ -27,9 +27,12 @@
 //!
 //! [`STATIC_TABLE`] below is exactly the "genuinely 1:1, vetted forward
 //! table" that doc comment says may be added as a third tier later. It is
-//! built by manually reviewing every entry in `ROMM_SLUG_ALIASES` (the only
-//! *observed*, not invented, RomM slug data in this repo) and keeping only
+//! built by manually reviewing every entry in `ROMM_SLUG_ALIASES` plus the
+//! RomM 5.0 supported-platform table, and keeping only
 //! the platforms where:
+//!
+//! The reviewed table is RomM's `Supported Platforms` page at
+//! <https://docs.romm.app/5.0.0/platforms/supported-platforms/>.
 //!
 //! - exactly one slug maps to that canonical platform (a platform named by
 //!   *two different* observed slugs - `Amstrad CPC` via both `acpc` and
@@ -41,8 +44,8 @@
 //!   (`fds`, `pc-fx`, `xboxone`).
 //!
 //! Every other canonical platform (the large majority of the 74) has no
-//! observed RomM slug anywhere in this repo and is honestly `Unmapped`
-//! here - never guessed from its display name or folder alias.
+//! reviewed outbound slug and is honestly `Unmapped` here - never guessed
+//! from its display name or folder alias.
 
 use std::collections::BTreeMap;
 
@@ -166,6 +169,20 @@ const STATIC_TABLE: &[RommPlatformMapping] = &[
         provenance: "single slug observed in ROMM_SLUG_ALIASES",
     },
     RommPlatformMapping {
+        canonical_platform_id: "PSP",
+        slug: Some("psp"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM 5.0 Supported Platforms: PlayStation Portable -> psp",
+    },
+    RommPlatformMapping {
+        canonical_platform_id: "PS3",
+        slug: Some("ps3"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM 5.0 Supported Platforms: PlayStation 3 -> ps3",
+    },
+    RommPlatformMapping {
         canonical_platform_id: "PlayStation Vita",
         slug: Some("psvita"),
         aliases: &[],
@@ -186,6 +203,20 @@ const STATIC_TABLE: &[RommPlatformMapping] = &[
         status: RommMappingSupportStatus::Mapped,
         provenance: "two slugs observed (snes, sfam - the Super Famicom regional name); \
                      'snes' chosen as the non-regional primary, 'sfam' kept as a known alias only",
+    },
+    RommPlatformMapping {
+        canonical_platform_id: "Xbox",
+        slug: Some("xbox"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM 5.0 Supported Platforms: Xbox -> xbox",
+    },
+    RommPlatformMapping {
+        canonical_platform_id: "Xbox360",
+        slug: Some("xbox360"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM 5.0 Supported Platforms: Xbox 360 -> xbox360",
     },
     RommPlatformMapping {
         canonical_platform_id: "MasterSystem",

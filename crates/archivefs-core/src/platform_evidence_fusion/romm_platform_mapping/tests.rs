@@ -39,6 +39,27 @@ fn canonical_n64_resolves_forward_to_its_real_observed_slug() {
     );
 }
 
+#[test]
+fn modern_console_targets_resolve_to_reviewed_romm_slugs() {
+    let overrides = FrontendPlatformMapping::default();
+    for (platform, slug) in [
+        ("PSP", "psp"),
+        ("PS3", "ps3"),
+        ("Xbox", "xbox"),
+        ("Xbox360", "xbox360"),
+    ] {
+        assert_eq!(
+            production_romm_slug(platform, &overrides, None),
+            Some(slug.to_string()),
+            "reviewed RomM mapping missing for {platform}"
+        );
+        assert_eq!(
+            production_romm_status(platform, &overrides, None),
+            RommMappingSupportStatus::Mapped
+        );
+    }
+}
+
 // ------------------------------------------------------------------
 // Consistency (section 6)
 // ------------------------------------------------------------------
