@@ -457,6 +457,70 @@ fn game_boy_family_verified_loose_rom_sha256_resolves_with_no_fabricated_fact() 
     }
 }
 
+#[test]
+fn n64_prefers_canonical_hash_as_game_key_with_no_fabricated_fact() {
+    let source = report(
+        IdentityPlatform::N64,
+        vec![
+            evidence(
+                IdentityKind::LooseRomSha256,
+                IdentityStatus::Verified,
+                Some("dd".repeat(32).as_str()),
+                IdentityConfidence::ExactBytes,
+            ),
+            evidence(
+                IdentityKind::LooseRomCanonicalSha256,
+                IdentityStatus::Verified,
+                Some("ee".repeat(32).as_str()),
+                IdentityConfidence::ExactBytes,
+            ),
+        ],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "N64".to_string(),
+            game_key: "ee".repeat(32),
+        }),
+        "the canonical (byte-order-normalized) hash must be preferred as the game key"
+    );
+    assert!(
+        facts.is_empty(),
+        "no VerifiedIdentityFact variant exists for a generic cartridge hash - the bridge must \
+         not invent one"
+    );
+}
+
+#[test]
+fn n64_falls_back_to_physical_hash_when_canonical_is_unavailable() {
+    // A malformed/unrecognized header still leaves a real physical hash -
+    // the resolved identity must fall back to it rather than reporting
+    // Unknown just because normalization couldn't happen.
+    let source = report(
+        IdentityPlatform::N64,
+        vec![evidence(
+            IdentityKind::LooseRomSha256,
+            IdentityStatus::Verified,
+            Some("ff".repeat(32).as_str()),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "N64".to_string(),
+            game_key: "ff".repeat(32),
+        })
+    );
+    assert!(facts.is_empty());
+}
+
 // --- unknown stays Unknown ---------------------------------------------------
 
 #[test]

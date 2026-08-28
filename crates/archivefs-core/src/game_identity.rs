@@ -24,6 +24,7 @@ use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
+use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
@@ -179,6 +180,12 @@ pub enum IdentityKind {
     DolphinDiscNumber,
     DolphinRegion,
     LooseRomSha256,
+    /// SHA-256 of the byte-order-normalized (canonical `Z64`) image - only
+    /// ever emitted for a platform with a tested, reversible byte-order
+    /// normalization ([`crate::n64_byte_order`], currently N64 only).
+    /// Distinct from [`Self::LooseRomSha256`], which always covers the exact
+    /// physical on-disk bytes regardless of byte order.
+    LooseRomCanonicalSha256,
     LooseRomFormat,
     LooseRomTitle,
     XexTitleId,
@@ -200,6 +207,7 @@ impl fmt::Display for IdentityKind {
             Self::DolphinDiscNumber => "Dolphin disc number",
             Self::DolphinRegion => "Dolphin region code",
             Self::LooseRomSha256 => "Local ROM SHA-256",
+            Self::LooseRomCanonicalSha256 => "Canonical byte-order-normalized ROM SHA-256",
             Self::LooseRomFormat => "Loose ROM format",
             Self::LooseRomTitle => "Normalized ROM title",
             Self::XexTitleId => "Xbox 360 Title ID",
@@ -235,6 +243,7 @@ pub enum IdentityPlatform {
     GameBoy,
     GameBoyColor,
     GameBoyAdvance,
+    N64,
     Xbox360,
     Other,
 }
@@ -263,6 +272,7 @@ impl IdentityPlatform {
             "game boy" | "gb" | "nintendo game boy" => Self::GameBoy,
             "game boy color" | "gbc" | "nintendo game boy color" => Self::GameBoyColor,
             "game boy advance" | "gba" | "nintendo game boy advance" => Self::GameBoyAdvance,
+            "n64" | "nintendo 64" | "nintendo64" => Self::N64,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             _ => Self::Other,
         }
@@ -283,6 +293,7 @@ impl IdentityPlatform {
             Self::GameBoy => "Game Boy",
             Self::GameBoyColor => "Game Boy Color",
             Self::GameBoyAdvance => "Game Boy Advance",
+            Self::N64 => "Nintendo 64",
             Self::Xbox360 => "Xbox 360",
             Self::Other => "Unsupported platform",
         }
@@ -457,6 +468,14 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::LooseRomSha256)
     }
 
+    /// The verified byte-order-normalized (canonical `Z64`) SHA-256 -
+    /// currently only ever populated for N64. `None` whenever no reversible
+    /// byte-order normalization exists for the platform, or the ROM's own
+    /// header/length couldn't be normalized (see [`push_n64_canonical_evidence`]).
+    pub fn verified_loose_rom_canonical_sha256(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::LooseRomCanonicalSha256)
+    }
+
     pub fn is_verified_loose_rom(&self) -> bool {
         self.format == IdentityImageFormat::LooseCartridgeRom
             && self.verified_loose_rom_sha256().is_some()
@@ -564,6 +583,7 @@ fn inspect_game_identity_with_platform_trust(
             | IdentityPlatform::GameBoy
             | IdentityPlatform::GameBoyColor
             | IdentityPlatform::GameBoyAdvance
+            | IdentityPlatform::N64
     ) {
         inspect_loose_rom(&mut report, trusted_platform, trusted);
         return report;
@@ -661,6 +681,9 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
         (IdentityPlatform::GameBoyAdvance, "gba") => Some("gba"),
+        (IdentityPlatform::N64, "z64") => Some("z64"),
+        (IdentityPlatform::N64, "v64") => Some("v64"),
+        (IdentityPlatform::N64, "n64") => Some("n64"),
         _ => None,
     }
 }
@@ -752,14 +775,46 @@ fn inspect_loose_rom(
         );
         return;
     }
-    let digest = match hash_bounded_file(&mut file, MAX_LOOSE_ROM_BYTES) {
-        Ok((digest, bytes_read)) => {
-            report.bytes_read = bytes_read;
-            digest
+    let is_n64 = report.platform == IdentityPlatform::N64;
+    let mut whole_file_bytes: Option<Vec<u8>> = None;
+    let digest = if is_n64 {
+        // N64 needs the raw bytes afterward for byte-order detection and
+        // canonical normalization, not just a hash - read once into memory
+        // (already bounded by the `before.len <= MAX_LOOSE_ROM_BYTES` check
+        // above) and hash that buffer the exact same way
+        // [`hash_bounded_file`] would, rather than reading the file twice.
+        let mut bytes = Vec::with_capacity(before.len as usize);
+        match file
+            .by_ref()
+            .take(MAX_LOOSE_ROM_BYTES)
+            .read_to_end(&mut bytes)
+        {
+            Ok(_) => {}
+            Err(error) => {
+                add_loose_rom_unavailable(report, source_error_status(&error), &error.to_string());
+                return;
+            }
         }
-        Err(error) => {
-            add_loose_rom_unavailable(report, source_error_status(&error), &error.to_string());
-            return;
+        report.bytes_read = bytes.len() as u64;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        whole_file_bytes = Some(bytes);
+        digest
+    } else {
+        match hash_bounded_file(&mut file, MAX_LOOSE_ROM_BYTES) {
+            Ok((digest, bytes_read)) => {
+                report.bytes_read = bytes_read;
+                digest
+            }
+            Err(error) => {
+                add_loose_rom_unavailable(report, source_error_status(&error), &error.to_string());
+                return;
+            }
         }
     };
     let after = match StableFileMetadata::from_file(&file) {
@@ -787,6 +842,9 @@ fn inspect_loose_rom(
         "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim",
         "bounded full-file SHA-256",
     ));
+    if let Some(bytes) = whole_file_bytes.as_deref() {
+        push_n64_canonical_evidence(report, bytes);
+    }
     report.evidence.push(evidence(
         report,
         IdentityKind::LooseRomFormat,
@@ -817,6 +875,57 @@ fn inspect_loose_rom(
         );
     }
     report.complete = true;
+}
+
+/// Emits the canonical (byte-order-normalized `Z64`) SHA-256 for an N64
+/// loose ROM, when [`detect_n64_byte_order`] recognizes `bytes`'s header and
+/// [`normalize_to_z64`] succeeds - both pure, tested, already-existing
+/// primitives from [`crate::n64_byte_order`], reused unchanged.
+///
+/// Silently adds nothing (only a retained warning) when the header is
+/// unrecognized or the buffer's length doesn't match what the detected
+/// order requires: a physically valid file with an unrecognized/malformed
+/// byte-order header still keeps its exact-bytes [`IdentityKind::LooseRomSha256`]
+/// - see the module docs on "physical vs. normalized identity" - it simply
+/// never gets a canonical fact fabricated on top of it.
+fn push_n64_canonical_evidence(report: &mut GameIdentityReport, bytes: &[u8]) {
+    let Some(order) = detect_n64_byte_order(bytes) else {
+        retain_warning(
+            report,
+            "N64 byte-order header not recognized; canonical normalized identity is \
+             unavailable, but the exact physical-file SHA-256 above remains verified",
+        );
+        return;
+    };
+    let normalized = match normalize_to_z64(bytes, order) {
+        Ok(result) => result,
+        Err(_) => {
+            retain_warning(
+                report,
+                "N64 byte-order normalization failed on a malformed buffer length; canonical \
+                 normalized identity is unavailable, but the exact physical-file SHA-256 above \
+                 remains verified",
+            );
+            return;
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&normalized.bytes);
+    let canonical_sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::LooseRomCanonicalSha256,
+        IdentityStatus::Verified,
+        Some(canonical_sha256),
+        IdentityConfidence::ExactBytes,
+        "SHA-256 of the byte-order-normalized (canonical Z64) image; distinct from the exact \
+         physical-file SHA-256, and identical across z64/v64/n64 dumps of the same ROM",
+        "byte-order detection + n64_byte_order::normalize_to_z64",
+    ));
 }
 
 fn loose_rom_read_was_stable(
@@ -1143,6 +1252,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::N64
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
@@ -1527,6 +1637,7 @@ fn inspect_iso_source(
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::N64
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => {}
     }
@@ -3671,6 +3782,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::N64
         | IdentityPlatform::Other => &[],
     };
     for kind in kinds {
@@ -3757,6 +3869,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::N64
         | IdentityPlatform::Other => {}
     }
 }
@@ -6539,6 +6652,287 @@ mod tests {
                 IdentityPlatform::from_catalogue(Some(hint)),
                 expected,
                 "{hint} must resolve to {expected:?}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // N64 loose-ROM identity
+    // ------------------------------------------------------------------
+
+    /// A synthetic, canonical (`Z64`) N64 ROM: the real magic header
+    /// followed by distinct, non-repeating per-word content so a
+    /// header-only-transform bug (rather than a whole-buffer transform)
+    /// would be caught by comparing normalized output - the same
+    /// discipline [`crate::n64_byte_order`]'s own tests use.
+    fn synthetic_z64_rom() -> Vec<u8> {
+        use crate::n64_byte_order::N64ByteOrder;
+        let mut bytes = N64ByteOrder::Z64.magic().to_vec();
+        for word in 0u32..64 {
+            bytes.extend_from_slice(&(0x1000_0000u32.wrapping_add(word)).to_be_bytes());
+        }
+        bytes
+    }
+
+    fn to_v64(z64: &[u8]) -> Vec<u8> {
+        use crate::n64_byte_order::{N64ByteOrder, normalize_to_z64};
+        // `normalize_to_z64` is its own inverse for a byte-pair swap, so
+        // running it again on canonical bytes under `V64` produces a
+        // correctly V64-ordered buffer - reusing the tested primitive
+        // rather than hand-rolling a second swap implementation here.
+        normalize_to_z64(z64, N64ByteOrder::V64).unwrap().bytes
+    }
+
+    fn to_n64(z64: &[u8]) -> Vec<u8> {
+        use crate::n64_byte_order::{N64ByteOrder, normalize_to_z64};
+        normalize_to_z64(z64, N64ByteOrder::N64).unwrap().bytes
+    }
+
+    #[test]
+    fn n64_z64_receives_verified_physical_and_canonical_identity() {
+        let directory = FixtureDir::new("loose-n64-z64");
+        let bytes = synthetic_z64_rom();
+        let path = write_fixture(&directory, "Super Mario 64 (USA).z64", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        assert_eq!(report.platform, IdentityPlatform::N64);
+        assert_eq!(report.format, IdentityImageFormat::LooseCartridgeRom);
+        assert_eq!(report.bytes_read, bytes.len() as u64);
+        assert_eq!(
+            report.verified_loose_rom_sha256(),
+            Some(sha256_hex(&bytes)).as_deref()
+        );
+        // Already canonical: physical and normalized bytes are identical,
+        // so the canonical hash must equal the physical hash exactly.
+        assert_eq!(
+            report.verified_loose_rom_canonical_sha256(),
+            Some(sha256_hex(&bytes)).as_deref()
+        );
+        assert!(report.complete);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn n64_v64_receives_verified_physical_and_canonical_identity() {
+        let directory = FixtureDir::new("loose-n64-v64");
+        let z64 = synthetic_z64_rom();
+        let v64 = to_v64(&z64);
+        let path = write_fixture(&directory, "Super Mario 64 (USA).v64", &v64);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        assert_eq!(report.platform, IdentityPlatform::N64);
+        assert_eq!(
+            report.verified_loose_rom_sha256(),
+            Some(sha256_hex(&v64)).as_deref(),
+            "physical hash must cover the exact on-disk (V64-ordered) bytes"
+        );
+        assert_eq!(
+            report.verified_loose_rom_canonical_sha256(),
+            Some(sha256_hex(&z64)).as_deref(),
+            "canonical hash must equal the same ROM's Z64 hash"
+        );
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn n64_n64_receives_verified_physical_and_canonical_identity() {
+        let directory = FixtureDir::new("loose-n64-n64");
+        let z64 = synthetic_z64_rom();
+        let n64 = to_n64(&z64);
+        let path = write_fixture(&directory, "Super Mario 64 (USA).n64", &n64);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        assert_eq!(report.platform, IdentityPlatform::N64);
+        assert_eq!(
+            report.verified_loose_rom_sha256(),
+            Some(sha256_hex(&n64)).as_deref(),
+            "physical hash must cover the exact on-disk (N64-ordered) bytes"
+        );
+        assert_eq!(
+            report.verified_loose_rom_canonical_sha256(),
+            Some(sha256_hex(&z64)).as_deref(),
+            "canonical hash must equal the same ROM's Z64 hash"
+        );
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn n64_byte_order_variants_share_one_canonical_identity_but_differ_physically() {
+        // The core claim this milestone exists to prove: z64/v64/n64 dumps
+        // of literally the same ROM must never be treated as different
+        // games merely because their raw file hashes differ.
+        let directory = FixtureDir::new("loose-n64-equivalence");
+        let z64 = synthetic_z64_rom();
+        let v64 = to_v64(&z64);
+        let n64 = to_n64(&z64);
+
+        let report_z64 = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "Game.z64", &z64),
+            Some("N64"),
+        );
+        let report_v64 = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "Game.v64", &v64),
+            Some("N64"),
+        );
+        let report_n64 = inspect_catalogued_game_identity(
+            &write_fixture(&directory, "Game.n64", &n64),
+            Some("N64"),
+        );
+
+        let canonical = report_z64.verified_loose_rom_canonical_sha256();
+        assert!(canonical.is_some());
+        assert_eq!(canonical, report_v64.verified_loose_rom_canonical_sha256());
+        assert_eq!(canonical, report_n64.verified_loose_rom_canonical_sha256());
+
+        // But the exact physical bytes genuinely differ, so the physical
+        // hash must differ too - normalization must never overwrite or
+        // hide the real on-disk identity.
+        assert_ne!(
+            report_z64.verified_loose_rom_sha256(),
+            report_v64.verified_loose_rom_sha256()
+        );
+        assert_ne!(
+            report_z64.verified_loose_rom_sha256(),
+            report_n64.verified_loose_rom_sha256()
+        );
+    }
+
+    #[test]
+    fn n64_malformed_header_is_rejected_but_physical_identity_still_verifies() {
+        // Bytes with no recognizable z64/v64/n64 magic - a genuine,
+        // structurally invalid header. The physical hash is still real
+        // (it covers whatever bytes are actually on disk), but no
+        // canonical fact may be fabricated on top of an unrecognized
+        // header.
+        let directory = FixtureDir::new("loose-n64-malformed");
+        let bytes = b"this is not an n64 rom header at all!!".to_vec();
+        let path = write_fixture(&directory, "Mystery.z64", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        assert_eq!(
+            report.verified_loose_rom_sha256(),
+            Some(sha256_hex(&bytes)).as_deref()
+        );
+        assert_eq!(report.verified_loose_rom_canonical_sha256(), None);
+        assert!(report.complete);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("byte-order header not recognized"))
+        );
+    }
+
+    #[test]
+    fn n64_filename_only_identity_is_refused_when_untrusted() {
+        let directory = FixtureDir::new("loose-n64-untrusted");
+        let bytes = synthetic_z64_rom();
+        let path = write_fixture(&directory, "Super Mario 64 (USA).z64", &bytes);
+        let candidate = inspect_game_identity(&path, Some("N64"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert_eq!(candidate.verified_loose_rom_canonical_sha256(), None);
+        assert!(candidate.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Ambiguous
+        }));
+        assert!(!candidate.complete);
+    }
+
+    #[test]
+    fn n64_wrong_extension_platform_combination_fails_closed() {
+        let directory = FixtureDir::new("loose-n64-wrong-ext");
+        let bytes = synthetic_z64_rom();
+        let path = write_fixture(&directory, "Mystery Game.gba", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert_eq!(report.verified_loose_rom_canonical_sha256(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn n64_zip_extension_is_unsupported_not_extracted() {
+        let directory = FixtureDir::new("loose-n64-zip");
+        let bytes = synthetic_z64_rom();
+        let path = write_fixture(&directory, "Mystery Game.zip", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn n64_platform_hint_recognizes_every_catalogue_synonym() {
+        for hint in ["N64", "Nintendo 64", "nintendo64", "n64"] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(hint)),
+                IdentityPlatform::N64,
+                "{hint} must resolve to IdentityPlatform::N64"
+            );
+        }
+    }
+
+    #[test]
+    fn n64_spaces_and_unicode_paths_verify() {
+        let directory = FixtureDir::new("loose-n64-unicode");
+        for name in [
+            "Star Fox 64 (USA) (Rev A).z64",
+            "ゼルダの伝説 時のオカリナ (Japan).v64",
+            "Paper Mario - Édition Spéciale.n64",
+        ] {
+            let bytes = synthetic_z64_rom();
+            let path = write_fixture(&directory, name, &bytes);
+            let report = inspect_catalogued_game_identity(&path, Some("N64"));
+            assert_eq!(
+                report.verified_loose_rom_sha256(),
+                Some(sha256_hex(&bytes)).as_deref(),
+                "failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn n64_content_hash_drives_identity_not_filename() {
+        let directory = FixtureDir::new("loose-n64-content");
+        let same_name = "Same Name.z64";
+        let a_bytes = synthetic_z64_rom();
+        let mut b_bytes = a_bytes.clone();
+        b_bytes[8] ^= 0xFF; // still a valid Z64 header, different content
+        let a = write_fixture(&directory, same_name, &a_bytes);
+        let report_a = inspect_catalogued_game_identity(&a, Some("N64"));
+        fs::remove_file(&a).unwrap();
+        let b = write_fixture(&directory, same_name, &b_bytes);
+        let report_b = inspect_catalogued_game_identity(&b, Some("N64"));
+        assert_ne!(
+            report_a.verified_loose_rom_sha256(),
+            report_b.verified_loose_rom_sha256(),
+            "identical filenames with different content must not share an identity"
+        );
+    }
+
+    #[test]
+    fn n64_no_fabricated_verified_identity_fact_beyond_hashes() {
+        // Only LooseRomSha256/LooseRomCanonicalSha256/LooseRomFormat/
+        // LooseRomTitle may ever appear Verified for N64 - no invented
+        // platform-specific fact (e.g. a cartridge serial) exists.
+        let directory = FixtureDir::new("loose-n64-no-fabrication");
+        let bytes = synthetic_z64_rom();
+        let path = write_fixture(&directory, "Game.z64", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("N64"));
+        for item in report
+            .evidence
+            .iter()
+            .filter(|item| item.status == IdentityStatus::Verified)
+        {
+            assert!(
+                matches!(
+                    item.kind,
+                    IdentityKind::Platform
+                        | IdentityKind::LooseRomSha256
+                        | IdentityKind::LooseRomCanonicalSha256
+                        | IdentityKind::LooseRomFormat
+                        | IdentityKind::LooseRomTitle
+                ),
+                "unexpected verified N64 identity kind: {:?}",
+                item.kind
             );
         }
     }

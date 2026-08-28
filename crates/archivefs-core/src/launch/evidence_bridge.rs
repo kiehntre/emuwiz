@@ -79,6 +79,7 @@ fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::Pcsx2ExecutableCrc
             | IdentityKind::DolphinGameId
             | IdentityKind::LooseRomSha256
+            | IdentityKind::LooseRomCanonicalSha256
             | IdentityKind::XexTitleId
             | IdentityKind::XexMediaId
     )
@@ -142,6 +143,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::GameBoy => Some("Game Boy"),
         IdentityPlatform::GameBoyColor => Some("Game Boy Color"),
         IdentityPlatform::GameBoyAdvance => Some("Game Boy Advance"),
+        IdentityPlatform::N64 => Some("N64"),
         IdentityPlatform::Xbox360 => Some("Xbox360"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
@@ -242,6 +244,23 @@ fn resolved_identity_for_platform(
             // The resolved identity itself is still real and reported.
             let sha256 = find_value(resolved, IdentityKind::LooseRomSha256)?;
             Some((platform_id, sha256.to_string(), Vec::new()))
+        }
+        IdentityPlatform::N64 => {
+            // Prefer the byte-order-normalized canonical hash as the game
+            // key when it exists: unlike the generic loose-ROM platforms
+            // above, N64 dumps of the *same* game legitimately differ in
+            // physical byte order (z64/v64/n64), and using the physical
+            // hash here would wrongly treat those as different games. Falls
+            // back to the physical hash when the header couldn't be
+            // recognized/normalized (see `push_n64_canonical_evidence`) -
+            // the resolved identity is still real, just not order-
+            // independent in that case. No `VerifiedIdentityFact` variant
+            // exists for either generic cartridge hash, so facts stay empty
+            // exactly like the group above.
+            let canonical = find_value(resolved, IdentityKind::LooseRomCanonicalSha256);
+            let physical = find_value(resolved, IdentityKind::LooseRomSha256);
+            let game_key = canonical.or(physical)?.to_string();
+            Some((platform_id, game_key, Vec::new()))
         }
         IdentityPlatform::Xbox360 => {
             // `VerifiedIdentityFact::XboxTitleId` names the original Xbox,
