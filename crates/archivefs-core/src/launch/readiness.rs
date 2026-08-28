@@ -229,6 +229,27 @@ pub enum LaunchBlockerKind {
     /// blocker detail for the underlying
     /// [`crate::patch_manager::XeniaLaunchBlockerKind`].
     XeniaBindingUnavailable,
+    /// A command-plan request was given a non-xemu-standalone launch
+    /// candidate.
+    XemuCandidateRequired,
+    /// The canonical identity this xemu command plan was built for does not
+    /// target `Xbox` - the only platform this native launch slice supports.
+    /// Xbox 360/XEX identity must never reach this arm - see
+    /// [`crate::launch::xemu_command`]'s own doc comment.
+    XemuPlatformMismatch,
+    /// The content is not a direct, non-mounted, non-archived `.iso`/`.xiso`
+    /// disc image. A loose `.xbe` (even though xemu cannot boot one
+    /// directly - see the module doc) and a ZIP-contained `.xbe` (even
+    /// though it is genuinely verifiable identity) are both refused here.
+    XemuContentFormatUnsupported,
+    /// No verified original-Xbox XBE title ID is available for this
+    /// content.
+    XemuTitleIdMissing,
+    /// [`crate::patch_manager::resolve_xemu_native_launch_binding`] itself
+    /// refused to produce a launch binding for the candidate's profile -
+    /// see the blocker detail for the underlying
+    /// [`crate::patch_manager::XemuLaunchBlockerKind`].
+    XemuBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].

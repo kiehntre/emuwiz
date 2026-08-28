@@ -83,6 +83,7 @@ pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
 pub mod rpcs3_command;
+pub mod xemu_command;
 pub mod xenia_command;
 
 #[cfg(test)]
@@ -180,6 +181,10 @@ pub use retroarch_command::{
 pub use rpcs3_command::{
     RPCS3_SUPPORTED_PLATFORM_ID, Rpcs3Command, Rpcs3CommandPlan, Rpcs3CommandSelection,
     build_rpcs3_command_plan,
+};
+pub use xemu_command::{
+    XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,
+    build_xemu_command_plan,
 };
 pub use xenia_command::{
     XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, XeniaCommandPlan, XeniaCommandSelection,
