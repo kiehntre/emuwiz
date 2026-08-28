@@ -19,6 +19,7 @@ use crate::disc_evidence_collector::{
     read_bounded_chd_bytes,
 };
 use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
+use crate::gb_header_evidence::{GB_HEADER_BYTES, GbColorSupport, parse_gb_header};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
@@ -231,6 +232,9 @@ pub enum IdentityPlatform {
     MegaDrive,
     Snes,
     Nes,
+    GameBoy,
+    GameBoyColor,
+    GameBoyAdvance,
     Xbox360,
     Other,
 }
@@ -256,6 +260,9 @@ impl IdentityPlatform {
             | "nintendo super nintendo entertainment system"
             | "super famicom" => Self::Snes,
             "nes" | "nintendo entertainment system" | "famicom" | "nintendo famicom" => Self::Nes,
+            "game boy" | "gb" | "nintendo game boy" => Self::GameBoy,
+            "game boy color" | "gbc" | "nintendo game boy color" => Self::GameBoyColor,
+            "game boy advance" | "gba" | "nintendo game boy advance" => Self::GameBoyAdvance,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             _ => Self::Other,
         }
@@ -273,6 +280,9 @@ impl IdentityPlatform {
             Self::MegaDrive => "Mega Drive / Genesis",
             Self::Snes => "SNES",
             Self::Nes => "NES",
+            Self::GameBoy => "Game Boy",
+            Self::GameBoyColor => "Game Boy Color",
+            Self::GameBoyAdvance => "Game Boy Advance",
             Self::Xbox360 => "Xbox 360",
             Self::Other => "Unsupported platform",
         }
@@ -548,7 +558,12 @@ fn inspect_game_identity_with_platform_trust(
 
     if matches!(
         platform,
-        IdentityPlatform::MegaDrive | IdentityPlatform::Snes | IdentityPlatform::Nes
+        IdentityPlatform::MegaDrive
+            | IdentityPlatform::Snes
+            | IdentityPlatform::Nes
+            | IdentityPlatform::GameBoy
+            | IdentityPlatform::GameBoyColor
+            | IdentityPlatform::GameBoyAdvance
     ) {
         inspect_loose_rom(&mut report, trusted_platform, trusted);
         return report;
@@ -643,8 +658,45 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Snes, "sfc") => Some("sfc"),
         (IdentityPlatform::Snes, "smc") => Some("smc"),
         (IdentityPlatform::Nes, "nes") => Some("nes"),
+        (IdentityPlatform::GameBoy, "gb") => Some("gb"),
+        (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
+        (IdentityPlatform::GameBoyAdvance, "gba") => Some("gba"),
         _ => None,
     }
+}
+
+/// Whether a `.gb`-hinted cartridge's own header proves it cannot actually
+/// run on original Game Boy hardware - a genuine, structural
+/// platform/content contradiction, never a guess.
+///
+/// Reads only the fixed, tiny [`GB_HEADER_BYTES`] header (never the whole
+/// file) through the same safe-open primitive every other loose-ROM read in
+/// this module uses - a second, independent read from the one
+/// [`inspect_loose_rom`] performs for the SHA-256 hash, since the header
+/// this checks and the identity that hash proves are two different
+/// concerns answered from two different (tiny vs. bounded-full) reads.
+///
+/// `None` for everything that is not a *proven* contradiction: an
+/// unreadable/too-short file, a header whose Nintendo logo does not match
+/// (no structural claim to contradict), or a header that validates as
+/// `DmgOnly`/`CgbEnhanced` (both genuinely run on original Game Boy
+/// hardware). This never fails closed on mere absence of evidence - only a
+/// `cgb_flag == 0xC0` ("CGB-only") header, which the hardware itself
+/// enforces, counts.
+fn gameboy_extension_conflict(path: &Path, trusted: &TrustedRoots) -> Option<String> {
+    let mut file = open_read_only_regular(path, trusted).ok()?;
+    let mut header = vec![0_u8; GB_HEADER_BYTES];
+    file.read_exact(&mut header).ok()?;
+    let fact = parse_gb_header(&header)?;
+    if fact.logo_valid && fact.color_support == GbColorSupport::CgbOnly {
+        return Some(
+            "the cartridge header's own cgb_flag (0xC0) proves this title is Game Boy \
+             Color-exclusive; it cannot run on original Game Boy hardware, so its \
+             platform/content evidence conflicts with a .gb Game Boy assignment"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn inspect_loose_rom(
@@ -667,6 +719,12 @@ fn inspect_loose_rom(
             IdentityStatus::Ambiguous,
             "loose ROM identity requires exact scanner or manual platform evidence",
         );
+        return;
+    }
+    if report.platform == IdentityPlatform::GameBoy
+        && let Some(reason) = gameboy_extension_conflict(&report.archive_path, trusted)
+    {
+        add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
         return;
     }
     let mut file = match open_read_only_regular(&report.archive_path, trusted) {
@@ -1082,6 +1140,9 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
+        | IdentityPlatform::GameBoy
+        | IdentityPlatform::GameBoyColor
+        | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
@@ -1463,6 +1524,9 @@ fn inspect_iso_source(
         IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
+        | IdentityPlatform::GameBoy
+        | IdentityPlatform::GameBoyColor
+        | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => {}
     }
@@ -3604,6 +3668,9 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
+        | IdentityPlatform::GameBoy
+        | IdentityPlatform::GameBoyColor
+        | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::Other => &[],
     };
     for kind in kinds {
@@ -3687,6 +3754,9 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
+        | IdentityPlatform::GameBoy
+        | IdentityPlatform::GameBoyColor
+        | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::Other => {}
     }
 }
@@ -6201,6 +6271,276 @@ mod tests {
         assert!(report.evidence.iter().any(|item| {
             item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
         }));
+    }
+
+    // ------------------------------------------------------------------
+    // Game Boy / Game Boy Color / Game Boy Advance loose-ROM identity
+    // ------------------------------------------------------------------
+
+    /// Builds a minimal, valid GB/GBC header: real Nintendo logo, the given
+    /// `cgb_flag`, and a correctly-computed header checksum - everything
+    /// [`gameboy_extension_conflict`]'s real content-based check needs to
+    /// actually run against, not a placeholder.
+    fn valid_gb_header(cgb_flag: u8) -> Vec<u8> {
+        use crate::gb_header_evidence::{GB_HEADER_BYTES, compute_header_checksum};
+        const NINTENDO_LOGO_OFFSET: usize = 0x104;
+        const NINTENDO_LOGO: [u8; 48] = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
+            0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6,
+            0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC,
+            0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        const CGB_FLAG_OFFSET: usize = 0x143;
+        const HEADER_CHECKSUM_OFFSET: usize = 0x14D;
+        let mut bytes = vec![0u8; GB_HEADER_BYTES];
+        bytes[NINTENDO_LOGO_OFFSET..NINTENDO_LOGO_OFFSET + NINTENDO_LOGO.len()]
+            .copy_from_slice(&NINTENDO_LOGO);
+        bytes[CGB_FLAG_OFFSET] = cgb_flag;
+        bytes[HEADER_CHECKSUM_OFFSET] = compute_header_checksum(&bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn game_boy_loose_format_receives_verified_local_byte_identity() {
+        let directory = FixtureDir::new("loose-gb");
+        let bytes = valid_gb_header(0x00); // DMG-only: a real, ordinary .gb cartridge
+        let path = write_fixture(&directory, "Tetris (World).gb", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(report.platform, IdentityPlatform::GameBoy);
+        assert_eq!(report.format, IdentityImageFormat::LooseCartridgeRom);
+        assert_eq!(report.bytes_read, bytes.len() as u64);
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256
+                && item.diagnostic.contains("not a known-good dump claim")
+        }));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn game_boy_color_loose_format_receives_verified_local_byte_identity() {
+        let directory = FixtureDir::new("loose-gbc");
+        let bytes = valid_gb_header(0x80); // CGB-enhanced, still DMG-compatible
+        let path = write_fixture(&directory, "Pokemon Gold (USA).gbc", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy Color"));
+        assert_eq!(report.platform, IdentityPlatform::GameBoyColor);
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn game_boy_advance_loose_format_receives_verified_local_byte_identity() {
+        let directory = FixtureDir::new("loose-gba");
+        let bytes = b"synthetic-gba-cartridge-bytes".to_vec();
+        let path = write_fixture(&directory, "Metroid Fusion (USA).gba", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy Advance"));
+        assert_eq!(report.platform, IdentityPlatform::GameBoyAdvance);
+        assert_eq!(report.format, IdentityImageFormat::LooseCartridgeRom);
+        assert_eq!(report.bytes_read, bytes.len() as u64);
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn game_boy_actual_content_hash_drives_identity_not_filename() {
+        let directory = FixtureDir::new("loose-gb-content");
+        let same_name = "Final Fantasy Legend.gb";
+        let a = write_fixture(&directory, same_name, b"content-one");
+        let report_a = inspect_catalogued_game_identity(&a, Some("Game Boy"));
+        fs::remove_file(&a).unwrap();
+        let b = write_fixture(&directory, same_name, b"content-two");
+        let report_b = inspect_catalogued_game_identity(&b, Some("Game Boy"));
+        assert_ne!(
+            report_a.verified_loose_rom_sha256(),
+            report_b.verified_loose_rom_sha256(),
+            "identical filenames with different content must not share an identity"
+        );
+        assert_eq!(
+            report_b.verified_loose_rom_sha256(),
+            Some(sha256_hex(b"content-two")).as_deref()
+        );
+    }
+
+    #[test]
+    fn game_boy_filename_only_game_like_names_do_not_resolve_when_untrusted() {
+        let directory = FixtureDir::new("loose-gb-filename-trap");
+        // A thoroughly game-like, plausible commercial title - the point is
+        // that no filename, however convincing, ever substitutes for a
+        // trusted platform assignment.
+        let path = write_fixture(
+            &directory,
+            "The Legend of Zelda - Link's Awakening (USA, Europe).gb",
+            b"unverified bytes",
+        );
+        let candidate = inspect_game_identity(&path, Some("Game Boy"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert!(!candidate.complete);
+        assert!(candidate.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Ambiguous
+        }));
+    }
+
+    #[test]
+    fn game_boy_untrusted_platform_evidence_fails_closed() {
+        let directory = FixtureDir::new("loose-gb-untrusted");
+        let path = write_fixture(&directory, "Mystery.gb", b"bytes");
+        let candidate = inspect_game_identity(&path, Some("Game Boy"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert!(candidate.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Ambiguous
+        }));
+
+        let trusted = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(
+            trusted.verified_loose_rom_sha256(),
+            Some(sha256_hex(b"bytes")).as_deref()
+        );
+    }
+
+    #[test]
+    fn game_boy_wrong_extension_is_unsupported_not_guessed() {
+        let directory = FixtureDir::new("loose-gb-wrong-ext");
+        let path = write_fixture(&directory, "Mystery Game.bin", b"bytes");
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn game_boy_zip_extension_is_unsupported_not_extracted() {
+        // No archive-mount/ZIP-member path exists for any loose-cartridge
+        // platform (Mega Drive/SNES/NES included) - a `.zip` extension
+        // simply fails closed as unsupported, exactly like any other wrong
+        // extension. This crate never adds ZIP extraction for this pass.
+        let directory = FixtureDir::new("loose-gb-zip");
+        let path = write_fixture(&directory, "Mystery Game.zip", b"bytes");
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn game_boy_extension_paired_with_cgb_only_content_conflicts_and_fails_closed() {
+        // The header's own cgb_flag (0xC0) proves this title cannot run on
+        // original Game Boy hardware - a genuine content/platform
+        // contradiction under a plain .gb/"Game Boy" assignment, not merely
+        // unverified. This is the one case this module fails closed on
+        // instead of trusting the caller's platform assignment outright.
+        let directory = FixtureDir::new("loose-gb-cgb-conflict");
+        let bytes = valid_gb_header(0xC0);
+        let path = write_fixture(&directory, "Genuinely CGB-Only Game.gb", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256
+                && item.status == IdentityStatus::Invalid
+                && item.diagnostic.contains("Game Boy Color-exclusive")
+        }));
+    }
+
+    #[test]
+    fn game_boy_color_extension_accepts_cgb_only_content_without_conflict() {
+        // The identical CGB-only header is perfectly consistent under a
+        // Game Boy Color assignment - only the .gb/"Game Boy" pairing is a
+        // structural contradiction, never .gbc/"Game Boy Color" itself.
+        let directory = FixtureDir::new("loose-gbc-cgb-only");
+        let bytes = valid_gb_header(0xC0);
+        let path = write_fixture(&directory, "Genuinely CGB-Only Game.gbc", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy Color"));
+        assert_eq!(report.platform, IdentityPlatform::GameBoyColor);
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn game_boy_cgb_enhanced_content_is_not_a_conflict_under_dot_gb() {
+        // cgb_flag=0x80 (CGB-enhanced) is still a genuine, backward-
+        // compatible Game Boy cartridge - it must verify normally under a
+        // plain .gb/"Game Boy" assignment, unlike the 0xC0 (CGB-only) case.
+        let directory = FixtureDir::new("loose-gb-cgb-enhanced");
+        let bytes = valid_gb_header(0x80);
+        let path = write_fixture(&directory, "Dual Mode Game.gb", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(report.platform, IdentityPlatform::GameBoy);
+        let expected = sha256_hex(&bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn game_boy_advance_extension_cannot_be_verified_under_the_game_boy_platform() {
+        let directory = FixtureDir::new("loose-gba-cross-ext");
+        let path = write_fixture(&directory, "Mystery.gba", b"bytes");
+        let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn game_boy_family_quoted_spaces_and_unicode_paths_verify() {
+        let directory = FixtureDir::new("loose-gb-unicode");
+        for (name, extension, platform) in [
+            ("Pokémon Blue Version (USA).gb", "gb", "Game Boy"),
+            (
+                "ゼルダの伝説 夢をみる島 (Japan).gbc",
+                "gbc",
+                "Game Boy Color",
+            ),
+            (
+                "Kirby & the Amazing Mirror (USA).gba",
+                "gba",
+                "Game Boy Advance",
+            ),
+        ] {
+            let bytes = format!("synthetic-{extension}-bytes").into_bytes();
+            let path = write_fixture(&directory, name, &bytes);
+            let report = inspect_catalogued_game_identity(&path, Some(platform));
+            let expected = sha256_hex(&bytes);
+            assert_eq!(
+                report.verified_loose_rom_sha256(),
+                Some(expected.as_str()),
+                "failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn game_boy_family_platform_hints_recognize_every_catalogue_synonym() {
+        for (hint, expected) in [
+            ("Game Boy", IdentityPlatform::GameBoy),
+            ("game boy", IdentityPlatform::GameBoy),
+            ("GB", IdentityPlatform::GameBoy),
+            ("Nintendo Game Boy", IdentityPlatform::GameBoy),
+            ("Game Boy Color", IdentityPlatform::GameBoyColor),
+            ("GBC", IdentityPlatform::GameBoyColor),
+            ("Nintendo Game Boy Color", IdentityPlatform::GameBoyColor),
+            ("Game Boy Advance", IdentityPlatform::GameBoyAdvance),
+            ("GBA", IdentityPlatform::GameBoyAdvance),
+            (
+                "Nintendo Game Boy Advance",
+                IdentityPlatform::GameBoyAdvance,
+            ),
+        ] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(hint)),
+                expected,
+                "{hint} must resolve to {expected:?}"
+            );
+        }
     }
 
     #[test]

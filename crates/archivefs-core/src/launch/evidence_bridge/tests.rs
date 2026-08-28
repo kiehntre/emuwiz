@@ -422,6 +422,41 @@ fn nes_verified_loose_rom_sha256_resolves_with_no_fabricated_fact() {
     );
 }
 
+#[test]
+fn game_boy_family_verified_loose_rom_sha256_resolves_with_no_fabricated_fact() {
+    for (platform, platform_id) in [
+        (IdentityPlatform::GameBoy, "Game Boy"),
+        (IdentityPlatform::GameBoyColor, "Game Boy Color"),
+        (IdentityPlatform::GameBoyAdvance, "Game Boy Advance"),
+    ] {
+        let source = report(
+            platform,
+            vec![evidence(
+                IdentityKind::LooseRomSha256,
+                IdentityStatus::Verified,
+                Some("cc".repeat(32).as_str()),
+                IdentityConfidence::ExactBytes,
+            )],
+        );
+
+        let (status, facts) = canonical_identity_from_game_report(&source);
+
+        assert_eq!(
+            status,
+            CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+                platform_id: platform_id.to_string(),
+                game_key: "cc".repeat(32),
+            }),
+            "failed for {platform:?}"
+        );
+        assert!(
+            facts.is_empty(),
+            "no VerifiedIdentityFact variant exists for a generic cartridge hash - the bridge \
+             must not invent one ({platform:?})"
+        );
+    }
+}
+
 // --- unknown stays Unknown ---------------------------------------------------
 
 #[test]
