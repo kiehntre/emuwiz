@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 
@@ -342,6 +344,143 @@ pub fn discover_xemu_profiles(roots: &XemuProfileDiscoveryRoots) -> XemuProfileD
         warnings,
         complete: true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Launch binding
+// ---------------------------------------------------------------------------
+//
+// Proves, freshly and read-only, exactly which native `xemu` executable
+// belongs to a discovered profile - the standalone-launch prerequisite
+// `crate::launch::xemu_command` needs. This never launches xemu, never
+// writes configuration, and never creates a directory. Mirrors
+// `resolve_ppsspp_native_launch_binding`'s exact shape: only `Native`
+// installations are supported (Flatpak's sandboxing and Portable/Explicit's
+// unconfirmed user-data location are not yet provably safe to launch
+// against, exactly as PPSSPP/DuckStation already decided for themselves).
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XemuNativeLaunchBinding {
+    pub executable: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum XemuLaunchBlockerKind {
+    /// Any installation type other than [`XemuInstallationType::Native`].
+    UnsupportedInstallationType,
+    /// The profile itself reports `eligible: false`.
+    ProfileIneligible,
+    /// More than one viable executable candidate matches the profile and no
+    /// authority distinguishes them.
+    AmbiguousExecutable,
+    /// No candidate executable exists on disk.
+    ExecutableMissing,
+    /// A candidate executable exists but is a symlink, not a regular file,
+    /// or is not an absolute path.
+    ExecutableUnsafe,
+    /// A candidate executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XemuLaunchBlocker {
+    pub kind: XemuLaunchBlockerKind,
+    pub detail: String,
+}
+
+fn launch_blocker(kind: XemuLaunchBlockerKind, detail: impl Into<String>) -> XemuLaunchBlocker {
+    XemuLaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Freshly revalidates `profile` and either proves a launch binding or
+/// returns a structured blocker. Pure and read-only: inspects only
+/// filesystem metadata, never spawns a process, writes xemu configuration,
+/// or creates a directory. Safe - and intended - to call again at future
+/// launch time.
+pub fn resolve_xemu_native_launch_binding(
+    profile: &XemuProfile,
+) -> Result<XemuNativeLaunchBinding, XemuLaunchBlocker> {
+    if !profile.eligible {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::ProfileIneligible,
+            "profile is not eligible",
+        ));
+    }
+    if profile.installation_type != XemuInstallationType::Native {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::UnsupportedInstallationType,
+            format!(
+                "only native xemu installations are supported, got {:?}",
+                profile.installation_type
+            ),
+        ));
+    }
+    let matching: Vec<&XemuExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == XemuInstallationType::Native)
+        .collect();
+    if matching.is_empty() {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::ExecutableMissing,
+            "no native xemu executable was discovered for this profile",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_xemu_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one candidate was inspected")),
+        1 => Ok(XemuNativeLaunchBinding {
+            executable: valid.into_iter().next().expect("length checked above"),
+        }),
+        count => Err(launch_blocker(
+            XemuLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable native xemu executables match this profile and none is \
+                 distinguished as authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_xemu_executable(path: &Path) -> Result<(), XemuLaunchBlocker> {
+    if !path.is_absolute() {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        launch_blocker(
+            XemuLaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a regular non-symlink file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_xemu_version(output: &str) -> Option<String> {
@@ -1037,5 +1176,121 @@ mod tests {
         assert!(!inspection.per_game_configuration_supported);
         assert!(!inspection.save_data_inspected);
         assert_eq!(inspection.game_id_mapping, XemuGameIdMapping::Unavailable);
+    }
+
+    // -----------------------------------------------------------------
+    // Launch binding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn native_launch_binding_requires_one_safe_executable() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let executable = temp.path().join("xemu");
+        fs::write(&executable, b"native executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut candidate = profile(&roots);
+        candidate.executable_candidates = vec![XemuExecutable {
+            path: executable.clone(),
+            installation_type: XemuInstallationType::Native,
+            version: None,
+        }];
+        let binding = resolve_xemu_native_launch_binding(&candidate).unwrap();
+        assert_eq!(binding.executable, executable);
+    }
+
+    #[test]
+    fn native_launch_binding_refuses_ineligible_and_non_native_profiles() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let mut candidate = profile(&roots);
+        candidate.installation_type = XemuInstallationType::FlatpakUser;
+        let blocker = resolve_xemu_native_launch_binding(&candidate).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            XemuLaunchBlockerKind::UnsupportedInstallationType
+        );
+
+        let mut ineligible = profile(&roots);
+        ineligible.eligible = false;
+        let blocker = resolve_xemu_native_launch_binding(&ineligible).unwrap_err();
+        assert_eq!(blocker.kind, XemuLaunchBlockerKind::ProfileIneligible);
+    }
+
+    #[test]
+    fn native_launch_binding_refuses_a_missing_executable() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let blocker = resolve_xemu_native_launch_binding(&profile(&roots)).unwrap_err();
+        assert_eq!(blocker.kind, XemuLaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_launch_binding_refuses_a_symlinked_executable() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let real = temp.path().join("real-xemu");
+        fs::write(&real, b"native executable").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = temp.path().join("xemu-link");
+        symlink(&real, &link).unwrap();
+        let mut candidate = profile(&roots);
+        candidate.executable_candidates = vec![XemuExecutable {
+            path: link,
+            installation_type: XemuInstallationType::Native,
+            version: None,
+        }];
+        let blocker = resolve_xemu_native_launch_binding(&candidate).unwrap_err();
+        assert_eq!(blocker.kind, XemuLaunchBlockerKind::ExecutableUnsafe);
+    }
+
+    #[test]
+    fn native_launch_binding_refuses_ambiguous_executables() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let mut candidate = profile(&roots);
+        for name in ["xemu-one", "xemu-two"] {
+            let executable = temp.path().join(name);
+            fs::write(&executable, b"native executable").unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            candidate.executable_candidates.push(XemuExecutable {
+                path: executable,
+                installation_type: XemuInstallationType::Native,
+                version: None,
+            });
+        }
+        let blocker = resolve_xemu_native_launch_binding(&candidate).unwrap_err();
+        assert_eq!(blocker.kind, XemuLaunchBlockerKind::AmbiguousExecutable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_launch_binding_refuses_a_non_executable_file() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let executable = temp.path().join("xemu");
+        fs::write(&executable, b"native executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut candidate = profile(&roots);
+        candidate.executable_candidates = vec![XemuExecutable {
+            path: executable,
+            installation_type: XemuInstallationType::Native,
+            version: None,
+        }];
+        let blocker = resolve_xemu_native_launch_binding(&candidate).unwrap_err();
+        assert_eq!(blocker.kind, XemuLaunchBlockerKind::ExecutableNotExecutable);
     }
 }

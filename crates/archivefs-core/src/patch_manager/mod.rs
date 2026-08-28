@@ -598,10 +598,11 @@ pub use shared_transaction::{
 pub use xemu_local::{
     XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,
     XemuGameIdMapping, XemuGameInspection, XemuGameRequest, XemuHealth, XemuInstallationType,
-    XemuProfile, XemuProfileBlocker, XemuProfileBlockerKind, XemuProfileDiscovery,
-    XemuProfileDiscoveryRoots, XemuProfileScope, XemuSystemFile, XemuSystemFileKind,
-    XemuSystemFileState, XemuWarning, XemuWarningKind, discover_xemu_profiles, inspect_xemu_game,
-    parse_xemu_version,
+    XemuLaunchBlocker, XemuLaunchBlockerKind, XemuNativeLaunchBinding, XemuProfile,
+    XemuProfileBlocker, XemuProfileBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots,
+    XemuProfileScope, XemuSystemFile, XemuSystemFileKind, XemuSystemFileState, XemuWarning,
+    XemuWarningKind, discover_xemu_profiles, inspect_xemu_game, parse_xemu_version,
+    resolve_xemu_native_launch_binding,
 };
 pub use xenia_install_plan::{
     LoadedXeniaDestination, MAX_EXISTING_XENIA_PATCH_BYTES, MAX_STAGED_XENIA_PATCH_BYTES,
