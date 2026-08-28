@@ -882,6 +882,7 @@ fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
 }
 
 fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::Iso;
     let track = match resolve_data_track(&report.archive_path) {
         Ok(track) => track,
         Err(error) => {
@@ -893,6 +894,7 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             return;
         }
     };
+    let member_path = relative_member_path(report, &track.path);
     let mut source = match track.mode {
         CueDataTrackMode::Mode1_2048 => match open_cooked_cd_file_logical_media(&track.path) {
             Ok(media) => CueMediaSource::Cooked(MediaSource::new(media)),
@@ -911,8 +913,33 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             }
         }
     };
-    inspect_iso_source(report, &mut source, None, None);
+    inspect_iso_source(report, &mut source, member_path, None);
     report.bytes_read = source.bytes_read();
+}
+
+/// The path a resolved CUE/GDI data-track file should be recorded as in
+/// [`IdentityProvenance::member_path`] - relative to the descriptor's own
+/// directory when possible (matching a ZIP member name's shape: a name
+/// relative to its container, not an absolute filesystem path), falling
+/// back to the resolved path verbatim if it somehow does not share that
+/// parent (it always does in practice, since [`resolve_data_track`]/
+/// [`resolve_gdi_data_track`] only ever resolve within the descriptor's own
+/// directory tree).
+///
+/// Without this, a CUE/GDI-derived [`IdentityEvidence`]'s provenance named
+/// only the `.cue`/`.gdi` descriptor itself (`report.archive_path`) - never
+/// which physical file the verified bytes actually came from. For a
+/// multi-file release (a CUE with an audio track alongside its data track)
+/// that made every verified fact indistinguishable from a plain single-file
+/// `.iso` read, even though the bytes proving identity live in a *different*
+/// physical file than the one the report names.
+fn relative_member_path(report: &GameIdentityReport, resolved_path: &Path) -> Option<Vec<u8>> {
+    let relative = report
+        .archive_path
+        .parent()
+        .and_then(|dir| resolved_path.strip_prefix(dir).ok())
+        .unwrap_or(resolved_path);
+    Some(relative.to_string_lossy().into_owned().into_bytes())
 }
 
 /// Authoritative Dreamcast identity from a `.gdi` descriptor's own
@@ -934,6 +961,7 @@ fn inspect_gdi(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             return;
         }
     };
+    let member_path = relative_member_path(report, &track.path);
     let mut source = match track.mode {
         GdiDataTrackMode::Cooked2048 => match open_cooked_cd_file_logical_media(&track.path) {
             Ok(media) => CueMediaSource::Cooked(MediaSource::new(media)),
@@ -950,7 +978,7 @@ fn inspect_gdi(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             }
         },
     };
-    inspect_iso_source(report, &mut source, None, None);
+    inspect_iso_source(report, &mut source, member_path, None);
     report.bytes_read = source.bytes_read();
 }
 
@@ -5549,6 +5577,259 @@ mod tests {
         );
         let report = inspect_game_identity(&cue_path, Some("PS1"));
         assert_eq!(report.verified_ps1_serial(), Some("SLPS-34567"));
+    }
+
+    #[test]
+    fn ps1_cue_track_order_data_before_audio_is_also_unambiguous() {
+        // The mirror of `ps1_multi_bin_cue_selects_the_unambiguous_data_track`
+        // with the data track declared first - track declaration order must
+        // never affect which file is selected.
+        let directory = FixtureDir::new("ps1-cue-data-first");
+        fs::write(
+            directory.0.join("data.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SLPS_456.78;1",
+                b"BOOT=cdrom:\\SLPS_456.78;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        fs::write(directory.0.join("audio.bin"), vec![0_u8; 2352 * 2]).unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "multi.cue",
+            b"FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLPS-45678"));
+    }
+
+    #[test]
+    fn ps1_cue_reports_iso_format_and_names_the_actual_bin_in_provenance() {
+        // Requirement: verified identity must remain tied to the physical
+        // release actually inspected - the report's own `format` must not
+        // stay `Unsupported` for a CUE that verified cleanly, and every
+        // piece of evidence's provenance must name the resolved data-track
+        // file (`disc.bin`), never leave that implicit or point only at
+        // the `.cue` itself.
+        let directory = FixtureDir::new("ps1-cue-provenance");
+        fs::write(
+            directory.0.join("disc.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SLUS_555.55;1",
+                b"BOOT=cdrom:\\SLUS_555.55;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLUS-55555"));
+        assert_eq!(report.format, IdentityImageFormat::Iso);
+        let serial_evidence = report
+            .evidence
+            .iter()
+            .find(|item| {
+                item.kind == IdentityKind::Ps1Serial && item.status == IdentityStatus::Verified
+            })
+            .expect("a Verified Ps1Serial evidence item must exist");
+        assert_eq!(
+            serial_evidence
+                .provenance
+                .member_path
+                .as_deref()
+                .map(String::from_utf8_lossy),
+            Some(std::borrow::Cow::Borrowed("disc.bin"))
+        );
+    }
+
+    #[test]
+    fn ps1_cue_quoted_filename_with_spaces_verifies() {
+        let directory = FixtureDir::new("ps1-cue-spaces");
+        fs::write(
+            directory.0.join("my disc image.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SCUS_111.11;1",
+                b"BOOT=cdrom:\\SCUS_111.11;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"my disc image.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), Some("SCUS-11111"));
+    }
+
+    #[test]
+    fn ps1_cue_unicode_bin_path_verifies() {
+        let directory = FixtureDir::new("ps1-cue-unicode");
+        let bin_name = "ゲームディスク.bin";
+        fs::write(
+            directory.0.join(bin_name),
+            ps1_raw_bin(&ps1_iso(
+                b"SLES_222.22;1",
+                b"BOOT=cdrom:\\SLES_222.22;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            format!("FILE \"{bin_name}\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n")
+                .as_bytes(),
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLES-22222"));
+    }
+
+    #[test]
+    fn ps1_cue_relative_subdirectory_reference_verifies() {
+        let directory = FixtureDir::new("ps1-cue-subdir");
+        let tracks_dir = directory.0.join("tracks");
+        fs::create_dir(&tracks_dir).unwrap();
+        fs::write(
+            tracks_dir.join("data.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SLPM_333.33;1",
+                b"BOOT=cdrom:\\SLPM_333.33;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"tracks/data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), Some("SLPM-33333"));
+    }
+
+    #[test]
+    fn ps1_cue_missing_referenced_bin_fails_closed() {
+        let directory = FixtureDir::new("ps1-cue-missing-bin");
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"does-not-exist.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_cue_referencing_a_non_disc_bin_fails_closed() {
+        // The referenced file exists (so this is not the missing-file
+        // case), but it is not a PS1 disc at all - a "wrong/mismatched"
+        // BIN must never be reported Verified merely because the CUE
+        // successfully pointed at *some* real file.
+        let directory = FixtureDir::new("ps1-cue-wrong-bin");
+        fs::write(directory.0.join("not-a-disc.bin"), vec![0x55_u8; 2352 * 4]).unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"not-a-disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_cue_ambiguous_data_tracks_fail_closed() {
+        let directory = FixtureDir::new("ps1-cue-ambiguous");
+        fs::write(
+            directory.0.join("one.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SLUS_777.77;1",
+                b"BOOT=cdrom:\\SLUS_777.77;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("two.bin"),
+            ps1_raw_bin(&ps1_iso(
+                b"SLUS_888.88;1",
+                b"BOOT=cdrom:\\SLUS_888.88;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            b"FILE \"one.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"two.bin\" BINARY\nTRACK 02 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.diagnostic.contains("data track could not be resolved")),
+            "{:?}",
+            report.evidence
+        );
+    }
+
+    #[test]
+    fn ps1_cue_traversal_reference_fails_closed() {
+        let directory = FixtureDir::new("ps1-cue-traversal");
+        let outside = std::env::temp_dir().join(format!(
+            "archivefs-game-identity-outside-{}",
+            std::process::id()
+        ));
+        fs::write(
+            &outside,
+            ps1_raw_bin(&ps1_iso(
+                b"SLUS_999.99;1",
+                b"BOOT=cdrom:\\SLUS_999.99;1\r\n",
+                true,
+            )),
+        )
+        .unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "game.cue",
+            format!(
+                "FILE \"../{}\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+                outside.file_name().unwrap().to_str().unwrap()
+            )
+            .as_bytes(),
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        let _ = fs::remove_file(&outside);
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps1_cue_filename_alone_never_authorizes_identity() {
+        // The BIN's own filename looks exactly like a real PS1 serial
+        // shape, but its content is not a PS1 disc at all - the filename
+        // must never substitute for verified content.
+        let directory = FixtureDir::new("ps1-cue-filename-trap");
+        fs::write(directory.0.join("SLUS-99999.bin"), vec![0xAA_u8; 2352 * 4]).unwrap();
+        let cue_path = write_fixture(
+            &directory,
+            "SLUS-99999.cue",
+            b"FILE \"SLUS-99999.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_game_identity(&cue_path, Some("PS1"));
+        assert_eq!(report.verified_ps1_serial(), None);
+        assert!(!report.complete);
     }
 
     #[test]
