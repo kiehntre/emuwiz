@@ -24,6 +24,23 @@
 //! exists, [`read_file_prefix`] once - exactly the shape
 //! [`crate::xbox_boot_evidence`]/[`crate::xbox360_boot_evidence`] need.
 //!
+//! # Real Xbox disc images: bounded, random-access, never materialized whole
+//!
+//! [`list_root`]/[`find_path`]/[`read_file_prefix`] above all require the
+//! entire image as one in-memory `&[u8]` - safe for a small archive member,
+//! unsafe for a multi-gigabyte Xbox disc image. [`list_root_in_disc_image`]/
+//! [`find_path_in_disc_image`]/[`read_file_prefix_in_disc_image`] are the
+//! same operations, unchanged, over an already-open [`std::fs::File`]
+//! instead: every read is one bounded `seek`+`read_exact` for exactly the
+//! bytes requested, under the same [`MAX_TRAVERSAL_READS`] budget - never a
+//! whole-file read. They also transparently handle both real-world disc
+//! layouts via the `xdvdfs` crate's own [`xdvdfs::blockdev::OffsetWrapper`]:
+//! a raw/stripped XISO (volume descriptor at byte `0`) and a full,
+//! unstripped Redump-style dump (volume descriptor at one of three fixed
+//! XGD1/XGD2/XGD3 offsets) - see [`open_disc_volume`]'s own doc comment.
+//! No offset is guessed here; every candidate comes from the vetted
+//! upstream crate.
+//!
 //! # Safety bounds (never a panic, always an explicit error)
 //!
 //! - [`MAX_ROOT_ENTRIES`]: the root listing is truncated (never silently
@@ -49,8 +66,11 @@
 //! only adds the bounds above and translates results into this crate's own
 //! evidence-shaped types.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+
 use alloc_free_prelude::*;
-use xdvdfs::blockdev::BlockDeviceRead;
+use xdvdfs::blockdev::{BlockDeviceRead, OffsetWrapper};
 use xdvdfs::layout::VolumeDescriptor;
 use xdvdfs::read::read_volume;
 use xdvdfs::util::Error as XdvdfsCrateError;
@@ -223,20 +243,7 @@ fn entry_fact(node: &xdvdfs::layout::DirectoryEntryNode) -> XdvdfsEntryFact {
 /// or an exhausted read budget - never a panic.
 pub fn list_root(bytes: &[u8]) -> Result<XdvdfsRootObservation, XdvdfsTraversalError> {
     let (mut dev, volume) = open_volume(bytes)?;
-    let nodes = volume
-        .root_table
-        .walk_dirent_tree(&mut dev)
-        .map_err(map_error)?;
-
-    let truncated = nodes.len() > MAX_ROOT_ENTRIES;
-    let mut entries: Vec<XdvdfsEntryFact> = nodes
-        .iter()
-        .take(MAX_ROOT_ENTRIES)
-        .map(entry_fact)
-        .collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(XdvdfsRootObservation { entries, truncated })
+    list_root_generic(&mut dev, &volume)
 }
 
 /// Resolves one exact path from the volume root, case-insensitively (the
@@ -250,11 +257,7 @@ pub fn find_path(
 ) -> Result<Option<XdvdfsEntryFact>, XdvdfsTraversalError> {
     validate_path(path)?;
     let (mut dev, volume) = open_volume(bytes)?;
-    match volume.root_table.walk_path(&mut dev, path) {
-        Ok(node) => Ok(Some(entry_fact(&node))),
-        Err(XdvdfsCrateError::DoesNotExist | XdvdfsCrateError::NoDirent) => Ok(None),
-        Err(error) => Err(map_error(error)),
-    }
+    find_path_generic(&mut dev, &volume, path)
 }
 
 /// Reads up to `max_bytes` (itself capped at [`MAX_FILE_PREFIX_BYTES`])
@@ -268,9 +271,55 @@ pub fn read_file_prefix(
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, XdvdfsTraversalError> {
     validate_path(path)?;
-    let bound = max_bytes.min(MAX_FILE_PREFIX_BYTES);
     let (mut dev, volume) = open_volume(bytes)?;
-    let node = match volume.root_table.walk_path(&mut dev, path) {
+    read_file_prefix_generic(&mut dev, &volume, path, max_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Generic core - shared by the in-memory (`bytes: &[u8]`) API above and the
+// bounded, random-access, file-backed disc-image API below. Neither backend
+// re-derives the traversal algorithm; both only supply a
+// `BlockDeviceRead<XdvdfsTraversalError>` and get the identical, already-
+// reviewed walk/bound behavior.
+// ---------------------------------------------------------------------------
+
+fn list_root_generic<D: BlockDeviceRead<XdvdfsTraversalError>>(
+    dev: &mut D,
+    volume: &VolumeDescriptor,
+) -> Result<XdvdfsRootObservation, XdvdfsTraversalError> {
+    let nodes = volume.root_table.walk_dirent_tree(dev).map_err(map_error)?;
+
+    let truncated = nodes.len() > MAX_ROOT_ENTRIES;
+    let mut entries: Vec<XdvdfsEntryFact> = nodes
+        .iter()
+        .take(MAX_ROOT_ENTRIES)
+        .map(entry_fact)
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(XdvdfsRootObservation { entries, truncated })
+}
+
+fn find_path_generic<D: BlockDeviceRead<XdvdfsTraversalError>>(
+    dev: &mut D,
+    volume: &VolumeDescriptor,
+    path: &str,
+) -> Result<Option<XdvdfsEntryFact>, XdvdfsTraversalError> {
+    match volume.root_table.walk_path(dev, path) {
+        Ok(node) => Ok(Some(entry_fact(&node))),
+        Err(XdvdfsCrateError::DoesNotExist | XdvdfsCrateError::NoDirent) => Ok(None),
+        Err(error) => Err(map_error(error)),
+    }
+}
+
+fn read_file_prefix_generic<D: BlockDeviceRead<XdvdfsTraversalError>>(
+    dev: &mut D,
+    volume: &VolumeDescriptor,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, XdvdfsTraversalError> {
+    let bound = max_bytes.min(MAX_FILE_PREFIX_BYTES);
+    let node = match volume.root_table.walk_path(dev, path) {
         Ok(node) => node,
         Err(XdvdfsCrateError::DoesNotExist | XdvdfsCrateError::NoDirent) => return Ok(None),
         Err(error) => return Err(map_error(error)),
@@ -284,9 +333,121 @@ pub fn read_file_prefix(
     let mut buf = vec![0u8; read_len];
     node.node
         .dirent
-        .read_data(&mut dev, &mut buf)
+        .read_data(dev, &mut buf)
         .map_err(map_error)?;
     Ok(Some(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Bounded, random-access, file-backed disc-image API
+// ---------------------------------------------------------------------------
+//
+// The functions above require the entire image as one in-memory `&[u8]` -
+// fine for a small archive member, unsafe for a multi-gigabyte Xbox disc
+// image. [`BoundedFileReader`] implements the same
+// [`xdvdfs::blockdev::BlockDeviceRead`] contract over an already-open,
+// caller-authorized [`File`] instead: every read is a bounded `seek` +
+// `read_exact` for exactly the bytes the `xdvdfs` crate's own traversal
+// algorithm asks for - never the whole file. The same [`MAX_TRAVERSAL_READS`]
+// call budget applies, so a corrupt/cyclic directory table fails closed
+// exactly as it does for the in-memory path.
+//
+// Wrapped in [`xdvdfs::blockdev::OffsetWrapper`] - the `xdvdfs` crate's own,
+// already-published mechanism for locating the XDVDFS volume descriptor at
+// one of the handful of well-known fixed byte offsets real Xbox disc dumps
+// use: `0` (a raw/stripped XISO, e.g. `extract-xiso` output) or one of the
+// three fixed XGD1/XGD2/XGD3 offsets a full, unstripped Redump-style disc
+// dump (padding/security sectors included) places it at. This module invents
+// no offset of its own; every value tried comes from the vetted upstream
+// crate.
+
+/// A [`BlockDeviceRead`] implementation over an already-open file - the
+/// caller is responsible for having opened it safely (e.g. via
+/// [`crate::safe_read::open_bounded_read`]); this module never opens a path
+/// itself. Never materializes the whole file: every call is one bounded
+/// `seek` + `read_exact`, and the same [`MAX_TRAVERSAL_READS`] call budget
+/// as [`BoundedSliceReader`] applies.
+struct BoundedFileReader<'a> {
+    file: &'a mut File,
+    reads_remaining: u32,
+}
+
+impl<'a> BoundedFileReader<'a> {
+    fn new(file: &'a mut File) -> Self {
+        Self {
+            file,
+            reads_remaining: MAX_TRAVERSAL_READS,
+        }
+    }
+}
+
+impl<'a> BlockDeviceRead<XdvdfsTraversalError> for BoundedFileReader<'a> {
+    fn read(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), XdvdfsTraversalError> {
+        if self.reads_remaining == 0 {
+            return Err(XdvdfsTraversalError::TraversalBudgetExceeded);
+        }
+        self.reads_remaining -= 1;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| XdvdfsTraversalError::OutOfBounds)?;
+        self.file
+            .read_exact(buffer)
+            .map_err(|_| XdvdfsTraversalError::OutOfBounds)
+    }
+}
+
+/// Opens the XDVDFS volume on `file`, trying each of the `xdvdfs` crate's
+/// own well-known fixed offsets (see the module documentation) until one
+/// validates. `Err(InvalidVolume)` when none do - never a guessed offset,
+/// never a partial/best-effort volume.
+fn open_disc_volume(
+    file: &mut File,
+) -> Result<
+    (
+        OffsetWrapper<BoundedFileReader<'_>, XdvdfsTraversalError>,
+        VolumeDescriptor,
+    ),
+    XdvdfsTraversalError,
+> {
+    let dev = BoundedFileReader::new(file);
+    let mut wrapper = OffsetWrapper::new(dev).map_err(|_| XdvdfsTraversalError::InvalidVolume)?;
+    let volume = read_volume(&mut wrapper).map_err(map_error)?;
+    Ok((wrapper, volume))
+}
+
+/// Every entry directly under a disc image's volume root - the file-backed,
+/// offset-aware equivalent of [`list_root`]. Never reads the whole image.
+pub fn list_root_in_disc_image(
+    file: &mut File,
+) -> Result<XdvdfsRootObservation, XdvdfsTraversalError> {
+    let (mut dev, volume) = open_disc_volume(file)?;
+    list_root_generic(&mut dev, &volume)
+}
+
+/// Resolves one exact path in a disc image, case-insensitively - the
+/// file-backed, offset-aware equivalent of [`find_path`]. Never reads the
+/// whole image.
+pub fn find_path_in_disc_image(
+    file: &mut File,
+    path: &str,
+) -> Result<Option<XdvdfsEntryFact>, XdvdfsTraversalError> {
+    validate_path(path)?;
+    let (mut dev, volume) = open_disc_volume(file)?;
+    find_path_generic(&mut dev, &volume, path)
+}
+
+/// Reads a bounded prefix of one file in a disc image - the file-backed,
+/// offset-aware equivalent of [`read_file_prefix`]. Never reads the whole
+/// image and never reads past the file's own declared size or the byte
+/// bound, whichever is smaller.
+pub fn read_file_prefix_in_disc_image(
+    file: &mut File,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, XdvdfsTraversalError> {
+    validate_path(path)?;
+    let (mut dev, volume) = open_disc_volume(file)?;
+    read_file_prefix_generic(&mut dev, &volume, path, max_bytes)
 }
 
 /// Test-only helpers for building minimal, hand-assembled XDVDFS images -
@@ -345,6 +506,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     // A hand-assembled, minimal-but-valid XDVDFS image: volume descriptor
     // at sector 32, a root directory table with two entries (one file, one
@@ -690,5 +852,193 @@ mod tests {
         let observation = list_root(&image).unwrap();
         assert!(observation.entries.is_empty());
         assert!(!observation.truncated);
+    }
+
+    // ------------------------------------------------------------------
+    // Bounded, random-access, file-backed disc-image API
+    // ------------------------------------------------------------------
+
+    /// The exact XGD1 offset the `xdvdfs` crate itself tries - a real,
+    /// well-known fixed offset a full, unstripped Redump-style Xbox disc
+    /// dump places its XDVDFS volume descriptor at. Not invented here.
+    const XGD1_OFFSET: u64 = 405_798_912;
+
+    /// Writes `bytes` into a fresh temp file starting at `offset`, leaving
+    /// everything before `offset` as a sparse hole (never actually written
+    /// to disk) - exactly what a real Redump-style dump's leading
+    /// padding/security-sector region is, as far as this test cares: bytes
+    /// this code must never need to read, let alone materialize.
+    fn file_with_bytes_at(offset: u64, bytes: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(offset + bytes.len() as u64).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
+    }
+
+    #[test]
+    fn disc_image_raw_xiso_shape_resolves_default_xbe() {
+        let mut file = file_with_bytes_at(0, &synthetic_xdvdfs_image(b"XBEH payload"));
+        let entry = find_path_in_disc_image(&mut file, "default.xbe")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.name, "DEFAULT.XBE");
+        assert!(!entry.is_directory);
+        let data = read_file_prefix_in_disc_image(&mut file, "default.xbe", 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"XBEH payload");
+    }
+
+    #[test]
+    fn disc_image_redump_style_offset_shape_resolves_default_xbe() {
+        // The same content as the raw-XISO test above, but with the whole
+        // volume shifted to the real XGD1 offset - simulating a full,
+        // unstripped Redump-style dump. `OffsetWrapper` must find it without
+        // this module guessing the offset itself.
+        let mut file = file_with_bytes_at(XGD1_OFFSET, &synthetic_xdvdfs_image(b"XBEH payload"));
+        let entry = find_path_in_disc_image(&mut file, "default.xbe")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.name, "DEFAULT.XBE");
+        let data = read_file_prefix_in_disc_image(&mut file, "default.xbe", 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"XBEH payload");
+    }
+
+    #[test]
+    fn disc_image_list_root_finds_both_entries() {
+        let mut file = file_with_bytes_at(0, &synthetic_xdvdfs_image(b"content"));
+        let observation = list_root_in_disc_image(&mut file).unwrap();
+        assert_eq!(observation.entries.len(), 2);
+        let names: Vec<&str> = observation
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(names.contains(&"DEFAULT.XBE"));
+        assert!(names.contains(&"SUBDIR"));
+    }
+
+    #[test]
+    fn disc_image_malformed_volume_fails_closed_at_every_known_offset() {
+        // No valid magic at offset 0 or at any of the crate's other known
+        // XGD offsets - must be refused, never a guessed/partial volume.
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"not an xdvdfs volume at all").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            find_path_in_disc_image(&mut file, "default.xbe"),
+            Err(XdvdfsTraversalError::InvalidVolume)
+        );
+        assert_eq!(
+            list_root_in_disc_image(&mut file),
+            Err(XdvdfsTraversalError::InvalidVolume)
+        );
+    }
+
+    #[test]
+    fn disc_image_missing_default_xbe_is_none_not_error() {
+        let image = synthetic_single_root_file_image_for_test("SOMETHING.ELSE", b"not an xbe");
+        let mut file = file_with_bytes_at(0, &image);
+        assert_eq!(
+            find_path_in_disc_image(&mut file, "default.xbe").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn disc_image_default_xbe_as_a_directory_fails_closed() {
+        // A root entry named DEFAULT.XBE that is itself a directory (attrs
+        // marks it as one) must never be treated as the boot executable.
+        let mut image = vec![0u8; 33 * SECTOR];
+        let root_sector = 33u32;
+        let mut root_table = Vec::new();
+        append_dirent(&mut root_table, 0, 0, true, "DEFAULT.XBE");
+        pad_to_sector(&mut root_table);
+        let root_table_len = root_table.len() as u32;
+        image.resize(image.len() + SECTOR, 0);
+        let root_offset = root_sector as usize * SECTOR;
+        image[root_offset..root_offset + root_table.len()].copy_from_slice(&root_table);
+        let mut volume = vec![0u8; SECTOR];
+        volume[0..20].copy_from_slice(xdvdfs::layout::VOLUME_HEADER_MAGIC.as_slice());
+        volume[20..24].copy_from_slice(&root_sector.to_le_bytes());
+        volume[24..28].copy_from_slice(&root_table_len.to_le_bytes());
+        volume[2028..2048].copy_from_slice(xdvdfs::layout::VOLUME_HEADER_MAGIC.as_slice());
+        image[32 * SECTOR..33 * SECTOR].copy_from_slice(&volume);
+
+        let mut file = file_with_bytes_at(0, &image);
+        let entry = find_path_in_disc_image(&mut file, "default.xbe")
+            .unwrap()
+            .unwrap();
+        assert!(entry.is_directory);
+        assert_eq!(
+            read_file_prefix_in_disc_image(&mut file, "default.xbe", 4096),
+            Err(XdvdfsTraversalError::NotAFile)
+        );
+    }
+
+    #[test]
+    fn disc_image_huge_overflow_data_sector_is_refused_not_panicked() {
+        // DEFAULT.XBE's data_sector field is patched to u32::MAX, a sector
+        // number whose byte offset (far beyond the small backing file) can
+        // never be satisfied - must fail closed with a real error, never a
+        // panic or a silently truncated/garbage read.
+        let mut image = synthetic_xdvdfs_image(b"XBEH payload");
+        // Locate DEFAULT.XBE's dirent within the root table by scanning for
+        // its own name bytes, then overwrite its data_sector field (the 4
+        // bytes immediately preceding the name-length/name in the fixed
+        // dirent layout: left(2) + right(2) + data_sector(4) + data_size(4)
+        // + attrs(1) + name_len(1) + name).
+        let needle = b"DEFAULT.XBE";
+        let name_pos = image
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("DEFAULT.XBE name bytes must be present in the synthetic image");
+        // name is preceded by: name_len(1) + attrs(1) + data_size(4) +
+        // data_sector(4) = 10 bytes.
+        let data_sector_offset = name_pos - 10;
+        image[data_sector_offset..data_sector_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut file = file_with_bytes_at(0, &image);
+        let result = read_file_prefix_in_disc_image(&mut file, "default.xbe", 4096);
+        assert_eq!(result, Err(XdvdfsTraversalError::OutOfBounds));
+    }
+
+    #[test]
+    fn disc_image_never_materializes_the_whole_image() {
+        // A multi-gigabyte sparse file (a hole - no real disk I/O for the
+        // padding) with a real, valid XDVDFS volume placed only at the real
+        // XGD1 offset. If this code ever tried to read the whole file into
+        // memory, this would be a multi-gigabyte allocation; instead it
+        // must resolve default.xbe using only the small number of bounded
+        // reads the traversal genuinely needs.
+        let mut file = file_with_bytes_at(XGD1_OFFSET, &synthetic_xdvdfs_image(b"XBEH payload"));
+        // Extend well past any real Xbox disc (XGD3 alone is ~6.8 GB) to
+        // make a whole-image read practically infeasible in a unit test if
+        // this code ever regressed to doing one.
+        let huge_len = XGD1_OFFSET + 8 * 1024 * 1024 * 1024;
+        file.set_len(huge_len).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let entry = find_path_in_disc_image(&mut file, "default.xbe")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.name, "DEFAULT.XBE");
+        let data = read_file_prefix_in_disc_image(&mut file, "default.xbe", 4096)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"XBEH payload");
+    }
+
+    /// A minimal valid XDVDFS image with exactly one root file - a thin
+    /// local alias for [`test_support::synthetic_single_root_file_image`]
+    /// (already `pub(crate)`, shared with `xbox_boot_evidence`/
+    /// `xbox360_boot_evidence`'s own tests) so this module's disc-image
+    /// tests can use it without a second, competing implementation.
+    fn synthetic_single_root_file_image_for_test(filename: &str, content: &[u8]) -> Vec<u8> {
+        test_support::synthetic_single_root_file_image(filename, content)
     }
 }

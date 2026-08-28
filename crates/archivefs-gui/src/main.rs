@@ -20999,6 +20999,7 @@ fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
         | IdentityImageFormat::ZipContainingXex
         | IdentityImageFormat::Xbe
         | IdentityImageFormat::ZipContainingXbe
+        | IdentityImageFormat::XboxDiscImage
         | IdentityImageFormat::Unsupported => "This file",
     }
 }

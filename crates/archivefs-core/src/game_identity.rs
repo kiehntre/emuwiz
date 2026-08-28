@@ -337,6 +337,13 @@ pub enum IdentityImageFormat {
     Xbe,
     /// A ZIP containing exactly one `.xbe` member - see [`Self::Xbe`].
     ZipContainingXbe,
+    /// A whole original-Xbox disc image (`.iso`/`.xiso`) - identity is read
+    /// from `/default.xbe` inside its XDVDFS filesystem, via a bounded,
+    /// random-access reader that never materializes the whole image (see
+    /// [`crate::xdvdfs_traversal`]'s file-backed API). Unlike [`Self::Xbe`],
+    /// this format's own path is genuinely runnable disc content, not just
+    /// verified identity.
+    XboxDiscImage,
     /// WIA/RVZ (`.rvz`) - identity is read from the documented uncompressed
     /// `wia_disc_t.dhead` header field, never from the compressed disc body.
     Rvz,
@@ -701,6 +708,9 @@ fn inspect_game_identity_with_platform_trust(
         "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report, trusted),
         "xbe" if platform == IdentityPlatform::Xbox => inspect_direct_xbe(&mut report, trusted),
         "zip" if platform == IdentityPlatform::Xbox => inspect_zip_xbe(&mut report, trusted),
+        "iso" | "xiso" if platform == IdentityPlatform::Xbox => {
+            inspect_direct_xbox_disc(&mut report, trusted);
+        }
         "zip" => inspect_zip_iso(&mut report, trusted),
         "rvz" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
             inspect_rvz(&mut report, trusted);
@@ -1811,6 +1821,88 @@ fn inspect_zip_xbe(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         truncated: member_size > data.len() as u64,
     };
     inspect_xbe_header(report, &mut source, Some(member_path), Some(index));
+}
+
+/// Authoritative original-Xbox identity from a whole disc image
+/// (`.iso`/`.xiso`): locates `/default.xbe` in the XDVDFS filesystem via
+/// [`crate::xdvdfs_traversal`]'s bounded, random-access, file-backed reader
+/// (never materializing the whole image, and transparently handling both
+/// raw-XISO and Redump-style offset-shifted dumps - see that module's own
+/// doc comment), then reuses [`inspect_xbe_header`] unchanged on a bounded
+/// prefix of its bytes - exactly the same identity authority a direct loose
+/// `.xbe` file already has, just reached through a disc filesystem instead
+/// of the plain filesystem.
+fn inspect_direct_xbox_disc(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::XboxDiscImage;
+    let mut file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    report.metadata_paths_inspected += 1;
+    let entry = match crate::xdvdfs_traversal::find_path_in_disc_image(&mut file, "default.xbe") {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Missing,
+                "no default.xbe was found at the Xbox disc image root",
+            );
+            return;
+        }
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("XDVDFS traversal failed: {error}"),
+            );
+            return;
+        }
+    };
+    if entry.is_directory {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "default.xbe exists but is a directory, not a file",
+        );
+        return;
+    }
+    // Bounded to the same generous prefix `xbox_boot_evidence` already reads
+    // for a real disc's `default.xbe` (header plus a realistic certificate
+    // offset) - reused here rather than inventing a new, unreviewed bound.
+    let prefix = match crate::xdvdfs_traversal::read_file_prefix_in_disc_image(
+        &mut file,
+        "default.xbe",
+        crate::xbox_boot_evidence::XBE_PREFIX_READ_BYTES,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "default.xbe could not be read after being located",
+            );
+            return;
+        }
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("XDVDFS traversal failed: {error}"),
+            );
+            return;
+        }
+    };
+    report.bytes_read = prefix.len() as u64;
+    let declared_len = u64::from(entry.size);
+    let mut source = SliceSource {
+        data: &prefix,
+        declared_len,
+        truncated: declared_len > prefix.len() as u64,
+    };
+    inspect_xbe_header(report, &mut source, None, None);
 }
 
 /// Reads the unencrypted original-Xbox XBE header plus the certificate at
@@ -8420,8 +8512,13 @@ mod tests {
     }
 
     #[test]
-    fn xbox_never_reads_an_iso_extension_as_a_disc_image() {
-        let directory = FixtureDir::new("xbox-not-iso");
+    fn xbox_iso_with_non_xdvdfs_content_fails_closed_not_unsupported() {
+        // `.iso` under a trusted Xbox assignment is a genuinely supported
+        // format (routed to the XDVDFS disc-image reader) - but content that
+        // is not actually an XDVDFS volume (a GameCube disc image, here)
+        // must fail closed as structurally invalid, never silently guessed
+        // at or misreported as merely "Unsupported".
+        let directory = FixtureDir::new("xbox-non-xdvdfs-iso");
         let path = write_fixture(
             &directory,
             "game.iso",
@@ -8429,7 +8526,14 @@ mod tests {
         );
         let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
         assert_eq!(report.verified_xbox_title_id(), None);
-        assert_eq!(report.format, IdentityImageFormat::Unsupported);
+        assert_eq!(report.format, IdentityImageFormat::XboxDiscImage);
+        assert!(!report.complete);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
     }
 
     #[test]
@@ -8481,6 +8585,182 @@ mod tests {
                 "{hint} must resolve to IdentityPlatform::Xbox360, not Xbox"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Original Xbox disc image (XDVDFS `.iso`/`.xiso`) identity
+    // ------------------------------------------------------------------
+
+    /// A minimal, valid XDVDFS disc image with a real, structurally valid
+    /// `default.xbe` (via [`xbe_fixture`]) as its only root file.
+    fn xbox_disc_image_fixture(title_id: u32) -> Vec<u8> {
+        crate::xdvdfs_traversal::test_support::synthetic_single_root_file_image(
+            "DEFAULT.XBE",
+            &xbe_fixture(title_id),
+        )
+    }
+
+    #[test]
+    fn xbox_disc_image_verifies_title_id_from_structure_not_filename() {
+        let directory = FixtureDir::new("xbox-disc-valid");
+        let path = write_fixture(
+            &directory,
+            "Mystery Game.iso",
+            &xbox_disc_image_fixture(0x4D53_0058),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.platform, IdentityPlatform::Xbox);
+        assert_eq!(report.format, IdentityImageFormat::XboxDiscImage);
+        assert_eq!(report.verified_xbox_title_id(), Some("4D530058"));
+        assert!(report.complete);
+        // The real, on-disk path is exactly what a later xemu `dvd_path`
+        // launch would need - never rewritten, extracted, or discarded.
+        assert_eq!(report.archive_path, path);
+    }
+
+    #[test]
+    fn xbox_disc_image_supports_the_xiso_extension_too() {
+        let directory = FixtureDir::new("xbox-disc-xiso-ext");
+        let path = write_fixture(
+            &directory,
+            "game.xiso",
+            &xbox_disc_image_fixture(0x4D53_0058),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.format, IdentityImageFormat::XboxDiscImage);
+        assert_eq!(report.verified_xbox_title_id(), Some("4D530058"));
+    }
+
+    #[test]
+    fn xbox_disc_image_malformed_volume_fails_closed() {
+        let directory = FixtureDir::new("xbox-disc-bad-volume");
+        let path = write_fixture(&directory, "game.iso", b"not an xdvdfs volume at all");
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn xbox_disc_image_missing_default_xbe_is_missing_not_fabricated() {
+        let directory = FixtureDir::new("xbox-disc-no-xbe");
+        let image = crate::xdvdfs_traversal::test_support::synthetic_single_root_file_image(
+            "README.TXT",
+            b"not an xbe",
+        );
+        let path = write_fixture(&directory, "game.iso", &image);
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::XbeTitleId && item.status == IdentityStatus::Missing
+        }));
+    }
+
+    #[test]
+    fn xbox_disc_image_malformed_xbe_content_fails_closed() {
+        let directory = FixtureDir::new("xbox-disc-bad-xbe");
+        let image = crate::xdvdfs_traversal::test_support::synthetic_single_root_file_image(
+            "DEFAULT.XBE",
+            b"NOPE not an xbe header",
+        );
+        let path = write_fixture(&directory, "game.iso", &image);
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn xbox_disc_image_huge_overflow_data_sector_is_refused_not_panicked() {
+        // Patch DEFAULT.XBE's own data_sector field (the 4 bytes
+        // immediately preceding attrs/name_len/name in the fixed on-disk
+        // dirent layout) to u32::MAX - a sector whose byte offset can never
+        // be satisfied by this tiny backing file. Must fail closed with a
+        // real diagnostic, never panic or silently return garbage.
+        let directory = FixtureDir::new("xbox-disc-overflow-sector");
+        let mut image = xbox_disc_image_fixture(0x4D53_0058);
+        let needle = b"DEFAULT.XBE";
+        let name_pos = image
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("DEFAULT.XBE name bytes must be present in the synthetic image");
+        let data_sector_offset = name_pos - 10;
+        image[data_sector_offset..data_sector_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let path = write_fixture(&directory, "game.iso", &image);
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn xbox_disc_image_filename_only_content_never_authorizes_identity() {
+        // A title-ID-looking filename with no real backing file at all -
+        // filename alone must never become verified identity.
+        let report =
+            inspect_catalogued_game_identity(Path::new("/games/4D530058.iso"), Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn xbox_disc_image_and_xbox_360_never_cross_authorize() {
+        // The exact same real, structurally valid Xbox disc image content,
+        // trusted as "Xbox 360" instead, must never verify as either
+        // platform: Xbox 360 has no `.iso`/`.xiso` dispatch at all (XEX
+        // identity is loose-file/ZIP only), so this must fail closed as
+        // unsupported rather than silently reinterpreted.
+        let directory = FixtureDir::new("xbox-disc-vs-xbox360");
+        let path = write_fixture(
+            &directory,
+            "game.iso",
+            &xbox_disc_image_fixture(0x4D53_0058),
+        );
+        let as_xbox = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(as_xbox.verified_xbox_title_id(), Some("4D530058"));
+
+        let as_xbox360 = inspect_catalogued_game_identity(&path, Some("Xbox 360"));
+        assert_eq!(as_xbox360.verified_xbox_title_id(), None);
+        assert_eq!(as_xbox360.verified_xex_title_id(), None);
+        assert_eq!(as_xbox360.format, IdentityImageFormat::Unsupported);
+    }
+
+    #[test]
+    fn xbox_disc_image_never_materializes_the_whole_image() {
+        // A multi-gigabyte sparse file (a hole - no real disk I/O for the
+        // padding) with the real XDVDFS volume placed only at the real XGD1
+        // offset, simulating a full, unstripped Redump-style dump. If the
+        // identity pipeline ever tried to read the whole file into memory,
+        // this would be a multi-gigabyte allocation.
+        const XGD1_OFFSET: u64 = 405_798_912;
+        let directory = FixtureDir::new("xbox-disc-huge-sparse");
+        let path = directory.0.join("game.iso");
+        let image = xbox_disc_image_fixture(0x4D53_0058);
+        let mut file = fs::File::create(&path).unwrap();
+        file.set_len(XGD1_OFFSET + image.len() as u64).unwrap();
+        file.seek(SeekFrom::Start(XGD1_OFFSET)).unwrap();
+        file.write_all(&image).unwrap();
+        drop(file);
+
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), Some("4D530058"));
+        assert!(report.complete);
     }
 }
 
