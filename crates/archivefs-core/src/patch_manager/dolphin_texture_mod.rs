@@ -87,6 +87,10 @@ pub enum DolphinTextureModErrorKind {
     SourceSymlink,
     /// The selected source's extension is not (case-insensitively) `.png`.
     SourceNotPng,
+    /// A manifest source is not within its approved expanded-pack root.
+    SourceOutsideApprovedScope,
+    /// A manifest source no longer matches its declared metadata.
+    SourceChanged,
     /// The selected source's own filename is not exactly one safe, normal
     /// path component (or is not valid UTF-8).
     SourceUnsafeFilename,

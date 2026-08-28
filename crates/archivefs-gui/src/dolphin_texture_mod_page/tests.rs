@@ -17,12 +17,15 @@ use archivefs_core::game_identity::{
     IdentityPlatform, IdentityProvenance, IdentityStatus,
 };
 use archivefs_core::patch_manager::{
-    DolphinInstallationType, DolphinProfileScope, DolphinSettingsDirectoryState,
-    EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,
-    PreviewAdapter, ResolvedEmulatorProfile, SharedApplyContext, SharedApplyEntry,
-    SharedApplyOutcome, SharedApplyResult, SharedApplyStatus, SharedPlanEntry, SharedPreviewReport,
-    SharedTransactionPath, SharedTransactionStage,
+    DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DolphinInstallationType, DolphinProfileScope,
+    DolphinSettingsDirectoryState, DolphinTextureModIdentity, DolphinTexturePackFile,
+    DolphinTexturePackManifest, DolphinTexturePackPreviewRequest, EmulatorDestinationDirectories,
+    EmulatorInstallationType, EmulatorProfileConfidence, PreviewAdapter, ResolvedEmulatorProfile,
+    SharedApplyContext, SharedApplyEntry, SharedApplyOutcome, SharedApplyResult, SharedApplyStatus,
+    SharedPlanEntry, SharedPreviewReport, SharedTransactionPath, SharedTransactionStage,
+    build_dolphin_texture_pack_preview,
 };
+use tempfile::TempDir;
 
 use super::*;
 
@@ -145,6 +148,26 @@ fn render_stage(stage: DolphinTextureModStage) -> egui::FullOutput {
                         Path::new("/home/user/.local/share/dolphin-emu/Load/Textures"),
                     );
                 }
+                DolphinTextureModStage::PackPreviewReady {
+                    plan,
+                    manifest_path,
+                } => {
+                    show_pack_preview(
+                        ui,
+                        &mut DolphinTextureModPageState::default(),
+                        &plan,
+                        &manifest_path,
+                        "dolphin-native",
+                    );
+                }
+                DolphinTextureModStage::PackConfirmationPending { plan } => {
+                    show_pack_confirmation(
+                        ui,
+                        &mut DolphinTextureModPageState::default(),
+                        plan,
+                        Path::new("/home/user/.local/share/dolphin-emu/Load/Textures"),
+                    );
+                }
                 DolphinTextureModStage::Applied {
                     result,
                     destination_root,
@@ -160,6 +183,39 @@ fn render_stage(stage: DolphinTextureModStage) -> egui::FullOutput {
             }
         });
     })
+}
+
+fn sample_pack_plan() -> (TempDir, DolphinTexturePackPlan) {
+    let dir = tempfile::tempdir().unwrap();
+    let source_root = dir.path().join("pack with spaces");
+    std::fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("menu with unicode.png");
+    std::fs::write(&source, b"a").unwrap();
+    let manifest = DolphinTexturePackManifest {
+        format: DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT.to_string(),
+        name: "HD Pack".to_string(),
+        version: Some("1.2".to_string()),
+        target_game_id: "GALE01".to_string(),
+        source_root: source_root.clone(),
+        files: vec![DolphinTexturePackFile {
+            source_path: source,
+            destination_filename: "menu.png".to_string(),
+            size_bytes: 1,
+            sha256: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".to_string(),
+        }],
+    };
+    let plan = build_dolphin_texture_pack_preview(&DolphinTexturePackPreviewRequest {
+        selected_archive: PathBuf::from("/library/game.iso"),
+        identity: DolphinTextureModIdentity {
+            game_id: "GALE01".to_string(),
+            platform: IdentityPlatform::GameCube,
+        },
+        destination_root: dir.path().join("textures"),
+        source_root,
+        manifest,
+    })
+    .unwrap();
+    (dir, plan)
 }
 
 // --- blocked prerequisites ----------------------------------------------------
@@ -324,6 +380,121 @@ fn identical_destination_shows_already_installed() {
         source_parent: PathBuf::from("/source"),
     });
     assert!(rendered_text_contains(&output, "Already installed"));
+}
+
+#[test]
+fn texture_pack_preview_shows_manifest_summary_and_explicit_review_action() {
+    let (dir, plan) = sample_pack_plan();
+    let output = render_stage(DolphinTextureModStage::PackPreviewReady {
+        plan,
+        manifest_path: dir.path().join("pack.json"),
+    });
+    assert!(rendered_text_contains(&output, "Texture pack: HD Pack"));
+    assert!(rendered_text_contains(&output, "Version: 1.2"));
+    assert!(rendered_text_contains(
+        &output,
+        "Verified target GameID: GALE01"
+    ));
+    assert!(rendered_text_contains(&output, "Files to install: 1"));
+    assert!(rendered_text_contains(&output, "Review and install"));
+}
+
+#[test]
+fn texture_pack_confirmation_is_explicit_and_lists_all_planned_files() {
+    let plan = SharedTransactionPlan {
+        schema_version: 1,
+        plan_id: "pack-plan-1".to_string(),
+        context: SharedApplyContext {
+            adapter: PreviewAdapter::Dolphin,
+            selected_archive: SharedTransactionPath::from_path(Path::new("/library/game.iso")),
+            verified_game_identity: "GALE01".to_string(),
+            profile_id: "dolphin-native".to_string(),
+            source_mode: "dolphin_texture_pack".to_string(),
+        },
+        approved_source_root: SharedTransactionPath::from_path(Path::new("/source")),
+        destination_root: SharedTransactionPath::from_path(Path::new(
+            "/home/user/.local/share/dolphin-emu/Load/Textures",
+        )),
+        entries: vec![SharedPlanEntry {
+            adapter: PreviewAdapter::Dolphin,
+            selected_archive: SharedTransactionPath::from_path(Path::new("/library/game.iso")),
+            verified_game_identity: "GALE01".to_string(),
+            source_path: SharedTransactionPath::from_path(Path::new("/source/menu.png")),
+            source_digest: "digest".to_string(),
+            destination_root: SharedTransactionPath::from_path(Path::new(
+                "/home/user/.local/share/dolphin-emu/Load/Textures",
+            )),
+            destination_relative_path: SharedTransactionPath::from_path(Path::new(
+                "GALE01/menu.png",
+            )),
+            destination_pre_state: archivefs_core::patch_manager::PreviewDestinationState::Missing,
+            destination_pre_digest: None,
+            proposed_action: archivefs_core::patch_manager::PreviewProposedAction::Install,
+            backup_required: false,
+            parent_creation_approved: true,
+            content_verification: None,
+        }],
+    };
+    let output = render_stage(DolphinTextureModStage::PackConfirmationPending { plan });
+    assert!(rendered_text_contains(
+        &output,
+        "Confirm installing this texture pack?"
+    ));
+    assert!(rendered_text_contains(&output, "Confirm install"));
+    assert!(rendered_text_contains(&output, "Cancel"));
+}
+
+#[test]
+fn malformed_texture_pack_manifest_fails_before_preview_or_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("malformed.json");
+    std::fs::write(&path, b"{\"name\":\"not a complete manifest\"}").unwrap();
+    let stage = build_pack_preview_stage(
+        &path,
+        Path::new("/library/game.iso"),
+        &DolphinTextureModIdentity {
+            game_id: "GALE01".to_string(),
+            platform: IdentityPlatform::GameCube,
+        },
+        &dir.path().join("textures"),
+    );
+    assert!(matches!(stage, DolphinTextureModStage::Failed { .. }));
+    assert!(!dir.path().join("textures").exists());
+}
+
+#[test]
+fn texture_pack_apply_failure_is_rendered_as_failure_not_success() {
+    let mut apply = sample_apply_result(SharedApplyOutcome::InstalledNew, None);
+    apply.journal.status = SharedApplyStatus::PartialFailure;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(DolphinTexturePackApplyResult {
+            apply,
+            rollback: None,
+        })
+        .unwrap();
+    let mut state = DolphinTextureModPageState::default();
+    let profile = sample_profile(true);
+    let report = verified_game_id_report("GALE01");
+    let _ = render_panel(
+        &mut state,
+        Path::new("/library/game.iso"),
+        &profile,
+        Some(&report),
+    );
+    state.stage = Some(DolphinTextureModStage::PackApplying {
+        receiver,
+        destination_root: PathBuf::from("/tmp/texture-pack-destination"),
+    });
+    assert!(state.poll());
+    let output = render_panel(
+        &mut state,
+        Path::new("/library/game.iso"),
+        &profile,
+        Some(&report),
+    );
+    assert!(rendered_text_contains(&output, "Texture install failed"));
+    assert!(!rendered_text_contains(&output, "Installed"));
 }
 
 // --- hard conflict has no Install -------------------------------------------------

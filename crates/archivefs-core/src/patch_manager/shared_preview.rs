@@ -39,6 +39,10 @@ pub enum PreviewIdentityKind {
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
     DolphinGameId,
+    /// An explicit multi-file Dolphin texture-pack manifest. Multiple
+    /// verified source files are expected and are not competing identity
+    /// matches in this mode.
+    DolphinTexturePack,
     XeniaTitleId,
 }
 
@@ -846,10 +850,10 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
         .filter(|entry| entry.match_strength == PreviewMatchStrength::VerifiedExact)
         .filter_map(|entry| entry.source_path.as_ref())
         .collect::<BTreeSet<_>>();
-    if matches!(
-        request.adapter,
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin
-    ) && exact_sources.len() > 1
+    if (request.adapter == PreviewAdapter::Pcsx2
+        || (request.adapter == PreviewAdapter::Dolphin
+            && request.identity.kind == PreviewIdentityKind::DolphinGameId))
+        && exact_sources.len() > 1
     {
         for index in 0..report.entries.len() {
             mark_conflict(
