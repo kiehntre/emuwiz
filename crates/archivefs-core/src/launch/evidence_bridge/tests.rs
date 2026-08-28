@@ -85,6 +85,31 @@ fn verified_ps2_serial_resolves_with_a_matching_fact() {
 }
 
 #[test]
+fn verified_psp_disc_id_resolves_to_ppsspp_fact() {
+    let source = report(
+        IdentityPlatform::Psp,
+        vec![evidence(
+            IdentityKind::PspDiscId,
+            IdentityStatus::Verified,
+            Some("ULUS10000"),
+            IdentityConfidence::StructuredMetadata,
+        )],
+    );
+    let (status, facts) = canonical_identity_from_game_report(&source);
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PSP".to_string(),
+            game_key: "ULUS10000".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::PspDiscId("ULUS10000".to_string())]
+    );
+}
+
+#[test]
 fn verified_ps1_serial_resolves_to_duckstation_fact() {
     let source = report(
         IdentityPlatform::PlayStation,

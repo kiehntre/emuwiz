@@ -25,6 +25,7 @@ use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
+use crate::param_sfo::parse_param_sfo;
 use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
@@ -171,6 +172,7 @@ pub enum IdentityKind {
     Platform,
     Ps1Serial,
     Ps2Serial,
+    PspDiscId,
     SaturnProductNumber,
     DreamcastProductCode,
     SegaCdProductCode,
@@ -198,6 +200,7 @@ impl fmt::Display for IdentityKind {
             Self::Platform => "Platform",
             Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
+            Self::PspDiscId => "PSP disc ID",
             Self::SaturnProductNumber => "Saturn product number",
             Self::DreamcastProductCode => "Dreamcast product code",
             Self::SegaCdProductCode => "Sega CD product code",
@@ -232,6 +235,7 @@ pub enum IdentityConfidence {
 pub enum IdentityPlatform {
     PlayStation,
     PlayStation2,
+    Psp,
     Saturn,
     Dreamcast,
     SegaCd,
@@ -255,6 +259,7 @@ impl IdentityPlatform {
             "playstation" | "playstation 1" | "playstation1" | "psx" | "ps1"
             | "sony playstation" => Self::PlayStation,
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
+            "psp" | "playstation portable" | "sony playstation portable" => Self::Psp,
             "saturn" | "sega saturn" | "sega saturn console" => Self::Saturn,
             "dreamcast" | "sega dreamcast" => Self::Dreamcast,
             "sega cd" | "sega-cd" | "segacd" | "mega cd" | "mega-cd" | "megacd" => Self::SegaCd,
@@ -282,6 +287,7 @@ impl IdentityPlatform {
         match self {
             Self::PlayStation => "PlayStation",
             Self::PlayStation2 => "PlayStation 2",
+            Self::Psp => "PlayStation Portable",
             Self::Saturn => "Sega Saturn",
             Self::Dreamcast => "Sega Dreamcast",
             Self::SegaCd => "Sega Mega-CD / Sega CD",
@@ -446,6 +452,10 @@ impl GameIdentityReport {
 
     pub fn verified_ps2_serial(&self) -> Option<&str> {
         self.verified_value(IdentityKind::Ps2Serial)
+    }
+
+    pub fn verified_psp_disc_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::PspDiscId)
     }
 
     pub fn verified_ps1_serial(&self) -> Option<&str> {
@@ -618,6 +628,7 @@ fn inspect_game_identity_with_platform_trust(
             if matches!(
                 platform,
                 IdentityPlatform::PlayStation
+                    | IdentityPlatform::Psp
                     | IdentityPlatform::Saturn
                     | IdentityPlatform::Dreamcast
                     | IdentityPlatform::SegaCd
@@ -1243,6 +1254,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         }
         IdentityPlatform::PlayStation
         | IdentityPlatform::PlayStation2
+        | IdentityPlatform::Psp
         | IdentityPlatform::Saturn
         | IdentityPlatform::Dreamcast
         | IdentityPlatform::SegaCd
@@ -1616,6 +1628,7 @@ fn inspect_iso_source(
 ) {
     match report.platform {
         IdentityPlatform::PlayStation => inspect_ps1_iso(report, source, member_path, member_index),
+        IdentityPlatform::Psp => inspect_psp_iso(report, source, member_path, member_index),
         IdentityPlatform::Saturn => {
             inspect_saturn_source(report, source, member_path, member_index)
         }
@@ -1641,6 +1654,174 @@ fn inspect_iso_source(
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => {}
     }
+}
+
+/// Authoritative PSP identity from a UMD-style ISO filesystem. `PSP_GAME` and
+/// `PARAM.SFO` are not sufficient on their own because they overlap with the
+/// Sony ecosystem; the root `UMD_DATA.BIN` marker and a structurally valid
+/// `DISC_ID` are required together. This reuses the existing bounded ISO
+/// reader and PARAM.SFO parser and never consults a filename.
+fn inspect_psp_iso(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let root = match iso_root(source) {
+        Ok(root) => root,
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::PspDiscId,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "ISO 9660 primary volume descriptor",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    report.metadata_paths_inspected += 1;
+    let psp_dir =
+        matches!(find_iso_path(source, root, &[b"PSP_GAME"]), Ok(Some(record)) if record.directory);
+    let umd = matches!(find_iso_path(source, root, &[b"UMD_DATA.BIN"]), Ok(Some(record)) if !record.directory);
+    if !psp_dir || !umd {
+        push_with_source(
+            report,
+            IdentityKind::PspDiscId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PSP UMD layout validation",
+            "PSP_GAME and root UMD_DATA.BIN are both required",
+        );
+        return;
+    }
+    let sfo = match find_iso_path(source, root, &[b"PSP_GAME", b"PARAM.SFO"]) {
+        Ok(Some(record)) if !record.directory => record,
+        Ok(_) => {
+            push_with_source(
+                report,
+                IdentityKind::PspDiscId,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PSP PARAM.SFO lookup",
+                "PSP_GAME/PARAM.SFO is missing",
+            );
+            return;
+        }
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::PspDiscId,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PSP PARAM.SFO lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    if sfo.size > MAX_SYSTEM_CNF_BYTES {
+        push_with_source(
+            report,
+            IdentityKind::PspDiscId,
+            IdentityStatus::ResourceLimitReached,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "bounded PARAM.SFO read",
+            "PARAM.SFO exceeds 64 KiB",
+        );
+        return;
+    }
+    let bytes = match read_iso_record(source, sfo) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            push_with_source(
+                report,
+                IdentityKind::PspDiscId,
+                source_error_status(&error),
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "bounded PARAM.SFO read",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let Some(sfo) = parse_param_sfo(&bytes) else {
+        push_with_source(
+            report,
+            IdentityKind::PspDiscId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PARAM.SFO validation",
+            "PARAM.SFO is malformed",
+        );
+        return;
+    };
+    let Some(raw_id) = sfo.get_text("DISC_ID") else {
+        push_with_source(
+            report,
+            IdentityKind::PspDiscId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PARAM.SFO DISC_ID lookup",
+            "DISC_ID is missing",
+        );
+        return;
+    };
+    let id = raw_id.trim().to_ascii_uppercase();
+    let valid = id.len() == 9
+        && id.as_bytes()[..4].iter().all(u8::is_ascii_uppercase)
+        && id.as_bytes()[4..].iter().all(u8::is_ascii_digit);
+    if !valid {
+        push_with_source(
+            report,
+            IdentityKind::PspDiscId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PARAM.SFO DISC_ID validation",
+            "DISC_ID is not a valid PSP product identifier",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::PspDiscId,
+        IdentityStatus::Verified,
+        Some(id),
+        IdentityConfidence::StructuredMetadata,
+        member_path,
+        member_index,
+        "PSP UMD_DATA.BIN plus PARAM.SFO DISC_ID",
+        "verified from PSP UMD content",
+    );
+    report.complete = true;
 }
 
 /// Authoritative Saturn identity from the fixed System ID at logical sector
@@ -3769,6 +3950,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::PlayStation2 => {
             &[IdentityKind::Ps2Serial, IdentityKind::Pcsx2ExecutableCrc]
         }
+        IdentityPlatform::Psp => &[IdentityKind::PspDiscId],
         IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
         IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
         IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
@@ -3844,6 +4026,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
                 }
             }
         }
+        IdentityPlatform::Psp => {}
         IdentityPlatform::Xbox360 => {
             for token in stem.split(|character: char| !character.is_ascii_alphanumeric()) {
                 if token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -4048,6 +4231,61 @@ mod tests {
         iso[cursor] = 0;
         let cnf_offset = 21 * ISO_SECTOR_SIZE as usize;
         iso[cnf_offset..cnf_offset + cnf.len()].copy_from_slice(cnf);
+        iso
+    }
+
+    fn psp_sfo(disc_id: &[u8]) -> Vec<u8> {
+        let mut value = disc_id.to_vec();
+        value.push(0);
+        let key = b"DISC_ID\0";
+        let key_start = 20 + 16;
+        let data_start = key_start + 8;
+        let mut out = vec![0_u8; data_start];
+        out[0..4].copy_from_slice(crate::param_sfo::SFO_MAGIC);
+        out[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&(key_start as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&(data_start as u32).to_le_bytes());
+        out[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        out[20..22].copy_from_slice(&0_u16.to_le_bytes());
+        out[22..24].copy_from_slice(&0x0204_u16.to_le_bytes());
+        out[24..28].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        out[28..32].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        out[32..36].copy_from_slice(&0_u32.to_le_bytes());
+        out[key_start..key_start + key.len()].copy_from_slice(key);
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn psp_iso(disc_id: &[u8], include_umd: bool) -> Vec<u8> {
+        let sfo = psp_sfo(disc_id);
+        let mut iso = vec![0_u8; 28 * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+        let root_offset = 20 * ISO_SECTOR_SIZE as usize;
+        let dir = directory_record(b"PSP_GAME", 21, ISO_SECTOR_SIZE as u32, true);
+        iso[root_offset..root_offset + dir.len()].copy_from_slice(&dir);
+        let umd = directory_record(b"UMD_DATA.BIN;1", 23, 3, false);
+        let umd_offset = root_offset + dir.len();
+        if include_umd {
+            iso[umd_offset..umd_offset + umd.len()].copy_from_slice(&umd);
+        }
+        iso[umd_offset + if include_umd { umd.len() } else { 0 }] = 0;
+        let psp_offset = 21 * ISO_SECTOR_SIZE as usize;
+        let sfo_record = directory_record(b"PARAM.SFO;1", 22, sfo.len() as u32, false);
+        iso[psp_offset..psp_offset + sfo_record.len()].copy_from_slice(&sfo_record);
+        iso[psp_offset + sfo_record.len()] = 0;
+        iso[22 * ISO_SECTOR_SIZE as usize..22 * ISO_SECTOR_SIZE as usize + sfo.len()]
+            .copy_from_slice(&sfo);
+        iso[23 * ISO_SECTOR_SIZE as usize..23 * ISO_SECTOR_SIZE as usize + 3]
+            .copy_from_slice(b"UMD");
         iso
     }
 
@@ -4889,6 +5127,65 @@ mod tests {
         );
         assert_eq!(report.verified_pcsx2_crc(), Some(expected.as_str()));
         assert!(report.complete);
+    }
+
+    #[test]
+    fn psp_iso_verifies_disc_id_from_umd_content() {
+        let directory = FixtureDir::new("psp");
+        let path = write_fixture(
+            &directory,
+            "not-the-disc-id – 日本語.iso",
+            &psp_iso(b"ULUS10000", true),
+        );
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.platform, IdentityPlatform::Psp);
+        assert_eq!(report.verified_psp_disc_id(), Some("ULUS10000"));
+        let (status, facts) =
+            crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+        assert!(matches!(
+            status,
+            crate::launch::planning::CanonicalIdentityStatus::Resolved(_)
+        ));
+        assert_eq!(
+            facts,
+            vec![
+                crate::launch::input_projection::VerifiedIdentityFact::PspDiscId(
+                    "ULUS10000".to_string()
+                )
+            ]
+        );
+
+        let wrong_platform = inspect_game_identity(&path, Some("PlayStation 2"));
+        assert_eq!(wrong_platform.platform, IdentityPlatform::PlayStation2);
+        assert_eq!(wrong_platform.verified_psp_disc_id(), None);
+    }
+
+    #[test]
+    fn psp_identity_fails_closed_without_umd_or_for_malformed_sfo() {
+        let directory = FixtureDir::new("psp-invalid");
+        let missing_umd = write_fixture(&directory, "missing.iso", &psp_iso(b"ULUS10000", false));
+        assert_eq!(
+            inspect_game_identity(&missing_umd, Some("PSP")).verified_psp_disc_id(),
+            None
+        );
+        let malformed = write_fixture(
+            &directory,
+            "malformed.iso",
+            &psp_iso(b"not-a-disc-id", true),
+        );
+        assert_eq!(
+            inspect_game_identity(&malformed, Some("PSP")).verified_psp_disc_id(),
+            None
+        );
+        let filename_only = write_fixture(&directory, "ULUS10000.iso", &[0_u8; 32]);
+        let report = inspect_game_identity(&filename_only, Some("PSP"));
+        assert_eq!(report.verified_psp_disc_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|item| item.status != IdentityStatus::Verified)
+        );
     }
 
     #[test]
