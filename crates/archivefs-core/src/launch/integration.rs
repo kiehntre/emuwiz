@@ -17,7 +17,7 @@ use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_duckstation_launch_input,
     project_flycast_launch_input, project_pcsx2_launch_input, project_ppsspp_launch_input,
-    project_xenia_launch_input,
+    project_rpcs3_launch_input, project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
@@ -25,12 +25,12 @@ use crate::launch::planning::{
 };
 use crate::launch::readiness::{
     duckstation_firmware_readiness, flycast_firmware_readiness, pcsx2_firmware_readiness,
-    ppsspp_firmware_readiness,
+    ppsspp_firmware_readiness, rpcs3_firmware_readiness,
 };
 use crate::patch_manager::{
     DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
     FlycastProfile, FlycastSystemFileState, Pcsx2BiosVerification, Pcsx2GameInspection,
-    Pcsx2Profile, PpssppProfile, XeniaProfile,
+    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -64,6 +64,10 @@ pub enum DiscoveredStandaloneProfile<'a> {
         profile: &'a FlycastProfile,
         bios: FlycastSystemFileState,
     },
+    Rpcs3 {
+        profile: &'a Rpcs3Profile,
+        inspection: &'a Rpcs3GameInspection,
+    },
 }
 
 impl<'a> DiscoveredStandaloneProfile<'a> {
@@ -96,6 +100,13 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
         Self::Flycast {
             profile,
             bios: inspection.health.system.dreamcast_bios,
+        }
+    }
+
+    pub fn rpcs3(profile: &'a Rpcs3Profile, inspection: &'a Rpcs3GameInspection) -> Self {
+        Self::Rpcs3 {
+            profile,
+            inspection,
         }
     }
 }
@@ -168,6 +179,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware: flycast_firmware_readiness(*bios),
+                })
+            }
+            DiscoveredStandaloneProfile::Rpcs3 {
+                profile,
+                inspection,
+            } if authorized(project_rpcs3_launch_input(input.verified_identity_facts)) => {
+                Some(StandaloneProfileInput {
+                    adapter_id: "rpcs3",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: rpcs3_firmware_readiness(&inspection.health.firmware),
                 })
             }
             DiscoveredStandaloneProfile::Xenia { profile } => {

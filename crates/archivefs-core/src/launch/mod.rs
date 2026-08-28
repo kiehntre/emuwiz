@@ -81,6 +81,7 @@ pub mod platform_map;
 pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
+pub mod rpcs3_command;
 pub mod xenia_command;
 
 #[cfg(test)]
@@ -170,6 +171,10 @@ pub use readiness::{
 };
 pub use retroarch_command::{
     RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
+};
+pub use rpcs3_command::{
+    RPCS3_SUPPORTED_PLATFORM_ID, Rpcs3Command, Rpcs3CommandPlan, Rpcs3CommandSelection,
+    build_rpcs3_command_plan,
 };
 pub use xenia_command::{
     XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, XeniaCommandPlan, XeniaCommandSelection,

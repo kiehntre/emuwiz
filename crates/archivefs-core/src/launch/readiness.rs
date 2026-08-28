@@ -162,6 +162,21 @@ pub enum LaunchBlockerKind {
     /// profile - see the blocker detail for the underlying
     /// [`crate::patch_manager::DuckStationLaunchBlockerKind`].
     DuckStationBindingUnavailable,
+    /// A command-plan request was given a non-RPCS3-standalone launch
+    /// candidate.
+    Rpcs3CandidateRequired,
+    /// The canonical identity this RPCS3 command plan was built for does not
+    /// target `PS3`.
+    Rpcs3PlatformMismatch,
+    /// The content is not a direct, resolved PS3 path supported by the
+    /// native RPCS3 command contract.
+    Rpcs3ContentFormatUnsupported,
+    /// No verified PS3 title ID is available for this content.
+    Rpcs3TitleIdMissing,
+    /// RPCS3 firmware location/readiness could not be established.
+    Rpcs3FirmwareUnavailable,
+    /// The RPCS3 profile/executable binding could not be safely resolved.
+    Rpcs3BindingUnavailable,
     /// A Flycast command-plan request was given a non-Flycast-standalone
     /// launch candidate.
     FlycastCandidateRequired,

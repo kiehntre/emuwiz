@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 
@@ -149,6 +151,118 @@ pub struct Rpcs3Profile {
     pub custom_configs_path: PathBuf,
     pub patches_path: PathBuf,
     pub games_yml_path: PathBuf,
+}
+
+/// The exact native RPCS3 executable selected for a launch. This is a
+/// binding, not a command: the launch planner owns argv construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rpcs3LaunchBinding {
+    pub executable: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rpcs3LaunchBlockerKind {
+    ProfileIneligible,
+    UnsupportedInstallation,
+    ExecutableMissing,
+    AmbiguousExecutable,
+    ExecutableUnsafe,
+    ExecutableNotExecutable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rpcs3LaunchBlocker {
+    pub kind: Rpcs3LaunchBlockerKind,
+    pub detail: String,
+}
+
+fn rpcs3_launch_blocker(
+    kind: Rpcs3LaunchBlockerKind,
+    detail: impl Into<String>,
+) -> Rpcs3LaunchBlocker {
+    Rpcs3LaunchBlocker {
+        kind,
+        detail: detail.into(),
+    }
+}
+
+/// Resolves one safe native Linux RPCS3 executable for a discovered profile.
+/// Flatpak/portable profiles are intentionally not bound here because this
+/// milestone has no proven configuration-directory/argv contract for them.
+pub fn resolve_rpcs3_native_launch_binding(
+    profile: &Rpcs3Profile,
+) -> Result<Rpcs3LaunchBinding, Rpcs3LaunchBlocker> {
+    if !profile.eligible {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::ProfileIneligible,
+            "profile is not eligible",
+        ));
+    }
+    if profile.installation_type != Rpcs3InstallationType::Native {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::UnsupportedInstallation,
+            "only native Linux RPCS3 profiles have a reviewed direct argv contract",
+        ));
+    }
+    let matching: Vec<&Rpcs3Executable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == Rpcs3InstallationType::Native)
+        .collect();
+    if matching.is_empty() {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::ExecutableMissing,
+            "no native RPCS3 executable was discovered",
+        ));
+    }
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_rpcs3_executable(&candidate.path) {
+            Ok(()) => valid.push(candidate.path.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.expect("at least one executable was inspected")),
+        1 => Ok(Rpcs3LaunchBinding {
+            executable: valid.pop().expect("length checked above"),
+        }),
+        count => Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::AmbiguousExecutable,
+            format!("{count} viable native RPCS3 executables remain"),
+        )),
+    }
+}
+
+fn validate_rpcs3_executable(path: &Path) -> Result<(), Rpcs3LaunchBlocker> {
+    if !path.is_absolute() {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::ExecutableMissing,
+            format!("{} does not exist", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::ExecutableUnsafe,
+            format!("{} is not a safe regular executable file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::ExecutableNotExecutable,
+            format!("{} is not executable", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
