@@ -609,9 +609,11 @@ pub use xenia_install_plan::{
     load_xenia_destination, stage_xenia_patch_file,
 };
 pub use xenia_local::{
-    XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaPatchesDirectoryState,
-    XeniaProfile, XeniaProfileBlocker, XeniaProfileBlockerKind, XeniaProfileDiscovery,
+    XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaLaunchBinding,
+    XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaPatchesDirectoryState, XeniaProfile,
+    XeniaProfileBlocker, XeniaProfileBlockerKind, XeniaProfileDiscovery,
     XeniaProfileDiscoveryRoots, XeniaProfileScope, discover_xenia_profiles,
+    resolve_xenia_launch_binding,
 };
 pub use xenia_patch_document::{
     MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,

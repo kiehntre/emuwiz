@@ -181,6 +181,28 @@ pub enum LaunchBlockerKind {
     /// profile - see the blocker detail for the underlying
     /// [`crate::patch_manager::FlycastLaunchBlockerKind`].
     FlycastBindingUnavailable,
+    /// A Xenia command-plan request was given a non-Xenia-standalone launch
+    /// candidate.
+    XeniaCandidateRequired,
+    /// The canonical identity this Xenia plan was built for does not target
+    /// `Xbox360` - the only platform this native launch slice supports.
+    XeniaPlatformMismatch,
+    /// The content is not a direct, non-mounted `.xex` file - no ZIP member
+    /// (even though [`crate::game_identity::inspect_zip_xex`] can verify one),
+    /// no other archive/mount-input container, and no ISO (Xbox 360 disc
+    /// image parsing is not modeled by this build at all).
+    XeniaContentFormatUnsupported,
+    /// Neither a verified XEX title ID nor a verified XEX media ID is
+    /// available for this content - this native launch slice always
+    /// requires at least one, exactly matching what
+    /// [`crate::launch::evidence_bridge`] itself requires to resolve Xbox
+    /// 360 identity at all.
+    XeniaTitleIdMissing,
+    /// [`crate::patch_manager::resolve_xenia_launch_binding`] itself refused
+    /// to produce a launch binding for the candidate's profile - see the
+    /// blocker detail for the underlying
+    /// [`crate::patch_manager::XeniaLaunchBlockerKind`].
+    XeniaBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
@@ -322,6 +344,15 @@ pub fn hatari_firmware_readiness(state: HatariTosHealth) -> FirmwareReadiness {
 /// such state exists to project from - inventing one here would itself be
 /// exactly the mistake this function's existence prevents.
 pub fn ppsspp_firmware_readiness() -> FirmwareReadiness {
+    FirmwareReadiness::NotRequired
+}
+
+/// Xenia has no BIOS/firmware requirement - it emulates the Xbox 360 kernel
+/// directly and needs no separate console firmware dump the way PS1/PS2/
+/// (original) Xbox/Dreamcast do. A constant, not a projection from any
+/// Xenia adapter state, for exactly the same reason [`ppsspp_firmware_readiness`]
+/// is one: no such state exists to project from.
+pub fn xenia_firmware_readiness() -> FirmwareReadiness {
     FirmwareReadiness::NotRequired
 }
 

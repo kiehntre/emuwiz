@@ -81,6 +81,7 @@ pub mod platform_map;
 pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
+pub mod xenia_command;
 
 #[cfg(test)]
 mod tests;
@@ -165,7 +166,12 @@ pub use readiness::{
     LaunchWarningKind, duckstation_firmware_readiness, flycast_firmware_readiness,
     hatari_firmware_readiness, pcsx2_firmware_readiness, ppsspp_firmware_readiness,
     retroarch_core_firmware_readiness, rpcs3_firmware_readiness, xemu_firmware_readiness,
+    xenia_firmware_readiness,
 };
 pub use retroarch_command::{
     RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
+};
+pub use xenia_command::{
+    XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, XeniaCommandPlan, XeniaCommandSelection,
+    build_xenia_command_plan,
 };
