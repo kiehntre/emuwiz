@@ -39,6 +39,7 @@ pub mod duplicate_scan;
 pub mod exact_duplicate;
 pub mod execute;
 pub mod library;
+pub mod n64_equivalent;
 pub mod plan;
 pub mod preflight;
 pub mod proposal;
@@ -76,6 +77,11 @@ pub use library::{
     QuarantineApplyResult, RepairProfile, ReportCounts, SetItem, apply_library_repair_plan,
     apply_saved_plan, apply_saved_plan_selected, build_library_repair_report, plan_file_from_scan,
     preview_library_repair_plan, re_prove_saved_plan, run_library_scan,
+};
+pub use n64_equivalent::{
+    N64_EQUIVALENT_SCAN_VERSION, N64EquivalentGroup, N64EquivalentMember, N64EquivalentScanReport,
+    N64ExcludedCandidate, apply_n64_equivalent_group, build_n64_equivalent_repair_plan,
+    rollback_n64_equivalent_group, scan_n64_equivalent_duplicates,
 };
 pub use plan::{
     PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,

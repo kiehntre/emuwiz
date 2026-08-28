@@ -61,6 +61,10 @@ use archivefs_core::repair::{
     build_exact_duplicate_group_proposals, classify_persisted_transactions,
     rollback_quarantine_transaction, scan_exact_duplicates,
 };
+use archivefs_core::repair::{
+    N64EquivalentScanReport, apply_n64_equivalent_group, rollback_n64_equivalent_group,
+    scan_n64_equivalent_duplicates,
+};
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
@@ -73,6 +77,13 @@ pub(crate) enum ScanStatus {
     Completed,
     Cancelled,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DuplicateReviewMode {
+    #[default]
+    Exact,
+    EquivalentN64,
 }
 
 /// The running background scan job, mirroring the same one-shot
@@ -109,6 +120,8 @@ pub(crate) struct ExactDuplicateReviewPageState {
     scan_status: Option<ScanStatus>,
 
     report: Option<ExactDuplicateScanReport>,
+    equivalent_report: Option<N64EquivalentScanReport>,
+    mode: DuplicateReviewMode,
     /// group index -> the path a person picked to keep, for a group whose
     /// own recommendation is `RequiresUserChoice`. Cleared on every new
     /// scan.
@@ -121,6 +134,7 @@ pub(crate) struct ExactDuplicateReviewPageState {
     /// The most recently applied quarantine transaction, kept so "You can
     /// undo this" has something concrete to roll back.
     applied: Option<RenameTransaction>,
+    applied_equivalent: bool,
     rollback_error: Option<String>,
 
     recovery: Option<RepairRecoveryReport>,
@@ -148,11 +162,14 @@ impl Default for ExactDuplicateReviewPageState {
             scan_cancel: None,
             scan_status: None,
             report: None,
+            equivalent_report: None,
+            mode: DuplicateReviewMode::Exact,
             manual_choice: BTreeMap::new(),
             expanded_group: None,
             apply_confirm: None,
             apply_error: None,
             applied: None,
+            applied_equivalent: false,
             rollback_error: None,
             recovery: None,
             recovery_error: None,
@@ -220,6 +237,21 @@ impl ExactDuplicateReviewPageState {
         self.report.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn equivalent_report(&self) -> Option<&N64EquivalentScanReport> {
+        self.equivalent_report.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> DuplicateReviewMode {
+        self.mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_equivalent_mode(&mut self) {
+        self.mode = DuplicateReviewMode::EquivalentN64;
+    }
+
     pub(crate) fn scan_status(&self) -> Option<&ScanStatus> {
         self.scan_status.as_ref()
     }
@@ -240,10 +272,15 @@ impl ExactDuplicateReviewPageState {
     /// beyond reading directory listings and file bytes through the same
     /// trusted, bounded hashing the core engine already enforces.
     pub(crate) fn scan(&mut self) {
+        if self.mode == DuplicateReviewMode::EquivalentN64 {
+            self.scan_equivalent();
+            return;
+        }
         self.error = None;
         self.apply_error = None;
         self.rollback_error = None;
         self.report = None;
+        self.equivalent_report = None;
         self.manual_choice.clear();
         self.expanded_group = None;
         self.applied = None;
@@ -321,6 +358,26 @@ impl ExactDuplicateReviewPageState {
         self.scan_job = Some(ExactDuplicateScanJob { messages });
         self.scan_cancel = Some(cancel);
         self.scan_status = Some(ScanStatus::Scanning);
+    }
+
+    fn scan_equivalent(&mut self) {
+        self.error = None;
+        self.apply_error = None;
+        self.rollback_error = None;
+        self.report = None;
+        self.equivalent_report = None;
+        self.applied = None;
+        self.applied_equivalent = false;
+        let source = PathBuf::from(self.source_root_draft.trim());
+        if !source.is_dir() {
+            self.error = Some("choose a source folder first".to_string());
+            return;
+        }
+        let candidates = collect_regular_files(&source);
+        self.trust_scope_dirs = vec![source.clone()];
+        let trusted = TrustedRoots::from_paths(vec![source]);
+        self.equivalent_report = Some(scan_n64_equivalent_duplicates(&candidates, &trusted, None));
+        self.scan_status = Some(ScanStatus::Completed);
     }
 
     /// Requests cancellation of a running scan. The scan itself keeps
@@ -418,6 +475,26 @@ impl ExactDuplicateReviewPageState {
     /// freezing exactly what will be quarantined - a no-op if the group is
     /// not actually ready.
     pub(crate) fn open_apply_confirmation(&mut self, group_index: usize) {
+        if self.mode == DuplicateReviewMode::EquivalentN64 {
+            let Some(group) = self
+                .equivalent_report
+                .as_ref()
+                .and_then(|report| report.groups.get(group_index))
+            else {
+                return;
+            };
+            if group.quarantine_candidates.is_empty() || self.applied_equivalent {
+                return;
+            }
+            self.apply_error = None;
+            self.apply_confirm = Some(ApplyConfirmation {
+                group_index,
+                retained_path: group.preferred.clone(),
+                redundant_count: group.quarantine_candidates.len(),
+                reclaimable_bytes: group.projected_savings,
+            });
+            return;
+        }
         let Some(group) = self.effective_group(group_index) else {
             return;
         };
@@ -453,6 +530,35 @@ impl ExactDuplicateReviewPageState {
         let Some(confirmation) = self.apply_confirm.take() else {
             return;
         };
+        if self.mode == DuplicateReviewMode::EquivalentN64 {
+            let Some(group) = self
+                .equivalent_report
+                .as_ref()
+                .and_then(|report| report.groups.get(confirmation.group_index))
+                .cloned()
+            else {
+                self.apply_error =
+                    Some("this equivalent-content group is no longer available".to_string());
+                return;
+            };
+            let trusted = TrustedRoots::from_paths(self.trust_scope_dirs.clone());
+            let cancel = AtomicBool::new(false);
+            match apply_n64_equivalent_group(
+                &group,
+                trusted_root,
+                trusted,
+                &self.journal_dir,
+                &cancel,
+            ) {
+                Ok(result) => {
+                    self.applied = Some(result.transaction);
+                    self.applied_equivalent = true;
+                    self.apply_error = None;
+                }
+                Err(error) => self.apply_error = Some(format!("Nothing was moved: {error}")),
+            }
+            return;
+        }
         let Some(group) = self.effective_group(confirmation.group_index) else {
             self.apply_error = Some("this group is no longer part of the current scan".to_string());
             return;
@@ -551,6 +657,19 @@ impl ExactDuplicateReviewPageState {
             return;
         };
         let cancel = AtomicBool::new(false);
+        if self.applied_equivalent {
+            match rollback_n64_equivalent_group(&mut transaction, &self.journal_dir, &cancel) {
+                Ok(_) => {
+                    self.rollback_error = None;
+                    self.applied_equivalent = false;
+                }
+                Err(error) => {
+                    self.rollback_error = Some(error);
+                    self.applied = Some(transaction);
+                }
+            }
+            return;
+        }
         match rollback_quarantine_transaction(
             &mut transaction,
             &self.journal_dir,
@@ -649,9 +768,22 @@ pub(crate) fn show_exact_duplicate_review_page(
         ui.colored_label(theme::WARNING, error);
     }
 
-    let group_count = state.report.as_ref().map_or(0, |r| r.groups.len());
-    for index in 0..group_count {
-        show_group(ui, state, index);
+    if state.mode == DuplicateReviewMode::EquivalentN64 {
+        let group_count = state
+            .equivalent_report
+            .as_ref()
+            .map_or(0, |r| r.groups.len());
+        if group_count == 0 && state.scan_status == Some(ScanStatus::Completed) {
+            ui.label("No equivalent N64 representations found.");
+        }
+        for index in 0..group_count {
+            show_equivalent_group(ui, state, index);
+        }
+    } else {
+        let group_count = state.report.as_ref().map_or(0, |r| r.groups.len());
+        for index in 0..group_count {
+            show_group(ui, state, index);
+        }
     }
 
     show_apply_confirmation_dialog(ui, state);
@@ -738,8 +870,33 @@ fn show_recovery_banner(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageS
 
 fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState) {
     widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Find exact copies").strong());
-        ui.label("Choose a folder to scan for files that are byte-for-byte identical.");
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Duplicate review").strong());
+            if ui
+                .selectable_label(state.mode == DuplicateReviewMode::Exact, "Exact duplicates")
+                .clicked()
+            {
+                state.mode = DuplicateReviewMode::Exact;
+                state.report = None;
+                state.equivalent_report = None;
+            }
+            if ui
+                .selectable_label(
+                    state.mode == DuplicateReviewMode::EquivalentN64,
+                    "Equivalent content (N64)",
+                )
+                .clicked()
+            {
+                state.mode = DuplicateReviewMode::EquivalentN64;
+                state.report = None;
+                state.equivalent_report = None;
+            }
+        });
+        if state.mode == DuplicateReviewMode::EquivalentN64 {
+            ui.label("Find .z64, .v64 and .n64 files with different bytes but the same canonical N64 content.");
+        } else {
+            ui.label("Choose a folder to scan for files that are byte-for-byte identical.");
+        }
         ui.horizontal(|ui| {
             ui.label("Source folder:");
             ui.add(
@@ -924,6 +1081,66 @@ fn show_group(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState, inde
             ui.label(format!("Recommendation: {:?}", group.recommendation));
             ui.label(format!("Multi-file protection: {:?}", group.multi_file));
             ui.label(format!("Readiness: {:?}", group.readiness));
+        });
+    });
+}
+
+fn show_equivalent_group(
+    ui: &mut egui::Ui,
+    state: &mut ExactDuplicateReviewPageState,
+    index: usize,
+) {
+    let Some(report) = state.equivalent_report.as_ref() else {
+        return;
+    };
+    let Some(group) = report.groups.get(index) else {
+        return;
+    };
+    let group = group.clone();
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Equivalent N64 content").strong());
+        ui.label(format!(
+            "{} byte-order representations · {} reclaimable",
+            group.members.len(),
+            format_bytes(group.projected_savings)
+        ));
+        ui.label(format!(
+            "Preferred representation: {}",
+            group.preferred.display()
+        ));
+        ui.label(format!("Canonical SHA-256: {}", group.canonical_sha256));
+        for member in &group.members {
+            ui.label(format!(
+                "{} · {} · {} · physical SHA-256 {}",
+                member.path.display(),
+                member.byte_order.label(),
+                format_bytes(member.size_bytes),
+                member.physical_sha256
+            ));
+        }
+        ui.label(format!(
+            "Proposed quarantine: {}",
+            group
+                .quarantine_candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if !state.applied_equivalent
+            && widgets::action_button(
+                ui,
+                "Move redundant representations to quarantine",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+        {
+            state.open_apply_confirmation(index);
+        }
+        widgets::technical_details(ui, ("n64_equivalent_group", index), |ui| {
+            ui.label("Physical hashes differ; canonical hashes match after the existing N64 byte-order normalization.");
+            ui.label("Supported only for N64 .z64/.v64/.n64 representations in this review.");
         });
     });
 }

@@ -39,6 +39,9 @@ fn base_state(fixture: &Fixture) -> ExactDuplicateReviewPageState {
 /// that never finishes) fails the test instead of hanging the suite.
 fn run_scan_to_completion(state: &mut ExactDuplicateReviewPageState) {
     state.scan();
+    if state.mode == DuplicateReviewMode::EquivalentN64 {
+        return;
+    }
     for _ in 0..2000 {
         if state.poll_scan() {
             return;
@@ -46,6 +49,21 @@ fn run_scan_to_completion(state: &mut ExactDuplicateReviewPageState) {
         std::thread::sleep(Duration::from_millis(2));
     }
     panic!("scan did not complete in time");
+}
+
+fn n64_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    use archivefs_core::n64_byte_order::{N64ByteOrder, denormalize_from_z64};
+    let mut canonical = N64ByteOrder::Z64.magic().to_vec();
+    canonical.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
+    let preferred = dir.join("preferred.z64");
+    let redundant = dir.join("redundant.v64");
+    std::fs::write(&preferred, &canonical).unwrap();
+    std::fs::write(
+        &redundant,
+        denormalize_from_z64(&canonical, N64ByteOrder::V64).unwrap(),
+    )
+    .unwrap();
+    (preferred, redundant)
 }
 
 // --- real-widget render/interaction helpers, same idiom as
@@ -573,6 +591,81 @@ fn recovery_state_appears_after_interrupted_transaction() {
     assert!(rendered_text_contains(
         &output,
         "were interrupted before this program closed"
+    ));
+}
+
+#[test]
+fn equivalent_mode_renders_distinct_hashes_preference_and_savings() {
+    let fixture = Fixture::new();
+    let source = fixture.path("N64 sources with spaces/日本語");
+    std::fs::create_dir_all(&source).unwrap();
+    let (preferred, redundant) = n64_fixture(&source);
+    let mut state = base_state(&fixture);
+    state.source_root_draft = source.display().to_string();
+    state.select_equivalent_mode();
+    run_scan_to_completion(&mut state);
+    assert_eq!(state.mode(), DuplicateReviewMode::EquivalentN64);
+    let group = &state.equivalent_report().unwrap().groups[0];
+    assert_eq!(group.preferred, preferred);
+    assert_eq!(group.quarantine_candidates, vec![redundant]);
+    let ctx = egui::Context::default();
+    let output = render(&ctx, &mut state, base_input());
+    assert!(rendered_text_contains(&output, "Equivalent N64 content"));
+    assert!(rendered_text_contains(&output, "Preferred representation"));
+    assert!(rendered_text_contains(&output, "Canonical SHA-256"));
+    assert!(rendered_text_contains(&output, "physical SHA-256"));
+    assert!(rendered_text_contains(&output, "reclaimable"));
+}
+
+#[test]
+fn equivalent_mode_requires_confirmation_and_supports_undo() {
+    let fixture = Fixture::new();
+    let source = fixture.path("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let (preferred, redundant) = n64_fixture(&source);
+    let original = std::fs::read(&redundant).unwrap();
+    let mut state = base_state(&fixture);
+    state.source_root_draft = source.display().to_string();
+    state.select_equivalent_mode();
+    run_scan_to_completion(&mut state);
+    let ctx = egui::Context::default();
+    let preview = render(&ctx, &mut state, base_input());
+    assert!(redundant.exists());
+    assert!(rendered_text_contains(
+        &preview,
+        "Move redundant representations"
+    ));
+    state.open_apply_confirmation(0);
+    assert!(redundant.exists());
+    assert!(state.apply_confirm().is_some());
+    state.cancel_apply_confirmation();
+    assert!(redundant.exists());
+    state.open_apply_confirmation(0);
+    state.confirm_apply(&source);
+    assert!(!redundant.exists());
+    assert!(preferred.exists());
+    assert!(state.applied().is_some());
+    let applied = render(&ctx, &mut state, base_input());
+    assert!(rendered_text_contains(&applied, "You can undo this"));
+    state.rollback_last(&source);
+    assert!(redundant.exists());
+    assert_eq!(std::fs::read(&redundant).unwrap(), original);
+}
+
+#[test]
+fn equivalent_mode_empty_state_is_explicit() {
+    let fixture = Fixture::new();
+    let source = fixture.path("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("ordinary.n64"), b"not a rom").unwrap();
+    let mut state = base_state(&fixture);
+    state.source_root_draft = source.display().to_string();
+    state.select_equivalent_mode();
+    run_scan_to_completion(&mut state);
+    let output = render(&egui::Context::default(), &mut state, base_input());
+    assert!(rendered_text_contains(
+        &output,
+        "No equivalent N64 representations found"
     ));
 }
 
