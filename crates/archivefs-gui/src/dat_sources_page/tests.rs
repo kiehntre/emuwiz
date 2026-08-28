@@ -844,6 +844,208 @@ fn a_second_job_is_refused_while_one_is_running() {
 }
 
 // ---------------------------------------------------------------------------
+// Validate all
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_all_schedules_every_source_exactly_once() {
+    let fixture = Fixture::new();
+    let a = fixture.write("a.dat", &logiqx_with_doctype_and_entries(1));
+    let b = fixture.write("b.dat", LOGIQX);
+    let c = fixture.write("c.dat", "<?xml version=\"1.0\"?><datafile><game");
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: a });
+    page.apply(DatSourcesPageAction::AddFile { path: b });
+    page.apply(DatSourcesPageAction::AddFile { path: c });
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+    assert!(page.is_busy(), "validate all runs off the calling thread");
+    run_to_completion(&mut page);
+
+    assert!(page.view().running.is_none());
+    for id in ["a", "b", "c"] {
+        assert!(
+            page.validation(id).is_some(),
+            "{id} must have been validated exactly once"
+        );
+    }
+    let summary = page
+        .view()
+        .last_validate_all_summary
+        .expect("a summary after validate all");
+    assert_eq!(summary.total, 3);
+    assert_eq!(summary.skipped, 0, "an uncancelled run skips nothing");
+}
+
+#[test]
+fn validate_all_preserves_each_sources_own_result() {
+    // Every row must end up with exactly the same per-source result a single
+    // Validate against it would have produced - `ValidateAll` must not merge,
+    // average, or otherwise blend distinct sources' reports.
+    let fixture = Fixture::new();
+    let good = fixture.write("good.dat", LOGIQX);
+    let bad = fixture.write("bad.dat", "<?xml version=\"1.0\"?><datafile><game");
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: good });
+    page.apply(DatSourcesPageAction::AddFile { path: bad });
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let good_row = view.rows.iter().find(|row| row.id == "good").unwrap();
+    let bad_row = view.rows.iter().find(|row| row.id == "bad").unwrap();
+    assert_eq!(good_row.health_state, DatHealthState::Valid);
+    assert_eq!(good_row.formats, vec!["Logiqx XML".to_string()]);
+    assert_eq!(good_row.entry_count, Some(1));
+    assert_eq!(bad_row.health_state, DatHealthState::Invalid);
+    assert!(bad_row.health_detail.is_some());
+}
+
+#[test]
+fn validate_all_summarizes_a_mix_of_valid_changed_and_failed() {
+    let fixture = Fixture::new();
+    let already_checked = fixture.write("already-checked.dat", LOGIQX);
+    let never_checked = fixture.write("never-checked.dat", &logiqx_with_doctype_and_entries(1));
+    let broken = fixture.write("broken.dat", "<?xml version=\"1.0\"?><datafile><game");
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile {
+        path: already_checked,
+    });
+    page.apply(DatSourcesPageAction::AddFile {
+        path: never_checked,
+    });
+    page.apply(DatSourcesPageAction::AddFile { path: broken });
+
+    // Validate one source ahead of time, with its file left untouched -
+    // `ValidateAll` re-validating it must then find nothing changed.
+    page.apply(DatSourcesPageAction::Validate {
+        id: "already-checked".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+    run_to_completion(&mut page);
+
+    let summary = page
+        .view()
+        .last_validate_all_summary
+        .expect("a summary after validate all");
+    assert_eq!(summary.total, 3);
+    assert_eq!(summary.valid, 1, "the already-checked, unchanged source");
+    assert_eq!(summary.changed, 1, "the never-before-checked source");
+    assert_eq!(summary.failed, 1, "the broken source");
+    assert_eq!(summary.skipped, 0);
+}
+
+#[test]
+fn validate_all_on_an_empty_registry_reports_an_empty_summary_without_a_job() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    assert!(page.view().rows.is_empty());
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+
+    assert!(
+        !page.is_busy(),
+        "nothing to validate means no job is spawned"
+    );
+    let summary = page
+        .view()
+        .last_validate_all_summary
+        .expect("an immediate empty summary");
+    assert_eq!(summary, ValidateAllSummary::default());
+}
+
+#[test]
+fn clicking_validate_all_twice_while_active_does_not_duplicate_the_run() {
+    let fixture = Fixture::new();
+    let a = fixture.write("a.dat", LOGIQX);
+    let b = fixture.write("b.dat", &logiqx_with_doctype_and_entries(1));
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: a });
+    page.apply(DatSourcesPageAction::AddFile { path: b });
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+    let first = page.view().running.clone();
+    assert!(first.is_some());
+    // A second click while the first run is in flight must not replace it or
+    // start a second worker.
+    page.apply(DatSourcesPageAction::ValidateAll);
+    assert_eq!(page.view().running, first);
+
+    run_to_completion(&mut page);
+
+    let summary = page
+        .view()
+        .last_validate_all_summary
+        .expect("a summary after validate all");
+    assert_eq!(
+        summary.total, 2,
+        "exactly one run's worth of sources, not doubled by the repeated click"
+    );
+    assert!(page.validation("a").is_some());
+    assert!(page.validation("b").is_some());
+}
+
+#[test]
+fn one_failed_source_does_not_abort_validation_of_the_rest() {
+    let fixture = Fixture::new();
+    let broken = fixture.write("aaa-broken.dat", "<?xml version=\"1.0\"?><datafile><game");
+    let good_one = fixture.write("bbb-good-one.dat", LOGIQX);
+    let good_two = fixture.write("ccc-good-two.dat", &logiqx_with_doctype_and_entries(1));
+    let mut page = fixture.page();
+    // Added, and therefore scheduled, in an order where the failure comes
+    // first - proving a failure partway through does not stop the sources
+    // scheduled after it.
+    page.apply(DatSourcesPageAction::AddFile { path: broken });
+    page.apply(DatSourcesPageAction::AddFile { path: good_one });
+    page.apply(DatSourcesPageAction::AddFile { path: good_two });
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+    run_to_completion(&mut page);
+
+    assert_eq!(
+        page.view().rows[0].health_state,
+        DatHealthState::Invalid,
+        "the aaa- prefix sorts first, so this is the source that failed"
+    );
+    assert!(page.validation("bbb-good-one").is_some());
+    assert_eq!(
+        page.validation("bbb-good-one").unwrap().state,
+        DatHealthState::Valid
+    );
+    assert!(page.validation("ccc-good-two").is_some());
+    assert_eq!(
+        page.validation("ccc-good-two").unwrap().state,
+        DatHealthState::Valid
+    );
+    let summary = page.view().last_validate_all_summary.unwrap();
+    assert_eq!(summary.total, 3);
+    assert_eq!(summary.failed, 1);
+}
+
+#[test]
+fn validate_all_never_touches_a_dat_file_on_disk() {
+    let fixture = Fixture::new();
+    let a = fixture.write("a.dat", LOGIQX);
+    let b = fixture.write("b.dat", "<?xml version=\"1.0\"?><datafile><game");
+    let before = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: a.clone() });
+    page.apply(DatSourcesPageAction::AddFile { path: b.clone() });
+
+    page.apply(DatSourcesPageAction::ValidateAll);
+    run_to_completion(&mut page);
+
+    assert_eq!(
+        (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()),
+        before,
+        "validating must never modify a DAT file"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Audit through the page
 // ---------------------------------------------------------------------------
 
@@ -2712,6 +2914,7 @@ fn draining_a_progress_backlog_keeps_the_eta_stable() {
         started_at: Instant::now() - Duration::from_secs(60),
         audit_progress: Some(AuditProgressTracker::new()),
         platform_display: None,
+        bulk: None,
     });
 
     let total = 1000;
@@ -2834,6 +3037,7 @@ fn take_over_job(page: &mut DatSourcesPageState, latest: &str) -> SyncSender<Job
         started_at: Instant::now(),
         audit_progress: Some(AuditProgressTracker::new()),
         platform_display: None,
+        bulk: None,
     });
     sender
 }

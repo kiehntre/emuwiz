@@ -73,8 +73,8 @@ use archivefs_core::dat::sources::audit_run::{
     DatAuditRequest, run_combined_dat_audit, run_dat_audit,
 };
 use archivefs_core::dat::sources::{
-    DatFileOutcome, DatHealthState, DatSourceEntry, DatSourceKind, DatSourceRegistry,
-    DatValidationReport, UnresolvedDatSetting, load_dat_sources_config_from,
+    DatFileOutcome, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
+    DatSourceRegistry, DatValidationReport, UnresolvedDatSetting, load_dat_sources_config_from,
     save_dat_sources_config_to, suggest_display_name, validate_dat_source,
 };
 use archivefs_core::dat::tosec_release_pack::{
@@ -405,14 +405,20 @@ pub(crate) struct RunningJobView {
 
 impl RunningJobView {
     /// The heading: "Auditing 'collection'" normally, "Stopping 'collection'…"
-    /// the moment Cancel has been pressed.
+    /// the moment Cancel has been pressed. An empty `source_id` (only ever
+    /// `ValidateAll`, which has no single source to name) omits the quoted
+    /// subject entirely rather than rendering empty quotes.
     pub(crate) fn heading(&self) -> String {
         let verb = if self.cancellation_requested {
             "Stopping"
         } else {
             self.what
         };
-        format!("{verb} '{}'", self.source_id)
+        if self.source_id.is_empty() {
+            verb.to_string()
+        } else {
+            format!("{verb} '{}'", self.source_id)
+        }
     }
 }
 
@@ -516,6 +522,9 @@ pub(crate) struct DatSourcesPageView {
     /// Any page-owned worker is running, including an explicit managed-DAT
     /// check/update which intentionally has no generic cancellation button.
     pub(crate) background_busy: bool,
+    /// The final tally of the last completed (or cancelled) "Validate all"
+    /// run, this session.
+    pub(crate) last_validate_all_summary: Option<ValidateAllSummary>,
     /// The folders offered as audit targets: the configured library source
     /// folders, in configuration order.
     pub(crate) library_folders: Vec<PathBuf>,
@@ -1147,6 +1156,12 @@ pub(crate) enum DatSourcesPageAction {
     Validate {
         id: String,
     },
+    /// Validates every currently configured source (enabled or not - the
+    /// per-source Validate button already does not require a source to be
+    /// enabled, so this does not either), sequentially, on the same
+    /// [`validate_dat_source`] path a single Validate uses. A no-op while a
+    /// job is already running.
+    ValidateAll,
     Audit {
         id: String,
         scan_root: PathBuf,
@@ -1330,7 +1345,24 @@ enum JobMessage {
     /// Structured audit progress, kept structured so the page can compute
     /// percentages and an ETA instead of only echoing text.
     AuditProgress(DatAuditProgress),
+    /// One source's validation report - a single Validate job's only result,
+    /// or one of many in a `ValidateAll` job's sequential run. Which it is is
+    /// decided entirely by `RunningJob::kind`; the report and the update it
+    /// drives are identical either way; see `validate_dat_source`, the one
+    /// path both use.
     Validated(Box<DatValidationReport>),
+    /// `ValidateAll` only: sent immediately before each source starts, so the
+    /// page can show which source is currently being read and mark its row
+    /// busy - the same way `RunningJob::source_id` already does for a single
+    /// Validate/Audit job.
+    ValidatingNext {
+        id: String,
+        display_name: String,
+    },
+    /// `ValidateAll` only: every source has either been validated or (only
+    /// when cancelled) skipped. The final tally already lives on
+    /// `RunningJob::bulk`; this just marks the run over.
+    ValidateAllFinished,
     Audited {
         /// The audit generation this result belongs to. A result from a stale
         /// generation is discarded so an older plan can never replace a newer
@@ -1349,7 +1381,85 @@ enum JobMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobKind {
     Validate,
+    ValidateAll,
     Audit,
+}
+
+/// `ValidateAll`-only running tally, carried on the job so the final summary
+/// is exact even if the page never sees `ValidateAllFinished` (a panicked
+/// worker still leaves whatever was already committed intact and visible).
+#[derive(Debug, Clone, Copy)]
+struct BulkValidationProgress {
+    total: usize,
+    completed: usize,
+    valid: usize,
+    changed: usize,
+    failed: usize,
+}
+
+impl BulkValidationProgress {
+    fn summary(self) -> ValidateAllSummary {
+        ValidateAllSummary {
+            total: self.total,
+            valid: self.valid,
+            changed: self.changed,
+            failed: self.failed,
+            skipped: self.total.saturating_sub(self.completed),
+        }
+    }
+}
+
+/// The final tally a "Validate all" run leaves for display, until the next
+/// run replaces it or a Revert discards it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ValidateAllSummary {
+    pub(crate) total: usize,
+    pub(crate) valid: usize,
+    pub(crate) changed: usize,
+    pub(crate) failed: usize,
+    /// Never validated because the run was cancelled before reaching them.
+    /// Always `0` for a run that finished on its own.
+    pub(crate) skipped: usize,
+}
+
+/// One source's outcome inside a "Validate all" run, classified from the
+/// exact [`DatValidationReport`]/[`DatSourceHealth`] a single Validate
+/// already produces and stores - no separate judgment call invented for the
+/// bulk case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidateAllOutcome {
+    /// Parsed cleanly (or with warnings) and the recorded health did not
+    /// change from what was already on file.
+    Valid,
+    /// Parsed cleanly (or with warnings), but the recorded health differs
+    /// from what was on file before this run - including a source's very
+    /// first validation, where "on file" was empty.
+    Changed,
+    /// The path is unreadable, or at least one registered DAT failed to
+    /// parse.
+    Failed,
+}
+
+fn classify_validate_all_outcome(
+    state: DatHealthState,
+    previous_health: Option<&DatSourceHealth>,
+    new_health: &DatSourceHealth,
+) -> ValidateAllOutcome {
+    if matches!(state, DatHealthState::Invalid | DatHealthState::Unreadable) {
+        return ValidateAllOutcome::Failed;
+    }
+    // `last_validated_unix_seconds` always differs (this run just set it), so
+    // it is excluded from the comparison - otherwise every run would report
+    // "changed" regardless of whether anything the user cares about moved.
+    let mut new_without_timestamp = new_health.clone();
+    new_without_timestamp.last_validated_unix_seconds = None;
+    let mut previous_without_timestamp = previous_health.cloned().unwrap_or_default();
+    previous_without_timestamp.last_validated_unix_seconds = None;
+    if previous_without_timestamp == new_without_timestamp {
+        ValidateAllOutcome::Valid
+    } else {
+        ValidateAllOutcome::Changed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1433,6 +1543,9 @@ struct RunningJob {
     /// The source's resolved platform at job start, shown on the running card
     /// only when it is authoritative (assigned and recognised).
     platform_display: Option<String>,
+    /// `Some` only for `JobKind::ValidateAll`: the running tally across the
+    /// whole batch. `None` for every other kind.
+    bulk: Option<BulkValidationProgress>,
 }
 
 /// Sends without blocking, dropping the message when the queue is full.
@@ -1930,6 +2043,10 @@ pub(crate) struct DatSourcesPageState {
     /// report lands and cached so the per-frame view rebuild does not re-group
     /// thousands of diagnostics. Kept in lockstep with `validations`.
     diagnostic_groups: BTreeMap<String, Vec<DiagnosticGroupView>>,
+    /// The final tally of the last completed (or cancelled) "Validate all"
+    /// run, this session. `None` until one has run at least once, and reset
+    /// to `None` at the start of the next run and on Revert.
+    last_validate_all_summary: Option<ValidateAllSummary>,
     audit: Option<Box<DatAuditOutcome>>,
     audit_error: Option<String>,
     /// How long the most recent completed audit took, read from the job's start
@@ -2133,6 +2250,7 @@ impl DatSourcesPageState {
             action_error: None,
             validations: BTreeMap::new(),
             diagnostic_groups: BTreeMap::new(),
+            last_validate_all_summary: None,
             audit: None,
             audit_error: None,
             audit_elapsed_seconds: None,
@@ -2430,28 +2548,88 @@ impl DatSourcesPageState {
                     changed = true;
                 }
                 Ok(JobMessage::Validated(report)) => {
-                    if job.cancel_requested {
-                        // A result that lands after cancellation was requested
-                        // must not repopulate state: the user stopped this job.
+                    if job.kind == JobKind::Validate && job.cancel_requested {
+                        // A single Validate's result landing after
+                        // cancellation was requested must not repopulate
+                        // state: the user stopped this job. `ValidateAll`
+                        // does not take this branch - see its own arm below
+                        // for why a bulk run's already-computed results are
+                        // never discarded this way.
                         finished = true;
                     } else {
                         let id = report.source_id.clone();
+                        // Captured before the overwrite below, so a
+                        // `ValidateAll` run can tell whether this source's
+                        // recorded health actually changed.
+                        let previous_health = self.draft.get(&id).map(|entry| entry.health.clone());
                         // The health the run observed is written onto the
                         // *draft*, so it becomes an unsaved change like any
-                        // other and the user chooses whether to keep it.
+                        // other and the user chooses whether to keep it -
+                        // exactly the same for a bulk run as for a single one.
+                        let mut new_health = None;
                         if let Some(entry) = self.draft.get_mut(&id) {
-                            entry.health = report.to_health(&entry.path.clone(), entry.kind);
+                            let health = report.to_health(&entry.path.clone(), entry.kind);
+                            new_health = Some(health.clone());
+                            entry.health = health;
                         }
                         // The grouped diagnostics are derived once here, when
                         // the report lands, and cached: the view is rebuilt
                         // every frame, and re-grouping thousands of diagnostics
                         // per frame would be pure churn for an unchanged report.
                         let groups = group_diagnostics(&id, &report);
+                        let state = report.state;
                         self.validations.insert(id.clone(), *report);
                         self.diagnostic_groups.insert(id, groups);
                         changed = true;
-                        finished = true;
+                        match job.kind {
+                            JobKind::ValidateAll => {
+                                // Committed regardless of `cancel_requested`:
+                                // this source had already finished (or was
+                                // already in flight) when Cancel was pressed,
+                                // so its real result is kept - only sources
+                                // not yet reached are ever skipped. The job
+                                // itself only ends on `ValidateAllFinished`.
+                                if let (Some(bulk), Some(new_health)) =
+                                    (job.bulk.as_mut(), new_health)
+                                {
+                                    bulk.completed += 1;
+                                    match classify_validate_all_outcome(
+                                        state,
+                                        previous_health.as_ref(),
+                                        &new_health,
+                                    ) {
+                                        ValidateAllOutcome::Valid => bulk.valid += 1,
+                                        ValidateAllOutcome::Changed => bulk.changed += 1,
+                                        ValidateAllOutcome::Failed => bulk.failed += 1,
+                                    }
+                                }
+                            }
+                            JobKind::Validate | JobKind::Audit => finished = true,
+                        }
                     }
+                }
+                Ok(JobMessage::ValidatingNext { id, display_name }) => {
+                    // Tracks reality (which source the worker is actually
+                    // reading) even while "Stopping…" is showing, exactly
+                    // like a single Validate/Audit job's own `source_id`
+                    // does - only the terminal message is gated on
+                    // cancellation, not this.
+                    job.source_id = id;
+                    if let Some(bulk) = job.bulk.as_ref() {
+                        job.latest = format!(
+                            "Validating {} of {}: {display_name}",
+                            bulk.completed + 1,
+                            bulk.total
+                        );
+                    }
+                    changed = true;
+                }
+                Ok(JobMessage::ValidateAllFinished) => {
+                    if let Some(bulk) = job.bulk {
+                        self.last_validate_all_summary = Some(bulk.summary());
+                    }
+                    changed = true;
+                    finished = true;
                 }
                 Ok(JobMessage::Audited {
                     generation,
@@ -2506,7 +2684,7 @@ impl DatSourcesPageState {
                                 self.audit_error = Some(error);
                             }
                         }
-                        JobKind::Validate => {
+                        JobKind::Validate | JobKind::ValidateAll => {
                             if !job.cancel_requested {
                                 self.action_error = Some(error);
                             }
@@ -2524,6 +2702,17 @@ impl DatSourcesPageState {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // The worker stopped without sending `ValidateAllFinished`
+                    // (e.g. it panicked). Whatever it had already committed to
+                    // `self.draft`/`self.validations` is real and stays; the
+                    // tally accumulated so far is still worth showing rather
+                    // than silently losing the whole run's summary.
+                    if job.kind == JobKind::ValidateAll
+                        && let Some(bulk) = job.bulk
+                    {
+                        self.last_validate_all_summary = Some(bulk.summary());
+                        changed = true;
+                    }
                     finished = true;
                     break;
                 }
@@ -2602,6 +2791,7 @@ impl DatSourcesPageState {
                 }
             }
             DatSourcesPageAction::Validate { id } => self.start_validate(id),
+            DatSourcesPageAction::ValidateAll => self.start_validate_all(),
             DatSourcesPageAction::Audit { id, scan_root } => self.start_audit(id, scan_root),
             DatSourcesPageAction::AuditAllEnabled { scan_root } => {
                 self.start_combined_audit(scan_root)
@@ -2673,6 +2863,10 @@ impl DatSourcesPageState {
                 // a "Not checked" badge. Both maps are discarded together.
                 self.validations.clear();
                 self.diagnostic_groups.clear();
+                // A "Validate all" summary describes a run against the
+                // discarded draft's sources; it goes with it, same as the
+                // per-source validation records above.
+                self.last_validate_all_summary = None;
                 // The policy scope is not persisted, so discarding returns it
                 // to the global scope rather than leaving a platform selected
                 // whose override the user just discarded.
@@ -3707,6 +3901,84 @@ impl DatSourcesPageState {
             started_at: Instant::now(),
             audit_progress: None,
             platform_display,
+            bulk: None,
+        });
+    }
+
+    /// Validates every currently configured source, sequentially, on one
+    /// worker thread reusing [`validate_dat_source`] unchanged - the same
+    /// authority [`Self::start_validate`] uses, run once per source instead
+    /// of once. A no-op while any job is already running, exactly like
+    /// [`Self::start_validate`].
+    fn start_validate_all(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        self.action_error = None;
+        self.last_validate_all_summary = None;
+        let entries: Vec<DatSourceEntry> = self.draft.sorted_all().into_iter().cloned().collect();
+        let total = entries.len();
+        if total == 0 {
+            // Nothing to schedule: report the (empty) summary immediately
+            // rather than spawning a worker and a job for no sources.
+            self.last_validate_all_summary = Some(ValidateAllSummary::default());
+            return;
+        }
+        let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let limits = self.limits;
+
+        std::thread::spawn(move || {
+            for entry in entries {
+                // Checked between sources, never mid-parse: `validate_dat_source`
+                // has no cancellation contract of its own (see the comment on
+                // `RunningJobView::cancellable` for a single Validate), so the
+                // source already being read always finishes; only sources not
+                // yet started are ever skipped.
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                if sender
+                    .send(JobMessage::ValidatingNext {
+                        id: entry.id.clone(),
+                        display_name: entry.display_name.clone(),
+                    })
+                    .is_err()
+                {
+                    // The page dropped the receiver (the job was abandoned) -
+                    // stop working rather than validating sources nobody will
+                    // ever see the result of.
+                    return;
+                }
+                let report = validate_dat_source(&entry, limits);
+                if sender
+                    .send(JobMessage::Validated(Box::new(report)))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = sender.send(JobMessage::ValidateAllFinished);
+        });
+
+        self.job = Some(RunningJob {
+            kind: JobKind::ValidateAll,
+            source_id: String::new(),
+            cancel,
+            cancel_requested: false,
+            messages,
+            latest: format!("Starting… (0 of {total})"),
+            started_at: Instant::now(),
+            audit_progress: None,
+            platform_display: None,
+            bulk: Some(BulkValidationProgress {
+                total,
+                completed: 0,
+                valid: 0,
+                changed: 0,
+                failed: 0,
+            }),
         });
     }
 
@@ -3842,6 +4114,7 @@ impl DatSourcesPageState {
             started_at: Instant::now(),
             audit_progress: Some(AuditProgressTracker::new()),
             platform_display,
+            bulk: None,
         });
     }
 
@@ -3925,6 +4198,7 @@ impl DatSourcesPageState {
             started_at: Instant::now(),
             audit_progress: Some(AuditProgressTracker::new()),
             platform_display: None,
+            bulk: None,
         });
     }
 
@@ -4038,17 +4312,29 @@ impl DatSourcesPageState {
             action_error: self.action_error.clone(),
             pending_consequences: self.pending_consequences(&rows),
             background_busy: self.is_busy(),
+            last_validate_all_summary: self.last_validate_all_summary,
             running: self.job.as_ref().map(|job| RunningJobView {
-                source_id: job.source_id.clone(),
+                // Empty for `ValidateAll`: there is no one source name to
+                // quote in the heading (`RunningJobView::heading` reads this
+                // as "no subject" and omits the quoted part). The source
+                // currently being read is still shown, in `detail`.
+                source_id: match job.kind {
+                    JobKind::ValidateAll => String::new(),
+                    JobKind::Validate | JobKind::Audit => job.source_id.clone(),
+                },
                 what: match job.kind {
                     JobKind::Validate => "Validating",
+                    JobKind::ValidateAll => "Validating all sources",
                     JobKind::Audit => "Auditing",
                 },
                 detail: job.latest.clone(),
-                // Validation is bounded by `DatLimits` and finishes on its own;
-                // offering a Cancel that the parser does not check would be a
-                // button that lies.
-                cancellable: job.kind == JobKind::Audit,
+                // A single Validate is bounded by `DatLimits` and finishes on
+                // its own; offering a Cancel that the parser does not check
+                // would be a button that lies. `ValidateAll` is different: it
+                // is this page's own sequential loop over sources, checked
+                // between each one, so Cancel is real here even though the
+                // source already being read still finishes.
+                cancellable: matches!(job.kind, JobKind::Audit | JobKind::ValidateAll),
                 cancellation_requested: job.cancel_requested,
                 // The elapsed clock is read here rather than at poll time so
                 // the running card keeps ticking between progress messages; it
@@ -5391,6 +5677,26 @@ pub(crate) fn show_dat_sources_page(
         "Local DAT Sources",
         Some("User-added DAT files and folders. These stay local-only and are never updateable."),
     );
+    if !view.rows.is_empty() {
+        ui.horizontal(|ui| {
+            if action.is_none()
+                && widgets::action_button(
+                    ui,
+                    "Validate all",
+                    widgets::ActionStyle::Secondary,
+                    !view.background_busy,
+                )
+                .clicked()
+            {
+                action = Some(DatSourcesPageAction::ValidateAll);
+            }
+        });
+        ui.add_space(6.0);
+    }
+    if let Some(summary) = &view.last_validate_all_summary {
+        show_validate_all_summary(ui, summary);
+        ui.add_space(8.0);
+    }
     if view.is_empty() {
         widgets::empty_state(
             ui,
@@ -7121,6 +7427,42 @@ fn show_toolbar(ui: &mut egui::Ui, view: &DatSourcesPageView) -> Option<DatSourc
         );
     });
     action
+}
+
+/// The final tally banner for the last completed (or cancelled) "Validate
+/// all" run. Shown until the next run replaces it or a Revert discards it.
+fn show_validate_all_summary(ui: &mut egui::Ui, summary: &ValidateAllSummary) {
+    let checked = summary.total.saturating_sub(summary.skipped);
+    let tone = if summary.failed > 0 {
+        widgets::StatusTone::Warning
+    } else if summary.total == 0 {
+        widgets::StatusTone::Info
+    } else {
+        widgets::StatusTone::Success
+    };
+    let title = if summary.total == 0 {
+        "Validate all: nothing to validate".to_string()
+    } else if summary.skipped > 0 {
+        format!(
+            "Validate all: stopped after {checked} of {} sources",
+            summary.total
+        )
+    } else {
+        format!("Validate all: {checked} source(s) checked")
+    };
+    let detail = if summary.total == 0 {
+        "No DAT sources are configured.".to_string()
+    } else {
+        let mut detail = format!(
+            "{} valid, {} changed, {} failed",
+            summary.valid, summary.changed, summary.failed
+        );
+        if summary.skipped > 0 {
+            detail.push_str(&format!(", {} skipped (cancelled)", summary.skipped));
+        }
+        detail
+    };
+    widgets::banner(ui, &title, &detail, tone);
 }
 
 fn show_running_job(ui: &mut egui::Ui, running: &RunningJobView) -> Option<DatSourcesPageAction> {
