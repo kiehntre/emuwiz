@@ -36,6 +36,7 @@
 pub mod adapter;
 pub mod duplicate;
 pub mod duplicate_scan;
+pub mod exact_duplicate;
 pub mod execute;
 pub mod library;
 pub mod plan;
@@ -55,6 +56,13 @@ pub use duplicate::{
 };
 pub use duplicate_scan::{
     DuplicateNeedsReviewMember, DuplicateScanAccounting, plan_duplicate_quarantine_from_rename_plan,
+};
+pub use exact_duplicate::{
+    CanonicalRecommendation, EXACT_DUPLICATE_SCAN_VERSION, ExactDuplicateGroup,
+    ExactDuplicateMember, ExactDuplicateScanReport, ExcludedCandidate, FullFileIdentity,
+    FullHashRefusal, GroupQuarantineReadiness, MultiFileProtection,
+    build_exact_duplicate_group_proposals, exact_bytes_match, hash_full_file_sha256,
+    scan_exact_duplicates, select_canonical_copy,
 };
 pub use execute::{
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairRecoveryReport,
