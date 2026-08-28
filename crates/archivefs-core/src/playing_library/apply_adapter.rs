@@ -115,7 +115,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::dat::rename_apply::executor::{ApplyExecution, HardConflictMode, apply_transaction};
+    use crate::dat::rename_apply::executor::{
+        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
+    };
     use crate::dat::rename_apply::journal::write_journal;
     use crate::dat::rename_apply::preflight::DirectoryPolicy;
     use crate::playing_library::model::{
@@ -141,13 +143,15 @@ mod tests {
                     steps: Vec::new(),
                     rejected: Vec::new(),
                 },
-                operation: operation.clone(),
+                launcher_operation: operation.clone(),
+                companion_operations: Vec::new(),
             }],
             unresolved_groups: Vec::new(),
             exclusions: Vec::new(),
             singleton_families: 1,
             conflicts: Vec::new(),
             operations: vec![operation],
+            rejected_launchers: Vec::new(),
         }
     }
 
@@ -243,5 +247,328 @@ mod tests {
         )
         .unwrap();
         assert_eq!(on_disk.state, TransactionState::Applied);
+    }
+
+    /// A plan with one CUE-based election: the launcher plus two companion
+    /// BIN tracks.
+    fn plan_with_cue_and_two_tracks(
+        cue: PathBuf,
+        track1: PathBuf,
+        track2: PathBuf,
+        destination_root: PathBuf,
+    ) -> PlayingLibraryPlan {
+        let launcher_operation = LinkedLibraryOperation {
+            source_path: cue,
+            destination_path: destination_root.join("Game (Europe).cue"),
+        };
+        let companion_operations = vec![
+            LinkedLibraryOperation {
+                source_path: track1,
+                destination_path: destination_root.join("track1.bin"),
+            },
+            LinkedLibraryOperation {
+                source_path: track2,
+                destination_path: destination_root.join("track2.bin"),
+            },
+        ];
+        let mut operations = vec![launcher_operation.clone()];
+        operations.extend(companion_operations.iter().cloned());
+        PlayingLibraryPlan {
+            destination_root,
+            policy: PlayingLibraryPolicy::default(),
+            archives_examined: 1,
+            families_examined: 1,
+            elected_games: vec![ElectedGame {
+                dat_entry_name: "Game (Europe)".to_string(),
+                family_root_name: "Game (Europe)".to_string(),
+                explanation: ElectionExplanation {
+                    steps: Vec::new(),
+                    rejected: Vec::new(),
+                },
+                launcher_operation,
+                companion_operations,
+            }],
+            unresolved_groups: Vec::new(),
+            exclusions: Vec::new(),
+            singleton_families: 1,
+            conflicts: Vec::new(),
+            operations,
+            rejected_launchers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_transaction_links_every_file_of_a_multi_file_release() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = temp.path().join("Game (Europe).cue");
+        let track1 = temp.path().join("track1.bin");
+        let track2 = temp.path().join("track2.bin");
+        std::fs::write(&cue, b"FILE \"track1.bin\" BINARY\n").unwrap();
+        std::fs::write(&track1, b"one").unwrap();
+        std::fs::write(&track2, b"two").unwrap();
+        let destination_root = temp.path().join("playing");
+
+        let plan = plan_with_cue_and_two_tracks(
+            cue.clone(),
+            track1.clone(),
+            track2.clone(),
+            destination_root.clone(),
+        );
+        let transaction = build_playing_library_transaction(&plan, 1).expect("transaction");
+
+        assert_eq!(transaction.entries.len(), 3, "{:?}", transaction.entries);
+        let sources: Vec<&std::path::Path> = transaction
+            .entries
+            .iter()
+            .map(|entry| entry.source_path.as_path())
+            .collect();
+        assert!(sources.contains(&cue.as_path()));
+        assert!(sources.contains(&track1.as_path()));
+        assert!(sources.contains(&track2.as_path()));
+    }
+
+    #[test]
+    fn applying_a_multi_file_release_links_the_complete_set() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = temp.path().join("Game (Europe).cue");
+        let track1 = temp.path().join("track1.bin");
+        let track2 = temp.path().join("track2.bin");
+        std::fs::write(&cue, b"FILE \"track1.bin\" BINARY\n").unwrap();
+        std::fs::write(&track1, b"one").unwrap();
+        std::fs::write(&track2, b"two").unwrap();
+        let destination_root = temp.path().join("playing");
+        std::fs::create_dir_all(&destination_root).unwrap();
+        let journal_dir = temp.path().join("journal");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+
+        let plan = plan_with_cue_and_two_tracks(
+            cue.clone(),
+            track1.clone(),
+            track2.clone(),
+            destination_root.clone(),
+        );
+        let mut transaction = build_playing_library_transaction(&plan, 1).expect("transaction");
+        write_journal(&journal_dir, &transaction).unwrap();
+
+        let approved_paths = [&cue, &track1, &track2]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let outcome = apply_transaction(&mut ApplyExecution {
+            transaction: &mut transaction,
+            approved_paths,
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .expect("apply succeeds");
+
+        assert_eq!(outcome.summary.applied, 3);
+        for (name, original) in [
+            ("Game (Europe).cue", &cue),
+            ("track1.bin", &track1),
+            ("track2.bin", &track2),
+        ] {
+            let link = destination_root.join(name);
+            assert!(link.is_symlink(), "{name} must be linked");
+            assert_eq!(&std::fs::read_link(&link).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn an_induced_failure_in_a_multi_file_release_leaves_no_partial_release() {
+        // A destination one of the release's own files would need to
+        // occupy is pre-created as a real directory (not a symlink) - the
+        // shared preflight's no-clobber check refuses to replace it.
+        // `HardConflictMode::AbortAll` (what this apply path always uses)
+        // preflights the *entire* batch before mutating anything, so this
+        // proves requirement 11 directly: the failure leaves nothing
+        // applied at all, for any file in the release - not just the one
+        // that actually conflicts.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = temp.path().join("Game (Europe).cue");
+        let track1 = temp.path().join("track1.bin");
+        let track2 = temp.path().join("track2.bin");
+        std::fs::write(&cue, b"FILE \"track1.bin\" BINARY\n").unwrap();
+        std::fs::write(&track1, b"one").unwrap();
+        std::fs::write(&track2, b"two").unwrap();
+        let destination_root = temp.path().join("playing");
+        std::fs::create_dir_all(&destination_root).unwrap();
+        // Block one companion's destination with a real directory.
+        std::fs::create_dir_all(destination_root.join("track2.bin")).unwrap();
+        let journal_dir = temp.path().join("journal");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+
+        let plan = plan_with_cue_and_two_tracks(
+            cue.clone(),
+            track1.clone(),
+            track2.clone(),
+            destination_root.clone(),
+        );
+        let mut transaction = build_playing_library_transaction(&plan, 1).expect("transaction");
+        write_journal(&journal_dir, &transaction).unwrap();
+
+        let approved_paths = [&cue, &track1, &track2]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let error = apply_transaction(&mut ApplyExecution {
+            transaction: &mut transaction,
+            approved_paths,
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .expect_err("a hard conflict on any one file must abort the whole batch");
+        assert!(matches!(error, ApplyError::HardConflicts(_)));
+
+        // Nothing was applied for this release - not the launcher, not
+        // the unblocked companion either.
+        assert!(!destination_root.join("Game (Europe).cue").exists());
+        assert!(!destination_root.join("track1.bin").exists());
+        // The pre-existing blocking directory itself is untouched.
+        assert!(destination_root.join("track2.bin").is_dir());
+        // The originals are always untouched.
+        assert_eq!(std::fs::read(&track1).unwrap(), b"one");
+        assert_eq!(std::fs::read(&track2).unwrap(), b"two");
+    }
+
+    #[test]
+    fn rollback_of_a_multi_file_release_removes_only_the_generated_links() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = temp.path().join("Game (Europe).cue");
+        let track1 = temp.path().join("track1.bin");
+        let track2 = temp.path().join("track2.bin");
+        std::fs::write(&cue, b"FILE \"track1.bin\" BINARY\n").unwrap();
+        std::fs::write(&track1, b"one").unwrap();
+        std::fs::write(&track2, b"two").unwrap();
+        let destination_root = temp.path().join("playing");
+        std::fs::create_dir_all(&destination_root).unwrap();
+        let journal_dir = temp.path().join("journal");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+
+        let plan = plan_with_cue_and_two_tracks(
+            cue.clone(),
+            track1.clone(),
+            track2.clone(),
+            destination_root.clone(),
+        );
+        let mut transaction = build_playing_library_transaction(&plan, 1).expect("transaction");
+        write_journal(&journal_dir, &transaction).unwrap();
+        let approved_paths = [&cue, &track1, &track2]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        apply_transaction(&mut ApplyExecution {
+            transaction: &mut transaction,
+            approved_paths,
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([temp.path()]),
+            journal_dir: journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .expect("apply succeeds");
+        assert!(destination_root.join("Game (Europe).cue").is_symlink());
+        assert!(destination_root.join("track1.bin").is_symlink());
+        assert!(destination_root.join("track2.bin").is_symlink());
+
+        crate::dat::rename_apply::rollback::rollback_transaction(
+            &mut transaction,
+            &journal_dir,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("rollback succeeds");
+
+        assert!(!destination_root.join("Game (Europe).cue").exists());
+        assert!(!destination_root.join("track1.bin").exists());
+        assert!(!destination_root.join("track2.bin").exists());
+        // Only the generated links were removed - every master file
+        // remains exactly as it was.
+        assert!(cue.is_file() && !cue.is_symlink());
+        assert_eq!(
+            std::fs::read(&cue).unwrap(),
+            b"FILE \"track1.bin\" BINARY\n"
+        );
+        assert_eq!(std::fs::read(&track1).unwrap(), b"one");
+        assert_eq!(std::fs::read(&track2).unwrap(), b"two");
+    }
+
+    #[test]
+    fn reapplying_the_same_multi_file_plan_is_idempotent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cue = temp.path().join("Game (Europe).cue");
+        let track1 = temp.path().join("track1.bin");
+        let track2 = temp.path().join("track2.bin");
+        std::fs::write(&cue, b"FILE \"track1.bin\" BINARY\n").unwrap();
+        std::fs::write(&track1, b"one").unwrap();
+        std::fs::write(&track2, b"two").unwrap();
+        let destination_root = temp.path().join("playing");
+        std::fs::create_dir_all(&destination_root).unwrap();
+        let journal_dir = temp.path().join("journal");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let trusted = TrustedRoots::from_paths([temp.path()]);
+        let approved_paths: std::collections::BTreeSet<String> = [&cue, &track1, &track2]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+
+        let plan = plan_with_cue_and_two_tracks(
+            cue.clone(),
+            track1.clone(),
+            track2.clone(),
+            destination_root.clone(),
+        );
+
+        // First apply.
+        let mut first = build_playing_library_transaction(&plan, 1).expect("transaction");
+        write_journal(&journal_dir, &first).unwrap();
+        let outcome = apply_transaction(&mut ApplyExecution {
+            transaction: &mut first,
+            approved_paths: approved_paths.clone(),
+            current_generation: 1,
+            trusted: trusted.clone(),
+            journal_dir: journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .expect("first apply succeeds");
+        assert_eq!(outcome.summary.applied, 3);
+
+        // Re-running the identical plan (a fresh transaction over the same
+        // election) must succeed again rather than treating the
+        // already-correct symlinks as a conflict.
+        let mut second = build_playing_library_transaction(&plan, 2).expect("transaction");
+        write_journal(&journal_dir, &second).unwrap();
+        let outcome = apply_transaction(&mut ApplyExecution {
+            transaction: &mut second,
+            approved_paths,
+            current_generation: 2,
+            trusted,
+            journal_dir: journal_dir.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &std::sync::atomic::AtomicBool::new(false),
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        })
+        .expect("reapplying an already-correct plan succeeds");
+        assert_eq!(outcome.summary.applied, 3);
+        assert_eq!(second.state, TransactionState::Applied);
+
+        for name in ["Game (Europe).cue", "track1.bin", "track2.bin"] {
+            assert!(destination_root.join(name).is_symlink());
+        }
     }
 }

@@ -158,6 +158,15 @@ pub struct ElectionExplanation {
 }
 
 /// One elected representative of one game family.
+///
+/// A release is not always one filesystem file: a CUE sheet needs its
+/// referenced BIN/audio tracks, a GDI descriptor needs every track it
+/// declares, and an M3U playlist needs each referenced disc plus that
+/// disc's own companions. [`Self::launcher_operation`] is the one file a
+/// frontend should be pointed at to play the release; every other
+/// required file is [`Self::companion_operations`] - empty for an
+/// ordinary single-file release (CHD, ISO, RVZ, a loose cartridge ROM, or
+/// an archive), which behaves exactly as before this field existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElectedGame {
     /// The canonical DAT entry name of the elected release.
@@ -165,9 +174,28 @@ pub struct ElectedGame {
     /// The family root's canonical DAT entry name.
     pub family_root_name: String,
     pub explanation: ElectionExplanation,
-    /// The proposed linked-library operation derived from this election:
-    /// destination becomes a symlink pointing at the untouched source.
-    pub operation: LinkedLibraryOperation,
+    /// The proposed linked-library operation for the file a frontend
+    /// should launch: the CUE/GDI/M3U file itself for a multi-file
+    /// release, or the sole file for an ordinary single-file release -
+    /// see [`crate::launch::es_de_publish`], which points ES-DE at this
+    /// path and never at a companion.
+    pub launcher_operation: LinkedLibraryOperation,
+    /// Every other file this release requires alongside
+    /// [`Self::launcher_operation`] - referenced BIN/audio tracks for a
+    /// CUE, every other track for a GDI, or each disc (and that disc's
+    /// own companions) for an M3U. Always empty for an ordinary
+    /// single-file release.
+    pub companion_operations: Vec<LinkedLibraryOperation>,
+}
+
+impl ElectedGame {
+    /// Every operation this election proposes, launcher first - the exact
+    /// set [`crate::playing_library::apply_adapter::build_playing_library_transaction`]
+    /// turns into linked-library symlinks, and the same set the planner's
+    /// own destination-conflict check inspects.
+    pub fn all_operations(&self) -> impl Iterator<Item = &LinkedLibraryOperation> {
+        std::iter::once(&self.launcher_operation).chain(self.companion_operations.iter())
+    }
 }
 
 /// A group that could not be elected deterministically.
@@ -229,7 +257,24 @@ pub struct PlayingLibraryPlan {
     /// "2084 files -> XXX families -> YYY games".
     pub singleton_families: usize,
     pub conflicts: Vec<DestinationConflict>,
-    /// Only conflict-free elections appear here. Every operation points at
-    /// the original source archive; nothing else is ever produced.
+    /// Only conflict-free elections appear here, launcher and companion
+    /// operations flattened together. Every operation points at an
+    /// original source file; nothing else is ever produced.
     pub operations: Vec<LinkedLibraryOperation>,
+    /// A CUE/GDI/M3U launcher file the planner found alongside matched
+    /// candidates but could not safely turn into a multi-file election -
+    /// a missing/unsafe/ambiguous companion reference, or companions that
+    /// verify against more than one distinct DAT game. Never silently
+    /// dropped: requirement 6's "plain reasons" land here rather than in
+    /// [`ElectedGame::explanation`], since the launcher never became a
+    /// candidate at all.
+    pub rejected_launchers: Vec<RejectedLauncher>,
+}
+
+/// Why a discovered CUE/GDI/M3U launcher never became an election
+/// candidate - see [`PlayingLibraryPlan::rejected_launchers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedLauncher {
+    pub launcher_path: PathBuf,
+    pub reason: String,
 }

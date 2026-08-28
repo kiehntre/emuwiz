@@ -48,6 +48,7 @@ fn auto_matches(dat_games: &[DatGameEntry], source: &Path) -> Vec<DatArchiveMatc
         .map(|(index, game)| DatArchiveMatch {
             archive_path: source.join(format!("{}.zip", game.name)),
             dat_entry_index: index,
+            companion_paths: Vec::new(),
         })
         .collect()
 }
@@ -356,10 +357,12 @@ fn plan_points_at_originals_and_touches_nothing() {
         DatArchiveMatch {
             archive_path: source.join("Sonic the Hedgehog (Europe).zip"),
             dat_entry_index: 0,
+            companion_paths: Vec::new(),
         },
         DatArchiveMatch {
             archive_path: source.join("Sonic the Hedgehog (USA).zip"),
             dat_entry_index: 1,
+            companion_paths: Vec::new(),
         },
     ];
     let request = PlayingLibraryRequest {
@@ -383,7 +386,7 @@ fn plan_points_at_originals_and_touches_nothing() {
     );
     assert_eq!(
         operation.source_path,
-        plan.elected_games[0].operation.source_path
+        plan.elected_games[0].launcher_operation.source_path
     );
 
     // Planning created nothing: not even the destination root.
@@ -409,10 +412,12 @@ fn duplicate_destination_names_become_conflicts_never_overwritten() {
         DatArchiveMatch {
             archive_path: temp.path().join("a").join("game.zip"),
             dat_entry_index: 0,
+            companion_paths: Vec::new(),
         },
         DatArchiveMatch {
             archive_path: temp.path().join("b").join("game.zip"),
             dat_entry_index: 1,
+            companion_paths: Vec::new(),
         },
     ];
     let request = PlayingLibraryRequest {
@@ -621,6 +626,7 @@ fn out_of_range_dat_entry_index_is_an_error() {
         matches: vec![DatArchiveMatch {
             archive_path: temp.path().join("solo.zip"),
             dat_entry_index: 7,
+            companion_paths: Vec::new(),
         }],
         destination_root: temp.path().join("playing"),
         policy: default_policy(),
@@ -659,4 +665,98 @@ fn multi_region_evidence_ranks_by_best_preferred_match() {
     let plan = build_playing_library_plan(&request).expect("plan");
 
     assert_eq!(elected_names(&plan), vec!["Game (Europe) (USA)"]);
+}
+
+// --- multi-file releases (CUE/GDI companions) ----------------------------
+
+#[test]
+fn a_multi_file_match_produces_one_election_with_launcher_and_companions() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![game("Game (Europe)", None)]);
+    let cue = temp.path().join("Game (Europe).cue");
+    let track1 = temp.path().join("track1.bin");
+    let track2 = temp.path().join("track2.bin");
+    let matches = vec![DatArchiveMatch {
+        archive_path: cue.clone(),
+        dat_entry_index: 0,
+        companion_paths: vec![track1.clone(), track2.clone()],
+    }];
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches,
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).expect("plan");
+
+    assert_eq!(plan.elected_games.len(), 1);
+    let elected = &plan.elected_games[0];
+    assert_eq!(elected.launcher_operation.source_path, cue);
+    assert_eq!(elected.companion_operations.len(), 2);
+    assert!(
+        elected
+            .companion_operations
+            .iter()
+            .any(|op| op.source_path == track1)
+    );
+    assert!(
+        elected
+            .companion_operations
+            .iter()
+            .any(|op| op.source_path == track2)
+    );
+    // Requirement 14: the explanation states that companions are included.
+    assert!(
+        elected
+            .explanation
+            .steps
+            .iter()
+            .any(|step| step.contains("2 companion file"))
+    );
+    // Requirement 8: the transaction-facing operations list carries every
+    // required file, launcher and companions alike.
+    assert_eq!(plan.operations.len(), 3);
+    assert!(plan.operations.contains(&elected.launcher_operation));
+    for companion in &elected.companion_operations {
+        assert!(plan.operations.contains(companion));
+    }
+}
+
+#[test]
+fn a_companion_destination_collision_excludes_the_whole_release_not_just_the_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![
+        game("Game One (Europe)", None),
+        game("Game Two (Europe)", None),
+    ]);
+    let destination_root = temp.path().join("playing");
+    // Game One is a CUE release whose companion happens to share a
+    // basename with Game Two's own (single-file) destination.
+    let matches = vec![
+        DatArchiveMatch {
+            archive_path: temp.path().join("one.cue"),
+            dat_entry_index: 0,
+            companion_paths: vec![temp.path().join("shared.bin")],
+        },
+        DatArchiveMatch {
+            archive_path: temp.path().join("shared.bin"),
+            dat_entry_index: 1,
+            companion_paths: Vec::new(),
+        },
+    ];
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches,
+        destination_root: destination_root.clone(),
+        policy: default_policy(),
+    };
+    let plan = build_playing_library_plan(&request).expect("plan");
+
+    assert_eq!(plan.elected_games.len(), 2);
+    assert_eq!(plan.conflicts.len(), 1);
+    // Neither election's operations appear in the applicable set - Game
+    // One's own launcher (one.cue) is excluded too, even though its own
+    // destination never collided with anything, because collision
+    // handling covers the whole release atomically.
+    assert!(plan.operations.is_empty(), "{:?}", plan.operations);
 }

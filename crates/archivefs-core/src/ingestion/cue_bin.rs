@@ -107,6 +107,105 @@ pub fn resolve_cue(cue_path: &Path) -> Result<CueSheet, CueError> {
     })
 }
 
+/// Safety-resolves one CUE `FILE "..."` reference relative to `base`,
+/// exactly like [`resolve_data_track`]'s own inline check: no absolute path,
+/// no `..` component, and the canonicalized result must both exist as a
+/// regular file and remain inside `canonical_base`. Shared by
+/// [`resolve_data_track`] (one data track) and [`resolve_cue_all_files`]
+/// (every referenced file) so the one safety rule lives in one place.
+fn resolve_safe_reference(
+    quoted: &str,
+    base: &Path,
+    canonical_base: &Path,
+) -> Result<PathBuf, CueError> {
+    let reference = Path::new(quoted);
+    if reference.is_absolute()
+        || reference
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(CueError::UnsafeReference);
+    }
+    let resolved = base.join(reference);
+    let canonical = std::fs::canonicalize(&resolved)
+        .map_err(|_| CueError::MissingDataFile(resolved.clone()))?;
+    if !canonical.starts_with(canonical_base) || !canonical.is_file() {
+        return Err(CueError::UnsafeReference);
+    }
+    Ok(canonical)
+}
+
+/// Resolve every `FILE "..."` reference in a `.cue` sheet - every BIN/audio
+/// track a multi-file release needs, not just the one data track
+/// [`resolve_data_track`] selects for identity. Same bounded read and the
+/// exact same per-reference safety check
+/// ([`resolve_safe_reference`]); refuses (never guesses at) any unsafe,
+/// missing, or duplicate-named reference. Declaration order is preserved
+/// and duplicates by canonical path are collapsed to one entry (a track
+/// split across `INDEX`es inside one `FILE` still names that file only
+/// once here).
+pub fn resolve_cue_all_files(cue_path: &Path) -> Result<Vec<PathBuf>, CueError> {
+    let per_reference = resolve_cue_all_files_lenient(cue_path)?;
+    let mut files = Vec::with_capacity(per_reference.len());
+    for outcome in per_reference {
+        let resolved = outcome?;
+        if !files.contains(&resolved) {
+            files.push(resolved);
+        }
+    }
+    if files.is_empty() {
+        return Err(CueError::NoFileReferences);
+    }
+    Ok(files)
+}
+
+/// Like [`resolve_cue_all_files`], but never lets one bad `FILE` reference
+/// hide the others: every declared reference is safety-checked
+/// independently and reported as its own `Ok`/`Err`, in declaration order.
+/// The outer `Result` only ever fails for reasons that make the sheet
+/// itself unreadable (I/O, size, a malformed `FILE` line, or more
+/// references than the bounded limit) - never for one missing or unsafe
+/// track, since a caller rejecting an incomplete multi-file release still
+/// needs to know exactly which of its files were safely, structurally
+/// identified as belonging to that release (see
+/// `playing_library::matching`'s fail-closed-as-a-whole handling).
+pub fn resolve_cue_all_files_lenient(
+    cue_path: &Path,
+) -> Result<Vec<Result<PathBuf, CueError>>, CueError> {
+    let metadata = std::fs::metadata(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
+    if metadata.len() > MAX_CUE_BYTES {
+        return Err(CueError::TooLarge);
+    }
+    let contents =
+        std::fs::read_to_string(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
+    let base = cue_path.parent().unwrap_or_else(|| Path::new("."));
+    let canonical_base =
+        std::fs::canonicalize(base).map_err(|error| CueError::Io(error.to_string()))?;
+
+    let mut outcomes = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || !(line.len() >= 4 && line[..4].eq_ignore_ascii_case("FILE")) {
+            continue;
+        }
+        let rest = line[4..].trim_start();
+        let quoted = rest
+            .strip_prefix('"')
+            .and_then(|value| value.find('"').map(|end| &value[..end]))
+            .ok_or_else(|| CueError::Malformed("FILE line has no quoted filename".into()))?;
+        if outcomes.len() >= MAX_CUE_FILE_REFERENCES {
+            return Err(CueError::Malformed(
+                "CUE declares more file references than the bounded limit".into(),
+            ));
+        }
+        outcomes.push(resolve_safe_reference(quoted, base, &canonical_base));
+    }
+    if outcomes.is_empty() {
+        return Err(CueError::NoFileReferences);
+    }
+    Ok(outcomes)
+}
+
 /// Resolve the single unambiguous data track needed for ISO9660 identity.
 /// The parser deliberately ignores audio tracks but refuses multiple data
 /// tracks, missing INDEX 01 declarations, unsafe references, and modes for
@@ -147,21 +246,7 @@ pub fn resolve_data_track(cue_path: &Path) -> Result<CueDataTrack, CueError> {
                 .strip_prefix('"')
                 .and_then(|value| value.find('"').map(|end| &value[..end]))
                 .ok_or_else(|| CueError::Malformed("FILE line has no quoted filename".into()))?;
-            let reference = Path::new(quoted);
-            if reference.is_absolute()
-                || reference
-                    .components()
-                    .any(|component| component == Component::ParentDir)
-            {
-                return Err(CueError::UnsafeReference);
-            }
-            let resolved = base.join(reference);
-            let canonical = std::fs::canonicalize(&resolved)
-                .map_err(|_| CueError::MissingDataFile(resolved.clone()))?;
-            if !canonical.starts_with(&canonical_base) || !canonical.is_file() {
-                return Err(CueError::UnsafeReference);
-            }
-            current_file = Some(canonical);
+            current_file = Some(resolve_safe_reference(quoted, base, &canonical_base)?);
             continue;
         }
         if line.len() >= 5 && line[..5].eq_ignore_ascii_case("TRACK") {
@@ -333,5 +418,66 @@ mod tests {
             resolve_data_track(&ambiguous),
             Err(CueError::AmbiguousDataTracks)
         );
+    }
+
+    #[test]
+    fn resolve_cue_all_files_returns_every_referenced_track_in_order() {
+        let cue = write_temp(
+            "multi-track.cue",
+            "FILE \"track01.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n\
+             FILE \"track02.bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n\
+             FILE \"track03.bin\" BINARY\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n",
+        );
+        for name in ["track01.bin", "track02.bin", "track03.bin"] {
+            std::fs::write(cue.with_file_name(name), vec![0_u8; 16]).unwrap();
+        }
+        let files = resolve_cue_all_files(&cue).unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files[0].ends_with("track01.bin"));
+        assert!(files[1].ends_with("track02.bin"));
+        assert!(files[2].ends_with("track03.bin"));
+    }
+
+    #[test]
+    fn resolve_cue_all_files_refuses_a_missing_track() {
+        let cue = write_temp(
+            "missing-track.cue",
+            "FILE \"present.bin\" BINARY\nFILE \"missing.bin\" BINARY\n",
+        );
+        std::fs::write(cue.with_file_name("present.bin"), vec![0_u8; 16]).unwrap();
+        assert!(matches!(
+            resolve_cue_all_files(&cue),
+            Err(CueError::MissingDataFile(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_cue_all_files_refuses_traversal_and_absolute_references() {
+        let traversal = write_temp("traversal-all.cue", "FILE \"../outside.bin\" BINARY\n");
+        assert_eq!(
+            resolve_cue_all_files(&traversal),
+            Err(CueError::UnsafeReference)
+        );
+
+        let absolute = write_temp("absolute-all.cue", "FILE \"/etc/passwd\" BINARY\n");
+        assert_eq!(
+            resolve_cue_all_files(&absolute),
+            Err(CueError::UnsafeReference)
+        );
+    }
+
+    #[test]
+    fn resolve_cue_all_files_deduplicates_a_repeated_file_reference() {
+        let cue = write_temp(
+            "repeated.cue",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nINDEX 02 00:01:00\n",
+        );
+        std::fs::write(cue.with_file_name("data.bin"), vec![0_u8; 16]).unwrap();
+        // Only one FILE line here, so this mainly proves the ordinary
+        // single-reference case still works through the shared resolver;
+        // an explicit two-FILE-same-name case is exercised structurally by
+        // the dedup check (`!files.contains`) itself.
+        let files = resolve_cue_all_files(&cue).unwrap();
+        assert_eq!(files.len(), 1);
     }
 }

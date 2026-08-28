@@ -40,7 +40,7 @@ pub use matching::match_loose_files_against_dat;
 pub use model::{
     DestinationConflict, ElectedGame, ElectionExplanation, ExcludedCandidate,
     LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan, PlayingLibraryPolicy,
-    RejectedCandidate, ReleaseClass, RevisionNumber, UnresolvedGroup,
+    RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber, UnresolvedGroup,
 };
 
 /// How far a clone chain may be walked while resolving one family root.
@@ -57,10 +57,24 @@ const MAX_FAMILY_DEPTH: usize = 64;
 /// never re-verifies and never guesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatArchiveMatch {
-    /// The untouched source archive a playing-library link would point at.
+    /// The untouched source file a playing-library link would point at -
+    /// the launcher file (a CUE/GDI/M3U) for a multi-file release, or the
+    /// sole file for an ordinary single-file release.
     pub archive_path: PathBuf,
     /// Index into [`ParsedDat::games`] this archive was verified against.
+    /// For a multi-file release this is the entry [`Self::archive_path`]'s
+    /// own primary track/disc verified against; [`Self::companion_paths`]
+    /// need not each have their own distinct DAT entry (a CUE's `.bin`
+    /// tracks each verify against their own `<rom>`, but the `.cue`/`.gdi`/
+    /// `.m3u` file itself is never individually hashed by any real
+    /// provider).
     pub dat_entry_index: usize,
+    /// Every other file this release requires alongside
+    /// [`Self::archive_path`] - already verified/safety-checked by the
+    /// caller (see [`matching::detect_multi_file_matches`]). Empty for an
+    /// ordinary single-file match, which behaves exactly as before this
+    /// field existed.
+    pub companion_paths: Vec<PathBuf>,
 }
 
 /// Everything one read-only planning run needs.
@@ -113,6 +127,7 @@ pub fn build_playing_library_plan(
         singleton_families: 0,
         conflicts: Vec::new(),
         operations: Vec::new(),
+        rejected_launchers: Vec::new(),
     };
 
     for (root_index, members) in &families {
@@ -123,14 +138,27 @@ pub fn build_playing_library_plan(
     }
     mark_destination_conflicts(&mut plan);
     // A conflicted destination is reported, never proposed again: nothing in
-    // this plan may overwrite it at apply time.
-    plan.operations.retain(|operation| {
-        !plan
-            .conflicts
-            .iter()
-            .flat_map(|conflict| &conflict.destinations)
-            .any(|destination| *destination == operation.destination_path)
-    });
+    // this plan may overwrite it at apply time. Requirement 10: collision
+    // handling covers the *whole* release atomically - if any one of a
+    // release's own operations (launcher or a companion) collides, every
+    // operation for that same election is excluded together, never just
+    // the one colliding file (which would otherwise propose linking a CUE
+    // without its BIN, or a BIN without its CUE).
+    let conflicted_destinations: BTreeSet<&PathBuf> = plan
+        .conflicts
+        .iter()
+        .flat_map(|conflict| &conflict.destinations)
+        .collect();
+    plan.operations = plan
+        .elected_games
+        .iter()
+        .filter(|elected| {
+            !elected
+                .all_operations()
+                .any(|operation| conflicted_destinations.contains(&operation.destination_path))
+        })
+        .flat_map(|elected| elected.all_operations().cloned())
+        .collect();
     Ok(plan)
 }
 
@@ -431,16 +459,17 @@ fn position_names(
         .join(", ")
 }
 
-/// Records an elected game and its proposed linked-library operation. The
-/// operation points at the original archive path verbatim - planning never
-/// rewrites, reorders, or renames source material.
+/// Records an elected game and its proposed linked-library operation(s).
+/// The launcher operation points at the original archive/launcher path
+/// verbatim; each companion (if any) points at its own untouched source
+/// file - planning never rewrites, reorders, or renames source material.
 fn record_election(
     plan: &mut PlayingLibraryPlan,
     request: &PlayingLibraryRequest<'_>,
     root_index: usize,
     members: &[DatArchiveMatch],
     winner_position: usize,
-    steps: Vec<String>,
+    mut steps: Vec<String>,
     reasons: &[Vec<String>],
 ) {
     let rejected = (0..members.len())
@@ -454,16 +483,32 @@ fn record_election(
         })
         .collect();
     let member = &members[winner_position];
-    let operation = LinkedLibraryOperation {
+    let launcher_operation = LinkedLibraryOperation {
         source_path: member.archive_path.clone(),
         destination_path: proposed_destination(&plan.destination_root, &member.archive_path),
     };
-    plan.operations.push(operation.clone());
+    let companion_operations: Vec<LinkedLibraryOperation> = member
+        .companion_paths
+        .iter()
+        .map(|companion| LinkedLibraryOperation {
+            source_path: companion.clone(),
+            destination_path: proposed_destination(&plan.destination_root, companion),
+        })
+        .collect();
+    if !companion_operations.is_empty() {
+        steps.push(format!(
+            "{} companion file(s) required to play this release are included alongside it",
+            companion_operations.len()
+        ));
+    }
+    plan.operations.push(launcher_operation.clone());
+    plan.operations.extend(companion_operations.iter().cloned());
     plan.elected_games.push(ElectedGame {
         dat_entry_name: request.dat.games[member.dat_entry_index].name.clone(),
         family_root_name: request.dat.games[root_index].name.clone(),
         explanation: ElectionExplanation { steps, rejected },
-        operation,
+        launcher_operation,
+        companion_operations,
     });
 }
 
@@ -547,40 +592,50 @@ fn proposed_destination(destination_root: &Path, source_path: &Path) -> PathBuf 
 /// them as conflicts - planning never resolves a name clash by overwriting.
 /// Case-insensitive clashes (casefolded equality) count too, matching the
 /// destination discipline of the existing organisation planner.
+///
+/// Every operation an election proposes is checked - launcher and every
+/// companion alike - so a collision on a companion file (e.g. two
+/// different CUE-based releases each proposing a `track01.bin` at the
+/// same destination) is caught exactly like a launcher collision. See
+/// requirement 10 in the module's own design notes: [`build_playing_library_plan`]
+/// then excludes a conflicted election's operations *as a whole*, never
+/// just the one colliding file, so a release is never proposed half
+/// linked.
 fn mark_destination_conflicts(plan: &mut PlayingLibraryPlan) {
-    let mut seen: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut seen: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
     for (index, elected) in plan.elected_games.iter().enumerate() {
-        let Some(basename) = elected.operation.destination_path.file_name() else {
-            continue;
-        };
-        seen.entry(basename.to_string_lossy().to_ascii_lowercase())
-            .or_default()
-            .push(index);
+        for operation in elected.all_operations() {
+            let Some(basename) = operation.destination_path.file_name() else {
+                continue;
+            };
+            seen.entry(basename.to_string_lossy().to_ascii_lowercase())
+                .or_default()
+                .insert(index);
+        }
     }
-    let clashing: Vec<Vec<usize>> = seen
-        .into_values()
-        .filter(|indexes| indexes.len() > 1)
+    let clashing: Vec<(String, BTreeSet<usize>)> = seen
+        .into_iter()
+        .filter(|(_, indexes)| indexes.len() > 1)
         .collect();
-    for indexes in clashing {
-        let first = &plan.elected_games[indexes[0]];
+    for (basename, indexes) in clashing {
+        let indexes: Vec<usize> = indexes.into_iter().collect();
         let conflict = DestinationConflict {
-            destination_basename: first
-                .operation
-                .destination_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            destination_basename: basename.clone(),
             contenders: indexes
                 .iter()
                 .map(|index| plan.elected_games[*index].dat_entry_name.clone())
                 .collect(),
             destinations: indexes
                 .iter()
-                .map(|index| {
+                .filter_map(|index| {
                     plan.elected_games[*index]
-                        .operation
-                        .destination_path
-                        .clone()
+                        .all_operations()
+                        .find(|operation| {
+                            operation.destination_path.file_name().is_some_and(|name| {
+                                name.to_string_lossy().to_ascii_lowercase() == basename
+                            })
+                        })
+                        .map(|operation| operation.destination_path.clone())
                 })
                 .collect(),
         };

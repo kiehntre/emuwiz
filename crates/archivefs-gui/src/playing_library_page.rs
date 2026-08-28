@@ -35,7 +35,7 @@ use archivefs_core::launch::es_de_publish::{
     recover_es_de_gamelist_publication,
 };
 use archivefs_core::playing_library::{
-    DatArchiveMatch, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest, ReleaseClass,
+    PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest, ReleaseClass,
     build_playing_library_plan, build_playing_library_transaction, match_loose_files_against_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
@@ -291,7 +291,7 @@ impl PlayingLibraryPageState {
 
         let candidates = collect_source_files(std::slice::from_ref(&source_root));
         let trusted = TrustedRoots::from_paths([&source_root]);
-        let matches: Vec<DatArchiveMatch> = match_loose_files_against_dat(
+        let outcome_matches = match_loose_files_against_dat(
             &outcome.dat,
             &candidates,
             &trusted,
@@ -300,12 +300,15 @@ impl PlayingLibraryPageState {
 
         let request = PlayingLibraryRequest {
             dat: &outcome.dat,
-            matches,
+            matches: outcome_matches.matches,
             destination_root,
             policy: self.build_policy(),
         };
         match build_playing_library_plan(&request) {
-            Ok(plan) => self.plan = Some(plan),
+            Ok(mut plan) => {
+                plan.rejected_launchers = outcome_matches.rejected_launchers;
+                self.plan = Some(plan);
+            }
             Err(error) => self.error = Some(error),
         }
     }

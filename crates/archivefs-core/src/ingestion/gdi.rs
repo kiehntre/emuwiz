@@ -124,22 +124,28 @@ struct GdiTrackLine {
     sector_size: u32,
 }
 
-/// Parses a `.gdi` descriptor and resolves the single unambiguous
-/// high-density data track needed for identity, relative to the
-/// descriptor's own directory. The parser deliberately ignores low-density
-/// and audio tracks, and refuses ambiguous selections, unsafe references,
-/// duplicate/inconsistent track metadata, and sector sizes for which no
-/// verified logical-sector view exists.
-pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError> {
+/// Reads, bounds, and validates a `.gdi` descriptor's track lines -
+/// exactly the shared prefix [`resolve_gdi_data_track`] and
+/// [`resolve_gdi_all_tracks`] both need: header parsing, per-line length
+/// bounds, duplicate-track-number, and duplicate-start-LBA checks. Neither
+/// caller re-parses anything; they only interpret this same validated
+/// `Vec<GdiTrackLine>` differently (one selects the identity track, the
+/// other resolves every track's own file).
+fn parse_and_validate_gdi_tracks(
+    gdi_path: &Path,
+) -> Result<(Vec<GdiTrackLine>, PathBuf, PathBuf), GdiError> {
     let metadata = std::fs::metadata(gdi_path).map_err(|error| GdiError::Io(error.to_string()))?;
     if metadata.len() > MAX_GDI_BYTES {
         return Err(GdiError::TooLarge);
     }
     let contents =
         std::fs::read_to_string(gdi_path).map_err(|error| GdiError::Io(error.to_string()))?;
-    let base = gdi_path.parent().unwrap_or_else(|| Path::new("."));
+    let base = gdi_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let canonical_base =
-        std::fs::canonicalize(base).map_err(|error| GdiError::Io(error.to_string()))?;
+        std::fs::canonicalize(&base).map_err(|error| GdiError::Io(error.to_string()))?;
 
     let mut lines = contents
         .lines()
@@ -199,6 +205,44 @@ pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError>
         return Err(GdiError::DuplicateStartLba);
     }
 
+    Ok((tracks, base, canonical_base))
+}
+
+/// Safety-resolves one GDI track's filename relative to `base`, exactly
+/// like [`resolve_gdi_data_track`]'s own inline check: no absolute path,
+/// no `..` component, and the canonicalized result must both exist as a
+/// regular file and remain inside `canonical_base`.
+fn resolve_gdi_track_file(
+    filename: &str,
+    base: &Path,
+    canonical_base: &Path,
+) -> Result<PathBuf, GdiError> {
+    let reference = Path::new(filename);
+    if reference.is_absolute()
+        || reference
+            .components()
+            .any(|component| component == Component::ParentDir)
+    {
+        return Err(GdiError::UnsafeReference);
+    }
+    let resolved = base.join(reference);
+    let canonical = std::fs::canonicalize(&resolved)
+        .map_err(|_| GdiError::MissingTrackFile(resolved.clone()))?;
+    if !canonical.starts_with(canonical_base) || !canonical.is_file() {
+        return Err(GdiError::UnsafeReference);
+    }
+    Ok(canonical)
+}
+
+/// Parses a `.gdi` descriptor and resolves the single unambiguous
+/// high-density data track needed for identity, relative to the
+/// descriptor's own directory. The parser deliberately ignores low-density
+/// and audio tracks, and refuses ambiguous selections, unsafe references,
+/// duplicate/inconsistent track metadata, and sector sizes for which no
+/// verified logical-sector view exists.
+pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError> {
+    let (tracks, base, canonical_base) = parse_and_validate_gdi_tracks(gdi_path)?;
+
     // Data-track selection: metadata only, never filename or track order -
     // see the module doc comment for the exact GD-ROM boundary this reuses.
     let mut candidates = tracks
@@ -220,25 +264,53 @@ pub fn resolve_gdi_data_track(gdi_path: &Path) -> Result<GdiDataTrack, GdiError>
         other => return Err(GdiError::UnsupportedSectorSize(other)),
     };
 
-    let reference = Path::new(&track.filename);
-    if reference.is_absolute()
-        || reference
-            .components()
-            .any(|component| component == Component::ParentDir)
-    {
-        return Err(GdiError::UnsafeReference);
-    }
-    let resolved = base.join(reference);
-    let canonical = std::fs::canonicalize(&resolved)
-        .map_err(|_| GdiError::MissingTrackFile(resolved.clone()))?;
-    if !canonical.starts_with(&canonical_base) || !canonical.is_file() {
-        return Err(GdiError::UnsafeReference);
-    }
+    let canonical = resolve_gdi_track_file(&track.filename, &base, &canonical_base)?;
 
     Ok(GdiDataTrack {
         path: canonical,
         mode,
     })
+}
+
+/// Resolves every track file a `.gdi` descriptor references - low-density,
+/// high-density, and audio alike - the complete file set a multi-track
+/// GD-ROM release needs, not just the one identity track
+/// [`resolve_gdi_data_track`] selects. Reuses the exact same descriptor
+/// parsing/validation ([`parse_and_validate_gdi_tracks`]) and the exact
+/// same per-file safety check ([`resolve_gdi_track_file`]); refuses (never
+/// guesses at) any unsafe, missing, or malformed reference exactly as
+/// [`resolve_gdi_data_track`] does. Declaration order is preserved and
+/// duplicates by canonical path are collapsed to one entry.
+pub fn resolve_gdi_all_tracks(gdi_path: &Path) -> Result<Vec<PathBuf>, GdiError> {
+    let per_track = resolve_gdi_all_tracks_lenient(gdi_path)?;
+    let mut files = Vec::with_capacity(per_track.len());
+    for outcome in per_track {
+        let resolved = outcome?;
+        if !files.contains(&resolved) {
+            files.push(resolved);
+        }
+    }
+    Ok(files)
+}
+
+/// Like [`resolve_gdi_all_tracks`], but never lets one bad track hide the
+/// others: every declared track's file is safety-checked independently and
+/// reported as its own `Ok`/`Err`, in declaration order. The outer
+/// `Result` only ever fails for reasons that make the descriptor itself
+/// unreadable (I/O, size, header/count/duplicate-number/duplicate-LBA
+/// problems) - never for one missing or unsafe track file, since a caller
+/// rejecting an incomplete multi-file release still needs to know exactly
+/// which of its files were safely, structurally identified as belonging to
+/// that release (see `playing_library::matching`'s fail-closed-as-a-whole
+/// handling).
+pub fn resolve_gdi_all_tracks_lenient(
+    gdi_path: &Path,
+) -> Result<Vec<Result<PathBuf, GdiError>>, GdiError> {
+    let (tracks, base, canonical_base) = parse_and_validate_gdi_tracks(gdi_path)?;
+    Ok(tracks
+        .iter()
+        .map(|track| resolve_gdi_track_file(&track.filename, &base, &canonical_base))
+        .collect())
 }
 
 fn parse_gdi_track_line(line: &str, track_count: usize) -> Result<GdiTrackLine, GdiError> {
@@ -526,5 +598,38 @@ mod tests {
             resolve_gdi_data_track(&too_many),
             Err(GdiError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn resolve_gdi_all_tracks_returns_every_track_in_order() {
+        let gdi = write_temp("all-tracks.gdi", &normal_gdi("track03.bin", 2352));
+        write_sibling(&gdi, "track01.bin", &vec![0_u8; 2352]);
+        write_sibling(&gdi, "track02.raw", &vec![0_u8; 2352]);
+        write_sibling(&gdi, "track03.bin", &vec![0_u8; 2352 * 2]);
+
+        let files = resolve_gdi_all_tracks(&gdi).unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files[0].ends_with("track01.bin"));
+        assert!(files[1].ends_with("track02.raw"));
+        assert!(files[2].ends_with("track03.bin"));
+    }
+
+    #[test]
+    fn resolve_gdi_all_tracks_refuses_a_missing_track() {
+        let gdi = write_temp("missing-one-track.gdi", &normal_gdi("track03.bin", 2352));
+        write_sibling(&gdi, "track01.bin", &vec![0_u8; 2352]);
+        // track02.raw deliberately not written.
+        write_sibling(&gdi, "track03.bin", &vec![0_u8; 2352 * 2]);
+
+        assert!(matches!(
+            resolve_gdi_all_tracks(&gdi),
+            Err(GdiError::MissingTrackFile(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_gdi_all_tracks_refuses_traversal() {
+        let gdi = write_temp("traversal-all.gdi", "1\n1 45000 4 2352 ../outside.bin 0\n");
+        assert_eq!(resolve_gdi_all_tracks(&gdi), Err(GdiError::UnsafeReference));
     }
 }

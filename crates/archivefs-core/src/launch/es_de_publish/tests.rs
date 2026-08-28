@@ -83,7 +83,8 @@ fn plan_with_operations(
                 steps: Vec::new(),
                 rejected: Vec::new(),
             },
-            operation: operation.clone(),
+            launcher_operation: operation.clone(),
+            companion_operations: Vec::new(),
         })
         .collect();
     PlayingLibraryPlan {
@@ -97,6 +98,7 @@ fn plan_with_operations(
         singleton_families: entries.len(),
         conflicts: Vec::new(),
         operations,
+        rejected_launchers: Vec::new(),
     }
 }
 
@@ -344,7 +346,8 @@ fn destination_not_in_operations_is_never_published() {
                     steps: Vec::new(),
                     rejected: Vec::new(),
                 },
-                operation: conflicted_operation.clone(),
+                launcher_operation: conflicted_operation.clone(),
+                companion_operations: Vec::new(),
             },
             ElectedGame {
                 dat_entry_name: "Clean Game".to_string(),
@@ -353,7 +356,8 @@ fn destination_not_in_operations_is_never_published() {
                     steps: Vec::new(),
                     rejected: Vec::new(),
                 },
-                operation: clean_operation.clone(),
+                launcher_operation: clean_operation.clone(),
+                companion_operations: Vec::new(),
             },
         ],
         unresolved_groups: Vec::new(),
@@ -365,6 +369,7 @@ fn destination_not_in_operations_is_never_published() {
             destinations: vec![conflicted_operation.destination_path.clone()],
         }],
         operations: vec![clean_operation],
+        rejected_launchers: Vec::new(),
     };
 
     let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
@@ -741,4 +746,59 @@ fn writing_the_recovery_record_through_a_symlinked_path_never_touches_its_target
     assert!(metadata.is_file());
     let record = read_recovery_record(&recovery_path, &gamelist_path).unwrap();
     assert_eq!(record.previous_content.as_deref(), Some("captured"));
+}
+
+#[test]
+fn publication_points_at_the_launcher_file_never_a_companion() {
+    let home = tempdir().unwrap();
+    let profile = profile_with_psx_system(home.path());
+    let destination_root = home.path().join("playing/psx");
+    let launcher_operation = LinkedLibraryOperation {
+        source_path: destination_root.join("Game (Europe).cue"),
+        destination_path: destination_root.join("Game (Europe).cue"),
+    };
+    let companion_operations = vec![
+        LinkedLibraryOperation {
+            source_path: destination_root.join("track1.bin"),
+            destination_path: destination_root.join("track1.bin"),
+        },
+        LinkedLibraryOperation {
+            source_path: destination_root.join("track2.bin"),
+            destination_path: destination_root.join("track2.bin"),
+        },
+    ];
+    let mut operations = vec![launcher_operation.clone()];
+    operations.extend(companion_operations.iter().cloned());
+    let plan = PlayingLibraryPlan {
+        destination_root: destination_root.clone(),
+        policy: PlayingLibraryPolicy::default(),
+        archives_examined: 1,
+        families_examined: 1,
+        elected_games: vec![ElectedGame {
+            dat_entry_name: "Game (Europe)".to_string(),
+            family_root_name: "Game (Europe)".to_string(),
+            explanation: ElectionExplanation {
+                steps: Vec::new(),
+                rejected: Vec::new(),
+            },
+            launcher_operation,
+            companion_operations,
+        }],
+        unresolved_groups: Vec::new(),
+        exclusions: Vec::new(),
+        singleton_families: 1,
+        conflicts: Vec::new(),
+        operations,
+        rejected_launchers: Vec::new(),
+    };
+
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert_eq!(publication.added.len(), 1);
+    assert_eq!(
+        publication.added[0].destination_path,
+        destination_root.join("Game (Europe).cue")
+    );
+    assert!(publication.new_content.contains("Game (Europe).cue"));
+    assert!(!publication.new_content.contains("track1.bin"));
+    assert!(!publication.new_content.contains("track2.bin"));
 }

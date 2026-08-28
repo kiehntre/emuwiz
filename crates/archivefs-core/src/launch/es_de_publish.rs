@@ -427,15 +427,18 @@ pub fn plan_es_de_gamelist_publication(
         }
     };
 
-    // Only elections whose operation survived conflict filtering into
-    // `plan.operations` are eligible - exactly the same subset the
-    // existing symlink apply consumes.
+    // Only elections whose launcher operation survived conflict filtering
+    // into `plan.operations` are eligible - exactly the same subset the
+    // existing symlink apply consumes. Always the launcher's own
+    // destination path, never a companion's: a CUE/GDI/M3U-based release
+    // must be pointed at its CUE/GDI/M3U file, not one of its BIN/track
+    // companions.
     let mut entries: Vec<EsDePublicationEntry> = Vec::new();
     for elected in &plan.elected_games {
-        if plan.operations.contains(&elected.operation) {
+        if plan.operations.contains(&elected.launcher_operation) {
             entries.push(EsDePublicationEntry {
                 dat_entry_name: elected.dat_entry_name.clone(),
-                destination_path: elected.operation.destination_path.clone(),
+                destination_path: elected.launcher_operation.destination_path.clone(),
             });
         }
     }
