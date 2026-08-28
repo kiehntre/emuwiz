@@ -19,7 +19,10 @@ use crate::disc_evidence_collector::{
     read_bounded_chd_bytes,
 };
 use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
-use crate::executable_signatures::looks_like_self;
+use crate::executable_signatures::{
+    XBE_CERTIFICATE_READ_BYTES, XBE_HEADER_PREFIX_BYTES, looks_like_self, looks_like_xbe,
+    parse_xbe_header, xbe_certificate_file_offset,
+};
 use crate::gb_header_evidence::{GB_HEADER_BYTES, GbColorSupport, parse_gb_header};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
@@ -193,6 +196,10 @@ pub enum IdentityKind {
     LooseRomCanonicalSha256,
     LooseRomFormat,
     LooseRomTitle,
+    /// A verified original-Xbox title ID, read from a `default.xbe`-style
+    /// executable's own certificate. Distinct from [`Self::XexTitleId`]
+    /// (Xbox 360) - the two platforms are never conflated.
+    XbeTitleId,
     XexTitleId,
     XexMediaId,
 }
@@ -217,6 +224,7 @@ impl fmt::Display for IdentityKind {
             Self::LooseRomCanonicalSha256 => "Canonical byte-order-normalized ROM SHA-256",
             Self::LooseRomFormat => "Loose ROM format",
             Self::LooseRomTitle => "Normalized ROM title",
+            Self::XbeTitleId => "Xbox Title ID",
             Self::XexTitleId => "Xbox 360 Title ID",
             Self::XexMediaId => "Xbox 360 Media ID",
         };
@@ -253,6 +261,7 @@ pub enum IdentityPlatform {
     GameBoyColor,
     GameBoyAdvance,
     N64,
+    Xbox,
     Xbox360,
     Other,
 }
@@ -284,6 +293,7 @@ impl IdentityPlatform {
             "game boy color" | "gbc" | "nintendo game boy color" => Self::GameBoyColor,
             "game boy advance" | "gba" | "nintendo game boy advance" => Self::GameBoyAdvance,
             "n64" | "nintendo 64" | "nintendo64" => Self::N64,
+            "xbox" | "original xbox" | "microsoft xbox" => Self::Xbox,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             _ => Self::Other,
         }
@@ -307,6 +317,7 @@ impl IdentityPlatform {
             Self::GameBoyColor => "Game Boy Color",
             Self::GameBoyAdvance => "Game Boy Advance",
             Self::N64 => "Nintendo 64",
+            Self::Xbox => "Xbox",
             Self::Xbox360 => "Xbox 360",
             Self::Other => "Unsupported platform",
         }
@@ -321,6 +332,11 @@ pub enum IdentityImageFormat {
     LooseCartridgeRom,
     Xex,
     ZipContainingXex,
+    /// A direct original-Xbox `.xbe` executable - identity is read from its
+    /// own header/certificate, exactly like [`Self::Xex`] for Xbox 360.
+    Xbe,
+    /// A ZIP containing exactly one `.xbe` member - see [`Self::Xbe`].
+    ZipContainingXbe,
     /// WIA/RVZ (`.rvz`) - identity is read from the documented uncompressed
     /// `wia_disc_t.dhead` header field, never from the compressed disc body.
     Rvz,
@@ -502,6 +518,14 @@ impl GameIdentityReport {
             && self.verified_loose_rom_sha256().is_some()
     }
 
+    /// The verified original-Xbox Title ID, formatted as eight uppercase hex
+    /// characters, read directly from a `default.xbe`-style executable's
+    /// own certificate. Distinct from [`Self::verified_xex_title_id`]
+    /// (Xbox 360) - the two platforms are never conflated.
+    pub fn verified_xbox_title_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::XbeTitleId)
+    }
+
     /// The verified Xbox 360 Title ID, formatted as eight uppercase hex
     /// characters (matching the `xenia-canary/game-patches` filename and
     /// `title_id` field convention).
@@ -610,6 +634,20 @@ fn inspect_game_identity_with_platform_trust(
         return report;
     }
 
+    // Original-Xbox identity is gated on trusted platform evidence even
+    // though the structural XBE/XDVDFS family shares filesystem signatures
+    // with Xbox 360 - an untrusted/scanner-guessed "Xbox" hint must never
+    // authorize verified identity, unlike the existing (unchanged) Xbox 360
+    // XEX path, which has no equivalent collision risk to guard against.
+    if platform == IdentityPlatform::Xbox && !trusted_platform {
+        add_unavailable(
+            &mut report,
+            IdentityStatus::Ambiguous,
+            "original-Xbox identity requires exact scanner or manual platform evidence",
+        );
+        return report;
+    }
+
     if platform == IdentityPlatform::Other {
         report.evidence.push(evidence(
             &report,
@@ -654,11 +692,15 @@ fn inspect_game_identity_with_platform_trust(
         {
             inspect_cue(&mut report, trusted);
         }
-        "iso" | "gcm" if platform != IdentityPlatform::Xbox360 => {
+        "iso" | "gcm"
+            if platform != IdentityPlatform::Xbox360 && platform != IdentityPlatform::Xbox =>
+        {
             inspect_direct_iso(&mut report, trusted)
         }
         "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report, trusted),
         "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report, trusted),
+        "xbe" if platform == IdentityPlatform::Xbox => inspect_direct_xbe(&mut report, trusted),
+        "zip" if platform == IdentityPlatform::Xbox => inspect_zip_xbe(&mut report, trusted),
         "zip" => inspect_zip_iso(&mut report, trusted),
         "rvz" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
             inspect_rvz(&mut report, trusted);
@@ -691,7 +733,7 @@ fn inspect_game_identity_with_platform_trust(
         _ => add_unavailable(
             &mut report,
             IdentityStatus::Unsupported,
-            "only direct ISO/GCM, RVZ and CISO for GameCube/Wii, a single ISO inside ZIP, direct XEX, and a single XEX inside ZIP are supported",
+            "only direct ISO/GCM, RVZ and CISO for GameCube/Wii, a single ISO inside ZIP, direct XEX, a single XEX inside ZIP, direct XBE, and a single XBE inside ZIP are supported",
         ),
     }
     report
@@ -1284,6 +1326,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
@@ -1635,6 +1678,260 @@ fn inspect_xex_header(
         member_index,
         "XEX execution-info optional header (media_id)",
         "verified directly from the reviewed XEX execution-info header",
+    );
+    report.complete = true;
+}
+
+fn inspect_direct_xbe(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::Xbe;
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut source = FileSource {
+        file,
+        len,
+        bytes_read: 0,
+    };
+    inspect_xbe_header(report, &mut source, None, None);
+    report.bytes_read = source.bytes_read;
+}
+
+fn inspect_zip_xbe(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::ZipContainingXbe;
+    report.nested_container_depth = 1;
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("invalid ZIP: {error}"),
+            );
+            return;
+        }
+    };
+    if archive.len() > MAX_ARCHIVE_MEMBERS {
+        report.archive_members_inspected = MAX_ARCHIVE_MEMBERS;
+        add_unavailable(
+            report,
+            IdentityStatus::ResourceLimitReached,
+            "ZIP member limit reached before identity inspection",
+        );
+        return;
+    }
+    let mut xbe_members = Vec::new();
+    for index in 0..archive.len() {
+        report.archive_members_inspected += 1;
+        let raw = match archive.by_index_raw(index) {
+            Ok(raw) => raw,
+            Err(error) => {
+                add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        };
+        if raw.encrypted() {
+            add_unavailable(
+                report,
+                IdentityStatus::Unsupported,
+                "encrypted ZIP entries are refused",
+            );
+            return;
+        }
+        if !raw.is_dir() && ascii_extension_is_xbe(raw.name_raw()) {
+            xbe_members.push((index, raw.name_raw().to_vec(), raw.size()));
+        }
+    }
+    if xbe_members.is_empty() {
+        add_unavailable(
+            report,
+            IdentityStatus::Missing,
+            "ZIP contains no XBE member",
+        );
+        return;
+    }
+    if xbe_members.len() != 1 {
+        add_unavailable(
+            report,
+            IdentityStatus::Ambiguous,
+            "ZIP contains multiple XBE members; none was selected implicitly",
+        );
+        return;
+    }
+    let (index, member_path, member_size) = xbe_members.remove(0);
+    if member_path.len() > MAX_PATH_BYTES {
+        add_unavailable(
+            report,
+            IdentityStatus::ResourceLimitReached,
+            "XBE member path exceeds the path-length limit",
+        );
+        return;
+    }
+    let mut entry = match archive.by_index(index) {
+        Ok(entry) => entry,
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    // Bounded to the same generous prefix `xbox_boot_evidence` already reads
+    // for a real disc's `default.xbe` (header plus a realistic certificate
+    // offset) - reused here rather than inventing a new, unreviewed bound.
+    let read_cap = member_size.min(crate::xbox_boot_evidence::XBE_PREFIX_READ_BYTES as u64);
+    let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
+    if let Err(error) = entry.by_ref().take(read_cap).read_to_end(&mut data) {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            &format!("could not read XBE member: {error}"),
+        );
+        return;
+    }
+    report.bytes_read = data.len() as u64;
+    let mut source = SliceSource {
+        data: &data,
+        declared_len: member_size,
+        truncated: member_size > data.len() as u64,
+    };
+    inspect_xbe_header(report, &mut source, Some(member_path), Some(index));
+}
+
+/// Reads the unencrypted original-Xbox XBE header plus the certificate at
+/// its own declared (virtual-address-translated) file offset, holding the
+/// `title_id` this platform's verified identity rests on. Reuses
+/// [`crate::executable_signatures`]'s existing `looks_like_xbe`/
+/// `parse_xbe_header`/`xbe_certificate_file_offset` unchanged - this
+/// function only supplies the bounded I/O those pure functions need, never
+/// reimplementing XBE's byte layout.
+fn inspect_xbe_header(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut header = vec![0_u8; XBE_HEADER_PREFIX_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut header) {
+        let status = source_error_status(&error);
+        push_with_source(
+            report,
+            IdentityKind::XbeTitleId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "bounded XBE header read",
+            "XBE header is truncated or unavailable",
+        );
+        return;
+    }
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    if !looks_like_xbe(&header) {
+        push_with_source(
+            report,
+            IdentityKind::XbeTitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XBE magic check",
+            "file does not begin with the XBEH magic",
+        );
+        return;
+    }
+    let Some(certificate_offset) = xbe_certificate_file_offset(&header) else {
+        push_with_source(
+            report,
+            IdentityKind::XbeTitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XBE certificate address",
+            "certificate address underflows the header's own base address",
+        );
+        return;
+    };
+    let mut certificate = vec![0_u8; XBE_CERTIFICATE_READ_BYTES];
+    if let Err(error) = source.read_exact_at(certificate_offset, &mut certificate) {
+        let status = source_error_status(&error);
+        push_with_source(
+            report,
+            IdentityKind::XbeTitleId,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XBE certificate read",
+            "certificate is truncated or unavailable",
+        );
+        return;
+    }
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    // `looks_like_xbe` already passed above, so `parse_xbe_header` can only
+    // return `None` here if the header itself were somehow shorter than
+    // `XBE_HEADER_PREFIX_BYTES` - impossible given the fixed-size read above
+    // succeeded. Handled explicitly anyway rather than unwrapped, so a
+    // future change to either function still fails closed instead of
+    // panicking.
+    let Some(fact) = parse_xbe_header(&header, Some(&certificate)) else {
+        push_with_source(
+            report,
+            IdentityKind::XbeTitleId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XBE header parse",
+            "XBE header failed to parse",
+        );
+        return;
+    };
+    let Some(title_id) = fact.title_id else {
+        push_with_source(
+            report,
+            IdentityKind::XbeTitleId,
+            IdentityStatus::Missing,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "XBE certificate",
+            "no title ID is present in the certificate",
+        );
+        return;
+    };
+    push_with_source(
+        report,
+        IdentityKind::XbeTitleId,
+        IdentityStatus::Verified,
+        Some(title_id),
+        IdentityConfidence::ExactBytes,
+        member_path,
+        member_index,
+        "XBE certificate (title_id)",
+        "verified directly from the reviewed XBE certificate",
     );
     report.complete = true;
 }
@@ -1999,6 +2296,7 @@ fn inspect_iso_source(
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::Other => {}
     }
@@ -4307,6 +4605,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
         IdentityPlatform::Xbox360 => &[IdentityKind::XexTitleId, IdentityKind::XexMediaId],
+        IdentityPlatform::Xbox => &[IdentityKind::XbeTitleId],
         IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
@@ -4403,6 +4702,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Xbox
         | IdentityPlatform::Other => {}
     }
 }
@@ -4433,6 +4733,16 @@ fn ascii_extension_is_xex(path: &[u8]) -> bool {
         return false;
     };
     name[dot + 1..].eq_ignore_ascii_case(b"xex")
+}
+
+fn ascii_extension_is_xbe(path: &[u8]) -> bool {
+    let Some(name) = path.rsplit(|byte| *byte == b'/' || *byte == b'\\').next() else {
+        return false;
+    };
+    let Some(dot) = name.iter().rposition(|byte| *byte == b'.') else {
+        return false;
+    };
+    name[dot + 1..].eq_ignore_ascii_case(b"xbe")
 }
 
 fn strip_iso_version(name: &[u8]) -> &[u8] {
@@ -7958,6 +8268,219 @@ mod tests {
         let report = inspect_game_identity(&path, Some("Xbox 360"));
         assert_eq!(report.verified_xex_title_id(), None);
         assert_eq!(report.format, IdentityImageFormat::Unsupported);
+    }
+
+    // ------------------------------------------------------------------
+    // Original Xbox (XBE) identity
+    // ------------------------------------------------------------------
+
+    /// A minimal, well-formed XBE header + certificate: magic, `base`/
+    /// `certificate_addr` pointing the certificate right after the header,
+    /// and a `title_id` encoded at the certificate's own fixed offset.
+    fn xbe_fixture(title_id: u32) -> Vec<u8> {
+        const XBE_BASE_OFFSET: usize = 0x104;
+        const XBE_CERT_ADDR_OFFSET: usize = 0x118;
+        const XBE_CERT_TITLE_ID_OFFSET: usize = 0x8;
+        let base = 0x10000_u32;
+        let cert_file_offset = 0x200_usize;
+        let cert_addr = base + cert_file_offset as u32;
+
+        let mut bytes = vec![0_u8; cert_file_offset + XBE_CERTIFICATE_READ_BYTES];
+        bytes[0..4].copy_from_slice(b"XBEH");
+        bytes[XBE_BASE_OFFSET..XBE_BASE_OFFSET + 4].copy_from_slice(&base.to_le_bytes());
+        bytes[XBE_CERT_ADDR_OFFSET..XBE_CERT_ADDR_OFFSET + 4]
+            .copy_from_slice(&cert_addr.to_le_bytes());
+        bytes[cert_file_offset + XBE_CERT_TITLE_ID_OFFSET
+            ..cert_file_offset + XBE_CERT_TITLE_ID_OFFSET + 4]
+            .copy_from_slice(&title_id.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn verifies_xbe_title_id_from_certificate_when_platform_is_trusted() {
+        let directory = FixtureDir::new("xbe");
+        let path = write_fixture(&directory, "default.xbe", &xbe_fixture(0x4D53_0058));
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.platform, IdentityPlatform::Xbox);
+        assert_eq!(report.format, IdentityImageFormat::Xbe);
+        assert_eq!(report.verified_xbox_title_id(), Some("4D530058"));
+        assert!(report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::XbeTitleId
+                && item.status == IdentityStatus::Verified
+                && item.confidence == IdentityConfidence::ExactBytes
+        }));
+    }
+
+    #[test]
+    fn untrusted_xbox_platform_evidence_never_authorizes_identity() {
+        let directory = FixtureDir::new("xbe-untrusted");
+        let path = write_fixture(&directory, "default.xbe", &xbe_fixture(0x4D53_0058));
+        // Same real, structurally valid bytes as the verified test above -
+        // only the platform trust differs, and that alone must be decisive.
+        let report = inspect_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::XbeTitleId && item.status == IdentityStatus::Ambiguous
+        }));
+    }
+
+    #[test]
+    fn malformed_xbe_magic_fails_closed_not_verified() {
+        let directory = FixtureDir::new("xbe-bad-magic");
+        let mut bytes = xbe_fixture(0x4D53_0058);
+        bytes[0..4].copy_from_slice(b"NOPE");
+        let path = write_fixture(&directory, "default.xbe", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn truncated_xbe_header_fails_closed_not_verified() {
+        let directory = FixtureDir::new("xbe-truncated");
+        let path = write_fixture(&directory, "default.xbe", b"XBEH");
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn zip_with_one_xbe_reads_only_the_xbe_header() {
+        let directory = FixtureDir::new("zip-xbe");
+        let path = directory.0.join("container.zip");
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file(
+                "default.xbe",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )
+            .unwrap();
+        let image = xbe_fixture(0x4D53_0058);
+        writer.write_all(&image).unwrap();
+        writer.finish().unwrap();
+
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), Some("4D530058"));
+        assert_eq!(report.archive_members_inspected, 1);
+        assert_eq!(report.nested_container_depth, 1);
+    }
+
+    #[test]
+    fn zip_with_multiple_xbe_members_is_ambiguous_not_guessed() {
+        let directory = FixtureDir::new("zip-xbe-ambiguous");
+        let path = directory.0.join("container.zip");
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        for name in ["default.xbe", "dash.xbe"] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&xbe_fixture(0x4D53_0058)).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == IdentityStatus::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn xbe_filename_token_never_resolves_identity() {
+        // A thoroughly XBE-title-ID-looking filename, with no real file
+        // content at all - filename alone must never become verified
+        // identity. Unlike Xbox 360's XEX path, this platform's
+        // `add_filename_candidate` does not even emit a filename candidate
+        // fact for it (see the catch-all group), so there is no evidence at
+        // all beyond an outright refusal.
+        let report =
+            inspect_catalogued_game_identity(Path::new("/games/4D530058.xbe"), Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+    }
+
+    #[test]
+    fn xbox_never_reads_an_xex_extension_as_its_own_content() {
+        let directory = FixtureDir::new("xbox-not-xex");
+        let path = write_fixture(&directory, "default.xex", &xex_fixture(0x4156_07D2, 0));
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert_eq!(report.format, IdentityImageFormat::Unsupported);
+    }
+
+    #[test]
+    fn xbox_never_reads_an_iso_extension_as_a_disc_image() {
+        let directory = FixtureDir::new("xbox-not-iso");
+        let path = write_fixture(
+            &directory,
+            "game.iso",
+            &dolphin_fixture(IdentityPlatform::GameCube, b"GM8E01", 0),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
+        assert_eq!(report.verified_xbox_title_id(), None);
+        assert_eq!(report.format, IdentityImageFormat::Unsupported);
+    }
+
+    #[test]
+    fn xbox_and_xbox_360_never_cross_authorize() {
+        // The exact same real, structurally valid XEX content, trusted, must
+        // verify only as Xbox 360 - never as original Xbox - and vice versa
+        // for a real XBE under an Xbox 360 platform assignment.
+        let directory = FixtureDir::new("xbox-vs-xbox360");
+        let xex_path = write_fixture(
+            &directory,
+            "default.xex",
+            &xex_fixture(0x4156_07D2, 0x4C27_792A),
+        );
+        let as_xbox360 = inspect_catalogued_game_identity(&xex_path, Some("Xbox 360"));
+        assert_eq!(as_xbox360.verified_xex_title_id(), Some("415607D2"));
+        assert_eq!(as_xbox360.verified_xbox_title_id(), None);
+
+        let xbe_path = write_fixture(&directory, "default.xbe", &xbe_fixture(0x4D53_0058));
+        let as_xbox = inspect_catalogued_game_identity(&xbe_path, Some("Xbox"));
+        assert_eq!(as_xbox.verified_xbox_title_id(), Some("4D530058"));
+        assert_eq!(as_xbox.verified_xex_title_id(), None);
+
+        // And swapping platform assignments across formats resolves nothing
+        // for either: an XBE trusted as "Xbox 360" is an unsupported
+        // extension for that platform, and an XEX trusted as "Xbox" is
+        // likewise unsupported for it.
+        let xbe_as_xbox360 = inspect_catalogued_game_identity(&xbe_path, Some("Xbox 360"));
+        assert_eq!(xbe_as_xbox360.verified_xex_title_id(), None);
+        assert_eq!(xbe_as_xbox360.verified_xbox_title_id(), None);
+        let xex_as_xbox = inspect_catalogued_game_identity(&xex_path, Some("Xbox"));
+        assert_eq!(xex_as_xbox.verified_xex_title_id(), None);
+        assert_eq!(xex_as_xbox.verified_xbox_title_id(), None);
+    }
+
+    #[test]
+    fn xbox_platform_hint_recognizes_every_catalogue_synonym() {
+        for hint in ["Xbox", "xbox", "Original Xbox", "Microsoft Xbox"] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(hint)),
+                IdentityPlatform::Xbox,
+                "{hint} must resolve to IdentityPlatform::Xbox"
+            );
+        }
+        // These must resolve to Xbox 360, never original Xbox.
+        for hint in ["Xbox360", "Xbox 360", "Microsoft Xbox 360"] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(hint)),
+                IdentityPlatform::Xbox360,
+                "{hint} must resolve to IdentityPlatform::Xbox360, not Xbox"
+            );
+        }
     }
 }
 

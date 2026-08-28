@@ -111,7 +111,12 @@ impl ContentDetector for SelfDetector {
 pub const XBE_MAGIC: &[u8; 4] = b"XBEH";
 const XBE_BASE_OFFSET: usize = 0x104;
 const XBE_CERT_ADDR_OFFSET: usize = 0x118;
-const XBE_HEADER_PREFIX_BYTES: usize = 0x11C;
+/// The fixed prefix `parse_xbe_header`/`xbe_certificate_file_offset` read
+/// from - `pub(crate)` so `game_identity`'s bounded XBE reader can size its
+/// own read exactly, rather than duplicating this value or over-reading via
+/// [`crate::xbox_boot_evidence::XBE_PREFIX_READ_BYTES`]'s more generous
+/// disc-traversal bound.
+pub(crate) const XBE_HEADER_PREFIX_BYTES: usize = 0x11C;
 /// Bounded certificate read - the real structure is smaller than this in
 /// every known XBE version; this is headroom, not a claim about the exact
 /// certificate size.

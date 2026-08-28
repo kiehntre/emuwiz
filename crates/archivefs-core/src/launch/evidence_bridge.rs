@@ -82,6 +82,7 @@ fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::DolphinGameId
             | IdentityKind::LooseRomSha256
             | IdentityKind::LooseRomCanonicalSha256
+            | IdentityKind::XbeTitleId
             | IdentityKind::XexTitleId
             | IdentityKind::XexMediaId
     )
@@ -148,6 +149,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::GameBoyColor => Some("Game Boy Color"),
         IdentityPlatform::GameBoyAdvance => Some("Game Boy Advance"),
         IdentityPlatform::N64 => Some("N64"),
+        IdentityPlatform::Xbox => Some("Xbox"),
         IdentityPlatform::Xbox360 => Some("Xbox360"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
@@ -291,6 +293,18 @@ fn resolved_identity_for_platform(
             let media_id = find_value(resolved, IdentityKind::XexMediaId);
             let game_key = title_id.or(media_id)?.to_string();
             Some((platform_id, game_key, Vec::new()))
+        }
+        IdentityPlatform::Xbox => {
+            // The one platform this bridge conflates least: `IdentityKind::XbeTitleId`
+            // is Xbox-only (see its own doc comment), and
+            // `VerifiedIdentityFact::XboxTitleId` genuinely names this
+            // platform - unlike Xbox 360 above, a real fact variant exists.
+            let title_id = find_value(resolved, IdentityKind::XbeTitleId)?;
+            Some((
+                platform_id,
+                title_id.to_string(),
+                vec![VerifiedIdentityFact::XboxTitleId(title_id.to_string())],
+            ))
         }
         IdentityPlatform::Other => None,
     }

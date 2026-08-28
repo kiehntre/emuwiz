@@ -706,6 +706,96 @@ fn xbox_360_resolves_identity_but_never_the_original_xbox_fact_variant() {
     );
 }
 
+#[test]
+fn xbox_resolves_identity_and_produces_the_xbox_title_id_fact() {
+    let source = report(
+        IdentityPlatform::Xbox,
+        vec![evidence(
+            IdentityKind::XbeTitleId,
+            IdentityStatus::Verified,
+            Some("4D530058"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+    let (status, facts) = canonical_identity_from_game_report(&source);
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Xbox".to_string(),
+            game_key: "4D530058".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::XboxTitleId("4D530058".to_string())]
+    );
+}
+
+#[test]
+fn xbox_and_xbox_360_verified_facts_never_cross_authorize() {
+    // A verified Xbox 360 XEX title ID must never resolve as original Xbox,
+    // and a verified original-Xbox XBE title ID must never resolve as Xbox
+    // 360 - the two platforms are wholly distinct even though their names
+    // and evidence kinds look similar.
+    let as_xbox360 = report(
+        IdentityPlatform::Xbox360,
+        vec![evidence(
+            IdentityKind::XexTitleId,
+            IdentityStatus::Verified,
+            Some("4D5307E6"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+    let (status, _) = canonical_identity_from_game_report(&as_xbox360);
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Xbox360".to_string(),
+            game_key: "4D5307E6".to_string(),
+        })
+    );
+
+    let as_xbox = report(
+        IdentityPlatform::Xbox,
+        vec![evidence(
+            IdentityKind::XbeTitleId,
+            IdentityStatus::Verified,
+            Some("4D530058"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+    let (status, facts) = canonical_identity_from_game_report(&as_xbox);
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Xbox".to_string(),
+            game_key: "4D530058".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::XboxTitleId("4D530058".to_string())]
+    );
+
+    // A report claiming platform Xbox but only ever carrying a 360-shaped
+    // XexTitleId fact (never genuinely produced by real `game_identity`
+    // code, but this bridge must not assume that) resolves to Unknown, not
+    // a fabricated Xbox identity - `XexTitleId` is not in Xbox's own
+    // identity-conferring lookup.
+    let mismatched = report(
+        IdentityPlatform::Xbox,
+        vec![evidence(
+            IdentityKind::XexTitleId,
+            IdentityStatus::Verified,
+            Some("4D5307E6"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+    let (status, facts) = canonical_identity_from_game_report(&mismatched);
+    assert_eq!(status, CanonicalIdentityStatus::Unknown);
+    assert!(facts.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Content fixtures
 // ---------------------------------------------------------------------------

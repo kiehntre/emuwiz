@@ -587,6 +587,32 @@ mod tests {
     }
 
     #[test]
+    fn xemu_projection_accepts_verified_xbox_title_id() {
+        let facts = vec![VerifiedIdentityFact::XboxTitleId("4D530058".to_string())];
+        let LaunchInputProjection::Authorized(request) = project_xemu_launch_input(&facts) else {
+            panic!("verified Xbox title ID must authorize xemu input")
+        };
+        assert_eq!(request.verified_xbox_title_id.as_deref(), Some("4D530058"));
+        assert_eq!(request.emulator_title_id, None);
+        assert_eq!(request.emulator_title_name, None);
+    }
+
+    #[test]
+    fn xemu_projection_never_accepts_a_360_shaped_fact() {
+        // `VerifiedIdentityFact` has no Xbox-360-title-ID variant at all
+        // (see the enum's own doc comment) - there is nothing a caller could
+        // even construct to try this with, so the only reachable case is
+        // "no fact supplied at all", already covered by
+        // `unknown_or_conflicting_identity_produces_no_authorized_request`.
+        // This test exists to name that guarantee explicitly for xemu.
+        let facts: Vec<VerifiedIdentityFact> = Vec::new();
+        assert!(matches!(
+            project_xemu_launch_input(&facts),
+            LaunchInputProjection::Unavailable { .. }
+        ));
+    }
+
+    #[test]
     fn ppsspp_projection_matches_the_existing_request_bridge() {
         let facts = vec![VerifiedIdentityFact::PspDiscId("ULUS10000".to_string())];
         let LaunchInputProjection::Authorized(request) = project_ppsspp_launch_input(&facts) else {
