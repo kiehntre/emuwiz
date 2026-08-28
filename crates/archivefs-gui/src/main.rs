@@ -62,25 +62,26 @@ use archivefs_core::patch_manager::{
     DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
     DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
     DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelectReason,
-    EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection,
-    GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity,
-    GameCubeInstallPlanError, GameCubeInstallPlanErrorKind, GameHackingErrorKind,
-    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
-    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
-    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
-    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
-    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
-    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewProposedAction, PreviewSourceItem,
-    PreviewState, ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
+    EmulatorProfileSelection, FlycastProfileDiscovery, FlycastProfileDiscoveryRoots,
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
+    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
+    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState, PageRequest,
+    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
+    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewProposedAction, PreviewSourceItem, PreviewState,
+    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
     ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
     RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
@@ -3956,6 +3957,11 @@ struct ArchiveFsApp {
     /// than only when the Cheats & Mods PCSX2 workflow is active like
     /// `pcsx2_profiles` is.
     pcsx2_launch_profiles: Pcsx2LaunchProfilesState,
+    /// Read-only Flycast profile discovery shared by Dreamcast Launch
+    /// Readiness. This is deliberately separate from the core launch
+    /// preflight: the page may report a missing executable/configuration,
+    /// while core revalidates both again before any spawn.
+    flycast_profiles: FlycastProfilesState,
     /// PS2 firmware/BIOS evidence resolved from the user's registered DAT
     /// sources - see [`pcsx2_firmware_evidence_from_registry`]. Loaded
     /// once in the background, the same way `pcsx2_launch_profiles` and
@@ -4538,6 +4544,7 @@ impl ArchiveFsApp {
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
             pcsx2_launch_profiles: Pcsx2LaunchProfilesState::NotScanned,
+            flycast_profiles: FlycastProfilesState::NotScanned,
             pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: load_remembered_emulator_profiles_default()
@@ -6018,10 +6025,61 @@ impl ArchiveFsApp {
                 })
                 .unwrap_or_default();
 
+        // Flycast is additive to the existing readiness view. Its adapter
+        // already owns configuration, executable and firmware inspection;
+        // this page only projects those read-only results into the shared
+        // launch planner. A binding is resolved here solely so a missing,
+        // unsafe or ambiguous executable is shown as blocked rather than
+        // advertised as launch-ready. Core preflight repeats the same check.
+        let flycast_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
+            match &self.flycast_profiles {
+                FlycastProfilesState::Ready(ready) => ready
+                    .discovery
+                    .profiles
+                    .iter()
+                    .map(|profile| {
+                        let verified_product_code = verified_facts.iter().find_map(|fact| match fact {
+                            archivefs_core::launch::VerifiedIdentityFact::DreamcastProductCode(code) => {
+                                Some(code.clone())
+                            }
+                            _ => None,
+                        });
+                        let inspection = archivefs_core::patch_manager::inspect_flycast_game(
+                            profile,
+                            &archivefs_core::patch_manager::FlycastGameRequest {
+                                canonical_platform: Some("Dreamcast".to_string()),
+                                flycast_platform: Some(
+                                    archivefs_core::patch_manager::FlycastPlatform::Dreamcast,
+                                ),
+                                verified_dreamcast_product_code: verified_product_code,
+                                ..Default::default()
+                            },
+                        );
+                        archivefs_core::launch::StandaloneProfileInput {
+                            adapter_id: "flycast",
+                            profile_id: profile.profile_id.clone(),
+                            profile_path: Some(profile.configuration_path.clone()),
+                            eligible: profile.eligible
+                                && archivefs_core::patch_manager::resolve_flycast_native_launch_binding(
+                                    profile,
+                                )
+                                .is_ok(),
+                            firmware: archivefs_core::launch::flycast_firmware_readiness(
+                                inspection.health.system.dreamcast_bios,
+                            ),
+                        }
+                    })
+                    .collect(),
+                FlycastProfilesState::NotScanned
+                | FlycastProfilesState::Scanning { .. }
+                | FlycastProfilesState::Error(_) => Vec::new(),
+            };
+
         let standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
             dolphin_standalone_profiles
                 .into_iter()
                 .chain(pcsx2_standalone_profiles)
+                .chain(flycast_standalone_profiles)
                 .collect();
 
         let plan = archivefs_core::launch::build_launch_plan(
@@ -10859,6 +10917,9 @@ impl ArchiveFsApp {
         ) {
             self.start_pcsx2_firmware_evidence_load(context.clone());
         }
+        if matches!(self.flycast_profiles, FlycastProfilesState::NotScanned) {
+            self.start_flycast_profile_scan(context.clone());
+        }
         let live = match &self.state {
             LoadState::Ready(data) => Some(data.as_ref()),
             _ => None,
@@ -10889,6 +10950,20 @@ impl ArchiveFsApp {
             LoadState::Ready(data) => Some(data.as_ref()),
             _ => None,
         };
+        match &self.flycast_profiles {
+            FlycastProfilesState::Scanning { .. } => {
+                ui.label("Checking Flycast installation and Dreamcast BIOS readiness…");
+            }
+            FlycastProfilesState::Error(message) => {
+                widgets::banner(
+                    ui,
+                    "Flycast readiness could not be checked",
+                    message,
+                    widgets::StatusTone::Warning,
+                );
+            }
+            FlycastProfilesState::NotScanned | FlycastProfilesState::Ready(_) => {}
+        }
         let launch_readiness_input = self.build_launch_readiness_input(live_for_launch_readiness);
         if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
             ui.ctx().request_repaint();
@@ -14489,6 +14564,41 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Starts read-only Flycast profile discovery for Launch Readiness. No
+    /// configuration or emulator state is written by this scan.
+    fn start_flycast_profile_scan(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.flycast_profiles = FlycastProfilesState::Scanning { receiver };
+        thread::spawn(move || {
+            let result = FlycastProfileDiscoveryRoots::from_environment()
+                .map_err(|error| error.to_string())
+                .map(|roots| {
+                    let discovery =
+                        archivefs_core::patch_manager::discover_flycast_profiles(&roots);
+                    FlycastProfilesReady { discovery }
+                });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_flycast_profiles(&mut self) {
+        if let FlycastProfilesState::Scanning { receiver } = &self.flycast_profiles {
+            match receiver.try_recv() {
+                Ok(Ok(ready)) => self.flycast_profiles = FlycastProfilesState::Ready(ready),
+                Ok(Err(message)) => {
+                    self.flycast_profiles = FlycastProfilesState::Error(message);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.flycast_profiles = FlycastProfilesState::Error(
+                        "Flycast profile discovery stopped unexpectedly.".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     /// Starts the background load of PS2 firmware/BIOS evidence from the
     /// user's registered DAT sources - see
     /// [`load_pcsx2_firmware_evidence_from_registry`]. Read-only: parses
@@ -15596,6 +15706,7 @@ impl ArchiveFsApp {
         self.poll_dolphin_profiles();
         self.poll_dolphin_local_profiles();
         self.poll_pcsx2_launch_profiles();
+        self.poll_flycast_profiles();
         self.poll_pcsx2_firmware_evidence();
         self.poll_cheat_workflow(context);
         if matches!(
@@ -28151,6 +28262,19 @@ enum Pcsx2LaunchProfilesState {
         receiver: Receiver<Result<Pcsx2LaunchProfilesReady, String>>,
     },
     Ready(Pcsx2LaunchProfilesReady),
+    Error(String),
+}
+
+struct FlycastProfilesReady {
+    discovery: FlycastProfileDiscovery,
+}
+
+enum FlycastProfilesState {
+    NotScanned,
+    Scanning {
+        receiver: Receiver<Result<FlycastProfilesReady, String>>,
+    },
+    Ready(FlycastProfilesReady),
     Error(String),
 }
 

@@ -1088,6 +1088,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         dolphin_profiles: DolphinProfilesState::NotScanned,
         dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
         pcsx2_launch_profiles: Pcsx2LaunchProfilesState::NotScanned,
+        flycast_profiles: FlycastProfilesState::NotScanned,
         pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
         xenia_profiles: XeniaProfilesState::NotScanned,
         remembered_emulator_profiles: Vec::new(),
