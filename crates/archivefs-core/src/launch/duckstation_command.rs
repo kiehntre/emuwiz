@@ -12,7 +12,8 @@
 //! # Scope
 //!
 //! Only the first supported native DuckStation launch slice: `PSX`
-//! platform, a direct regular `.iso` or `.chd` file, a verified PS1 serial,
+//! platform, a direct regular `.iso`, validated complete `.cue`/`.bin`, or
+//! `.chd` file, a verified PS1 serial,
 //! and an exact eligible [`DuckStationNativeLaunchBinding`]. Mounted/archive
 //! content, Flatpak, Portable/AppImage, and `Explicit` installs are all
 //! refused here - never silently widened.
@@ -24,7 +25,7 @@
 //! maps both `"iso"` and `"chd"` to it, so both already resolve through
 //! [`crate::launch::evidence_bridge::launch_content_ref_from_archive_record`]
 //! as [`LaunchContainerKind::PlainFile`] with `requires_mount: false`. Other
-//! formats DuckStation itself can read directly (`.cue`/`.bin`, `.pbp`,
+//! formats DuckStation itself can read directly (`.pbp`,
 //! `.ecm`, `.mds`/`.mdf`, `.ccd`) are not yet classified by that registry at
 //! all, so they are refused here rather than guessed at.
 //!
@@ -49,7 +50,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
+use crate::launch::planning::{
+    CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind, LaunchTarget,
+};
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 use crate::patch_manager::{
     DuckStationLaunchBlocker, DuckStationNativeLaunchBinding, DuckStationUserDirectoryMode,
@@ -59,11 +62,11 @@ use crate::patch_manager::{
 pub const DUCKSTATION_SUPPORTED_PLATFORM_ID: &str = "PSX";
 
 /// The only direct content extensions this slice supports (lowercase, no
-/// dot). CUE/BIN sets remain outside this native command slice until the
-/// complete-release validation is carried through the DuckStation candidate;
-/// a lone `.bin` is also refused because its track geometry is not
-/// authoritative.
-const DUCKSTATION_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "chd"];
+/// dot). A `.cue` is accepted only when the caller carries the explicit
+/// [`LaunchContainerKind::CueBin`] marker produced after complete-release
+/// validation; a lone `.bin` is always refused because its track geometry is
+/// not authoritative.
+const DUCKSTATION_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "cue", "chd"];
 
 /// The executable invocation data for a DuckStation launch that has passed
 /// every fail-closed check. This is data only: no type in this module
@@ -117,6 +120,21 @@ pub(crate) fn direct_ps1_extension(path: &std::path::Path) -> bool {
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
+}
+
+fn direct_ps1_content_is_supported(
+    path: &std::path::Path,
+    container: Option<LaunchContainerKind>,
+) -> bool {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("cue") => {
+            container == Some(LaunchContainerKind::CueBin)
+        }
+        Some(extension) => DUCKSTATION_SUPPORTED_EXTENSIONS.iter().any(|supported| {
+            !supported.eq_ignore_ascii_case("cue") && extension.eq_ignore_ascii_case(supported)
+        }),
+        None => false,
+    }
 }
 
 /// Builds a safe DuckStation argv plan from only an already-authorized
@@ -226,11 +244,11 @@ pub fn build_duckstation_command_plan(
                 LaunchBlockerKind::DuckStationContentFormatUnsupported,
                 "content path is an outer archive/mount-input path, not direct content",
             ));
-        } else if !direct_ps1_extension(path) {
+        } else if !direct_ps1_content_is_supported(path, candidate.content.container) {
             blockers.push(blocker(
                 LaunchBlockerKind::DuckStationContentFormatUnsupported,
-                "only a direct .iso or .chd file is supported by this native DuckStation launch \
-                 slice",
+                "only a direct .iso/.chd or a structurally validated complete .cue/.bin release \
+                 is supported by this native DuckStation launch slice",
             ));
         }
     }

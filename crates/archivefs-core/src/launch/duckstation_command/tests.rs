@@ -289,6 +289,20 @@ fn direct_iso_and_chd_are_both_accepted() {
     }
 }
 
+#[test]
+fn structurally_validated_cue_bin_is_accepted() {
+    let mut cue = candidate(Some(PathBuf::from("/games/game.cue")));
+    cue.content.container = Some(LaunchContainerKind::CueBin);
+    let plan = build_duckstation_command_plan(
+        &resolved(),
+        Some("SLUS-12345"),
+        &cue,
+        &default_native_binding("/usr/bin/duckstation-qt"),
+    );
+    assert!(plan.command.is_some());
+    assert!(plan.blockers.is_empty());
+}
+
 // --- 12: warnings/blockers rejected -----------------------------------------------------------------
 
 #[test]

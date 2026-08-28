@@ -11,11 +11,9 @@
 //! - `PSX` only - the only platform
 //!   [`crate::launch::duckstation_command::DUCKSTATION_SUPPORTED_PLATFORM_ID`]
 //!   names in this phase.
-//! - One direct loose regular `.iso`, `.cue`, or `.chd` file - no archive members,
-//!   no mounted content. See `duckstation_command`'s own module doc
-//!   comment for exactly why `.chd` is included alongside `.iso` here
-//!   (unlike PCSX2's PS2 slice) while `.cue`/`.bin` and other
-//!   DuckStation-readable formats are not.
+//! - One direct loose regular `.iso`, validated complete `.cue`/`.bin`, or
+//!   `.chd` file - no archive members, no mounted content. See
+//!   `duckstation_command`'s own module doc for the validation contract.
 //! - A verified PS1 serial is always required.
 //! - Strictly [`LaunchReadiness::Ready`] - `ReadyWithWarnings` and
 //!   `Blocked` are both refused, never silently accepted.
@@ -74,6 +72,7 @@ use std::path::{Path, PathBuf};
 use crate::dat::firmware_evidence::FirmwareIdentityRecord;
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::game_identity::inspect_catalogued_game_identity;
+use crate::ingestion::cue_bin::resolve_cue_all_files;
 use crate::launch::duckstation_command::{
     DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, build_duckstation_command_plan,
     direct_ps1_extension,
@@ -337,6 +336,23 @@ pub fn preflight_duckstation_launch(
     // --- 4: fresh identity re-inspection + verified PS1 serial ---
     let (identity_status, facts, verified_serial) = fresh_identity_status(content_path, request)?;
 
+    // A CUE is runnable only after every structurally referenced companion is
+    // present and safe. The identity reinspection above separately validates
+    // the unambiguous PS1 data track; together these checks establish a
+    // complete release before the pure command planner sees CueBin.
+    let cue_bin_release = content_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+    if cue_bin_release {
+        resolve_cue_all_files(content_path).map_err(|error| {
+            preflight_error(
+                DuckStationLaunchPreflightErrorKind::ContentFormatUnsupported,
+                format!("CUE/BIN release is incomplete or unsafe: {error}"),
+            )
+        })?;
+    }
+
     // --- 5-6: fresh profile discovery, find the exact requested profile ---
     let discovery = discover_duckstation_profiles(roots);
     let profile = discovery
@@ -371,7 +387,11 @@ pub fn preflight_duckstation_launch(
     // --- 8: rebuild the plan via the existing integration entry point ---
     let content_ref = LaunchContentRef {
         kind: Some(LaunchContentKind::OpticalDisc),
-        container: Some(LaunchContainerKind::PlainFile),
+        container: Some(if cue_bin_release {
+            LaunchContainerKind::CueBin
+        } else {
+            LaunchContainerKind::PlainFile
+        }),
         resolved_path: Some(content_path.clone()),
         requires_mount: false,
         provenance: "duckstation launch execution preflight: revalidated direct regular file"
@@ -433,8 +453,10 @@ pub fn preflight_duckstation_launch(
             ),
         ));
     }
-    if candidate.content.container != Some(LaunchContainerKind::PlainFile)
-        || candidate.content.requires_mount
+    if !matches!(
+        candidate.content.container,
+        Some(LaunchContainerKind::PlainFile | LaunchContainerKind::CueBin)
+    ) || candidate.content.requires_mount
         || !candidate.content.has_runnable_path()
     {
         return Err(preflight_error(
