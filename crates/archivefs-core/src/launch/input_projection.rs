@@ -91,6 +91,8 @@ pub enum VerifiedIdentityFact {
     SegaCdProductCode(String),
     /// A verified ScummVM engine/game ID returned by the local detector.
     ScummVmGameId(String),
+    /// A verified structured 3DO Opera disc identity.
+    ThreeDoDiscId(String),
     /// A verified Atari ST title, matching
     /// [`crate::patch_manager::HatariSelectedGameRequest::verified_title`].
     AtariStTitle(String),

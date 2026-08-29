@@ -30,13 +30,13 @@
 //! [92..96] root_block_size        u32   (block size used within the root directory)
 //! ```
 //!
-//! No field in this header is a serial/catalog/product code - unlike
-//! [`crate::saturn_boot_evidence`]'s `PRODUCT_NUMBER`, no independently
-//! corroborated source found in this research pass identifies any Opera
-//! volume-header field as a release identifier, so this module emits no
-//! [`crate::content_evidence::ContentEvidenceKind::ProductCode`] fact -
-//! `volume_label`/`volume_comment` are exposed as plain fields only, never
-//! promoted to evidence.
+//! The volume and root identifiers are not publisher-assigned serials. They
+//! are nevertheless the strongest stable, structured identity exposed by the
+//! format: the 3DO Development Repo documents them as the volume unique ID
+//! and root unique ID, and its identification table uses them for software
+//! identification. They are therefore exposed as a composite *disc
+//! identity* fact, never as a title or catalogue lookup. The human-readable
+//! label/comment remain plain fields and are never promoted to identity.
 //!
 //! # Collision safety
 //!
@@ -94,6 +94,29 @@ impl OperaVolumeHeaderFact {
     /// evidence at all.
     pub fn header_is_valid(&self) -> bool {
         self.record_type == 1 && self.sync_valid && self.record_version == 1
+    }
+
+    /// The structural fields needed for a trustworthy 3DO disc identity.
+    /// The identifiers are random-looking format fields rather than a
+    /// filename or human title; block geometry is included to prevent a
+    /// truncated/header-only lookalike from becoming authoritative.
+    pub fn identity_is_valid(&self) -> bool {
+        self.header_is_valid()
+            && self.volume_id != 0
+            && self.block_size == 2048
+            && self.block_count != 0
+            && self.root_directory_id != 0
+            && self.root_directory_blocks != 0
+            && self.root_block_size == 2048
+    }
+
+    /// Stable structured identity value, preserving both on-disc IDs and
+    /// the declared logical size. This is not a database-derived title.
+    pub fn disc_identity(&self) -> String {
+        format!(
+            "VOL{:08X}-ROOT{:08X}-BLOCKS{:08X}",
+            self.volume_id, self.root_directory_id, self.block_count
+        )
     }
 }
 

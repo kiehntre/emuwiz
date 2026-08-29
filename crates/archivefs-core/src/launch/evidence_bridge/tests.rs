@@ -974,3 +974,32 @@ fn requires_mount_is_false_for_every_loose_direct_kind() {
         );
     }
 }
+
+#[test]
+fn verified_threedo_disc_identity_resolves_to_3do_fact() {
+    let source = report(
+        IdentityPlatform::ThreeDo,
+        vec![evidence(
+            IdentityKind::ThreeDoDiscId,
+            IdentityStatus::Verified,
+            Some("VOL198EEB79-ROOT1F2377CF-BLOCKS00000001"),
+            IdentityConfidence::StructuredMetadata,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "3DO".to_string(),
+            game_key: "VOL198EEB79-ROOT1F2377CF-BLOCKS00000001".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::ThreeDoDiscId(
+            "VOL198EEB79-ROOT1F2377CF-BLOCKS00000001".to_string()
+        )]
+    );
+}

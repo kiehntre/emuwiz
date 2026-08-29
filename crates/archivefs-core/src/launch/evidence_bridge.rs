@@ -86,6 +86,7 @@ fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::XexTitleId
             | IdentityKind::XexMediaId
             | IdentityKind::ScummVmGameId
+            | IdentityKind::ThreeDoDiscId
     )
 }
 
@@ -153,6 +154,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::Xbox => Some("Xbox"),
         IdentityPlatform::Xbox360 => Some("Xbox360"),
         IdentityPlatform::ScummVM => Some("ScummVM"),
+        IdentityPlatform::ThreeDo => Some("3DO"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
         IdentityPlatform::Other => None,
@@ -314,6 +316,14 @@ fn resolved_identity_for_platform(
                 platform_id,
                 game_id.to_string(),
                 vec![VerifiedIdentityFact::ScummVmGameId(game_id.to_string())],
+            ))
+        }
+        IdentityPlatform::ThreeDo => {
+            let disc_id = find_value(resolved, IdentityKind::ThreeDoDiscId)?;
+            Some((
+                platform_id,
+                disc_id.to_string(),
+                vec![VerifiedIdentityFact::ThreeDoDiscId(disc_id.to_string())],
             ))
         }
         IdentityPlatform::Other => None,

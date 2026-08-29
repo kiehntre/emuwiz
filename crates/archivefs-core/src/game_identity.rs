@@ -39,6 +39,7 @@ use crate::raw_cd_logical_media::{
 };
 use crate::saturn_boot_evidence::{SATURN_SYSTEM_ID_BYTES, parse_saturn_system_id};
 use crate::segacd_boot_evidence::{SEGA_CD_DISC_ID_BYTES, parse_segacd_product_code};
+use crate::threedo_boot_evidence::{OPERA_HEADER_BYTES, parse_opera_volume_header};
 
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
 pub const MAX_ARCHIVE_MEMBERS: usize = 4_096;
@@ -205,6 +206,10 @@ pub enum IdentityKind {
     /// A game ID returned by the locally installed ScummVM detector for an
     /// extracted game folder. The ID is never derived from its folder name.
     ScummVmGameId,
+    /// Composite structured identity from a 3DO Opera volume header:
+    /// volume identifier, root unique identifier, and declared block count.
+    /// These are on-disc fields, not a filename or title-database lookup.
+    ThreeDoDiscId,
 }
 
 impl fmt::Display for IdentityKind {
@@ -231,6 +236,7 @@ impl fmt::Display for IdentityKind {
             Self::XexTitleId => "Xbox 360 Title ID",
             Self::XexMediaId => "Xbox 360 Media ID",
             Self::ScummVmGameId => "ScummVM game ID",
+            Self::ThreeDoDiscId => "3DO disc identity",
         };
         f.write_str(value)
     }
@@ -268,6 +274,7 @@ pub enum IdentityPlatform {
     Xbox,
     Xbox360,
     ScummVM,
+    ThreeDo,
     Other,
 }
 
@@ -301,6 +308,7 @@ impl IdentityPlatform {
             "xbox" | "original xbox" | "microsoft xbox" => Self::Xbox,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             "scummvm" | "scumm vm" => Self::ScummVM,
+            "3do" | "panasonic 3do" | "3do interactive multiplayer" => Self::ThreeDo,
             _ => Self::Other,
         }
     }
@@ -326,6 +334,7 @@ impl IdentityPlatform {
             Self::Xbox => "Xbox",
             Self::Xbox360 => "Xbox 360",
             Self::ScummVM => "ScummVM",
+            Self::ThreeDo => "3DO",
             Self::Other => "Unsupported platform",
         }
     }
@@ -560,6 +569,13 @@ impl GameIdentityReport {
     pub fn verified_scummvm_game_id(&self) -> Option<&str> {
         self.verified_value(IdentityKind::ScummVmGameId)
     }
+
+    /// The verified structured 3DO Opera disc identity. This preserves the
+    /// volume/root identifiers and declared block count from the disc header;
+    /// it is not a publisher serial or a filename-derived title.
+    pub fn verified_threedo_disc_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::ThreeDoDiscId)
+    }
 }
 
 pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameIdentityReport {
@@ -716,6 +732,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::Saturn
                     | IdentityPlatform::Dreamcast
                     | IdentityPlatform::SegaCd
+                    | IdentityPlatform::ThreeDo
             ) =>
         {
             inspect_cue(&mut report, trusted);
@@ -1360,6 +1377,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
+        | IdentityPlatform::ThreeDo
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -2397,6 +2415,9 @@ fn inspect_iso_source(
         IdentityPlatform::SegaCd => {
             inspect_sega_cd_source(report, source, member_path, member_index)
         }
+        IdentityPlatform::ThreeDo => {
+            inspect_threedo_source(report, source, member_path, member_index)
+        }
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -2810,6 +2831,103 @@ fn inspect_sega_cd_source(
             "product code read from SEGADISCSYSTEM Disc ID; raw field {:?}",
             fact.raw_product_code
         ),
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
+/// Authoritative 3DO identity from the Opera filesystem volume header at
+/// logical offset zero. The composite value uses only documented structured
+/// fields (volume identifier, root unique identifier, and block count); the
+/// volume label and path are deliberately not identity authority.
+fn inspect_threedo_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut header = [0_u8; OPERA_HEADER_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut header) {
+        push_with_source(
+            report,
+            IdentityKind::ThreeDoDiscId,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "3DO Opera volume header bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(fact) = parse_opera_volume_header(&header) else {
+        push_with_source(
+            report,
+            IdentityKind::ThreeDoDiscId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "3DO Opera volume header parse",
+            "Opera volume header is truncated or malformed",
+        );
+        return;
+    };
+    if !fact.identity_is_valid() {
+        push_with_source(
+            report,
+            IdentityKind::ThreeDoDiscId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "3DO Opera volume header validation",
+            "Opera header signature or logical block geometry is invalid",
+        );
+        return;
+    }
+    let Some(declared_bytes) = (fact.block_size as u64).checked_mul(fact.block_count as u64) else {
+        push_with_source(
+            report,
+            IdentityKind::ThreeDoDiscId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "3DO Opera volume size arithmetic",
+            "declared Opera volume size overflows",
+        );
+        return;
+    };
+    if declared_bytes > source.len() {
+        push_with_source(
+            report,
+            IdentityKind::ThreeDoDiscId,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "3DO Opera volume size validation",
+            "declared Opera volume extends beyond the readable image",
+        );
+        return;
+    }
+    let value = fact.disc_identity();
+    push_with_source(
+        report,
+        IdentityKind::ThreeDoDiscId,
+        IdentityStatus::Verified,
+        Some(value),
+        IdentityConfidence::StructuredMetadata,
+        member_path,
+        member_index,
+        "3DO Opera volume header identity",
+        "volume identifier, root unique identifier, and block count read from validated OperaFS header",
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -4716,6 +4834,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
         IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
         IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
+        IdentityPlatform::ThreeDo => &[IdentityKind::ThreeDoDiscId],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -4916,6 +5035,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::N64
         | IdentityPlatform::Xbox
         | IdentityPlatform::ScummVM
+        | IdentityPlatform::ThreeDo
         | IdentityPlatform::Other => {}
     }
 }
@@ -8881,6 +9001,94 @@ mod tests {
 
         let report = inspect_catalogued_game_identity(&path, Some("Xbox"));
         assert_eq!(report.verified_xbox_title_id(), Some("4D530058"));
+        assert!(report.complete);
+    }
+
+    fn threedo_fixture(volume_id: u32, root_id: u32, blocks: u32) -> Vec<u8> {
+        let mut image = vec![0_u8; 2048];
+        image[0] = 1;
+        image[1..6].fill(0x5A);
+        image[6] = 1;
+        image[40..51].copy_from_slice(b"CD-ROM TEST");
+        image[72..76].copy_from_slice(&volume_id.to_be_bytes());
+        image[76..80].copy_from_slice(&2048_u32.to_be_bytes());
+        image[80..84].copy_from_slice(&blocks.to_be_bytes());
+        image[84..88].copy_from_slice(&root_id.to_be_bytes());
+        image[88..92].copy_from_slice(&1_u32.to_be_bytes());
+        image[92..96].copy_from_slice(&2048_u32.to_be_bytes());
+        image
+    }
+
+    #[test]
+    fn threedo_opera_header_provides_verified_structured_identity() {
+        let directory = FixtureDir::new("threedo-identity");
+        let path = write_fixture(
+            &directory,
+            "misleading-name.iso",
+            &threedo_fixture(0x198E_EB79, 0x1F23_77CF, 1),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("3DO"));
+        assert_eq!(report.platform, IdentityPlatform::ThreeDo);
+        assert_eq!(report.format, IdentityImageFormat::Iso);
+        assert_eq!(
+            report.verified_threedo_disc_id(),
+            Some("VOL198EEB79-ROOT1F2377CF-BLOCKS00000001")
+        );
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn threedo_filename_and_human_label_are_not_identity_authority() {
+        let directory = FixtureDir::new("threedo-renamed");
+        let path = write_fixture(
+            &directory,
+            "Totally-Wrong-Title.iso",
+            &threedo_fixture(0x1234_5678, 0x9ABC_DEF0, 1),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("Panasonic 3DO"));
+        assert_eq!(
+            report.verified_threedo_disc_id(),
+            Some("VOL12345678-ROOT9ABCDEF0-BLOCKS00000001")
+        );
+        assert!(!report.evidence.iter().any(|evidence| {
+            evidence.status == IdentityStatus::Verified
+                && evidence.confidence == IdentityConfidence::FilenameOnly
+        }));
+    }
+
+    #[test]
+    fn ordinary_iso_and_truncated_opera_headers_fail_closed() {
+        let directory = FixtureDir::new("threedo-invalid");
+        let ordinary = write_fixture(&directory, "ordinary.iso", &[0_u8; 2048]);
+        let ordinary_report = inspect_catalogued_game_identity(&ordinary, Some("3DO"));
+        assert_eq!(ordinary_report.verified_threedo_disc_id(), None);
+        assert!(!ordinary_report.complete);
+
+        let truncated = write_fixture(&directory, "truncated.iso", &[1_u8; 95]);
+        let truncated_report = inspect_catalogued_game_identity(&truncated, Some("3DO"));
+        assert_eq!(truncated_report.verified_threedo_disc_id(), None);
+        assert!(!truncated_report.complete);
+    }
+
+    #[test]
+    fn threedo_mode1_2048_cue_uses_the_same_verified_header_path() {
+        let directory = FixtureDir::new("threedo-cue");
+        fs::write(
+            directory.0.join("data with spaces.bin"),
+            threedo_fixture(0x1020_3040, 0x5060_7080, 1),
+        )
+        .unwrap();
+        let cue = write_fixture(
+            &directory,
+            "renamed.cue",
+            b"FILE \"data with spaces.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        let report = inspect_catalogued_game_identity(&cue, Some("3DO"));
+        assert_eq!(report.format, IdentityImageFormat::Iso);
+        assert_eq!(
+            report.verified_threedo_disc_id(),
+            Some("VOL10203040-ROOT50607080-BLOCKS00000001")
+        );
         assert!(report.complete);
     }
 }
