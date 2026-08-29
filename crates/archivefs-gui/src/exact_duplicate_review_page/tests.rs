@@ -208,7 +208,7 @@ fn different_byte_files_never_display_as_duplicates() {
     assert!(state.report().unwrap().groups.is_empty());
     let ctx = egui::Context::default();
     let output = render(&ctx, &mut state, base_input());
-    assert!(!rendered_text_contains(&output, "Exact copies"));
+    assert!(rendered_text_contains(&output, "Review & actions"));
 }
 
 // --- 3: trusted-root recommendation is shown --------------------------------

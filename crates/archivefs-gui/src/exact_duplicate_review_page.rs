@@ -983,9 +983,9 @@ fn show_recovery_banner(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageS
 fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState) {
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Duplicate review").strong());
+            ui.label(egui::RichText::new("Review & actions").strong());
             if ui
-                .selectable_label(state.mode == DuplicateReviewMode::Exact, "Exact duplicates")
+                .selectable_label(state.mode == DuplicateReviewMode::Exact, "Exact copies")
                 .clicked()
             {
                 state.mode = DuplicateReviewMode::Exact;
@@ -995,7 +995,7 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
             if ui
                 .selectable_label(
                     state.mode == DuplicateReviewMode::EquivalentN64,
-                    "Equivalent content (N64)",
+                    "Equivalent games · N64",
                 )
                 .clicked()
             {
@@ -1007,7 +1007,7 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
             if ui
                 .selectable_label(
                     state.mode == DuplicateReviewMode::EquivalentOptical,
-                    "Equivalent content (optical disc)",
+                    "Equivalent games · optical disc",
                 )
                 .clicked()
             {
@@ -1030,6 +1030,11 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
                 egui::TextEdit::singleline(&mut state.source_root_draft)
                     .id(egui::Id::new("exact_duplicate_source_root")),
             );
+            if ui.button("Browse…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                state.source_root_draft = path.display().to_string();
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Trusted folder (optional):");
@@ -1037,6 +1042,11 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
                 egui::TextEdit::singleline(&mut state.trusted_root_draft)
                     .id(egui::Id::new("exact_duplicate_trusted_root")),
             );
+            if ui.button("Browse…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                state.trusted_root_draft = path.display().to_string();
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Already-organized library folder (optional):");
@@ -1044,6 +1054,11 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
                 egui::TextEdit::singleline(&mut state.elected_library_draft)
                     .id(egui::Id::new("exact_duplicate_elected_root")),
             );
+            if ui.button("Browse…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                state.elected_library_draft = path.display().to_string();
+            }
         });
         ui.horizontal(|ui| {
             let scanning = matches!(state.scan_status, Some(ScanStatus::Scanning));

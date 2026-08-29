@@ -576,6 +576,8 @@ pub(crate) fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
             // one-character-wide vertical text. Narrow viewports scroll or
             // wrap whole cards instead.
             ui.set_min_width(96.0);
+            ui.set_width(120.0);
+            ui.set_max_width(120.0);
             ui.vertical_centered(|ui| {
                 ui.strong(value.to_string());
                 ui.small(label);

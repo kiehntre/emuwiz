@@ -1646,130 +1646,140 @@ pub(super) fn show_history_logs_page(
                         .cmp(&left.1.timestamp_unix_seconds)
                         .then_with(|| right.1.operation_id.cmp(&left.1.operation_id))
                 });
-                for (path, journal) in journals.into_iter().take(200) {
-                    widgets::card(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            widgets::status_badge(
-                                ui,
-                                shared_history_status_label(journal.status),
-                                match journal.status {
-                                    SharedApplyStatus::Success => widgets::StatusTone::Success,
-                                    SharedApplyStatus::PartialFailure => {
-                                        widgets::StatusTone::Warning
-                                    }
-                                    SharedApplyStatus::Failed => widgets::StatusTone::Blocked,
-                                    SharedApplyStatus::DryRun => widgets::StatusTone::Info,
-                                },
-                            );
-                            ui.strong(shared_history_title(journal));
-                            if selected_operation == Some(journal.operation_id.as_str()) {
+                egui::CollapsingHeader::new(format!(
+                    "Saved change history ({})",
+                    report.journals.len()
+                ))
+                .id_salt("history-saved-changes")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label("Expand to review saved changes and rollback previews.");
+                    ui.add_space(4.0);
+                    for (path, journal) in journals.into_iter().take(200) {
+                        widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 widgets::status_badge(
                                     ui,
-                                    "Opened from apply result",
-                                    widgets::StatusTone::Info,
+                                    shared_history_status_label(journal.status),
+                                    match journal.status {
+                                        SharedApplyStatus::Success => widgets::StatusTone::Success,
+                                        SharedApplyStatus::PartialFailure => {
+                                            widgets::StatusTone::Warning
+                                        }
+                                        SharedApplyStatus::Failed => widgets::StatusTone::Blocked,
+                                        SharedApplyStatus::DryRun => widgets::StatusTone::Info,
+                                    },
                                 );
+                                ui.strong(shared_history_title(journal));
+                                if selected_operation == Some(journal.operation_id.as_str()) {
+                                    widgets::status_badge(
+                                        ui,
+                                        "Opened from apply result",
+                                        widgets::StatusTone::Info,
+                                    );
+                                }
+                            });
+                            ui.label(format!(
+                                "{} · {}",
+                                shared_history_adapter_label(journal.context.adapter),
+                                format_shared_history_time(
+                                    journal.timestamp_unix_seconds,
+                                    SystemTime::now()
+                                )
+                            ));
+                            ui.label(format!(
+                                "{} change{}",
+                                journal.entries.len(),
+                                if journal.entries.len() == 1 { "" } else { "s" }
+                            ));
+                            ui.label(format!(
+                                "Rollback: {}",
+                                if journal.rollback_operation_id.is_some() {
+                                    "already completed"
+                                } else if journal.status == SharedApplyStatus::Success {
+                                    "preview may be available"
+                                } else {
+                                    "unavailable"
+                                }
+                            ));
+                            widgets::technical_details(
+                                ui,
+                                ("journal_technical_detail", &journal.plan_id),
+                                |ui| {
+                                    widgets::copyable_value(
+                                        ui,
+                                        "Transaction ID",
+                                        &journal.operation_id,
+                                    );
+                                    widgets::copyable_value(ui, "Plan ID", &journal.plan_id);
+                                    ui.label(format!(
+                                        "Raw timestamp: {}",
+                                        journal.timestamp_unix_seconds
+                                    ));
+                                    widgets::copyable_value(
+                                        ui,
+                                        "Selected archive",
+                                        &journal.context.selected_archive.display,
+                                    );
+                                    widgets::copyable_value(
+                                        ui,
+                                        "Source mode",
+                                        &journal.context.source_mode,
+                                    );
+                                    widgets::copyable_value(
+                                        ui,
+                                        "Destination root",
+                                        &journal.destination_root.display,
+                                    );
+                                    if widgets::path_value(
+                                        ui,
+                                        "Journal path",
+                                        &PathBuf::from(&path.display),
+                                    ) {
+                                        let _ = clipboard.set_text(path.display.clone());
+                                    }
+                                    for entry in &journal.entries {
+                                        ui.label(format!(
+                                            "{:?} · {} · verification {} · backup {}",
+                                            entry.outcome,
+                                            entry.plan_entry.destination_relative_path.display,
+                                            if entry.verification_succeeded {
+                                                "passed"
+                                            } else {
+                                                "not complete"
+                                            },
+                                            if entry.backup_path.is_some() {
+                                                "retained"
+                                            } else {
+                                                "not required"
+                                            }
+                                        ));
+                                    }
+                                },
+                            );
+                            let journal_path = path.to_path_buf().ok();
+                            let destination_root = journal.destination_root.to_path_buf().ok();
+                            let can_preview = journal.status == SharedApplyStatus::Success
+                                && journal.rollback_operation_id.is_none()
+                                && journal_path.is_some()
+                                && destination_root.is_some()
+                                && matches!(rollback, SharedRollbackState::Idle);
+                            if widgets::action_button(
+                                ui,
+                                "Preview rollback",
+                                widgets::ActionStyle::Secondary,
+                                can_preview,
+                            )
+                            .clicked()
+                            {
+                                action = Some(HistoryPageAction::PreviewRollback {
+                                    journal_path: journal_path.expect("enabled path"),
+                                    destination_root: destination_root.expect("enabled root"),
+                                });
                             }
                         });
-                        ui.label(format!(
-                            "{} · {}",
-                            shared_history_adapter_label(journal.context.adapter),
-                            format_shared_history_time(
-                                journal.timestamp_unix_seconds,
-                                SystemTime::now()
-                            )
-                        ));
-                        ui.label(format!(
-                            "{} change{}",
-                            journal.entries.len(),
-                            if journal.entries.len() == 1 { "" } else { "s" }
-                        ));
-                        ui.label(format!(
-                            "Rollback: {}",
-                            if journal.rollback_operation_id.is_some() {
-                                "already completed"
-                            } else if journal.status == SharedApplyStatus::Success {
-                                "preview may be available"
-                            } else {
-                                "unavailable"
-                            }
-                        ));
-                        widgets::technical_details(
-                            ui,
-                            ("journal_technical_detail", &journal.plan_id),
-                            |ui| {
-                                widgets::copyable_value(
-                                    ui,
-                                    "Transaction ID",
-                                    &journal.operation_id,
-                                );
-                                widgets::copyable_value(ui, "Plan ID", &journal.plan_id);
-                                ui.label(format!(
-                                    "Raw timestamp: {}",
-                                    journal.timestamp_unix_seconds
-                                ));
-                                widgets::copyable_value(
-                                    ui,
-                                    "Selected archive",
-                                    &journal.context.selected_archive.display,
-                                );
-                                widgets::copyable_value(
-                                    ui,
-                                    "Source mode",
-                                    &journal.context.source_mode,
-                                );
-                                widgets::copyable_value(
-                                    ui,
-                                    "Destination root",
-                                    &journal.destination_root.display,
-                                );
-                                if widgets::path_value(
-                                    ui,
-                                    "Journal path",
-                                    &PathBuf::from(&path.display),
-                                ) {
-                                    let _ = clipboard.set_text(path.display.clone());
-                                }
-                                for entry in &journal.entries {
-                                    ui.label(format!(
-                                        "{:?} · {} · verification {} · backup {}",
-                                        entry.outcome,
-                                        entry.plan_entry.destination_relative_path.display,
-                                        if entry.verification_succeeded {
-                                            "passed"
-                                        } else {
-                                            "not complete"
-                                        },
-                                        if entry.backup_path.is_some() {
-                                            "retained"
-                                        } else {
-                                            "not required"
-                                        }
-                                    ));
-                                }
-                            },
-                        );
-                        let journal_path = path.to_path_buf().ok();
-                        let destination_root = journal.destination_root.to_path_buf().ok();
-                        let can_preview = journal.status == SharedApplyStatus::Success
-                            && journal.rollback_operation_id.is_none()
-                            && journal_path.is_some()
-                            && destination_root.is_some()
-                            && matches!(rollback, SharedRollbackState::Idle);
-                        if widgets::action_button(
-                            ui,
-                            "Preview rollback",
-                            widgets::ActionStyle::Secondary,
-                            can_preview,
-                        )
-                        .clicked()
-                        {
-                            action = Some(HistoryPageAction::PreviewRollback {
-                                journal_path: journal_path.expect("enabled path"),
-                                destination_root: destination_root.expect("enabled root"),
-                            });
-                        }
-                    });
-                }
+                    }
+                });
             }
         }
     }
@@ -1957,53 +1967,60 @@ pub(super) fn show_history_logs_page(
         );
         ui.add_space(4.0);
     }
-    for (row_index, (entry, text)) in visible_entries
-        .iter()
-        .zip(&visible_texts)
-        .enumerate()
-        .take(HISTORY_ACTIVITY_RENDER_CAP)
-    {
-        widgets::card(ui, |ui| {
-            widgets::activity_row_header(
-                ui,
-                entry.outcome.to_string(),
-                activity_outcome_tone(entry.outcome),
-                entry.action.to_string(),
-                Some(&format_history_timestamp(entry.timestamp)),
-                |ui| {
-                    if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
-                        .clicked()
-                    {
-                        let _ = clipboard.set_text(text.clone());
+    egui::CollapsingHeader::new(format!("Session entries ({})", visible_texts.len()))
+        .id_salt("history-session-activity")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label("Expand to review the recorded operation cards.");
+            ui.add_space(4.0);
+            for (row_index, (entry, text)) in visible_entries
+                .iter()
+                .zip(&visible_texts)
+                .enumerate()
+                .take(HISTORY_ACTIVITY_RENDER_CAP)
+            {
+                widgets::card(ui, |ui| {
+                    widgets::activity_row_header(
+                        ui,
+                        entry.outcome.to_string(),
+                        activity_outcome_tone(entry.outcome),
+                        entry.action.to_string(),
+                        Some(&format_history_timestamp(entry.timestamp)),
+                        |ui| {
+                            if widgets::action_button(ui, "Copy", widgets::ActionStyle::Quiet, true)
+                                .clicked()
+                            {
+                                let _ = clipboard.set_text(text.clone());
+                            }
+                        },
+                    );
+                    ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
+                    if let Some(path) = &entry.archive_path {
+                        // Root cause of the "First use of widget ID .../Second use
+                        // of widget ID ..." egui warning in this list: the salt
+                        // used to be `("history_related_archive", path)` alone, so
+                        // any two entries referencing the same archive (e.g. a
+                        // mount followed by an unmount of the same file) collided
+                        // on an identical `CollapsingHeader` ID. `row_index` is
+                        // this render's own guaranteed-unique per-row discriminator
+                        // (unlike the path, or `entry.timestamp`, which is not
+                        // guaranteed unique at typical `SystemTime` resolution),
+                        // so every row gets a distinct, stable-for-this-frame ID
+                        // regardless of how many entries share the same archive.
+                        widgets::technical_details(
+                            ui,
+                            ("history_related_archive", row_index, path),
+                            |ui| {
+                                if widgets::path_value(ui, "Archive", path) {
+                                    let _ = clipboard.set_text(path.display().to_string());
+                                }
+                            },
+                        );
                     }
-                },
-            );
-            ui.add(egui::Label::new(&entry.message).selectable(true).wrap());
-            if let Some(path) = &entry.archive_path {
-                // Root cause of the "First use of widget ID .../Second use
-                // of widget ID ..." egui warning in this list: the salt
-                // used to be `("history_related_archive", path)` alone, so
-                // any two entries referencing the same archive (e.g. a
-                // mount followed by an unmount of the same file) collided
-                // on an identical `CollapsingHeader` ID. `row_index` is
-                // this render's own guaranteed-unique per-row discriminator
-                // (unlike the path, or `entry.timestamp`, which is not
-                // guaranteed unique at typical `SystemTime` resolution),
-                // so every row gets a distinct, stable-for-this-frame ID
-                // regardless of how many entries share the same archive.
-                widgets::technical_details(
-                    ui,
-                    ("history_related_archive", row_index, path),
-                    |ui| {
-                        if widgets::path_value(ui, "Archive", path) {
-                            let _ = clipboard.set_text(path.display().to_string());
-                        }
-                    },
-                );
+                });
+                ui.add_space(6.0);
             }
         });
-        ui.add_space(6.0);
-    }
     action
 }
 

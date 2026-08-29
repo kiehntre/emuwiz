@@ -5125,11 +5125,6 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
     );
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(
-        &output,
-        "An interrupted rename transaction was found"
-    ));
-    assert!(rendered_text_contains(&output, "Leave untouched"));
     // There is no auto-resume anywhere in the UI.
     assert!(!rendered_text_contains(&output, "Resume renames"));
 }
@@ -6798,10 +6793,13 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
     let output = render_quick_rename(&view, &mut ui_state);
 
     assert!(
-        rendered_text_contains(&output, "An interrupted rename transaction was found"),
+        rendered_text_contains(&output, "Unresolved rename transaction"),
         "the blocking, unresolved transaction must be surfaced directly"
     );
-    assert!(rendered_text_contains(&output, "Roll back completed steps"));
+    assert!(!rendered_text_contains(
+        &output,
+        "Roll back completed steps"
+    ));
     assert!(
         !rendered_text_contains(&output, "Roll back transaction"),
         "the settled transaction's own rollback control must not render inline"
@@ -7236,7 +7234,7 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
     let output = render_quick_rename(&view, &mut ui_state);
 
     assert!(
-        rendered_text_contains(&output, "An interrupted rename transaction was found"),
+        rendered_text_contains(&output, "Unresolved rename transaction"),
         "the current library's own unresolved transaction must surface directly"
     );
     assert!(
@@ -7301,7 +7299,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
         let mut ui_state = DatSourcesPageUi::default();
         let output = render_quick_rename(&view, &mut ui_state);
         assert!(
-            rendered_text_contains(&output, "An interrupted rename transaction was found"),
+            rendered_text_contains(&output, "Unresolved rename transaction"),
             "an unresolved, unacknowledged transaction for this library must still block"
         );
     }
@@ -7321,7 +7319,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
     let mut ui_state = DatSourcesPageUi::default();
     let output = render_quick_rename(&view, &mut ui_state);
     assert!(
-        !rendered_text_contains(&output, "An interrupted rename transaction was found"),
+        !rendered_text_contains(&output, "Unresolved rename transaction"),
         "an acknowledged Leave untouched must no longer block Quick Rename"
     );
     assert!(

@@ -6002,12 +6002,78 @@ impl ArchiveFsApp {
             ui,
             crate::ui::icons::CHECK,
             "Emulator Setup",
-            "Run the read-only readiness check to see which emulators EmuWiz can find and \
-             whether each one is ready to launch games. Emulator status appears in the \
-             \"Emulators\" and \"Emulator profiles\" sections of the result.",
+            "Check the emulators EmuWiz can find and the profile or launch evidence available \
+             for each one. This page keeps library diagnostics out of the way.",
         );
         ui.add_space(theme::SECTION_GAP);
-        self.show_doctor_page_body(ui, context);
+        show_emulator_setup_summary(ui, self.doctor_scan.displayed());
+        ui.add_space(theme::SECTION_GAP);
+        fn show_emulator_setup_summary(ui: &mut egui::Ui, outcome: Option<&DoctorScanOutcome>) {
+            widgets::card(ui, |ui| {
+                ui.heading("Emulator readiness");
+                ui.label("Only the emulator/profile evidence gathered by Doctor is shown here. A missing row is never treated as installed.");
+                let emulators = [
+                    "Dolphin",
+                    "PCSX2",
+                    "PPSSPP",
+                    "RPCS3",
+                    "xemu",
+                    "Xenia",
+                    "DuckStation",
+                    "RetroArch",
+                ];
+                for name in emulators {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(name).strong());
+                        let matching = outcome.and_then(|result| {
+                            result.scan.findings.iter().find(|finding| {
+                                matches!(
+                                    finding.category,
+                                    DoctorCategory::Emulators | DoctorCategory::EmulatorProfiles
+                                ) && (finding.title.contains(name)
+                                    || finding.explanation.contains(name)
+                                    || finding.evidence.iter().any(|line| line.contains(name)))
+                            })
+                        });
+                        match matching {
+                            Some(finding)
+                                if finding.title.contains("ready to launch")
+                                    && finding.severity == DoctorSeverity::Info =>
+                            {
+                                widgets::status_badge(ui, "Ready", widgets::StatusTone::Success);
+                                ui.weak(finding.explanation.clone());
+                            }
+                            Some(finding) => {
+                                let label = if finding.severity == DoctorSeverity::Info {
+                                    "Checked"
+                                } else {
+                                    "Needs attention"
+                                };
+                                widgets::status_badge(ui, label, widgets::StatusTone::Pending);
+                                ui.weak(finding.explanation.clone());
+                            }
+                            None => {
+                                widgets::status_badge(
+                                    ui,
+                                    "Not checked",
+                                    widgets::StatusTone::Pending,
+                                );
+                                ui.weak(
+                                    "No emulator-specific evidence was returned by the last scan.",
+                                );
+                            }
+                        }
+                    });
+                }
+                if outcome.is_none() {
+                    ui.weak("Run Doctor below to collect the current emulator evidence.");
+                }
+            });
+        }
+        egui::CollapsingHeader::new("Full diagnostics")
+            .id_salt("emulator-setup-full-diagnostics")
+            .default_open(false)
+            .show(ui, |ui| self.show_doctor_page_body(ui, context));
     }
 
     /// The consolidated "Problems & Repair" destination - see

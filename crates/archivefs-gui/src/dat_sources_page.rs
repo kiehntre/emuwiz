@@ -6779,18 +6779,37 @@ pub(crate) fn show_quick_rename_page(
         }
         if !blocking.is_empty() {
             ui.add_space(10.0);
-            widgets::section_header(
+            widgets::banner(
                 ui,
-                "Unresolved rename transaction",
-                Some(
-                    "This must be resolved before Quick Rename can safely continue in this folder.",
+                "Recovery required",
+                &format!(
+                    "{} unresolved rename transaction{} must be resolved before Quick Rename can safely continue in this folder.",
+                    blocking.len(),
+                    if blocking.len() == 1 { "" } else { "s" }
                 ),
+                widgets::StatusTone::Warning,
             );
-            if let Some(recovery_action) =
-                show_recovery_transactions(ui, &blocking, view.rename_apply.rollback_running)
-            {
-                action = Some(recovery_action);
-            }
+            egui::CollapsingHeader::new(format!(
+                "Unresolved rename transaction recovery ({})",
+                blocking.len()
+            ))
+            .id_salt("quick-rename-blocking-recovery")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Expand this section to review rollback and recovery actions.",
+                    )
+                    .color(theme::muted(ui))
+                    .small(),
+                );
+                ui.add_space(4.0);
+                if let Some(recovery_action) =
+                    show_recovery_transactions(ui, &blocking, view.rename_apply.rollback_running)
+                {
+                    action = Some(recovery_action);
+                }
+            });
         }
         if action.is_none() && !other.is_empty() {
             ui.add_space(10.0);

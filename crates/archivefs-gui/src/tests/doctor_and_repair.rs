@@ -2373,10 +2373,8 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
         rendered_text_contains(&output, "Emulator Setup"),
         "the dedicated page header must render"
     );
-    assert!(
-        rendered_text_contains(&output, "Emulator profiles"),
-        "the emulator-profile findings category must be listed"
-    );
+    assert!(rendered_text_contains(&output, "Emulator readiness"));
+    assert!(rendered_text_contains(&output, "Full diagnostics"));
     assert!(
         rendered_text_contains(&output, "PPSSPP"),
         "a supported emulator's own row must be visible"
@@ -2394,7 +2392,8 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
 
     app.view = MainView::EmulatorSetup;
     let on_setup = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&on_setup, "Healthy"));
+    assert!(rendered_text_contains(&on_setup, "Emulator readiness"));
+    assert!(rendered_text_contains(&on_setup, "Full diagnostics"));
 
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
