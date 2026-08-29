@@ -643,6 +643,89 @@ fn history_filters_select_by_action_and_outcome_without_reordering() {
 }
 
 #[test]
+fn history_text_search_matches_message_action_and_outcome_case_insensitively() {
+    let mut history = OperationHistory::default();
+    history.record(HistoryEntry::new(
+        ActivityAction::Mount,
+        None,
+        ActivityOutcome::Completed,
+        "Mounted Chrono Trigger",
+    ));
+    history.record(HistoryEntry::new(
+        ActivityAction::Unmount,
+        None,
+        ActivityOutcome::Failed,
+        "unrelated entry",
+    ));
+
+    let by_message = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            text_query: "chrono".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert_eq!(
+        by_message
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Mounted Chrono Trigger"]
+    );
+
+    let by_action = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            text_query: "unmount".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert_eq!(by_action.len(), 1);
+    assert_eq!(by_action[0].action, ActivityAction::Unmount);
+
+    let by_outcome = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            text_query: "failed".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert_eq!(by_outcome.len(), 1);
+    assert_eq!(by_outcome[0].outcome, ActivityOutcome::Failed);
+
+    let none_match = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            text_query: "no-such-thing".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert!(none_match.is_empty());
+
+    // Search combines with the existing category filters rather than
+    // replacing them.
+    let combined = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            action: Some(ActivityAction::Mount),
+            text_query: "chrono".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert_eq!(combined.len(), 1);
+
+    let combined_miss = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            action: Some(ActivityAction::Unmount),
+            text_query: "chrono".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert!(combined_miss.is_empty());
+}
+
+#[test]
 fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
     let records = vec![
         record("/roms/mounted.zip", MountState::Mounted),

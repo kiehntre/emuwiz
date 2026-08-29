@@ -743,6 +743,8 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         undo_error: None,
         clear_confirm: None,
         clear_outcome: None,
+        hide_settled: false,
+        search_query: String::new(),
     };
 
     let output = render(&mut state);
@@ -781,6 +783,8 @@ fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
         undo_error: None,
         clear_confirm: None,
         clear_outcome: None,
+        hide_settled: false,
+        search_query: String::new(),
     };
     let mut clipboard = NoopClipboard::default();
     render_with_clipboard(&mut state, &mut clipboard);
@@ -1030,4 +1034,104 @@ fn the_page_module_never_calls_fs_rename_remove_or_copy_directly() {
         source.contains("rollback_transaction"),
         "the page must undo through the core rollback engine"
     );
+}
+
+// --- compact list: filtering and search ----------------------------------------
+
+#[test]
+fn hide_settled_defaults_to_true_on_a_freshly_loaded_page() {
+    let dir = TestDir::new("hide-settled-default");
+    let journal_dir = dir.path().join("journals");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    assert!(state.hide_settled);
+    assert!(state.search_query.is_empty());
+}
+
+#[test]
+fn hide_settled_removes_only_transactions_with_nothing_left_to_undo() {
+    let applied = bare_transaction(
+        "still-undoable",
+        TransactionState::Applied,
+        EntryState::Applied,
+    );
+    let rolled_back = bare_transaction(
+        "already-settled",
+        TransactionState::RolledBack,
+        EntryState::RolledBack,
+    );
+
+    let visible_all = visible_transaction_ids(&[applied.clone(), rolled_back.clone()], false, "");
+    assert_eq!(visible_all.len(), 2, "hide_settled: false shows everything");
+
+    let visible_hidden = visible_transaction_ids(&[applied.clone(), rolled_back.clone()], true, "");
+    assert_eq!(
+        visible_hidden,
+        vec![applied.transaction_id.clone()],
+        "hide_settled: true keeps the still-undoable transaction and drops the settled one"
+    );
+
+    // The predicate used here must be the exact one Undo/Clear already
+    // trust, not a second opinion.
+    assert!(applied.is_rollbackable());
+    assert!(!rolled_back.is_rollbackable());
+}
+
+#[test]
+fn search_matches_entry_basenames_case_insensitively() {
+    let transaction = bare_transaction_with_entries(
+        "search-me",
+        TransactionState::Applied,
+        vec![bare_entry(
+            "Chrono Trigger (USA).sfc",
+            "Chrono Trigger.sfc",
+            EntryState::Applied,
+        )],
+    );
+
+    assert_eq!(
+        visible_transaction_ids(std::slice::from_ref(&transaction), false, "chrono"),
+        vec![transaction.transaction_id.clone()]
+    );
+    assert!(
+        visible_transaction_ids(std::slice::from_ref(&transaction), false, "no-such-game")
+            .is_empty()
+    );
+    // The transaction id itself is also searchable.
+    assert_eq!(
+        visible_transaction_ids(std::slice::from_ref(&transaction), false, "search-me"),
+        vec![transaction.transaction_id.clone()]
+    );
+}
+
+#[test]
+fn filtering_never_mutates_the_underlying_transaction_list() {
+    let transactions = vec![
+        bare_transaction("a", TransactionState::Applied, EntryState::Applied),
+        bare_transaction("b", TransactionState::RolledBack, EntryState::RolledBack),
+    ];
+    let before = transactions.clone();
+    let _ = visible_transaction_ids(&transactions, true, "nonexistent");
+    assert_eq!(
+        transactions, before,
+        "reading a filtered view must never change the source data"
+    );
+}
+
+#[test]
+fn hiding_settled_transactions_leaves_undo_and_clear_reachable_for_them() {
+    // Regression guard: the filter only affects the compact list's display -
+    // `can_undo`/`clearable_transaction_ids` still act on the full,
+    // unfiltered `transactions`, so a row hidden by the toggle never becomes
+    // unreachable to those existing controls.
+    let dir = TestDir::new("hide-settled-actions-still-work");
+    let (_roms, journal_dir, result) = scan_and_apply(dir.path());
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    state.hide_settled = true;
+
+    let visible = visible_transaction_ids(&state.transactions, state.hide_settled, "");
+    // A freshly applied transaction is still rollbackable, so it stays
+    // visible even with the toggle on.
+    assert!(visible.contains(&result.summary.transaction_id));
+    assert!(state.can_undo(&result.summary.transaction_id));
 }

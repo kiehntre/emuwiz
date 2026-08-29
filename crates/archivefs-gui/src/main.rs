@@ -544,11 +544,16 @@ const ALL_ACTIVITY_OUTCOMES: [ActivityOutcome; 10] = [
 
 /// The History & Logs page's filter/sort state. `None` filters mean
 /// "show everything" (the design's "All Operations"/"All Results").
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HistoryLogFilters {
     action: Option<ActivityAction>,
     outcome: Option<ActivityOutcome>,
     oldest_first: bool,
+    /// Free-text search over the entry's message, action label, and outcome
+    /// label. Empty (the default) matches everything. Matched
+    /// case-insensitively; never mutates or reorders the underlying
+    /// history.
+    text_query: String,
 }
 
 /// Whether one history entry passes the History & Logs filters - pure,
@@ -558,6 +563,28 @@ fn history_entry_visible(entry: &HistoryEntry, filters: &HistoryLogFilters) -> b
         && filters
             .outcome
             .is_none_or(|outcome| entry.outcome == outcome)
+        && history_entry_matches_text(entry, &filters.text_query)
+}
+
+/// Whether `query` (matched case-insensitively, empty meaning "match
+/// everything") appears in the entry's message, action label, or outcome
+/// label.
+fn history_entry_matches_text(entry: &HistoryEntry, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query_lower = query.to_lowercase();
+    entry.message.to_lowercase().contains(&query_lower)
+        || entry
+            .action
+            .to_string()
+            .to_lowercase()
+            .contains(&query_lower)
+        || entry
+            .outcome
+            .to_string()
+            .to_lowercase()
+            .contains(&query_lower)
 }
 
 /// The filtered, ordered entries the History & Logs page shows.

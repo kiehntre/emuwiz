@@ -100,6 +100,15 @@ pub(crate) struct RepairHistoryPageState {
     /// The outcome of the last "Clear completed history" run: how many
     /// journals were actually removed, and any that failed to delete.
     pub(crate) clear_outcome: Option<ClearHistoryOutcome>,
+    /// When true (the default), transactions with nothing left to undo -
+    /// [`RenameTransaction::is_rollbackable`] is false - are hidden from the
+    /// list. Purely a display filter: `transactions` itself is never
+    /// touched, so "Clear completed history" and "Undo" keep working on
+    /// hidden rows exactly as before.
+    pub(crate) hide_settled: bool,
+    /// Free-text filter matched against the transaction id and each entry's
+    /// original/proposed basenames. Empty matches everything.
+    pub(crate) search_query: String,
 }
 
 /// The result of removing every provably-safe-to-remove transaction's
@@ -136,6 +145,8 @@ impl RepairHistoryPageState {
             undo_error: None,
             clear_confirm: None,
             clear_outcome: None,
+            hide_settled: true,
+            search_query: String::new(),
         };
         state.refresh();
         state
@@ -371,6 +382,57 @@ impl RepairHistoryPageState {
         self.clear_outcome = Some(outcome);
         self.refresh();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Filtering (display-only - never mutates `transactions`)
+// ---------------------------------------------------------------------------
+
+/// Whether a transaction has nothing left to undo, by the exact same
+/// predicate [`RepairHistoryPageState::can_undo`] and "Clear completed
+/// history" already trust.
+fn is_settled(transaction: &RenameTransaction) -> bool {
+    !transaction.is_rollbackable()
+}
+
+/// Whether `query` (already expected lowercase, empty meaning "match
+/// everything") appears in the transaction id or any entry's basenames.
+/// Never inspects full paths, so this stays cheap even for a transaction
+/// with many entries.
+fn transaction_matches_search(transaction: &RenameTransaction, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    if transaction
+        .transaction_id
+        .to_lowercase()
+        .contains(query_lower)
+    {
+        return true;
+    }
+    transaction.entries.iter().any(|entry| {
+        entry.original_basename.to_lowercase().contains(query_lower)
+            || entry.proposed_basename.to_lowercase().contains(query_lower)
+    })
+}
+
+/// The transaction ids to actually draw, in their existing (most-recent
+/// first) order, after applying "hide settled" and the search box. A pure
+/// read over `transactions` - it never reorders or mutates the underlying
+/// list, so Undo/Details/Clear keep acting on the real data regardless of
+/// what the filter currently hides.
+fn visible_transaction_ids(
+    transactions: &[RenameTransaction],
+    hide_settled: bool,
+    search_query: &str,
+) -> Vec<String> {
+    let query_lower = search_query.to_lowercase();
+    transactions
+        .iter()
+        .filter(|transaction| !(hide_settled && is_settled(transaction)))
+        .filter(|transaction| transaction_matches_search(transaction, &query_lower))
+        .map(|transaction| transaction.transaction_id.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -611,11 +673,46 @@ pub(crate) fn show_repair_history_page(
         return;
     }
 
-    let ids: Vec<String> = state
-        .transactions
-        .iter()
-        .map(|transaction| transaction.transaction_id.clone())
-        .collect();
+    // Filtering only earns its keep once there is actually a list to sift
+    // through; a handful of transactions reads fine without it.
+    if state.transactions.len() > 5 {
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.search_query)
+                        .hint_text("file name or transaction id")
+                        .desired_width(220.0),
+                );
+                ui.checkbox(
+                    &mut state.hide_settled,
+                    "Hide completed (nothing left to undo)",
+                );
+            });
+        });
+    }
+
+    let ids = visible_transaction_ids(&state.transactions, state.hide_settled, &state.search_query);
+    if ids.len() != state.transactions.len() {
+        ui.label(
+            egui::RichText::new(format!(
+                "Showing {} of {} transaction(s).",
+                ids.len(),
+                state.transactions.len()
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
+    }
+    if ids.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No matching transactions",
+            "Nothing matches the current search and filter. Clear them to see everything.",
+            None,
+        );
+        return;
+    }
     for transaction_id in &ids {
         let Some(transaction) = state.transaction_by_id(transaction_id) else {
             continue;

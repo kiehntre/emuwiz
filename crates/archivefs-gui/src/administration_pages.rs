@@ -1565,6 +1565,12 @@ pub(super) fn format_shared_history_time(timestamp: u64, now: SystemTime) -> Str
     }
 }
 
+/// The most "Session activity" cards drawn in one frame. Copy/Export still
+/// act on every filtered entry regardless of this cap - it only bounds how
+/// many cards are laid out at once, matching the 200-journal cap the
+/// "Changes you can undo" section above already uses.
+const HISTORY_ACTIVITY_RENDER_CAP: usize = 200;
+
 pub(super) fn show_history_logs_page(
     ui: &mut egui::Ui,
     shared_history: &SharedHistoryState,
@@ -1785,6 +1791,12 @@ pub(super) fn show_history_logs_page(
 
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
+            ui.label("Search:");
+            ui.add(
+                egui::TextEdit::singleline(&mut filters.text_query)
+                    .hint_text("message, operation, or result")
+                    .desired_width(200.0),
+            );
             egui::ComboBox::from_label("Operation")
                 .selected_text(
                     filters
@@ -1827,12 +1839,15 @@ pub(super) fn show_history_logs_page(
                 ui,
                 "Clear filters",
                 widgets::ActionStyle::Quiet,
-                filters.action.is_some() || filters.outcome.is_some(),
+                filters.action.is_some()
+                    || filters.outcome.is_some()
+                    || !filters.text_query.is_empty(),
             )
             .clicked()
             {
                 filters.action = None;
                 filters.outcome = None;
+                filters.text_query.clear();
             }
         })
         .inner
@@ -1927,7 +1942,27 @@ pub(super) fn show_history_logs_page(
         );
         return action;
     }
-    for (row_index, (entry, text)) in visible_entries.iter().zip(&visible_texts).enumerate() {
+    // Copy/Export above already act on the full filtered set regardless of
+    // this cap - only the on-screen list is bounded, so a very long session
+    // never has to lay out thousands of cards per frame.
+    if visible_texts.len() > HISTORY_ACTIVITY_RENDER_CAP {
+        ui.label(
+            egui::RichText::new(format!(
+                "Showing the first {HISTORY_ACTIVITY_RENDER_CAP} of {} matching entries in the \
+                 current sort order. Narrow the filters or search to see the rest.",
+                visible_texts.len()
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
+        ui.add_space(4.0);
+    }
+    for (row_index, (entry, text)) in visible_entries
+        .iter()
+        .zip(&visible_texts)
+        .enumerate()
+        .take(HISTORY_ACTIVITY_RENDER_CAP)
+    {
         widgets::card(ui, |ui| {
             widgets::activity_row_header(
                 ui,
