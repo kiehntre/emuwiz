@@ -3425,6 +3425,40 @@ enum LibraryTab {
     RecentlyFound,
 }
 
+/// Compresses `DoctorScanState` into the `home_page::SetupCheckSummary` the
+/// Home "Set up emulators" card shows. The card's action opens Problems &
+/// Repair -> Diagnostics, which renders this exact `doctor_scan` state, so
+/// badge and page can never disagree. A pass is reported only for a
+/// completed, clean run that actually performed at least one check - a
+/// never-run, in-flight, or zero-checks state is never a pass.
+fn setup_check_summary(state: &DoctorScanState) -> home_page::SetupCheckSummary {
+    use home_page::SetupCheckSummary;
+    match state.displayed() {
+        None => {
+            if state.is_running() {
+                SetupCheckSummary::Running
+            } else {
+                SetupCheckSummary::NeverRun
+            }
+        }
+        Some(outcome) => {
+            let scan = &outcome.scan;
+            if scan.checked_subsystems().is_empty() {
+                SetupCheckSummary::NoChecksRun
+            } else if scan.is_healthy() {
+                SetupCheckSummary::Healthy
+            } else {
+                let blocking = scan.blocking_count();
+                if blocking > 0 {
+                    SetupCheckSummary::NeedsAttention(blocking)
+                } else {
+                    SetupCheckSummary::Warnings(scan.findings.len())
+                }
+            }
+        }
+    }
+}
+
 /// The `MainView` destination that currently renders `tab`'s content -
 /// the inverse of `library_tab_for_main_view`. Used by
 /// `ArchiveFsApp::navigate_to_library_tab`.
@@ -3437,10 +3471,19 @@ enum LibraryTab {
 fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
     match card {
         home_page::HomeCard::BuildLibrary => MainView::Sources,
-        home_page::HomeCard::RomM => MainView::CanonicalOrganisation,
+        // The RomM provider card (connect / browse records) lives on the
+        // Sources page's Libraries tab - the same subsystem its
+        // `romm_snapshot` readiness badge reports on. It is *not* the
+        // whole-collection Playing Library planner.
+        home_page::HomeCard::RomM => MainView::Sources,
         home_page::HomeCard::BrowseGames => MainView::Library,
-        home_page::HomeCard::DuplicateReview => MainView::Duplicates,
-        home_page::HomeCard::ConvertDiscs => MainView::Problems,
+        // The actionable byte-identical duplicate finder, not the read-only
+        // DAT-relative Library duplicates tab.
+        home_page::HomeCard::DuplicateReview => MainView::ExactDuplicateReview,
+        // Lands on the optical conversion page itself (see
+        // `navigate_to_home_card`), which renders under the Repair tab whose
+        // primary view is `RepairReview`.
+        home_page::HomeCard::ConvertDiscs => MainView::RepairReview,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
         home_page::HomeCard::QuickRename => MainView::IdentifyRename,
@@ -4816,17 +4859,29 @@ impl ArchiveFsApp {
     fn navigate_to_home_card(&mut self, card: home_page::HomeCard) {
         match card {
             home_page::HomeCard::RomM => {
-                self.navigate_to_main_view(MainView::CanonicalOrganisation);
-                let page = self
-                    .rom_organisation_page
-                    .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
-                page.showing_playing_library = true;
+                // The RomM provider integration is the RomM source card on
+                // Sources -> Libraries. Route there so the card's
+                // `romm_snapshot` readiness badge and its destination
+                // describe the same subsystem. (The whole-collection Playing
+                // Library planner remains reachable honestly via Library
+                // Organisation -> "Build Playing Library".)
+                self.navigate_to_sources_tab(SourcesTab::Libraries);
             }
             home_page::HomeCard::ConvertDiscs => {
                 self.navigate_to_problems_repair_tab(ProblemsRepairTab::Repair);
+                // Open the optical conversion UI itself, so the card lands on
+                // the conversion page with no further click - the Repair
+                // tab renders it as soon as this state exists.
+                self.optical_conversion_page.get_or_insert_with(
+                    optical_conversion_page::OpticalConversionPageState::default,
+                );
             }
             home_page::HomeCard::DuplicateReview => {
-                self.navigate_to_library_tab(LibraryTab::Duplicates);
+                // The actionable Exact Duplicate Review, reached exactly the
+                // way the Repair tab's own "Exact duplicates" link reaches
+                // it.
+                self.navigate_to_problems_repair_tab(ProblemsRepairTab::Repair);
+                self.view = MainView::ExactDuplicateReview;
             }
             _ => self.navigate_to_main_view(main_view_for_home_card(card)),
         }
@@ -16516,14 +16571,15 @@ impl ArchiveFsApp {
                         .map(|roots| roots.len())
                         .unwrap_or(0);
                     let has_database = self.database_state.snapshot().is_some();
-                    let (diagnostics_checks, config_missing) = match &self.diagnostics {
-                        DiagnosticsState::Ready { report, .. } => {
-                            (Some(report.checks.as_slice()), report.config_missing)
-                        }
-                        DiagnosticsState::Loading { .. } | DiagnosticsState::Error { .. } => {
-                            (None, false)
-                        }
+                    // `config_missing` (banner only) still comes from the
+                    // background setup diagnostics; the "Set up emulators"
+                    // card's readiness comes from `doctor_scan` - the same
+                    // state its "Open Doctor" action lands on.
+                    let config_missing = match &self.diagnostics {
+                        DiagnosticsState::Ready { report, .. } => report.config_missing,
+                        DiagnosticsState::Loading { .. } | DiagnosticsState::Error { .. } => false,
                     };
+                    let setup_check = setup_check_summary(&self.doctor_scan);
                     let first_run = missing_config_is_first_run(self.config_previously_confirmed);
                     // Never triggers the load these pages themselves start
                     // on first visit - `None` here means "not visited yet
@@ -16544,7 +16600,7 @@ impl ArchiveFsApp {
                     let home_inputs = home_page::HomeInputs {
                         source_folder_count,
                         has_database,
-                        diagnostics: diagnostics_checks,
+                        setup_check,
                         config_missing,
                         first_run,
                         cheat_sources_enabled_count,

@@ -3529,6 +3529,83 @@ fn convert_discs_is_visible_on_the_repair_tab() {
     assert!(!rendered_text_contains(&output, "OpticalConversionPage"));
 }
 
+#[test]
+fn convert_discs_home_card_lands_on_the_optical_conversion_ui() {
+    // Blocker 3: the Home "Convert discs" card must open the conversion page
+    // itself, with no second "Convert discs" click on the Repair tab.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.navigate_to_home_card(home_page::HomeCard::ConvertDiscs);
+    assert!(
+        app.optical_conversion_page.is_some(),
+        "the conversion page state must exist on arrival"
+    );
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(
+        rendered_text_contains(&output, "Convert Disc Images"),
+        "the optical conversion page's own heading must render immediately"
+    );
+    assert!(rendered_text_contains(&output, "Source folder:"));
+}
+
+#[test]
+fn duplicate_home_card_lands_on_the_actionable_exact_duplicate_review() {
+    // Blocker 4: route to the workflow that can act, not the read-only
+    // Library duplicates viewer that dead-ends without a prior scan.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.navigate_to_home_card(home_page::HomeCard::DuplicateReview);
+    assert_eq!(app.view, MainView::ExactDuplicateReview);
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(
+        rendered_text_contains(&output, "Source folder:"),
+        "the Exact Duplicate Review page's own content must render"
+    );
+    assert!(!rendered_text_contains(&output, "Repair History"));
+}
+
+#[test]
+fn setup_check_summary_maps_the_doctor_scan_state_the_home_card_shows() {
+    use home_page::SetupCheckSummary;
+
+    // Before any run this session.
+    assert_eq!(
+        setup_check_summary(&DoctorScanState::NotRun),
+        SetupCheckSummary::NeverRun
+    );
+
+    // A completed, clean run that actually checked at least one subsystem.
+    let healthy = doctor_outcome(doctor_scan_from(&[]));
+    assert_eq!(setup_check_summary(&healthy), SetupCheckSummary::Healthy);
+
+    // A completed run where every subsystem was unavailable - never a pass.
+    let nothing_checked = doctor_outcome(run_doctor_scan(&DoctorScanInputs::none_loaded()));
+    assert_eq!(
+        setup_check_summary(&nothing_checked),
+        SetupCheckSummary::NoChecksRun
+    );
+
+    // A completed run that produced findings is never Healthy / NeverRun /
+    // NoChecksRun, and a blocking count is reported faithfully.
+    let with_findings =
+        doctor_scan_with_storage(500 * 1024 * 1024 * 1024, 1000 * 1024 * 1024 * 1024, true);
+    assert!(!with_findings.is_healthy());
+    match setup_check_summary(&doctor_outcome(with_findings.clone())) {
+        SetupCheckSummary::NeedsAttention(n) => {
+            assert_eq!(n, with_findings.blocking_count());
+            assert!(n > 0);
+        }
+        SetupCheckSummary::Warnings(n) => {
+            assert_eq!(with_findings.blocking_count(), 0);
+            assert!(n > 0);
+        }
+        other => panic!("a scan with findings must not map to {other:?}"),
+    }
+}
+
 // --- 2: selecting it reaches the Exact Duplicate Review page -----------
 
 #[test]

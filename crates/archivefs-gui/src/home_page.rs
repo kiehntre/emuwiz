@@ -25,7 +25,6 @@
 //! nothing is configured.
 
 use crate::ui::{components as widgets, theme};
-use archivefs_core::{SetupDiagnostic, SetupDiagnosticStatus};
 use eframe::egui;
 
 /// One of the task-oriented destinations Home can send a user to.
@@ -169,12 +168,13 @@ pub(crate) struct HomeView {
 /// Everything [`build_home_view`] needs, gathered by `main.rs` from state
 /// that is already loaded - building this never reads a file, starts a
 /// thread, or makes a request.
-pub(crate) struct HomeInputs<'a> {
+pub(crate) struct HomeInputs {
     pub(crate) source_folder_count: usize,
     pub(crate) has_database: bool,
-    /// `None` while diagnostics are still loading in the background, or if
-    /// the last diagnostics run itself failed.
-    pub(crate) diagnostics: Option<&'a [SetupDiagnostic]>,
+    /// A read of `ArchiveFsApp::doctor_scan` - the exact state the "Set up
+    /// emulators" card's destination renders, so the badge and that page can
+    /// never disagree.
+    pub(crate) setup_check: SetupCheckSummary,
     pub(crate) config_missing: bool,
     /// Mirrors `missing_config_is_first_run(config_previously_confirmed)`.
     pub(crate) first_run: bool,
@@ -195,6 +195,30 @@ pub(crate) enum RommReadinessLabel {
     NotConfigured(&'static str),
     Unavailable(&'static str),
     Ready(&'static str),
+}
+
+/// A compressed read of `ArchiveFsApp::doctor_scan` - the exact state the
+/// "Set up emulators" card's destination (Problems & Repair -> Diagnostics)
+/// renders. Built by `main.rs` (see `setup_check_summary`) so this module
+/// needs no dependency on the Doctor engine, and so the card summarises the
+/// *same* state a click opens - never the separate `self.diagnostics`
+/// background report, which is a different subsystem with a different notion
+/// of "last run".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupCheckSummary {
+    /// Doctor has not finished a run this session.
+    NeverRun,
+    /// A Doctor run is in flight and there is no earlier result on screen.
+    Running,
+    /// Doctor finished, but no check could actually run (every subsystem was
+    /// unavailable). Never reported as a pass.
+    NoChecksRun,
+    /// Doctor finished with nothing actionable.
+    Healthy,
+    /// Doctor finished with warnings only (nothing blocking).
+    Warnings(usize),
+    /// Doctor finished with at least one blocking (error/critical) finding.
+    NeedsAttention(usize),
 }
 
 /// Turns already-loaded state into what Home draws. Pure: the same inputs
@@ -246,7 +270,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
     };
 
     let romm_readiness = match &inputs.romm_state_label {
-        None => CardReadiness::Unknown("Open the RomM workflow to check status".to_string()),
+        None => CardReadiness::Unknown("Open RomM to check status".to_string()),
         Some(RommReadinessLabel::NotConfigured(label)) => {
             CardReadiness::NotConfigured((*label).to_string())
         }
@@ -256,7 +280,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         Some(RommReadinessLabel::Ready(label)) => CardReadiness::Ready((*label).to_string()),
     };
 
-    let setup_readiness = summarize_setup_checks(inputs.diagnostics, inputs.config_missing);
+    let setup_readiness = summarize_setup_checks(inputs.setup_check);
 
     let cards = vec![
         // --- Primary destinations: the major jobs -------------------------
@@ -318,12 +342,12 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         HomeCardView {
             card: HomeCard::DuplicateReview,
             icon: crate::ui::icons::CHECK,
-            title: "Find duplicate / equivalent games",
-            explanation: "Review equivalent media already found in your collection.",
+            title: "Find duplicate games",
+            explanation: "Find byte-for-byte identical copies, keep one, and move the rest into a recoverable quarantine. Nothing is permanently deleted.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Check),
             readiness: None,
-            action_label: "Open duplicate review",
+            action_label: "Open duplicate finder",
             secondary: None,
         },
         HomeCardView {
@@ -374,12 +398,12 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         HomeCardView {
             card: HomeCard::RomM,
             icon: crate::ui::icons::ROMM,
-            title: "Build RomM library",
-            explanation: "Build a separate RomM-readable library from your collection. RomM is read-only: EmuWiz never changes your RomM library.",
+            title: "Connect RomM",
+            explanation: "Connect EmuWiz to your RomM server and browse its records. RomM is treated as a read-only source: nothing in your RomM library is ever changed.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Organise),
             readiness: Some(romm_readiness),
-            action_label: "Open RomM workflow",
+            action_label: "Open RomM",
             secondary: None,
         },
     ];
@@ -391,33 +415,25 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Summarizes `SetupDiagnostics.checks` into one readiness for the "Check
-/// my setup" card. Reads only what diagnostics already computed - never
-/// starts a Doctor scan, which requires its own explicit action.
-fn summarize_setup_checks(
-    checks: Option<&[SetupDiagnostic]>,
-    config_missing: bool,
-) -> CardReadiness {
-    let Some(checks) = checks else {
-        return CardReadiness::Unknown("Checking...".to_string());
-    };
-    let errors = checks
-        .iter()
-        .filter(|c| c.status == SetupDiagnosticStatus::Error)
-        .count();
-    let warnings = checks
-        .iter()
-        .filter(|c| c.status == SetupDiagnosticStatus::Warning)
-        .count();
-    if errors > 0 {
-        let verb = if errors == 1 { "needs" } else { "need" };
-        CardReadiness::Unavailable(format!("{errors} check{} {verb} attention", plural(errors)))
-    } else if warnings > 0 {
-        CardReadiness::Unavailable(format!("{warnings} warning{}", plural(warnings)))
-    } else if config_missing {
-        CardReadiness::NotConfigured("Not configured yet - expected on a fresh install".to_string())
-    } else {
-        CardReadiness::Ready("All checks passed".to_string())
+/// Turns the Doctor scan summary into one readiness for the "Set up
+/// emulators" card. The card's action opens the Doctor page, which renders
+/// this exact state, so the two can never contradict each other. Only a
+/// completed, clean run with at least one check actually performed is ever
+/// shown as a pass - a never-run, in-flight, or zero-checks-performed state
+/// is `Unknown`, and any warning or blocking finding is `Unavailable`.
+fn summarize_setup_checks(summary: SetupCheckSummary) -> CardReadiness {
+    match summary {
+        SetupCheckSummary::NeverRun => CardReadiness::Unknown("Not checked yet".to_string()),
+        SetupCheckSummary::Running => CardReadiness::Unknown("Checking...".to_string()),
+        SetupCheckSummary::NoChecksRun => CardReadiness::Unknown("No checks could run".to_string()),
+        SetupCheckSummary::NeedsAttention(count) => {
+            let verb = if count == 1 { "needs" } else { "need" };
+            CardReadiness::Unavailable(format!("{count} check{} {verb} attention", plural(count)))
+        }
+        SetupCheckSummary::Warnings(count) => {
+            CardReadiness::Unavailable(format!("{count} warning{}", plural(count)))
+        }
+        SetupCheckSummary::Healthy => CardReadiness::Ready("All checks passed".to_string()),
     }
 }
 

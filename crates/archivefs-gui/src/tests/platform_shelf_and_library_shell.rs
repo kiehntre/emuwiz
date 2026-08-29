@@ -183,19 +183,51 @@ fn every_home_card_maps_to_its_real_existing_destination() {
     // reachable some other way - none of these are invented for Home.
     let expected = [
         (home_page::HomeCard::BuildLibrary, MainView::Sources),
-        (home_page::HomeCard::ConvertDiscs, MainView::Problems),
+        (home_page::HomeCard::ConvertDiscs, MainView::RepairReview),
         (home_page::HomeCard::BrowseGames, MainView::Library),
-        (home_page::HomeCard::DuplicateReview, MainView::Duplicates),
+        (
+            home_page::HomeCard::DuplicateReview,
+            MainView::ExactDuplicateReview,
+        ),
         (home_page::HomeCard::CheatsAndMods, MainView::CheatsMods),
         (home_page::HomeCard::CheatSources, MainView::CheatSources),
         (home_page::HomeCard::DatSources, MainView::DatSources),
-        (home_page::HomeCard::RomM, MainView::CanonicalOrganisation),
+        (home_page::HomeCard::RomM, MainView::Sources),
         (home_page::HomeCard::CheckSetup, MainView::Doctor),
         (home_page::HomeCard::Settings, MainView::Settings),
         (home_page::HomeCard::QuickRename, MainView::IdentifyRename),
     ];
     for (card, expected_view) in expected {
         assert_eq!(main_view_for_home_card(card), expected_view, "{card:?}");
+    }
+}
+
+#[test]
+fn main_view_for_home_card_agrees_with_runtime_navigate_to_home_card() {
+    // Routing consistency: the pure mapping and `navigate_to_home_card` must
+    // not drift for any card (they did for RomM and ConvertDiscs before the
+    // 0.8.1 release-workflow fixes).
+    for card in [
+        home_page::HomeCard::BuildLibrary,
+        home_page::HomeCard::ConvertDiscs,
+        home_page::HomeCard::BrowseGames,
+        home_page::HomeCard::DuplicateReview,
+        home_page::HomeCard::CheatsAndMods,
+        home_page::HomeCard::CanonicalOrganisation,
+        home_page::HomeCard::QuickRename,
+        home_page::HomeCard::CheatSources,
+        home_page::HomeCard::DatSources,
+        home_page::HomeCard::RomM,
+        home_page::HomeCard::CheckSetup,
+        home_page::HomeCard::Settings,
+    ] {
+        let mut app = app_for_operation_tests();
+        app.navigate_to_home_card(card);
+        assert_eq!(
+            app.view,
+            main_view_for_home_card(card),
+            "{card:?}: navigate_to_home_card and main_view_for_home_card disagree"
+        );
     }
 }
 
@@ -221,21 +253,59 @@ fn navigate_to_main_view_for_a_home_card_click_matches_a_sidebar_click() {
 fn task_cards_open_the_existing_specialised_workflows() {
     let mut app = app_for_operation_tests();
 
+    // "Convert discs" lands on the optical conversion page itself - no
+    // second hidden "Convert discs" click on the Repair tab.
     app.navigate_to_home_card(home_page::HomeCard::ConvertDiscs);
     assert_eq!(app.view, MainView::RepairReview);
     assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
+    assert!(
+        app.optical_conversion_page.is_some(),
+        "the conversion page must be open on arrival"
+    );
 
+    // "Find duplicate games" lands on the actionable byte-identical finder,
+    // not the read-only DAT-relative Library duplicates viewer.
     app.navigate_to_home_card(home_page::HomeCard::DuplicateReview);
-    assert_eq!(app.view, MainView::Duplicates);
-    assert_eq!(app.library_tab, LibraryTab::Duplicates);
+    assert_eq!(app.view, MainView::ExactDuplicateReview);
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
 
+    // "Connect RomM" lands on the RomM provider card on Sources -> Libraries
+    // (the subsystem its readiness badge reflects), never the whole-library
+    // Playing Library planner.
     app.navigate_to_home_card(home_page::HomeCard::RomM);
-    assert_eq!(app.view, MainView::CanonicalOrganisation);
+    assert_eq!(app.view, MainView::Sources);
+    assert_eq!(app.sources_tab, SourcesTab::Libraries);
     assert!(
         app.rom_organisation_page
             .as_ref()
-            .is_some_and(|page| page.showing_playing_library)
+            .is_none_or(|page| !page.showing_playing_library),
+        "the RomM card must not flip Library Organisation into playing-library mode"
     );
+}
+
+#[test]
+fn playing_library_planner_stays_reachable_from_library_organisation() {
+    // Blocker 1 fix moved the RomM card off the playing-library planner; the
+    // planner must still be reachable honestly from its own page - the
+    // "Build Playing Library" button on the Organise page.
+    let mut page = rom_organisation_page::RomOrganisationPageState::load();
+    assert!(!page.showing_playing_library);
+    let ctx = egui::Context::default();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 2000.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                rom_organisation_page::show_rom_organisation_page(ui, &mut page);
+            });
+        },
+    );
+    assert!(rendered_text_contains(&output, "Build Playing Library"));
 }
 
 #[test]

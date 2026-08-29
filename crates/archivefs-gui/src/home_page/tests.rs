@@ -1,20 +1,10 @@
 use super::*;
-use archivefs_core::SetupDiagnosticStatus;
+use archivefs_core::{SetupDiagnostic, SetupDiagnosticStatus};
 
 fn passing_check(name: &str) -> SetupDiagnostic {
     SetupDiagnostic {
         name: name.to_string(),
         status: SetupDiagnosticStatus::Ready,
-        detail: String::new(),
-        why_it_matters: String::new(),
-        next_step: String::new(),
-    }
-}
-
-fn not_configured_check(name: &str) -> SetupDiagnostic {
-    SetupDiagnostic {
-        name: name.to_string(),
-        status: SetupDiagnosticStatus::NotConfigured,
         detail: String::new(),
         why_it_matters: String::new(),
         next_step: String::new(),
@@ -41,11 +31,37 @@ fn warning_check(name: &str) -> SetupDiagnostic {
     }
 }
 
-fn fresh_install_inputs(checks: &[SetupDiagnostic]) -> HomeInputs<'_> {
+/// The Home "Set up emulators" badge now reflects `ArchiveFsApp::doctor_scan`,
+/// not the background `SetupDiagnostics` report. These helpers keep phrasing
+/// the fixtures in terms of a Doctor check list and translate it, so the
+/// existing tests still read naturally.
+fn summary_from_checks(checks: &[SetupDiagnostic]) -> SetupCheckSummary {
+    if checks.is_empty() {
+        return SetupCheckSummary::NoChecksRun;
+    }
+    let errors = checks
+        .iter()
+        .filter(|c| c.status == SetupDiagnosticStatus::Error)
+        .count();
+    let warnings = checks
+        .iter()
+        .filter(|c| c.status == SetupDiagnosticStatus::Warning)
+        .count();
+    if errors > 0 {
+        SetupCheckSummary::NeedsAttention(errors)
+    } else if warnings > 0 {
+        SetupCheckSummary::Warnings(warnings)
+    } else {
+        SetupCheckSummary::Healthy
+    }
+}
+
+fn fresh_install_inputs() -> HomeInputs {
     HomeInputs {
         source_folder_count: 0,
         has_database: false,
-        diagnostics: Some(checks),
+        // A genuine fresh install: Doctor has never run this session.
+        setup_check: SetupCheckSummary::NeverRun,
         config_missing: true,
         first_run: true,
         cheat_sources_enabled_count: None,
@@ -54,11 +70,11 @@ fn fresh_install_inputs(checks: &[SetupDiagnostic]) -> HomeInputs<'_> {
     }
 }
 
-fn established_inputs(checks: &[SetupDiagnostic]) -> HomeInputs<'_> {
+fn established_inputs(checks: &[SetupDiagnostic]) -> HomeInputs {
     HomeInputs {
         source_folder_count: 3,
         has_database: true,
-        diagnostics: Some(checks),
+        setup_check: summary_from_checks(checks),
         config_missing: false,
         first_run: false,
         cheat_sources_enabled_count: Some(5),
@@ -105,8 +121,7 @@ fn render(view: &HomeView, width: f32) -> (egui::FullOutput, Option<HomeCard>) {
 
 #[test]
 fn fresh_install_shows_the_welcome_banner_and_not_configured_cards() {
-    let checks = [not_configured_check("config file")];
-    let view = build_home_view(&fresh_install_inputs(&checks));
+    let view = build_home_view(&fresh_install_inputs());
     assert_eq!(view.banner, HomeBanner::FreshInstall);
     for card in &view.cards {
         if let Some(readiness) = &card.readiness {
@@ -147,8 +162,7 @@ fn established_install_shows_no_banner_and_ready_cards() {
 
 #[test]
 fn config_disappeared_after_being_confirmed_shows_the_warning_banner_not_the_welcome_one() {
-    let checks = [not_configured_check("config file")];
-    let mut inputs = fresh_install_inputs(&checks);
+    let mut inputs = fresh_install_inputs();
     inputs.first_run = false; // previously confirmed, now gone
     let view = build_home_view(&inputs);
     assert_eq!(view.banner, HomeBanner::ConfigDisappeared);
@@ -183,12 +197,12 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::CheckSetup, "Open Doctor"),
         (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
         (HomeCard::DatSources, "Open DAT Sources"),
-        (HomeCard::DuplicateReview, "Open duplicate review"),
+        (HomeCard::DuplicateReview, "Open duplicate finder"),
         (HomeCard::ConvertDiscs, "Open disc conversion"),
         (HomeCard::Settings, "Open Settings"),
         (HomeCard::BuildLibrary, "Open Sources"),
         (HomeCard::QuickRename, "Choose a library"),
-        (HomeCard::RomM, "Open RomM workflow"),
+        (HomeCard::RomM, "Open RomM"),
     ];
     assert_eq!(view.cards.len(), expected.len());
     for (card, (expected_card, expected_label)) in view.cards.iter().zip(expected.iter()) {
@@ -253,8 +267,7 @@ fn setup_checks_with_errors_are_reported_as_unavailable() {
 
 #[test]
 fn lazily_loaded_pages_not_yet_visited_are_reported_as_unknown_not_not_configured() {
-    let checks = [passing_check("config file")];
-    let view = build_home_view(&fresh_install_inputs(&checks));
+    let view = build_home_view(&fresh_install_inputs());
     for card_kind in [
         HomeCard::CheatsAndMods,
         HomeCard::DatSources,
@@ -529,4 +542,96 @@ fn the_primary_home_cards_render_at_compact_width() {
             "expected {expected:?} to render at compact width"
         );
     }
+}
+
+// --- "Set up emulators" badge tracks the Doctor scan it opens ------------
+//
+// The card's action opens Problems & Repair -> Diagnostics, which renders
+// `ArchiveFsApp::doctor_scan`. `build_home_view` is fed a
+// `SetupCheckSummary` derived from that same state (see
+// `crate::setup_check_summary`), so the badge and the page can never
+// disagree, and "All checks passed" can only appear after a clean completed
+// run that actually performed a check.
+
+fn check_setup_readiness(summary: SetupCheckSummary) -> CardReadiness {
+    let mut inputs = established_inputs(&[passing_check("config file")]);
+    inputs.setup_check = summary;
+    build_home_view(&inputs)
+        .cards
+        .into_iter()
+        .find(|c| c.card == HomeCard::CheckSetup)
+        .and_then(|c| c.readiness)
+        .expect("the Set up emulators card always carries a readiness")
+}
+
+#[test]
+fn set_up_emulators_shows_not_checked_yet_before_the_first_doctor_run() {
+    let readiness = check_setup_readiness(SetupCheckSummary::NeverRun);
+    assert!(matches!(readiness, CardReadiness::Unknown(_)));
+    assert_eq!(readiness.label(), "Not checked yet");
+    assert_ne!(readiness.label(), "All checks passed");
+}
+
+#[test]
+fn set_up_emulators_is_pending_while_a_doctor_run_is_in_flight() {
+    let readiness = check_setup_readiness(SetupCheckSummary::Running);
+    assert!(matches!(readiness, CardReadiness::Unknown(_)));
+    assert_ne!(readiness.label(), "All checks passed");
+}
+
+#[test]
+fn set_up_emulators_shows_passed_only_after_a_clean_completed_doctor_run() {
+    let readiness = check_setup_readiness(SetupCheckSummary::Healthy);
+    assert!(matches!(readiness, CardReadiness::Ready(_)));
+    assert_eq!(readiness.label(), "All checks passed");
+}
+
+#[test]
+fn set_up_emulators_never_shows_passed_when_doctor_found_warnings() {
+    let readiness = check_setup_readiness(SetupCheckSummary::Warnings(2));
+    assert!(matches!(readiness, CardReadiness::Unavailable(_)));
+    assert_eq!(readiness.label(), "2 warnings");
+    assert_ne!(readiness.label(), "All checks passed");
+}
+
+#[test]
+fn set_up_emulators_never_shows_passed_when_doctor_found_blocking_problems() {
+    let readiness = check_setup_readiness(SetupCheckSummary::NeedsAttention(1));
+    assert!(matches!(readiness, CardReadiness::Unavailable(_)));
+    assert_eq!(readiness.label(), "1 check needs attention");
+    assert_ne!(readiness.label(), "All checks passed");
+}
+
+#[test]
+fn set_up_emulators_never_shows_passed_when_no_check_could_run() {
+    let readiness = check_setup_readiness(SetupCheckSummary::NoChecksRun);
+    assert!(matches!(readiness, CardReadiness::Unknown(_)));
+    assert_ne!(readiness.label(), "All checks passed");
+}
+
+#[test]
+fn connect_romm_card_readiness_comes_from_the_romm_provider_state() {
+    // Blocker 1: the card that now routes to the RomM provider workflow must
+    // keep taking its badge from the RomM provider subsystem.
+    let mut inputs = established_inputs(&[passing_check("config file")]);
+    inputs.romm_state_label = Some(RommReadinessLabel::Unavailable("Offline"));
+    let romm = build_home_view(&inputs)
+        .cards
+        .into_iter()
+        .find(|c| c.card == HomeCard::RomM)
+        .unwrap();
+    assert_eq!(romm.title, "Connect RomM");
+    assert_eq!(romm.action_label, "Open RomM");
+    assert!(matches!(
+        romm.readiness,
+        Some(CardReadiness::Unavailable(_))
+    ));
+
+    inputs.romm_state_label = Some(RommReadinessLabel::Ready("Connected"));
+    let romm = build_home_view(&inputs)
+        .cards
+        .into_iter()
+        .find(|c| c.card == HomeCard::RomM)
+        .unwrap();
+    assert!(matches!(romm.readiness, Some(CardReadiness::Ready(_))));
 }
