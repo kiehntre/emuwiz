@@ -1714,12 +1714,15 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // Seven subsystems were genuinely checked, and the rest are honestly
     // recorded as unavailable rather than as passes.
     assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
-    // Storage, filesystem mount state, emulator profiles and managed entries
-    // are not gathered by this test, so they must appear as unavailable
-    // alongside the snapshot, setup and RetroArch subsystems - never as passes.
+    // Storage, filesystem mount state, emulator profiles, xemu/Xenia launch
+    // readiness and managed entries are not gathered by this test, so they
+    // must appear as unavailable alongside the snapshot, setup and RetroArch
+    // subsystems - never as passes. xemu and Xenia readiness share one
+    // (category, subsystem) tag but carry different "not gathered" wording,
+    // so they count as two entries here, not one.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        7,
+        9,
         "{:?}",
         scan.coverage
     );

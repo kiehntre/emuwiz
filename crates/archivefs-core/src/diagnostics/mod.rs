@@ -251,8 +251,14 @@ pub enum DoctorSubsystem {
     /// `diagnostics::environment::mount_table` (`/proc/self/mountinfo`)
     FilesystemMountState,
     /// `discover_dolphin_profiles` / `discover_pcsx2_profiles` /
-    /// `discover_xenia_profiles`
+    /// `discover_xenia_profiles` / `discover_xemu_profiles`
     EmulatorProfiles,
+    /// Whether a discovered xemu/Xenia profile can actually launch a game:
+    /// native executable binding safety/ambiguity, plus - xemu only - the
+    /// four required system files (MCPX boot ROM, flash BIOS, EEPROM, HDD
+    /// image). A distinct question from [`Self::EmulatorProfiles`]'s "could
+    /// EmuWiz write into this profile".
+    EmulatorReadiness,
     /// EmuWiz-managed cheat and patch entries, anchored on install
     /// journals and on each adapter's own ownership marker.
     ManagedEntries,
@@ -278,6 +284,7 @@ impl DoctorSubsystem {
             Self::FilesystemCapacity => "filesystem_capacity",
             Self::FilesystemMountState => "filesystem_mount_state",
             Self::EmulatorProfiles => "emulator_profiles",
+            Self::EmulatorReadiness => "emulator_readiness",
             Self::ManagedEntries => "managed_entries",
             Self::DoctorRunner => "doctor_runner",
         }
@@ -298,6 +305,7 @@ impl DoctorSubsystem {
             Self::FilesystemCapacity => "filesystem capacity",
             Self::FilesystemMountState => "filesystem mount state",
             Self::EmulatorProfiles => "emulator profiles",
+            Self::EmulatorReadiness => "emulator launch readiness",
             Self::ManagedEntries => "managed entries",
             Self::DoctorRunner => "Doctor runner",
         }

@@ -35,7 +35,9 @@ use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
 use super::profiles::{
-    ProfileAssessmentReport, findings_from_emulator_profiles, not_checked_from_emulator_profiles,
+    ProfileAssessmentReport, XemuReadinessAssessment, XeniaReadinessAssessment,
+    findings_from_emulator_profiles, findings_from_xemu_readiness, findings_from_xenia_readiness,
+    not_checked_from_emulator_profiles,
 };
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
 use super::{
@@ -126,6 +128,10 @@ pub struct DoctorScanInputs<'a> {
     pub storage: Gathered<&'a StorageAssessment>,
     /// From `profiles::assess_emulator_profiles`.
     pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
+    /// From `profiles::assess_xemu_readiness`.
+    pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
+    /// From `profiles::assess_xenia_readiness`.
+    pub xenia_readiness: Gathered<&'a [XeniaReadinessAssessment]>,
     /// From `managed::scan_managed_entries`.
     pub managed_entries: Gathered<&'a ManagedEntryScan>,
     /// The free-space thresholds to apply. Not a `Gathered`: policy is always
@@ -157,6 +163,12 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             emulator_profiles: Gathered::NotLoaded(
                 "Emulator profiles have not been discovered in this session.",
+            ),
+            xemu_readiness: Gathered::NotLoaded(
+                "xemu launch readiness has not been checked in this session.",
+            ),
+            xenia_readiness: Gathered::NotLoaded(
+                "Xenia launch readiness has not been checked in this session.",
             ),
             managed_entries: Gathered::NotLoaded(
                 "EmuWiz-managed cheat entries have not been scanned yet.",
@@ -474,6 +486,18 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         |report: &&ProfileAssessmentReport| findings_from_emulator_profiles(report)
     );
     subsystem!(
+        inputs.xemu_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[XemuReadinessAssessment]| findings_from_xemu_readiness(assessments)
+    );
+    subsystem!(
+        inputs.xenia_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[XeniaReadinessAssessment]| findings_from_xenia_readiness(assessments)
+    );
+    subsystem!(
         inputs.managed_entries,
         DoctorCategory::ManagedEntries,
         DoctorSubsystem::ManagedEntries,
@@ -501,6 +525,13 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
 
     findings.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
     coverage.sort_by_key(|entry| (entry.category, entry.subsystem));
+    // xemu and Xenia readiness share one (category, subsystem) tag - see
+    // their own `subsystem!` calls above - so an identical pair of entries
+    // (both checked, or both unavailable for the same reason) collapses to
+    // one coverage line rather than showing a confusing duplicate. A
+    // genuine difference (one available, one not) is never collapsed: only
+    // consecutive, fully identical entries are.
+    coverage.dedup();
 
     DoctorScan {
         findings,

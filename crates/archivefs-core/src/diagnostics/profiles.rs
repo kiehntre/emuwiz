@@ -45,9 +45,12 @@ use crate::patch_manager::{
     DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DuckStationProfileDiscovery,
     DuckStationProfileDiscoveryRoots, EmulatorProfileSelection, Pcsx2ProfileDiscovery,
     Pcsx2ProfileDiscoveryRoots, PpssppProfileDiscovery, PpssppProfileDiscoveryRoots,
+    XemuGameRequest, XemuLaunchBlocker, XemuLaunchBlockerKind, XemuProfileDiscovery,
+    XemuProfileDiscoveryRoots, XemuSystemFileState, XeniaLaunchBlocker, XeniaLaunchBlockerKind,
     XeniaProfileDiscovery, XeniaProfileDiscoveryRoots, discover_dolphin_profiles,
     discover_duckstation_profiles, discover_pcsx2_profiles, discover_ppsspp_profiles,
-    discover_xenia_profiles, select_dolphin_profile,
+    discover_xemu_profiles, discover_xenia_profiles, inspect_xemu_game,
+    resolve_xemu_native_launch_binding, resolve_xenia_launch_binding, select_dolphin_profile,
 };
 
 /// At most this many profiles are reported individually; beyond it Doctor
@@ -65,6 +68,7 @@ pub enum EmulatorKind {
     Xenia,
     Ppsspp,
     DuckStation,
+    Xemu,
 }
 
 impl EmulatorKind {
@@ -75,6 +79,7 @@ impl EmulatorKind {
             Self::Xenia => "Xenia Canary",
             Self::Ppsspp => "PPSSPP",
             Self::DuckStation => "DuckStation",
+            Self::Xemu => "xemu",
         }
     }
 
@@ -85,6 +90,7 @@ impl EmulatorKind {
             Self::Xenia => "xenia",
             Self::Ppsspp => "ppsspp",
             Self::DuckStation => "duckstation",
+            Self::Xemu => "xemu",
         }
     }
 
@@ -98,6 +104,7 @@ impl EmulatorKind {
             Self::Xenia => "emulator_profile.ambiguous_preferred_xenia_profile",
             Self::Ppsspp => "emulator_profile.ambiguous_preferred_ppsspp_profile",
             Self::DuckStation => "emulator_profile.ambiguous_preferred_duckstation_profile",
+            Self::Xemu => "emulator_profile.ambiguous_preferred_xemu_profile",
         }
     }
 }
@@ -175,7 +182,10 @@ impl ProfileAssessment {
         match self.emulator {
             EmulatorKind::Ppsspp => "emulator_profile.ppsspp_inspected",
             EmulatorKind::DuckStation => "emulator_profile.duckstation_inspected",
-            EmulatorKind::Dolphin | EmulatorKind::Pcsx2 | EmulatorKind::Xenia => {
+            EmulatorKind::Dolphin
+            | EmulatorKind::Pcsx2
+            | EmulatorKind::Xenia
+            | EmulatorKind::Xemu => {
                 unreachable!("only inspection-only profiles have inspection finding ids")
             }
         }
@@ -368,12 +378,15 @@ pub struct ProfileDiscoveries<'a> {
     pub ppsspp_error: Option<String>,
     pub duckstation: Option<&'a DuckStationProfileDiscovery>,
     pub duckstation_error: Option<String>,
+    pub xemu: Option<&'a XemuProfileDiscovery>,
+    pub xemu_error: Option<String>,
     /// The profile ids EmuWiz currently prefers, when known.
     pub preferred_dolphin: Option<&'a str>,
     pub preferred_pcsx2: Option<&'a str>,
     pub preferred_xenia: Option<&'a str>,
     pub preferred_ppsspp: Option<&'a str>,
     pub preferred_duckstation: Option<&'a str>,
+    pub preferred_xemu: Option<&'a str>,
 }
 
 /// Assesses every discovered profile's write destination.
@@ -540,6 +553,34 @@ pub fn assess_emulator_profiles(
         }
     } else if let Some(error) = &discoveries.duckstation_error {
         unavailable.push((EmulatorKind::DuckStation, error.clone()));
+    }
+
+    if let Some(discovery) = discoveries.xemu {
+        discovery_incomplete |= !discovery.complete;
+        for profile in &discovery.profiles {
+            profiles.push(assess_one(
+                EmulatorKind::Xemu,
+                profile.profile_id.clone(),
+                format!("{:?}", profile.installation_type),
+                format!("{:?}", profile.scope),
+                profile.provenance.to_string(),
+                profile.eligible,
+                profile
+                    .blockers
+                    .iter()
+                    .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
+                    .collect(),
+                &profile.configuration_path,
+                // xemu has no separate install/cheat destination yet; report
+                // the profile root itself so the finding still names
+                // something real.
+                &profile.configuration_path,
+                discoveries.preferred_xemu,
+                mount_table,
+            ));
+        }
+    } else if let Some(error) = &discoveries.xemu_error {
+        unavailable.push((EmulatorKind::Xemu, error.clone()));
     }
 
     profiles.sort_by(|left, right| {
@@ -710,6 +751,7 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
         EmulatorKind::Xenia,
         EmulatorKind::Ppsspp,
         EmulatorKind::DuckStation,
+        EmulatorKind::Xemu,
     ] {
         let candidates: Vec<&ProfileAssessment> = report
             .profiles
@@ -849,11 +891,13 @@ pub struct DiscoveredProfiles {
     pub xenia: Option<XeniaProfileDiscovery>,
     pub ppsspp: Result<PpssppProfileDiscovery, String>,
     pub duckstation: Result<DuckStationProfileDiscovery, String>,
+    pub xemu: Result<XemuProfileDiscovery, String>,
 }
 
 impl DiscoveredProfiles {
-    /// Discovers Dolphin, PCSX2, PPSSPP and DuckStation profiles from their
-    /// documented paths, plus Xenia from the supplied explicit roots only.
+    /// Discovers Dolphin, PCSX2, PPSSPP, DuckStation and xemu profiles from
+    /// their documented paths, plus Xenia from the supplied explicit roots
+    /// only.
     ///
     /// Read-only: each adapter's discovery inspects metadata of documented
     /// paths and never creates a directory or a profile.
@@ -883,6 +927,9 @@ impl DiscoveredProfiles {
         let duckstation = DuckStationProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("DuckStation profiles could not be discovered: {error}"))
             .map(|roots| discover_duckstation_profiles(&roots));
+        let xemu = XemuProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("xemu profiles could not be discovered: {error}"))
+            .map(|roots| discover_xemu_profiles(&roots));
         let preferred_dolphin = dolphin.as_ref().ok().and_then(|discovery| {
             match select_dolphin_profile(discovery, None) {
                 EmulatorProfileSelection::Auto { profile_id, .. } => Some(profile_id),
@@ -897,6 +944,7 @@ impl DiscoveredProfiles {
             xenia,
             ppsspp,
             duckstation,
+            xemu,
         }
     }
 
@@ -912,11 +960,14 @@ impl DiscoveredProfiles {
             ppsspp_error: self.ppsspp.as_ref().err().cloned(),
             duckstation: self.duckstation.as_ref().ok(),
             duckstation_error: self.duckstation.as_ref().err().cloned(),
+            xemu: self.xemu.as_ref().ok(),
+            xemu_error: self.xemu.as_ref().err().cloned(),
             preferred_dolphin: self.preferred_dolphin.as_deref(),
             preferred_pcsx2: None,
             preferred_xenia: None,
             preferred_ppsspp: None,
             preferred_duckstation: None,
+            preferred_xemu: None,
         }
     }
 }
@@ -966,7 +1017,10 @@ pub fn managed_scan_targets(report: &ProfileAssessmentReport) -> Vec<ManagedScan
                 format: match profile.emulator {
                     EmulatorKind::Dolphin => ManagedFormat::DolphinGameSettings,
                     EmulatorKind::Pcsx2 => ManagedFormat::Pcsx2Pnach,
-                    EmulatorKind::Xenia | EmulatorKind::Ppsspp | EmulatorKind::DuckStation => {
+                    EmulatorKind::Xenia
+                    | EmulatorKind::Ppsspp
+                    | EmulatorKind::DuckStation
+                    | EmulatorKind::Xemu => {
                         unreachable!("filtered above")
                     }
                 },
@@ -981,6 +1035,405 @@ pub fn managed_scan_targets(report: &ProfileAssessmentReport) -> Vec<ManagedScan
     targets.sort_by(|left, right| left.destination_root.cmp(&right.destination_root));
     targets.dedup();
     targets
+}
+
+// ---------------------------------------------------------------------------
+// xemu / Xenia launch readiness
+// ---------------------------------------------------------------------------
+//
+// A distinct question from the writability assessment above: not "could
+// EmuWiz write into this profile" but "could this profile actually launch a
+// game right now". Kept as its own small model rather than folded into
+// `ProfileAssessment` because the two adapters' real failure reasons do not
+// reduce to one shared shape - xemu has four independent system files with
+// no Xenia equivalent, and Xenia's one real-world confusion (a Windows
+// `xenia_canary.exe` sitting beside a real profile, unusable natively) has
+// no xemu equivalent. Genericizing them into one struct would either lose
+// xemu's four-way firmware detail or invent a fake firmware requirement for
+// Xenia - see the module's own task notes.
+//
+// The `assess_*` functions below read profile/system-file metadata (via
+// `resolve_xemu_native_launch_binding`/`resolve_xenia_launch_binding`/
+// `inspect_xemu_game`, all already read-only) and belong in this gatherer
+// module for exactly the same reason `assess_one` does. The `findings_from_*`
+// functions are pure transforms over that already-gathered data, safe to
+// call from the pure `runner`.
+
+/// One eligible xemu profile's launch readiness: its native executable
+/// binding, and all four required system files. Independent of any
+/// specific game - xemu's system files are read from its own `xemu.toml`,
+/// never from per-game state, so [`XemuGameRequest::default`] is always
+/// enough here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct XemuReadinessAssessment {
+    pub profile_id: String,
+    pub root_path: EncodedPath,
+    /// `Some` only when [`resolve_xemu_native_launch_binding`] succeeded.
+    pub executable: Option<EncodedPath>,
+    /// The plain-language reason no executable binding exists, when there
+    /// is one.
+    pub binding_problem: Option<String>,
+    pub mcpx: XemuSystemFileState,
+    pub flash_bios: XemuSystemFileState,
+    pub eeprom: XemuSystemFileState,
+    pub hdd: XemuSystemFileState,
+}
+
+/// Assesses every eligible discovered xemu profile's launch readiness.
+///
+/// Read-only: [`resolve_xemu_native_launch_binding`] inspects only
+/// filesystem metadata, and [`inspect_xemu_game`] reads only `xemu.toml`
+/// and the configured system-file paths' metadata. Nothing is created,
+/// mounted, or executed.
+pub fn assess_xemu_readiness(
+    discovery: Option<&XemuProfileDiscovery>,
+) -> Vec<XemuReadinessAssessment> {
+    let Some(discovery) = discovery else {
+        return Vec::new();
+    };
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| {
+            let binding = resolve_xemu_native_launch_binding(profile);
+            let health = inspect_xemu_game(profile, &XemuGameRequest::default()).health;
+            XemuReadinessAssessment {
+                profile_id: profile.profile_id.clone(),
+                root_path: EncodedPath::from_path(&profile.configuration_path),
+                executable: binding
+                    .as_ref()
+                    .ok()
+                    .map(|binding| EncodedPath::from_path(&binding.executable)),
+                binding_problem: binding
+                    .as_ref()
+                    .err()
+                    .map(|blocker| xemu_binding_problem(blocker)),
+                mcpx: health.mcpx,
+                flash_bios: health.flash_bios,
+                eeprom: health.eeprom,
+                hdd: health.hdd,
+            }
+        })
+        .collect()
+}
+
+/// A user-facing sentence for one xemu binding failure - never a raw enum
+/// dump.
+fn xemu_binding_problem(blocker: &XemuLaunchBlocker) -> String {
+    match blocker.kind {
+        XemuLaunchBlockerKind::ProfileIneligible => {
+            "the profile is not eligible for a native launch".to_string()
+        }
+        XemuLaunchBlockerKind::UnsupportedInstallationType => {
+            "the discovered xemu installation is not a supported native Linux install".to_string()
+        }
+        XemuLaunchBlockerKind::ExecutableMissing => {
+            "no native xemu executable was found in the profile".to_string()
+        }
+        XemuLaunchBlockerKind::ExecutableUnsafe => {
+            "the xemu executable is a symlink or not a regular file".to_string()
+        }
+        XemuLaunchBlockerKind::ExecutableNotExecutable => {
+            "the xemu executable does not have the execute permission set".to_string()
+        }
+        XemuLaunchBlockerKind::AmbiguousExecutable => {
+            "more than one native xemu executable was found and none is preferred".to_string()
+        }
+    }
+}
+
+/// A short, user-facing label for one xemu system file's state - never a
+/// raw enum dump.
+fn xemu_system_file_label(state: XemuSystemFileState) -> &'static str {
+    match state {
+        XemuSystemFileState::Present => "present",
+        XemuSystemFileState::Missing => "missing",
+        XemuSystemFileState::Unreadable => "present but unreadable",
+        XemuSystemFileState::NotConfigured => "not configured",
+        XemuSystemFileState::Unknown => "could not be determined",
+    }
+}
+
+/// One Finding per eligible xemu profile, always produced (like the
+/// PPSSPP/DuckStation inspection findings) so a healthy result is stated
+/// explicitly rather than left as silence a user could mistake for "not
+/// checked".
+pub fn findings_from_xemu_readiness(assessments: &[XemuReadinessAssessment]) -> Vec<Finding> {
+    assessments
+        .iter()
+        .map(|assessment| {
+            let firmware: Vec<(&str, XemuSystemFileState)> = vec![
+                ("MCPX boot ROM", assessment.mcpx),
+                ("flash BIOS", assessment.flash_bios),
+                ("EEPROM", assessment.eeprom),
+                ("HDD image", assessment.hdd),
+            ];
+            let missing: Vec<&str> = firmware
+                .iter()
+                .filter(|(_, state)| *state != XemuSystemFileState::Present)
+                .map(|(label, _)| *label)
+                .collect();
+            let ready = assessment.executable.is_some() && missing.is_empty();
+            let severity = if ready {
+                DoctorSeverity::Info
+            } else {
+                DoctorSeverity::Warning
+            };
+            let title = if ready {
+                "xemu is ready to launch".to_string()
+            } else {
+                "xemu is not ready to launch".to_string()
+            };
+            let mut problems = Vec::new();
+            if let Some(binding_problem) = &assessment.binding_problem {
+                problems.push(format!("Executable: {binding_problem}"));
+            }
+            for (label, state) in &firmware {
+                if *state != XemuSystemFileState::Present {
+                    problems.push(format!("{label} is {}", xemu_system_file_label(*state)));
+                }
+            }
+            let explanation = if ready {
+                "A native xemu executable was found and all four required system files (MCPX \
+                 boot ROM, flash BIOS, EEPROM, HDD image) are present."
+                    .to_string()
+            } else {
+                format!("xemu cannot launch a game yet: {}.", problems.join("; "))
+            };
+            let mut evidence = vec![
+                format!("Profile: {}", assessment.profile_id),
+                format!("Configuration path: {}", assessment.root_path.display),
+            ];
+            match &assessment.executable {
+                Some(executable) => evidence.push(format!("Executable: {}", executable.display)),
+                None => evidence.push(format!(
+                    "Executable: not available ({})",
+                    assessment.binding_problem.as_deref().unwrap_or("unknown")
+                )),
+            }
+            for (label, state) in &firmware {
+                evidence.push(format!("{label}: {}", xemu_system_file_label(*state)));
+            }
+            let (why_it_matters, next_step) = if ready {
+                (
+                    "xemu needs a safe native executable and all four Xbox system files (MCPX \
+                     boot ROM, flash BIOS, EEPROM, HDD image) to boot a game.",
+                    "No action needed.",
+                )
+            } else {
+                (
+                    "xemu cannot launch a game until every required system file is present and a \
+                     safe native executable is found.",
+                    "Place the missing file(s) where xemu expects them, or fix the executable \
+                     issue, then re-run Doctor.",
+                )
+            };
+            Finding::new(
+                "emulator_readiness.xemu",
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                severity,
+                title,
+                explanation,
+            )
+            .with_affected(assessment.root_path.clone())
+            .with_evidence(evidence)
+            .with_measurements([
+                ("profile", Measurement::text(&assessment.profile_id)),
+                (
+                    "executable_found",
+                    Measurement::Flag(assessment.executable.is_some()),
+                ),
+                (
+                    "mcpx",
+                    Measurement::text(xemu_system_file_label(assessment.mcpx)),
+                ),
+                (
+                    "flash_bios",
+                    Measurement::text(xemu_system_file_label(assessment.flash_bios)),
+                ),
+                (
+                    "eeprom",
+                    Measurement::text(xemu_system_file_label(assessment.eeprom)),
+                ),
+                (
+                    "hdd",
+                    Measurement::text(xemu_system_file_label(assessment.hdd)),
+                ),
+                ("ready", Measurement::Flag(ready)),
+            ])
+            .with_guidance(why_it_matters, next_step)
+        })
+        .collect()
+}
+
+/// One eligible Xenia profile's launch readiness: its native Linux
+/// executable binding only. Xenia has no firmware/BIOS concept in this
+/// build, so none is invented here - see [`findings_from_xenia_readiness`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct XeniaReadinessAssessment {
+    pub profile_id: String,
+    pub root_path: EncodedPath,
+    /// `Some` only when [`resolve_xenia_launch_binding`] succeeded.
+    pub executable: Option<EncodedPath>,
+    pub binding_problem: Option<String>,
+    /// `true` when a Windows `xenia_canary.exe` exists in the profile
+    /// directory - checked purely for wording: it never counts toward, or
+    /// substitutes for, a valid native binding.
+    pub windows_exe_present: bool,
+}
+
+/// Assesses every eligible discovered Xenia profile's launch readiness.
+///
+/// Read-only: [`resolve_xenia_launch_binding`] inspects only filesystem
+/// metadata, and the `.exe` check is a single `Path::exists` read solely to
+/// word the "Windows-only install" case precisely - it never influences
+/// which binding is chosen.
+pub fn assess_xenia_readiness(
+    discovery: Option<&XeniaProfileDiscovery>,
+) -> Vec<XeniaReadinessAssessment> {
+    let Some(discovery) = discovery else {
+        return Vec::new();
+    };
+    discovery
+        .profiles
+        .iter()
+        .filter(|profile| profile.eligible)
+        .map(|profile| {
+            let binding = resolve_xenia_launch_binding(profile);
+            XeniaReadinessAssessment {
+                profile_id: profile.profile_id.clone(),
+                root_path: EncodedPath::from_path(&profile.configuration_path),
+                executable: binding
+                    .as_ref()
+                    .ok()
+                    .map(|binding| EncodedPath::from_path(&binding.executable)),
+                binding_problem: binding
+                    .as_ref()
+                    .err()
+                    .map(|blocker| xenia_binding_problem(blocker)),
+                windows_exe_present: profile.configuration_path.join("xenia_canary.exe").exists(),
+            }
+        })
+        .collect()
+}
+
+/// A user-facing sentence for one Xenia binding failure - never a raw enum
+/// dump.
+fn xenia_binding_problem(blocker: &XeniaLaunchBlocker) -> String {
+    match blocker.kind {
+        XeniaLaunchBlockerKind::ProfileRootMismatch => {
+            "the profile configuration no longer matches what was discovered".to_string()
+        }
+        XeniaLaunchBlockerKind::ExecutableMissing => {
+            "no native Linux Xenia executable (xenia_canary or xenia) was found".to_string()
+        }
+        XeniaLaunchBlockerKind::ExecutableUnsafe => {
+            "the candidate executable is a symlink or not a regular file".to_string()
+        }
+        XeniaLaunchBlockerKind::ExecutableNotExecutable => {
+            "the candidate executable does not have the execute permission set".to_string()
+        }
+        XeniaLaunchBlockerKind::AmbiguousExecutable => {
+            "more than one native Xenia executable was found and none is preferred".to_string()
+        }
+    }
+}
+
+/// One Finding per eligible Xenia profile, always produced for the same
+/// reason as [`findings_from_xemu_readiness`].
+pub fn findings_from_xenia_readiness(assessments: &[XeniaReadinessAssessment]) -> Vec<Finding> {
+    assessments
+        .iter()
+        .map(|assessment| {
+            let ready = assessment.executable.is_some();
+            let severity = if ready {
+                DoctorSeverity::Info
+            } else {
+                DoctorSeverity::Warning
+            };
+            let title = if ready {
+                "Xenia is ready to launch".to_string()
+            } else {
+                "Xenia is not ready to launch".to_string()
+            };
+            let explanation = match (&assessment.executable, assessment.windows_exe_present) {
+                (Some(executable), _) => format!(
+                    "A native Linux Xenia executable was found: {}.",
+                    executable.display
+                ),
+                (None, true) => "A Windows xenia_canary.exe was found, but it cannot be launched \
+                                  natively on Linux. It is never treated as a valid native \
+                                  executable. Install or place a native Linux Xenia executable \
+                                  (xenia_canary or xenia, without a .exe extension) in the same \
+                                  folder."
+                    .to_string(),
+                (None, false) => format!(
+                    "Xenia cannot launch a game yet: {}.",
+                    assessment
+                        .binding_problem
+                        .as_deref()
+                        .unwrap_or("no native executable is available")
+                ),
+            };
+            let mut evidence = vec![
+                format!("Profile: {}", assessment.profile_id),
+                format!("Configuration path: {}", assessment.root_path.display),
+                format!(
+                    "Windows xenia_canary.exe present: {}",
+                    assessment.windows_exe_present
+                ),
+            ];
+            match &assessment.executable {
+                Some(executable) => evidence.push(format!("Executable: {}", executable.display)),
+                None => evidence.push(format!(
+                    "Executable: not available ({})",
+                    assessment.binding_problem.as_deref().unwrap_or("unknown")
+                )),
+            }
+            let (why_it_matters, next_step) = if ready {
+                (
+                    "Xenia needs a safe native Linux executable to boot a game. Windows/Wine \
+                     execution is not supported.",
+                    "No action needed.",
+                )
+            } else if assessment.windows_exe_present {
+                (
+                    "Only a Windows build was found. EmuWiz never assumes or configures Wine/Proton \
+                     to run it.",
+                    "Download or build a native Linux Xenia (Canary) release and place its \
+                     executable in the same folder as xenia-canary.config.toml.",
+                )
+            } else {
+                (
+                    "Xenia cannot launch a game until a safe native Linux executable is found.",
+                    "Fix the executable issue, or place a native Linux Xenia executable in the \
+                     profile folder, then re-run Doctor.",
+                )
+            };
+            Finding::new(
+                "emulator_readiness.xenia",
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                severity,
+                title,
+                explanation,
+            )
+            .with_affected(assessment.root_path.clone())
+            .with_evidence(evidence)
+            .with_measurements([
+                ("profile", Measurement::text(&assessment.profile_id)),
+                ("executable_found", Measurement::Flag(ready)),
+                (
+                    "windows_exe_present",
+                    Measurement::Flag(assessment.windows_exe_present),
+                ),
+                ("ready", Measurement::Flag(ready)),
+            ])
+            .with_guidance(why_it_matters, next_step)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1294,11 +1747,14 @@ mod tests {
             ppsspp_error: None,
             duckstation: None,
             duckstation_error: None,
+            xemu: None,
+            xemu_error: None,
             preferred_dolphin: None,
             preferred_pcsx2: None,
             preferred_xenia: None,
             preferred_ppsspp: None,
             preferred_duckstation: None,
+            preferred_xemu: None,
         };
         let assessed = assess_emulator_profiles(&discoveries, None);
         assert!(assessed.profiles.is_empty());
@@ -1352,11 +1808,14 @@ mod tests {
             ppsspp_error: None,
             duckstation: None,
             duckstation_error: None,
+            xemu: None,
+            xemu_error: None,
             preferred_dolphin: None,
             preferred_pcsx2: None,
             preferred_xenia: None,
             preferred_ppsspp: None,
             preferred_duckstation: None,
+            preferred_xemu: None,
         };
         let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
         assert_eq!(assessed.profiles.len(), 1);
@@ -1407,11 +1866,14 @@ mod tests {
             ppsspp_error: None,
             duckstation: Some(&discovery),
             duckstation_error: None,
+            xemu: None,
+            xemu_error: None,
             preferred_dolphin: None,
             preferred_pcsx2: None,
             preferred_xenia: None,
             preferred_ppsspp: None,
             preferred_duckstation: None,
+            preferred_xemu: None,
         };
         let assessed = assess_emulator_profiles(&discoveries, Some(&rw_table()));
         assert_eq!(assessed.profiles.len(), 1);
@@ -1847,5 +2309,403 @@ mod tests {
                 appimage_directory: None,
             },
         }
+    }
+
+    // -----------------------------------------------------------------
+    // xemu / Xenia launch readiness
+    // -----------------------------------------------------------------
+    //
+    // xemu's own `resolve_xemu_native_launch_binding` only ever authorizes
+    // an executable candidate whose installation type is `Native`, and
+    // `discover_xemu_profiles`'s own executable discovery only ever
+    // classifies a candidate `Native` when it is found by searching the
+    // current process's real `PATH` - exactly the same PATH/global-env
+    // testing limitation already established for xemu/PPSSPP/DuckStation's
+    // own execution-layer tests (see `xemu_execution::tests`'s own module
+    // doc comment). Mutating this test binary's real `PATH` to fabricate a
+    // match would race every other concurrently running test that also
+    // reads it, so - following that same precedent - the *finding-shaping*
+    // logic below (severity, wording, measurements) is tested directly
+    // against hand-built [`XemuReadinessAssessment`] values, never through
+    // a real `Native` binding. The one gatherer-wiring test
+    // (`xemu_readiness_is_only_assessed_for_eligible_profiles`) proves
+    // `assess_xemu_readiness` itself reads real profile/health metadata and
+    // filters ineligible profiles correctly, without depending on a
+    // genuine `Native` executable ever being reachable in a test binary.
+    //
+    // Xenia has no such limitation: `resolve_xenia_launch_binding` never
+    // searches `$PATH` at all, so its readiness tests below use real,
+    // fully genuine fixtures throughout (see `xenia_execution::tests`'s own
+    // module doc comment for the same observation at the execution layer).
+
+    use crate::patch_manager::{
+        XemuGameIdMapping, XemuHealth, XemuProfileDiscoveryRoots, discover_xemu_profiles,
+        discover_xenia_profiles,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &Path, contents: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn healthy_xemu_health() -> XemuHealth {
+        XemuHealth {
+            detected: true,
+            config_readable: true,
+            mcpx: XemuSystemFileState::Present,
+            flash_bios: XemuSystemFileState::Present,
+            eeprom: XemuSystemFileState::Present,
+            hdd: XemuSystemFileState::Present,
+            game_profile_mapping: XemuGameIdMapping::Unavailable,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn xemu_assessment(
+        executable: Option<&str>,
+        binding_problem: Option<&str>,
+        health: XemuHealth,
+    ) -> XemuReadinessAssessment {
+        XemuReadinessAssessment {
+            profile_id: "xemu-native".to_string(),
+            root_path: EncodedPath::from_path(Path::new("/home/user/.config/xemu")),
+            executable: executable.map(|path| EncodedPath::from_path(Path::new(path))),
+            binding_problem: binding_problem.map(str::to_string),
+            mcpx: health.mcpx,
+            flash_bios: health.flash_bios,
+            eeprom: health.eeprom,
+            hdd: health.hdd,
+        }
+    }
+
+    fn xemu_finding(assessment: XemuReadinessAssessment) -> Finding {
+        let mut findings = findings_from_xemu_readiness(&[assessment]);
+        assert_eq!(findings.len(), 1);
+        findings.remove(0)
+    }
+
+    #[test]
+    fn xemu_ready_profile_is_reported_healthy() {
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            healthy_xemu_health(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Info);
+        assert_eq!(finding.id, "emulator_readiness.xemu");
+        assert_eq!(finding.title, "xemu is ready to launch");
+        assert_eq!(
+            finding.measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            finding.measurements.get("mcpx"),
+            Some(&Measurement::text("present"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_mcpx_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.mcpx = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("MCPX boot ROM is missing"));
+        assert_eq!(
+            finding.measurements.get("mcpx"),
+            Some(&Measurement::text("missing"))
+        );
+        assert_eq!(
+            finding.measurements.get("flash_bios"),
+            Some(&Measurement::text("present"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_flash_bios_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.flash_bios = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("flash BIOS is missing"));
+        assert_eq!(
+            finding.measurements.get("flash_bios"),
+            Some(&Measurement::text("missing"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_eeprom_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.eeprom = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("EEPROM is missing"));
+        assert_eq!(
+            finding.measurements.get("eeprom"),
+            Some(&Measurement::text("missing"))
+        );
+    }
+
+    #[test]
+    fn xemu_missing_hdd_is_reported_by_name() {
+        let mut health = healthy_xemu_health();
+        health.hdd = XemuSystemFileState::Missing;
+        let finding = xemu_finding(xemu_assessment(
+            Some("/home/user/.config/xemu/xemu"),
+            None,
+            health,
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(finding.explanation.contains("HDD image is missing"));
+        assert_eq!(
+            finding.measurements.get("hdd"),
+            Some(&Measurement::text("missing"))
+        );
+    }
+
+    #[test]
+    fn xemu_unsafe_executable_is_reported() {
+        let finding = xemu_finding(xemu_assessment(
+            None,
+            Some("the xemu executable is a symlink or not a regular file"),
+            healthy_xemu_health(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("symlink or not a regular file")
+        );
+        assert_eq!(
+            finding.measurements.get("executable_found"),
+            Some(&Measurement::Flag(false))
+        );
+    }
+
+    #[test]
+    fn xemu_ambiguous_executables_are_reported() {
+        let finding = xemu_finding(xemu_assessment(
+            None,
+            Some("more than one native xemu executable was found and none is preferred"),
+            healthy_xemu_health(),
+        ));
+        assert_eq!(finding.severity, DoctorSeverity::Warning);
+        assert!(
+            finding
+                .explanation
+                .contains("more than one native xemu executable")
+        );
+    }
+
+    /// Proves the real, I/O-touching gatherer: an ineligible profile
+    /// contributes no assessment at all (its own writability finding
+    /// already covers it), and an eligible one is genuinely inspected via
+    /// [`inspect_xemu_game`]'s real, read-only firmware detection - not
+    /// through any hand-built value.
+    #[test]
+    fn xemu_readiness_is_only_assessed_for_eligible_profiles() {
+        let tree = TempTree::new("xemu-gatherer");
+        // A native profile root with real system files and a real
+        // xemu.toml - genuinely eligible and genuinely inspected, even
+        // though no `Native`-classified executable can be placed here
+        // without touching `$PATH` (see this section's own doc comment).
+        let root = tree.path().join("config/xemu/xemu");
+        fs::create_dir_all(root.join("system")).unwrap();
+        fs::write(root.join("system/mcpx.bin"), b"mcpx").unwrap();
+        fs::write(
+            root.join("xemu.toml"),
+            "[sys.files]\nbootrom_path = 'system/mcpx.bin'\n",
+        )
+        .unwrap();
+        let discovery = discover_xemu_profiles(&XemuProfileDiscoveryRoots {
+            home: tree.path().join("home"),
+            xdg_config_home: tree.path().join("config"),
+            xdg_data_home: tree.path().join("data-unused"),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: std::collections::BTreeMap::new(),
+            appimage_directory: None,
+        });
+        assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
+        assert!(discovery.profiles[0].eligible);
+        let assessments = assess_xemu_readiness(Some(&discovery));
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].mcpx, XemuSystemFileState::Present);
+        assert_eq!(
+            assessments[0].flash_bios,
+            XemuSystemFileState::NotConfigured
+        );
+        // No `Native` executable is reachable here (see the doc comment
+        // above), so the binding is genuinely absent - proving the
+        // gatherer reports that honestly rather than fabricating success.
+        assert!(assessments[0].executable.is_none());
+        assert!(assessments[0].binding_problem.is_some());
+
+        assert!(assess_xemu_readiness(None).is_empty());
+    }
+
+    /// A real, eligible Xenia profile: `xenia-canary.config.toml` marker plus
+    /// a native `xenia_canary` executable directly beneath `root`.
+    fn xenia_ready_profile(root: &Path) -> XeniaProfileDiscovery {
+        fs::write(root.join("xenia-canary.config.toml"), b"").unwrap();
+        write_executable(&root.join("xenia_canary"), b"#!/bin/sh\nexit 0\n");
+        discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+            explicit_configuration_roots: vec![root.to_path_buf()],
+        })
+    }
+
+    #[test]
+    fn xenia_ready_with_native_linux_binary_is_reported_healthy() {
+        let tree = TempTree::new("xenia-ready");
+        let discovery = xenia_ready_profile(tree.path());
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Info);
+        assert_eq!(findings[0].id, "emulator_readiness.xenia");
+        assert_eq!(
+            findings[0].measurements.get("ready"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            findings[0].measurements.get("windows_exe_present"),
+            Some(&Measurement::Flag(false))
+        );
+    }
+
+    #[test]
+    fn xenia_windows_exe_only_is_reported_as_not_launchable_natively() {
+        let tree = TempTree::new("xenia-exe-only");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        fs::write(tree.path().join("xenia_canary.exe"), b"MZ fake pe").unwrap();
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert_eq!(
+            findings[0].measurements.get("windows_exe_present"),
+            Some(&Measurement::Flag(true))
+        );
+        assert_eq!(
+            findings[0].measurements.get("executable_found"),
+            Some(&Measurement::Flag(false))
+        );
+        assert!(
+            findings[0]
+                .explanation
+                .contains("cannot be launched natively on Linux")
+        );
+        // Never claims the .exe is a valid native executable anywhere.
+        assert!(!findings[0].explanation.contains("A native Linux Xenia"));
+    }
+
+    #[test]
+    fn xenia_missing_native_binding_is_reported() {
+        let tree = TempTree::new("xenia-missing-binding");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert_eq!(
+            findings[0].measurements.get("windows_exe_present"),
+            Some(&Measurement::Flag(false))
+        );
+        assert!(
+            findings[0]
+                .explanation
+                .contains("no native Linux Xenia executable")
+        );
+    }
+
+    #[test]
+    fn xenia_non_executable_binary_is_reported() {
+        let tree = TempTree::new("xenia-not-executable");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        fs::write(tree.path().join("xenia_canary"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert!(
+            findings[0]
+                .explanation
+                .contains("does not have the execute permission")
+        );
+    }
+
+    #[test]
+    fn xenia_ambiguous_native_candidates_are_reported() {
+        let tree = TempTree::new("xenia-ambiguous");
+        fs::write(tree.path().join("xenia-canary.config.toml"), b"").unwrap();
+        write_executable(&tree.path().join("xenia_canary"), b"#!/bin/sh\nexit 0\n");
+        write_executable(&tree.path().join("xenia"), b"#!/bin/sh\nexit 0\n");
+        let discovery =
+            discover_xenia_profiles(&crate::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: vec![tree.path().to_path_buf()],
+            });
+        let assessments = assess_xenia_readiness(Some(&discovery));
+        let findings = findings_from_xenia_readiness(&assessments);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, DoctorSeverity::Warning);
+        assert!(
+            findings[0]
+                .explanation
+                .contains("more than one native Xenia executable")
+        );
+    }
+
+    #[test]
+    fn unrelated_emulator_rows_are_unchanged_by_xemu_and_xenia_readiness() {
+        // Adding xemu/Xenia readiness must never alter another adapter's own
+        // writability finding shape or wording.
+        let tree = TempTree::new("unrelated-unchanged");
+        let ppsspp_root = tree.path().join("ppsspp");
+        fs::create_dir_all(ppsspp_root.join("PSP/SYSTEM")).unwrap();
+        fs::write(ppsspp_root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
+        let roots = roots_for_ppsspp_and_duckstation(&tree.path().to_path_buf(), &[], &[]);
+        let discovery = discover_ppsspp_profiles(&PpssppProfileDiscoveryRoots {
+            explicit_configuration_roots: vec![ppsspp_root.clone()],
+            ..roots.ppsspp
+        });
+        let discoveries = ProfileDiscoveries {
+            ppsspp: Some(&discovery),
+            ..ProfileDiscoveries::default()
+        };
+        let assessed = assess_emulator_profiles(&discoveries, None);
+        let findings = findings_from_emulator_profiles(&assessed);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "emulator_profile.ppsspp_inspected");
+        assert_eq!(findings[0].category, DoctorCategory::EmulatorProfiles);
+        assert_eq!(findings[0].subsystem, DoctorSubsystem::EmulatorProfiles);
     }
 }

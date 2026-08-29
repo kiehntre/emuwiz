@@ -21,7 +21,8 @@ use archivefs_core::diagnostics::environment::{
 };
 use archivefs_core::diagnostics::managed::{ManagedEntryScan, scan_managed_entries};
 use archivefs_core::diagnostics::profiles::{
-    DiscoveredProfiles, ProfileAssessmentReport, assess_emulator_profiles, managed_scan_targets,
+    DiscoveredProfiles, ProfileAssessmentReport, XemuReadinessAssessment, XeniaReadinessAssessment,
+    assess_emulator_profiles, assess_xemu_readiness, assess_xenia_readiness, managed_scan_targets,
     profile_destination_directories,
 };
 use archivefs_core::diagnostics::repair::{
@@ -1808,6 +1809,8 @@ struct DoctorGathered {
     transactions: Gathered<SharedHistoryReport>,
     storage: Gathered<StorageAssessment>,
     emulator_profiles: Gathered<ProfileAssessmentReport>,
+    xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,
+    xenia_readiness: Gathered<Vec<XeniaReadinessAssessment>>,
     managed_entries: Gathered<ManagedEntryScan>,
 }
 
@@ -2046,6 +2049,16 @@ fn gather_doctor_inputs() -> DoctorGathered {
     let discovered = DiscoveredProfiles::from_environment(Vec::new());
     let profile_report = assess_emulator_profiles(&discovered.borrowed(), mount_table.as_deref());
     let managed_targets = managed_scan_targets(&profile_report);
+    // Launch readiness (native executable binding, plus - xemu only - the
+    // four required system files) is a distinct question from the
+    // writability assessment above, so it is gathered separately - see
+    // `diagnostics::profiles`'s own "xemu / Xenia launch readiness" module
+    // doc section.
+    let xemu_readiness = match &discovered.xemu {
+        Ok(discovery) => Gathered::Ready(assess_xemu_readiness(Some(discovery))),
+        Err(error) => Gathered::Failed(error.clone()),
+    };
+    let xenia_readiness = Gathered::Ready(assess_xenia_readiness(discovered.xenia.as_ref()));
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -2093,6 +2106,8 @@ fn gather_doctor_inputs() -> DoctorGathered {
             &profile_destination_directories(&profile_report),
         ))),
         emulator_profiles: Gathered::Ready(profile_report),
+        xemu_readiness,
+        xenia_readiness,
         managed_entries: match &transactions {
             Gathered::Ready(history) => {
                 Gathered::Ready(scan_managed_entries(history, &managed_targets))
@@ -5358,6 +5373,12 @@ impl ArchiveFsApp {
                             emulator_profiles: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            xemu_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            xenia_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             managed_entries: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -5423,6 +5444,8 @@ impl ArchiveFsApp {
             },
             storage: borrowed(&gathered.storage, |value| value),
             emulator_profiles: borrowed(&gathered.emulator_profiles, |value| value),
+            xemu_readiness: borrowed(&gathered.xemu_readiness, |value| value.as_slice()),
+            xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
             managed_entries: borrowed(&gathered.managed_entries, |value| value),
             free_space_policy: FreeSpacePolicy::default(),
         };

@@ -2653,6 +2653,8 @@ fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
                 transactions: Gathered::NotLoaded("stale"),
                 storage: Gathered::NotLoaded("stale"),
                 emulator_profiles: Gathered::NotLoaded("stale"),
+                xemu_readiness: Gathered::NotLoaded("stale"),
+                xenia_readiness: Gathered::NotLoaded("stale"),
                 managed_entries: Gathered::NotLoaded("stale"),
             },
         ))
@@ -2687,6 +2689,8 @@ fn a_current_doctor_run_completes_and_records_when_it_finished() {
                 transactions: Gathered::NotLoaded("no history"),
                 storage: Gathered::NotLoaded("not gathered"),
                 emulator_profiles: Gathered::NotLoaded("not gathered"),
+                xemu_readiness: Gathered::NotLoaded("not gathered"),
+                xenia_readiness: Gathered::NotLoaded("not gathered"),
                 managed_entries: Gathered::NotLoaded("not gathered"),
             },
         ))
