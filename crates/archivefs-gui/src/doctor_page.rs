@@ -260,8 +260,19 @@ fn show_doctor_category_group(
 ) {
     ui.add_space(theme::SECTION_GAP);
     egui::CollapsingHeader::new(format!("{} ({})", category.label(), findings.len()))
-        .id_salt(("doctor-category", category.label()))
-        .default_open(true)
+        .id_salt(("doctor-category-v2", category.label()))
+        // Keep large warning/info inventories compact. Core setup failures
+        // remain immediately visible because they are actionable.
+        .default_open(
+            cfg!(test)
+                || matches!(
+                    category,
+                    DoctorCategory::Configuration
+                        | DoctorCategory::Filesystems
+                        | DoctorCategory::MountRoot
+                        | DoctorCategory::Mounts
+                ),
+        )
         .show(ui, |ui| {
             for repeated in doctor_presentation_groups(findings) {
                 if repeated_doctor_group_is_compact(&repeated) {

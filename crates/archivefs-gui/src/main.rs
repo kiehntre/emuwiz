@@ -6045,7 +6045,11 @@ impl ArchiveFsApp {
                             }
                             Some(finding) => {
                                 let label = if finding.severity == DoctorSeverity::Info {
-                                    "Checked"
+                                    if finding.category == DoctorCategory::EmulatorProfiles {
+                                        "Profile found"
+                                    } else {
+                                        "Evidence found"
+                                    }
                                 } else {
                                     "Needs attention"
                                 };

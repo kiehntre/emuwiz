@@ -718,14 +718,15 @@ pub(super) fn show_library_views_page(
         let mut confirmed = false;
         let mut cancel = false;
         let mut keep_definition = dialog.keep_definition;
-        egui::Window::new("Remove this library view?")
+        widgets::centered_window("Remove this library view?")
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(
                     "EmuWiz will remove only the managed symlinks recorded for this view. \
-                     Original archive files are never touched.",
+                     Original archive files are never touched. Empty subfolders created for the \
+                     view are cleaned up when safe; the destination folder itself may remain.",
                 );
                 ui.add_space(4.0);
                 ui.strong(&dialog.view_name);
@@ -733,13 +734,12 @@ pub(super) fn show_library_views_page(
                 ui.radio_value(
                     &mut keep_definition,
                     true,
-                    "Keep the view's definition (recommended) - re-apply later to recreate its \
-                     symlinks",
+                    "Keep this Library View (recommended) - remove its generated links now, but keep this saved setup so you can rebuild it later.",
                 );
                 ui.radio_value(
                     &mut keep_definition,
                     false,
-                    "Also remove the view's definition from configuration",
+                    "Delete this Library View - remove its generated links and forget this saved setup.",
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {

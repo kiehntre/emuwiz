@@ -243,7 +243,10 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     },
     NavGroup {
         heading: Some("SOURCES"),
-        entries: &[nav_view(MainView::Sources, "Sources")],
+        entries: &[
+            nav_view(MainView::Sources, "Sources"),
+            nav_view(MainView::DatSources, "DAT Sources"),
+        ],
     },
     NavGroup {
         heading: Some("HISTORY & JOURNALS"),
@@ -285,7 +288,7 @@ pub(crate) fn navigation_destination_enabled(view: MainView, has_database: bool)
 /// exact equality; `MainView::Library`'s button is the sole sidebar entry
 /// point into the unified Library shell, so it renders selected whenever
 /// `current` is *any* of the five Library-related destinations
-/// (`library_tab_for_main_view(current).is_some()`), not just
+/// (`current == MainView::Library`), not just
 /// `MainView::Library` itself - otherwise the sidebar would show no
 /// selected destination at all while on the Health, Duplicates, or Views
 /// tab.
@@ -303,11 +306,11 @@ pub(crate) fn navigation_destination_enabled(view: MainView, has_database: bool)
 /// `CheatSources`/`SourcesDiscovery` (see `sources_tab_for_main_view`).
 pub(crate) fn navigation_destination_selected(current: MainView, candidate: MainView) -> bool {
     if candidate == MainView::Library {
-        library_tab_for_main_view(current).is_some()
+        current == MainView::Library
     } else if candidate == MainView::Problems {
         problems_repair_tab_for_main_view(current).is_some()
     } else if candidate == MainView::Sources {
-        sources_tab_for_main_view(current).is_some()
+        current == MainView::Sources
     } else {
         current == candidate
     }
@@ -370,7 +373,10 @@ pub(crate) fn show_primary_navigation(
                         NavClick::Overlay(overlay) => {
                             (true, entry.highlightable && current_overlay == overlay)
                         }
-                        NavClick::QuickRename => (true, entry.highlightable),
+                        NavClick::QuickRename => (
+                            true,
+                            entry.highlightable && current == MainView::IdentifyRename,
+                        ),
                         // Routes to Sources -> Libraries; the "Sources" entry
                         // owns that selected state, so `nav_romm` is not
                         // highlightable and this is always `false`.

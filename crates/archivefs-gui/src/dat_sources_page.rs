@@ -5928,6 +5928,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// something whose difference from disk defines the unsaved-change state.
 #[derive(Default)]
 pub(crate) struct DatSourcesPageUi {
+    /// Session-only bulk disclosure choices for the two large DAT lists.
+    /// `None` leaves individual card state alone; explicit actions set the
+    /// whole list to compact or expanded browsing.
+    pub(crate) local_sources_expanded: Option<bool>,
+    pub(crate) managed_sources_expanded: Option<bool>,
     /// Which source's detail disclosure is open.
     pub(crate) open_inspect: Option<String>,
     /// Which source's platform picker is open.
@@ -5976,6 +5981,8 @@ pub(crate) struct DatSourcesPageUi {
 impl DatSourcesPageUi {
     /// Forgets every unsubmitted choice.
     pub(crate) fn clear(&mut self) {
+        self.local_sources_expanded = None;
+        self.managed_sources_expanded = None;
         self.open_inspect = None;
         self.open_platform_picker = None;
         self.platform_query.clear();
@@ -6080,6 +6087,15 @@ pub(crate) fn show_dat_sources_page(
         "Local DAT Sources",
         Some("User-added DAT files and folders. These stay local-only and are never updateable."),
     );
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{} source(s)", view.rows.len())).strong());
+        if ui.button("Expand all").clicked() {
+            ui_state.local_sources_expanded = Some(true);
+        }
+        if ui.button("Collapse all").clicked() {
+            ui_state.local_sources_expanded = Some(false);
+        }
+    });
     if !view.rows.is_empty() {
         ui.horizontal(|ui| {
             if action.is_none()
@@ -6110,11 +6126,19 @@ pub(crate) fn show_dat_sources_page(
         );
     } else {
         for row in &view.rows {
-            if action.is_none()
-                && let Some(row_action) = show_source_row(ui, row, view, ui_state)
-            {
-                action = Some(row_action);
-            }
+            let open = ui_state
+                .local_sources_expanded
+                .unwrap_or(view.rows.len() < 10);
+            egui::CollapsingHeader::new(format!("{} · {}", row.display_name, row.kind_label))
+                .id_salt(("local-dat-source", row.id.as_str()))
+                .default_open(open)
+                .show(ui, |ui| {
+                    if action.is_none()
+                        && let Some(row_action) = show_source_row(ui, row, view, ui_state)
+                    {
+                        action = Some(row_action);
+                    }
+                });
             ui.add_space(8.0);
         }
     }
@@ -7083,6 +7107,17 @@ fn show_managed_dat_sources_section(
             "Built-in MAME and Redump sources. Checks and downloads happen only after you click an action.",
         ),
     );
+    let managed_count =
+        view.managed_rows.len() + view.redump_bios_rows.len() + view.redump_game_rows.len();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{managed_count} source(s)")).strong());
+        if ui.button("Expand all").clicked() {
+            ui_state.managed_sources_expanded = Some(true);
+        }
+        if ui.button("Collapse all").clicked() {
+            ui_state.managed_sources_expanded = Some(false);
+        }
+    });
 
     if let Some(error) = &view.managed_load_error {
         widgets::banner(
@@ -7136,11 +7171,19 @@ fn show_managed_dat_sources_section(
     ui.add_space(8.0);
 
     for row in &view.managed_rows {
-        if action.is_none()
-            && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
-        {
-            action = Some(row_action);
-        }
+        let open = ui_state
+            .managed_sources_expanded
+            .unwrap_or(managed_count < 10);
+        egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
+            .id_salt(("managed-dat-source", row.source_id.clone()))
+            .default_open(open)
+            .show(ui, |ui| {
+                if action.is_none()
+                    && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+                {
+                    action = Some(row_action);
+                }
+            });
         ui.add_space(8.0);
     }
     ui.add_space(4.0);
@@ -7150,11 +7193,19 @@ fn show_managed_dat_sources_section(
         Some("Fixed Redump firmware metadata sources. No URLs or provider settings are exposed."),
     );
     for row in &view.redump_bios_rows {
-        if action.is_none()
-            && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
-        {
-            action = Some(row_action);
-        }
+        let open = ui_state
+            .managed_sources_expanded
+            .unwrap_or(managed_count < 10);
+        egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
+            .id_salt(("managed-dat-source", row.source_id.clone()))
+            .default_open(open)
+            .show(ui, |ui| {
+                if action.is_none()
+                    && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+                {
+                    action = Some(row_action);
+                }
+            });
         ui.add_space(8.0);
     }
     widgets::section_header(
@@ -7163,11 +7214,19 @@ fn show_managed_dat_sources_section(
         Some("Fixed Redump catalogues for PlayStation, PlayStation 2, and Xbox only."),
     );
     for row in &view.redump_game_rows {
-        if action.is_none()
-            && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
-        {
-            action = Some(row_action);
-        }
+        let open = ui_state
+            .managed_sources_expanded
+            .unwrap_or(managed_count < 10);
+        egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
+            .id_salt(("managed-dat-source", row.source_id.clone()))
+            .default_open(open)
+            .show(ui, |ui| {
+                if action.is_none()
+                    && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+                {
+                    action = Some(row_action);
+                }
+            });
         ui.add_space(8.0);
     }
     action

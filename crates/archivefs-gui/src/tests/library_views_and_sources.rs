@@ -3444,7 +3444,7 @@ fn sources_discovery_tab_still_renders_collection_discovery() {
 }
 
 #[test]
-fn sources_is_the_only_sidebar_entry_for_dat_cheat_and_discovery() {
+fn sources_and_direct_dat_are_the_sidebar_entries_for_dat_cheat_and_discovery() {
     let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
         .iter()
         .flat_map(|group| group.entries)
@@ -3454,16 +3454,9 @@ fn sources_is_the_only_sidebar_entry_for_dat_cheat_and_discovery() {
         })
         .collect();
     assert!(sidebar_views.contains(&MainView::Sources));
-    for view in [
-        MainView::DatSources,
-        MainView::CheatSources,
-        MainView::SourcesDiscovery,
-    ] {
-        assert!(
-            !sidebar_views.contains(&view),
-            "{view:?} must not have its own sidebar entry any more"
-        );
-    }
+    assert!(sidebar_views.contains(&MainView::DatSources));
+    assert!(!sidebar_views.contains(&MainView::CheatSources));
+    assert!(!sidebar_views.contains(&MainView::SourcesDiscovery));
     assert!(
         !ADVANCED_NAV_GROUPS
             .iter()

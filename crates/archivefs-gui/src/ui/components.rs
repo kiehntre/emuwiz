@@ -78,7 +78,10 @@ pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: St
         StatusTone::Success => "✓",
         StatusTone::Warning => "!",
         StatusTone::Blocked => "×",
-        StatusTone::Pending => "?",
+        // A question mark is read as a broken/missing icon by several Linux
+        // font stacks and made labels such as "? Remove" look malformed.
+        // Pending is a neutral state, so use a plain supported text cue.
+        StatusTone::Pending => "·",
         StatusTone::Active => "▶",
         StatusTone::Info => "i",
     };

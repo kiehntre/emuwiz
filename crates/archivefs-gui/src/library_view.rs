@@ -363,7 +363,7 @@ pub(crate) fn show_loaded_data(
     }
     if confirm_mount_all.is_some() {
         let actions_available = !busy;
-        egui::Window::new("Mount All pending archives?")
+        widgets::centered_window("Mount All pending archives?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -425,7 +425,7 @@ pub(crate) fn show_loaded_data(
 
     if confirm_unmount_all.is_some() {
         let actions_available = !busy;
-        egui::Window::new("Unmount All mounted archives?")
+        widgets::centered_window("Unmount All mounted archives?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -488,7 +488,7 @@ pub(crate) fn show_loaded_data(
         let mounted_selected_count = mounted_selected.len();
         let selected_count = selected_archives.len();
         let actions_available = !busy;
-        egui::Window::new("Unmount selected mounted archives?")
+        widgets::centered_window("Unmount selected mounted archives?")
             .collapsible(false)
             .resizable(false)
             .default_width(700.0)
@@ -573,7 +573,7 @@ pub(crate) fn show_loaded_data(
         let items = mount_all_items_for_paths(&data.records, &paths);
         let count = items.len();
         let actions_available = !busy;
-        egui::Window::new("Mount selected pending archives?")
+        widgets::centered_window("Mount selected pending archives?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -639,7 +639,7 @@ pub(crate) fn show_loaded_data(
                 format!("Clear the manually assigned platform of {count} selected archives.")
             }
         };
-        egui::Window::new("Change platform for selected archives?")
+        widgets::centered_window("Change platform for selected archives?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -684,7 +684,7 @@ pub(crate) fn show_loaded_data(
     if let Some(archive_path) = confirm_lazy_unmount.clone() {
         let actions_available =
             lazy_confirmation_available(&archive_path, lazy_unmount_offers, busy);
-        egui::Window::new("Use Lazy Unmount?")
+        widgets::centered_window("Use Lazy Unmount?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -750,7 +750,7 @@ pub(crate) fn show_loaded_data(
     if let Some(archive_path) = confirm_lazy_unmount_final.clone() {
         let actions_available =
             lazy_confirmation_available(&archive_path, lazy_unmount_offers, busy);
-        egui::Window::new("Confirm Lazy Unmount")
+        widgets::centered_window("Confirm Lazy Unmount")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -801,7 +801,7 @@ pub(crate) fn show_loaded_data(
 
     if let Some(archive_path) = confirm_unmount.clone() {
         let actions_available = confirmation_actions_available(busy);
-        egui::Window::new("Confirm unmount")
+        widgets::centered_window("Confirm unmount")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -1000,7 +1000,7 @@ pub(crate) fn show_loaded_data(
                     let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
                     let still_valid =
                         selected_missing_paths(cached, &confirmation_selection).is_ok();
-                    egui::Window::new(format!(
+                    widgets::centered_window(format!(
                         "Remove {} missing catalogue entr{}?",
                         paths.len(),
                         if paths.len() == 1 { "y" } else { "ies" }
@@ -1157,7 +1157,7 @@ pub(crate) fn show_loaded_data(
         Some(LibraryTableMessage::NoFilterResults) => {
             widgets::empty_state(
                 ui,
-                &crate::ui::icons::with_icon(crate::ui::icons::SEARCH, "No matching archives"),
+                "No matching archives",
                 ZERO_FILTER_RESULTS_MESSAGE,
                 None,
             );

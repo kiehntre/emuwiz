@@ -967,7 +967,7 @@ fn library_is_the_only_sidebar_destination_for_the_library_area() {
 }
 
 #[test]
-fn library_sidebar_button_is_selected_on_every_library_tab() {
+fn library_sidebar_button_is_selected_only_on_the_library_destination() {
     for view in [
         MainView::Library,
         MainView::Health,
@@ -975,9 +975,10 @@ fn library_sidebar_button_is_selected_on_every_library_tab() {
         MainView::LibraryViews,
         MainView::RecentlyFound,
     ] {
-        assert!(
+        assert_eq!(
             navigation_destination_selected(view, MainView::Library),
-            "the Library sidebar button must render selected while on {view:?}"
+            view == MainView::Library,
+            "Library selection must have one visual owner while on {view:?}"
         );
     }
     for view in [MainView::Mount, MainView::Settings] {
@@ -3690,9 +3691,10 @@ fn sources_still_covers_every_consolidated_view() {
         MainView::CheatSources,
         MainView::SourcesDiscovery,
     ] {
-        assert!(
-            !sidebar_views.contains(&view),
-            "{view:?} must not have its own standalone sidebar entry any more - it is only reachable through Sources' tabs"
+        assert_eq!(
+            sidebar_views.contains(&view),
+            view == MainView::DatSources,
+            "only DAT Sources has a direct sidebar route now"
         );
     }
     // The old Collection Discovery overlay entry must not survive under a
