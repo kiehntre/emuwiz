@@ -84,6 +84,7 @@ pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
 pub mod rpcs3_command;
+pub mod rpcs3_execution;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
@@ -189,6 +190,12 @@ pub use retroarch_command::{
 pub use rpcs3_command::{
     RPCS3_SUPPORTED_PLATFORM_ID, Rpcs3Command, Rpcs3CommandPlan, Rpcs3CommandSelection,
     build_rpcs3_command_plan,
+};
+pub use rpcs3_execution::{
+    LaunchedRpcs3Process, Rpcs3LaunchCommandFacts, Rpcs3LaunchExecutionError,
+    Rpcs3LaunchExitReport, Rpcs3LaunchPreflightError, Rpcs3LaunchPreflightErrorKind,
+    Rpcs3LaunchRequest, Rpcs3LaunchSpawnError, preflight_and_launch_rpcs3, preflight_rpcs3_launch,
+    spawn_rpcs3,
 };
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,

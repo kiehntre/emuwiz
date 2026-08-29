@@ -59,7 +59,7 @@ fn blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker 
 /// shape that RPCS3 can boot: a `.iso` image or an extracted PS3 game folder.
 /// An extensionless path is accepted only as the latter shape; identity still
 /// must come from verified PS3 content and never from that path spelling.
-fn direct_ps3_content_is_supported(path: &std::path::Path) -> bool {
+pub(crate) fn direct_ps3_content_is_supported(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map_or(true, |extension| extension.eq_ignore_ascii_case("iso"))
