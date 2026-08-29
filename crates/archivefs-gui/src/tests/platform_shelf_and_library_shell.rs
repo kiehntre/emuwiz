@@ -183,7 +183,7 @@ fn every_home_card_maps_to_its_real_existing_destination() {
     // reachable some other way - none of these are invented for Home.
     let expected = [
         (home_page::HomeCard::BuildLibrary, MainView::Sources),
-        (home_page::HomeCard::ConvertDiscs, MainView::RepairReview),
+        (home_page::HomeCard::ConvertDiscs, MainView::DiscConversion),
         (home_page::HomeCard::BrowseGames, MainView::Library),
         (
             home_page::HomeCard::DuplicateReview,
@@ -193,7 +193,7 @@ fn every_home_card_maps_to_its_real_existing_destination() {
         (home_page::HomeCard::CheatSources, MainView::CheatSources),
         (home_page::HomeCard::DatSources, MainView::DatSources),
         (home_page::HomeCard::RomM, MainView::Sources),
-        (home_page::HomeCard::CheckSetup, MainView::Doctor),
+        (home_page::HomeCard::CheckSetup, MainView::EmulatorSetup),
         (home_page::HomeCard::Settings, MainView::Settings),
         (home_page::HomeCard::QuickRename, MainView::IdentifyRename),
     ];
@@ -253,21 +253,20 @@ fn navigate_to_main_view_for_a_home_card_click_matches_a_sidebar_click() {
 fn task_cards_open_the_existing_specialised_workflows() {
     let mut app = app_for_operation_tests();
 
-    // "Convert discs" lands on the optical conversion page itself - no
-    // second hidden "Convert discs" click on the Repair tab.
+    // "Convert discs" lands on the first-class Disc Conversion page itself -
+    // no Repair framing, no second hidden click.
     app.navigate_to_home_card(home_page::HomeCard::ConvertDiscs);
-    assert_eq!(app.view, MainView::RepairReview);
-    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
+    assert_eq!(app.view, MainView::DiscConversion);
     assert!(
         app.optical_conversion_page.is_some(),
         "the conversion page must be open on arrival"
     );
 
-    // "Find duplicate games" lands on the actionable byte-identical finder,
-    // not the read-only DAT-relative Library duplicates viewer.
+    // "Find duplicate games" lands on the first-class Duplicate Finder, not
+    // the read-only DAT-relative Library duplicates viewer and not a Repair
+    // sub-page.
     app.navigate_to_home_card(home_page::HomeCard::DuplicateReview);
     assert_eq!(app.view, MainView::ExactDuplicateReview);
-    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
 
     // "Connect RomM" lands on the RomM provider card on Sources -> Libraries
     // (the subsystem its readiness badge reflects), never the whole-library
@@ -306,6 +305,263 @@ fn playing_library_planner_stays_reachable_from_library_organisation() {
         },
     );
     assert!(rendered_text_contains(&output, "Build Playing Library"));
+}
+
+// --- 0.8.1: core workflows directly discoverable ----------------------
+
+fn pointer_click(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        },
+    ]
+}
+
+/// Every `Shape::Text` whose laid-out string exactly matches `needle`, as a
+/// centre point - the plural of `find_exact_text_center`, needed where a
+/// label appears both in the left sidebar and in a top-menu popup.
+fn exact_text_centers(output: &egui::FullOutput, needle: &str) -> Vec<egui::Pos2> {
+    fn walk(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Pos2>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == needle => {
+                out.push(text.pos + text.galley.size() / 2.0);
+            }
+            egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, needle, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &output.shapes {
+        walk(&clipped.shape, needle, &mut out);
+    }
+    out
+}
+
+fn advanced_screen_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1600.0, 1200.0),
+        )),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn major_workflows_are_reachable_from_home_sidebar_and_top_menu() {
+    let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
+        .iter()
+        .flat_map(|group| group.entries)
+        .filter_map(|entry| match entry.click {
+            NavClick::View(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+
+    // Duplicate Finder / Disc Conversion / Emulator Setup: first-class
+    // `MainView` destinations exposed on the sidebar AND the Tools menu, and
+    // every entry point converges on the identical view.
+    for (home_card, target) in [
+        (
+            home_page::HomeCard::DuplicateReview,
+            MainView::ExactDuplicateReview,
+        ),
+        (home_page::HomeCard::ConvertDiscs, MainView::DiscConversion),
+        (home_page::HomeCard::CheckSetup, MainView::EmulatorSetup),
+    ] {
+        assert!(
+            sidebar_views.contains(&target),
+            "{target:?} must have a sidebar entry"
+        );
+        assert!(
+            TOOLS_MENU_WORKFLOWS.iter().any(|(_, _, t)| *t == target),
+            "{target:?} must be a Tools-menu workflow"
+        );
+        assert_eq!(
+            main_view_for_home_card(home_card),
+            target,
+            "the Home card for {target:?} must converge on it"
+        );
+
+        let mut from_home = app_for_operation_tests();
+        from_home.navigate_to_home_card(home_card);
+        let mut from_sidebar = app_for_operation_tests();
+        from_sidebar.navigate_to_main_view(target);
+        assert_eq!(from_home.view, target);
+        assert_eq!(from_home.view, from_sidebar.view);
+    }
+
+    // Each Tools-menu workflow label is exactly its destination's chrome
+    // title - the menu can never name a destination differently.
+    for (label, _hover, target) in TOOLS_MENU_WORKFLOWS {
+        assert_eq!(main_view_title(target), label);
+    }
+
+    // RomM has no `MainView` of its own; sidebar, Home card and the Sources
+    // menu all converge on Sources -> Libraries (the RomM provider card).
+    assert!(
+        ADVANCED_NAV_GROUPS
+            .iter()
+            .flat_map(|group| group.entries)
+            .any(|entry| matches!(entry.click, NavClick::Romm) && entry.label == "RomM"),
+        "the sidebar must expose a RomM entry"
+    );
+    assert_eq!(
+        main_view_for_home_card(home_page::HomeCard::RomM),
+        MainView::Sources
+    );
+    let mut romm = app_for_operation_tests();
+    romm.navigate_to_home_card(home_page::HomeCard::RomM);
+    assert_eq!(romm.view, MainView::Sources);
+    assert_eq!(romm.sources_tab, SourcesTab::Libraries);
+}
+
+#[test]
+fn the_tools_menu_opens_and_routes_directly_to_a_first_class_workflow() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let output = ctx.run(advanced_screen_input(), |ctx| app.update(ctx, &mut frame));
+    let tools = find_exact_text_center(&output, "Tools").expect("the Tools menu label renders");
+    let _ = ctx.run(
+        egui::RawInput {
+            events: pointer_click(tools),
+            ..advanced_screen_input()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+    // Settle so the menu popup is painted into the output.
+    let _ = ctx.run(advanced_screen_input(), |ctx| app.update(ctx, &mut frame));
+    let output = ctx.run(advanced_screen_input(), |ctx| app.update(ctx, &mut frame));
+
+    // "Platform Aliases" is a Tools-menu-only label (never in the sidebar) -
+    // its presence proves the menu is actually open.
+    assert!(
+        rendered_text_contains(&output, "Platform Aliases"),
+        "the Tools menu must be open"
+    );
+    assert!(rendered_text_contains(&output, "Emulator Setup"));
+
+    // The menu popup drops from the top bar (y < 200); the identically
+    // labelled sidebar entry is far lower. Click the menu one.
+    let menu_item = exact_text_centers(&output, "Emulator Setup")
+        .into_iter()
+        .find(|pos| pos.y < 200.0)
+        .expect("Emulator Setup must render inside the open Tools menu");
+    let _ = ctx.run(
+        egui::RawInput {
+            events: pointer_click(menu_item),
+            ..advanced_screen_input()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+
+    assert_eq!(app.view, MainView::EmulatorSetup);
+}
+
+#[test]
+fn duplicate_finder_and_disc_conversion_render_standalone_from_the_sidebar_route() {
+    // Item 6 & 7: arriving via the dedicated route shows the workflow's own
+    // page, never Repair Review / Repair History framing.
+    for (target, own_content) in [
+        (MainView::ExactDuplicateReview, "Duplicate Finder"),
+        (MainView::DiscConversion, "Convert Disc Images"),
+    ] {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::AdvancedView;
+        app.navigate_to_main_view(target);
+        assert_eq!(app.view, target);
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run(advanced_screen_input(), |ctx| app.update(ctx, &mut frame));
+
+        assert!(
+            rendered_text_contains(&output, own_content),
+            "{target:?} must render its own page content ({own_content:?})"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Repair History"),
+            "{target:?} must not render Repair History framing"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Repair / Recovery"),
+            "{target:?} must not render the Problems & Repair tab row"
+        );
+    }
+}
+
+#[test]
+fn collapsible_section_toggles_and_persists_for_the_app_session() {
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    widgets::collapsible_section(
+                        ui,
+                        "collapse_test_section",
+                        "Advanced options",
+                        false,
+                        |ui| {
+                            ui.label("BODY-CONTENT-MARKER");
+                        },
+                    );
+                });
+            },
+        )
+    }
+
+    let ctx = egui::Context::default();
+
+    // default_open: false -> the body is not drawn.
+    let output = frame(&ctx, vec![]);
+    assert!(!rendered_text_contains(&output, "BODY-CONTENT-MARKER"));
+    let header = find_exact_text_center(&output, "Advanced options").expect("header renders");
+
+    // Click the header, then settle - now expanded.
+    let _ = frame(&ctx, pointer_click(header));
+    let _ = frame(&ctx, vec![]);
+    let output = frame(&ctx, vec![]);
+    assert!(
+        rendered_text_contains(&output, "BODY-CONTENT-MARKER"),
+        "the section expands when its header is clicked"
+    );
+
+    // A later frame in the SAME context stays expanded - the state persists
+    // for the session.
+    let output = frame(&ctx, vec![]);
+    assert!(
+        rendered_text_contains(&output, "BODY-CONTENT-MARKER"),
+        "the expanded state persists across frames in the session"
+    );
+
+    // A fresh context (a new session) starts from `default_open: false`.
+    let fresh = egui::Context::default();
+    let output = frame(&fresh, vec![]);
+    assert!(
+        !rendered_text_contains(&output, "BODY-CONTENT-MARKER"),
+        "a new session starts collapsed again"
+    );
 }
 
 #[test]

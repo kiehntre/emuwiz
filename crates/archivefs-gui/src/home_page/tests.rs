@@ -194,7 +194,7 @@ fn every_primary_card_action_reports_its_own_card() {
     let expected = [
         (HomeCard::BrowseGames, "Open Library"),
         (HomeCard::CanonicalOrganisation, "Open Organise"),
-        (HomeCard::CheckSetup, "Open Doctor"),
+        (HomeCard::CheckSetup, "Open Emulator Setup"),
         (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
         (HomeCard::DatSources, "Open DAT Sources"),
         (HomeCard::DuplicateReview, "Open duplicate finder"),

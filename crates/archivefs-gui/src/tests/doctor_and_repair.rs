@@ -2331,6 +2331,77 @@ fn doctor_page_shows_a_healthy_result_rather_than_an_empty_screen() {
 }
 
 #[test]
+fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
+    // Item 5: the dedicated "Emulator Setup" destination must land on a page
+    // where the supported emulator checks are actually visible. It renders
+    // the shared Doctor scan (same engine and `doctor_scan` state as the
+    // Problems & Repair -> Diagnostics tab); the scan's "Emulator profiles"
+    // / "Emulators" categories carry the per-emulator rows.
+    let profile_report = ProfileAssessmentReport {
+        profiles: vec![ProfileAssessment {
+            emulator: EmulatorKind::Ppsspp,
+            profile_id: "ppsspp-native".to_string(),
+            profile_kind: "Native".to_string(),
+            scope: "User".to_string(),
+            discovery_confidence: "documented native path".to_string(),
+            eligible: true,
+            blockers: Vec::new(),
+            root_path: EncodedPath::from_path(Path::new("/profiles/ppsspp")),
+            destination_path: EncodedPath::from_path(Path::new("/profiles/ppsspp/PSP/Cheats")),
+            destination_exists: true,
+            destination_is_directory: true,
+            destination_is_symlink: false,
+            mount_mode: MountMode::ReadWrite,
+            permissions: None,
+            writability: WritabilityAssessment::AppearsWritable,
+            preferred: None,
+        }],
+        unavailable: vec![(EmulatorKind::Xenia, "no documented native path".to_string())],
+        discovery_incomplete: false,
+    };
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.emulator_profiles = Gathered::Ready(&profile_report);
+    let scan = run_doctor_scan(&inputs);
+
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.doctor_scan = doctor_outcome(scan);
+    app.view = MainView::EmulatorSetup;
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(
+        rendered_text_contains(&output, "Emulator Setup"),
+        "the dedicated page header must render"
+    );
+    assert!(
+        rendered_text_contains(&output, "Emulator profiles"),
+        "the emulator-profile findings category must be listed"
+    );
+    assert!(
+        rendered_text_contains(&output, "PPSSPP"),
+        "a supported emulator's own row must be visible"
+    );
+    // No Problems & Repair tab chrome when arriving at the dedicated route.
+    assert!(!rendered_text_contains(&output, "Repair / Recovery"));
+}
+
+#[test]
+fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
+    // Same engine, same `doctor_scan` - no second scan, no divergent state.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.doctor_scan = doctor_outcome(doctor_scan_from(&[]));
+
+    app.view = MainView::EmulatorSetup;
+    let on_setup = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&on_setup, "Healthy"));
+
+    app.view = MainView::Doctor;
+    let on_diagnostics = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&on_diagnostics, "Healthy"));
+}
+
+#[test]
 fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
     let profile_report = ProfileAssessmentReport {
         profiles: vec![
@@ -3486,13 +3557,15 @@ fn problems_repair_is_the_only_sidebar_entry_for_doctor_and_repair() {
 // these prove reachability, not re-test the page itself).
 
 #[test]
-fn exact_duplicate_review_maps_to_the_repair_tab_like_history_does() {
+fn duplicate_finder_is_a_first_class_standalone_destination_not_a_repair_tab() {
+    // 0.8.1 "core workflows directly discoverable": Duplicate Finder is no
+    // longer routed through the Problems & Repair Repair tab, so it renders
+    // standalone (no Repair Review / Repair History framing).
     assert_eq!(
         problems_repair_tab_for_main_view(MainView::ExactDuplicateReview),
-        Some(ProblemsRepairTab::Repair)
+        None
     );
-    // It never gets a sidebar entry of its own - reached only from inside
-    // the existing Problems & Repair destination.
+    // ...and it now DOES have its own sidebar entry ("Duplicate Finder").
     let sidebar_views: std::collections::HashSet<MainView> = ADVANCED_NAV_GROUPS
         .iter()
         .flat_map(|group| group.entries)
@@ -3501,41 +3574,42 @@ fn exact_duplicate_review_maps_to_the_repair_tab_like_history_does() {
             _ => None,
         })
         .collect();
-    assert!(!sidebar_views.contains(&MainView::ExactDuplicateReview));
+    assert!(sidebar_views.contains(&MainView::ExactDuplicateReview));
 }
 
 // --- 1: the navigation destination is visible -------------------------
 
 #[test]
-fn the_exact_duplicates_link_is_visible_on_the_repair_tab() {
+fn the_duplicate_finder_cross_link_is_visible_on_the_repair_tab() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.view = MainView::RepairReview;
 
     let output = render_problems_repair_app(&mut app);
 
-    assert!(rendered_text_contains(&output, "Exact duplicates"));
+    assert!(rendered_text_contains(&output, "Open Duplicate Finder"));
 }
 
 #[test]
-fn convert_discs_is_visible_on_the_repair_tab() {
+fn the_disc_conversion_cross_link_is_visible_on_the_repair_tab() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.view = MainView::RepairReview;
 
     let output = render_problems_repair_app(&mut app);
 
-    assert!(rendered_text_contains(&output, "Convert discs"));
+    assert!(rendered_text_contains(&output, "Open Disc Conversion"));
     assert!(!rendered_text_contains(&output, "OpticalConversionPage"));
 }
 
 #[test]
-fn convert_discs_home_card_lands_on_the_optical_conversion_ui() {
-    // Blocker 3: the Home "Convert discs" card must open the conversion page
-    // itself, with no second "Convert discs" click on the Repair tab.
+fn convert_discs_home_card_lands_on_the_first_class_disc_conversion_page() {
+    // The Home "Convert discs" card opens the dedicated Disc Conversion
+    // destination directly - no Repair framing, no second click.
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.navigate_to_home_card(home_page::HomeCard::ConvertDiscs);
+    assert_eq!(app.view, MainView::DiscConversion);
     assert!(
         app.optical_conversion_page.is_some(),
         "the conversion page state must exist on arrival"
@@ -3547,19 +3621,23 @@ fn convert_discs_home_card_lands_on_the_optical_conversion_ui() {
         "the optical conversion page's own heading must render immediately"
     );
     assert!(rendered_text_contains(&output, "Source folder:"));
+    assert!(!rendered_text_contains(&output, "Repair History"));
 }
 
 #[test]
-fn duplicate_home_card_lands_on_the_actionable_exact_duplicate_review() {
-    // Blocker 4: route to the workflow that can act, not the read-only
-    // Library duplicates viewer that dead-ends without a prior scan.
+fn duplicate_home_card_lands_on_the_first_class_duplicate_finder_page() {
+    // Route to the actionable Duplicate Finder, standalone - not the
+    // read-only Library duplicates viewer and not a Repair sub-page.
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.navigate_to_home_card(home_page::HomeCard::DuplicateReview);
     assert_eq!(app.view, MainView::ExactDuplicateReview);
-    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
 
     let output = render_problems_repair_app(&mut app);
+    assert!(
+        rendered_text_contains(&output, "Duplicate Finder"),
+        "the standalone Duplicate Finder header must render"
+    );
     assert!(
         rendered_text_contains(&output, "Source folder:"),
         "the Exact Duplicate Review page's own content must render"
@@ -3609,7 +3687,7 @@ fn setup_check_summary_maps_the_doctor_scan_state_the_home_card_shows() {
 // --- 2: selecting it reaches the Exact Duplicate Review page -----------
 
 #[test]
-fn selecting_exact_duplicates_reaches_the_page() {
+fn selecting_the_repair_tab_cross_link_reaches_the_duplicate_finder_page() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.view = MainView::RepairReview;
@@ -3619,8 +3697,8 @@ fn selecting_exact_duplicates_reaches_the_page() {
     let before = ctx.run(problems_repair_screen_input(), |ctx| {
         app.update(ctx, &mut frame)
     });
-    let pos = find_exact_text_center(&before, "Exact duplicates")
-        .expect("the Exact duplicates link must be clickable");
+    let pos = find_exact_text_center(&before, "Open Duplicate Finder")
+        .expect("the Duplicate Finder cross-link must be clickable");
     let click = vec![
         egui::Event::PointerMoved(pos),
         egui::Event::PointerButton {
@@ -3645,17 +3723,19 @@ fn selecting_exact_duplicates_reaches_the_page() {
     );
 
     assert_eq!(app.view, MainView::ExactDuplicateReview);
-    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
 
     let output = ctx.run(problems_repair_screen_input(), |ctx| {
         app.update(ctx, &mut frame)
     });
     assert!(
+        rendered_text_contains(&output, "Duplicate Finder"),
+        "the standalone Duplicate Finder page header must be visible"
+    );
+    assert!(
         rendered_text_contains(&output, "Source folder:"),
         "the Exact Duplicate Review page's own content must be visible"
     );
-    // Review/History are replaced, not stacked underneath, when this
-    // destination is selected.
+    // No Repair framing when arriving at the first-class destination.
     assert!(!rendered_text_contains(&output, "Repair History"));
 }
 

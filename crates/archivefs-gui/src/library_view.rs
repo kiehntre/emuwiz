@@ -255,6 +255,73 @@ pub(crate) fn show_loaded_data(
         widgets::status_badge(ui, readiness, tone);
     });
 
+    // The focused-archive mount / context actions render here, directly
+    // under the bulk "Mount all" / "Unmount all" / "Doctor ready" row, so
+    // every mount action - bulk and per-archive - sits in one place instead
+    // of the focused-archive controls floating alone in the middle of the
+    // page between the results banners and the filter card (manual smoke
+    // feedback). Collapsed by default; state persists for the session.
+    let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
+    let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
+        .and_then(|index| merged_rows[index].source_path.as_deref());
+    let selected_actions = if let Some(path) = selected_archive.as_deref() {
+        egui::CollapsingHeader::new(format!("Focused archive · {}", path.display()))
+            .id_salt("library_focused_archive_details")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("library_selected_archive_scroll")
+                    .max_height((ui.available_height() * 0.35).clamp(120.0, 280.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        show_selected_archive(
+                            ui,
+                            selected_record(&data.records, selected_archive.as_deref()),
+                            selected_persisted,
+                            selected_platform_details(cached, selected_persisted),
+                            selected_source_path,
+                            SelectedArchiveViewState {
+                                operation,
+                                busy,
+                                block_reason,
+                                action_readiness_debug_lines,
+                                confirm_unmount,
+                                confirm_lazy_unmount,
+                                focus_lazy_cancel,
+                                lazy_unmount_offers,
+                                remount_offers,
+                                cleanup_after_unmount,
+                                platform_choice,
+                                platform_custom_text,
+                                platform_busy,
+                                clipboard,
+                            },
+                        )
+                    })
+                    .inner
+            })
+            .body_returned
+            .unwrap_or_default()
+    } else {
+        ui.weak("No focused archive. Select a Library row to establish workflow context.");
+        SelectedArchiveActions::default()
+    };
+    if let Some(request) = selected_actions.operation {
+        requested_action = Some(AppOperationRequest::Archive(request));
+    }
+    if let Some((archive_path, action)) = selected_actions.platform {
+        requested_action = Some(AppOperationRequest::PlatformAssignment {
+            archive_path,
+            action,
+        });
+    }
+    if let Some(archive_path) = selected_actions.inspect {
+        requested_action = Some(AppOperationRequest::InspectArchive(archive_path));
+    }
+    if let Some(archive_path) = selected_actions.cheats_mods {
+        requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
+    }
+
     if let Some(result) = mount_all_result {
         show_mount_all_result(ui, result);
     }
@@ -612,67 +679,6 @@ pub(crate) fn show_loaded_data(
                     }
                 });
             });
-    }
-
-    let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
-    let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
-        .and_then(|index| merged_rows[index].source_path.as_deref());
-    let selected_actions = if let Some(path) = selected_archive.as_deref() {
-        egui::CollapsingHeader::new(format!("Focused archive · {}", path.display()))
-            .id_salt("library_focused_archive_details")
-            .default_open(false)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("library_selected_archive_scroll")
-                    .max_height((ui.available_height() * 0.35).clamp(120.0, 280.0))
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        show_selected_archive(
-                            ui,
-                            selected_record(&data.records, selected_archive.as_deref()),
-                            selected_persisted,
-                            selected_platform_details(cached, selected_persisted),
-                            selected_source_path,
-                            SelectedArchiveViewState {
-                                operation,
-                                busy,
-                                block_reason,
-                                action_readiness_debug_lines,
-                                confirm_unmount,
-                                confirm_lazy_unmount,
-                                focus_lazy_cancel,
-                                lazy_unmount_offers,
-                                remount_offers,
-                                cleanup_after_unmount,
-                                platform_choice,
-                                platform_custom_text,
-                                platform_busy,
-                                clipboard,
-                            },
-                        )
-                    })
-                    .inner
-            })
-            .body_returned
-            .unwrap_or_default()
-    } else {
-        ui.weak("No focused archive. Select a Library row to establish workflow context.");
-        SelectedArchiveActions::default()
-    };
-    if let Some(request) = selected_actions.operation {
-        requested_action = Some(AppOperationRequest::Archive(request));
-    }
-    if let Some((archive_path, action)) = selected_actions.platform {
-        requested_action = Some(AppOperationRequest::PlatformAssignment {
-            archive_path,
-            action,
-        });
-    }
-    if let Some(archive_path) = selected_actions.inspect {
-        requested_action = Some(AppOperationRequest::InspectArchive(archive_path));
-    }
-    if let Some(archive_path) = selected_actions.cheats_mods {
-        requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
     }
 
     if let Some(archive_path) = confirm_lazy_unmount.clone() {

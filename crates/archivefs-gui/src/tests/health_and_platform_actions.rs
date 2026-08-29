@@ -2235,6 +2235,7 @@ fn primary_nav_rects(
                             ),
                             NavClick::Overlay(overlay) => (true, current_overlay == overlay),
                             NavClick::QuickRename => (true, false),
+                            NavClick::Romm => (true, false),
                         };
                         let button = egui::Button::selectable(selected, entry.label)
                             .min_size(egui::vec2(ui.available_width(), 30.0));
@@ -2353,6 +2354,48 @@ fn library_app_with_test_rows(count: usize) -> (ArchiveFsApp, Vec<String>) {
     app.archive_context
         .select_only(PathBuf::from(paths[0].as_str()));
     (app, paths)
+}
+
+#[test]
+fn the_focused_archive_mount_actions_sit_with_the_bulk_mount_actions() {
+    // Item 7 (manual smoke): the per-archive mount / context actions
+    // ("Focused archive") must render directly under the bulk
+    // "Mount all" / "Unmount all" / "Doctor" row - not floating alone lower
+    // down the page, above the Find-and-filter card.
+    let (mut app, _paths) = library_app_with_test_rows(3);
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1500.0, 2400.0),
+        )),
+        ..Default::default()
+    };
+    run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
+    let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+    let bulk_mount =
+        find_exact_text_center(&output, "Mount all").expect("the bulk 'Mount all' action renders");
+    let focused = find_exact_text_center(&output, "Focused archive · /roms/library-row-00.zip")
+        .or_else(|| {
+            find_exact_text_center(
+                &output,
+                "No focused archive. Select a Library row to establish workflow context.",
+            )
+        })
+        .expect("the focused-archive mount / context section renders");
+    let filter = find_exact_text_center(&output, "Find and filter")
+        .expect("the Find and filter card renders");
+
+    assert!(
+        bulk_mount.y < focused.y,
+        "focused-archive actions must render below the bulk Mount all / Unmount all / Doctor row"
+    );
+    assert!(
+        focused.y < filter.y,
+        "focused-archive actions must render with the mount actions, above the Find and filter card"
+    );
 }
 
 #[test]

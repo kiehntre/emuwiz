@@ -20,7 +20,7 @@ use super::*;
 // those tests assert against; `--all-targets` clippy's non-test pass does
 // not see that usage.
 #[allow(dead_code)]
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 20] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::CheatsMods, "Cheats & Mods"),
@@ -28,6 +28,9 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
     (MainView::Problems, "Problems & Repair"),
     (MainView::RepairReview, "Repair Review"),
     (MainView::RepairHistory, "Repair History"),
+    (MainView::ExactDuplicateReview, "Duplicate Finder"),
+    (MainView::DiscConversion, "Disc Conversion"),
+    (MainView::EmulatorSetup, "Emulator Setup"),
     (MainView::LibraryViewHistory, "Library View History"),
     (MainView::DatSources, "DAT Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
@@ -54,6 +57,13 @@ pub(crate) enum NavClick {
     View(MainView),
     QuickRename,
     Overlay(ToolsOverlay),
+    /// The RomM provider workflow. Has no `MainView` of its own - it is the
+    /// RomM source card on Sources -> Libraries - so it routes through
+    /// `ArchiveFsApp::navigate_to_sources_tab(SourcesTab::Libraries)`, the
+    /// exact same call Home's "Connect RomM" card and the Sources top-menu
+    /// "RomM" item make. Not highlightable (the "Sources" entry owns that
+    /// destination's selected state).
+    Romm,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +101,14 @@ pub(crate) const fn nav_quick_rename(label: &'static str) -> NavEntry {
         click: NavClick::QuickRename,
         label,
         highlightable: true,
+    }
+}
+
+pub(crate) const fn nav_romm(label: &'static str) -> NavEntry {
+    NavEntry {
+        click: NavClick::Romm,
+        label,
+        highlightable: false,
     }
 }
 
@@ -196,8 +214,24 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
             nav_view(MainView::CanonicalOrganisation, "Library Organisation"),
         ],
     },
+    // 0.8.1 "core workflows directly discoverable": the major task-oriented
+    // workflows get their own visible sidebar group instead of being
+    // reachable only from Home or buried under Problems & Repair. Duplicate
+    // Finder and Disc Conversion are first-class `MainView`s now; Emulator
+    // Setup is the dedicated Doctor-readiness destination; RomM routes to the
+    // RomM provider card on Sources -> Libraries (same call as Home's
+    // "Connect RomM" card - see `NavClick::Romm`).
     NavGroup {
-        heading: Some("MOUNT & ACTIVE MOUNTS"),
+        heading: Some("TOOLS & WORKFLOWS"),
+        entries: &[
+            nav_view(MainView::ExactDuplicateReview, "Duplicate Finder"),
+            nav_view(MainView::DiscConversion, "Disc Conversion"),
+            nav_view(MainView::EmulatorSetup, "Emulator Setup"),
+            nav_romm("RomM"),
+        ],
+    },
+    NavGroup {
+        heading: Some("MOUNTS"),
         entries: &[
             nav_view(MainView::Mount, "Mounts"),
             nav_view(MainView::ActiveMounts, "Active mounts"),
@@ -337,6 +371,10 @@ pub(crate) fn show_primary_navigation(
                             (true, entry.highlightable && current_overlay == overlay)
                         }
                         NavClick::QuickRename => (true, entry.highlightable),
+                        // Routes to Sources -> Libraries; the "Sources" entry
+                        // owns that selected state, so `nav_romm` is not
+                        // highlightable and this is always `false`.
+                        NavClick::Romm => (true, entry.highlightable),
                     };
                     let button = egui::Button::selectable(selected, entry.label)
                         .min_size(egui::vec2(ui.available_width(), 30.0));

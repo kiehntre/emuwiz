@@ -3344,18 +3344,40 @@ enum MainView {
     // directly.
     #[allow(dead_code)]
     RepairHistory,
-    /// Exact Duplicate Review: a DAT-independent, byte-identical-only
-    /// duplicate scan (`archivefs_core::repair::exact_duplicate`) with
-    /// evidence-backed canonical-copy selection and multi-file (CUE/GDI/
-    /// M3U) protection, quarantined through the same transaction/journal/
-    /// rollback engine every other repair flow already uses. Reachable
-    /// from inside the `ProblemsRepairTab::Repair` tab exactly like
-    /// `RepairHistory` is - see `ArchiveFsApp::show_problems_repair_page`.
-    /// Deliberately a separate destination from `MainView::Duplicates`
-    /// (a read-only Library-tab duplicate viewer over a different,
-    /// DAT-relative notion of "duplicate") - the two are unrelated and
-    /// never share state.
+    /// Duplicate Finder: a DAT-independent duplicate/equivalent-content scan
+    /// (`archivefs_core::repair::exact_duplicate`, plus the N64 and optical
+    /// equivalent scanners) with evidence-backed canonical-copy selection and
+    /// multi-file (CUE/GDI/M3U) protection, quarantined through the same
+    /// transaction/journal/rollback engine every other repair flow already
+    /// uses.
+    ///
+    /// Since 0.8.1's "core workflows directly discoverable" pass this is a
+    /// first-class destination with its own sidebar and top-menu entry
+    /// ("Duplicate Finder") - it is no longer routed through
+    /// `ProblemsRepairTab::Repair` (`problems_repair_tab_for_main_view` no
+    /// longer maps it), so arriving here never shows Repair Review / Repair
+    /// History framing. Deliberately a separate destination from
+    /// `MainView::Duplicates` (a read-only Library-tab duplicate viewer over
+    /// a different, DAT-relative notion of "duplicate") - the two are
+    /// unrelated and never share state.
     ExactDuplicateReview,
+    /// Disc Conversion: verified CUE/BIN -> CHD conversion
+    /// (`optical_conversion_page` over `archivefs_core::repair`'s
+    /// `build_chd_conversion_plan` / `execute_chd_conversion` /
+    /// `rollback_chd_conversion`). A first-class destination with its own
+    /// sidebar and top-menu entry - the user never has to conceptually enter
+    /// "Repair" to convert a disc image. Reuses the exact same
+    /// `OpticalConversionPageState` and backend the Repair tab used before.
+    DiscConversion,
+    /// Emulator Setup: the read-only emulator readiness / profile check.
+    /// Renders `doctor_page::show_doctor_page` over the shared
+    /// `ArchiveFsApp::doctor_scan` - the same engine and state the Problems &
+    /// Repair -> Diagnostics tab uses (no second scan, no divergent state) -
+    /// but presented as a dedicated, clearly-named destination so emulator
+    /// setup is discoverable without going through "Problems & Repair". The
+    /// Doctor scan's "Emulators" and "Emulator profiles" categories carry the
+    /// per-emulator rows.
+    EmulatorSetup,
     /// Library View History: a read-only view of the durable, append-only
     /// Library View apply/remove history
     /// (`archivefs_core::library_view_history`), re-read from disk on every
@@ -3425,6 +3447,31 @@ enum LibraryTab {
     RecentlyFound,
 }
 
+/// The major task-oriented workflows the top menu bar's "Tools" menu
+/// exposes, as `(label, hover, destination)`. The menu renders directly from
+/// this so the label and `MainView` a test asserts are exactly the ones the
+/// menu uses, and so every entry point (Home card, sidebar, this menu)
+/// provably converges on the same destination - see
+/// `major_workflows_are_reachable_from_home_sidebar_and_top_menu`. RomM is
+/// exposed under the "Sources" menu instead (it has no `MainView` of its own).
+const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 3] = [
+    (
+        "Duplicate Finder",
+        "Find identical or equivalent copies and quarantine the extras.",
+        MainView::ExactDuplicateReview,
+    ),
+    (
+        "Disc Conversion",
+        "Convert supported CUE/BIN disc images to fingerprint-verified CHD.",
+        MainView::DiscConversion,
+    ),
+    (
+        "Emulator Setup",
+        "Read-only check of which emulators EmuWiz can find and their launch readiness.",
+        MainView::EmulatorSetup,
+    ),
+];
+
 /// Compresses `DoctorScanState` into the `home_page::SetupCheckSummary` the
 /// Home "Set up emulators" card shows. The card's action opens Problems &
 /// Repair -> Diagnostics, which renders this exact `doctor_scan` state, so
@@ -3477,19 +3524,20 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         // whole-collection Playing Library planner.
         home_page::HomeCard::RomM => MainView::Sources,
         home_page::HomeCard::BrowseGames => MainView::Library,
-        // The actionable byte-identical duplicate finder, not the read-only
-        // DAT-relative Library duplicates tab.
+        // First-class Duplicate Finder destination (not the read-only
+        // DAT-relative Library duplicates tab, and no longer a Repair
+        // sub-page).
         home_page::HomeCard::DuplicateReview => MainView::ExactDuplicateReview,
-        // Lands on the optical conversion page itself (see
-        // `navigate_to_home_card`), which renders under the Repair tab whose
-        // primary view is `RepairReview`.
-        home_page::HomeCard::ConvertDiscs => MainView::RepairReview,
+        // First-class Disc Conversion destination - no "Repair" framing.
+        home_page::HomeCard::ConvertDiscs => MainView::DiscConversion,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
         home_page::HomeCard::QuickRename => MainView::IdentifyRename,
         home_page::HomeCard::CheatSources => MainView::CheatSources,
         home_page::HomeCard::DatSources => MainView::DatSources,
-        home_page::HomeCard::CheckSetup => MainView::Doctor,
+        // "Set up emulators" - the dedicated Emulator Setup destination,
+        // backed by the same `doctor_scan` state its badge summarises.
+        home_page::HomeCard::CheckSetup => MainView::EmulatorSetup,
         home_page::HomeCard::Settings => MainView::Settings,
     }
 }
@@ -3561,13 +3609,16 @@ fn main_view_for_problems_repair_tab(tab: ProblemsRepairTab) -> MainView {
 }
 
 /// Which `ProblemsRepairTab` (if any) `view` corresponds to.
+///
+/// `MainView::ExactDuplicateReview` is deliberately absent since 0.8.1's
+/// "core workflows directly discoverable" pass: Duplicate Finder is a
+/// first-class destination now, not a Repair tab, so it renders standalone
+/// (no Repair Review / Repair History framing).
 fn problems_repair_tab_for_main_view(view: MainView) -> Option<ProblemsRepairTab> {
     match view {
         MainView::Problems => Some(ProblemsRepairTab::Overview),
         MainView::Doctor => Some(ProblemsRepairTab::Diagnostics),
-        MainView::RepairReview | MainView::RepairHistory | MainView::ExactDuplicateReview => {
-            Some(ProblemsRepairTab::Repair)
-        }
+        MainView::RepairReview | MainView::RepairHistory => Some(ProblemsRepairTab::Repair),
         _ => None,
     }
 }
@@ -3778,7 +3829,9 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::IdentifyRename => "Identify & Rename",
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
-        MainView::ExactDuplicateReview => "Exact duplicates",
+        MainView::ExactDuplicateReview => "Duplicate Finder",
+        MainView::DiscConversion => "Disc Conversion",
+        MainView::EmulatorSetup => "Emulator Setup",
         MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
@@ -3812,6 +3865,8 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::CanonicalOrganisation
         | MainView::IdentifyRename
         | MainView::RepairReview
+        | MainView::DiscConversion
+        | MainView::EmulatorSetup
         | MainView::DatSources
         | MainView::Problems
         | MainView::Doctor
@@ -3857,6 +3912,8 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::IdentifyRename
             | MainView::Problems
             | MainView::Doctor
+            | MainView::EmulatorSetup
+            | MainView::DiscConversion
             | MainView::HistoryLogs
             | MainView::Settings
             | MainView::About
@@ -4864,24 +4921,24 @@ impl ArchiveFsApp {
                 // `romm_snapshot` readiness badge and its destination
                 // describe the same subsystem. (The whole-collection Playing
                 // Library planner remains reachable honestly via Library
-                // Organisation -> "Build Playing Library".)
+                // Organisation -> "Build Playing Library".) Sidebar and
+                // top-menu "RomM" converge on this exact call.
                 self.navigate_to_sources_tab(SourcesTab::Libraries);
             }
             home_page::HomeCard::ConvertDiscs => {
-                self.navigate_to_problems_repair_tab(ProblemsRepairTab::Repair);
-                // Open the optical conversion UI itself, so the card lands on
-                // the conversion page with no further click - the Repair
-                // tab renders it as soon as this state exists.
+                // First-class Disc Conversion destination. The dispatch
+                // branch lazily creates `optical_conversion_page`, so no
+                // pre-seeding is needed; done here too so the state exists
+                // the instant the card is clicked.
+                self.navigate_to_main_view(MainView::DiscConversion);
                 self.optical_conversion_page.get_or_insert_with(
                     optical_conversion_page::OpticalConversionPageState::default,
                 );
             }
             home_page::HomeCard::DuplicateReview => {
-                // The actionable Exact Duplicate Review, reached exactly the
-                // way the Repair tab's own "Exact duplicates" link reaches
-                // it.
-                self.navigate_to_problems_repair_tab(ProblemsRepairTab::Repair);
-                self.view = MainView::ExactDuplicateReview;
+                // First-class Duplicate Finder destination - renders
+                // standalone, without Repair Review / Repair History.
+                self.navigate_to_main_view(MainView::ExactDuplicateReview);
             }
             _ => self.navigate_to_main_view(main_view_for_home_card(card)),
         }
@@ -5892,6 +5949,67 @@ impl ArchiveFsApp {
         optical_conversion_page::show_optical_conversion_page(ui, page);
     }
 
+    /// Renders the Doctor page over the shared `doctor_scan` state and
+    /// dispatches whatever action it returned. Shared verbatim by the
+    /// Problems & Repair -> Diagnostics tab and the dedicated
+    /// `MainView::EmulatorSetup` destination, so the two can never diverge in
+    /// behaviour or state (there is exactly one `doctor_scan`, one scan
+    /// engine, one repair-review flow).
+    fn show_doctor_page_body(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let action = doctor_page::show_doctor_page(
+            ui,
+            &self.doctor_scan,
+            &mut self.doctor_selected_finding,
+            self.doctor_repair_review.as_ref(),
+            self.doctor_repair_result.as_deref(),
+            self.doctor_repair_finished_at_unix_seconds,
+            &mut self.clipboard,
+            self.ui_mode == GuiMode::GamerView,
+        );
+        match action {
+            // Never `self.refresh(context)`: Doctor must not reload the
+            // application or rescan the library.
+            Some(doctor_page::DoctorPageAction::RunScan) => {
+                self.start_doctor_scan(context.clone());
+            }
+            Some(doctor_page::DoctorPageAction::ReviewRepair {
+                action,
+                finding_id,
+                affected,
+            }) => match affected {
+                Some(affected) => {
+                    self.review_doctor_repair_for(action, finding_id, affected);
+                }
+                None => self.review_doctor_repair(action, finding_id),
+            },
+            Some(doctor_page::DoctorPageAction::ConfirmRepair) => {
+                self.confirm_doctor_repair();
+            }
+            Some(doctor_page::DoctorPageAction::CancelRepair) => {
+                self.cancel_doctor_repair();
+            }
+            None => {}
+        }
+    }
+
+    /// The dedicated "Emulator Setup" destination: the same read-only Doctor
+    /// readiness check the Diagnostics tab runs, presented as its own
+    /// clearly-named page so emulator setup is discoverable without entering
+    /// "Problems & Repair". Per-emulator rows appear in the scan's
+    /// "Emulators" / "Emulator profiles" categories once the check has run.
+    fn show_emulator_setup_page(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        widgets::page_header_with_icon(
+            ui,
+            crate::ui::icons::CHECK,
+            "Emulator Setup",
+            "Run the read-only readiness check to see which emulators EmuWiz can find and \
+             whether each one is ready to launch games. Emulator status appears in the \
+             \"Emulators\" and \"Emulator profiles\" sections of the result.",
+        );
+        ui.add_space(theme::SECTION_GAP);
+        self.show_doctor_page_body(ui, context);
+    }
+
     /// The consolidated "Problems & Repair" destination - see
     /// `problems_repair_page`'s module doc. Renders the shared tab chrome,
     /// then dispatches to whichever tab `self.problems_repair_tab` currently
@@ -5914,40 +6032,7 @@ impl ArchiveFsApp {
                 }
             }
             ProblemsRepairTab::Diagnostics => {
-                let action = doctor_page::show_doctor_page(
-                    ui,
-                    &self.doctor_scan,
-                    &mut self.doctor_selected_finding,
-                    self.doctor_repair_review.as_ref(),
-                    self.doctor_repair_result.as_deref(),
-                    self.doctor_repair_finished_at_unix_seconds,
-                    &mut self.clipboard,
-                    self.ui_mode == GuiMode::GamerView,
-                );
-                match action {
-                    // Never `self.refresh(context)`: Doctor must not
-                    // reload the application or rescan the library.
-                    Some(doctor_page::DoctorPageAction::RunScan) => {
-                        self.start_doctor_scan(context.clone());
-                    }
-                    Some(doctor_page::DoctorPageAction::ReviewRepair {
-                        action,
-                        finding_id,
-                        affected,
-                    }) => match affected {
-                        Some(affected) => {
-                            self.review_doctor_repair_for(action, finding_id, affected);
-                        }
-                        None => self.review_doctor_repair(action, finding_id),
-                    },
-                    Some(doctor_page::DoctorPageAction::ConfirmRepair) => {
-                        self.confirm_doctor_repair();
-                    }
-                    Some(doctor_page::DoctorPageAction::CancelRepair) => {
-                        self.cancel_doctor_repair();
-                    }
-                    None => {}
-                }
+                self.show_doctor_page_body(ui, context);
             }
             ProblemsRepairTab::Repair => {
                 // Review and History are rendered together rather than as a
@@ -5958,62 +6043,51 @@ impl ArchiveFsApp {
                 // visible, correct content without inventing a third tab
                 // layer this task's UX sketch does not ask for.
                 //
-                // Exact Duplicate Review is the one exception: it is a
-                // genuinely separate task (a DAT-independent scan, its own
-                // source-folder setup, its own scan/apply state) rather
-                // than another lens over the same repair plan, so it
-                // replaces Review+History when specifically selected -
-                // reached via the "Exact duplicates" link below, and left
-                // via the ordinary "Repair" tab button (which always lands
-                // back on `MainView::RepairReview`, exactly like every
-                // other tab button's normal back/navigation behaviour).
+                // Duplicate Finder and Disc Conversion used to be reached
+                // through secondary buttons here; since 0.8.1's "core
+                // workflows directly discoverable" pass they are first-class
+                // destinations (`MainView::ExactDuplicateReview` /
+                // `MainView::DiscConversion`) with their own sidebar and
+                // top-menu entries, so this tab is now purely repair-plan
+                // review + history. A quiet cross-link is kept for the user
+                // who is already here.
                 ui.horizontal(|ui| {
                     if widgets::action_button(
                         ui,
-                        "Exact duplicates",
+                        "Open Duplicate Finder",
                         widgets::ActionStyle::Secondary,
                         true,
                     )
                     .on_hover_text(
-                        "Find byte-identical files, keep one copy, and move the others into a \
-                         recoverable quarantine. Nothing is permanently deleted.",
+                        "Find identical or equivalent copies and move extras into a recoverable \
+                         quarantine. Opens the dedicated Duplicate Finder page.",
                     )
                     .clicked()
                     {
-                        self.view = MainView::ExactDuplicateReview;
+                        self.navigate_to_main_view(MainView::ExactDuplicateReview);
                     }
                     if widgets::action_button(
                         ui,
-                        "Convert discs",
+                        "Open Disc Conversion",
                         widgets::ActionStyle::Secondary,
                         true,
                     )
                     .on_hover_text(
-                        "Convert one supported CUE/BIN source to a fingerprint-verified CHD; this is separate from duplicate cleanup.",
+                        "Convert a supported CUE/BIN source to a fingerprint-verified CHD. Opens \
+                         the dedicated Disc Conversion page.",
                     )
                     .clicked()
                     {
-                        self.show_optical_conversion_page(ui);
+                        self.navigate_to_main_view(MainView::DiscConversion);
                     }
                 });
                 ui.add_space(theme::SECTION_GAP);
 
-                if self.optical_conversion_page.is_some() {
-                    self.show_optical_conversion_page(ui);
-                    ui.add_space(theme::SECTION_GAP);
-                    ui.separator();
-                    ui.add_space(theme::SECTION_GAP);
-                }
-
-                if self.view == MainView::ExactDuplicateReview {
-                    self.show_exact_duplicate_review_page(ui);
-                } else {
-                    self.show_repair_review_page(ui);
-                    ui.add_space(theme::SECTION_GAP);
-                    ui.separator();
-                    ui.add_space(theme::SECTION_GAP);
-                    self.show_repair_history_page(ui);
-                }
+                self.show_repair_review_page(ui);
+                ui.add_space(theme::SECTION_GAP);
+                ui.separator();
+                ui.add_space(theme::SECTION_GAP);
+                self.show_repair_history_page(ui);
             }
         }
     }
@@ -6411,33 +6485,47 @@ impl ArchiveFsApp {
         }
 
         ui.add_space(theme::SECTION_GAP);
-        widgets::section_header(
+        // Large, infrequently-touched configuration blocks - collapsed by
+        // default so the Sources page opens on the source-folder list rather
+        // than a wall of stacked cards. State persists for the session.
+        let catalogue_action = widgets::collapsible_section(
             ui,
-            "Database and sources",
-            Some(
-                "Download, update, or verify the trusted cheat database EmuWiz uses for cheat setup.",
-            ),
-        );
-        let catalogue_action = show_retroarch_catalogue_manager(
-            ui,
-            &self.catalogue_manager,
-            self.catalogue_review.as_ref(),
-            self.catalogue_retrieval.as_ref(),
-            self.catalogue_last_result.as_ref(),
-            &mut self.clipboard,
-        );
+            "sources_catalogue_manager",
+            "Cheat database & RetroArch catalogue",
+            false,
+            |ui| {
+                ui.label(
+                    "Download, update, or verify the trusted cheat database EmuWiz uses for \
+                     cheat setup.",
+                );
+                show_retroarch_catalogue_manager(
+                    ui,
+                    &self.catalogue_manager,
+                    self.catalogue_review.as_ref(),
+                    self.catalogue_retrieval.as_ref(),
+                    self.catalogue_last_result.as_ref(),
+                    &mut self.clipboard,
+                )
+            },
+        )
+        .flatten();
         if let Some(catalogue_action) = catalogue_action {
             self.handle_catalogue_manager_action(context, catalogue_action);
         }
 
         ui.add_space(theme::SECTION_GAP);
-        if let Some(operation) = show_bsfree_source_card(
-            ui,
-            &self.bsfree_manager,
-            self.bsfree_operation.is_some(),
-            &mut self.bsfree_ui,
-            &mut self.clipboard,
-        ) {
+        let bsfree_operation =
+            widgets::collapsible_section(ui, "sources_bsfree", "BSFree source", false, |ui| {
+                show_bsfree_source_card(
+                    ui,
+                    &self.bsfree_manager,
+                    self.bsfree_operation.is_some(),
+                    &mut self.bsfree_ui,
+                    &mut self.clipboard,
+                )
+            })
+            .flatten();
+        if let Some(operation) = bsfree_operation {
             self.start_bsfree_operation(context.clone(), operation);
         }
 
@@ -16091,6 +16179,17 @@ impl ArchiveFsApp {
                             self.tools_overlay = ToolsOverlay::None;
                             ui.close();
                         }
+                        if ui
+                            .button("RomM")
+                            .on_hover_text(
+                                "Connect EmuWiz to your RomM server and browse its records \
+                                 (Sources -> Libraries).",
+                            )
+                            .clicked()
+                        {
+                            self.navigate_to_sources_tab(SourcesTab::Libraries);
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Tools", |ui| {
                         if ui
@@ -16136,6 +16235,25 @@ impl ArchiveFsApp {
                         // DESIGN.md §3.2, Phase 2) - it lives naturally next
                         // to Sources/DAT Sources now rather than in this
                         // generic Tools menu; see `ADVANCED_NAV_GROUPS`.
+                        ui.separator();
+                        // Major workflows, also on the sidebar and Home -
+                        // exposed here so they never depend on returning to
+                        // Home to be found. Rendered from `TOOLS_MENU_WORKFLOWS`
+                        // so the label and destination a test asserts are the
+                        // exact ones this menu uses; every route converges on
+                        // the same `MainView` (see
+                        // `major_workflows_are_reachable_from_home_sidebar_and_top_menu`).
+                        for (label, hover, target) in TOOLS_MENU_WORKFLOWS {
+                            if ui.button(label).on_hover_text(hover).clicked() {
+                                self.navigate_to_main_view(target);
+                                if target == MainView::DiscConversion {
+                                    self.optical_conversion_page.get_or_insert_with(
+                                        optical_conversion_page::OpticalConversionPageState::default,
+                                    );
+                                }
+                                ui.close();
+                            }
+                        }
                         ui.separator();
                         let activity_label = if self.show_activity {
                             "Hide Activity"
@@ -16214,12 +16332,24 @@ impl ArchiveFsApp {
             });
         }
         match navigation_request {
-            Some(NavClick::View(view)) => self.navigate_to_main_view(view),
+            Some(NavClick::View(view)) => {
+                self.navigate_to_main_view(view);
+                // Disc Conversion's dispatch lazily creates its page state,
+                // but seed it here too so the page is populated the instant
+                // the sidebar entry is clicked - the same thing Home's card
+                // and the top menu do.
+                if view == MainView::DiscConversion {
+                    self.optical_conversion_page.get_or_insert_with(
+                        optical_conversion_page::OpticalConversionPageState::default,
+                    );
+                }
+            }
             Some(NavClick::QuickRename) => {
                 self.quick_rename_mode = true;
                 self.navigate_to_main_view(MainView::IdentifyRename);
             }
             Some(NavClick::Overlay(overlay)) => self.tools_overlay = overlay,
+            Some(NavClick::Romm) => self.navigate_to_sources_tab(SourcesTab::Libraries),
             None => {}
         }
 
@@ -17177,6 +17307,33 @@ impl ArchiveFsApp {
                     }
                     ui.add_space(theme::SECTION_GAP);
                     show_active_mounts_recent_activity(ui, &self.history);
+                    return;
+                }
+
+                // First-class workflow destinations - rendered standalone,
+                // never wrapped in Problems & Repair chrome (see 0.8.1's
+                // "core workflows directly discoverable" pass). Home, the
+                // sidebar and the top menu all route straight here.
+                if self.view == MainView::ExactDuplicateReview {
+                    widgets::page_header_with_icon(
+                        ui,
+                        crate::ui::icons::CHECK,
+                        "Duplicate Finder",
+                        "Find identical or equivalent copies in your library, keep one, and move \
+                         the rest into a recoverable quarantine. Nothing is permanently deleted.",
+                    );
+                    ui.add_space(theme::SECTION_GAP);
+                    self.show_exact_duplicate_review_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::DiscConversion {
+                    self.show_optical_conversion_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::EmulatorSetup {
+                    self.show_emulator_setup_page(ui, context);
                     return;
                 }
 

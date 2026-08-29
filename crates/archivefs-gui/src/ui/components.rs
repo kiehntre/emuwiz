@@ -236,6 +236,32 @@ pub(crate) fn technical_details<R>(
         .body_returned
 }
 
+/// A substantial, named page section the reader can collapse. The
+/// open/closed state is remembered for the rest of the app session - egui
+/// persists a `CollapsingHeader`'s openness in its own memory keyed by
+/// `id_salt` - so collapsing a dense "advanced" block stays collapsed while
+/// the reader moves around the app and comes back.
+///
+/// Use this only for genuinely large sections (a card's worth of controls or
+/// more); never wrap a single-row control in it. Pass `default_open: true`
+/// for the current/primary task and `default_open: false` for advanced,
+/// reference-heavy, or rarely-needed detail. Changes no behaviour - it only
+/// controls whether the body is drawn this frame. Returns the body closure's
+/// value when the section is expanded, `None` when it is collapsed.
+pub(crate) fn collapsible_section<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    title: &str,
+    default_open: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+        .id_salt(id_salt)
+        .default_open(default_open)
+        .show(ui, add_contents)
+        .body_returned
+}
+
 /// A compact, searchable platform picker: a filter box above a bounded,
 /// internally-scrolling list of compact selectable rows - a drop-in
 /// replacement for the "one full-height `egui::Button` per platform" wall
