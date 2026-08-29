@@ -88,6 +88,7 @@ pub mod rpcs3_execution;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
+pub mod xenia_execution;
 
 #[cfg(test)]
 mod tests;
@@ -209,4 +210,10 @@ pub use xemu_execution::{
 pub use xenia_command::{
     XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, XeniaCommandPlan, XeniaCommandSelection,
     build_xenia_command_plan,
+};
+pub use xenia_execution::{
+    LaunchedXeniaProcess, XeniaLaunchCommandFacts, XeniaLaunchExecutionError,
+    XeniaLaunchExitReport, XeniaLaunchPreflightError, XeniaLaunchPreflightErrorKind,
+    XeniaLaunchRequest, XeniaLaunchSpawnError, preflight_and_launch_xenia, preflight_xenia_launch,
+    spawn_xenia,
 };

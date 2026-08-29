@@ -53,12 +53,16 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Ppsspp {
         profile: &'a PpssppProfile,
     },
-    /// Kept in the input so a caller does not silently discard a discovered
-    /// Xenia profile. It cannot become a launch candidate until Xenia has a
-    /// real per-game request type; [`project_xenia_launch_input`] stays
-    /// explicitly unavailable rather than fabricating one here.
+    /// Xenia has no per-game request/inspection type and no firmware/BIOS
+    /// concept in this build (see [`project_xenia_launch_input`]'s own doc
+    /// comment) - the verified XEX title/media ID a caller already obtained
+    /// directly from [`crate::game_identity::GameIdentityReport`] is carried
+    /// here instead of through `verified_identity_facts`, since no
+    /// `VerifiedIdentityFact` variant names Xbox 360 at all.
     Xenia {
         profile: &'a XeniaProfile,
+        verified_xex_title_id: Option<&'a str>,
+        verified_xex_media_id: Option<&'a str>,
     },
     Flycast {
         profile: &'a FlycastProfile,
@@ -103,8 +107,16 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
         Self::Ppsspp { profile }
     }
 
-    pub fn xenia(profile: &'a XeniaProfile) -> Self {
-        Self::Xenia { profile }
+    pub fn xenia(
+        profile: &'a XeniaProfile,
+        verified_xex_title_id: Option<&'a str>,
+        verified_xex_media_id: Option<&'a str>,
+    ) -> Self {
+        Self::Xenia {
+            profile,
+            verified_xex_title_id,
+            verified_xex_media_id,
+        }
     }
 
     pub fn flycast(profile: &'a FlycastProfile, inspection: &FlycastGameInspection) -> Self {
@@ -219,18 +231,22 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }
-            DiscoveredStandaloneProfile::Xenia { profile } => {
-                let _ = profile;
-                let LaunchInputProjection::Unavailable { detail } =
-                    project_xenia_launch_input(input.verified_identity_facts)
-                else {
-                    unreachable!("Xenia has no launch-input request type in this build")
-                };
-                debug_assert_eq!(
-                    detail,
-                    "no Xenia launch-input request type exists in this build"
-                );
-                None
+            DiscoveredStandaloneProfile::Xenia {
+                profile,
+                verified_xex_title_id,
+                verified_xex_media_id,
+            } if authorized(project_xenia_launch_input(
+                *verified_xex_title_id,
+                *verified_xex_media_id,
+            )) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "xenia",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
             }
             _ => None,
         })
@@ -788,10 +804,15 @@ mod tests {
     }
 
     #[test]
-    fn xenia_request_unavailability_stays_explicit() {
+    fn xenia_without_a_verified_xex_id_never_becomes_a_candidate() {
+        // A verified original-Xbox title ID is a different platform's fact
+        // (see `project_xenia_launch_input`'s own doc comment) - it must
+        // never substitute for Xenia's own directly-supplied XEX title/media
+        // ID, so this profile stays unauthorized despite an unrelated fact
+        // being present in `verified_identity_facts`.
         let identity = resolved("Xbox360", "4D5307E6");
         let profile = xenia_profile();
-        let profiles = [DiscoveredStandaloneProfile::xenia(&profile)];
+        let profiles = [DiscoveredStandaloneProfile::xenia(&profile, None, None)];
         let plan = plan(
             &identity,
             &[VerifiedIdentityFact::XboxTitleId("4D5307E6".to_string())],
@@ -800,12 +821,8 @@ mod tests {
             &empty_retroarch(),
         );
         assert!(matches!(
-            project_xenia_launch_input(&[VerifiedIdentityFact::XboxTitleId(
-                "4D5307E6".to_string()
-            )]),
-            LaunchInputProjection::Unavailable {
-                detail: "no Xenia launch-input request type exists in this build"
-            }
+            project_xenia_launch_input(None, None),
+            LaunchInputProjection::Unavailable { .. }
         ));
         assert!(
             plan.candidates[0]
@@ -813,5 +830,32 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
         );
+    }
+
+    #[test]
+    fn xenia_with_a_verified_xex_title_id_becomes_a_ready_candidate() {
+        let identity = resolved("Xbox360", "4D5307E6");
+        let profile = xenia_profile();
+        let profiles = [DiscoveredStandaloneProfile::xenia(
+            &profile,
+            Some("4D5307E6"),
+            None,
+        )];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "xenia",
+                ..
+            }
+        ));
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
     }
 }

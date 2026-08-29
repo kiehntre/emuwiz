@@ -397,16 +397,29 @@ pub fn project_amiga_whdload_launch_input(
     }
 }
 
-/// Xenia (Xbox 360) has no per-game request/inspection type in this build
-/// at all - unlike every other Phase 1 adapter, there is no
-/// `patch_manager::xenia_local` request struct to project onto. Rather
-/// than fabricate one, or silently reuse xemu's (a different platform's)
-/// request shape, this always answers `Unavailable`: no legitimate
-/// verified-identity projection exists yet for Xenia in this build.
-pub fn project_xenia_launch_input(facts: &[VerifiedIdentityFact]) -> LaunchInputProjection<()> {
-    let _ = facts;
-    LaunchInputProjection::Unavailable {
-        detail: "no Xenia launch-input request type exists in this build",
+/// Xenia (Xbox 360) has no per-game request/inspection type in this build -
+/// unlike every other Phase 1 adapter, there is no
+/// `patch_manager::xenia_local` request struct to project onto, and no
+/// `VerifiedIdentityFact` variant names Xbox 360 either (see
+/// [`crate::launch::evidence_bridge`]'s own doc comment: `XboxTitleId`
+/// names the original Xbox, not the 360, and conflating them would be
+/// wrong). So this deliberately does not take a `facts` slice at all -
+/// unlike every other `project_*_launch_input` function, it takes the
+/// already-verified XEX title/media ID directly, exactly the same two
+/// values [`crate::launch::xenia_command::build_xenia_command_plan`] itself
+/// already accepts as direct parameters rather than through a fact list.
+/// Authorizes whenever either is present, matching that same "either is
+/// sufficient" condition.
+pub fn project_xenia_launch_input(
+    verified_xex_title_id: Option<&str>,
+    verified_xex_media_id: Option<&str>,
+) -> LaunchInputProjection<()> {
+    if verified_xex_title_id.is_some() || verified_xex_media_id.is_some() {
+        LaunchInputProjection::Authorized(())
+    } else {
+        LaunchInputProjection::Unavailable {
+            detail: "no verified Xbox 360 XEX title ID or media ID is available",
+        }
     }
 }
 
@@ -553,7 +566,7 @@ mod tests {
             LaunchInputProjection::Unavailable { .. }
         ));
         assert!(matches!(
-            project_xenia_launch_input(&facts),
+            project_xenia_launch_input(None, None),
             LaunchInputProjection::Unavailable { .. }
         ));
     }
@@ -578,12 +591,29 @@ mod tests {
     }
 
     #[test]
-    fn xenia_has_no_authorized_projection_even_with_unrelated_facts() {
-        let facts = vec![VerifiedIdentityFact::XboxTitleId("XYZ".to_string())];
+    fn xenia_projection_ignores_unrelated_facts_and_requires_its_own_direct_parameters() {
+        // A verified original-Xbox title ID is a different platform's fact
+        // entirely (see this function's own doc comment) - it must never
+        // substitute for a verified Xbox 360 XEX title/media ID passed
+        // directly.
         assert!(matches!(
-            project_xenia_launch_input(&facts),
+            project_xenia_launch_input(None, None),
             LaunchInputProjection::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn xenia_projection_authorizes_on_either_title_or_media_id_alone() {
+        let LaunchInputProjection::Authorized(()) =
+            project_xenia_launch_input(Some("4D5307E6"), None)
+        else {
+            panic!("a verified XEX title ID alone must authorize Xenia input");
+        };
+        let LaunchInputProjection::Authorized(()) =
+            project_xenia_launch_input(None, Some("4A5307D1"))
+        else {
+            panic!("a verified XEX media ID alone must authorize Xenia input");
+        };
     }
 
     #[test]

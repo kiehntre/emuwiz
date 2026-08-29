@@ -1,12 +1,19 @@
 //! Bounded, read-only discovery of local Xenia Canary installations.
 //!
-//! Xenia Canary has no single standard install location: real installs on
-//! Linux are typically portable (a folder holding `xenia_canary.exe`,
-//! `xenia-canary.config.toml`, and its own `patches` directory), often run
-//! under Wine/Proton rather than natively packaged. No native path is
-//! guessed here without real evidence for one - discovery is deliberately
-//! limited to caller-supplied explicit directories, each validated the
-//! same way as every other emulator adapter's profile roots.
+//! Xenia Canary has no single standard install location: real installs are
+//! typically portable (a folder holding an executable,
+//! `xenia-canary.config.toml`, and its own `patches` directory). No native
+//! path is guessed here without real evidence for one - discovery is
+//! deliberately limited to caller-supplied explicit directories, each
+//! validated the same way as every other emulator adapter's profile roots.
+//!
+//! [`resolve_xenia_launch_binding`] (below) only ever authorizes a native
+//! Linux executable found in that directory - `xenia_canary` or `xenia`,
+//! never `xenia_canary.exe`. A portable folder that only carries the
+//! Windows binary is a real, eligible profile (its `patches`/config
+//! evidence is unaffected), but it has no valid *launch binding* until a
+//! native Linux executable is placed there too; this crate never assumes or
+//! configures Wine/Proton to run the `.exe` for it.
 //!
 //! This module never starts Xenia and has no write or network capability.
 
@@ -18,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -335,25 +344,33 @@ fn directory_identity(_metadata: &fs::Metadata) -> Option<XeniaDirectoryIdentity
 // [`crate::launch::xenia_command`] needs. This never launches Xenia, never
 // writes configuration, and never creates a directory.
 //
-// # Authoritative current Xenia Canary executable name
+// # Native Linux executable only - `xenia_canary.exe` is never a binding
 //
-// The upstream project ships a single Windows executable,
-// `xenia_canary.exe`, alongside its config file and `patches` directory in
-// one portable folder - there is no separate native Linux build, and no
-// other install layout is documented. Real use on Linux runs this `.exe`
-// under Wine/Proton (see the module doc comment); how a caller ultimately
-// invokes a `.exe` on Linux is an execution-layer concern this module does
-// not decide - it only proves the file itself genuinely exists as a safe,
-// regular, non-symlink file, exactly like every other adapter's binding
-// resolver proves its own native executable.
+// Upstream Xenia Canary ships both a Windows `xenia_canary.exe` and, in its
+// Linux release artifacts, a native ELF binary alongside the same
+// `xenia-canary.config.toml`/`patches` layout, conventionally named
+// `xenia_canary` (no extension) - `xenia` is also accepted for a mainline
+// Xenia portable directory laid out the same way. This resolver only ever
+// searches for those extensionless native names: a `.exe` sitting in the
+// same directory is never treated as a valid binding, even if it happens to
+// carry the executable permission bit, because spawning a Windows PE binary
+// directly on native Linux would either fail outright or silently depend on
+// a system-wide Wine/binfmt_misc association this crate never assumes,
+// configures, or requires - see this module's own doc comment. A profile
+// that only has `xenia_canary.exe` and no native binary is refused exactly
+// like a profile with no executable at all; Windows/Wine execution remains
+// entirely unsupported by this launch slice.
 //
 // Because Xenia profiles are always [`XeniaInstallationType::Explicit`]
 // (there is no XDG-style default location to guess), this resolver has no
-// installation-type branch and no `$PATH`-search ambiguity to arbitrate -
-// unlike PCSX2/DuckStation, there is exactly one place to look.
+// installation-type branch to arbitrate - unlike PCSX2/DuckStation, there is
+// exactly one directory to look in; only the base name is ambiguous, not
+// the containing directory.
 
-/// The exact executable filename Xenia Canary itself ships.
-const XENIA_CANARY_EXECUTABLE_NAME: &str = "xenia_canary.exe";
+/// The native Linux executable names this resolver accepts, in preference
+/// order - never `xenia_canary.exe`. See this section's own doc comment for
+/// why the Windows binary is deliberately never a valid binding here.
+const XENIA_NATIVE_LINUX_EXECUTABLE_CANDIDATES: &[&str] = &["xenia_canary", "xenia"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -362,11 +379,19 @@ pub enum XeniaLaunchBlockerKind {
     /// matches what discovery originally observed, or the profile itself is
     /// not eligible.
     ProfileRootMismatch,
-    /// No `xenia_canary.exe` exists in the profile's configuration
-    /// directory.
+    /// Neither `xenia_canary` nor `xenia` (the native Linux executable
+    /// names) exists in the profile's configuration directory - a
+    /// `xenia_canary.exe` alone, if present, does not satisfy this.
     ExecutableMissing,
-    /// `xenia_canary.exe` exists but is a symlink or not a regular file.
+    /// A candidate native executable exists but is a symlink or not a
+    /// regular file.
     ExecutableUnsafe,
+    /// A candidate native executable exists as a regular file but lacks the
+    /// executable permission bit.
+    ExecutableNotExecutable,
+    /// More than one native executable candidate matches and no authority
+    /// distinguishes them.
+    AmbiguousExecutable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,29 +450,80 @@ pub fn resolve_xenia_launch_binding(
             "Xenia Canary configuration evidence (xenia-canary.config.toml) is no longer present",
         ));
     }
-    let executable = profile
-        .configuration_path
-        .join(XENIA_CANARY_EXECUTABLE_NAME);
-    match fs::symlink_metadata(&executable) {
+    let mut valid = Vec::new();
+    let mut most_specific_error: Option<XeniaLaunchBlocker> = None;
+    for name in XENIA_NATIVE_LINUX_EXECUTABLE_CANDIDATES {
+        let candidate = profile.configuration_path.join(name);
+        match validate_native_linux_xenia_executable(&candidate) {
+            Ok(()) => valid.push(candidate),
+            Err(error) => {
+                // Prefer a real-but-unsafe/non-executable finding at one
+                // candidate name over a plain "missing" from a different
+                // candidate name that simply does not exist at all - never
+                // let a later, less informative "missing" overwrite an
+                // earlier, more specific refusal.
+                let replace = match &most_specific_error {
+                    None => true,
+                    Some(existing) => {
+                        existing.kind == XeniaLaunchBlockerKind::ExecutableMissing
+                            && error.kind != XeniaLaunchBlockerKind::ExecutableMissing
+                    }
+                };
+                if replace {
+                    most_specific_error = Some(error);
+                }
+            }
+        }
+    }
+    match valid.len() {
+        0 => Err(most_specific_error.unwrap_or_else(|| {
+            launch_blocker(
+                XeniaLaunchBlockerKind::ExecutableMissing,
+                "no native Linux Xenia executable (xenia_canary or xenia, without a .exe \
+                 extension) was found in the profile's configuration directory - a \
+                 xenia_canary.exe alone is never a valid native launch target",
+            )
+        })),
+        1 => Ok(XeniaLaunchBinding {
+            executable: valid.pop().expect("length checked above"),
+        }),
+        count => Err(launch_blocker(
+            XeniaLaunchBlockerKind::AmbiguousExecutable,
+            format!(
+                "{count} viable native Xenia executables match this profile and none is \
+                 distinguished as authoritative"
+            ),
+        )),
+    }
+}
+
+fn validate_native_linux_xenia_executable(path: &Path) -> Result<(), XeniaLaunchBlocker> {
+    match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(launch_blocker(
             XeniaLaunchBlockerKind::ExecutableUnsafe,
-            format!("{XENIA_CANARY_EXECUTABLE_NAME} is a symlink"),
+            format!("{} is a symlink", path.display()),
         )),
-        Ok(metadata) if metadata.is_file() => Ok(XeniaLaunchBinding { executable }),
+        Ok(metadata) if metadata.is_file() => {
+            #[cfg(unix)]
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(launch_blocker(
+                    XeniaLaunchBlockerKind::ExecutableNotExecutable,
+                    format!("{} is not executable", path.display()),
+                ));
+            }
+            Ok(())
+        }
         Ok(_) => Err(launch_blocker(
             XeniaLaunchBlockerKind::ExecutableUnsafe,
-            format!("{XENIA_CANARY_EXECUTABLE_NAME} is not a regular file"),
+            format!("{} is not a regular file", path.display()),
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(launch_blocker(
             XeniaLaunchBlockerKind::ExecutableMissing,
-            format!(
-                "{XENIA_CANARY_EXECUTABLE_NAME} was not found in the profile's configuration \
-                 directory"
-            ),
+            format!("{} was not found", path.display()),
         )),
         Err(_) => Err(launch_blocker(
             XeniaLaunchBlockerKind::ExecutableMissing,
-            format!("{XENIA_CANARY_EXECUTABLE_NAME} could not be inspected"),
+            format!("{} could not be inspected", path.display()),
         )),
     }
 }
@@ -577,22 +653,61 @@ mod tests {
         discovery.profiles.into_iter().next().unwrap()
     }
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn a_real_executable_next_to_the_marker_resolves() {
+    fn a_real_native_executable_next_to_the_marker_resolves() {
         let root = FixtureDir::new("binding-real");
         let profile = eligible_profile(&root.0);
-        fs::write(root.0.join(XENIA_CANARY_EXECUTABLE_NAME), "binary").unwrap();
+        write_executable(&root.0.join("xenia_canary"), b"binary");
         let binding = resolve_xenia_launch_binding(&profile).unwrap();
-        assert_eq!(
-            binding.executable,
-            root.0.join(XENIA_CANARY_EXECUTABLE_NAME)
-        );
+        assert_eq!(binding.executable, root.0.join("xenia_canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mainline_xenia_native_name_also_resolves() {
+        let root = FixtureDir::new("binding-mainline");
+        let profile = eligible_profile(&root.0);
+        write_executable(&root.0.join("xenia"), b"binary");
+        let binding = resolve_xenia_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, root.0.join("xenia"));
     }
 
     #[test]
     fn a_missing_executable_is_refused_not_guessed() {
         let root = FixtureDir::new("binding-missing");
         let profile = eligible_profile(&root.0);
+        let error = resolve_xenia_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, XeniaLaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[test]
+    fn a_windows_exe_alone_is_never_authorized_as_a_native_binding() {
+        // The Windows binary may genuinely exist in a real portable Xenia
+        // Canary folder, but it must never become this resolver's binding -
+        // this crate never assumes or configures Wine/Proton.
+        let root = FixtureDir::new("binding-exe-only");
+        let profile = eligible_profile(&root.0);
+        fs::write(root.0.join("xenia_canary.exe"), b"MZ fake pe").unwrap();
+        let error = resolve_xenia_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, XeniaLaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_permission_windows_exe_is_still_never_authorized() {
+        // Even if a `.exe` happens to carry the executable permission bit
+        // (e.g. a Wine wrapper setup), it must never be treated as native
+        // merely because it exists and is marked executable.
+        let root = FixtureDir::new("binding-exe-chmod");
+        let profile = eligible_profile(&root.0);
+        write_executable(&root.0.join("xenia_canary.exe"), b"MZ fake pe");
         let error = resolve_xenia_launch_binding(&profile).unwrap_err();
         assert_eq!(error.kind, XeniaLaunchBlockerKind::ExecutableMissing);
     }
@@ -604,10 +719,31 @@ mod tests {
         let root = FixtureDir::new("binding-symlink");
         let profile = eligible_profile(&root.0);
         let real = root.0.join("real-exe");
-        fs::write(&real, "binary").unwrap();
-        symlink(&real, root.0.join(XENIA_CANARY_EXECUTABLE_NAME)).unwrap();
+        write_executable(&real, b"binary");
+        symlink(&real, root.0.join("xenia_canary")).unwrap();
         let error = resolve_xenia_launch_binding(&profile).unwrap_err();
         assert_eq!(error.kind, XeniaLaunchBlockerKind::ExecutableUnsafe);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_native_binary_is_refused() {
+        let root = FixtureDir::new("binding-not-executable");
+        let profile = eligible_profile(&root.0);
+        fs::write(root.0.join("xenia_canary"), b"binary").unwrap();
+        let error = resolve_xenia_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, XeniaLaunchBlockerKind::ExecutableNotExecutable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_native_candidates_present_is_ambiguous() {
+        let root = FixtureDir::new("binding-ambiguous");
+        let profile = eligible_profile(&root.0);
+        write_executable(&root.0.join("xenia_canary"), b"binary");
+        write_executable(&root.0.join("xenia"), b"binary");
+        let error = resolve_xenia_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, XeniaLaunchBlockerKind::AmbiguousExecutable);
     }
 
     #[test]
@@ -628,7 +764,7 @@ mod tests {
     fn a_directory_named_like_the_executable_is_refused() {
         let root = FixtureDir::new("binding-exe-is-dir");
         let profile = eligible_profile(&root.0);
-        fs::create_dir_all(root.0.join(XENIA_CANARY_EXECUTABLE_NAME)).unwrap();
+        fs::create_dir_all(root.0.join("xenia_canary")).unwrap();
         let error = resolve_xenia_launch_binding(&profile).unwrap_err();
         assert_eq!(error.kind, XeniaLaunchBlockerKind::ExecutableUnsafe);
     }
