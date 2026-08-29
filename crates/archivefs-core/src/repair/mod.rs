@@ -40,6 +40,7 @@ pub mod exact_duplicate;
 pub mod execute;
 pub mod library;
 pub mod n64_equivalent;
+pub mod optical_conversion;
 pub mod optical_equivalent;
 pub mod plan;
 pub mod preflight;
@@ -83,6 +84,10 @@ pub use n64_equivalent::{
     N64_EQUIVALENT_SCAN_VERSION, N64EquivalentGroup, N64EquivalentMember, N64EquivalentScanReport,
     N64ExcludedCandidate, apply_n64_equivalent_group, build_n64_equivalent_repair_plan,
     rollback_n64_equivalent_group, scan_n64_equivalent_duplicates,
+};
+pub use optical_conversion::{
+    ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode, ChdConversionTransaction,
+    build_chd_conversion_plan, execute_chd_conversion, rollback_chd_conversion,
 };
 pub use optical_equivalent::{
     OPTICAL_EQUIVALENT_SCAN_VERSION, OpticalEquivalentFile, OpticalEquivalentGroup,

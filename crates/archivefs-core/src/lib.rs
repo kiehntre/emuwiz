@@ -7660,7 +7660,7 @@ fn run_command_os(program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
 
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 
-fn run_command_os_with_timeout(
+pub(crate) fn run_command_os_with_timeout(
     program: &str,
     args: &[&std::ffi::OsStr],
     timeout: Duration,
