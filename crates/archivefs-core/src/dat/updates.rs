@@ -615,6 +615,25 @@ pub struct ManagedDatState {
     pub current_snapshot: ManagedDatSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_snapshot: Option<ManagedDatSnapshot>,
+    /// `upstream_revision` as it stood for `previous_snapshot` while that
+    /// snapshot was still current, captured at the moment it was demoted
+    /// (see [`publish_validated_snapshot`]). `None` for a state that has
+    /// never been updated, or one persisted before this field existed -
+    /// both are honestly "unknown", never guessed from the snapshot's own
+    /// bytes. This is what lets rollback UI say which revision a previous
+    /// snapshot actually was, and what
+    /// [`rollback_managed_dat_to_previous`] restores `upstream_revision` to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_upstream_revision: Option<String>,
+    /// `retrieved_at_unix_seconds` as it stood for `previous_snapshot` at
+    /// the moment it was demoted. See `previous_upstream_revision`'s doc for
+    /// why this is `None` rather than guessed when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_retrieved_at_unix_seconds: Option<u64>,
+    /// `validation_summary` as it stood for `previous_snapshot` at the
+    /// moment it was demoted. See `previous_upstream_revision`'s doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_validation_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -649,6 +668,9 @@ impl ManagedDatState {
             sha256: current_snapshot.sha256.clone(),
             current_snapshot,
             previous_snapshot: None,
+            previous_upstream_revision: None,
+            previous_retrieved_at_unix_seconds: None,
+            previous_validation_summary: None,
             upstream_revision: None,
             etag: None,
             last_modified: None,
@@ -676,6 +698,16 @@ impl ManagedDatState {
                     "managed DAT previous snapshot must differ from current snapshot",
                 ));
             }
+        } else if self.previous_upstream_revision.is_some()
+            || self.previous_retrieved_at_unix_seconds.is_some()
+            || self.previous_validation_summary.is_some()
+        {
+            // Provenance for a previous snapshot that does not exist is
+            // ambiguous, not merely unused - refuse rather than let a
+            // rollback UI describe a revision that names no real object.
+            return Err(config_error(
+                "managed DAT previous-snapshot provenance is set without a previous snapshot",
+            ));
         }
         validate_sha256(&self.sha256)?;
         if self.sha256 != self.current_snapshot.sha256 {
@@ -696,6 +728,14 @@ impl ManagedDatState {
         validate_optional_metadata("Last-Modified", &self.last_modified)?;
         validate_optional_metadata("validation summary", &self.validation_summary)?;
         validate_optional_metadata("last failure", &self.last_failure)?;
+        validate_optional_metadata(
+            "previous upstream revision",
+            &self.previous_upstream_revision,
+        )?;
+        validate_optional_metadata(
+            "previous validation summary",
+            &self.previous_validation_summary,
+        )?;
         Ok(())
     }
 }
@@ -853,6 +893,67 @@ pub fn resolve_managed_dat_snapshot_source(
         source_id: state.source_id.clone(),
         path,
     })
+}
+
+/// Swaps a managed source's current and previous snapshot, entirely
+/// offline: no [`ManagedDatTransport`], no URL, no upstream contact of any
+/// kind. `current` becomes exactly what `previous` was, together with the
+/// provenance (`upstream_revision`, `retrieved_at_unix_seconds`,
+/// `validation_summary`) that was recorded for it while it was still
+/// current; the snapshot being replaced becomes the new `previous`, along
+/// with *its* provenance - so rolling back a second time restores exactly
+/// the state before the first rollback (an explicit design goal: rollback
+/// must itself be reversible).
+///
+/// Fails closed rather than ever swapping to a dangling or ambiguous
+/// snapshot:
+/// - `Err` when there is no previous snapshot recorded at all (the caller's
+///   UI is expected to check this first and not offer rollback at all, but
+///   this is enforced here too, not only presentation-side).
+/// - `Err` when either the current or the previous snapshot's immutable
+///   object file fails the same ownership check
+///   ([`validate_managed_snapshot_ownership`]) an ordinary read already
+///   requires - missing, non-regular, or symlinked objects refuse rather
+///   than silently naming a source that no longer exists on disk.
+/// - `Err` (via [`ManagedDatState::validate_for`]) if the resulting state
+///   would be internally inconsistent for any other reason this module
+///   already checks.
+///
+/// Nothing is mutated on disk unless every check above passes.
+pub fn rollback_managed_dat_to_previous(
+    managed_root: &Path,
+    descriptor: &ManagedDatSourceDescriptor,
+) -> Result<ManagedDatState> {
+    let mut state = load_managed_dat_state(managed_root, descriptor)?;
+    let Some(previous) = state.previous_snapshot.clone() else {
+        return Err(config_error(
+            "no previous local snapshot is available to roll back to",
+        ));
+    };
+    // Proves both objects are real, owned, regular files before anything is
+    // mutated; the resolved paths themselves are not needed here.
+    validate_managed_snapshot_ownership(managed_root, &state, &previous)?;
+    validate_managed_snapshot_ownership(managed_root, &state, &state.current_snapshot.clone())?;
+
+    let demoted_current = state.current_snapshot.clone();
+    let demoted_upstream_revision = state.upstream_revision.take();
+    let demoted_retrieved_at = state.retrieved_at_unix_seconds.take();
+    let demoted_validation_summary = state.validation_summary.take();
+
+    state.current_snapshot = previous;
+    state.sha256 = state.current_snapshot.sha256.clone();
+    state.upstream_revision = state.previous_upstream_revision.take();
+    state.retrieved_at_unix_seconds = state.previous_retrieved_at_unix_seconds.take();
+    state.validation_summary = state.previous_validation_summary.take();
+
+    state.previous_snapshot = Some(demoted_current);
+    state.previous_upstream_revision = demoted_upstream_revision;
+    state.previous_retrieved_at_unix_seconds = demoted_retrieved_at;
+    state.previous_validation_summary = demoted_validation_summary;
+
+    state.validate_for(descriptor)?;
+    save_managed_dat_state(managed_root, &state)?;
+    Ok(state)
 }
 
 /// Lists unreferenced immutable objects for one typed managed source.
@@ -1746,6 +1847,13 @@ fn publish_validated_snapshot(
         ManagedDatState::new(descriptor, snapshot.clone()).expect("validated descriptor and digest")
     });
     if state.current_snapshot != snapshot {
+        // Captured before the unconditional overwrites below replace them,
+        // so the snapshot being demoted keeps its own provenance rather than
+        // silently losing it - see `ManagedDatState::previous_upstream_revision`'s
+        // doc and `rollback_managed_dat_to_previous`.
+        state.previous_upstream_revision = state.upstream_revision.clone();
+        state.previous_retrieved_at_unix_seconds = state.retrieved_at_unix_seconds;
+        state.previous_validation_summary = state.validation_summary.clone();
         state.previous_snapshot = Some(state.current_snapshot.clone());
         state.current_snapshot = snapshot.clone();
         state.sha256 = sha256.clone();
@@ -3898,6 +4006,189 @@ mod tests {
             state.previous_snapshot.as_ref().unwrap().sha256,
             first_sha256
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Local rollback to the previous snapshot
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_update_captures_the_demoted_snapshots_own_revision_and_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let first = install(root.clone(), REV_A, mame_xml("gamecom", "first"));
+        assert!(first.previous_upstream_revision.is_none());
+
+        let second = install(root.clone(), REV_B, mame_xml("gamecom", "second"));
+        assert_eq!(second.upstream_revision.as_deref(), Some(REV_B));
+        assert_eq!(second.previous_upstream_revision.as_deref(), Some(REV_A));
+        assert_eq!(
+            second.previous_retrieved_at_unix_seconds,
+            first.retrieved_at_unix_seconds
+        );
+        assert_eq!(second.previous_validation_summary, first.validation_summary);
+    }
+
+    #[test]
+    fn rollback_swaps_current_and_previous_with_their_own_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        install(root.clone(), REV_A, mame_xml("gamecom", "first"));
+        let before = install(root.clone(), REV_B, mame_xml("gamecom", "second"));
+
+        let after = rollback_managed_dat_to_previous(&root, &descriptor()).unwrap();
+
+        assert_eq!(after.current_snapshot, before.previous_snapshot.unwrap());
+        assert_eq!(after.upstream_revision.as_deref(), Some(REV_A));
+        assert_eq!(after.sha256, after.current_snapshot.sha256);
+
+        assert_eq!(after.previous_snapshot, Some(before.current_snapshot));
+        assert_eq!(after.previous_upstream_revision.as_deref(), Some(REV_B));
+
+        // Provider/ecosystem/authoritative identity describe the source as a
+        // whole, not one snapshot - rollback must never touch them.
+        assert_eq!(after.source_id, before.source_id);
+        assert_eq!(after.parsed_ecosystem, before.parsed_ecosystem);
+        assert_eq!(after.authoritative_name, before.authoritative_name);
+
+        // Durable: an independently reloaded state agrees.
+        let reloaded = load_managed_dat_state(&root, &descriptor()).unwrap();
+        assert_eq!(reloaded, after);
+    }
+
+    #[test]
+    fn rolling_back_twice_restores_the_exact_pre_rollback_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        install(root.clone(), REV_A, mame_xml("gamecom", "first"));
+        let original = install(root.clone(), REV_B, mame_xml("gamecom", "second"));
+
+        rollback_managed_dat_to_previous(&root, &descriptor()).unwrap();
+        let restored = rollback_managed_dat_to_previous(&root, &descriptor()).unwrap();
+
+        assert_eq!(
+            restored, original,
+            "a second rollback must restore exactly the pre-rollback state"
+        );
+    }
+
+    #[test]
+    fn rollback_fails_closed_with_no_previous_snapshot_and_changes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        let before = install(root.clone(), REV_A, mame_xml("gamecom", "only"));
+
+        let result = rollback_managed_dat_to_previous(&root, &descriptor());
+        assert!(result.is_err());
+
+        let after = load_managed_dat_state(&root, &descriptor()).unwrap();
+        assert_eq!(after, before, "a failed rollback must not mutate state");
+    }
+
+    #[test]
+    fn rollback_fails_closed_when_the_previous_object_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        install(root.clone(), REV_A, mame_xml("gamecom", "first"));
+        let before = install(root.clone(), REV_B, mame_xml("gamecom", "second"));
+
+        let previous_sha = before.previous_snapshot.as_ref().unwrap().sha256.clone();
+        let objects = root
+            .join(descriptor().source_id.storage_relative_path())
+            .join(OBJECTS_DIRECTORY);
+        fs::remove_file(objects.join(&previous_sha)).unwrap();
+
+        let result = rollback_managed_dat_to_previous(&root, &descriptor());
+        assert!(
+            result.is_err(),
+            "a missing previous object must refuse rather than swap to a dangling snapshot"
+        );
+
+        let after = load_managed_dat_state(&root, &descriptor()).unwrap();
+        assert_eq!(
+            after, before,
+            "a failed rollback must leave the current snapshot exactly as it was"
+        );
+    }
+
+    #[test]
+    fn rollback_fails_closed_when_the_current_object_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        install(root.clone(), REV_A, mame_xml("gamecom", "first"));
+        let before = install(root.clone(), REV_B, mame_xml("gamecom", "second"));
+
+        let objects = root
+            .join(descriptor().source_id.storage_relative_path())
+            .join(OBJECTS_DIRECTORY);
+        fs::remove_file(objects.join(&before.current_snapshot.sha256)).unwrap();
+
+        let result = rollback_managed_dat_to_previous(&root, &descriptor());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn previous_snapshot_provenance_without_a_previous_snapshot_is_rejected() {
+        let mut corrupt = state();
+        corrupt.previous_upstream_revision = Some(REV_A.to_string());
+        assert!(
+            corrupt.validate_for(&descriptor()).is_err(),
+            "provenance for a previous snapshot that does not exist is ambiguous, not merely unused"
+        );
+    }
+
+    #[test]
+    fn rollback_never_references_a_transport_or_network_client() {
+        // A structural, source-text guard (matching this codebase's existing
+        // "never calls X directly" pattern - see e.g.
+        // `repair_history_page`'s own fs-mutation guard test) that the
+        // rollback function's body never mentions a transport, an HTTP
+        // client, or a URL scheme. Combined with its signature - which,
+        // unlike `check_managed_dat_update`/`update_managed_dat`, takes no
+        // `&dyn ManagedDatTransport` at all - this is as close to a
+        // compiler-enforced "no network" proof as a source-level test can
+        // give: there is no transport value anywhere in scope for the
+        // function to call.
+        let source = include_str!("updates.rs");
+        let start = source
+            .find("pub fn rollback_managed_dat_to_previous(")
+            .expect("the rollback function exists in this file");
+        let end = source[start..]
+            .find("/// Lists unreferenced immutable objects for one typed managed source.")
+            .expect("the next documented function follows rollback in this file");
+        let body = &source[start..start + end];
+        assert!(
+            !body.contains("fn get("),
+            "sanity: this slice should not reach into the transport trait definition"
+        );
+        for forbidden in ["Transport", "ureq", "https://", "http://", "Agent"] {
+            assert!(
+                !body.contains(forbidden),
+                "rollback_managed_dat_to_previous must never reference {forbidden} - it is local-only"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_makes_the_previous_snapshots_own_dat_content_active_for_a_fresh_parse() {
+        // Proves the completion-percentage feature (which always re-parses
+        // whatever `resolve_current_managed_dat_source` currently names,
+        // never a cached figure) will see the *restored* file's own real
+        // content after a rollback, not stale or invented data: the two
+        // installs below carry genuinely different catalogues (different
+        // game names -> different `entry_count`), and a fresh parse of the
+        // path rollback makes current must match the one that was actually
+        // restored.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(MANAGED_DAT_DIRECTORY);
+        install(root.clone(), REV_A, mame_xml("gamecom", "alpha"));
+        install(root.clone(), REV_B, mame_xml("gamecom", "bravo"));
+
+        let after = rollback_managed_dat_to_previous(&root, &descriptor()).unwrap();
+        let resolved = resolve_current_managed_dat_source(&root, &after).unwrap();
+        let parsed = parse_dat_file(resolved.path(), DatLimits::default()).unwrap();
+        assert_eq!(parsed.dat.games.len(), 1);
+        assert_eq!(parsed.dat.games[0].name, "alpha");
     }
 
     #[test]

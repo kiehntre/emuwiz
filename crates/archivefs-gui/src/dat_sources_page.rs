@@ -86,7 +86,8 @@ use archivefs_core::dat::updates::{
     HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
     ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState, ManagedDatUpdateFailureKind,
     ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy, RedumpBiosSystem,
-    RedumpGameSystem, check_managed_dat_update, managed_dat_root, update_managed_dat,
+    RedumpGameSystem, check_managed_dat_update, managed_dat_root, rollback_managed_dat_to_previous,
+    update_managed_dat,
 };
 use archivefs_core::identity_source::no_intro::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
@@ -560,6 +561,20 @@ pub(crate) struct ManagedDatSourceRowView {
     pub(crate) installed: bool,
     pub(crate) current_revision: Option<String>,
     pub(crate) last_checked: Option<String>,
+    /// The previous locally retained snapshot's own revision label, as it
+    /// stood while that snapshot was current - `None` when there is no
+    /// previous snapshot, or one exists but predates this field (an older
+    /// managed state on disk never had its demoted revision recorded).
+    pub(crate) previous_revision: Option<String>,
+    /// When the previous snapshot was originally acquired, formatted the
+    /// same way `last_checked` is.
+    pub(crate) previous_retrieved: Option<String>,
+    /// Whether [`DatSourcesPageAction::RollbackManagedDat`] can actually do
+    /// anything right now: a previous snapshot is recorded at all. The core
+    /// rollback call still independently re-checks both objects exist on
+    /// disk before touching anything - this only decides whether the
+    /// control is offered.
+    pub(crate) rollback_available: bool,
     pub(crate) status: ManagedDatStatusView,
     pub(crate) update_enabled: bool,
     pub(crate) busy: bool,
@@ -616,14 +631,23 @@ pub(crate) enum ManagedDatStatusView {
     NotInstalled,
     Idle,
     Checking,
-    UpdateAvailable { upstream_revision: String },
+    UpdateAvailable {
+        upstream_revision: String,
+    },
     UpToDate,
     Updating,
     Updated,
+    /// A local rollback to the previous snapshot just completed - distinct
+    /// from `Updated` since no network activity produced it.
+    RolledBack,
     Offline,
-    RateLimited { retry_after_seconds: Option<u64> },
+    RateLimited {
+        retry_after_seconds: Option<u64>,
+    },
     Disabled,
-    Failed { detail: String },
+    Failed {
+        detail: String,
+    },
 }
 
 fn managed_dat_status_from_outcome(outcome: ManagedDatUpdateOutcome) -> ManagedDatStatusView {
@@ -1498,6 +1522,14 @@ pub(crate) enum DatSourcesPageAction {
         source_id: ManagedDatSourceId,
     },
     UpdateManagedDat {
+        source_id: ManagedDatSourceId,
+    },
+    /// Swaps a managed source's current and previous local snapshot. Wholly
+    /// offline and synchronous - see
+    /// [`archivefs_core::dat::updates::rollback_managed_dat_to_previous`] -
+    /// never routed through the network worker `CheckManagedDat`/
+    /// `UpdateManagedDat` use.
+    RollbackManagedDat {
         source_id: ManagedDatSourceId,
     },
     ImportTosecReleasePack {
@@ -3120,6 +3152,9 @@ impl DatSourcesPageState {
             DatSourcesPageAction::UpdateManagedDat { source_id } => {
                 self.start_managed_dat_operation(source_id, ManagedDatOperation::Update);
             }
+            DatSourcesPageAction::RollbackManagedDat { source_id } => {
+                self.rollback_managed_dat(source_id);
+            }
             DatSourcesPageAction::ImportTosecReleasePack { root } => self.import_tosec_pack(root),
             DatSourcesPageAction::RemoveTosecReleasePack { pack_id } => {
                 self.remove_tosec_pack(&pack_id);
@@ -4151,6 +4186,52 @@ impl DatSourcesPageState {
         }
     }
 
+    /// Swaps a managed source's current and previous local snapshot.
+    /// Synchronous and offline: unlike Check/Update this never spawns the
+    /// network worker thread, never constructs an
+    /// [`archivefs_core::dat::updates::HttpsManagedDatTransport`], and never
+    /// builds a [`ManagedDatUpdateOptions`] - there is no request to make.
+    /// The core call re-validates both snapshots exist and are owned before
+    /// touching anything, so a missing or corrupt object is reported as a
+    /// failure here rather than partially applied.
+    fn rollback_managed_dat(&mut self, source_id: ManagedDatSourceId) {
+        if self.is_busy() || self.managed_load_error.is_some() {
+            return;
+        }
+        let descriptor = match self.managed_sources.descriptors().and_then(|descriptors| {
+            descriptors
+                .into_iter()
+                .find(|descriptor| descriptor.source_id() == &source_id)
+                .ok_or_else(|| {
+                    archivefs_core::ArchiveFsError::Config(
+                        "managed DAT source is not configured".to_string(),
+                    )
+                })
+        }) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                self.managed_action_error = Some(error.to_string());
+                return;
+            }
+        };
+        self.managed_action_error = None;
+        let source_key = managed_source_key(&source_id);
+        match rollback_managed_dat_to_previous(&self.managed_root, &descriptor) {
+            Ok(_state) => {
+                self.managed_statuses
+                    .insert(source_key, ManagedDatStatusView::RolledBack);
+            }
+            Err(error) => {
+                self.managed_statuses.insert(
+                    source_key,
+                    ManagedDatStatusView::Failed {
+                        detail: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
     fn save(&mut self) {
         if self.load_error.is_some() {
             self.save_state = DatSaveState::Failed(
@@ -4742,6 +4823,17 @@ impl DatSourcesPageState {
             last_checked: state
                 .and_then(|state| state.last_checked_at_unix_seconds)
                 .map(format_unix_timestamp),
+            previous_revision: state.and_then(|state| state.previous_upstream_revision.clone()),
+            previous_retrieved: state
+                .and_then(|state| state.previous_retrieved_at_unix_seconds)
+                .map(format_unix_timestamp),
+            // Gated on the already-resolved, already-ownership-checked
+            // `previous` source rather than merely `state.previous_snapshot`
+            // being `Some`: a previous snapshot named in state but missing
+            // or corrupt on disk fails the whole row's resolution earlier
+            // (see `resolve_managed_dat_sources`), so by the time this runs,
+            // `previous.is_some()` already means the object is real.
+            rollback_available: previous.is_some(),
             update_enabled: matches!(status, ManagedDatStatusView::UpdateAvailable { .. }),
             busy: self
                 .managed_job
@@ -5848,6 +5940,8 @@ pub(crate) struct DatSourcesPageUi {
     /// source add flow. There is intentionally no URL/provider field.
     pub(crate) managed_mame_name: String,
     pub(crate) confirm_remove_managed: Option<ManagedDatSourceId>,
+    /// Which managed source is awaiting rollback-to-previous confirmation.
+    pub(crate) confirm_rollback_managed: Option<ManagedDatSourceId>,
     pub(crate) open_managed_technical: Option<ManagedDatSourceId>,
     /// Per-pack free-text group filter. It limits rendering only; persisted
     /// selection remains the typed System/Category/Media key.
@@ -5883,6 +5977,7 @@ impl DatSourcesPageUi {
         self.confirm_remove = None;
         self.managed_mame_name.clear();
         self.confirm_remove_managed = None;
+        self.confirm_rollback_managed = None;
         self.open_managed_technical = None;
         self.tosec_group_filter.clear();
         self.show_tosec_raw.clear();
@@ -7123,6 +7218,29 @@ fn show_managed_dat_source_row(
                     .small(),
             );
         }
+        if row.rollback_available {
+            let previous_revision = row
+                .previous_revision
+                .as_deref()
+                .unwrap_or("unknown revision");
+            let previous_retrieved = row
+                .previous_retrieved
+                .as_deref()
+                .unwrap_or("acquisition time not recorded");
+            ui.label(
+                egui::RichText::new(format!(
+                    "Previous revision available: {previous_revision} ({previous_retrieved})"
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("No previous local revision available")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
         match &row.status {
             ManagedDatStatusView::UpdateAvailable { upstream_revision } => {
                 ui.label(
@@ -7181,6 +7299,17 @@ fn show_managed_dat_source_row(
                 ));
             }
             if row.configured
+                && widgets::action_button(
+                    ui,
+                    "Roll back to previous",
+                    widgets::ActionStyle::Secondary,
+                    !busy && row.rollback_available,
+                )
+                .clicked()
+            {
+                ui_state.confirm_rollback_managed = Some(row.source_id.clone());
+            }
+            if row.configured
                 && widgets::action_button(ui, "Remove", widgets::ActionStyle::Quiet, !busy)
                     .clicked()
             {
@@ -7232,6 +7361,46 @@ fn show_managed_dat_source_row(
                     .clicked()
                 {
                     ui_state.confirm_remove_managed = None;
+                }
+            });
+        }
+
+        if ui_state.confirm_rollback_managed.as_ref() == Some(&row.source_id) {
+            ui.add_space(6.0);
+            let previous_revision = row
+                .previous_revision
+                .as_deref()
+                .unwrap_or("unknown revision");
+            widgets::banner(
+                ui,
+                "Roll back to the previous local revision?",
+                &format!(
+                    "This switches the active DAT back to the previous locally retained \
+                     revision ({previous_revision}). Nothing is downloaded. The revision \
+                     currently active becomes the new previous, so rolling back again restores \
+                     it."
+                ),
+                widgets::StatusTone::Warning,
+            );
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Roll back",
+                    widgets::ActionStyle::Primary,
+                    !busy && row.rollback_available,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(DatSourcesPageAction::RollbackManagedDat {
+                        source_id: row.source_id.clone(),
+                    });
+                    ui_state.confirm_rollback_managed = None;
+                }
+                if widgets::action_button(ui, "Keep current", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    ui_state.confirm_rollback_managed = None;
                 }
             });
         }
@@ -7627,6 +7796,10 @@ fn managed_dat_status_presentation(status: &ManagedDatStatusView) -> (&str, widg
         ManagedDatStatusView::UpToDate => ("Up to date", widgets::StatusTone::Success),
         ManagedDatStatusView::Updating => ("Updating…", widgets::StatusTone::Pending),
         ManagedDatStatusView::Updated => ("Updated successfully", widgets::StatusTone::Success),
+        ManagedDatStatusView::RolledBack => (
+            "Rolled back to previous revision",
+            widgets::StatusTone::Success,
+        ),
         ManagedDatStatusView::Offline => (
             "Offline — existing DAT remains available",
             widgets::StatusTone::Warning,

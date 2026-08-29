@@ -25,7 +25,10 @@ use archivefs_core::dat::sources::{
     DatValidationReport, audit_run::DatAuditOutcome, load_dat_sources_config_from,
 };
 use archivefs_core::dat::tosec_release_pack::{TosecFriendlyCategory, TosecMediaType};
-use archivefs_core::dat::updates::{ManagedDatSnapshot, ManagedDatState, save_managed_dat_state};
+use archivefs_core::dat::updates::{
+    ManagedDatSnapshot, ManagedDatState, load_managed_dat_state, rollback_managed_dat_to_previous,
+    save_managed_dat_state,
+};
 use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
@@ -6167,6 +6170,242 @@ fn installed_current_and_previous_snapshots_refresh_the_managed_row_without_prom
         &output,
         "Previous snapshot (not active)"
     ));
+}
+
+// --- managed DAT rollback --------------------------------------------------
+
+/// Builds a two-object managed MAME source (current + previous, both real
+/// files under `objects/`) with distinct, hand-set provenance for each -
+/// exactly the fixture shape a real update leaves behind after this task's
+/// core change to `publish_validated_snapshot`, but built directly so the
+/// test controls both revisions independently.
+fn two_snapshot_fixture(
+    page: &DatSourcesPageState,
+) -> (ManagedDatSourceDescriptor, String, String) {
+    let descriptor = page.managed_sources.entries()[0].descriptor().unwrap();
+    let current = "a".repeat(64);
+    let previous = "b".repeat(64);
+    let objects = page
+        .managed_root
+        .join(descriptor.source_id().storage_relative_path())
+        .join("objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join(&current), "current XML").unwrap();
+    std::fs::write(objects.join(&previous), "previous XML").unwrap();
+    let mut state = ManagedDatState::new(
+        &descriptor,
+        ManagedDatSnapshot::new(current.clone()).unwrap(),
+    )
+    .unwrap();
+    state.previous_snapshot = Some(ManagedDatSnapshot::new(previous.clone()).unwrap());
+    state.upstream_revision = Some("current-revision".to_string());
+    state.retrieved_at_unix_seconds = Some(2_000);
+    state.validation_summary = Some("current validated cleanly".to_string());
+    state.previous_upstream_revision = Some("previous-revision".to_string());
+    state.previous_retrieved_at_unix_seconds = Some(1_000);
+    state.previous_validation_summary = Some("previous validated cleanly".to_string());
+    state.sha256 = current.clone();
+    save_managed_dat_state(&page.managed_root, &state).unwrap();
+    (descriptor, current, previous)
+}
+
+#[test]
+fn a_previous_revision_and_its_acquisition_time_are_shown_when_present() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    two_snapshot_fixture(&page);
+
+    let view = page.view();
+    let row = &view.managed_rows[0];
+    assert_eq!(row.previous_revision.as_deref(), Some("previous-revision"));
+    assert!(row.previous_retrieved.is_some());
+    assert!(row.rollback_available);
+
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(&output, "previous-revision"));
+    assert!(rendered_text_contains(
+        &output,
+        "Previous revision available"
+    ));
+}
+
+#[test]
+fn no_previous_revision_is_reported_honestly_when_there_is_only_one_snapshot() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let descriptor = page.managed_sources.entries()[0].descriptor().unwrap();
+    let current = "c".repeat(64);
+    let objects = page
+        .managed_root
+        .join(descriptor.source_id().storage_relative_path())
+        .join("objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join(&current), "only XML").unwrap();
+    let state =
+        ManagedDatState::new(&descriptor, ManagedDatSnapshot::new(current).unwrap()).unwrap();
+    save_managed_dat_state(&page.managed_root, &state).unwrap();
+
+    let view = page.view();
+    let row = &view.managed_rows[0];
+    assert_eq!(row.previous_revision, None);
+    assert!(!row.rollback_available);
+
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(
+        &output,
+        "No previous local revision available"
+    ));
+}
+
+#[test]
+fn no_previous_revision_disables_the_rollback_control() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let descriptor = page.managed_sources.entries()[0].descriptor().unwrap();
+    let current = "d".repeat(64);
+    let objects = page
+        .managed_root
+        .join(descriptor.source_id().storage_relative_path())
+        .join("objects");
+    std::fs::create_dir_all(&objects).unwrap();
+    std::fs::write(objects.join(&current), "only XML").unwrap();
+    let state =
+        ManagedDatState::new(&descriptor, ManagedDatSnapshot::new(current).unwrap()).unwrap();
+    save_managed_dat_state(&page.managed_root, &state).unwrap();
+
+    // Requesting rollback anyway (as if a stale button had been clicked)
+    // must be a no-op: the core call fails closed, and the on-disk state is
+    // untouched.
+    let before = load_managed_dat_state(&page.managed_root, &descriptor).unwrap();
+    page.apply(DatSourcesPageAction::RollbackManagedDat {
+        source_id: descriptor.source_id().clone(),
+    });
+    let after = load_managed_dat_state(&page.managed_root, &descriptor).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn rolling_back_swaps_the_active_managed_snapshot() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let (descriptor, current_sha, previous_sha) = two_snapshot_fixture(&page);
+
+    page.apply(DatSourcesPageAction::RollbackManagedDat {
+        source_id: descriptor.source_id().clone(),
+    });
+
+    let view = page.view();
+    let row = &view.managed_rows[0];
+    assert_eq!(row.technical.sha256, Some(previous_sha.clone()));
+    assert_eq!(row.current_revision.as_deref(), Some("previous-revision"));
+    assert_eq!(row.technical.previous_snapshot, Some(current_sha.clone()));
+    assert_eq!(row.previous_revision.as_deref(), Some("current-revision"));
+    assert!(row.rollback_available);
+
+    // Provider/ecosystem identity describes the source as a whole, not one
+    // snapshot, so rollback must never change it.
+    let state = load_managed_dat_state(&page.managed_root, &descriptor).unwrap();
+    assert_eq!(state.authoritative_name, "gamecom");
+    assert_eq!(
+        state.parsed_ecosystem,
+        archivefs_core::dat::model::DatEcosystem::MAMESoftwareList
+    );
+}
+
+#[test]
+fn rolling_back_twice_restores_the_original_active_snapshot() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let (descriptor, current_sha, _previous_sha) = two_snapshot_fixture(&page);
+    let original = load_managed_dat_state(&page.managed_root, &descriptor).unwrap();
+
+    page.apply(DatSourcesPageAction::RollbackManagedDat {
+        source_id: descriptor.source_id().clone(),
+    });
+    let after_first = load_managed_dat_state(&page.managed_root, &descriptor).unwrap();
+    assert_eq!(after_first.current_snapshot.sha256, "b".repeat(64));
+
+    page.apply(DatSourcesPageAction::RollbackManagedDat {
+        source_id: descriptor.source_id().clone(),
+    });
+    let after_second = load_managed_dat_state(&page.managed_root, &descriptor).unwrap();
+    assert_eq!(
+        after_second, original,
+        "rolling back twice must restore the original state exactly"
+    );
+    assert_eq!(after_second.current_snapshot.sha256, current_sha);
+}
+
+#[test]
+fn rollback_status_is_distinct_from_an_updated_status() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddManagedMameSoftwareList {
+        authoritative_name: "gamecom".to_string(),
+    });
+    let (descriptor, _current_sha, _previous_sha) = two_snapshot_fixture(&page);
+
+    page.apply(DatSourcesPageAction::RollbackManagedDat {
+        source_id: descriptor.source_id().clone(),
+    });
+
+    let view = page.view();
+    assert_eq!(
+        view.managed_rows[0].status,
+        ManagedDatStatusView::RolledBack
+    );
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(
+        &output,
+        "Rolled back to previous revision"
+    ));
+}
+
+#[test]
+fn rollback_reaches_the_page_only_through_the_synchronous_local_action_never_the_network_worker() {
+    // `RollbackManagedDat` must never be dispatched to
+    // `start_managed_dat_operation` (the thread that owns
+    // `HttpsManagedDatTransport`) - it is handled entirely inline in
+    // `apply()`. This pins that wiring directly against the source text, so
+    // a future refactor cannot silently route rollback through the network
+    // worker without this test failing.
+    let source = include_str!("../dat_sources_page.rs");
+    let handler = source
+        .find("DatSourcesPageAction::RollbackManagedDat { source_id } => {")
+        .expect("the rollback action has a handler in apply()");
+    let handler_line_end = source[handler..]
+        .find('\n')
+        .map(|offset| handler + offset)
+        .unwrap();
+    let handler_line = &source[handler..handler_line_end];
+    assert!(
+        !handler_line.contains("start_managed_dat_operation"),
+        "rollback's action arm must not exist"
+    );
+    let next_line_end = source[handler_line_end + 1..]
+        .find('\n')
+        .map(|offset| handler_line_end + 1 + offset)
+        .unwrap();
+    let call_line = &source[handler_line_end + 1..next_line_end];
+    assert!(
+        call_line.contains("self.rollback_managed_dat(source_id)"),
+        "rollback must call the synchronous local method, got: {call_line}"
+    );
 }
 
 #[test]
