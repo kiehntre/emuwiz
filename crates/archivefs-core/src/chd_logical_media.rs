@@ -61,7 +61,8 @@
 //! closed - see `malformed_truncated_map_fails_closed`.
 
 use std::cell::RefCell;
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{Cursor, Read, Seek};
 
 use chd::Chd;
 use chd::header::Header;
@@ -160,8 +161,8 @@ fn hex(bytes: &[u8]) -> String {
 /// access (decompression is inherently stateful). No write ever happens
 /// through this type or through `chd-rs`; the mutability is entirely about
 /// decoder/cache bookkeeping.
-pub struct ChdTrackLogicalMedia<'a> {
-    chd: RefCell<Chd<Cursor<&'a [u8]>>>,
+pub struct ChdTrackLogicalMediaReader<R: Read + Seek> {
+    chd: RefCell<Chd<R>>,
     hunk_bytes: u64,
     unit_bytes: u64,
     frame_count: u64,
@@ -172,6 +173,9 @@ pub struct ChdTrackLogicalMedia<'a> {
     /// "cache only if simple and bounded" requirement.
     cache: RefCell<Option<(u32, Vec<u8>)>>,
 }
+
+/// The original byte-slice API, retained as a public alias for callers.
+pub type ChdTrackLogicalMedia<'a> = ChdTrackLogicalMediaReader<Cursor<&'a [u8]>>;
 
 /// Opens `data` as a CHD, selects its data track (via
 /// [`select_candidate_data_track`]), and returns a [`LogicalMedia`] over
@@ -186,6 +190,43 @@ pub fn open_chd_track_logical_media(
     data: &[u8],
 ) -> Result<ChdTrackLogicalMedia<'_>, ChdLogicalMediaError> {
     let identity = observe_chd_identity(data).map_err(ChdLogicalMediaError::Header)?;
+    let chd = Chd::open(Cursor::new(data), None).map_err(|error| match error {
+        chd::Error::RequiresParent => ChdLogicalMediaError::NeedsParent {
+            parent_sha1: identity.parent_sha1,
+        },
+        other => ChdLogicalMediaError::Codec {
+            detail: format!("{other:?}"),
+        },
+    })?;
+    build_chd_track_logical_media(chd, &identity)
+}
+
+/// File-backed form of [`open_chd_track_logical_media`]. The CHD header, map,
+/// metadata, and individual hunks are read from the file as needed; the
+/// complete compressed image is never loaded into memory.
+pub fn open_chd_track_logical_media_file(
+    path: &std::path::Path,
+) -> Result<ChdTrackLogicalMediaReader<File>, ChdLogicalMediaError> {
+    let identity = crate::chd_identity::observe_chd_identity_file(path)
+        .map_err(ChdLogicalMediaError::Header)?;
+    let file = File::open(path).map_err(|error| ChdLogicalMediaError::Codec {
+        detail: error.to_string(),
+    })?;
+    let chd = Chd::open(file, None).map_err(|error| match error {
+        chd::Error::RequiresParent => ChdLogicalMediaError::NeedsParent {
+            parent_sha1: identity.parent_sha1,
+        },
+        other => ChdLogicalMediaError::Codec {
+            detail: format!("{other:?}"),
+        },
+    })?;
+    build_chd_track_logical_media(chd, &identity)
+}
+
+fn build_chd_track_logical_media<R: Read + Seek>(
+    chd: Chd<R>,
+    identity: &crate::chd_identity::ChdIdentityObservation,
+) -> Result<ChdTrackLogicalMediaReader<R>, ChdLogicalMediaError> {
     if identity.parent_required {
         return Err(ChdLogicalMediaError::NeedsParent {
             parent_sha1: identity.parent_sha1,
@@ -217,14 +258,6 @@ pub fn open_chd_track_logical_media(
         }
     };
 
-    let chd = Chd::open(Cursor::new(data), None).map_err(|error| match error {
-        chd::Error::RequiresParent => ChdLogicalMediaError::NeedsParent {
-            parent_sha1: identity.parent_sha1,
-        },
-        other => ChdLogicalMediaError::Codec {
-            detail: format!("{other:?}"),
-        },
-    })?;
     let Header::V5Header(header_v5) = chd.header() else {
         return Err(ChdLogicalMediaError::Codec {
             detail: "expected a CHD v5 header".to_string(),
@@ -233,7 +266,7 @@ pub fn open_chd_track_logical_media(
     let hunk_bytes = u64::from(header_v5.hunk_bytes);
     let unit_bytes = u64::from(header_v5.unit_bytes);
 
-    Ok(ChdTrackLogicalMedia {
+    Ok(ChdTrackLogicalMediaReader {
         chd: RefCell::new(chd),
         hunk_bytes,
         unit_bytes,
@@ -243,7 +276,7 @@ pub fn open_chd_track_logical_media(
     })
 }
 
-impl ChdTrackLogicalMedia<'_> {
+impl<R: Read + Seek> ChdTrackLogicalMediaReader<R> {
     /// Decodes hunk `hunk_index` (via the 1-hunk cache when possible) and
     /// returns its raw decompressed bytes.
     fn decode_hunk(&self, hunk_index: u32) -> Result<Vec<u8>, String> {
@@ -292,7 +325,7 @@ impl ChdTrackLogicalMedia<'_> {
     }
 }
 
-impl LogicalMedia for ChdTrackLogicalMedia<'_> {
+impl<R: Read + Seek> LogicalMedia for ChdTrackLogicalMediaReader<R> {
     fn len(&self) -> u64 {
         self.frame_count * LOGICAL_BLOCK_BYTES as u64
     }
@@ -471,6 +504,28 @@ mod tests {
     fn opens_a_valid_uncompressed_v5_chd() {
         let data = build_uncompressed_chd("MODE1_RAW", 2, 2, 2, [0; 20], mode1_pattern_sector);
         assert!(open_chd_track_logical_media(&data).is_ok());
+    }
+
+    #[test]
+    fn file_backed_reader_matches_the_in_memory_reader() {
+        let data = build_uncompressed_chd("MODE1_RAW", 2, 2, 2, [0; 20], mode1_pattern_sector);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &data).unwrap();
+        let memory = open_chd_track_logical_media(&data).unwrap();
+        let disk = open_chd_track_logical_media_file(file.path()).unwrap();
+        let mut memory_bytes = vec![0u8; memory.len() as usize];
+        let mut disk_bytes = vec![0u8; disk.len() as usize];
+        memory.read_at(0, &mut memory_bytes).unwrap();
+        disk.read_at(0, &mut disk_bytes).unwrap();
+        assert_eq!(disk_bytes, memory_bytes);
+        assert_eq!(
+            crate::chd_identity::observe_chd_identity(&data)
+                .unwrap()
+                .metadata,
+            crate::chd_identity::observe_chd_identity_file(file.path())
+                .unwrap()
+                .metadata
+        );
     }
 
     #[test]

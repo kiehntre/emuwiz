@@ -99,7 +99,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use crate::content_detector::{ContentDetectionOutcome, ContentDetector, ContentDiagnostic};
 use crate::content_evidence::{
@@ -180,6 +181,28 @@ pub fn observe_chd_identity(data: &[u8]) -> Result<ChdIdentityObservation, ChdHe
     let mut cursor = Cursor::new(data);
     let header = read_chd_v5_header(&mut cursor)?;
     let metadata = read_chd_metadata_chain(data, header.meta_offset);
+    Ok(ChdIdentityObservation {
+        version: 5,
+        logical_bytes: header.logical_bytes,
+        hunk_bytes: header.hunk_bytes,
+        unit_bytes: header.unit_bytes,
+        raw_sha1: header.raw_sha1,
+        combined_sha1: header.overall_sha1,
+        parent_sha1: header.parent_sha1,
+        parent_required: header.parent_required(),
+        metadata,
+    })
+}
+
+/// File-backed counterpart to [`observe_chd_identity`]. The header and
+/// metadata chain are read with bounded seeks; compressed hunks are not read.
+pub fn observe_chd_identity_file(
+    path: &std::path::Path,
+) -> Result<ChdIdentityObservation, ChdHeaderError> {
+    let mut file = File::open(path).map_err(ChdHeaderError::Io)?;
+    let length = file.metadata().map_err(ChdHeaderError::Io)?.len();
+    let header = read_chd_v5_header(&mut file)?;
+    let metadata = read_chd_metadata_chain_reader(&mut file, length, header.meta_offset);
     Ok(ChdIdentityObservation {
         version: 5,
         logical_bytes: header.logical_bytes,
@@ -510,6 +533,14 @@ pub enum ChdMetadataOutcome {
 /// ever decompressed - the metadata chain lives outside the compressed hunk
 /// data entirely, at plain, directly-addressed offsets within `data`.
 pub fn read_chd_metadata_chain(data: &[u8], meta_offset: u64) -> ChdMetadataOutcome {
+    read_chd_metadata_chain_reader(Cursor::new(data), data.len() as u64, meta_offset)
+}
+
+fn read_chd_metadata_chain_reader<R: Read + Seek>(
+    mut reader: R,
+    total_len: u64,
+    meta_offset: u64,
+) -> ChdMetadataOutcome {
     if meta_offset == 0 {
         return ChdMetadataOutcome::Empty;
     }
@@ -529,17 +560,18 @@ pub fn read_chd_metadata_chain(data: &[u8], meta_offset: u64) -> ChdMetadataOutc
         }
         visited.push(offset);
 
-        let Ok(header_start) = usize::try_from(offset) else {
+        let Some(header_end) = offset.checked_add(CHD_METADATA_HEADER_BYTES as u64) else {
             return ChdMetadataOutcome::Malformed(ChdMetadataError::HeaderOutOfBounds { offset });
         };
-        let Some(header_end) = header_start.checked_add(CHD_METADATA_HEADER_BYTES) else {
-            return ChdMetadataOutcome::Malformed(ChdMetadataError::HeaderOutOfBounds { offset });
-        };
-        if header_end > data.len() {
+        if header_end > total_len {
             return ChdMetadataOutcome::Malformed(ChdMetadataError::HeaderOutOfBounds { offset });
         }
-
-        let header_bytes = &data[header_start..header_end];
+        let mut header_bytes = [0u8; CHD_METADATA_HEADER_BYTES];
+        if reader.seek(SeekFrom::Start(offset)).is_err()
+            || reader.read_exact(&mut header_bytes).is_err()
+        {
+            return ChdMetadataOutcome::Malformed(ChdMetadataError::HeaderOutOfBounds { offset });
+        }
         let tag = u32::from_be_bytes([
             header_bytes[0],
             header_bytes[1],
@@ -559,22 +591,34 @@ pub fn read_chd_metadata_chain(data: &[u8], meta_offset: u64) -> ChdMetadataOutc
             header_bytes[15],
         ]);
 
-        let Some(payload_end) = header_end.checked_add(length as usize) else {
+        let Some(payload_end) = header_end.checked_add(length as u64) else {
             return ChdMetadataOutcome::Malformed(ChdMetadataError::PayloadOutOfBounds {
                 offset,
                 length,
             });
         };
-        if payload_end > data.len() {
+        if payload_end > total_len {
             return ChdMetadataOutcome::Malformed(ChdMetadataError::PayloadOutOfBounds {
                 offset,
                 length,
             });
         }
-        let payload = &data[header_end..payload_end];
+        let Ok(payload_len) = usize::try_from(length) else {
+            return ChdMetadataOutcome::Malformed(ChdMetadataError::PayloadOutOfBounds {
+                offset,
+                length,
+            });
+        };
+        let mut payload = vec![0u8; payload_len];
+        if reader.read_exact(&mut payload).is_err() {
+            return ChdMetadataOutcome::Malformed(ChdMetadataError::PayloadOutOfBounds {
+                offset,
+                length,
+            });
+        }
 
         let kind = ChdMetadataTagKind::from_tag(tag);
-        let fact = interpret_metadata_payload(kind, payload);
+        let fact = interpret_metadata_payload(kind, &payload);
 
         entries.push(ChdMetadataEntry {
             tag,

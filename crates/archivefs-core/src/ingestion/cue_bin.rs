@@ -65,6 +65,42 @@ pub struct CueDataTrack {
     pub mode: CueDataTrackMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueTrackMode {
+    Data(CueDataTrackMode),
+    Audio,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueTrack {
+    pub number: u32,
+    pub mode: CueTrackMode,
+    pub path: PathBuf,
+    pub index_01: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueLayout {
+    pub cue_path: PathBuf,
+    pub tracks: Vec<CueTrack>,
+}
+
+impl CueLayout {
+    pub fn supported_single_mode1_2048(&self) -> Result<&CueTrack, CueError> {
+        if self.tracks.len() != 1 {
+            return Err(CueError::AmbiguousDataTracks);
+        }
+        let track = &self.tracks[0];
+        if track.index_01.is_none() {
+            return Err(CueError::Malformed("track has no INDEX 01".into()));
+        }
+        if !matches!(track.mode, CueTrackMode::Data(CueDataTrackMode::Mode1_2048)) {
+            return Err(CueError::UnsupportedTrackMode(format!("{:?}", track.mode)));
+        }
+        Ok(track)
+    }
+}
+
 /// One resolved CUE sheet: the sheet itself plus every `.bin` (or other
 /// data file) it references, resolved relative to the sheet's own
 /// directory.
@@ -104,6 +140,112 @@ pub fn resolve_cue(cue_path: &Path) -> Result<CueSheet, CueError> {
     Ok(CueSheet {
         cue_path: cue_path.to_path_buf(),
         referenced_paths,
+    })
+}
+
+/// Parses the complete ordered track layout of a CUE sheet. This is the
+/// structured companion to [`resolve_data_track`]; it applies the same
+/// bounded file reading and safe reference resolution, while retaining
+/// audio tracks and per-track `INDEX 01` evidence for callers that must not
+/// accidentally treat a partial sheet as a complete disc.
+pub fn resolve_cue_layout(cue_path: &Path) -> Result<CueLayout, CueError> {
+    let metadata = std::fs::metadata(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
+    if metadata.len() > MAX_CUE_BYTES {
+        return Err(CueError::TooLarge);
+    }
+    let contents =
+        std::fs::read_to_string(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
+    let base = cue_path.parent().unwrap_or_else(|| Path::new("."));
+    let canonical_base =
+        std::fs::canonicalize(base).map_err(|error| CueError::Io(error.to_string()))?;
+    let mut current_file: Option<PathBuf> = None;
+    let mut current_track: Option<(u32, CueTrackMode, Option<String>)> = None;
+    let mut tracks = Vec::new();
+
+    let finish = |current_file: &mut Option<PathBuf>,
+                  current_track: &mut Option<(u32, CueTrackMode, Option<String>)>,
+                  tracks: &mut Vec<CueTrack>|
+     -> Result<(), CueError> {
+        if let Some((number, mode, index_01)) = current_track.take() {
+            let path = current_file
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| CueError::Malformed("TRACK has no FILE".into()))?;
+            if !matches!(mode, CueTrackMode::Audio) && index_01.is_none() {
+                return Err(CueError::Malformed("data TRACK has no INDEX 01".into()));
+            }
+            tracks.push(CueTrack {
+                number,
+                mode,
+                path,
+                index_01,
+            });
+        }
+        Ok(())
+    };
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("REM") {
+            continue;
+        }
+        if line.len() >= 4 && line[..4].eq_ignore_ascii_case("FILE") {
+            finish(&mut current_file, &mut current_track, &mut tracks)?;
+            let rest = line[4..].trim_start();
+            let quoted = rest
+                .strip_prefix('"')
+                .and_then(|value| value.find('"').map(|end| &value[..end]))
+                .ok_or_else(|| CueError::Malformed("FILE line has no quoted filename".into()))?;
+            current_file = Some(resolve_safe_reference(quoted, base, &canonical_base)?);
+            continue;
+        }
+        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("TRACK") {
+            finish(&mut current_file, &mut current_track, &mut tracks)?;
+            let mut fields = line.split_whitespace();
+            let _ = fields.next();
+            let number = fields
+                .next()
+                .ok_or_else(|| CueError::Malformed("TRACK has no number".into()))?
+                .parse::<u32>()
+                .map_err(|_| CueError::Malformed("TRACK number is malformed".into()))?;
+            let mode = fields
+                .next()
+                .ok_or_else(|| CueError::Malformed("TRACK has no mode".into()))?;
+            let mode = match mode.to_ascii_uppercase().as_str() {
+                "MODE1/2048" => CueTrackMode::Data(CueDataTrackMode::Mode1_2048),
+                "MODE1/2352" => CueTrackMode::Data(CueDataTrackMode::Mode1_2352),
+                "MODE2/2352" => CueTrackMode::Data(CueDataTrackMode::Mode2_2352),
+                "AUDIO" => CueTrackMode::Audio,
+                unsupported => return Err(CueError::UnsupportedTrackMode(unsupported.into())),
+            };
+            current_track = Some((number, mode, None));
+            continue;
+        }
+        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("INDEX") {
+            let mut fields = line.split_whitespace();
+            let _ = fields.next();
+            if fields.next() == Some("01") {
+                let timestamp = fields
+                    .next()
+                    .ok_or_else(|| CueError::Malformed("INDEX 01 has no timestamp".into()))?;
+                if timestamp.split(':').count() != 3 {
+                    return Err(CueError::Malformed(
+                        "INDEX 01 timestamp is malformed".into(),
+                    ));
+                }
+                if let Some((_, _, index_01)) = current_track.as_mut() {
+                    *index_01 = Some(timestamp.to_string());
+                }
+            }
+        }
+    }
+    finish(&mut current_file, &mut current_track, &mut tracks)?;
+    if tracks.is_empty() {
+        return Err(CueError::NoFileReferences);
+    }
+    Ok(CueLayout {
+        cue_path: cue_path.to_path_buf(),
+        tracks,
     })
 }
 
@@ -211,97 +353,18 @@ pub fn resolve_cue_all_files_lenient(
 /// tracks, missing INDEX 01 declarations, unsafe references, and modes for
 /// which no verified logical-sector view exists.
 pub fn resolve_data_track(cue_path: &Path) -> Result<CueDataTrack, CueError> {
-    let metadata = std::fs::metadata(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
-    if metadata.len() > MAX_CUE_BYTES {
-        return Err(CueError::TooLarge);
-    }
-    let contents =
-        std::fs::read_to_string(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
-    let base = cue_path.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_base =
-        std::fs::canonicalize(base).map_err(|error| CueError::Io(error.to_string()))?;
-    let mut current_file: Option<PathBuf> = None;
-    let mut current_track: Option<CueDataTrackMode> = None;
-    let mut data_tracks = Vec::new();
-    let mut has_index_01 = false;
-
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with("REM") {
-            continue;
-        }
-        if line.len() >= 4 && line[..4].eq_ignore_ascii_case("FILE") {
-            if let Some(mode) = current_track.take() {
-                let file = current_file
-                    .take()
-                    .ok_or_else(|| CueError::Malformed("TRACK has no FILE".into()))?;
-                if !has_index_01 {
-                    return Err(CueError::Malformed("data TRACK has no INDEX 01".into()));
-                }
-                data_tracks.push(CueDataTrack { path: file, mode });
-            }
-            has_index_01 = false;
-            let rest = line[4..].trim_start();
-            let quoted = rest
-                .strip_prefix('"')
-                .and_then(|value| value.find('"').map(|end| &value[..end]))
-                .ok_or_else(|| CueError::Malformed("FILE line has no quoted filename".into()))?;
-            current_file = Some(resolve_safe_reference(quoted, base, &canonical_base)?);
-            continue;
-        }
-        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("TRACK") {
-            if let Some(mode) = current_track.take() {
-                let file = current_file
-                    .take()
-                    .ok_or_else(|| CueError::Malformed("TRACK has no FILE".into()))?;
-                if !has_index_01 {
-                    return Err(CueError::Malformed("data TRACK has no INDEX 01".into()));
-                }
-                data_tracks.push(CueDataTrack { path: file, mode });
-            }
-            has_index_01 = false;
-            let mut fields = line.split_whitespace();
-            let _track = fields.next();
-            let _number = fields
-                .next()
-                .ok_or_else(|| CueError::Malformed("TRACK line has no track number".into()))?;
-            let mode = fields
-                .next()
-                .ok_or_else(|| CueError::Malformed("TRACK line has no mode".into()))?;
-            current_track = match mode.to_ascii_uppercase().as_str() {
-                "MODE1/2048" => Some(CueDataTrackMode::Mode1_2048),
-                "MODE1/2352" => Some(CueDataTrackMode::Mode1_2352),
-                "MODE2/2352" => Some(CueDataTrackMode::Mode2_2352),
-                "AUDIO" => None,
-                unsupported => {
-                    return Err(CueError::UnsupportedTrackMode(unsupported.to_string()));
-                }
-            };
-            continue;
-        }
-        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("INDEX") {
-            let mut fields = line.split_whitespace();
-            let _index = fields.next();
-            if fields.next() == Some("01") {
-                let timestamp = fields
-                    .next()
-                    .ok_or_else(|| CueError::Malformed("INDEX 01 has no timestamp".into()))?;
-                if timestamp.split(':').count() != 3 {
-                    return Err(CueError::Malformed(
-                        "INDEX 01 timestamp is malformed".into(),
-                    ));
-                }
-                has_index_01 = true;
-            }
-        }
-    }
-    if let (Some(mode), Some(file)) = (current_track, current_file) {
-        if !has_index_01 {
-            return Err(CueError::Malformed("data TRACK has no INDEX 01".into()));
-        }
-        data_tracks.push(CueDataTrack { path: file, mode });
-    }
-    // Audio-only sheets have no identity-bearing filesystem track.
+    let layout = resolve_cue_layout(cue_path)?;
+    let data_tracks: Vec<_> = layout
+        .tracks
+        .iter()
+        .filter_map(|track| match track.mode {
+            CueTrackMode::Data(mode) => Some(CueDataTrack {
+                path: track.path.clone(),
+                mode,
+            }),
+            CueTrackMode::Audio => None,
+        })
+        .collect();
     if data_tracks.len() != 1 {
         return if data_tracks.is_empty() {
             Err(CueError::NoFileReferences)
@@ -309,7 +372,7 @@ pub fn resolve_data_track(cue_path: &Path) -> Result<CueDataTrack, CueError> {
             Err(CueError::AmbiguousDataTracks)
         };
     }
-    Ok(data_tracks.remove(0))
+    Ok(data_tracks.into_iter().next().expect("length checked"))
 }
 
 /// Extracts the quoted filename from a CUE `FILE "name.bin" BINARY` line.
@@ -376,6 +439,37 @@ mod tests {
         let track = resolve_data_track(&cue).unwrap();
         assert_eq!(track.mode, CueDataTrackMode::Mode1_2048);
         assert!(track.path.ends_with("data.bin"));
+    }
+
+    #[test]
+    fn structured_layout_classifies_only_a_single_mode1_2048_track() {
+        let cue = write_temp(
+            "layout.cue",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        std::fs::write(cue.with_file_name("data.bin"), vec![0_u8; 4096]).unwrap();
+        let layout = resolve_cue_layout(&cue).unwrap();
+        let track = layout.supported_single_mode1_2048().unwrap();
+        assert_eq!(layout.tracks.len(), 1);
+        assert_eq!(track.number, 1);
+        assert!(matches!(
+            track.mode,
+            CueTrackMode::Data(CueDataTrackMode::Mode1_2048)
+        ));
+    }
+
+    #[test]
+    fn structured_layout_retains_audio_and_refuses_the_narrow_slice() {
+        let cue = write_temp(
+            "audio-layout.cue",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+        );
+        std::fs::write(cue.with_file_name("data.bin"), vec![0_u8; 2048]).unwrap();
+        std::fs::write(cue.with_file_name("audio.bin"), vec![0_u8; 2352]).unwrap();
+        let layout = resolve_cue_layout(&cue).unwrap();
+        assert_eq!(layout.tracks.len(), 2);
+        assert!(matches!(layout.tracks[1].mode, CueTrackMode::Audio));
+        assert!(layout.supported_single_mode1_2048().is_err());
     }
 
     #[test]
