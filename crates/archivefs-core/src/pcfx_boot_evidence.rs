@@ -1,5 +1,4 @@
-//! Pure, read-only PC-FX boot-sector evidence: the two magic strings
-//! Mednafen itself checks to recognize a PC-FX disc.
+//! Pure, read-only PC-FX boot-sector and disc-hash evidence.
 //!
 //! # Format verified, not assumed
 //!
@@ -34,6 +33,7 @@
 //!   about, and shares no evidence value with, PC Engine CD detection.
 
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
+use md5::{Digest, Md5};
 
 pub const PCFX_PRIMARY_MAGIC: &[u8] = b"PC-FX:Hu_CD-ROM";
 pub const PCFX_SECONDARY_MAGIC: &[u8] = b"PPPPHHHHOOOOTTTTOOOO____CCCCDDDD";
@@ -42,6 +42,74 @@ const PCFX_SECONDARY_MAGIC_OFFSET: usize = 64;
 /// Bound on the sector prefix this module ever looks at - a real CD-ROM
 /// sector is 2048 bytes; this is exactly that, never more.
 pub const PCFX_BOOT_SECTOR_BYTES: usize = 2048;
+pub const PCFX_HASH_SECTOR0_BYTES: usize = 32;
+pub const PCFX_VOLUME_HEADER_BYTES: usize = 128;
+const PCFX_BOOT_SECTOR_OFFSET: usize = 32;
+const PCFX_BOOT_SECTOR_COUNT_OFFSET: usize = 36;
+/// Keep a malformed header from requesting an unreasonable boot-code read.
+pub const PCFX_MAX_BOOT_SECTORS: u32 = 32 * 1024;
+
+/// The header-directed part of the documented PC-FX disc identity hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcfxVolumeHeader {
+    pub boot_sector: u32,
+    pub boot_sector_count: u32,
+}
+
+/// Parses the 128-byte sector-1 volume header used by the PC-FX custom disc
+/// hash. The fields are little-endian, as documented by the
+/// RetroAchievements PC-FX identification algorithm.
+pub fn parse_pcfx_volume_header(bytes: &[u8]) -> Option<PcfxVolumeHeader> {
+    if bytes.len() < PCFX_VOLUME_HEADER_BYTES {
+        return None;
+    }
+    let boot_sector = u32::from_le_bytes(
+        bytes[PCFX_BOOT_SECTOR_OFFSET..PCFX_BOOT_SECTOR_OFFSET + 4]
+            .try_into()
+            .ok()?,
+    );
+    let boot_sector_count = u32::from_le_bytes(
+        bytes[PCFX_BOOT_SECTOR_COUNT_OFFSET..PCFX_BOOT_SECTOR_COUNT_OFFSET + 4]
+            .try_into()
+            .ok()?,
+    );
+    if boot_sector < 2 || boot_sector_count == 0 || boot_sector_count > PCFX_MAX_BOOT_SECTORS {
+        return None;
+    }
+    Some(PcfxVolumeHeader {
+        boot_sector,
+        boot_sector_count,
+    })
+}
+
+/// Computes the documented representation-independent PC-FX disc hash from
+/// already bounded logical-sector pieces. This is the same algorithm used by
+/// RetroAchievements' [game-identification documentation][ra]: 32 bytes from
+/// sector 0, the first 128 bytes of sector 1, then the header-directed boot
+/// sectors in order. It is an identity fingerprint, not a title lookup.
+///
+/// [ra]: https://docs.retroachievements.org/developer-docs/game-identification.html
+pub fn pcfx_disc_hash(sector_zero: &[u8], sector_one: &[u8], boot_code: &[u8]) -> Option<String> {
+    if sector_zero.len() < PCFX_HASH_SECTOR0_BYTES || sector_one.len() < PCFX_VOLUME_HEADER_BYTES {
+        return None;
+    }
+    let header = parse_pcfx_volume_header(sector_one)?;
+    let expected_boot_bytes = usize::try_from(header.boot_sector_count)
+        .ok()?
+        .checked_mul(PCFX_BOOT_SECTOR_BYTES)?;
+    if boot_code.len() != expected_boot_bytes {
+        return None;
+    }
+    let mut digest = Md5::new();
+    digest.update(&sector_zero[..PCFX_HASH_SECTOR0_BYTES]);
+    digest.update(&sector_one[..PCFX_VOLUME_HEADER_BYTES]);
+    digest.update(boot_code);
+    Some(hexadecimal(digest.finalize().as_slice()))
+}
+
+fn hexadecimal(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// What was observed about a PC-FX boot-sector candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,5 +273,51 @@ mod tests {
     fn repeated_observation_is_deterministic() {
         let fact = parse_pcfx_boot_sector(&sector_with_primary_magic());
         assert_eq!(observe_pcfx_evidence(&fact), observe_pcfx_evidence(&fact));
+    }
+
+    #[test]
+    fn volume_header_parses_bounded_little_endian_geometry() {
+        let mut sector = vec![0_u8; PCFX_VOLUME_HEADER_BYTES];
+        sector[PCFX_BOOT_SECTOR_OFFSET..PCFX_BOOT_SECTOR_OFFSET + 4]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        sector[PCFX_BOOT_SECTOR_COUNT_OFFSET..PCFX_BOOT_SECTOR_COUNT_OFFSET + 4]
+            .copy_from_slice(&3_u32.to_le_bytes());
+        assert_eq!(
+            parse_pcfx_volume_header(&sector),
+            Some(PcfxVolumeHeader {
+                boot_sector: 2,
+                boot_sector_count: 3,
+            })
+        );
+        assert!(parse_pcfx_volume_header(&sector[..PCFX_VOLUME_HEADER_BYTES - 1]).is_none());
+    }
+
+    #[test]
+    fn disc_hash_changes_when_any_hashed_component_changes() {
+        let sector_zero = sector_with_primary_magic();
+        let mut sector_one = vec![0_u8; PCFX_VOLUME_HEADER_BYTES];
+        sector_one[PCFX_BOOT_SECTOR_OFFSET..PCFX_BOOT_SECTOR_OFFSET + 4]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        sector_one[PCFX_BOOT_SECTOR_COUNT_OFFSET..PCFX_BOOT_SECTOR_COUNT_OFFSET + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        let boot = vec![0xA5_u8; PCFX_BOOT_SECTOR_BYTES];
+        let original = pcfx_disc_hash(&sector_zero, &sector_one, &boot).unwrap();
+        let mut changed_boot = boot.clone();
+        changed_boot[0] ^= 1;
+        assert_ne!(
+            original,
+            pcfx_disc_hash(&sector_zero, &sector_one, &changed_boot).unwrap()
+        );
+    }
+
+    #[test]
+    fn disc_hash_rejects_wrong_boot_length() {
+        let sector_zero = sector_with_primary_magic();
+        let mut sector_one = vec![0_u8; PCFX_VOLUME_HEADER_BYTES];
+        sector_one[PCFX_BOOT_SECTOR_OFFSET..PCFX_BOOT_SECTOR_OFFSET + 4]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        sector_one[PCFX_BOOT_SECTOR_COUNT_OFFSET..PCFX_BOOT_SECTOR_COUNT_OFFSET + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        assert!(pcfx_disc_hash(&sector_zero, &sector_one, &[0_u8; 1]).is_none());
     }
 }

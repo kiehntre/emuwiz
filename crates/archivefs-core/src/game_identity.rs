@@ -30,6 +30,10 @@ use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use crate::param_sfo::parse_param_sfo;
+use crate::pcfx_boot_evidence::{
+    PCFX_BOOT_SECTOR_BYTES, PCFX_VOLUME_HEADER_BYTES, parse_pcfx_boot_sector,
+    parse_pcfx_volume_header, pcfx_disc_hash,
+};
 use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
@@ -210,6 +214,9 @@ pub enum IdentityKind {
     /// volume identifier, root unique identifier, and declared block count.
     /// These are on-disc fields, not a filename or title-database lookup.
     ThreeDoDiscId,
+    /// The established PC-FX custom disc-identification hash. It is derived
+    /// from PC-FX sector/header/boot content, never from a filename.
+    PcfxDiscHash,
 }
 
 impl fmt::Display for IdentityKind {
@@ -237,6 +244,7 @@ impl fmt::Display for IdentityKind {
             Self::XexMediaId => "Xbox 360 Media ID",
             Self::ScummVmGameId => "ScummVM game ID",
             Self::ThreeDoDiscId => "3DO disc identity",
+            Self::PcfxDiscHash => "PC-FX disc hash",
         };
         f.write_str(value)
     }
@@ -275,6 +283,7 @@ pub enum IdentityPlatform {
     Xbox360,
     ScummVM,
     ThreeDo,
+    Pcfx,
     Other,
 }
 
@@ -309,6 +318,7 @@ impl IdentityPlatform {
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             "scummvm" | "scumm vm" => Self::ScummVM,
             "3do" | "panasonic 3do" | "3do interactive multiplayer" => Self::ThreeDo,
+            "pc-fx" | "pcfx" | "nec pc-fx" | "nec pcfx" => Self::Pcfx,
             _ => Self::Other,
         }
     }
@@ -335,6 +345,7 @@ impl IdentityPlatform {
             Self::Xbox360 => "Xbox 360",
             Self::ScummVM => "ScummVM",
             Self::ThreeDo => "3DO",
+            Self::Pcfx => "PC-FX",
             Self::Other => "Unsupported platform",
         }
     }
@@ -509,6 +520,10 @@ impl GameIdentityReport {
 
     pub fn verified_ps3_title_id(&self) -> Option<&str> {
         self.verified_value(IdentityKind::Ps3TitleId)
+    }
+
+    pub fn verified_pcfx_disc_hash(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::PcfxDiscHash)
     }
 
     pub fn verified_ps1_serial(&self) -> Option<&str> {
@@ -733,6 +748,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::Dreamcast
                     | IdentityPlatform::SegaCd
                     | IdentityPlatform::ThreeDo
+                    | IdentityPlatform::Pcfx
             ) =>
         {
             inspect_cue(&mut report, trusted);
@@ -1378,6 +1394,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
         | IdentityPlatform::ThreeDo
+        | IdentityPlatform::Pcfx
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -2418,6 +2435,7 @@ fn inspect_iso_source(
         IdentityPlatform::ThreeDo => {
             inspect_threedo_source(report, source, member_path, member_index)
         }
+        IdentityPlatform::Pcfx => inspect_pcfx_source(report, source, member_path, member_index),
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -2928,6 +2946,154 @@ fn inspect_threedo_source(
         member_index,
         "3DO Opera volume header identity",
         "volume identifier, root unique identifier, and block count read from validated OperaFS header",
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
+/// Authoritative PC-FX identity using the documented local disc hash:
+/// sector-0 signature bytes, sector-1 volume header, and the header-directed
+/// boot code. All reads are bounded and use the existing logical-media
+/// source; no filename or title database participates.
+fn inspect_pcfx_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut sector_zero = [0_u8; PCFX_BOOT_SECTOR_BYTES];
+    if let Err(error) = source.read_exact_at(0, &mut sector_zero) {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX sector-zero bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let boot_fact = parse_pcfx_boot_sector(&sector_zero);
+    if !boot_fact.any_magic_present() {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX boot signature validation",
+            "sector zero does not contain a reviewed PC-FX boot signature",
+        );
+        return;
+    }
+    let mut sector_one = [0_u8; PCFX_BOOT_SECTOR_BYTES];
+    if let Err(error) = source.read_exact_at(PCFX_BOOT_SECTOR_BYTES as u64, &mut sector_one) {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX sector-one bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(header) = parse_pcfx_volume_header(&sector_one[..PCFX_VOLUME_HEADER_BYTES]) else {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX volume header validation",
+            "sector one has no valid boot-sector/count geometry",
+        );
+        return;
+    };
+    let Some(boot_offset) = (header.boot_sector as u64).checked_mul(PCFX_BOOT_SECTOR_BYTES as u64)
+    else {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX boot offset arithmetic",
+            "boot-sector offset overflows",
+        );
+        return;
+    };
+    let boot_bytes = match usize::try_from(header.boot_sector_count)
+        .ok()
+        .and_then(|count| count.checked_mul(PCFX_BOOT_SECTOR_BYTES))
+    {
+        Some(bytes) => bytes,
+        None => {
+            push_with_source(
+                report,
+                IdentityKind::PcfxDiscHash,
+                IdentityStatus::Invalid,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "PC-FX boot length arithmetic",
+                "boot-code length overflows",
+            );
+            return;
+        }
+    };
+    let mut boot_code = vec![0_u8; boot_bytes];
+    if let Err(error) = source.read_exact_at(boot_offset, &mut boot_code) {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX boot-code bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(hash) = pcfx_disc_hash(&sector_zero, &sector_one, &boot_code) else {
+        push_with_source(
+            report,
+            IdentityKind::PcfxDiscHash,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC-FX disc hash construction",
+            "PC-FX identity hash inputs were incomplete",
+        );
+        return;
+    };
+    push_with_source(
+        report,
+        IdentityKind::PcfxDiscHash,
+        IdentityStatus::Verified,
+        Some(hash),
+        IdentityConfidence::ExactBytes,
+        member_path,
+        member_index,
+        "PC-FX documented custom disc hash",
+        "hash covers sector-zero signature bytes, the sector-one volume header, and header-directed boot sectors",
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -4835,6 +5001,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
         IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
         IdentityPlatform::ThreeDo => &[IdentityKind::ThreeDoDiscId],
+        IdentityPlatform::Pcfx => &[IdentityKind::PcfxDiscHash],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -5035,6 +5202,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::N64
         | IdentityPlatform::Xbox
         | IdentityPlatform::ScummVM
+        | IdentityPlatform::Pcfx
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Other => {}
     }
@@ -5097,6 +5265,7 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pcfx_boot_evidence::PCFX_PRIMARY_MAGIC;
     use crate::segacd_boot_evidence::{
         SEGA_CD_BOOT_SIGNATURE, SEGA_CD_PRODUCT_FIELD_BYTES, SEGA_CD_PRODUCT_FIELD_OFFSET,
     };
@@ -9090,6 +9259,105 @@ mod tests {
             Some("VOL10203040-ROOT50607080-BLOCKS00000001")
         );
         assert!(report.complete);
+    }
+
+    fn pcfx_fixture(boot_sector: u32, boot_sector_count: u32, seed: u8) -> Vec<u8> {
+        let end_sector = boot_sector
+            .checked_add(boot_sector_count)
+            .expect("synthetic fixture geometry must fit");
+        let mut image = vec![0_u8; end_sector as usize * PCFX_BOOT_SECTOR_BYTES];
+        image[..PCFX_PRIMARY_MAGIC.len()].copy_from_slice(PCFX_PRIMARY_MAGIC);
+        let volume = PCFX_BOOT_SECTOR_BYTES;
+        image[volume + 32..volume + 36].copy_from_slice(&boot_sector.to_le_bytes());
+        image[volume + 36..volume + 40].copy_from_slice(&boot_sector_count.to_le_bytes());
+        for (index, byte) in image[boot_sector as usize * PCFX_BOOT_SECTOR_BYTES..]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        image
+    }
+
+    #[test]
+    fn pcfx_disc_hash_verifies_from_disc_content_not_filename() {
+        let directory = FixtureDir::new("pcfx-identity");
+        let path = write_fixture(
+            &directory,
+            "misleading-title.iso",
+            &pcfx_fixture(2, 2, 0x31),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("PC-FX"));
+        assert_eq!(report.platform, IdentityPlatform::Pcfx);
+        assert_eq!(report.format, IdentityImageFormat::Iso);
+        assert!(report.verified_pcfx_disc_hash().is_some());
+        assert!(report.complete);
+        assert!(!report.evidence.iter().any(|evidence| {
+            evidence.kind == IdentityKind::PcfxDiscHash
+                && evidence.confidence == IdentityConfidence::FilenameOnly
+        }));
+    }
+
+    #[test]
+    fn pcfx_renamed_copy_has_the_same_verified_identity() {
+        let directory = FixtureDir::new("pcfx-renamed");
+        let bytes = pcfx_fixture(2, 1, 0x52);
+        let first = write_fixture(&directory, "first.iso", &bytes);
+        let second = write_fixture(&directory, "deliberately-wrong-name.iso", &bytes);
+        let first_report = inspect_catalogued_game_identity(&first, Some("NEC PC-FX"));
+        let second_report = inspect_catalogued_game_identity(&second, Some("PCFX"));
+        assert_eq!(
+            first_report.verified_pcfx_disc_hash(),
+            second_report.verified_pcfx_disc_hash()
+        );
+    }
+
+    #[test]
+    fn pcfx_mode1_2048_cue_supports_spaces_and_unicode_paths() {
+        let directory = FixtureDir::new("pcfx-cue-unicode");
+        let bin_name = "données with spaces.bin";
+        fs::write(directory.0.join(bin_name), pcfx_fixture(2, 1, 0x63)).unwrap();
+        let cue = write_fixture(
+            &directory,
+            "renamed-disc.cue",
+            format!("FILE \"{bin_name}\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n")
+                .as_bytes(),
+        );
+        let report = inspect_catalogued_game_identity(&cue, Some("PC-FX"));
+        assert!(report.verified_pcfx_disc_hash().is_some());
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn pcfx_invalid_or_unrelated_content_fails_closed() {
+        let directory = FixtureDir::new("pcfx-invalid");
+        let ordinary = write_fixture(&directory, "ordinary.iso", &[0_u8; 4096]);
+        assert_eq!(
+            inspect_catalogued_game_identity(&ordinary, Some("PC-FX")).verified_pcfx_disc_hash(),
+            None
+        );
+
+        let truncated = write_fixture(&directory, "truncated.iso", &[0_u8; 2048]);
+        assert_eq!(
+            inspect_catalogued_game_identity(&truncated, Some("PC-FX")).verified_pcfx_disc_hash(),
+            None
+        );
+
+        let valid = write_fixture(&directory, "valid.iso", &pcfx_fixture(2, 1, 0x74));
+        let wrong_platform = inspect_catalogued_game_identity(&valid, Some("PlayStation"));
+        assert_eq!(wrong_platform.verified_pcfx_disc_hash(), None);
+    }
+
+    #[test]
+    fn pcfx_missing_or_invalid_boot_geometry_fails_closed() {
+        let directory = FixtureDir::new("pcfx-bad-geometry");
+        let mut missing_count = pcfx_fixture(2, 1, 0x85);
+        missing_count[PCFX_BOOT_SECTOR_BYTES + 36..PCFX_BOOT_SECTOR_BYTES + 40]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        let path = write_fixture(&directory, "missing-count.iso", &missing_count);
+        let report = inspect_catalogued_game_identity(&path, Some("PC-FX"));
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
     }
 }
 

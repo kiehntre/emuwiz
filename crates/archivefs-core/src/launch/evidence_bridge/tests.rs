@@ -1003,3 +1003,31 @@ fn verified_threedo_disc_identity_resolves_to_3do_fact() {
         )]
     );
 }
+
+#[test]
+fn verified_pcfx_disc_hash_resolves_to_pcfx_fact() {
+    let value = "0123456789abcdef0123456789abcdef";
+    let source = report(
+        IdentityPlatform::Pcfx,
+        vec![evidence(
+            IdentityKind::PcfxDiscHash,
+            IdentityStatus::Verified,
+            Some(value),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PC-FX".to_string(),
+            game_key: value.to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::PcfxDiscHash(value.to_string())]
+    );
+}

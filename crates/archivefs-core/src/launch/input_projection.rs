@@ -93,6 +93,8 @@ pub enum VerifiedIdentityFact {
     ScummVmGameId(String),
     /// A verified structured 3DO Opera disc identity.
     ThreeDoDiscId(String),
+    /// A verified PC-FX custom disc hash from boot/volume/boot-code content.
+    PcfxDiscHash(String),
     /// A verified Atari ST title, matching
     /// [`crate::patch_manager::HatariSelectedGameRequest::verified_title`].
     AtariStTitle(String),
