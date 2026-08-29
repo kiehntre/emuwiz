@@ -2655,6 +2655,8 @@ fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
                 emulator_profiles: Gathered::NotLoaded("stale"),
                 xemu_readiness: Gathered::NotLoaded("stale"),
                 xenia_readiness: Gathered::NotLoaded("stale"),
+                ppsspp_readiness: Gathered::NotLoaded("stale"),
+                rpcs3_readiness: Gathered::NotLoaded("stale"),
                 managed_entries: Gathered::NotLoaded("stale"),
             },
         ))
@@ -2691,6 +2693,8 @@ fn a_current_doctor_run_completes_and_records_when_it_finished() {
                 emulator_profiles: Gathered::NotLoaded("not gathered"),
                 xemu_readiness: Gathered::NotLoaded("not gathered"),
                 xenia_readiness: Gathered::NotLoaded("not gathered"),
+                ppsspp_readiness: Gathered::NotLoaded("not gathered"),
+                rpcs3_readiness: Gathered::NotLoaded("not gathered"),
                 managed_entries: Gathered::NotLoaded("not gathered"),
             },
         ))

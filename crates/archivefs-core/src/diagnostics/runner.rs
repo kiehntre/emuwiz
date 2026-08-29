@@ -35,9 +35,10 @@ use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
 use super::profiles::{
-    ProfileAssessmentReport, XemuReadinessAssessment, XeniaReadinessAssessment,
-    findings_from_emulator_profiles, findings_from_xemu_readiness, findings_from_xenia_readiness,
-    not_checked_from_emulator_profiles,
+    PpssppReadinessAssessment, ProfileAssessmentReport, Rpcs3ReadinessAssessment,
+    XemuReadinessAssessment, XeniaReadinessAssessment, findings_from_emulator_profiles,
+    findings_from_ppsspp_readiness, findings_from_rpcs3_readiness, findings_from_xemu_readiness,
+    findings_from_xenia_readiness, not_checked_from_emulator_profiles,
 };
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
 use super::{
@@ -132,6 +133,10 @@ pub struct DoctorScanInputs<'a> {
     pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
     /// From `profiles::assess_xenia_readiness`.
     pub xenia_readiness: Gathered<&'a [XeniaReadinessAssessment]>,
+    /// From `profiles::assess_ppsspp_readiness`.
+    pub ppsspp_readiness: Gathered<&'a [PpssppReadinessAssessment]>,
+    /// From `profiles::assess_rpcs3_readiness`.
+    pub rpcs3_readiness: Gathered<&'a [Rpcs3ReadinessAssessment]>,
     /// From `managed::scan_managed_entries`.
     pub managed_entries: Gathered<&'a ManagedEntryScan>,
     /// The free-space thresholds to apply. Not a `Gathered`: policy is always
@@ -169,6 +174,12 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             xenia_readiness: Gathered::NotLoaded(
                 "Xenia launch readiness has not been checked in this session.",
+            ),
+            ppsspp_readiness: Gathered::NotLoaded(
+                "PPSSPP launch readiness has not been checked in this session.",
+            ),
+            rpcs3_readiness: Gathered::NotLoaded(
+                "RPCS3 launch readiness has not been checked in this session.",
             ),
             managed_entries: Gathered::NotLoaded(
                 "EmuWiz-managed cheat entries have not been scanned yet.",
@@ -496,6 +507,18 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::EmulatorProfiles,
         DoctorSubsystem::EmulatorReadiness,
         |assessments: &&[XeniaReadinessAssessment]| findings_from_xenia_readiness(assessments)
+    );
+    subsystem!(
+        inputs.ppsspp_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[PpssppReadinessAssessment]| findings_from_ppsspp_readiness(assessments)
+    );
+    subsystem!(
+        inputs.rpcs3_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |assessments: &&[Rpcs3ReadinessAssessment]| findings_from_rpcs3_readiness(assessments)
     );
     subsystem!(
         inputs.managed_entries,

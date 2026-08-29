@@ -21,8 +21,10 @@ use archivefs_core::diagnostics::environment::{
 };
 use archivefs_core::diagnostics::managed::{ManagedEntryScan, scan_managed_entries};
 use archivefs_core::diagnostics::profiles::{
-    DiscoveredProfiles, ProfileAssessmentReport, XemuReadinessAssessment, XeniaReadinessAssessment,
-    assess_emulator_profiles, assess_xemu_readiness, assess_xenia_readiness, managed_scan_targets,
+    DiscoveredProfiles, PpssppReadinessAssessment, ProfileAssessmentReport,
+    Rpcs3ReadinessAssessment, XemuReadinessAssessment, XeniaReadinessAssessment,
+    assess_emulator_profiles, assess_ppsspp_readiness, assess_rpcs3_readiness,
+    assess_xemu_readiness, assess_xenia_readiness, managed_scan_targets,
     profile_destination_directories,
 };
 use archivefs_core::diagnostics::repair::{
@@ -1811,6 +1813,8 @@ struct DoctorGathered {
     emulator_profiles: Gathered<ProfileAssessmentReport>,
     xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,
     xenia_readiness: Gathered<Vec<XeniaReadinessAssessment>>,
+    ppsspp_readiness: Gathered<Vec<PpssppReadinessAssessment>>,
+    rpcs3_readiness: Gathered<Vec<Rpcs3ReadinessAssessment>>,
     managed_entries: Gathered<ManagedEntryScan>,
 }
 
@@ -2059,6 +2063,14 @@ fn gather_doctor_inputs() -> DoctorGathered {
         Err(error) => Gathered::Failed(error.clone()),
     };
     let xenia_readiness = Gathered::Ready(assess_xenia_readiness(discovered.xenia.as_ref()));
+    let ppsspp_readiness = match &discovered.ppsspp {
+        Ok(discovery) => Gathered::Ready(assess_ppsspp_readiness(Some(discovery))),
+        Err(error) => Gathered::Failed(error.clone()),
+    };
+    let rpcs3_readiness = match &discovered.rpcs3 {
+        Ok(discovery) => Gathered::Ready(assess_rpcs3_readiness(Some(discovery))),
+        Err(error) => Gathered::Failed(error.clone()),
+    };
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -2108,6 +2120,8 @@ fn gather_doctor_inputs() -> DoctorGathered {
         emulator_profiles: Gathered::Ready(profile_report),
         xemu_readiness,
         xenia_readiness,
+        ppsspp_readiness,
+        rpcs3_readiness,
         managed_entries: match &transactions {
             Gathered::Ready(history) => {
                 Gathered::Ready(scan_managed_entries(history, &managed_targets))
@@ -5379,6 +5393,12 @@ impl ArchiveFsApp {
                             xenia_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            ppsspp_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            rpcs3_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             managed_entries: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -5446,6 +5466,8 @@ impl ArchiveFsApp {
             emulator_profiles: borrowed(&gathered.emulator_profiles, |value| value),
             xemu_readiness: borrowed(&gathered.xemu_readiness, |value| value.as_slice()),
             xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
+            ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),
+            rpcs3_readiness: borrowed(&gathered.rpcs3_readiness, |value| value.as_slice()),
             managed_entries: borrowed(&gathered.managed_entries, |value| value),
             free_space_policy: FreeSpacePolicy::default(),
         };
