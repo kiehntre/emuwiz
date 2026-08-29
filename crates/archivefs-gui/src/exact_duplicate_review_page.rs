@@ -65,6 +65,10 @@ use archivefs_core::repair::{
     N64EquivalentScanReport, apply_n64_equivalent_group, rollback_n64_equivalent_group,
     scan_n64_equivalent_duplicates,
 };
+use archivefs_core::repair::{
+    OpticalEquivalentScanReport, apply_optical_equivalent_group, rollback_optical_equivalent_group,
+    scan_optical_equivalent_duplicates,
+};
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
@@ -84,6 +88,7 @@ pub(crate) enum DuplicateReviewMode {
     #[default]
     Exact,
     EquivalentN64,
+    EquivalentOptical,
 }
 
 /// The running background scan job, mirroring the same one-shot
@@ -121,6 +126,7 @@ pub(crate) struct ExactDuplicateReviewPageState {
 
     report: Option<ExactDuplicateScanReport>,
     equivalent_report: Option<N64EquivalentScanReport>,
+    optical_report: Option<OpticalEquivalentScanReport>,
     mode: DuplicateReviewMode,
     /// group index -> the path a person picked to keep, for a group whose
     /// own recommendation is `RequiresUserChoice`. Cleared on every new
@@ -163,6 +169,7 @@ impl Default for ExactDuplicateReviewPageState {
             scan_status: None,
             report: None,
             equivalent_report: None,
+            optical_report: None,
             mode: DuplicateReviewMode::Exact,
             manual_choice: BTreeMap::new(),
             expanded_group: None,
@@ -252,6 +259,11 @@ impl ExactDuplicateReviewPageState {
         self.mode = DuplicateReviewMode::EquivalentN64;
     }
 
+    #[cfg(test)]
+    pub(crate) fn select_optical_mode(&mut self) {
+        self.mode = DuplicateReviewMode::EquivalentOptical;
+    }
+
     pub(crate) fn scan_status(&self) -> Option<&ScanStatus> {
         self.scan_status.as_ref()
     }
@@ -274,6 +286,10 @@ impl ExactDuplicateReviewPageState {
     pub(crate) fn scan(&mut self) {
         if self.mode == DuplicateReviewMode::EquivalentN64 {
             self.scan_equivalent();
+            return;
+        }
+        if self.mode == DuplicateReviewMode::EquivalentOptical {
+            self.scan_optical();
             return;
         }
         self.error = None;
@@ -377,6 +393,31 @@ impl ExactDuplicateReviewPageState {
         self.trust_scope_dirs = vec![source.clone()];
         let trusted = TrustedRoots::from_paths(vec![source]);
         self.equivalent_report = Some(scan_n64_equivalent_duplicates(&candidates, &trusted, None));
+        self.scan_status = Some(ScanStatus::Completed);
+    }
+
+    fn scan_optical(&mut self) {
+        self.error = None;
+        self.apply_error = None;
+        self.rollback_error = None;
+        self.report = None;
+        self.equivalent_report = None;
+        self.optical_report = None;
+        self.applied = None;
+        self.applied_equivalent = false;
+        let source = PathBuf::from(self.source_root_draft.trim());
+        if !source.is_dir() {
+            self.error = Some("choose a source folder first".to_string());
+            return;
+        }
+        let candidates = collect_regular_files(&source);
+        self.trust_scope_dirs = vec![source.clone()];
+        let trusted = TrustedRoots::from_paths(vec![source]);
+        self.optical_report = Some(scan_optical_equivalent_duplicates(
+            &candidates,
+            &trusted,
+            None,
+        ));
         self.scan_status = Some(ScanStatus::Completed);
     }
 
@@ -495,6 +536,26 @@ impl ExactDuplicateReviewPageState {
             });
             return;
         }
+        if self.mode == DuplicateReviewMode::EquivalentOptical {
+            let Some(group) = self
+                .optical_report
+                .as_ref()
+                .and_then(|report| report.groups.get(group_index))
+            else {
+                return;
+            };
+            if group.quarantine_candidates.is_empty() || self.applied_equivalent {
+                return;
+            }
+            self.apply_error = None;
+            self.apply_confirm = Some(ApplyConfirmation {
+                group_index,
+                retained_path: group.preferred.clone(),
+                redundant_count: group.quarantine_candidates.len(),
+                reclaimable_bytes: group.projected_savings,
+            });
+            return;
+        }
         let Some(group) = self.effective_group(group_index) else {
             return;
         };
@@ -544,6 +605,34 @@ impl ExactDuplicateReviewPageState {
             let trusted = TrustedRoots::from_paths(self.trust_scope_dirs.clone());
             let cancel = AtomicBool::new(false);
             match apply_n64_equivalent_group(
+                &group,
+                trusted_root,
+                trusted,
+                &self.journal_dir,
+                &cancel,
+            ) {
+                Ok(result) => {
+                    self.applied = Some(result.transaction);
+                    self.applied_equivalent = true;
+                    self.apply_error = None;
+                }
+                Err(error) => self.apply_error = Some(format!("Nothing was moved: {error}")),
+            }
+            return;
+        }
+        if self.mode == DuplicateReviewMode::EquivalentOptical {
+            let Some(group) = self
+                .optical_report
+                .as_ref()
+                .and_then(|report| report.groups.get(confirmation.group_index))
+                .cloned()
+            else {
+                self.apply_error = Some("this optical group is no longer available".to_string());
+                return;
+            };
+            let trusted = TrustedRoots::from_paths(self.trust_scope_dirs.clone());
+            let cancel = AtomicBool::new(false);
+            match apply_optical_equivalent_group(
                 &group,
                 trusted_root,
                 trusted,
@@ -658,7 +747,12 @@ impl ExactDuplicateReviewPageState {
         };
         let cancel = AtomicBool::new(false);
         if self.applied_equivalent {
-            match rollback_n64_equivalent_group(&mut transaction, &self.journal_dir, &cancel) {
+            let result = if self.mode == DuplicateReviewMode::EquivalentOptical {
+                rollback_optical_equivalent_group(&mut transaction, &self.journal_dir, &cancel)
+            } else {
+                rollback_n64_equivalent_group(&mut transaction, &self.journal_dir, &cancel)
+            };
+            match result {
                 Ok(_) => {
                     self.rollback_error = None;
                     self.applied_equivalent = false;
@@ -779,6 +873,17 @@ pub(crate) fn show_exact_duplicate_review_page(
         for index in 0..group_count {
             show_equivalent_group(ui, state, index);
         }
+    } else if state.mode == DuplicateReviewMode::EquivalentOptical {
+        let group_count = state
+            .optical_report
+            .as_ref()
+            .map_or(0, |report| report.groups.len());
+        if group_count == 0 && state.scan_status == Some(ScanStatus::Completed) {
+            ui.label("No equivalent supported CUE/BIN and CHD discs found.");
+        }
+        for index in 0..group_count {
+            show_optical_group(ui, state, index);
+        }
     } else {
         let group_count = state.report.as_ref().map_or(0, |r| r.groups.len());
         for index in 0..group_count {
@@ -890,10 +995,25 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
                 state.mode = DuplicateReviewMode::EquivalentN64;
                 state.report = None;
                 state.equivalent_report = None;
+                state.optical_report = None;
+            }
+            if ui
+                .selectable_label(
+                    state.mode == DuplicateReviewMode::EquivalentOptical,
+                    "Equivalent content (optical disc)",
+                )
+                .clicked()
+            {
+                state.mode = DuplicateReviewMode::EquivalentOptical;
+                state.report = None;
+                state.equivalent_report = None;
+                state.optical_report = None;
             }
         });
         if state.mode == DuplicateReviewMode::EquivalentN64 {
             ui.label("Find .z64, .v64 and .n64 files with different bytes but the same canonical N64 content.");
+        } else if state.mode == DuplicateReviewMode::EquivalentOptical {
+            ui.label("Find supported CUE/BIN and CHD discs whose optical fingerprints match. Only one MODE1/2048 data track is supported.");
         } else {
             ui.label("Choose a folder to scan for files that are byte-for-byte identical.");
         }
@@ -1141,6 +1261,54 @@ fn show_equivalent_group(
         widgets::technical_details(ui, ("n64_equivalent_group", index), |ui| {
             ui.label("Physical hashes differ; canonical hashes match after the existing N64 byte-order normalization.");
             ui.label("Supported only for N64 .z64/.v64/.n64 representations in this review.");
+        });
+    });
+}
+
+fn show_optical_group(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState, index: usize) {
+    let Some(report) = state.optical_report.as_ref() else {
+        return;
+    };
+    let Some(group) = report.groups.get(index) else {
+        return;
+    };
+    let group = group.clone();
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Equivalent optical content").strong());
+        ui.label(format!(
+            "CUE/BIN ↔ CHD · {} track · {} sectors · {} reclaimable",
+            group.structure.track_count,
+            group.structure.logical_sector_count,
+            format_bytes(group.projected_savings)
+        ));
+        ui.label(format!("Canonical SHA-256: {}", group.canonical_sha256));
+        ui.label(format!(
+            "Preferred representation: {}",
+            group.preferred.display()
+        ));
+        ui.label("The CUE and referenced BIN are one logical representation and are quarantined together.");
+        for file in group.cue_bin.files.iter().chain(group.chd.files.iter()) {
+            ui.label(format!(
+                "{} · {} bytes · physical SHA-256 {}",
+                file.path.display(),
+                file.size_bytes,
+                file.physical_sha256
+            ));
+        }
+        if !state.applied_equivalent
+            && widgets::action_button(
+                ui,
+                "Move redundant optical representation to quarantine",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+        {
+            state.open_apply_confirmation(index);
+        }
+        widgets::technical_details(ui, ("optical_equivalent_group", index), |ui| {
+            ui.label("Equivalence requires matching optical structure and canonical cooked-sector SHA-256.");
+            ui.label("Supported only for one-track MODE1/2048 CUE/BIN and one-track zero-pregap MODE1_RAW CHD.");
         });
     });
 }

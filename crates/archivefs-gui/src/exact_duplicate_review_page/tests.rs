@@ -39,7 +39,10 @@ fn base_state(fixture: &Fixture) -> ExactDuplicateReviewPageState {
 /// that never finishes) fails the test instead of hanging the suite.
 fn run_scan_to_completion(state: &mut ExactDuplicateReviewPageState) {
     state.scan();
-    if state.mode == DuplicateReviewMode::EquivalentN64 {
+    if matches!(
+        state.mode,
+        DuplicateReviewMode::EquivalentN64 | DuplicateReviewMode::EquivalentOptical
+    ) {
         return;
     }
     for _ in 0..2000 {
@@ -666,6 +669,24 @@ fn equivalent_mode_empty_state_is_explicit() {
     assert!(rendered_text_contains(
         &output,
         "No equivalent N64 representations found"
+    ));
+}
+
+#[test]
+fn optical_equivalent_mode_is_reachable_and_has_explicit_empty_state() {
+    let fixture = Fixture::new();
+    let source = fixture.path("optical source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("not-a-disc.chd"), b"not a chd").unwrap();
+    let mut state = base_state(&fixture);
+    state.source_root_draft = source.display().to_string();
+    state.select_optical_mode();
+    assert_eq!(state.mode(), DuplicateReviewMode::EquivalentOptical);
+    run_scan_to_completion(&mut state);
+    let output = render(&egui::Context::default(), &mut state, base_input());
+    assert!(rendered_text_contains(
+        &output,
+        "No equivalent supported CUE/BIN and CHD discs found"
     ));
 }
 
