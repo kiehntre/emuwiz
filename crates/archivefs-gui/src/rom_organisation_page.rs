@@ -559,12 +559,11 @@ impl RomOrganisationPageState {
 
         // Ensure the parent directory exists (data dir may not exist yet
         // on a fresh install).
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                self.approval_persistence_warning =
-                    Some(format!("cannot create data directory: {e}"));
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.approval_persistence_warning = Some(format!("cannot create data directory: {e}"));
+            return;
         }
 
         let payload = PersistedApprovals {
@@ -1546,8 +1545,10 @@ mod tests {
 
     #[test]
     fn a_pending_preview_resolves_to_an_error_when_no_master_root_is_configured() {
-        let mut state = RomOrganisationPageState::default();
-        state.pending_preview = true;
+        let mut state = RomOrganisationPageState {
+            pending_preview: true,
+            ..Default::default()
+        };
         assert!(state.saved_master_root.is_none());
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1782,8 +1783,10 @@ mod tests {
 
     #[test]
     fn approval_persistence_warning_is_rendered_in_the_ui() {
-        let mut state = RomOrganisationPageState::default();
-        state.approval_persistence_warning = Some("test persistence failure".to_string());
+        let mut state = RomOrganisationPageState {
+            approval_persistence_warning: Some("test persistence failure".to_string()),
+            ..Default::default()
+        };
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1890,9 +1893,11 @@ mod tests {
 
     #[test]
     fn linked_library_mode_uses_the_explicit_library_root_not_the_master_root() {
-        let mut state = RomOrganisationPageState::default();
         // Set directly (no config write): the master root stays session-only.
-        state.saved_master_root = Some(PathBuf::from("/master/roms"));
+        let mut state = RomOrganisationPageState {
+            saved_master_root: Some(PathBuf::from("/master/roms")),
+            ..Default::default()
+        };
         assert_eq!(state.effective_root(), Some(PathBuf::from("/master/roms")));
 
         state.set_mode(OrganisationMode::BuildLinkedLibrary);
@@ -1958,8 +1963,10 @@ mod tests {
 
     #[test]
     fn a_linked_library_plan_renders_source_destination_and_untouched_wording() {
-        let mut state = RomOrganisationPageState::default();
-        state.mode = OrganisationMode::BuildLinkedLibrary;
+        let mut state = RomOrganisationPageState {
+            mode: OrganisationMode::BuildLinkedLibrary,
+            ..Default::default()
+        };
         let library_root = test_root("linked-lib-preview").join("library");
         state.saved_library_root = Some(library_root.clone());
         state.plan_generation = 1;

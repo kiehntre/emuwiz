@@ -1281,17 +1281,16 @@ fn show_romm_projection_summary(
             )
             .color(theme::muted(ui)),
         );
-        if state.romm_projection.is_none() {
-            if widgets::action_button(
+        if state.romm_projection.is_none()
+            && widgets::action_button(
                 ui,
                 "Preview RomM Library",
                 widgets::ActionStyle::Secondary,
                 true,
             )
             .clicked()
-            {
-                *action = Some(PlayingLibraryPageAction::PreviewRomm);
-            }
+        {
+            *action = Some(PlayingLibraryPageAction::PreviewRomm);
         }
         if let Some(error) = &state.romm_error {
             ui.label(egui::RichText::new(error).color(theme::WARNING));

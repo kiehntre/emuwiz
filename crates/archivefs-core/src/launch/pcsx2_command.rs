@@ -25,8 +25,8 @@
 //! slice, [`crate::patch_manager::resolve_pcsx2_native_launch_binding`]
 //! never actually returns [`Pcsx2UserDirectoryMode::ExplicitDataPath`] (see
 //! that type's own doc comment for why), so in practice every produced
-//! command uses the first form. This planner never invents the mode itself
-//! - it only ever renders whatever the binding it was handed already
+//! command uses the first form. This planner never invents the mode itself -
+//! it only ever renders whatever the binding it was handed already
 //! proved.
 //!
 //! Every argument is carried as its own `OsString` - spaces, quotes, and

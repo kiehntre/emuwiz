@@ -14,6 +14,7 @@
 //! Predominant theme observed in this slice: Cheats & Mods navigation, GameCube/Dolphin/PCSX2 gamehacking flows.
 
 use super::*;
+use archivefs_core::patch_manager::SharedPreviewEntry;
 
 #[test]
 fn gamecube_cancel_notice_is_distinct_from_success_and_failure() {

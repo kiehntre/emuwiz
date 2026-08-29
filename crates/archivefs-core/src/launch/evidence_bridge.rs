@@ -65,8 +65,8 @@ use crate::{ArchiveKind, ArchiveRecord, MountState};
 /// facts - as opposed to display/format metadata that happens to also carry
 /// [`IdentityStatus::Verified`] (see [`IdentityKind::LooseRomTitle`]'s own
 /// doc comment: "not content identity"). Only kinds in this list can ever
-/// contribute to [`ResolvedIdentity::game_key`] or a [`VerifiedIdentityFact`]
-/// - this is the one place that distinction is made, so nothing downstream
+/// contribute to [`ResolvedIdentity::game_key`] or a [`VerifiedIdentityFact`] -
+/// this is the one place that distinction is made, so nothing downstream
 /// has to re-derive it.
 fn is_identity_conferring(kind: IdentityKind) -> bool {
     matches!(
@@ -340,8 +340,8 @@ fn resolved_identity_for_platform(
     }
 }
 
-/// Converts `report` - the existing authoritative per-file identity report
-/// - into the [`CanonicalIdentityStatus`]/[`VerifiedIdentityFact`] shapes
+/// Converts `report` - the existing authoritative per-file identity report -
+/// into the [`CanonicalIdentityStatus`]/[`VerifiedIdentityFact`] shapes
 /// [`crate::launch::planning::build_launch_plan`] and
 /// [`crate::launch::input_projection`] already require.
 ///

@@ -163,7 +163,7 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
     if let Some(working_directory) = &command.working_directory {
         process.current_dir(working_directory);
     }
-    let mut child: Child = process.spawn()?;
+    let mut child: Child = spawn_child(&mut process)?;
     let pid = child.id();
     let stderr = child.stderr.take();
 
@@ -182,6 +182,46 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
         receiver,
         exit_report: None,
     })
+}
+
+/// Production spawn: exactly one `Command::spawn`, no retry, no other
+/// behaviour. This is the only spawn path any shipped binary ever compiles.
+#[cfg(not(test))]
+#[inline]
+fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
+    command.spawn()
+}
+
+/// Test-build-only spawn: identical to the production path except it retries
+/// a handful of times, with a short back-off, on Linux `ETXTBSY` ("Text
+/// file busy").
+///
+/// This exists purely for this crate's own `launch::*_execution` unit
+/// tests. Each of those writes a tiny fake executable script into a
+/// temporary fixture directory and then immediately spawns it; under the
+/// full `cargo test` suite at high parallelism, another test thread's
+/// `fork`/`posix_spawn` can transiently hold a dup'd write descriptor to a
+/// *sibling* freshly-written script at the instant this thread `execve`s
+/// its own, which the kernel reports as `ETXTBSY`. It is always transient -
+/// the descriptor is `O_CLOEXEC` and closes as soon as that other child
+/// finishes its own `execve` - so a bounded retry clears it. `#[cfg(test)]`
+/// keeps this entirely out of every non-test build: production launch
+/// behaviour is byte-for-byte the `#[cfg(not(test))]` function above.
+#[cfg(test)]
+fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
+    const MAX_ATTEMPTS: u32 = 10;
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if attempt + 1 < MAX_ATTEMPTS && error.raw_os_error() == Some(libc::ETXTBSY) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5 * u64::from(attempt)));
+            }
+            result => return result,
+        }
+    }
 }
 
 pub fn read_bounded_stderr(mut stderr: impl Read) -> Vec<u8> {

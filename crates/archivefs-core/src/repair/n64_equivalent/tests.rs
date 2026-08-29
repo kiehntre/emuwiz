@@ -111,7 +111,8 @@ fn unrelated_files_are_excluded_without_filename_authority() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("looks-like.n64");
     std::fs::write(&path, b"ordinary content").unwrap();
-    let report = scan_n64_equivalent_duplicates(&[path.clone()], &roots(dir.path()), None);
+    let report =
+        scan_n64_equivalent_duplicates(std::slice::from_ref(&path), &roots(dir.path()), None);
     assert!(report.groups.is_empty());
     assert_eq!(report.excluded.len(), 1);
 }

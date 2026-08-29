@@ -1155,10 +1155,7 @@ pub fn assess_xemu_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding
-                    .as_ref()
-                    .err()
-                    .map(|blocker| xemu_binding_problem(blocker)),
+                binding_problem: binding.as_ref().err().map(xemu_binding_problem),
                 mcpx: health.mcpx,
                 flash_bios: health.flash_bios,
                 eeprom: health.eeprom,
@@ -1359,10 +1356,7 @@ pub fn assess_xenia_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding
-                    .as_ref()
-                    .err()
-                    .map(|blocker| xenia_binding_problem(blocker)),
+                binding_problem: binding.as_ref().err().map(xenia_binding_problem),
                 windows_exe_present: profile.configuration_path.join("xenia_canary.exe").exists(),
             }
         })
@@ -1537,10 +1531,7 @@ pub fn assess_ppsspp_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding
-                    .as_ref()
-                    .err()
-                    .map(|blocker| ppsspp_binding_problem(blocker)),
+                binding_problem: binding.as_ref().err().map(ppsspp_binding_problem),
             }
         })
         .collect()
@@ -1697,10 +1688,7 @@ pub fn assess_rpcs3_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding
-                    .as_ref()
-                    .err()
-                    .map(|blocker| rpcs3_binding_problem(blocker)),
+                binding_problem: binding.as_ref().err().map(rpcs3_binding_problem),
                 firmware: rpcs3_firmware_readiness(&health.firmware),
             }
         })
@@ -2659,9 +2647,9 @@ mod tests {
         fs::write(duck_root.join("settings.ini"), "").expect("fixture");
 
         let roots = roots_for_ppsspp_and_duckstation(
-            &tree.path().to_path_buf(),
-            &[ppsspp_root.clone()],
-            &[duck_root.clone()],
+            tree.path(),
+            std::slice::from_ref(&ppsspp_root),
+            std::slice::from_ref(&duck_root),
         );
         let ppsspp = discover_ppsspp_profiles(&roots.ppsspp);
         let duckstation = discover_duckstation_profiles(&roots.duckstation);
@@ -2717,7 +2705,7 @@ mod tests {
     /// caller-supplied base directory and separate explicit configuration
     /// roots for each adapter. It never touches `HOME`/`XDG`.
     fn roots_for_ppsspp_and_duckstation(
-        base: &PathBuf,
+        base: &Path,
         ppsspp_explicit: &[PathBuf],
         duckstation_explicit: &[PathBuf],
     ) -> PpssppDuckstationRoots {
@@ -3130,7 +3118,7 @@ mod tests {
         let ppsspp_root = tree.path().join("ppsspp");
         fs::create_dir_all(ppsspp_root.join("PSP/SYSTEM")).unwrap();
         fs::write(ppsspp_root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
-        let roots = roots_for_ppsspp_and_duckstation(&tree.path().to_path_buf(), &[], &[]);
+        let roots = roots_for_ppsspp_and_duckstation(tree.path(), &[], &[]);
         let discovery = discover_ppsspp_profiles(&PpssppProfileDiscoveryRoots {
             explicit_configuration_roots: vec![ppsspp_root.clone()],
             ..roots.ppsspp
@@ -3197,7 +3185,7 @@ mod tests {
         // firmware measurement exists, and the explanation never claims one
         // is needed (it may only ever say the opposite - that none is
         // required).
-        assert!(finding.measurements.get("firmware").is_none());
+        assert!(!finding.measurements.contains_key("firmware"));
         assert!(
             !finding
                 .explanation
@@ -3555,7 +3543,7 @@ mod tests {
         let duckstation_root = tree.path().join("duckstation");
         fs::create_dir_all(&duckstation_root).unwrap();
         fs::write(duckstation_root.join("settings.ini"), b"[Main]\n").unwrap();
-        let roots = roots_for_ppsspp_and_duckstation(&tree.path().to_path_buf(), &[], &[]);
+        let roots = roots_for_ppsspp_and_duckstation(tree.path(), &[], &[]);
         let discovery = discover_duckstation_profiles(&DuckStationProfileDiscoveryRoots {
             explicit_configuration_roots: vec![duckstation_root.clone()],
             ..roots.duckstation

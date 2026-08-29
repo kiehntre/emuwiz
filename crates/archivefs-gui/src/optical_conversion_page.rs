@@ -168,10 +168,10 @@ pub(crate) fn show_optical_conversion_page(
     ui.horizontal(|ui| {
         ui.label("Source folder:");
         ui.text_edit_singleline(&mut state.source_root_draft);
-        if ui.button("Choose folder").clicked() {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                state.source_root_draft = path.display().to_string();
-            }
+        if ui.button("Choose folder").clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            state.source_root_draft = path.display().to_string();
         }
         if ui.button("Scan").clicked() {
             state.scan();

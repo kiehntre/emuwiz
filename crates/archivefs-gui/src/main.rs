@@ -90,11 +90,11 @@ use archivefs_core::patch_manager::{
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
-    SharedPreviewEntry, SharedPreviewError, SharedPreviewReport, SharedPreviewRequest,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, StagedCheatFile, StagedDolphinIni, StagedGameCubeCheat,
-    StagedGameCubeIni, StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, WiiCodeFormat, WiiGameIdentity,
-    XeniaCandidate, XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
+    SharedPreviewError, SharedPreviewReport, SharedPreviewRequest, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPlan,
+    StagedCheatFile, StagedDolphinIni, StagedGameCubeCheat, StagedGameCubeIni,
+    StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, WiiCodeFormat, WiiGameIdentity, XeniaCandidate,
+    XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
     XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
     XeniaProfileDiscoveryRoots, adapter_write_support, bsfree_gamecube_load_confirmed,
     bsfree_gamecube_search, bsfree_wii_load_confirmed, bsfree_wii_search,
@@ -157,6 +157,10 @@ pub(crate) mod doctor_page;
 // `main.rs`. Re-exporting here keeps every one of those call sites correct
 // without rewriting them, and costs nothing extra: `doctor_page` itself
 // still calls its own items unqualified regardless of this re-export.
+// `#[allow(unused_imports)]`: production `main.rs` code always qualifies as
+// `doctor_page::...`, so the glob only pays off in the `#[cfg(test)]` test
+// tree, which clippy's `unused_imports` pass does not credit here.
+#[allow(unused_imports)]
 use doctor_page::*;
 pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
@@ -200,8 +204,8 @@ use administration_pages::*;
 use sources_page::*;
 
 use archivefs_core::{
-    ArchiveFsError, ArchiveHealthInput, ArchiveKind, ArchiveMountSession, ArchivePresence,
-    ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
+    ArchiveFsError, ArchiveHealthInput, ArchiveMountSession, ArchivePresence, ArchiveRecord,
+    ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
     Config, ConfigIdentity, DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseHealth,
@@ -1989,8 +1993,8 @@ fn gather_selected_evidence_with_registry_at(
 /// itself uses, then handed to
 /// [`archivefs_core::dat::firmware_evidence::ps2_bios_evidence_from_dat`],
 /// which only ever yields records for a DAT it can itself prove is the
-/// Redump PS2 BIOS dataset (ecosystem plus dataset-identifying header text)
-/// - an unrelated ROM-set DAT, or one that fails to parse, silently
+/// Redump PS2 BIOS dataset (ecosystem plus dataset-identifying header text) -
+/// an unrelated ROM-set DAT, or one that fails to parse, silently
 /// contributes nothing rather than erroring the whole scan. A source's own
 /// `platform` label is never trusted as extraction authority here, for the
 /// same "never treat an arbitrary DAT as authoritative" reason
@@ -2441,6 +2445,10 @@ struct CachedLibrarySnapshot {
     source_views: Vec<SourceFolderView>,
 }
 
+// A one-shot value moved straight out of a worker channel
+// (`DatabaseLoadResult`) and destructured by its single consumer; it is
+// never stored or held in a collection, so the size gap does not matter.
+#[allow(clippy::large_enum_variant)]
 enum DatabaseOutcome {
     Loaded(CachedLibrarySnapshot),
     Scanned {
@@ -2460,6 +2468,11 @@ type DatabaseMessage = (DatabaseGeneration, DatabaseLoadResult);
 
 /// The Library Database status area's state - see requirement 3's exact
 /// vocabulary ("Not created / Loading / Ready / Outdated / Error").
+// Exactly one instance of this lives in `ArchiveFsApp`; the recoverable
+// snapshots are already boxed. Boxing the remaining inline
+// `ScanPersistSummary` would touch every read of `last_scan_summary` to
+// save ~300 bytes once, which is not worth it here.
+#[allow(clippy::large_enum_variant)]
 enum DatabaseState {
     NotCreated {
         database_path: PathBuf,
@@ -3323,6 +3336,13 @@ enum MainView {
     /// Repair Center (and any other flow sharing the same journal
     /// directory), with reverify status and safe undo when the core proves
     /// a transaction is reversible.
+    //
+    // Still routed and rendered (every `MainView` match handles it) and
+    // exercised by the navigation tests, but since the 0.8.1 consolidation
+    // it is reached as a tab within Problems & Repair rather than assigned
+    // as a top-level `view`, so production code no longer constructs it
+    // directly.
+    #[allow(dead_code)]
     RepairHistory,
     /// Exact Duplicate Review: a DAT-independent, byte-identical-only
     /// duplicate scan (`archivefs_core::repair::exact_duplicate`) with
@@ -4777,8 +4797,8 @@ impl ArchiveFsApp {
         self.tools_overlay = ToolsOverlay::None;
     }
 
-    /// `ProblemsRepairTab`'s exact counterpart to `navigate_to_library_tab`
-    /// - same synchronization rule, same reason for existing (called by the
+    /// `ProblemsRepairTab`'s exact counterpart to `navigate_to_library_tab` -
+    /// same synchronization rule, same reason for existing (called by the
     /// consolidated page's own tab row).
     fn navigate_to_problems_repair_tab(&mut self, tab: ProblemsRepairTab) {
         self.view = main_view_for_problems_repair_tab(tab);
@@ -16445,6 +16465,10 @@ impl ArchiveFsApp {
                         Some(GamerViewAction::ReviewIdentity(archive_path)) => {
                             self.review_identity(archive_path);
                         }
+                        // A match guard here (clippy's suggestion) would make
+                        // this otherwise-exhaustive `GamerViewAction` match
+                        // non-exhaustive and force a redundant fallback arm.
+                        #[allow(clippy::collapsible_match)]
                         Some(GamerViewAction::RefreshGameInformation) => {
                             if self.game_metadata_worker_allowed {
                                 let worker = self.game_metadata_worker.get_or_insert_with(|| {
@@ -28366,13 +28390,20 @@ struct DolphinLocalProfilesReady {
     roots: archivefs_core::patch_manager::DolphinLocalDiscoveryRoots,
 }
 
+// One instance in `ArchiveFsApp`, only ever read by Launch Readiness. The
+// larger `Ready` payload is the discovery result it must keep; the size gap
+// vs the small variants is a non-issue for a single long-lived field.
+#[allow(clippy::large_enum_variant)]
 enum DolphinLocalProfilesState {
     NotScanned,
     Scanning {
         receiver: Receiver<Result<DolphinLocalProfilesReady, String>>,
     },
     Ready(DolphinLocalProfilesReady),
-    Error(String),
+    // The detail is retained for parity with the other readiness states and
+    // for a future error banner; Launch Readiness currently only checks
+    // whether this is `Error(_)`, not what it says.
+    Error(#[allow(dead_code)] String),
 }
 
 /// PCSX2 profile discovery, plus the roots it ran against, for Launch
@@ -28384,13 +28415,16 @@ struct Pcsx2LaunchProfilesReady {
     roots: archivefs_core::patch_manager::Pcsx2ProfileDiscoveryRoots,
 }
 
+// See `DolphinLocalProfilesState` - same single-long-lived-field rationale.
+#[allow(clippy::large_enum_variant)]
 enum Pcsx2LaunchProfilesState {
     NotScanned,
     Scanning {
         receiver: Receiver<Result<Pcsx2LaunchProfilesReady, String>>,
     },
     Ready(Pcsx2LaunchProfilesReady),
-    Error(String),
+    // See `DolphinLocalProfilesState::Error`.
+    Error(#[allow(dead_code)] String),
 }
 
 struct FlycastProfilesReady {
@@ -28403,7 +28437,8 @@ enum FlycastProfilesState {
         receiver: Receiver<Result<FlycastProfilesReady, String>>,
     },
     Ready(FlycastProfilesReady),
-    Error(String),
+    // See `DolphinLocalProfilesState::Error`.
+    Error(#[allow(dead_code)] String),
 }
 
 /// PS2 firmware/BIOS evidence resolved from the user's registered DAT
@@ -28420,7 +28455,9 @@ enum Pcsx2FirmwareEvidenceState {
         >,
     },
     Ready(Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord>),
-    Error(String),
+    // Detail retained for a future error surface; readers currently only
+    // test for `Error(_)`. See `DolphinLocalProfilesState::Error`.
+    Error(#[allow(dead_code)] String),
 }
 
 /// Unlike Dolphin/PCSX2, Xenia Canary discovery only ever validates

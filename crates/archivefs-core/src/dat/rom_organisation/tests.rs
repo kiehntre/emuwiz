@@ -29,7 +29,6 @@ fn cancelled() -> AtomicBool {
 
 /// No RomM mapping is available at all in these fixtures: generic
 /// organisation must not need one.
-
 fn resolved(platform: &str, source: PlatformIdentitySource) -> PlatformIdentityResolution {
     PlatformIdentityResolution::Resolved {
         generation: 1,

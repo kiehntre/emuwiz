@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::*;
@@ -78,7 +78,7 @@ fn dreamcast_iso_bytes(product_code: &str) -> Vec<u8> {
     iso
 }
 
-fn flycast_roots(root: &PathBuf, executable: PathBuf) -> FlycastProfileDiscoveryRoots {
+fn flycast_roots(root: &Path, executable: PathBuf) -> FlycastProfileDiscoveryRoots {
     // Deliberately not under `xdg_config_home`/`flycast` - that path is
     // also the `Native` candidate's own config root, and a colliding path
     // would dedup away this `Explicit` candidate in favour of `Native`
@@ -251,15 +251,13 @@ fn malformed_dreamcast_media_fails_closed() {
 #[test]
 fn cdi_is_allowed_at_the_content_gate_and_identity_remains_authoritative() {
     let root = fixture_root("cdi-refused");
-    for extension in ["cdi"] {
-        let content_path = root.join(format!("games/game.{extension}"));
-        std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
-        // The extension gate must not reject CDI. This deliberately invalid
-        // fixture is still refused by the subsequent authoritative identity
-        // inspection, rather than being trusted from its filename.
-        std::fs::write(&content_path, dreamcast_iso_bytes("T-8109N")).unwrap();
-        assert!(inspect_and_capture_content_identity(&content_path).is_ok());
-    }
+    let content_path = root.join("games/game.cdi");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    // The extension gate must not reject CDI. This deliberately invalid
+    // fixture is still refused by the subsequent authoritative identity
+    // inspection, rather than being trusted from its filename.
+    std::fs::write(&content_path, dreamcast_iso_bytes("T-8109N")).unwrap();
+    assert!(inspect_and_capture_content_identity(&content_path).is_ok());
     let _ = std::fs::remove_dir_all(root);
 }
 

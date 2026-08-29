@@ -128,7 +128,7 @@ fn inspect_amiga_image_still_prefers_a_real_rdb_when_present() {
 
 #[test]
 fn inspect_amiga_image_still_reports_real_errors_not_just_no_rdb() {
-    let (_d, p) = file(&vec![0u8; 100]); // below the 512-byte minimum
+    let (_d, p) = file(&[0u8; 100]); // below the 512-byte minimum
     assert!(matches!(inspect_amiga_image(&p), Err(DiskError::TooSmall)));
 }
 

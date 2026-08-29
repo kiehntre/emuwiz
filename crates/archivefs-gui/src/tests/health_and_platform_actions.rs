@@ -14,6 +14,7 @@
 //! Predominant theme observed in this slice: health dashboard, platform alias/bulk actions.
 
 use super::*;
+use archivefs_core::ArchiveKind;
 
 #[test]
 fn apply_arrow_focus_change_replaces_selection_without_ctrl_and_preserves_it_with_ctrl() {
@@ -3172,13 +3173,17 @@ fn ingestion_item(
 fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
     use archivefs_core::ingestion::{ContentKind, SkipReason, ValidationState};
 
-    let mut ingestion_stats = archivefs_core::ingestion::DiscoveryStats::default();
-    ingestion_stats.loose_roms = 2;
-    ingestion_stats.disc_images = 1;
+    let ingestion_stats = archivefs_core::ingestion::DiscoveryStats {
+        loose_roms: 2,
+        disc_images: 1,
+        ..Default::default()
+    };
 
-    let mut ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts::default();
-    ingestion_skip_reasons.unsupported_extension = 3;
-    ingestion_skip_reasons.missing_paired_file = 1;
+    let ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts {
+        unsupported_extension: 3,
+        missing_paired_file: 1,
+        ..Default::default()
+    };
 
     let mut ingestion_platform_counts = std::collections::BTreeMap::new();
     ingestion_platform_counts.insert("Game Boy Advance".to_string(), 2_i64);

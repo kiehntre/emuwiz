@@ -941,14 +941,18 @@ mod tests {
     #[test]
     fn selecting_a_needs_attention_filter_narrows_item_details_to_that_reason_with_an_exact_total()
     {
-        let mut ingestion_stats = archivefs_core::ingestion::DiscoveryStats::default();
-        ingestion_stats.loose_roms = 1;
-        let mut ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts::default();
+        let ingestion_stats = archivefs_core::ingestion::DiscoveryStats {
+            loose_roms: 1,
+            ..Default::default()
+        };
         // The exact total (500) is deliberately larger than the bounded
         // sample (2 items) actually carried by the summary, mirroring a
         // real large collection where only a bounded sample is retained.
-        ingestion_skip_reasons.unsupported_extension = 500;
-        ingestion_skip_reasons.missing_paired_file = 3;
+        let ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts {
+            unsupported_extension: 500,
+            missing_paired_file: 3,
+            ..Default::default()
+        };
 
         let summary = ScanPersistSummary {
             scan_run_id: 1,
@@ -1054,8 +1058,10 @@ mod tests {
     }
 
     fn minimal_summary_for(scan_run_id: i64, total_unsupported: usize) -> ScanPersistSummary {
-        let mut ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts::default();
-        ingestion_skip_reasons.unsupported_extension = total_unsupported;
+        let ingestion_skip_reasons = archivefs_core::ingestion::SkipReasonCounts {
+            unsupported_extension: total_unsupported,
+            ..Default::default()
+        };
         ScanPersistSummary {
             scan_run_id,
             counts: archivefs_core::ScanRunCounts::default(),

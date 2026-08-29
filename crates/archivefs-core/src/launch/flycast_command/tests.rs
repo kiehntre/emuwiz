@@ -237,15 +237,14 @@ fn mounted_or_archive_content_is_rejected() {
 
 #[test]
 fn verified_direct_cdi_is_accepted_by_the_native_gate() {
-    for extension in ["cdi"] {
-        let plan = build_flycast_command_plan(
-            &resolved(),
-            Some("T-8109N"),
-            &candidate(Some(PathBuf::from(format!("/games/game.{extension}")))),
-            &native_binding("/usr/bin/flycast"),
-        );
-        assert!(plan.command.is_some(), "{extension} should be accepted");
-    }
+    let extension = "cdi";
+    let plan = build_flycast_command_plan(
+        &resolved(),
+        Some("T-8109N"),
+        &candidate(Some(PathBuf::from(format!("/games/game.{extension}")))),
+        &native_binding("/usr/bin/flycast"),
+    );
+    assert!(plan.command.is_some(), "{extension} should be accepted");
 }
 
 #[test]

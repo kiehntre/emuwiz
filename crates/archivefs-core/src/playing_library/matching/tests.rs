@@ -51,7 +51,7 @@ fn a_hash_verified_file_is_matched_to_its_game_index() {
 
     let outcome = match_loose_files_against_dat(
         &dat,
-        &[file.clone()],
+        std::slice::from_ref(&file),
         &TrustedRoots::from_paths([temp.path()]),
         &AtomicBool::new(false),
     );
@@ -162,7 +162,7 @@ fn a_cue_referencing_a_missing_track_is_rejected_with_a_plain_reason() {
 
     let outcome = match_loose_files_against_dat(
         &dat,
-        &[cue.clone()],
+        std::slice::from_ref(&cue),
         &TrustedRoots::from_paths([temp.path()]),
         &AtomicBool::new(false),
     );
@@ -421,7 +421,7 @@ fn a_single_chd_produces_an_ordinary_single_file_match_unchanged() {
 
     let outcome = match_loose_files_against_dat(
         &dat,
-        &[chd.clone()],
+        std::slice::from_ref(&chd),
         &TrustedRoots::from_paths([temp.path()]),
         &AtomicBool::new(false),
     );
@@ -645,7 +645,7 @@ fn an_m3u_referencing_traversal_paths_is_rejected() {
 
     let outcome = match_loose_files_against_dat(
         &dat,
-        &[m3u.clone()],
+        std::slice::from_ref(&m3u),
         &TrustedRoots::from_paths([temp.path()]),
         &AtomicBool::new(false),
     );

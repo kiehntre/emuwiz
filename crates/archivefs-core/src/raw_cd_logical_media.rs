@@ -320,14 +320,13 @@ impl LogicalMedia for CookedCdFileLogicalMedia {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LogicalMediaError> {
-        let end =
-            offset
-                .checked_add(buf.len() as u64)
-                .ok_or_else(|| LogicalMediaError::OutOfBounds {
-                    offset,
-                    requested_len: buf.len(),
-                    media_len: self.len,
-                })?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(LogicalMediaError::OutOfBounds {
+                offset,
+                requested_len: buf.len(),
+                media_len: self.len,
+            })?;
         if end > self.len {
             return Err(LogicalMediaError::OutOfBounds {
                 offset,

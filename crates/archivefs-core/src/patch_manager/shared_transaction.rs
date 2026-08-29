@@ -2228,8 +2228,8 @@ mod fd_relative {
 /// descriptor-anchored, no-follow traversal (see [`fd_relative`]): the
 /// starting ancestor is (re)opened with `O_NOFOLLOW`, and every directory
 /// below it is created with `mkdirat` and then immediately reopened with
-/// `openat`+`O_NOFOLLOW` *relative to that already-open parent descriptor*
-/// - never a fresh top-level pathname lookup. If an ancestor is swapped to
+/// `openat`+`O_NOFOLLOW` *relative to that already-open parent descriptor* -
+/// never a fresh top-level pathname lookup. If an ancestor is swapped to
 /// a symlink at any point after it was opened, there is no path string left
 /// for that swap to redirect: every subsequent `openat`/`mkdirat` resolves
 /// strictly against the open descriptor chain already established, not

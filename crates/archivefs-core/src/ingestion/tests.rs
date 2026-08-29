@@ -16,7 +16,6 @@ const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
 /// `.gb` is filename-strong evidence on its own - so loose ROM fixtures
 /// below use arbitrary content unless a format needs a real signature to
 /// be read at all (Amiga HDF, WHDLoad slave).
-
 fn put16(v: &mut [u8], at: usize, n: u16) {
     v[at..at + 2].copy_from_slice(&n.to_be_bytes());
 }

@@ -415,8 +415,10 @@ mod tests {
     fn file_over_size_limit_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "big.xml", "<mame></mame>");
-        let mut limits = DatLimits::default();
-        limits.max_file_size = 4;
+        let limits = DatLimits {
+            max_file_size: 4,
+            ..Default::default()
+        };
         assert!(matches!(
             parse_mame_listxml(&path, limits),
             Err(ParseError::FileTooLarge { .. })

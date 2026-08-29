@@ -1286,8 +1286,8 @@ fn dat_completion_view(outcome: &DatAuditOutcome) -> Option<DatCompletionView> {
 
 /// The provider name.
 ///
-/// Prefers the already-detected [`archivefs_core::dat::model::DatEcosystem`]
-/// - parse-time classification this crate already trusts, not a new text
+/// Prefers the already-detected [`archivefs_core::dat::model::DatEcosystem`] -
+/// parse-time classification this crate already trusts, not a new text
 /// heuristic - when it names something specific. The `Generic*` variants
 /// mean the parser could not confirm a specific ecosystem, so those fall
 /// through to the header's own `<author>`, then `<homepage>` text (several
@@ -2480,6 +2480,10 @@ impl DatSourcesPageState {
 
     /// [`Self::load`] with the rename-transaction journal directory injected,
     /// so tests never read or write the real home directory.
+    // Only the test suite constructs a page this way; the production entry
+    // point is [`Self::load`]. Kept out of `#[cfg(test)]` so the rustdoc
+    // link above still resolves.
+    #[allow(dead_code)]
     pub(crate) fn load_with_transaction_dir(
         config_path: PathBuf,
         library_folders: Vec<PathBuf>,
@@ -4783,6 +4787,11 @@ impl DatSourcesPageState {
             .collect()
     }
 
+    // Each parameter is one already-resolved fact about a single managed DAT
+    // row; they are assembled here into one view struct. Grouping them into
+    // a parameter struct would just relocate the same fields without making
+    // the one call site clearer.
+    #[allow(clippy::too_many_arguments)]
     fn managed_row_from_parts(
         &self,
         descriptor: ManagedDatSourceDescriptor,
@@ -6043,10 +6052,10 @@ pub(crate) fn show_dat_sources_page(
     }
     ui.add_space(10.0);
 
-    if let Some(bar_action) = show_toolbar(ui, view) {
-        if action.is_none() {
-            action = Some(bar_action);
-        }
+    if let Some(bar_action) = show_toolbar(ui, view)
+        && action.is_none()
+    {
+        action = Some(bar_action);
     }
     ui.add_space(10.0);
 
@@ -6979,8 +6988,7 @@ pub(crate) fn show_quick_rename_page(
             // or transaction-ID detail.
             if action.is_none()
                 && let Some(review) = &view.rename_apply.review
-            {
-                if let Some(confirm_action) = show_quick_rename_confirmation(
+                && let Some(confirm_action) = show_quick_rename_confirmation(
                     ui,
                     review,
                     unsupported,
@@ -6988,9 +6996,9 @@ pub(crate) fn show_quick_rename_page(
                     conflicts,
                     &view.rename_apply,
                     ui_state,
-                ) {
-                    action = Some(confirm_action);
-                }
+                )
+            {
+                action = Some(confirm_action);
             }
             if action.is_none()
                 && let Some(outcome) = &view.rename_apply.outcome
@@ -8590,7 +8598,7 @@ fn show_combined_audit_target_picker(
         for folder in &view.library_folders {
             if widgets::action_button(
                 ui,
-                &format!("Use {}", friendly_folder_label(folder)),
+                format!("Use {}", friendly_folder_label(folder)),
                 widgets::ActionStyle::Secondary,
                 true,
             )

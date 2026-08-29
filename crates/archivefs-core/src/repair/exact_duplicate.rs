@@ -383,7 +383,7 @@ pub fn select_canonical_copy(members: &[ExactDuplicateMember]) -> CanonicalRecom
         .filter(|member| member.elected_in_library)
         .collect();
     match elected.as_slice() {
-        [only] => CanonicalRecommendation::ElectedLibrary((*only).path.clone()),
+        [only] => CanonicalRecommendation::ElectedLibrary(only.path.clone()),
         _ => CanonicalRecommendation::RequiresUserChoice,
     }
 }

@@ -1020,8 +1020,8 @@ fn inspect_loose_rom(
 /// Silently adds nothing (only a retained warning) when the header is
 /// unrecognized or the buffer's length doesn't match what the detected
 /// order requires: a physically valid file with an unrecognized/malformed
-/// byte-order header still keeps its exact-bytes [`IdentityKind::LooseRomSha256`]
-/// - see the module docs on "physical vs. normalized identity" - it simply
+/// byte-order header still keeps its exact-bytes [`IdentityKind::LooseRomSha256`] -
+/// see the module docs on "physical vs. normalized identity" - it simply
 /// never gets a canonical fact fabricated on top of it.
 fn push_n64_canonical_evidence(report: &mut GameIdentityReport, bytes: &[u8]) {
     let Some(order) = detect_n64_byte_order(bytes) else {
@@ -4032,7 +4032,7 @@ fn inspect_ps1_iso(
         return;
     };
     let components: Vec<&[u8]> = executable_path
-        .split(|character| character == '\\' || character == '/')
+        .split(['\\', '/'])
         .map(str::as_bytes)
         .collect();
     report.metadata_paths_inspected += 1;
@@ -7190,6 +7190,10 @@ mod tests {
         assert!(report.complete);
     }
 
+    /// One CDI test-fixture track spec:
+    /// `(track_mode, read_mode, start_address, track_length, pregap)`.
+    type CdiTrackSpec = (u32, u32, u32, u32, u32);
+
     /// Mirrors `crate::dreamcast_cdi`'s own private test-fixture builder
     /// exactly (private to that module's own test mod, so re-derived here
     /// per this crate's established per-file-fixture convention).
@@ -7197,7 +7201,7 @@ mod tests {
     /// track_length, pregap)`; only cooked (`read_mode == 0`) tracks are
     /// used here since these tests need real, correctly-placed IP.BIN
     /// content, not just structural parsing.
-    fn cdi_bytes(sessions: &[Vec<(u32, u32, u32, u32, u32)>]) -> Vec<u8> {
+    fn cdi_bytes(sessions: &[Vec<CdiTrackSpec>]) -> Vec<u8> {
         fn push_track(
             desc: &mut Vec<u8>,
             track_mode: u32,

@@ -224,27 +224,26 @@ pub fn import_no_intro_pack_at(
 
     ensure_directory(storage_root)?;
     let state_path = storage_root.join("state.json");
-    if let Ok(state) = load_state(&state_path) {
-        if state.schema_version == NO_INTRO_PACK_SCHEMA_VERSION
-            && (state.pack_sha256 == pack_sha256
-                || state.pack_sha256s.iter().any(|sha| sha == &pack_sha256))
-        {
-            let snapshot_path = storage_root.join("snapshots").join(
-                state
-                    .snapshot_sha256
-                    .as_deref()
-                    .unwrap_or(&state.pack_sha256),
-            );
-            if snapshot_is_complete(&snapshot_path, &state.accepted_members) {
-                let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
-                return Ok(NoIntroPackImportReport {
-                    status: NoIntroPackImportStatus::Unchanged,
-                    pack_sha256,
-                    snapshot_path,
-                    accepted,
-                    rejected: Vec::new(),
-                });
-            }
+    if let Ok(state) = load_state(&state_path)
+        && state.schema_version == NO_INTRO_PACK_SCHEMA_VERSION
+        && (state.pack_sha256 == pack_sha256
+            || state.pack_sha256s.iter().any(|sha| sha == &pack_sha256))
+    {
+        let snapshot_path = storage_root.join("snapshots").join(
+            state
+                .snapshot_sha256
+                .as_deref()
+                .unwrap_or(&state.pack_sha256),
+        );
+        if snapshot_is_complete(&snapshot_path, &state.accepted_members) {
+            let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
+            return Ok(NoIntroPackImportReport {
+                status: NoIntroPackImportStatus::Unchanged,
+                pack_sha256,
+                snapshot_path,
+                accepted,
+                rejected: Vec::new(),
+            });
         }
     }
 
@@ -260,37 +259,37 @@ pub fn import_no_intro_pack_at(
 
     let mut accepted_members = new_members;
     let mut pack_sha256s = vec![pack_sha256.clone()];
-    if let Ok(previous) = load_state(&state_path) {
-        if previous.schema_version == NO_INTRO_PACK_SCHEMA_VERSION {
-            let previous_snapshot = storage_root.join("snapshots").join(
-                previous
-                    .snapshot_sha256
-                    .as_deref()
-                    .unwrap_or(&previous.pack_sha256),
-            );
-            if snapshot_is_complete(&previous_snapshot, &previous.accepted_members) {
-                let old_members = previous.accepted_members;
-                for (index, member) in old_members.iter().enumerate() {
-                    if accepted_members
-                        .iter()
-                        .any(|candidate| candidate.artifact_sha256 == member.artifact_sha256)
-                    {
-                        continue;
-                    }
-                    let source = previous_snapshot.join("dats").join(format!("{index}.dat"));
-                    let target_index = accepted_members.len();
-                    fs::copy(
-                        &source,
-                        staging.join("dats").join(format!("{target_index}.dat")),
-                    )
-                    .map_err(|error| io_error(&source, error))?;
-                    accepted_members.push(member.clone());
+    if let Ok(previous) = load_state(&state_path)
+        && previous.schema_version == NO_INTRO_PACK_SCHEMA_VERSION
+    {
+        let previous_snapshot = storage_root.join("snapshots").join(
+            previous
+                .snapshot_sha256
+                .as_deref()
+                .unwrap_or(&previous.pack_sha256),
+        );
+        if snapshot_is_complete(&previous_snapshot, &previous.accepted_members) {
+            let old_members = previous.accepted_members;
+            for (index, member) in old_members.iter().enumerate() {
+                if accepted_members
+                    .iter()
+                    .any(|candidate| candidate.artifact_sha256 == member.artifact_sha256)
+                {
+                    continue;
                 }
-                pack_sha256s.extend(previous.pack_sha256s);
-                pack_sha256s.push(previous.pack_sha256);
-                pack_sha256s.sort();
-                pack_sha256s.dedup();
+                let source = previous_snapshot.join("dats").join(format!("{index}.dat"));
+                let target_index = accepted_members.len();
+                fs::copy(
+                    &source,
+                    staging.join("dats").join(format!("{target_index}.dat")),
+                )
+                .map_err(|error| io_error(&source, error))?;
+                accepted_members.push(member.clone());
             }
+            pack_sha256s.extend(previous.pack_sha256s);
+            pack_sha256s.push(previous.pack_sha256);
+            pack_sha256s.sort();
+            pack_sha256s.dedup();
         }
     }
     let snapshot_id = snapshot_id(&accepted_members);

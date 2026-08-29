@@ -358,6 +358,10 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// One test-fixture track spec:
+    /// `(track_mode, read_mode, start_address, track_length, pregap)`.
+    type TrackSpec = (u32, u32, u32, u32, u32);
+
     /// Mirrors `opticaldiscs::discjuggler`'s own private test-fixture
     /// builder exactly (that helper is private to its own test module, so
     /// re-derived here per this crate's established per-file-fixture
@@ -419,10 +423,7 @@ mod tests {
     /// optionally overrides the physical byte length of the data region
     /// actually written (e.g. to simulate truncation) - `None` writes the
     /// full, correctly-sized region.
-    fn build_cdi(
-        sessions: &[Vec<(u32, u32, u32, u32, u32)>],
-        data_len_override: Option<u64>,
-    ) -> Vec<u8> {
+    fn build_cdi(sessions: &[Vec<TrackSpec>], data_len_override: Option<u64>) -> Vec<u8> {
         let mut total_bytes = 0u64;
         for session in sessions {
             for &(_, read_mode, _, length, _) in session {
@@ -655,7 +656,7 @@ mod tests {
         // metadata-only pre-check function directly by asserting the
         // bound itself is sane and positive, mirroring
         // `disc_evidence_collector::max_chd_bytes_is_a_positive_sane_bound`.
-        assert!(MAX_CDI_BYTES > 0);
-        assert!(MAX_CDI_BYTES < 100 * 1024 * 1024 * 1024);
+        const { assert!(MAX_CDI_BYTES > 0) };
+        const { assert!(MAX_CDI_BYTES < 100 * 1024 * 1024 * 1024) };
     }
 }

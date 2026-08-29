@@ -440,7 +440,7 @@ fn apply_moves_only_approved_redundant_copies() {
     let report = scan_exact_duplicates(
         &[live.retained.clone(), live.redundant.clone()],
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );
@@ -498,7 +498,7 @@ fn an_existing_destination_collision_blocks_the_transaction() {
     let report = scan_exact_duplicates(
         &[live.retained.clone(), live.redundant.clone()],
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );
@@ -567,7 +567,7 @@ fn an_induced_failure_rolls_back_every_move_in_the_batch() {
     let report = scan_exact_duplicates(
         &[retained.clone(), redundant1.clone(), redundant2.clone()],
         &trusted_roots,
-        &[trusted_dir.clone()],
+        std::slice::from_ref(&trusted_dir),
         &BTreeSet::new(),
         None,
     );
@@ -633,7 +633,7 @@ fn reapplying_an_identical_plan_is_idempotent() {
     let report = scan_exact_duplicates(
         &[live.retained.clone(), live.redundant.clone()],
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );
@@ -675,9 +675,9 @@ fn reapplying_an_identical_plan_is_idempotent() {
     // Re-running the exact same scan now (source already moved) must not
     // find a new redundant copy, and must not disturb the quarantined file.
     let rescanned = scan_exact_duplicates(
-        &[live.retained.clone()],
+        std::slice::from_ref(&live.retained),
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );
@@ -704,7 +704,7 @@ fn unrelated_source_files_are_never_touched_by_a_scan() {
             live.unrelated.clone(),
         ],
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );
@@ -722,7 +722,13 @@ fn a_missing_candidate_is_reported_as_excluded_not_silently_dropped() {
     let missing = temp.path().join("does-not-exist.bin");
     let trusted = trusted_for(temp.path());
 
-    let report = scan_exact_duplicates(&[missing.clone()], &trusted, &[], &BTreeSet::new(), None);
+    let report = scan_exact_duplicates(
+        std::slice::from_ref(&missing),
+        &trusted,
+        &[],
+        &BTreeSet::new(),
+        None,
+    );
 
     assert!(report.groups.is_empty());
     assert_eq!(report.excluded.len(), 1);
@@ -1010,7 +1016,7 @@ fn a_file_mutated_after_preview_blocks_apply() {
     let report = scan_exact_duplicates(
         &[live.retained.clone(), live.redundant.clone()],
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );
@@ -1055,7 +1061,7 @@ fn a_retained_copy_mutated_after_preview_also_blocks_apply() {
     let report = scan_exact_duplicates(
         &[live.retained.clone(), live.redundant.clone()],
         &trusted_roots,
-        &[live.trusted_root.clone()],
+        std::slice::from_ref(&live.trusted_root),
         &BTreeSet::new(),
         None,
     );

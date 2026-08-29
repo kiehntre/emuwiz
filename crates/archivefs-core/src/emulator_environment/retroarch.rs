@@ -371,6 +371,11 @@ pub struct FirmwareRequirement {
     pub optional: bool,
 }
 
+// `Found` is by far the common case for a discovered core (a core with a
+// readable `.info`); the small variants are the rare error states. Boxing
+// the common variant would add indirection on the hot path to shrink the
+// rare ones - the wrong trade here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreInfoFinding {

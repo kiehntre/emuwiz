@@ -797,11 +797,13 @@ fn an_exact_user_local_pack_path_is_already_satisfied_without_duplication() {
     select_amiga_floppy(&mut pack);
     let selected = find_dat(&inventory, "Amiga - Games - Floppy");
     let selected_path = fixture.pack_root.join(&selected.relative_path);
-    let mut sources = DatSourcesConfig::default();
-    sources.sources = Some(vec![local_source(
-        "manual-amiga",
-        selected_path.to_str().unwrap(),
-    )]);
+    let mut sources = DatSourcesConfig {
+        sources: Some(vec![local_source(
+            "manual-amiga",
+            selected_path.to_str().unwrap(),
+        )]),
+        ..Default::default()
+    };
 
     let outcome = register_selected_tosec_dats(&pack, &mut sources, 42);
     assert!(outcome.registered.is_empty());
@@ -829,8 +831,10 @@ fn a_mixed_selection_reports_registered_already_deferred_and_conflict_separately
         category: TosecFriendlyCategory::Games,
         media: TosecMediaType::Tape,
     });
-    let mut sources = DatSourcesConfig::default();
-    sources.sources = Some(vec![local_source(&generated_id, "/unrelated/user.dat")]);
+    let mut sources = DatSourcesConfig {
+        sources: Some(vec![local_source(&generated_id, "/unrelated/user.dat")]),
+        ..Default::default()
+    };
 
     let outcome = register_selected_tosec_dats(&pack, &mut sources, 42);
     assert_eq!(outcome.registered.len(), 1);

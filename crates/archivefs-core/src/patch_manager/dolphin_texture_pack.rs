@@ -597,7 +597,7 @@ pub fn inspect_dolphin_texture_pack_zip(
             format!("could not create archive staging directory: {error}"),
         )
     })?;
-    let trusted = crate::safe_read::TrustedRoots::from_paths(archive_path.parent().into_iter());
+    let trusted = crate::safe_read::TrustedRoots::from_paths(archive_path.parent());
     let limits = crate::dat::archive::limits::ArchiveLimits {
         max_members: DOLPHIN_TEXTURE_ARCHIVE_MAX_MEMBERS,
         max_member_logical_bytes: super::shared_transaction::SHARED_MAX_SOURCE_BYTES,

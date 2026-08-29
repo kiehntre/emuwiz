@@ -323,8 +323,8 @@ impl RepairHistoryPageState {
     }
 
     /// The transactions "Clear completed history" would remove: every one
-    /// [`RenameTransaction::is_rollbackable`] reports as *not* rollbackable
-    /// - the exact same core predicate `can_undo` already trusts, just
+    /// [`RenameTransaction::is_rollbackable`] reports as *not* rollbackable -
+    /// the exact same core predicate `can_undo` already trusts, just
     /// inverted. This never touches a transaction that still has applied
     /// entries awaiting rollback, or one left interrupted by a crash and
     /// needing recovery; both remain `is_rollbackable() == true` and are

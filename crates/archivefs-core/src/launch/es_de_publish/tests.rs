@@ -572,9 +572,8 @@ fn generated_xml_values_are_escaped() {
     let mut reader = quick_xml::Reader::from_str(&publication.new_content);
     reader.config_mut().trim_text(true);
     loop {
-        match reader.read_event().unwrap() {
-            quick_xml::events::Event::Eof => break,
-            _ => {}
+        if let quick_xml::events::Event::Eof = reader.read_event().unwrap() {
+            break;
         }
     }
 

@@ -151,15 +151,19 @@ pub fn compare_dat_metadata_to_filename(dat: &ParsedDat) -> DatMetadataFilenameR
     // compare its own header-derived (Strong) resolution against its own
     // filename-derived (Weak) candidates, never a new text comparison.
     let all_evidence = gather_dat_platform_evidence(dat);
-    let header_identity =
-        resolve_dat_platform_identity(all_evidence.iter().cloned().filter(|evidence| {
-            !matches!(
-                evidence.kind,
-                DatPlatformEvidenceKind::FilenameCorroboration
-                    | DatPlatformEvidenceKind::FolderHint
-                    | DatPlatformEvidenceKind::MediaExtension
-            )
-        }));
+    let header_identity = resolve_dat_platform_identity(
+        all_evidence
+            .iter()
+            .filter(|evidence| {
+                !matches!(
+                    evidence.kind,
+                    DatPlatformEvidenceKind::FilenameCorroboration
+                        | DatPlatformEvidenceKind::FolderHint
+                        | DatPlatformEvidenceKind::MediaExtension
+                )
+            })
+            .cloned(),
+    );
     if let DatPlatformIdentity::Resolved {
         platform: header_platform,
         ..
@@ -227,19 +231,18 @@ pub fn compare_dat_metadata_to_filename(dat: &ParsedDat) -> DatMetadataFilenameR
     // date/version-shaped digit run embedded in the filename. Both sides
     // must carry a real digit run; anything shorter is too ambiguous
     // (page numbers, single digits in a title) to treat as a version.
-    if let Some(version) = dat.source.version.as_deref() {
-        if let (Some(version_digits), Some(filename_digits)) =
+    if let Some(version) = dat.source.version.as_deref()
+        && let (Some(version_digits), Some(filename_digits)) =
             (longest_digit_run(version), longest_digit_run(&stem))
-            && version_digits != filename_digits
-        {
-            divergences.push(FieldDivergence {
-                field: DivergenceField::RevisionOrVersion,
-                metadata_evidence: format!("DAT header declares version \"{version}\""),
-                filename_hint: format!(
-                    "filename carries the date/version digits \"{filename_digits}\""
-                ),
-            });
-        }
+        && version_digits != filename_digits
+    {
+        divergences.push(FieldDivergence {
+            field: DivergenceField::RevisionOrVersion,
+            metadata_evidence: format!("DAT header declares version \"{version}\""),
+            filename_hint: format!(
+                "filename carries the date/version digits \"{filename_digits}\""
+            ),
+        });
     }
 
     // BIOS/firmware: whether the catalogue actually declares any BIOS

@@ -15,8 +15,8 @@
 //!   itself accepts. No PKG, archive-contained game, CHD, CUE/BIN, or
 //!   mounted projection is supported here.
 //! - A verified PS3 TITLE_ID is always required.
-//! - [`LaunchReadiness::Ready`] **or** [`LaunchReadiness::ReadyWithWarnings`]
-//!   - never [`LaunchReadiness::Blocked`]. See
+//! - [`LaunchReadiness::Ready`] **or** [`LaunchReadiness::ReadyWithWarnings`],
+//!   never [`LaunchReadiness::Blocked`]. See
 //!   [`preflight_rpcs3_launch`]'s own doc comment for exactly why strict
 //!   `Ready` alone (the policy every other adapter in this family uses) is
 //!   not the right bar for RPCS3 specifically.

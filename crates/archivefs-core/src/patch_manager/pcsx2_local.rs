@@ -659,8 +659,8 @@ fn blocked_profile(
 /// `roots.explicit_executables` only - never guesses a legacy/plugin-era
 /// binary name, never searches an arbitrary directory tree, and never
 /// invents Flatpak/AppImage/portable executable evidence (there is no
-/// AppImage-directory channel here, unlike `patch_manager::dolphin_local`)
-/// - see [`resolve_pcsx2_native_launch_binding`]'s own doc comment for why
+/// AppImage-directory channel here, unlike `patch_manager::dolphin_local`) -
+/// see [`resolve_pcsx2_native_launch_binding`]'s own doc comment for why
 /// only [`Pcsx2InstallationType::Native`] is supported by the launch
 /// binding this feeds. `explicit_executables` entries are reported as
 /// `Native` too: this model has no separate "caller-confirmed" installation

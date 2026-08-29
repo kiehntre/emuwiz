@@ -702,8 +702,8 @@ fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
 ///
 /// A stray/malformed line (no `=`, an unrecognised `cheatN_*` shape, a
 /// non-numeric `cheats` value, ...) is likewise never fatal by itself
-/// (2026-08-23, real-corpus audit: 85 of 28,308 real files had exactly this
-/// - a bare `false`, a stray quote, a parenthetical note, an orphaned `_L`
+/// (2026-08-23, real-corpus audit: 85 of 28,308 real files had exactly this -
+/// a bare `false`, a stray quote, a parenthetical note, an orphaned `_L`
 /// continuation line, or similar hand-edit debris alongside otherwise-valid
 /// `cheatN_*` entries). Each such line is skipped and recorded as a warning
 /// diagnostic; parsing continues. A file is only rejected outright

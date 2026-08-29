@@ -26,8 +26,7 @@ use archivefs_core::dat::sources::{
 };
 use archivefs_core::dat::tosec_release_pack::{TosecFriendlyCategory, TosecMediaType};
 use archivefs_core::dat::updates::{
-    ManagedDatSnapshot, ManagedDatState, load_managed_dat_state, rollback_managed_dat_to_previous,
-    save_managed_dat_state,
+    ManagedDatSnapshot, ManagedDatState, load_managed_dat_state, save_managed_dat_state,
 };
 use archivefs_core::safe_read::TrustedRoots;
 
@@ -6162,9 +6161,10 @@ fn installed_current_and_previous_snapshots_refresh_the_managed_row_without_prom
     );
     assert_ne!(row.technical.current_path, row.technical.previous_path);
 
-    let mut ui_state = DatSourcesPageUi::default();
-    ui_state.open_managed_technical =
-        Some(ManagedDatSourceId::mame_software_list("gamecom").unwrap());
+    let mut ui_state = DatSourcesPageUi {
+        open_managed_technical: Some(ManagedDatSourceId::mame_software_list("gamecom").unwrap()),
+        ..Default::default()
+    };
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,

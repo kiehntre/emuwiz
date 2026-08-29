@@ -14,6 +14,12 @@
 
 use super::*;
 
+// Consulted only by the navigation/reachability test suite now that the
+// 0.8.1 sidebar consolidation stopped rendering this flat list directly
+// (see this module's own doc comment). Kept as the single source of truth
+// those tests assert against; `--all-targets` clippy's non-test pass does
+// not see that usage.
+#[allow(dead_code)]
 pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 17] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),

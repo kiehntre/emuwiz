@@ -232,14 +232,17 @@ impl ExactDuplicateReviewPageState {
         self.error.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_error(&self) -> Option<&str> {
         self.apply_error.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn rollback_error(&self) -> Option<&str> {
         self.rollback_error.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn report(&self) -> Option<&ExactDuplicateScanReport> {
         self.report.as_ref()
     }
@@ -264,6 +267,7 @@ impl ExactDuplicateReviewPageState {
         self.mode = DuplicateReviewMode::EquivalentOptical;
     }
 
+    #[cfg(test)]
     pub(crate) fn scan_status(&self) -> Option<&ScanStatus> {
         self.scan_status.as_ref()
     }
@@ -272,10 +276,12 @@ impl ExactDuplicateReviewPageState {
         matches!(self.scan_status, Some(ScanStatus::Scanning))
     }
 
+    #[cfg(test)]
     pub(crate) fn applied(&self) -> Option<&RenameTransaction> {
         self.applied.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn recovery(&self) -> Option<&RepairRecoveryReport> {
         self.recovery.as_ref()
     }
@@ -578,6 +584,7 @@ impl ExactDuplicateReviewPageState {
         self.apply_confirm = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_confirm(&self) -> Option<&ApplyConfirmation> {
         self.apply_confirm.as_ref()
     }
@@ -723,13 +730,13 @@ impl ExactDuplicateReviewPageState {
                 // The group just applied is stale now - remove it from the
                 // live report so the UI never offers to apply it again
                 // without a rescan.
-                if let Some(report) = &mut self.report {
-                    if confirmation.group_index < report.groups.len() {
-                        report.groups[confirmation.group_index].readiness =
-                            GroupQuarantineReadiness::NeedsReview(
-                                "already quarantined in this session".to_string(),
-                            );
-                    }
+                if let Some(report) = &mut self.report
+                    && confirmation.group_index < report.groups.len()
+                {
+                    report.groups[confirmation.group_index].readiness =
+                        GroupQuarantineReadiness::NeedsReview(
+                            "already quarantined in this session".to_string(),
+                        );
                 }
             }
             Err(error) => {

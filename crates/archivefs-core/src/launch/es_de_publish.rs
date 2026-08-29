@@ -754,18 +754,18 @@ fn read_bounded_gamelist(path: &PathBuf) -> Result<String, EsDePublicationError>
 /// tag - the one, unambiguous, safe place to insert new `<game>` blocks
 /// without touching a single byte of existing content. Refuses (never
 /// guesses) when that tag does not appear exactly once.
-fn locate_insertion_point(text: &str, path: &PathBuf) -> Result<usize, EsDePublicationError> {
+fn locate_insertion_point(text: &str, path: &Path) -> Result<usize, EsDePublicationError> {
     const CLOSING_TAG: &str = "</gameList>";
     let mut matches = text.match_indices(CLOSING_TAG);
     let Some((offset, _)) = matches.next() else {
         return Err(EsDePublicationError::MalformedGamelist {
-            path: path.clone(),
+            path: path.to_path_buf(),
             detail: "no </gameList> closing tag was found".to_string(),
         });
     };
     if matches.next().is_some() {
         return Err(EsDePublicationError::MalformedGamelist {
-            path: path.clone(),
+            path: path.to_path_buf(),
             detail: "more than one </gameList> closing tag was found".to_string(),
         });
     }

@@ -80,17 +80,12 @@ pub struct CachedHashes {
     pub sha1: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AuditCacheConfig {
+    #[default]
     Default,
     At(PathBuf),
     Disabled,
-}
-
-impl Default for AuditCacheConfig {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +266,10 @@ impl AuditHashCache {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn prune_to(&mut self, maximum: usize) {
         while self.entries.len() > maximum {
             let oldest = self
@@ -343,10 +342,10 @@ fn acquire_lock(path: &Path) -> Result<CacheLock, String> {
 }
 
 fn reclaimable_lock(path: &Path) -> bool {
-    if let Ok(bytes) = fs::read(path) {
-        if let Ok(record) = serde_json::from_slice::<LockRecord>(&bytes) {
-            return !process_is_alive(record.pid);
-        }
+    if let Ok(bytes) = fs::read(path)
+        && let Ok(record) = serde_json::from_slice::<LockRecord>(&bytes)
+    {
+        return !process_is_alive(record.pid);
     }
     let Ok(metadata) = fs::metadata(path) else {
         return false;

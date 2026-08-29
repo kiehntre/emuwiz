@@ -666,10 +666,9 @@ fn discover_ambiguous_disk_image(path: &Path, source_root: &Path) -> GameDiscove
             ContainerKind::DirectFile,
             ContentKind::ComputerDisk,
             identity,
-            format!(
-                "Disk image (.hdf/.hdfx is shared between formats; not verified as an Amiga \
-                 image, but the platform is otherwise identified)."
-            ),
+            "Disk image (.hdf/.hdfx is shared between formats; not verified as an Amiga \
+             image, but the platform is otherwise identified)."
+                .to_string(),
         ),
         _ => skipped(
             path.to_path_buf(),

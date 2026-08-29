@@ -389,13 +389,13 @@ fn builder_accepts_only_root_pngs_and_is_deterministic() {
         first
             .rejected
             .iter()
-            .any(|item| item.relative_path == PathBuf::from("readme.txt"))
+            .any(|item| item.relative_path == Path::new("readme.txt"))
     );
     assert!(
         first
             .rejected
             .iter()
-            .any(|item| item.relative_path == PathBuf::from("nested/n.png"))
+            .any(|item| item.relative_path == Path::new("nested/n.png"))
     );
 }
 

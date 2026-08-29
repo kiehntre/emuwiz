@@ -74,6 +74,10 @@ use crate::ui::{components as widgets, theme};
 /// non-[`Self::Plan`] variant is a prerequisite the caller checked *without*
 /// calling the planner - see each variant's own doc comment for exactly
 /// which check it stands for.
+// Built once per frame, borrowed immediately by the panel renderer, then
+// dropped; the `Plan` payload is the real launch plan it must carry. The
+// size gap vs the marker variants has no bearing on a per-frame temporary.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum LaunchReadinessInput {
     /// `SelectedEvidenceState` is not `Ready` for the focused archive yet.
     /// The planner is never called in this state.
@@ -797,8 +801,8 @@ fn pcsx2_launch_request(
     })
 }
 
-/// Translates a core PCSX2 launch error into a short player-facing message
-/// - the same reasoning as [`dolphin_launch_error_message`]. Core's own
+/// Translates a core PCSX2 launch error into a short player-facing message -
+/// the same reasoning as [`dolphin_launch_error_message`]. Core's own
 /// [`Pcsx2LaunchPreflightErrorKind::CandidateNotReady`]/
 /// `CandidateContentUnsupported`/`RequestedCandidateNotFound` cover *every*
 /// readiness regression at click time - including the BIOS having stopped
@@ -1105,6 +1109,11 @@ fn target_labels(target: &LaunchTarget) -> (String, String) {
     }
 }
 
+// One immediate-mode render call: the draw target, the plan/candidate being
+// drawn, the read-only per-emulator contexts, and the mutable per-emulator
+// launch states it toggles. A parameter struct would only rename the same
+// arguments.
+#[allow(clippy::too_many_arguments)]
 fn show_candidate(
     ui: &mut egui::Ui,
     plan: &LaunchPlan,

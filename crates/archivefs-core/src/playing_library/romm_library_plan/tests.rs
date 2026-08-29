@@ -483,7 +483,7 @@ fn apply_reuses_the_existing_transaction_journal_and_rollback_and_leaves_origina
 
     let journal_dir = temp.path().join("journal");
     std::fs::create_dir_all(&journal_dir).unwrap();
-    std::fs::create_dir_all(&romm_root.join("roms/gba")).unwrap();
+    std::fs::create_dir_all(romm_root.join("roms/gba")).unwrap();
     write_journal(&journal_dir, &transaction).unwrap();
     let approved_paths = transaction
         .entries

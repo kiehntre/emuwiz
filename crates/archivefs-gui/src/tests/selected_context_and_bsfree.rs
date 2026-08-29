@@ -3039,7 +3039,7 @@ fn max_shape_right(output: &egui::FullOutput) -> f32 {
 fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport() {
     let width = 1280.0_f32;
     let height = 720.0_f32;
-    let archive = Archive::from_path(&PathBuf::from("/roms/a.zip")).unwrap();
+    let archive = Archive::from_path(PathBuf::from("/roms/a.zip")).unwrap();
     let long_mount_path = PathBuf::from(format!(
         "/mnt/archivefs/{}/very-long-game-title",
         "extremely-long-platform-directory-segment".repeat(6)

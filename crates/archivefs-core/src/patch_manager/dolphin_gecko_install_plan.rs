@@ -348,7 +348,7 @@ pub fn load_dolphin_ini(path: &Path) -> Result<LoadedDolphinIni, DolphinInstallP
             ),
         )
     })?;
-    let document = parse_dolphin_ini(&text);
+    let document = parse_dolphin_ini(text);
     if document
         .warnings
         .iter()

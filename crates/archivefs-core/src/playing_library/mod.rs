@@ -345,6 +345,12 @@ fn elect_family(
 /// A rank tier: every candidate is ranked against the ordered preference
 /// list; the best rank survives, the rest are narrated away. No preference
 /// expressed (empty list) or a single survivor disables the tier entirely.
+// Each argument is a distinct in/out channel of one election pass (the
+// mutable survivor set, its per-member reason and step logs, and several
+// pure closures the caller composes per tier); bundling them into a struct
+// would only move the same 10 fields behind one name without making any
+// call site clearer.
+#[allow(clippy::too_many_arguments)]
 fn run_rank_tier(
     tier_label: &'static str,
     enabled: bool,

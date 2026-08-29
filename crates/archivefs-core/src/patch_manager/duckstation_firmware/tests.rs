@@ -327,7 +327,8 @@ fn matched_record_metadata_is_retained() {
     write_bios(&fixture.profile.bios_path, "scph1001.bin", BIOS_BYTES);
     let inspection = inspection_for(&fixture, "SLUS-12345");
     let record = record_for("PS1 BIOS SCPH-1001", BIOS_BYTES);
-    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &[record.clone()]);
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, std::slice::from_ref(&record));
     let DuckStationBiosVerificationOutcome::Verified(verified) = outcome else {
         panic!("expected Verified");
     };

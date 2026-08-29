@@ -62,7 +62,7 @@ fn blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker 
 pub(crate) fn direct_ps3_content_is_supported(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map_or(true, |extension| extension.eq_ignore_ascii_case("iso"))
+        .is_none_or(|extension| extension.eq_ignore_ascii_case("iso"))
 }
 
 /// Builds `[rpcs3] [content]` from a resolved PS3 candidate and a fresh safe
@@ -161,17 +161,16 @@ pub fn build_rpcs3_command_plan(
             None
         }
     };
-    if let Some(path) = &content_path {
-        if crate::archive_kind(path).is_some_and(|kind| kind.is_mount_input())
+    if let Some(path) = &content_path
+        && (crate::archive_kind(path).is_some_and(|kind| kind.is_mount_input())
             || !direct_ps3_content_is_supported(path)
             || candidate.content.container
-                != Some(crate::launch::planning::LaunchContainerKind::PlainFile)
-        {
-            blockers.push(blocker(
-                LaunchBlockerKind::Rpcs3ContentFormatUnsupported,
-                "only a direct PS3 ISO or an already-resolved extracted PS3 folder is supported",
-            ));
-        }
+                != Some(crate::launch::planning::LaunchContainerKind::PlainFile))
+    {
+        blockers.push(blocker(
+            LaunchBlockerKind::Rpcs3ContentFormatUnsupported,
+            "only a direct PS3 ISO or an already-resolved extracted PS3 folder is supported",
+        ));
     }
     let binding = match binding {
         Ok(binding) => Some(binding),

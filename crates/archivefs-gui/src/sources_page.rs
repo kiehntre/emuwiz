@@ -222,13 +222,13 @@ pub(super) fn show_retroarch_catalogue_manager(
                         if let Some(count) = entry.indexed_file_count {
                             ui.label(format!("Indexed: {count}"));
                         }
-                        if let Some(count) = entry.excluded_file_count {
-                            if count > 0 {
-                                ui.label(format!(
-                                    "{count} cheat file{} could not be read (see Technical details below)",
-                                    if count == 1 { "" } else { "s" }
-                                ));
-                            }
+                        if let Some(count) = entry.excluded_file_count
+                            && count > 0
+                        {
+                            ui.label(format!(
+                                "{count} cheat file{} could not be read (see Technical details below)",
+                                if count == 1 { "" } else { "s" }
+                            ));
                         }
                         if let Some(bytes) = entry.total_bytes {
                             ui.label(format!("Verified size: {}", format_size(Some(bytes))));

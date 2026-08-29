@@ -92,13 +92,14 @@ pub struct DatSource {
 /// This is a whole-DAT (header-level) policy, matching where RomVault's own
 /// `<romvault forcepacking="..." />` extension lives: one DAT file declares
 /// one policy for every game it contains.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatPackingPolicy {
     /// No explicit packing-policy marker - the existing member-based
     /// archive inspection applies unchanged. This is the default for
     /// every DAT that does not carry the marker, and for every non-Logiqx
     /// format (the marker is a Logiqx header extension).
+    #[default]
     Standard,
     /// RomVault `<romvault forcepacking="fileonly" />` (or its `"file"`
     /// alias): the archive file itself is the hashed DAT item. Its
@@ -120,12 +121,6 @@ pub enum DatPackingPolicy {
     /// (`crate::dat::sources::audit_run::DatAuditError`) rather than
     /// guessing `Standard` or `FileOnly`.
     Unrecognized(String),
-}
-
-impl Default for DatPackingPolicy {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 /// A checksum algorithm as it appears in a DAT file.

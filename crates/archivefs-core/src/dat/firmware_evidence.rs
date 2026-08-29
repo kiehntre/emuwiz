@@ -263,8 +263,8 @@ pub fn redump_bios_evidence_from_dat(
 
 /// Extracts authoritative PS2 BIOS firmware evidence from an already-parsed
 /// DAT catalogue. A thin, behavior-preserving wrapper over
-/// [`redump_bios_evidence_from_dat`] fixed to [`FirmwareSystem::PlayStation2`]
-/// - kept so existing callers (PCSX2 BIOS verification) never need to
+/// [`redump_bios_evidence_from_dat`] fixed to [`FirmwareSystem::PlayStation2`] -
+/// kept so existing callers (PCSX2 BIOS verification) never need to
 /// change.
 pub fn ps2_bios_evidence_from_dat(
     parsed: &ParsedDat,

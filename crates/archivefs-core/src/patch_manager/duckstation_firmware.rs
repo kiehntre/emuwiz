@@ -155,6 +155,11 @@ pub struct DuckStationVerifiedBios {
 
 /// The result of verifying (or attempting to verify) DuckStation's
 /// configured PS1 BIOS for one profile/game.
+// One-shot value returned by value from a single verification call and
+// immediately matched; it is never held in a collection, so the ~280-byte
+// `Verified` payload is not a memory-footprint concern and boxing it would
+// only add indirection to every match arm.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DuckStationBiosVerificationOutcome {
     /// The selected BIOS file exists, is a regular non-symlinked file, was
@@ -175,8 +180,8 @@ pub enum DuckStationBiosVerificationOutcome {
     /// refused before any byte is ever read from it.
     Unsafe { path: PathBuf, detail: String },
     /// More than one region-specific BIOS path is configured and the
-    /// required region could not be determined from a verified PS1 serial
-    /// - which file DuckStation will actually load is not resolvable from
+    /// required region could not be determined from a verified PS1 serial -
+    /// which file DuckStation will actually load is not resolvable from
     /// local evidence alone, so this never silently picks one.
     Ambiguous { detail: String },
     /// DuckStation's global configuration and the per-game configuration

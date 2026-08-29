@@ -421,8 +421,10 @@ mod tests {
 
     #[test]
     fn a_configured_timeout_within_bounds_is_used_as_is() {
-        let mut settings = ProviderSettings::default();
-        settings.import_timeout_seconds = Some(900);
+        let settings = ProviderSettings {
+            import_timeout_seconds: Some(900),
+            ..Default::default()
+        };
         assert_eq!(
             settings.effective_import_timeout(),
             std::time::Duration::from_secs(900)
@@ -431,8 +433,10 @@ mod tests {
 
     #[test]
     fn a_configured_timeout_below_the_floor_is_clamped_up() {
-        let mut settings = ProviderSettings::default();
-        settings.import_timeout_seconds = Some(1);
+        let settings = ProviderSettings {
+            import_timeout_seconds: Some(1),
+            ..Default::default()
+        };
         assert_eq!(
             settings.effective_import_timeout(),
             std::time::Duration::from_secs(MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS as u64)
@@ -441,8 +445,10 @@ mod tests {
 
     #[test]
     fn a_configured_timeout_above_the_ceiling_is_clamped_down() {
-        let mut settings = ProviderSettings::default();
-        settings.import_timeout_seconds = Some(u32::MAX);
+        let settings = ProviderSettings {
+            import_timeout_seconds: Some(u32::MAX),
+            ..Default::default()
+        };
         assert_eq!(
             settings.effective_import_timeout(),
             std::time::Duration::from_secs(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS as u64),
@@ -453,8 +459,8 @@ mod tests {
     #[test]
     fn the_ceiling_is_finite_and_bounded() {
         // Item 4's explicit requirement: no "unlimited" setting is offered.
-        assert!(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS < u32::MAX);
-        assert!(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS > DEFAULT_IMPORT_TIMEOUT_SECONDS);
-        assert!(MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS < DEFAULT_IMPORT_TIMEOUT_SECONDS);
+        const { assert!(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS < u32::MAX) };
+        const { assert!(MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS > DEFAULT_IMPORT_TIMEOUT_SECONDS) };
+        const { assert!(MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS < DEFAULT_IMPORT_TIMEOUT_SECONDS) };
     }
 }

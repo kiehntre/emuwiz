@@ -69,6 +69,11 @@ pub struct Pcsx2VerifiedBios {
 
 /// The result of verifying (or attempting to verify) one PCSX2 profile's
 /// selected BIOS.
+// One-shot value returned by value from a single verification call and
+// immediately matched; it is never held in a collection, so the ~264-byte
+// `Verified` payload is not a memory-footprint concern and boxing it would
+// only add indirection to every match arm.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pcsx2BiosVerificationOutcome {
     /// The selected BIOS file exists, is a regular non-symlinked file, was

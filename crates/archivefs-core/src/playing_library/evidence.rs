@@ -106,12 +106,9 @@ const LANGUAGE_BASE_CODES: &[&str] = &[
 fn recognized_language(token: &str) -> Option<String> {
     let mut parts = token.split('-');
     let base = parts.next()?;
-    let Some(code) = LANGUAGE_BASE_CODES
+    let code = LANGUAGE_BASE_CODES
         .iter()
-        .find(|code| code.eq_ignore_ascii_case(base))
-    else {
-        return None;
-    };
+        .find(|code| code.eq_ignore_ascii_case(base))?;
     let mut language = String::new();
     // Preserve the provider's own capitalisation (`Pt-BR` stays `Pt-BR`).
     language.push_str(&base[..code.len()]);
@@ -120,9 +117,7 @@ fn recognized_language(token: &str) -> Option<String> {
             return None;
         }
         let mut chars = suffix.chars();
-        let Some(head) = chars.next() else {
-            return None;
-        };
+        let head = chars.next()?;
         if !head.is_ascii_alphabetic() || !chars.all(|rest| rest.is_ascii_alphanumeric()) {
             return None;
         }

@@ -342,8 +342,8 @@ fn classify_entry(
 
 /// A conservative, read-only proxy for [`crate::safe_read`]'s symlink
 /// policy: the symlink must resolve (no break, no loop) and its canonical
-/// target must lie inside a configured trusted root. This is advisory only
-/// - the authoritative check runs again, unchanged, inside
+/// target must lie inside a configured trusted root. This is advisory only -
+/// the authoritative check runs again, unchanged, inside
 /// [`crate::safe_read::open_bounded_read`] and the apply engine's own
 /// preflight when the plan is actually applied.
 fn check_symlink_source_safety(source: &Path, trusted: &TrustedRoots) -> Result<(), String> {

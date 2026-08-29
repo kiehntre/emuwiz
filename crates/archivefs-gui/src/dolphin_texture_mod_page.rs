@@ -969,18 +969,17 @@ fn show_pack_builder_preview(
             destination_root,
         });
     }
-    if save {
-        if let Some(path) = rfd::FileDialog::new()
+    if save
+        && let Some(path) = rfd::FileDialog::new()
             .add_filter("Dolphin texture-pack manifest", &["json"])
             .save_file()
-        {
-            match save_pack_manifest(&path, &preview.manifest) {
-                Ok(()) => state.stage = Some(DolphinTextureModStage::PackManifestSaved { path }),
-                Err(error) => {
-                    state.stage = Some(DolphinTextureModStage::Failed {
-                        detail: format!("could not save manifest: {error}"),
-                    })
-                }
+    {
+        match save_pack_manifest(&path, &preview.manifest) {
+            Ok(()) => state.stage = Some(DolphinTextureModStage::PackManifestSaved { path }),
+            Err(error) => {
+                state.stage = Some(DolphinTextureModStage::Failed {
+                    detail: format!("could not save manifest: {error}"),
+                })
             }
         }
     }

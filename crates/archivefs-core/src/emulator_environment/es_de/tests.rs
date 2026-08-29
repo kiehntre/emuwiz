@@ -68,7 +68,7 @@ const ONE_SYSTEM_XML: &str = r#"<?xml version="1.0"?>
 </systemList>
 "#;
 
-fn profile_by_kind<'a>(report: &'a EsDeEnvironmentReport, kind: ProfileKind) -> &'a EsDeProfile {
+fn profile_by_kind(report: &EsDeEnvironmentReport, kind: ProfileKind) -> &EsDeProfile {
     report
         .profiles
         .iter()

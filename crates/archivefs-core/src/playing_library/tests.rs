@@ -68,14 +68,14 @@ fn tree_snapshot(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(current) = stack.pop() {
-        if current.is_dir() {
-            if let Ok(entries) = fs::read_dir(&current) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    paths.push(path.clone());
-                    if path.is_dir() {
-                        stack.push(path);
-                    }
+        if current.is_dir()
+            && let Ok(entries) = fs::read_dir(&current)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                paths.push(path.clone());
+                if path.is_dir() {
+                    stack.push(path);
                 }
             }
         }
@@ -344,7 +344,7 @@ fn plan_points_at_originals_and_touches_nothing() {
     fs::write(source.join("Sonic the Hedgehog (USA).zip"), b"usa").expect("write source");
     let destination_root = temp.path().join("playing library");
 
-    let before_source_tree = tree_snapshot(&temp.path());
+    let before_source_tree = tree_snapshot(temp.path());
 
     let dat = synthetic_dat(vec![
         game("Sonic the Hedgehog (Europe)", None),
@@ -391,7 +391,7 @@ fn plan_points_at_originals_and_touches_nothing() {
 
     // Planning created nothing: not even the destination root.
     assert!(!destination_root.exists());
-    let after_source_tree = tree_snapshot(&temp.path());
+    let after_source_tree = tree_snapshot(temp.path());
     assert_eq!(before_source_tree, after_source_tree);
     // Source files' bytes are intact.
     assert_eq!(

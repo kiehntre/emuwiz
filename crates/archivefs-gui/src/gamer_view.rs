@@ -1316,7 +1316,7 @@ pub(crate) fn show_gamer_view(
                                     featured_meta_line(
                                         ui,
                                         featured_platform_line(
-                                            &platform,
+                                            platform,
                                             archive_kind_name(record.mount_plan.archive.kind),
                                             metadata_view.release_year,
                                         ),

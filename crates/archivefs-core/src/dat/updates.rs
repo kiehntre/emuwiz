@@ -1873,11 +1873,12 @@ fn publish_validated_snapshot(
     // Only after the state pointer is durable may an object older than the
     // retained previous snapshot be forgotten.  A failed cleanup leaves an
     // unreachable immutable object, never damages the active source.
-    if let Some(old_previous) = old_previous {
-        if old_current.as_ref() != Some(&snapshot) && old_previous != snapshot {
-            let obsolete = objects.join(old_previous.sha256);
-            let _ = fs::remove_file(obsolete);
-        }
+    if let Some(old_previous) = old_previous
+        && old_current.as_ref() != Some(&snapshot)
+        && old_previous != snapshot
+    {
+        let obsolete = objects.join(old_previous.sha256);
+        let _ = fs::remove_file(obsolete);
     }
     Ok(ManagedDatUpdateOutcome::Updated {
         upstream_revision: revision.label,
@@ -2072,7 +2073,6 @@ struct FetchedRedumpBios {
 /// [`update_redump_bios`] (which additionally promotes the validated
 /// staging file on success). The caller's [`ManagedDatStagingCleanup`]
 /// guard is what actually deletes the staging file in either case.
-
 fn fetch_and_validate_redump_bios(
     descriptor: &ManagedDatSourceDescriptor,
     system: RedumpBiosSystem,
