@@ -188,6 +188,16 @@ pub enum LaunchBlockerKind {
     PpssppDiscIdMissing,
     /// The PPSSPP profile/executable binding could not be safely resolved.
     PpssppBindingUnavailable,
+    /// A command-plan request was given a non-ScummVM launch target.
+    ScummVmCandidateRequired,
+    /// The canonical identity does not target ScummVM.
+    ScummVmPlatformMismatch,
+    /// The supplied content is not a safe extracted ScummVM game folder.
+    ScummVmContentUnsupported,
+    /// No verified ScummVM engine/game ID is available.
+    ScummVmGameIdMissing,
+    /// The ScummVM executable/profile binding could not be safely resolved.
+    ScummVmBindingUnavailable,
     /// A Flycast command-plan request was given a non-Flycast-standalone
     /// launch candidate.
     FlycastCandidateRequired,

@@ -85,6 +85,8 @@ pub mod readiness;
 pub mod retroarch_command;
 pub mod rpcs3_command;
 pub mod rpcs3_execution;
+pub mod scummvm_command;
+pub mod scummvm_execution;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
@@ -197,6 +199,16 @@ pub use rpcs3_execution::{
     Rpcs3LaunchExitReport, Rpcs3LaunchPreflightError, Rpcs3LaunchPreflightErrorKind,
     Rpcs3LaunchRequest, Rpcs3LaunchSpawnError, preflight_and_launch_rpcs3, preflight_rpcs3_launch,
     spawn_rpcs3,
+};
+pub use scummvm_command::{
+    SCUMMVM_SUPPORTED_PLATFORM_ID, ScummVmCommand, ScummVmCommandPlan, ScummVmCommandSelection,
+    ScummVmNativeLaunchBinding, build_scummvm_command_plan, resolve_scummvm_native_launch_binding,
+    resolve_scummvm_native_launch_binding_at,
+};
+pub use scummvm_execution::{
+    LaunchedScummVmProcess, ScummVmLaunchExecutionError, ScummVmLaunchPreflightError,
+    ScummVmLaunchPreflightErrorKind, ScummVmLaunchRequest, ScummVmLaunchSpawnError,
+    preflight_and_launch_scummvm, preflight_scummvm_launch, spawn_scummvm,
 };
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,

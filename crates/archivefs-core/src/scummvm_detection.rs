@@ -72,6 +72,16 @@ pub fn detect_scummvm_directory(path: &Path) -> Result<ScummVmDetectedGame, Scum
     detect_scummvm_directory_with_executable(path, &executable)
 }
 
+/// Returns whether a detector-produced engine/game identifier has the
+/// qualified form ScummVM uses for launch targets. This validates syntax only;
+/// it does not make an identifier authoritative.
+pub fn is_valid_scummvm_game_id(value: &str) -> bool {
+    let Some((engine, game)) = value.split_once(':') else {
+        return false;
+    };
+    valid_id(engine) && valid_id(game) && !game.contains(':')
+}
+
 /// Testable form of [`detect_scummvm_directory`] which still uses the exact
 /// production argv and output parser. The executable is never invoked through
 /// a shell.
@@ -143,7 +153,7 @@ fn validate_game_directory(path: &Path) -> Result<(), ScummVmDetectionError> {
     Ok(())
 }
 
-fn resolve_scummvm_executable() -> Option<PathBuf> {
+pub fn resolve_scummvm_executable() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     candidates.push(PathBuf::from("/usr/games/scummvm"));
     candidates.push(PathBuf::from("/usr/bin/scummvm"));
