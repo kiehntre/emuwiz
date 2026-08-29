@@ -67,7 +67,7 @@ use crate::dat::dependency::resolve::{CollectionEvidence, resolve_collection};
 use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
 use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation};
 use crate::dat::limits::DatLimits;
-use crate::dat::model::{DatGameEntry, DatPackingPolicy, ParsedDat};
+use crate::dat::model::{DatEcosystem, DatGameEntry, DatPackingPolicy, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
 use crate::dat::policy::candidate::candidate_for_rom;
 use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
@@ -258,6 +258,28 @@ pub struct DatAuditOutcome {
     pub catalogue_names: Vec<String>,
     pub catalogue_entries: usize,
     pub catalogue_roms: usize,
+    /// The first parsed DAT file's `<version>` header text, when present.
+    /// This is the closest thing most DAT publishers (No-Intro, Redump, ...)
+    /// have to a revision/snapshot identifier, so completion UI can say
+    /// precisely which catalogue snapshot "100%" is measured against. `None`
+    /// for a combined multi-source audit (`run_combined_dat_audit`), which
+    /// has no single header to report.
+    #[serde(default)]
+    pub catalogue_version: Option<String>,
+    /// The first parsed DAT file's `<author>` header text, when present.
+    #[serde(default)]
+    pub catalogue_author: Option<String>,
+    /// The first parsed DAT file's `<homepage>` header text, when present.
+    /// Several No-Intro DATs put the provider name itself here rather than a
+    /// URL.
+    #[serde(default)]
+    pub catalogue_homepage: Option<String>,
+    /// The first parsed DAT file's detected ecosystem - already-classified
+    /// provenance ([`DatEcosystem`] detection runs at parse time from the
+    /// header and naming conventions this crate already trusts), not a new
+    /// text heuristic. `None` for a combined multi-source audit.
+    #[serde(default)]
+    pub catalogue_ecosystem: Option<DatEcosystem>,
     /// Orthogonal content classification. It never changes `report` or its
     /// counts; it controls only downstream selection eligibility.
     pub content: DatAuditContentOutcome,
@@ -541,6 +563,16 @@ pub fn run_dat_audit_with_cache(
     let disk_index = DatDiskIndex::build(&catalogue);
     let catalogue_entries = catalogue.source.entry_count;
     let catalogue_roms = catalogue.source.rom_count;
+    // Carried straight from the header of the first DAT file this source
+    // parsed - never reparsed, never guessed. For a folder source merging
+    // several DAT files, this is deliberately the first file's header only:
+    // `entry_count`/`rom_count` above are summed across every file, but a
+    // revision/provider string is not meaningfully summable, and showing the
+    // first is more honest than blending several into one string.
+    let catalogue_version = catalogue.source.version.clone();
+    let catalogue_author = catalogue.source.author.clone();
+    let catalogue_homepage = catalogue.source.homepage.clone();
+    let catalogue_ecosystem = Some(catalogue.source.ecosystem);
     let content_selection = request
         .policy
         .as_ref()
@@ -681,6 +713,10 @@ pub fn run_dat_audit_with_cache(
         catalogue_names,
         catalogue_entries,
         catalogue_roms,
+        catalogue_version,
+        catalogue_author,
+        catalogue_homepage,
+        catalogue_ecosystem,
         content: DatAuditContentOutcome {
             selection: content_selection,
             catalogue: catalogue_content,
@@ -1001,6 +1037,13 @@ pub fn run_combined_dat_audit_with_cache(
         catalogue_names,
         catalogue_entries,
         catalogue_roms,
+        // Several catalogues are merged here - no single header to report,
+        // so completion UI correctly finds no revision context and does not
+        // claim one.
+        catalogue_version: None,
+        catalogue_author: None,
+        catalogue_homepage: None,
+        catalogue_ecosystem: None,
         content: DatAuditContentOutcome {
             selection: ContentSelectionPolicy::AllEntries,
             catalogue: DatContentSummary::default(),

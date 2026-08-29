@@ -484,7 +484,7 @@ impl AuditProgressView {
 }
 
 /// Everything the page draws.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DatSourcesPageView {
     pub(crate) rows: Vec<DatSourceRowView>,
     /// Separately configured, app-managed DATs. These are never inferred from
@@ -980,7 +980,7 @@ pub(crate) struct AuditCategoryView {
     pub(crate) meaning: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AuditResultView {
     pub(crate) source_display_name: String,
     pub(crate) source_id: String,
@@ -1013,6 +1013,304 @@ pub(crate) struct AuditResultView {
     /// policy. Never changes a verdict; it shows the preferred candidate
     /// order for the files whose hash matched several catalogue entries.
     pub(crate) policy: Option<AuditPolicyView>,
+    /// How much of this exact DAT/source snapshot the audit found locally,
+    /// or `None` when a completion claim would not have a trustworthy basis
+    /// (see [`dat_completion_view`]'s doc).
+    pub(crate) completion: Option<DatCompletionView>,
+}
+
+/// How much of one selected DAT/source's catalogue the last audit verified
+/// locally, and what that means in plain language.
+///
+/// "Verified" and "total" are never re-derived from a rescan: both come
+/// straight from the already-loaded [`DatAuditOutcome`] a completed audit
+/// produced - `total` from the catalogue's own declared entry count, and
+/// `verified` from counting the *distinct* catalogue games this audit's
+/// already-computed verdicts named with a confident, unambiguous
+/// cryptographic match. Building this view is one pass over data the audit
+/// already holds in memory; nothing here reads a file or a DAT again.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DatCompletionView {
+    /// Distinct catalogue games this audit found unambiguous evidence for.
+    pub(crate) verified: usize,
+    /// The catalogue's own declared entry (game) count.
+    pub(crate) total: usize,
+    /// `verified / total`, as a percentage, rounded to two decimal places.
+    /// `None` exactly when `state` is `Unknown` - a fabricated percentage
+    /// over an untrustworthy total is worse than no percentage at all.
+    pub(crate) percent: Option<f64>,
+    pub(crate) state: DatCompletionState,
+    /// `total - verified`, or `None` when `state` is `Unknown` and there is
+    /// nothing safe to subtract from. Never derived from unmatched *local*
+    /// files - see `extra_local_files`.
+    pub(crate) missing: Option<usize>,
+    /// Local files this audit compared that matched no catalogue entry at
+    /// all (`AuditVerdict::NotInDat`). A distinct concept from `missing`:
+    /// a library can have both catalogue entries with no local file
+    /// (missing) and local files with no catalogue entry (extra) at once,
+    /// and neither is derived from the other.
+    pub(crate) extra_local_files: usize,
+    /// The catalogue title(s) this completion is measured against - the
+    /// same names already shown as "Catalogue: ...".
+    pub(crate) source_title: String,
+    /// The provider name, when the DAT header carries one EmuWiz recognises
+    /// (its `<author>` or `<homepage>` text) - never guessed from the
+    /// source's display name or file path.
+    pub(crate) provider: Option<String>,
+    /// The DAT header's own `<version>` text - the closest thing most
+    /// publishers have to a revision/snapshot identifier. `None` when the
+    /// header did not carry one, or (for a combined multi-source audit)
+    /// when there is no single header to report.
+    pub(crate) revision: Option<String>,
+    /// True only when `state` is `Complete` and the provider looks like
+    /// No-Intro - see this view's constructor for why this is the one
+    /// provider-specific claim made here.
+    pub(crate) no_intro_complete_badge: bool,
+    /// Set when something about this run means the numbers above might
+    /// understate (never overstate) how complete the collection actually
+    /// is - a capped scan, or a catalogue file that failed to parse.
+    pub(crate) caveat: Option<String>,
+}
+
+/// Deterministic completion states, ordered from best to worst. `Complete`
+/// is the least reachable, matching `dat::set::SetState`'s own "Complete is
+/// the least reachable" convention for the same reason: it is the one claim
+/// that must never be produced by rounding or by a partial view of the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatCompletionState {
+    /// `verified == total`, `total > 0`.
+    Complete,
+    /// `>= 95% and < 100%`.
+    NearlyComplete,
+    /// `> 0% and < 95%`.
+    Incomplete,
+    /// `verified == 0`, `total > 0`.
+    NoneVerified,
+    /// `total` is unavailable or not trustworthy as a denominator (for
+    /// example a combined multi-source audit, or a catalogue that reported
+    /// zero entries).
+    Unknown,
+}
+
+impl DatCompletionState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "Complete",
+            Self::NearlyComplete => "Nearly complete",
+            Self::Incomplete => "Incomplete",
+            Self::NoneVerified => "None verified",
+            Self::Unknown => "Not enough information",
+        }
+    }
+
+    pub(crate) fn tone(self) -> widgets::StatusTone {
+        match self {
+            Self::Complete => widgets::StatusTone::Success,
+            Self::NearlyComplete => widgets::StatusTone::Warning,
+            Self::Incomplete | Self::NoneVerified => widgets::StatusTone::Blocked,
+            Self::Unknown => widgets::StatusTone::Pending,
+        }
+    }
+}
+
+/// Whether an outcome is the multi-source "audit everything enabled at once"
+/// pass rather than one selected DAT/source. Mirrors the literal id
+/// `run_combined_dat_audit_with_cache` constructs
+/// (`crates/archivefs-core/src/dat/sources/audit_run.rs`); a combined pass
+/// has no single catalogue snapshot, so it never gets a completion claim -
+/// see [`dat_completion_view`].
+fn is_combined_audit(outcome: &DatAuditOutcome) -> bool {
+    outcome.source_id == "combined-enabled-dat-sources"
+}
+
+/// Builds the completion view for one audit outcome, or `None` when a
+/// completion claim would not have a trustworthy basis: a combined
+/// multi-source audit (no single selected DAT), or a catalogue that
+/// declared zero entries (nothing to measure against).
+///
+/// # Why `verified` counts distinct games, not matched files
+///
+/// A library can hold more than one copy of the same ROM; counting matched
+/// *files* would let duplicates inflate completion past what the catalogue
+/// actually has. Counting distinct `game_name`s from
+/// [`AuditVerdict::Exact`] verdicts avoids that, and matches this DAT
+/// model's existing unit of "one catalogue set is one `<game>`" (see
+/// `dat::set`'s module doc).
+///
+/// `AuditVerdict::ExactMultipleCandidates` is deliberately excluded from
+/// this count even though [`AuditVerdict::is_confident`] treats it as
+/// cryptographic evidence: it names several *candidate* games, and crediting
+/// all of them (or guessing one) would overclaim which specific catalogue
+/// entry is actually verified. A file audited this way still counts toward
+/// `files_scanned`/the category breakdown elsewhere on the page; it is just
+/// never presented as proof that one particular game is present.
+///
+/// # Why `verified` cannot exceed `total`
+///
+/// Ordinarily distinct-games-matched cannot exceed the catalogue's own
+/// entry count, but a folder source can merge several DAT files whose game
+/// names collide, or a DAT can declare an entry count that undercounts its
+/// own `<game>` elements. Either way this clamps `verified` to `total`
+/// rather than ever showing a percentage above 100%, and remembers that it
+/// did so as a caveat rather than silently hiding the discrepancy.
+fn dat_completion_view(outcome: &DatAuditOutcome) -> Option<DatCompletionView> {
+    // A combined multi-source pass has no single selected DAT/snapshot to
+    // measure "100%" against at all - not even an "Unknown" claim about one
+    // - so this is the one case with no completion view whatsoever.
+    if is_combined_audit(outcome) {
+        return None;
+    }
+
+    let total = outcome.catalogue_entries;
+    let extra_local_files = outcome.report.summary.not_in_dat;
+
+    // A catalogue that declared zero entries has no trustworthy denominator:
+    // showing a percentage or a missing count here would be fabricated,
+    // never derived. This is the "Unknown/Not checked" state, not absence
+    // of the widget - the page still names the source and says plainly that
+    // there is not enough information.
+    if total == 0 {
+        return Some(DatCompletionView {
+            verified: 0,
+            total: 0,
+            percent: None,
+            state: DatCompletionState::Unknown,
+            missing: None,
+            extra_local_files,
+            source_title: outcome.catalogue_names.join(", "),
+            provider: provider_from_outcome(outcome),
+            revision: revision_from_outcome(outcome),
+            no_intro_complete_badge: false,
+            caveat: Some(
+                "This catalogue declared no entries, so completion cannot be measured against \
+                 it."
+                .to_string(),
+            ),
+        });
+    }
+
+    let mut confident_games: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for entry in &outcome.report.entries {
+        if let archivefs_core::dat::audit::AuditVerdict::Exact { game_name, .. } = &entry.verdict {
+            confident_games.insert(game_name.as_str());
+        }
+    }
+    let raw_verified = confident_games.len();
+    let verified = raw_verified.min(total);
+    let clamped = raw_verified > total;
+
+    let missing = total.saturating_sub(verified);
+    let percent = (verified as f64 / total as f64) * 100.0;
+    let rounded_percent = (percent * 100.0).round() / 100.0;
+
+    let state = if verified == total {
+        DatCompletionState::Complete
+    } else if rounded_percent >= 95.0 {
+        DatCompletionState::NearlyComplete
+    } else if verified > 0 {
+        DatCompletionState::Incomplete
+    } else {
+        DatCompletionState::NoneVerified
+    };
+
+    let provider = provider_from_outcome(outcome);
+    let revision = revision_from_outcome(outcome);
+    let no_intro_complete_badge =
+        looks_like_no_intro(outcome) && state == DatCompletionState::Complete;
+
+    let mut caveat_parts = Vec::new();
+    if outcome.truncated {
+        caveat_parts.push(
+            "The local scan stopped at a safety limit, so more matching files may exist than \
+             this run saw; completion may understate the true total, never overstate it."
+                .to_string(),
+        );
+    }
+    if !outcome.unreadable_catalogues.is_empty() {
+        caveat_parts.push(
+            "Part of this source's catalogue could not be read, so the total entry count may be \
+             lower than the source's real catalogue."
+                .to_string(),
+        );
+    }
+    if clamped {
+        caveat_parts.push(format!(
+            "{raw_verified} distinct catalogue games were matched, more than the catalogue's own \
+             {total}-entry count; the percentage below is capped at 100%."
+        ));
+    }
+    let caveat = if caveat_parts.is_empty() {
+        None
+    } else {
+        Some(caveat_parts.join(" "))
+    };
+
+    Some(DatCompletionView {
+        verified,
+        total,
+        percent: Some(rounded_percent.min(100.0)),
+        state,
+        missing: Some(missing),
+        extra_local_files,
+        source_title: outcome.catalogue_names.join(", "),
+        provider,
+        revision,
+        no_intro_complete_badge,
+        caveat,
+    })
+}
+
+/// The provider name.
+///
+/// Prefers the already-detected [`archivefs_core::dat::model::DatEcosystem`]
+/// - parse-time classification this crate already trusts, not a new text
+/// heuristic - when it names something specific. The `Generic*` variants
+/// mean the parser could not confirm a specific ecosystem, so those fall
+/// through to the header's own `<author>`, then `<homepage>` text (several
+/// No-Intro DATs put the provider name itself there rather than a URL).
+/// `None` when nothing above is available - never guessed from the source's
+/// display name or file path.
+fn provider_from_outcome(outcome: &DatAuditOutcome) -> Option<String> {
+    use archivefs_core::dat::model::DatEcosystem;
+    match outcome.catalogue_ecosystem {
+        Some(DatEcosystem::GenericLogiqx | DatEcosystem::GenericClrMamePro) | None => {
+            provider_from_header_text(outcome)
+        }
+        Some(ecosystem) => Some(ecosystem.label().to_string()),
+    }
+}
+
+fn provider_from_header_text(outcome: &DatAuditOutcome) -> Option<String> {
+    outcome
+        .catalogue_author
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or(outcome
+            .catalogue_homepage
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()))
+        .map(str::to_string)
+}
+
+/// The DAT header's own `<version>` text, when non-empty.
+fn revision_from_outcome(outcome: &DatAuditOutcome) -> Option<String> {
+    outcome
+        .catalogue_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Whether this outcome's detected ecosystem is specifically No-Intro - the
+/// one provider this view is allowed to badge specifically (see
+/// [`DatCompletionView::no_intro_complete_badge`]'s doc for why). Reads the
+/// same already-classified [`archivefs_core::dat::model::DatEcosystem`]
+/// `provider_from_outcome` does, never a text guess.
+fn looks_like_no_intro(outcome: &DatAuditOutcome) -> bool {
+    matches!(
+        outcome.catalogue_ecosystem,
+        Some(archivefs_core::dat::model::DatEcosystem::NoIntro)
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5350,6 +5648,7 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         content_selection: outcome.content.selection,
         content_summary: outcome.content.catalogue,
         policy: outcome.policy.as_ref().map(audit_policy_view),
+        completion: dat_completion_view(outcome),
     }
 }
 
@@ -9996,6 +10295,120 @@ fn show_unhashed_groups(ui: &mut egui::Ui, unhashed: &[(String, String)]) {
     );
 }
 
+/// The compact completion summary: a progress bar, the state badge, the
+/// verified/total/percent line, and missing/extra counts up front; revision,
+/// provider, and any caveat are one disclosure away rather than always on
+/// screen. Never recomputes anything - every number here already lives on
+/// `completion`.
+fn show_dat_completion(ui: &mut egui::Ui, completion: &DatCompletionView) {
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            widgets::status_badge(ui, completion.state.label(), completion.state.tone());
+            let headline = match completion.percent {
+                Some(percent) => format!(
+                    "Verified {} / {} · {}%",
+                    format_count(completion.verified as u64),
+                    format_count(completion.total as u64),
+                    format_percent(percent)
+                ),
+                // `total == 0`: no denominator to report a count or percent
+                // against - see `dat_completion_view`'s `Unknown` branch.
+                None => "Not enough information to measure completion".to_string(),
+            };
+            ui.label(egui::RichText::new(headline).strong());
+            if completion.no_intro_complete_badge {
+                widgets::status_badge(
+                    ui,
+                    "Complete against selected No-Intro DAT",
+                    widgets::StatusTone::Success,
+                );
+            }
+        });
+        if let Some(percent) = completion.percent {
+            ui.add(
+                egui::ProgressBar::new((percent / 100.0).clamp(0.0, 1.0) as f32).show_percentage(),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            if let Some(missing) = completion.missing {
+                ui.label(
+                    egui::RichText::new(format!("Missing: {}", format_count(missing as u64)))
+                        .color(theme::muted(ui)),
+                );
+            }
+            if completion.extra_local_files > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Extra (not in this catalogue): {}",
+                        format_count(completion.extra_local_files as u64)
+                    ))
+                    .color(theme::muted(ui)),
+                );
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!("Against: {}", completion.source_title))
+                .color(theme::muted(ui))
+                .small(),
+        );
+        if let Some(caveat) = &completion.caveat {
+            ui.add_space(4.0);
+            widgets::banner(
+                ui,
+                "This may understate completion",
+                caveat,
+                widgets::StatusTone::Warning,
+            );
+        }
+        widgets::technical_details(
+            ui,
+            ("dat_completion_details", &completion.source_title),
+            |ui| {
+                if let Some(provider) = &completion.provider {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Provider:").color(theme::muted(ui)));
+                        ui.label(provider);
+                    });
+                }
+                if let Some(revision) = &completion.revision {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Revision/snapshot:").color(theme::muted(ui)));
+                        widgets::copyable_value(ui, "Revision", revision);
+                    });
+                }
+                if completion.provider.is_none() && completion.revision.is_none() {
+                    ui.label(
+                        egui::RichText::new(
+                            "This DAT's header did not carry a provider or revision string.",
+                        )
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                }
+            },
+        );
+    });
+}
+
+fn format_percent(percent: f64) -> String {
+    format!("{percent:.2}")
+}
+
+/// `12438` -> `"12,438"`. Grouped by thousands for a count that can
+/// realistically run into five or six digits (a large No-Intro catalogue),
+/// where an ungrouped number is hard to read at a glance.
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().rev().enumerate() {
+        if position > 0 && position % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.chars().rev().collect()
+}
+
 fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
     widgets::section_header(ui, "Audit result", Some(&audit.headline));
     widgets::card(ui, |ui| {
@@ -10039,6 +10452,11 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
                     .color(theme::muted(ui))
                     .small(),
             );
+        }
+
+        if let Some(completion) = &audit.completion {
+            ui.add_space(8.0);
+            show_dat_completion(ui, completion);
         }
         ui.add_space(6.0);
 

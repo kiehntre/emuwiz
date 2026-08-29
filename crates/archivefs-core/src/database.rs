@@ -9602,6 +9602,10 @@ mod tests {
             catalogue_names: vec!["PSP".to_string()],
             catalogue_entries: 1,
             catalogue_roms: 1,
+            catalogue_version: None,
+            catalogue_author: None,
+            catalogue_homepage: None,
+            catalogue_ecosystem: None,
             unreadable_catalogues: Vec::new(),
             report: AuditReport {
                 entries: vec![AuditEntry {

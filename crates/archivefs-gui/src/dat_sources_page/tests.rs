@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-use archivefs_core::dat::audit::{AuditReport, AuditSummary};
+use archivefs_core::dat::audit::{AuditEntry, AuditReport, AuditSummary, AuditVerdict};
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::managed_sources::load_managed_dat_sources_from;
 use archivefs_core::dat::model::{DatEcosystem, DatFormat};
@@ -3053,6 +3053,10 @@ fn minimal_outcome() -> DatAuditOutcome {
         catalogue_names: vec!["Test No-Intro Collection".to_string()],
         catalogue_entries: 1,
         catalogue_roms: 1,
+        catalogue_version: None,
+        catalogue_author: None,
+        catalogue_homepage: None,
+        catalogue_ecosystem: None,
         unreadable_catalogues: Vec::new(),
         report: AuditReport {
             entries: Vec::new(),
@@ -7490,5 +7494,222 @@ fn no_intro_variant_labels_do_not_conflate_aftermarket_with_standard() {
             archivefs_core::identity_source::no_intro::NoIntroPackClassification::Standard
         ),
         "Standard No-Intro"
+    );
+}
+
+// --- DAT completion summary ------------------------------------------------
+
+/// One `Exact` match, naming a distinct game, so `verified` counts games
+/// rather than files.
+fn exact_entry(game_index: usize) -> AuditEntry {
+    AuditEntry {
+        local_path: format!("/tmp/roms/game-{game_index}.bin"),
+        local_filename: format!("game-{game_index}.bin"),
+        verdict: AuditVerdict::Exact {
+            game_name: format!("Game {game_index}"),
+            rom_name: format!("game-{game_index}.bin"),
+            algorithm: "SHA-1",
+        },
+    }
+}
+
+fn not_in_dat_entry(index: usize) -> AuditEntry {
+    AuditEntry {
+        local_path: format!("/tmp/roms/extra-{index}.bin"),
+        local_filename: format!("extra-{index}.bin"),
+        verdict: AuditVerdict::NotInDat,
+    }
+}
+
+/// An outcome with `total` catalogue entries, `verified` of them matched by
+/// a distinct-game `Exact` verdict, and `extra` local files that matched
+/// nothing in the catalogue - built the same way a real audit's report
+/// would be shaped, so `dat_completion_view` sees exactly the data a real
+/// run produces.
+fn completion_outcome(total: usize, verified: usize, extra: usize) -> DatAuditOutcome {
+    let mut entries: Vec<AuditEntry> = (0..verified).map(exact_entry).collect();
+    entries.extend((0..extra).map(not_in_dat_entry));
+    let summary = AuditSummary {
+        total: entries.len(),
+        exact: verified,
+        not_in_dat: extra,
+        ..AuditSummary::default()
+    };
+    let mut outcome = minimal_outcome();
+    outcome.catalogue_entries = total;
+    outcome.catalogue_roms = total;
+    outcome.report = AuditReport { entries, summary };
+    outcome
+}
+
+#[test]
+fn exactly_100_of_100_is_complete_at_100_percent() {
+    let outcome = completion_outcome(100, 100, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::Complete);
+    assert_eq!(completion.percent, Some(100.0));
+    assert_eq!(completion.verified, 100);
+    assert_eq!(completion.total, 100);
+    assert_eq!(completion.missing, Some(0));
+}
+
+#[test]
+fn ninety_nine_of_100_is_nearly_complete_at_99_percent() {
+    let outcome = completion_outcome(100, 99, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::NearlyComplete);
+    assert_eq!(completion.percent, Some(99.0));
+}
+
+#[test]
+fn ninety_five_of_100_is_nearly_complete() {
+    let outcome = completion_outcome(100, 95, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::NearlyComplete);
+    assert_eq!(completion.percent, Some(95.0));
+}
+
+#[test]
+fn ninety_four_of_100_is_incomplete() {
+    let outcome = completion_outcome(100, 94, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::Incomplete);
+}
+
+#[test]
+fn one_of_100_is_incomplete() {
+    let outcome = completion_outcome(100, 1, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::Incomplete);
+}
+
+#[test]
+fn zero_of_100_is_none_verified() {
+    let outcome = completion_outcome(100, 0, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::NoneVerified);
+    assert_eq!(completion.percent, Some(0.0));
+}
+
+#[test]
+fn an_unavailable_total_is_unknown_with_no_fabricated_percentage() {
+    // `catalogue_entries == 0`: nothing to measure completion against.
+    let outcome = completion_outcome(0, 0, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.state, DatCompletionState::Unknown);
+    assert_eq!(
+        completion.percent, None,
+        "an untrustworthy total must never produce a percentage"
+    );
+    assert_eq!(completion.missing, None);
+    assert!(completion.caveat.is_some());
+}
+
+#[test]
+fn verified_exceeding_total_is_clamped_not_shown_over_100_percent() {
+    // Two distinct matched games against a catalogue that only declares one
+    // entry - a real inconsistency (e.g. a merged folder source), not
+    // something that should ever render as 200%.
+    let outcome = completion_outcome(1, 2, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.verified, 1, "verified is clamped to total");
+    assert_eq!(completion.total, 1);
+    assert_eq!(completion.percent, Some(100.0));
+    assert!(
+        completion.caveat.is_some(),
+        "clamping must be surfaced, not silently hidden"
+    );
+}
+
+#[test]
+fn missing_is_total_minus_verified() {
+    let outcome = completion_outcome(12_500, 12_438, 0);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.missing, Some(62));
+}
+
+#[test]
+fn extra_local_files_are_never_folded_into_missing_or_total() {
+    // 60 missing catalogue entries and 5 unrelated extra local files at the
+    // same time: neither count may affect the other.
+    let outcome = completion_outcome(100, 40, 5);
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.total, 100, "extra files never inflate the total");
+    assert_eq!(completion.missing, Some(60));
+    assert_eq!(
+        completion.extra_local_files, 5,
+        "extra files are reported, not merged into missing"
+    );
+}
+
+#[test]
+fn completion_details_name_the_exact_selected_source_and_revision() {
+    let mut outcome = completion_outcome(1, 1, 0);
+    outcome.catalogue_names = vec!["Nintendo - Game Boy Advance".to_string()];
+    outcome.catalogue_version = Some("20240115-123456".to_string());
+    outcome.catalogue_author = Some("No-Intro".to_string());
+    let completion = dat_completion_view(&outcome).unwrap();
+    assert_eq!(completion.source_title, "Nintendo - Game Boy Advance");
+    assert_eq!(completion.revision.as_deref(), Some("20240115-123456"));
+    assert_eq!(completion.provider.as_deref(), Some("No-Intro"));
+}
+
+#[test]
+fn no_intro_badge_appears_only_at_exact_100_percent() {
+    let mut complete = completion_outcome(10, 10, 0);
+    complete.catalogue_ecosystem = Some(archivefs_core::dat::model::DatEcosystem::NoIntro);
+    let complete_view = dat_completion_view(&complete).unwrap();
+    assert!(complete_view.no_intro_complete_badge);
+
+    let mut nearly = completion_outcome(10, 9, 0);
+    nearly.catalogue_ecosystem = Some(archivefs_core::dat::model::DatEcosystem::NoIntro);
+    let nearly_view = dat_completion_view(&nearly).unwrap();
+    assert!(
+        !nearly_view.no_intro_complete_badge,
+        "the badge must not appear below exact 100%"
+    );
+
+    // A non-No-Intro provider never gets the badge even at 100%.
+    let mut redump = completion_outcome(10, 10, 0);
+    redump.catalogue_ecosystem = Some(archivefs_core::dat::model::DatEcosystem::Redump);
+    let redump_view = dat_completion_view(&redump).unwrap();
+    assert!(!redump_view.no_intro_complete_badge);
+}
+
+#[test]
+fn switching_the_selected_source_updates_the_completion_basis() {
+    let mut gba = completion_outcome(100, 100, 0);
+    gba.catalogue_names = vec!["Nintendo - Game Boy Advance".to_string()];
+    let mut nes = completion_outcome(200, 50, 0);
+    nes.catalogue_names = vec!["Nintendo Entertainment System".to_string()];
+
+    let gba_completion = dat_completion_view(&gba).unwrap();
+    let nes_completion = dat_completion_view(&nes).unwrap();
+
+    assert_eq!(gba_completion.source_title, "Nintendo - Game Boy Advance");
+    assert_eq!(gba_completion.state, DatCompletionState::Complete);
+    assert_eq!(nes_completion.source_title, "Nintendo Entertainment System");
+    assert_eq!(nes_completion.state, DatCompletionState::Incomplete);
+}
+
+#[test]
+fn building_the_completion_view_never_mutates_the_outcome() {
+    let outcome = completion_outcome(100, 62, 3);
+    let before = outcome.clone();
+    let _ = dat_completion_view(&outcome);
+    let _ = dat_completion_view(&outcome);
+    assert_eq!(
+        outcome, before,
+        "reading a completion view must never change the audit outcome"
+    );
+}
+
+#[test]
+fn combined_multi_source_audits_get_no_completion_claim() {
+    let mut outcome = completion_outcome(100, 100, 0);
+    outcome.source_id = "combined-enabled-dat-sources".to_string();
+    assert!(
+        dat_completion_view(&outcome).is_none(),
+        "a combined audit has no single selected DAT/snapshot to measure completion against"
     );
 }
