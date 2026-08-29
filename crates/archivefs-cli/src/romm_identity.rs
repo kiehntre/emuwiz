@@ -1518,6 +1518,7 @@ fn import(
             hashes: &hashes,
             page_size,
             cancel: Some(&cancel),
+            import_timeout: settings.effective_import_timeout(),
         },
         |record| facts_for(record, &trusted),
         |progress| {

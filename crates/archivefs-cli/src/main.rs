@@ -4815,6 +4815,21 @@ fn gather_doctor_scan() -> DoctorScan {
         },
         storage: Gathered::Ready(&storage),
         emulator_profiles: Gathered::Ready(&profile_report),
+        // Emulator launch-readiness assessment walks discovered install
+        // directories, which is a scan. Doctor never starts one from the
+        // CLI (the same reason RetroArch discovery above is NotLoaded).
+        xemu_readiness: Gathered::NotLoaded(
+            "xemu launch readiness has not been checked in this session.",
+        ),
+        xenia_readiness: Gathered::NotLoaded(
+            "Xenia launch readiness has not been checked in this session.",
+        ),
+        ppsspp_readiness: Gathered::NotLoaded(
+            "PPSSPP launch readiness has not been checked in this session.",
+        ),
+        rpcs3_readiness: Gathered::NotLoaded(
+            "RPCS3 launch readiness has not been checked in this session.",
+        ),
         managed_entries: match &managed {
             Gathered::Ready(scan) => Gathered::Ready(scan),
             Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
@@ -6256,6 +6271,11 @@ mod tests {
                         display_version: None,
                         system_name: Some("Super Nintendo Entertainment System".to_string()),
                         supported_extensions: vec!["zip".to_string(), "sfc".to_string()],
+                        core_name: None,
+                        manufacturer: None,
+                        categories: None,
+                        database: None,
+                        firmware: Vec::new(),
                     },
                 },
             ],

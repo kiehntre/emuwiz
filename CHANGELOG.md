@@ -11,6 +11,106 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
+## v0.8.1-alpha (unreleased)
+
+Identity, launch, optical, and whole-collection library release
+("Alpha 2.1"). **Not yet tagged or published.** The currently published
+release remains [`v0.8.0-alpha`](docs/releases/v0.8.0-alpha.md); this entry
+describes what has merged to `main` toward the next alpha so far. See
+[`docs/releases/v0.8.1-alpha.md`](docs/releases/v0.8.1-alpha.md) for full
+release notes.
+
+### Added
+
+- **Verified disc and folder identity for more platforms.** ScummVM game
+  folders, 3DO game discs, and PC-FX game discs are now identified from
+  their own on-disc/structural evidence (Opera volume header, PC-FX boot
+  sectors, ScummVM detection entries), never from a filename. Loose-ROM
+  identity for NES, Game Boy / Game Boy Color / Game Boy Advance, and N64
+  is verified from cartridge headers, and PlayStation, Saturn, Dreamcast,
+  PSP, PS3, and original Xbox disc identity is promoted into the game
+  reports.
+- **Canonical optical fingerprinting.** A representation-independent
+  fingerprint of an optical disc's actual data content, so the same disc
+  in CUE/BIN and in CHD form compares as equivalent, and a
+  chdman MODE1 conversion can be checked against its source.
+- **Verified CUE/BIN -> CHD conversion.** A deliberately narrow conversion
+  path that only finalizes when the staged CHD independently reproduces the
+  source's canonical optical fingerprint, run through the existing
+  journalled transaction engine with rollback and crash recovery, plus a
+  GUI workflow ("Convert discs" on Home) to preview, apply, and undo it.
+- **CUE/BIN <-> CHD and equivalent-representation review.** Review tools
+  for byte-different but content-equivalent optical discs and for
+  equivalent N64 ROM representations, alongside the existing exact-duplicate
+  quarantine.
+- **Whole-collection RomM-ready library planning.** Point EmuWiz at several
+  platform libraries at once and get one combined, deterministic RomM
+  layout plan across the whole collection, reusing the existing Playing
+  Library / 1G1R election and single-platform RomM projection unchanged.
+  The combined plan adds read-only preview checks the single-platform path
+  cannot perform - missing source, unsafe (symlinked) source, an occupied
+  destination, and a destination two platform inputs both claim - each
+  reported, never auto-resolved. Apply reuses the existing journalled,
+  no-clobber symlink transaction engine per platform.
+- **Verified native launch and readiness for more emulators.** Verified
+  native ScummVM launch execution, plus safe command planning and/or
+  readiness reporting for PPSSPP, RPCS3, xemu, and Xenia, wired into the
+  Doctor and Game Details readiness views.
+- **DAT collection completion reporting.** The DAT Sources page shows how
+  complete a catalogued collection is against its managed DATs.
+- **Managed DAT snapshot provenance and local revision rollback.** Managed
+  DAT sources (MAME, Redump, TOSEC, No-Intro browser-assisted import)
+  record which snapshot revision each catalogue came from, expose a
+  "Revision history" view, and support rolling a source back to a previous
+  local revision. Bulk DAT source validation surfaces unusable or
+  misconfigured sources in one pass.
+- **Home entry points for the major workflows.** The Home screen now has
+  direct cards for Build RomM library, Convert discs, Find duplicate /
+  equivalent games, Verify collection (DATs), Set up emulators, and
+  Cheats & Mods, with clearer DAT collection-completion, revision-history,
+  and rollback discoverability on the DAT Sources page.
+
+### Changed
+
+- **Transactional safety audit for the apply/rollback workflows.** The
+  landed DAT-rename, Playing Library / RomM symlink, optical-conversion,
+  and duplicate-quarantine apply/rollback paths were audited against
+  TOCTOU, interrupted-apply, stale-journal, and rollback-refusal cases.
+  No production safety regression was found; the existing fail-closed
+  behaviour (no-clobber `renameat2`, double preflight, identity
+  re-verification, ancestor-path confinement, honest crash reconciliation)
+  is unchanged.
+- **Cross-platform RomM destination-collision refusal is now proven.**
+  Added regression tests showing that two per-platform RomM apply
+  transactions that target the same destination path cannot overwrite each
+  other or a user's originals - the second is refused by the shared
+  engine's live filesystem check, in either hard-conflict mode and
+  regardless of apply order.
+- A large run of read-only identity, emulator-adapter, evidence-ingestion,
+  and launch-planning groundwork merged in this range (explainable platform
+  evidence fusion, normalized DAT matching and set identity, local emulator
+  adapters and BIOS verification, universal source ingestion, reversible
+  ROM header/SMD/N64 normalization observation, and RAR5 audit
+  integration).
+
+### Known limitations
+
+- 3DO and PC-FX identity is read from 2048-byte-sector ISO images and from
+  MODE1/MODE2 2352 CUE/BIN; 3DO and PC-FX identity from `.chd` is not yet
+  supported and fails closed rather than guessing.
+- CHD identity overall remains limited: PlayStation (pure-Rust track
+  reader) and multi-track Dreamcast GD-ROM (only when the optional
+  `chd-optical-specialist` build feature is enabled) are the supported
+  cases; other platforms' CHDs are refused.
+- Not every emulator or platform has verified native launch support; some
+  emulators expose readiness/command-planning only, and unverified inputs
+  fail closed rather than launching.
+- The whole-collection RomM planner produces the combined plan and the
+  per-platform apply transactions, but is driven through the existing
+  Playing Library / RomM GUI rather than a dedicated multi-platform wizard.
+- Reversible ROM header / SMD / N64 normalization is observation only in
+  this release; no ROM is rewritten.
+
 ## v0.8.0-alpha (2026-08-18)
 
 Frontend Profiles / RomM Library Views and repair-workflow release

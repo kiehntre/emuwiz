@@ -3574,7 +3574,7 @@ fn selecting_exact_duplicates_reaches_the_page() {
         app.update(ctx, &mut frame)
     });
     assert!(
-        rendered_text_contains(&output, "Find exact copies"),
+        rendered_text_contains(&output, "Source folder:"),
         "the Exact Duplicate Review page's own content must be visible"
     );
     // Review/History are replaced, not stacked underneath, when this

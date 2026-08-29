@@ -21,14 +21,26 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** the current release is `v0.8.0-alpha` ("Alpha 2.0"),
-the Frontend Profiles / Media Intelligence / Repair Workflow release. It adds
-preservation-first Library Views (Generic and RomM), whole-library repair
-planning and review with rollback, duplicate quarantine, centralized media
-recognition, trusted local DTD diagnostics, and further DAT verification
-hardening. See
+**Release status:** the current published release is `v0.8.0-alpha`
+("Alpha 2.0"), the Frontend Profiles / Media Intelligence / Repair Workflow
+release. It adds preservation-first Library Views (Generic and RomM),
+whole-library repair planning and review with rollback, duplicate
+quarantine, centralized media recognition, trusted local DTD diagnostics,
+and further DAT verification hardening. See
 [`docs/releases/v0.8.0-alpha.md`](docs/releases/v0.8.0-alpha.md) for the full
 release notes and known limitations.
+
+`main` is currently the `v0.8.1-alpha` release candidate: feature-frozen and
+in release preparation, with its own draft
+[`docs/releases/v0.8.1-alpha.md`](docs/releases/v0.8.1-alpha.md) and
+[`CHANGELOG.md`](CHANGELOG.md#v081-alpha-unreleased) entries kept up to date
+as it stabilizes. It adds verified ScummVM / 3DO / PC-FX disc and folder
+identity, canonical optical fingerprinting and verified CUE/BIN -> CHD
+conversion, whole-collection RomM-ready library planning, more verified
+emulator launch support, DAT collection-completion reporting with managed
+snapshot revisions and local rollback, and a transactional-safety audit.
+`v0.8.1-alpha` has **not** been tagged, released, or published yet - the
+current published release remains `v0.8.0-alpha` above until it is.
 
 ## Principles
 
