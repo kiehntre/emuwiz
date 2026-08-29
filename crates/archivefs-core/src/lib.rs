@@ -164,6 +164,8 @@ pub mod chd_logical_media;
 /// [`chd_logical_media`] and [`raw_cd_logical_media`].
 pub mod raw_cd_sector;
 
+/// Narrow, representation-independent optical-disc fingerprinting seam.
+pub mod optical_fingerprint;
 /// A [`logical_media::LogicalMedia`] adapter over a plain, file-backed
 /// raw-sector optical image (`.bin`-style: a bare stream of 2352-byte CD
 /// sectors) - cooks physical raw sectors down to the conventional
