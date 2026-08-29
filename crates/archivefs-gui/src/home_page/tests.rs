@@ -183,10 +183,12 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::CheckSetup, "Open Doctor"),
         (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
         (HomeCard::DatSources, "Open DAT Sources"),
+        (HomeCard::DuplicateReview, "Open duplicate review"),
+        (HomeCard::ConvertDiscs, "Open disc conversion"),
         (HomeCard::Settings, "Open Settings"),
         (HomeCard::BuildLibrary, "Open Sources"),
         (HomeCard::QuickRename, "Choose a library"),
-        (HomeCard::RomM, "Open Sources"),
+        (HomeCard::RomM, "Open RomM workflow"),
     ];
     assert_eq!(view.cards.len(), expected.len());
     for (card, (expected_card, expected_label)) in view.cards.iter().zip(expected.iter()) {
@@ -423,12 +425,12 @@ fn primary_home_cards_carry_their_visual_identity() {
     assert_eq!(organise.title, "Organise");
     let check = find(HomeCard::CheckSetup);
     assert_eq!(check.icon, crate::ui::icons::CHECK);
-    assert_eq!(check.title, "Check Library");
+    assert_eq!(check.title, "Set up emulators");
     let cheats = find(HomeCard::CheatsAndMods);
     assert_eq!(cheats.icon, crate::ui::icons::CHEATS);
     let verify = find(HomeCard::DatSources);
     assert_eq!(verify.icon, crate::ui::icons::VERIFY);
-    assert_eq!(verify.title, "Verify Games");
+    assert_eq!(verify.title, "Verify collection");
     let settings = find(HomeCard::Settings);
     assert_eq!(settings.icon, crate::ui::icons::SETTINGS);
     assert_eq!(settings.title, "Settings");
@@ -443,25 +445,24 @@ fn all_destinations_remain_and_six_are_primary() {
     let mut expected: Vec<HomeCard> = vec![
         HomeCard::BuildLibrary,
         HomeCard::BrowseGames,
+        HomeCard::ConvertDiscs,
         HomeCard::CheatsAndMods,
         HomeCard::CanonicalOrganisation,
         HomeCard::QuickRename,
         HomeCard::DatSources,
         HomeCard::RomM,
         HomeCard::CheckSetup,
+        HomeCard::DuplicateReview,
         HomeCard::Settings,
     ];
     expected.sort_by_key(|c| format!("{c:?}"));
-    assert_eq!(
-        all, expected,
-        "only the duplicate cleanup destination is removed"
-    );
+    assert_eq!(all, expected, "all major workflows remain represented");
     assert_eq!(
         view.cards
             .iter()
             .filter(|c| c.tier == HomeCardTier::Primary)
             .count(),
-        7
+        10
     );
     assert!(
         view.cards
@@ -518,9 +519,9 @@ fn the_primary_home_cards_render_at_compact_width() {
         crate::ui::icons::SETTINGS,
         "My Games",
         "Organise",
-        "Check Library",
+        "Set up emulators",
         "Cheats & Mods",
-        "Verify Games",
+        "Verify collection",
         "Settings",
     ] {
         assert!(

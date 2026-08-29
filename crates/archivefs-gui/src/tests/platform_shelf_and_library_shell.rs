@@ -183,11 +183,13 @@ fn every_home_card_maps_to_its_real_existing_destination() {
     // reachable some other way - none of these are invented for Home.
     let expected = [
         (home_page::HomeCard::BuildLibrary, MainView::Sources),
+        (home_page::HomeCard::ConvertDiscs, MainView::Problems),
         (home_page::HomeCard::BrowseGames, MainView::Library),
+        (home_page::HomeCard::DuplicateReview, MainView::Duplicates),
         (home_page::HomeCard::CheatsAndMods, MainView::CheatsMods),
         (home_page::HomeCard::CheatSources, MainView::CheatSources),
         (home_page::HomeCard::DatSources, MainView::DatSources),
-        (home_page::HomeCard::RomM, MainView::Sources),
+        (home_page::HomeCard::RomM, MainView::CanonicalOrganisation),
         (home_page::HomeCard::CheckSetup, MainView::Doctor),
         (home_page::HomeCard::Settings, MainView::Settings),
         (home_page::HomeCard::QuickRename, MainView::IdentifyRename),
@@ -213,6 +215,27 @@ fn navigate_to_main_view_for_a_home_card_click_matches_a_sidebar_click() {
     app.navigate_to_main_view(main_view_for_home_card(home_page::HomeCard::CheatsAndMods));
     assert_eq!(app.view, MainView::CheatsMods);
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
+}
+
+#[test]
+fn task_cards_open_the_existing_specialised_workflows() {
+    let mut app = app_for_operation_tests();
+
+    app.navigate_to_home_card(home_page::HomeCard::ConvertDiscs);
+    assert_eq!(app.view, MainView::RepairReview);
+    assert_eq!(app.problems_repair_tab, ProblemsRepairTab::Repair);
+
+    app.navigate_to_home_card(home_page::HomeCard::DuplicateReview);
+    assert_eq!(app.view, MainView::Duplicates);
+    assert_eq!(app.library_tab, LibraryTab::Duplicates);
+
+    app.navigate_to_home_card(home_page::HomeCard::RomM);
+    assert_eq!(app.view, MainView::CanonicalOrganisation);
+    assert!(
+        app.rom_organisation_page
+            .as_ref()
+            .is_some_and(|page| page.showing_playing_library)
+    );
 }
 
 #[test]

@@ -3416,8 +3416,11 @@ enum LibraryTab {
 /// destination.
 fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
     match card {
-        home_page::HomeCard::BuildLibrary | home_page::HomeCard::RomM => MainView::Sources,
+        home_page::HomeCard::BuildLibrary => MainView::Sources,
+        home_page::HomeCard::RomM => MainView::CanonicalOrganisation,
         home_page::HomeCard::BrowseGames => MainView::Library,
+        home_page::HomeCard::DuplicateReview => MainView::Duplicates,
+        home_page::HomeCard::ConvertDiscs => MainView::Problems,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
         home_page::HomeCard::QuickRename => MainView::IdentifyRename,
@@ -4790,6 +4793,25 @@ impl ArchiveFsApp {
         self.tools_overlay = ToolsOverlay::None;
     }
 
+    fn navigate_to_home_card(&mut self, card: home_page::HomeCard) {
+        match card {
+            home_page::HomeCard::RomM => {
+                self.navigate_to_main_view(MainView::CanonicalOrganisation);
+                let page = self
+                    .rom_organisation_page
+                    .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
+                page.showing_playing_library = true;
+            }
+            home_page::HomeCard::ConvertDiscs => {
+                self.navigate_to_problems_repair_tab(ProblemsRepairTab::Repair);
+            }
+            home_page::HomeCard::DuplicateReview => {
+                self.navigate_to_library_tab(LibraryTab::Duplicates);
+            }
+            _ => self.navigate_to_main_view(main_view_for_home_card(card)),
+        }
+    }
+
     /// The one sanctioned way to change `self.view` in response to a user
     /// action (a sidebar click, a Home card, a menu item) - shared so
     /// every navigation source applies the same special cases
@@ -5887,7 +5909,7 @@ impl ArchiveFsApp {
                     }
                     if widgets::action_button(
                         ui,
-                        "Convert disc images",
+                        "Convert discs",
                         widgets::ActionStyle::Secondary,
                         true,
                     )
@@ -16508,7 +16530,7 @@ impl ArchiveFsApp {
                     let home_view = home_page::build_home_view(&home_inputs);
                     if let Some(card) = home_page::show_home_page(ui, &home_view) {
                         self.quick_rename_mode = card == home_page::HomeCard::QuickRename;
-                        self.navigate_to_main_view(main_view_for_home_card(card));
+                        self.navigate_to_home_card(card);
                     }
                 }
 

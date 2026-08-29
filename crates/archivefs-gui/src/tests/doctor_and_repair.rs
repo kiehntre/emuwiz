@@ -3517,6 +3517,18 @@ fn the_exact_duplicates_link_is_visible_on_the_repair_tab() {
     assert!(rendered_text_contains(&output, "Exact duplicates"));
 }
 
+#[test]
+fn convert_discs_is_visible_on_the_repair_tab() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.view = MainView::RepairReview;
+
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(rendered_text_contains(&output, "Convert discs"));
+    assert!(!rendered_text_contains(&output, "OpticalConversionPage"));
+}
+
 // --- 2: selecting it reaches the Exact Duplicate Review page -----------
 
 #[test]

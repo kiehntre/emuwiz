@@ -35,7 +35,9 @@ use eframe::egui;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HomeCard {
     BuildLibrary,
+    ConvertDiscs,
     BrowseGames,
+    DuplicateReview,
     CheatsAndMods,
     CanonicalOrganisation,
     QuickRename,
@@ -195,8 +197,6 @@ pub(crate) enum RommReadinessLabel {
     Ready(&'static str),
 }
 
-const READ_ONLY_ROMM_NOTE: &str = "EmuWiz treats RomM as a read-only identity source: nothing in your RomM library is ever changed.";
-
 /// Turns already-loaded state into what Home draws. Pure: the same inputs
 /// always produce the same view, and nothing here touches disk or a
 /// socket.
@@ -246,7 +246,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
     };
 
     let romm_readiness = match &inputs.romm_state_label {
-        None => CardReadiness::Unknown("Open Sources to check status".to_string()),
+        None => CardReadiness::Unknown("Open the RomM workflow to check status".to_string()),
         Some(RommReadinessLabel::NotConfigured(label)) => {
             CardReadiness::NotConfigured((*label).to_string())
         }
@@ -285,8 +285,8 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         HomeCardView {
             card: HomeCard::CheckSetup,
             icon: crate::ui::icons::CHECK,
-            title: "Check Library",
-            explanation: "Find problems with your EmuWiz setup and library.",
+            title: "Set up emulators",
+            explanation: "Check emulator installation and your EmuWiz setup.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Check),
             readiness: Some(setup_readiness),
@@ -307,12 +307,34 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         HomeCardView {
             card: HomeCard::DatSources,
             icon: crate::ui::icons::VERIFY,
-            title: "Verify Games",
+            title: "Verify collection",
             explanation: "Check your games with DATs. Auditing is read-only: nothing is renamed, moved, or rewritten.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Verify),
             readiness: Some(dat_readiness),
             action_label: "Open DAT Sources",
+            secondary: None,
+        },
+        HomeCardView {
+            card: HomeCard::DuplicateReview,
+            icon: crate::ui::icons::CHECK,
+            title: "Find duplicate / equivalent games",
+            explanation: "Review equivalent media already found in your collection.",
+            tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Check),
+            readiness: None,
+            action_label: "Open duplicate review",
+            secondary: None,
+        },
+        HomeCardView {
+            card: HomeCard::ConvertDiscs,
+            icon: crate::ui::icons::GAMES,
+            title: "Convert discs",
+            explanation: "Convert supported disc images into verified CHD files.",
+            tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Games),
+            readiness: None,
+            action_label: "Open disc conversion",
             secondary: None,
         },
         HomeCardView {
@@ -352,12 +374,12 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         HomeCardView {
             card: HomeCard::RomM,
             icon: crate::ui::icons::ROMM,
-            title: "Connect RomM",
-            explanation: READ_ONLY_ROMM_NOTE,
-            tier: HomeCardTier::Secondary,
-            accent: None,
+            title: "Build RomM library",
+            explanation: "Build a separate RomM-readable library from your collection. RomM is read-only: EmuWiz never changes your RomM library.",
+            tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Organise),
             readiness: Some(romm_readiness),
-            action_label: "Open Sources",
+            action_label: "Open RomM workflow",
             secondary: None,
         },
     ];

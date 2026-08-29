@@ -7219,6 +7219,7 @@ fn show_managed_dat_source_row(
             );
         }
         if row.rollback_available {
+            ui.label(egui::RichText::new("Revision history").strong());
             let previous_revision = row
                 .previous_revision
                 .as_deref()
@@ -7235,6 +7236,7 @@ fn show_managed_dat_source_row(
                 .small(),
             );
         } else {
+            ui.label(egui::RichText::new("Revision history").strong());
             ui.label(
                 egui::RichText::new("No previous local revision available")
                     .color(theme::muted(ui))
@@ -10629,6 +10631,11 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
 
         if let Some(completion) = &audit.completion {
             ui.add_space(8.0);
+            widgets::section_header(
+                ui,
+                "Collection completion",
+                Some("How much of this DAT catalogue the audit verified in your collection."),
+            );
             show_dat_completion(ui, completion);
         }
         ui.add_space(6.0);
