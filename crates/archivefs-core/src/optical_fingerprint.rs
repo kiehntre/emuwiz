@@ -3,7 +3,8 @@
 //!
 //! The only supported representations here are one-file CUE sheets whose one
 //! track is `MODE1/2048`, and standalone CHD files with exactly one
-//! `MODE1_RAW` CD-ROM data track and zero pregap. The canonical byte stream is
+//! `MODE1_RAW` or chdman-produced `MODE1` CD-ROM data track and zero pregap.
+//! The canonical byte stream is
 //! the ordered concatenation of cooked 2048-byte user-data sectors. Container
 //! hashes and CHD header SHA-1 values are intentionally not used.
 
@@ -172,9 +173,12 @@ pub fn fingerprint_chd(
         ));
     }
     let track = tracks[0];
-    if track.track != 1 || track.track_type != "MODE1_RAW" || track.pregap != Some(0) {
+    if track.track != 1
+        || !matches!(track.track_type.as_str(), "MODE1_RAW" | "MODE1")
+        || track.pregap != Some(0)
+    {
         return Err(OpticalFingerprintError::UnsupportedChdLayout(
-            "requires track 1 MODE1_RAW with zero pregap".into(),
+            "requires track 1 MODE1 or MODE1_RAW with zero pregap".into(),
         ));
     }
     let media = open_chd_track_logical_media_file(path)
@@ -270,6 +274,39 @@ mod tests {
         chd
     }
 
+    fn cooked_mode1_chd_for(values: &[u8]) -> Vec<u8> {
+        let unit = 2448u32;
+        let frames = values.len() as u32;
+        let units_per_hunk = 8u32;
+        let hunk = unit * units_per_hunk;
+        let payload = format!(
+            "TRACK:1 TYPE:MODE1 SUBTYPE:NONE FRAMES:{frames} PREGAP:0 PGTYPE:MOD PGSUB:NONE POSTGAP:0"
+        );
+        let meta_offset = 124u64;
+        let map_offset = meta_offset + 16 + payload.len() as u64;
+        let data_offset = (map_offset + 4).div_ceil(hunk as u64) * hunk as u64;
+        let mut chd = vec![0u8; data_offset as usize + hunk as usize];
+        chd[..8].copy_from_slice(b"MComprHD");
+        put_u32(&mut chd, 8, 124);
+        put_u32(&mut chd, 12, 5);
+        put_u64(&mut chd, 32, hunk as u64);
+        put_u64(&mut chd, 40, map_offset);
+        put_u64(&mut chd, 48, meta_offset);
+        put_u32(&mut chd, 56, hunk);
+        put_u32(&mut chd, 60, unit);
+        let metadata = meta_offset as usize;
+        chd[metadata..metadata + 4].copy_from_slice(b"CHT2");
+        chd[metadata + 5..metadata + 8].copy_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        chd[metadata + 16..metadata + 16 + payload.len()].copy_from_slice(payload.as_bytes());
+        chd[map_offset as usize..map_offset as usize + 4]
+            .copy_from_slice(&((data_offset / hunk as u64) as u32).to_be_bytes());
+        for (index, value) in values.iter().enumerate() {
+            let start = data_offset as usize + index * unit as usize;
+            chd[start..start + LOGICAL_SECTOR_SIZE as usize].fill(*value);
+        }
+        chd
+    }
+
     fn cue_fixture(values: &[u8]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let cue = dir.path().join("disc with ü.cue");
@@ -298,6 +335,23 @@ mod tests {
         assert_eq!(left.structure, right.structure);
         assert_eq!(
             compare_optical_fingerprints(&left, &right),
+            OpticalFingerprintComparison::Equivalent
+        );
+    }
+
+    #[test]
+    fn chdman_mode1_cooked_frames_use_the_first_2048_bytes() {
+        let (dir, cue) = cue_fixture(&[0x11, 0x22]);
+        let chd = dir.path().join("cooked-mode1.chd");
+        std::fs::write(&chd, cooked_mode1_chd_for(&[0x11, 0x22])).unwrap();
+        let cue_fingerprint = fingerprint_cue_bin(&cue).unwrap();
+        let chd_fingerprint = fingerprint_chd(&chd).unwrap();
+        assert_eq!(
+            cue_fingerprint.canonical_sha256,
+            chd_fingerprint.canonical_sha256
+        );
+        assert_eq!(
+            compare_optical_fingerprints(&cue_fingerprint, &chd_fingerprint),
             OpticalFingerprintComparison::Equivalent
         );
     }

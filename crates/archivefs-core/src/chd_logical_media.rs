@@ -41,8 +41,10 @@
 //!   [`ChdLogicalMediaError::UnsupportedTrackPosition`].
 //! - Only a **zero pregap** on that track is supported, for the same
 //!   reason - see [`ChdLogicalMediaError::UnsupportedPregap`].
-//! - Only `MODE1_RAW` and `MODE2_RAW` track types are interpreted; for
-//!   `MODE2_RAW`, only Form 1 sectors are supported - a Form 2 sector
+//! - `MODE1_RAW` and `MODE2_RAW` track types are interpreted as raw 2352-byte
+//!   sectors. chdman's cooked `MODE1` type is interpreted as a 2448-byte CD
+//!   frame whose first 2048 bytes are the cooked payload. For `MODE2_RAW`,
+//!   only Form 1 sectors are supported - a Form 2 sector
 //!   encountered mid-read is a [`LogicalMediaError::DecodeFailed`], not a
 //!   silently wrong 2048 bytes. See [`extract_user_data`].
 //! - No metadata/codec/frame chain is ever written back; this module has
@@ -74,14 +76,20 @@ use crate::logical_media::{LogicalMedia, LogicalMediaError};
 // extraction) is verified once, in `crate::raw_cd_sector`, and shared with
 // `crate::raw_cd_logical_media` - see that module's documentation for why
 // this crate keeps a single copy rather than re-deriving the offsets here.
-// `TrackKind` is this module's existing local name for the shared
-// `RawCdSectorMode` type; kept as an alias so the rest of this file's
-// `TrackKind::Mode1Raw`/`TrackKind::Mode2Raw` matches are unchanged.
+// Raw sector decoding is shared below; the CHD metadata boundary keeps
+// cooked `MODE1` distinct from raw-sector modes.
 pub use crate::raw_cd_sector::{
     LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, MODE2_FORM1_USER_DATA_OFFSET,
     MODE2_SUBMODE_FORM2_BIT, MODE2_SUBMODE_OFFSET, RAW_SECTOR_BYTES,
 };
-use crate::raw_cd_sector::{RawCdSectorMode as TrackKind, extract_user_data};
+use crate::raw_cd_sector::{RawCdSectorMode, extract_user_data};
+
+#[derive(Debug, Clone, Copy)]
+enum TrackKind {
+    Mode1Raw,
+    Mode1Cooked,
+    Mode2Raw,
+}
 
 /// Why [`open_chd_track_logical_media`] could not produce a
 /// [`ChdTrackLogicalMedia`].
@@ -99,7 +107,7 @@ pub enum ChdLogicalMediaError {
     /// No non-audio CD/GD-ROM track was found in this CHD's metadata.
     NoDataTrack,
     /// The selected data track's `track_type` is not one this module
-    /// interprets (only `MODE1_RAW`/`MODE2_RAW` are supported today).
+    /// interprets (`MODE1`, `MODE1_RAW`, and `MODE2_RAW` are supported today).
     UnsupportedTrackType { track_type: String },
     /// The selected data track is not track 1 - see the module
     /// documentation's scope limits.
@@ -250,6 +258,7 @@ fn build_chd_track_logical_media<R: Read + Seek>(
     }
     let track_kind = match candidate.track_type.as_str() {
         "MODE1_RAW" => TrackKind::Mode1Raw,
+        "MODE1" => TrackKind::Mode1Cooked,
         "MODE2_RAW" => TrackKind::Mode2Raw,
         other => {
             return Err(ChdLogicalMediaError::UnsupportedTrackType {
@@ -265,6 +274,16 @@ fn build_chd_track_logical_media<R: Read + Seek>(
     };
     let hunk_bytes = u64::from(header_v5.hunk_bytes);
     let unit_bytes = u64::from(header_v5.unit_bytes);
+    if hunk_bytes == 0 || unit_bytes == 0 || !hunk_bytes.is_multiple_of(unit_bytes) {
+        return Err(ChdLogicalMediaError::Codec {
+            detail: "CHD has invalid hunk/unit geometry".to_string(),
+        });
+    }
+    if matches!(track_kind, TrackKind::Mode1Cooked) && unit_bytes != 2448 {
+        return Err(ChdLogicalMediaError::UnsupportedTrackType {
+            track_type: "MODE1 with non-CD frame geometry".to_string(),
+        });
+    }
 
     Ok(ChdTrackLogicalMediaReader {
         chd: RefCell::new(chd),
@@ -323,6 +342,31 @@ impl<R: Read + Seek> ChdTrackLogicalMediaReader<R> {
         }
         Ok(hunk[offset_within_hunk..end].to_vec())
     }
+
+    /// Reads the cooked 2048-byte frame payload used by CHD `TYPE:MODE1`.
+    /// Unlike `MODE1_RAW`, chdman stores the cooked sector at the beginning
+    /// of the 2448-byte CD frame; there is no raw sync/header prefix to strip.
+    fn read_cooked_sector(&self, sector_index: u64) -> Result<Vec<u8>, String> {
+        if sector_index >= self.frame_count {
+            return Err(format!(
+                "sector index {sector_index} exceeds the selected track's frame count {}",
+                self.frame_count
+            ));
+        }
+        let absolute_byte_offset = sector_index * self.unit_bytes;
+        let hunk_index = u32::try_from(absolute_byte_offset / self.hunk_bytes)
+            .map_err(|_| "hunk index exceeds u32 range".to_string())?;
+        let offset_within_hunk = (absolute_byte_offset % self.hunk_bytes) as usize;
+        let hunk = self.decode_hunk(hunk_index)?;
+        let end = offset_within_hunk + LOGICAL_BLOCK_BYTES;
+        if end > hunk.len() {
+            return Err(format!(
+                "decoded hunk ({} bytes) too short for cooked sector at {offset_within_hunk}",
+                hunk.len()
+            ));
+        }
+        Ok(hunk[offset_within_hunk..end].to_vec())
+    }
 }
 
 impl<R: Read + Seek> LogicalMedia for ChdTrackLogicalMediaReader<R> {
@@ -349,11 +393,26 @@ impl<R: Read + Seek> LogicalMedia for ChdTrackLogicalMediaReader<R> {
             let sector_index = absolute / LOGICAL_BLOCK_BYTES as u64;
             let within_sector = (absolute % LOGICAL_BLOCK_BYTES as u64) as usize;
 
-            let sector = self
-                .read_raw_sector(sector_index)
-                .map_err(|detail| LogicalMediaError::DecodeFailed { detail })?;
-            let user_data = extract_user_data(&sector, self.track_kind)
-                .map_err(|detail| LogicalMediaError::DecodeFailed { detail })?;
+            let user_data = match self.track_kind {
+                TrackKind::Mode1Cooked => self
+                    .read_cooked_sector(sector_index)
+                    .map_err(|detail| LogicalMediaError::DecodeFailed { detail })?,
+                TrackKind::Mode1Raw | TrackKind::Mode2Raw => {
+                    let sector = self
+                        .read_raw_sector(sector_index)
+                        .map_err(|detail| LogicalMediaError::DecodeFailed { detail })?;
+                    extract_user_data(
+                        &sector,
+                        match self.track_kind {
+                            TrackKind::Mode1Raw => RawCdSectorMode::Mode1Raw,
+                            TrackKind::Mode2Raw => RawCdSectorMode::Mode2Raw,
+                            TrackKind::Mode1Cooked => unreachable!(),
+                        },
+                    )
+                    .map_err(|detail| LogicalMediaError::DecodeFailed { detail })?
+                    .to_vec()
+                }
+            };
 
             let take = (LOGICAL_BLOCK_BYTES - within_sector).min(buf.len() - filled);
             buf[filled..filled + take]
