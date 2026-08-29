@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::dat::identity::DatPlatformConfidence;
-use crate::dat::rename_apply::executor::{ApplyExecution, HardConflictMode, apply_transaction};
+use crate::dat::rename_apply::executor::{
+    ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
+};
 use crate::dat::rename_apply::journal::write_journal;
+use crate::dat::rename_apply::model::RenameTransaction;
 use crate::dat::rename_apply::preflight::DirectoryPolicy;
 use crate::dat::rename_apply::rollback::rollback_transaction;
 use crate::playing_library::{
@@ -607,4 +610,282 @@ fn ps3_nested_multi_file_layout_through_the_aggregator_matches_the_single_platfo
     );
     assert!(launcher.blocked.is_none());
     assert!(companion.blocked.is_none());
+}
+
+// --- cross-transaction destination collisions fail closed at apply --------
+//
+// `build_romm_library_plan` flags a `DuplicateDestination` when two platform
+// inputs map to the same slug (proven by
+// `two_platforms_mapped_to_the_same_slug_collide_as_a_duplicate_destination`),
+// but that per-entry advisory is deliberately *not* threaded into the
+// transactions `build_romm_library_apply_transactions` returns - one
+// `RenameTransaction` per platform, each with its own within-transaction
+// `batch_destinations` set that cannot see another platform's transaction.
+// These tests prove the shared apply engine is the real enforcement point:
+// two per-platform transactions racing for one destination path can never
+// overwrite each other or the user's originals, in either hard-conflict
+// mode, regardless of apply order.
+
+fn colliding_inputs(temp: &Path) -> (PathBuf, PathBuf, Vec<RommLibraryPlatformInput>) {
+    let source_a = temp.join("drive-a/game.gba");
+    std::fs::create_dir_all(source_a.parent().unwrap()).unwrap();
+    std::fs::write(&source_a, b"AAAA drive A original bytes").unwrap();
+    let source_b = temp.join("drive-b/game.gba");
+    std::fs::create_dir_all(source_b.parent().unwrap()).unwrap();
+    std::fs::write(&source_b, b"BBBB drive B different-length original bytes").unwrap();
+
+    // Two different source libraries both (mistakenly) identified as the same
+    // platform, both with a launcher basename that maps to the same RomM
+    // path - but pointing at genuinely different source files.
+    let inputs = vec![
+        input(
+            "GBA - drive A",
+            &temp.join("playing-a"),
+            &source_a,
+            "game.gba",
+            "Game Boy Advance",
+        ),
+        input(
+            "GBA - drive B",
+            &temp.join("playing-b"),
+            &source_b,
+            "game.gba",
+            "Game Boy Advance",
+        ),
+    ];
+    (source_a, source_b, inputs)
+}
+
+#[allow(clippy::type_complexity)]
+fn build_colliding_transactions(
+    temp: &Path,
+    romm_root: &Path,
+) -> (
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    RenameTransaction,
+    RenameTransaction,
+) {
+    let (source_a, source_b, inputs) = colliding_inputs(temp);
+    let plan = build_romm_library_plan(&inputs, romm_root, &TrustedRoots::none()).unwrap();
+    // Sanity: the plan-time advisory really did flag this as a duplicate
+    // destination - the very case a careless caller might override.
+    assert!(
+        plan.entries.iter().any(|entry| matches!(
+            entry.blocked,
+            Some(RommLibraryBlockReason::DuplicateDestination { .. })
+        )),
+        "the aggregator must still flag the collision at plan time"
+    );
+
+    let visibility = RommVisibility::verified_same_path_bind(temp.to_path_buf()).unwrap();
+    let transactions = build_romm_library_apply_transactions(&plan, &inputs, &visibility, 1);
+    assert_eq!(
+        transactions.len(),
+        2,
+        "both platforms still build a transaction; the per-entry advisory block is not threaded \
+         into apply, so the engine must be the enforcement point"
+    );
+    let mut iter = transactions.into_iter();
+    let (label_a, result_a) = iter.next().unwrap();
+    let (label_b, result_b) = iter.next().unwrap();
+    assert_eq!(label_a, "GBA - drive A");
+    assert_eq!(label_b, "GBA - drive B");
+
+    let destination = romm_root.join("roms/gba/game.gba");
+    (
+        source_a,
+        source_b,
+        destination,
+        result_a.expect("drive A builds a transaction"),
+        result_b.expect("drive B builds a transaction"),
+    )
+}
+
+fn apply_colliding(
+    transaction: &mut RenameTransaction,
+    trusted: &TrustedRoots,
+    journal_dir: &Path,
+    mode: HardConflictMode,
+) -> Result<(), ApplyError> {
+    write_journal(journal_dir, transaction).unwrap();
+    let approved_paths = transaction
+        .entries
+        .iter()
+        .map(|entry| entry.source_path.to_string_lossy().into_owned())
+        .collect();
+    apply_transaction(&mut ApplyExecution {
+        transaction,
+        approved_paths,
+        current_generation: 1,
+        trusted: trusted.clone(),
+        journal_dir: journal_dir.to_path_buf(),
+        hard_conflict_mode: mode,
+        cancel: &AtomicBool::new(false),
+        directory_policy: DirectoryPolicy::SameFilesystem,
+        allow_symlink_source: false,
+    })
+    .map(|_| ())
+}
+
+#[cfg(unix)]
+#[test]
+fn two_per_platform_transactions_racing_for_one_destination_fail_closed_in_abort_all_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let romm_root = temp.path().join("romm");
+    let (source_a, source_b, destination, mut tx_a, mut tx_b) =
+        build_colliding_transactions(temp.path(), &romm_root);
+
+    let journal_dir = temp.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let trusted = TrustedRoots::from_paths([temp.path()]);
+
+    // Drive A applies cleanly: its symlink lands, pointing at drive A's file.
+    apply_colliding(
+        &mut tx_a,
+        &trusted,
+        &journal_dir,
+        HardConflictMode::AbortAll,
+    )
+    .unwrap();
+    assert!(destination.is_symlink());
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source_a);
+
+    // Drive B now targets the exact same path with a different link target.
+    // The engine's own destination-exists preflight must refuse the batch;
+    // nothing is mutated.
+    let outcome_b = apply_colliding(
+        &mut tx_b,
+        &trusted,
+        &journal_dir,
+        HardConflictMode::AbortAll,
+    );
+    assert!(
+        matches!(outcome_b, Err(ApplyError::HardConflicts(_))),
+        "drive B's colliding transaction must be refused, got {outcome_b:?}"
+    );
+
+    // Drive A's link is untouched and still points at drive A.
+    assert!(destination.is_symlink());
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source_a);
+    // Neither user original was modified or turned into a link.
+    assert_eq!(
+        std::fs::read(&source_a).unwrap(),
+        b"AAAA drive A original bytes"
+    );
+    assert_eq!(
+        std::fs::read(&source_b).unwrap(),
+        b"BBBB drive B different-length original bytes"
+    );
+    assert!(!source_a.is_symlink());
+    assert!(!source_b.is_symlink());
+
+    // Rolling back drive A restores the pre-apply state; drive B never
+    // applied anything, so there is nothing of its to reverse.
+    rollback_transaction(&mut tx_a, &journal_dir, &AtomicBool::new(false)).unwrap();
+    assert!(!destination.exists());
+    assert_eq!(
+        std::fs::read(&source_a).unwrap(),
+        b"AAAA drive A original bytes"
+    );
+    assert_eq!(
+        std::fs::read(&source_b).unwrap(),
+        b"BBBB drive B different-length original bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn two_per_platform_transactions_racing_for_one_destination_fail_closed_in_skip_subset_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let romm_root = temp.path().join("romm");
+    let (source_a, source_b, destination, mut tx_a, mut tx_b) =
+        build_colliding_transactions(temp.path(), &romm_root);
+
+    let journal_dir = temp.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let trusted = TrustedRoots::from_paths([temp.path()]);
+
+    apply_colliding(
+        &mut tx_a,
+        &trusted,
+        &journal_dir,
+        HardConflictMode::SkipUnsafeSubset,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source_a);
+
+    // In SkipUnsafeSubset mode the colliding entry is journaled Skipped
+    // rather than aborting the call, but it is still never applied and the
+    // destination is still never overwritten.
+    apply_colliding(
+        &mut tx_b,
+        &trusted,
+        &journal_dir,
+        HardConflictMode::SkipUnsafeSubset,
+    )
+    .unwrap();
+    assert!(
+        tx_b.entries
+            .iter()
+            .all(|entry| entry.state == crate::dat::rename_apply::model::EntryState::Skipped),
+        "drive B's colliding entry must be Skipped, never applied: {:?}",
+        tx_b.entries
+    );
+    assert_eq!(
+        std::fs::read_link(&destination).unwrap(),
+        source_a,
+        "the destination must still point at drive A"
+    );
+    assert_eq!(
+        std::fs::read(&source_b).unwrap(),
+        b"BBBB drive B different-length original bytes"
+    );
+    assert!(!source_b.is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cross_transaction_collision_is_refused_whichever_platform_applies_first() {
+    // Symmetry: the refusal is a property of the live filesystem check at
+    // apply time, not of input order. Applying drive B first and drive A
+    // second must fail closed exactly the same way.
+    let temp = tempfile::tempdir().unwrap();
+    let romm_root = temp.path().join("romm");
+    let (source_a, source_b, destination, mut tx_a, mut tx_b) =
+        build_colliding_transactions(temp.path(), &romm_root);
+
+    let journal_dir = temp.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let trusted = TrustedRoots::from_paths([temp.path()]);
+
+    apply_colliding(
+        &mut tx_b,
+        &trusted,
+        &journal_dir,
+        HardConflictMode::AbortAll,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source_b);
+
+    let outcome_a = apply_colliding(
+        &mut tx_a,
+        &trusted,
+        &journal_dir,
+        HardConflictMode::AbortAll,
+    );
+    assert!(
+        matches!(outcome_a, Err(ApplyError::HardConflicts(_))),
+        "drive A must be refused when drive B got there first, got {outcome_a:?}"
+    );
+    assert_eq!(std::fs::read_link(&destination).unwrap(), source_b);
+    assert_eq!(
+        std::fs::read(&source_a).unwrap(),
+        b"AAAA drive A original bytes"
+    );
+    assert!(!source_a.is_symlink());
 }
