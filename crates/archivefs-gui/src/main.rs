@@ -167,6 +167,7 @@ pub(crate) mod home_page;
 pub(crate) mod identity_sources_page;
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
+pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
 pub(crate) mod playing_library_page;
@@ -4127,6 +4128,7 @@ struct ArchiveFsApp {
     /// starts with no source folder chosen and no scan run, exactly like
     /// `RepairReviewPageState::default()` starts with no plan loaded.
     exact_duplicate_review_page: Option<exact_duplicate_review_page::ExactDuplicateReviewPageState>,
+    optical_conversion_page: Option<optical_conversion_page::OpticalConversionPageState>,
     /// The Library View History page, loaded lazily on first visit:
     /// durable Library View apply/remove records, re-read from disk on
     /// every refresh. Distinct from `history` (`OperationHistory`) below,
@@ -4571,6 +4573,7 @@ impl ArchiveFsApp {
             repair_review_page: None,
             repair_history_page: None,
             exact_duplicate_review_page: None,
+            optical_conversion_page: None,
             library_view_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
@@ -5785,6 +5788,13 @@ impl ArchiveFsApp {
         exact_duplicate_review_page::show_exact_duplicate_review_page(ui, page);
     }
 
+    fn show_optical_conversion_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .optical_conversion_page
+            .get_or_insert_with(optical_conversion_page::OpticalConversionPageState::default);
+        optical_conversion_page::show_optical_conversion_page(ui, page);
+    }
+
     /// The consolidated "Problems & Repair" destination - see
     /// `problems_repair_page`'s module doc. Renders the shared tab chrome,
     /// then dispatches to whichever tab `self.problems_repair_tab` currently
@@ -5875,8 +5885,28 @@ impl ArchiveFsApp {
                     {
                         self.view = MainView::ExactDuplicateReview;
                     }
+                    if widgets::action_button(
+                        ui,
+                        "Convert disc images",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .on_hover_text(
+                        "Convert one supported CUE/BIN source to a fingerprint-verified CHD; this is separate from duplicate cleanup.",
+                    )
+                    .clicked()
+                    {
+                        self.show_optical_conversion_page(ui);
+                    }
                 });
                 ui.add_space(theme::SECTION_GAP);
+
+                if self.optical_conversion_page.is_some() {
+                    self.show_optical_conversion_page(ui);
+                    ui.add_space(theme::SECTION_GAP);
+                    ui.separator();
+                    ui.add_space(theme::SECTION_GAP);
+                }
 
                 if self.view == MainView::ExactDuplicateReview {
                     self.show_exact_duplicate_review_page(ui);
