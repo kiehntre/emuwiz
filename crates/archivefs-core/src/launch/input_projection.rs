@@ -89,6 +89,8 @@ pub enum VerifiedIdentityFact {
     SaturnProductCode(String),
     /// A verified Sega CD/Mega-CD Disc ID product code.
     SegaCdProductCode(String),
+    /// A verified ScummVM engine/game ID returned by the local detector.
+    ScummVmGameId(String),
     /// A verified Atari ST title, matching
     /// [`crate::patch_manager::HatariSelectedGameRequest::verified_title`].
     AtariStTitle(String),

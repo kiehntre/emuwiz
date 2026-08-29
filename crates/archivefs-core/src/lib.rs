@@ -53,6 +53,7 @@ pub use inspector::{
 };
 
 pub mod game_identity;
+pub mod scummvm_detection;
 
 mod library_view_history;
 pub use library_view_history::{

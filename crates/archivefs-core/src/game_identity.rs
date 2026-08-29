@@ -202,6 +202,9 @@ pub enum IdentityKind {
     XbeTitleId,
     XexTitleId,
     XexMediaId,
+    /// A game ID returned by the locally installed ScummVM detector for an
+    /// extracted game folder. The ID is never derived from its folder name.
+    ScummVmGameId,
 }
 
 impl fmt::Display for IdentityKind {
@@ -227,6 +230,7 @@ impl fmt::Display for IdentityKind {
             Self::XbeTitleId => "Xbox Title ID",
             Self::XexTitleId => "Xbox 360 Title ID",
             Self::XexMediaId => "Xbox 360 Media ID",
+            Self::ScummVmGameId => "ScummVM game ID",
         };
         f.write_str(value)
     }
@@ -263,6 +267,7 @@ pub enum IdentityPlatform {
     N64,
     Xbox,
     Xbox360,
+    ScummVM,
     Other,
 }
 
@@ -295,6 +300,7 @@ impl IdentityPlatform {
             "n64" | "nintendo 64" | "nintendo64" => Self::N64,
             "xbox" | "original xbox" | "microsoft xbox" => Self::Xbox,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
+            "scummvm" | "scumm vm" => Self::ScummVM,
             _ => Self::Other,
         }
     }
@@ -319,6 +325,7 @@ impl IdentityPlatform {
             Self::N64 => "Nintendo 64",
             Self::Xbox => "Xbox",
             Self::Xbox360 => "Xbox 360",
+            Self::ScummVM => "ScummVM",
             Self::Other => "Unsupported platform",
         }
     }
@@ -374,6 +381,9 @@ pub enum IdentityImageFormat {
     /// Requires the `dreamcast-cdi` build feature (default-on); without
     /// it, this reports [`Self::Unsupported`] instead, never a guess.
     Cdi,
+    /// An extracted ScummVM game folder verified by the installed ScummVM
+    /// detector. No archive or folder name is used as identity evidence.
+    ScummVmDirectory,
     Deferred,
     Unsupported,
 }
@@ -546,6 +556,10 @@ impl GameIdentityReport {
     pub fn verified_xex_media_id(&self) -> Option<&str> {
         self.verified_value(IdentityKind::XexMediaId)
     }
+
+    pub fn verified_scummvm_game_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::ScummVmGameId)
+    }
 }
 
 pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameIdentityReport {
@@ -672,6 +686,13 @@ fn inspect_game_identity_with_platform_trust(
         && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
     {
         inspect_ps3_directory_identity(&mut report);
+        return report;
+    }
+
+    if platform == IdentityPlatform::ScummVM
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    {
+        inspect_scummvm_directory(&mut report);
         return report;
     }
 
@@ -1338,6 +1359,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::N64
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
+        | IdentityPlatform::ScummVM
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -2390,6 +2412,7 @@ fn inspect_iso_source(
         | IdentityPlatform::N64
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
+        | IdentityPlatform::ScummVM
         | IdentityPlatform::Other => {}
     }
 }
@@ -4698,6 +4721,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         }
         IdentityPlatform::Xbox360 => &[IdentityKind::XexTitleId, IdentityKind::XexMediaId],
         IdentityPlatform::Xbox => &[IdentityKind::XbeTitleId],
+        IdentityPlatform::ScummVM => &[IdentityKind::ScummVmGameId],
         IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
@@ -4717,6 +4741,102 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             diagnostic,
             "format and safety eligibility",
         ));
+    }
+}
+
+fn inspect_scummvm_directory(report: &mut GameIdentityReport) {
+    report.format = IdentityImageFormat::ScummVmDirectory;
+    let detection = crate::scummvm_detection::detect_scummvm_directory(&report.archive_path);
+    apply_scummvm_detection(report, detection);
+}
+
+/// Test/integration seam for the same report construction used by the normal
+/// installed-detector path. The caller supplies an explicitly selected
+/// executable; no folder or filename is interpreted as identity.
+pub fn inspect_scummvm_directory_with_executable(
+    path: &Path,
+    executable: &Path,
+) -> GameIdentityReport {
+    let mut report = GameIdentityReport {
+        archive_path: path.to_path_buf(),
+        platform: IdentityPlatform::ScummVM,
+        format: IdentityImageFormat::ScummVmDirectory,
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+        bytes_read: 0,
+        archive_members_inspected: 0,
+        metadata_paths_inspected: 0,
+        nested_container_depth: 0,
+        complete: false,
+    };
+    report.evidence.push(evidence(
+        &report,
+        IdentityKind::Platform,
+        IdentityStatus::Verified,
+        Some("ScummVM".into()),
+        IdentityConfidence::StructuredMetadata,
+        "explicit ScummVM identity inspection requested",
+        "caller-selected platform",
+    ));
+    apply_scummvm_detection(
+        &mut report,
+        crate::scummvm_detection::detect_scummvm_directory_with_executable(path, executable),
+    );
+    report
+}
+
+fn apply_scummvm_detection(
+    report: &mut GameIdentityReport,
+    detection: Result<
+        crate::scummvm_detection::ScummVmDetectedGame,
+        crate::scummvm_detection::ScummVmDetectionError,
+    >,
+) {
+    match detection {
+        Ok(game) => {
+            let mut diagnostic = format!(
+                "ScummVM native detector matched engine `{}` and game `{}`",
+                game.engine_id, game.game_id
+            );
+            for (label, value) in [
+                ("platform", game.platform.as_deref()),
+                ("language", game.language.as_deref()),
+                ("variant", game.variant.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    diagnostic.push_str(&format!(", {label} `{value}`"));
+                }
+            }
+            if let Some(demo) = game.demo {
+                diagnostic.push_str(if demo { ", demo" } else { ", full release" });
+            }
+            report.evidence.push(evidence(
+                report,
+                IdentityKind::ScummVmGameId,
+                IdentityStatus::Verified,
+                Some(format!("{}:{}", game.engine_id, game.game_id)),
+                IdentityConfidence::StructuredMetadata,
+                &diagnostic,
+                "installed ScummVM --detect",
+            ));
+            report.complete = true;
+        }
+        Err(error) => {
+            let status = match error {
+                crate::scummvm_detection::ScummVmDetectionError::DetectorUnavailable => {
+                    IdentityStatus::Deferred
+                }
+                crate::scummvm_detection::ScummVmDetectionError::Ambiguous(_)
+                | crate::scummvm_detection::ScummVmDetectionError::MalformedOutput(_) => {
+                    IdentityStatus::Ambiguous
+                }
+                crate::scummvm_detection::ScummVmDetectionError::NoMatch => {
+                    IdentityStatus::Unsupported
+                }
+                _ => IdentityStatus::Invalid,
+            };
+            add_unavailable(report, status, &error.to_string());
+        }
     }
 }
 
@@ -4795,6 +4915,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
         | IdentityPlatform::Xbox
+        | IdentityPlatform::ScummVM
         | IdentityPlatform::Other => {}
     }
 }
