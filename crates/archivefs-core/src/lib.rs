@@ -10840,6 +10840,12 @@ mod tests {
     }
 
     #[test]
+    fn hdi_nhd_capacity_and_filename_do_not_prove_pc98() {
+        assert_eq!(detect_platform("/roms/PC-98 Game.hdi", "/roms"), None);
+        assert_eq!(detect_platform("/roms/NEC PC-9801 Game.nhd", "/roms"), None);
+    }
+
+    #[test]
     fn detects_platform_from_collection_style_xbox_segments() {
         assert_eq!(
             detect_platform(

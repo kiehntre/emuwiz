@@ -51,6 +51,7 @@ pub mod atari_st;
 pub mod atari_stx;
 pub mod d88;
 pub mod dsk;
+pub mod hdi;
 pub mod scl;
 pub mod trd;
 
@@ -128,6 +129,8 @@ pub const D88_HEADER_BYTES: usize = 0x2b0;
 
 /// The maximum number of D88 track-table entries (82 tracks x 2 heads).
 pub const MAX_D88_TRACK_ENTRIES: usize = 164;
+/// The largest HDI/NHD image this bounded evidence layer will inspect.
+pub const MAX_HARD_DISK_IMAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// The fixed size of a `.dsk` disk-information block and of each track-
 /// information block.
@@ -168,6 +171,10 @@ pub enum DiskFormat {
     /// A structurally valid D88 disk container shared by Japanese computer
     /// families; it does not identify a platform by itself.
     D88Container,
+    /// A structurally valid Anex86 HDI hard-disk container.
+    HdiContainer,
+    /// A structurally valid T98-Next NHD hard-disk container.
+    NhdContainer,
 }
 
 impl DiskFormat {
@@ -180,6 +187,8 @@ impl DiskFormat {
             Self::SpectrumTrDosDisk => "ZX Spectrum TR-DOS disk image",
             Self::SpectrumSclArchive => "ZX Spectrum SCL (SINCLAIR) archive",
             Self::D88Container => "D88 disk container",
+            Self::HdiContainer => "HDI hard-disk container",
+            Self::NhdContainer => "NHD hard-disk container",
         }
     }
 
@@ -194,6 +203,7 @@ impl DiskFormat {
             Self::SpectrumPlus3Disk => "ZX Spectrum",
             Self::SpectrumTrDosDisk | Self::SpectrumSclArchive => "ZX Spectrum",
             Self::D88Container => "NEC PC-8801",
+            Self::HdiContainer | Self::NhdContainer => "PC-98",
         }
     }
 
@@ -217,6 +227,7 @@ impl DiskFormat {
             | Self::SpectrumTrDosDisk
             | Self::SpectrumSclArchive => true,
             Self::D88Container => false,
+            Self::HdiContainer | Self::NhdContainer => false,
         }
     }
 }
@@ -417,6 +428,20 @@ pub struct D88Layout {
     pub declared_data_bytes: u64,
 }
 
+/// Geometry and header facts declared by an HDI or NHD container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HardDiskLayout {
+    pub header_bytes: u64,
+    pub data_offset: u64,
+    pub sector_size: u64,
+    pub sectors_per_track: u64,
+    pub heads: u64,
+    pub cylinders: u64,
+    pub declared_payload_bytes: u64,
+    pub file_bytes: u64,
+    pub version: Option<u8>,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -428,6 +453,8 @@ pub enum DiskFormatMetadata {
     TrDos(TrDosDescriptor),
     Scl(SclLayout),
     D88(D88Layout),
+    Hdi(HardDiskLayout),
+    Nhd(HardDiskLayout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -533,6 +560,8 @@ pub fn inspect_disk_format(
         "trd" => Adapter::SpectrumTrDos,
         "scl" => Adapter::SpectrumScl,
         "d88" => Adapter::D88,
+        "hdi" => Adapter::Hdi,
+        "nhd" => Adapter::Nhd,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -558,6 +587,8 @@ pub fn inspect_disk_format(
         Adapter::SpectrumTrDos => trd::inspect(&mut reader, context, cancel),
         Adapter::SpectrumScl => scl::inspect(&mut reader, context, cancel),
         Adapter::D88 => d88::inspect(&mut reader, context, cancel),
+        Adapter::Hdi => hdi::inspect_hdi(&mut reader, context, cancel),
+        Adapter::Nhd => hdi::inspect_nhd(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -576,6 +607,8 @@ enum Adapter {
     SpectrumTrDos,
     SpectrumScl,
     D88,
+    Hdi,
+    Nhd,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

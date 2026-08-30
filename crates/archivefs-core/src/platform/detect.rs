@@ -768,11 +768,15 @@ fn structural_format_evidence(
         // falls back to folder and extension evidence.
         return Vec::new();
     };
-    // D88 is shared by several Japanese computer families. Its adapter keeps
-    // a dominant canonical label for metadata/display purposes, but that
-    // label is never platform evidence; folder or later DAT/hash evidence
-    // must supply the machine identity.
-    if format == crate::disk_format::DiskFormat::D88Container {
+    // D88, HDI, and NHD are shared Japanese-computer disk containers. Their
+    // labels and geometry are never platform evidence; folder or later
+    // DAT/hash evidence must supply the machine identity.
+    if matches!(
+        format,
+        crate::disk_format::DiskFormat::D88Container
+            | crate::disk_format::DiskFormat::HdiContainer
+            | crate::disk_format::DiskFormat::NhdContainer
+    ) {
         return Vec::new();
     }
     // One evidence item per structural match, carrying the layer's own verdict on

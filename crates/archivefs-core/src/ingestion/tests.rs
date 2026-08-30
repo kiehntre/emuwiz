@@ -9,6 +9,28 @@ fn source_dir(name: &str) -> tempfile::TempDir {
     tempdir().unwrap_or_else(|error| panic!("failed to create temp source dir {name}: {error}"))
 }
 
+fn minimal_hdi() -> Vec<u8> {
+    let mut image = vec![0; 32 + 512];
+    image[8..12].copy_from_slice(&32_u32.to_le_bytes());
+    image[12..16].copy_from_slice(&512_u32.to_le_bytes());
+    image[16..20].copy_from_slice(&512_u32.to_le_bytes());
+    image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    image[24..28].copy_from_slice(&1_u32.to_le_bytes());
+    image[28..32].copy_from_slice(&1_u32.to_le_bytes());
+    image
+}
+
+fn minimal_nhd() -> Vec<u8> {
+    let mut image = vec![0; 0x200 + 512];
+    image[..15].copy_from_slice(b"T98HDDIMAGE.R0\0");
+    image[0x110..0x114].copy_from_slice(&0x200_u32.to_le_bytes());
+    image[0x114..0x118].copy_from_slice(&1_u32.to_le_bytes());
+    image[0x118..0x11a].copy_from_slice(&1_u16.to_le_bytes());
+    image[0x11a..0x11c].copy_from_slice(&1_u16.to_le_bytes());
+    image[0x11c..0x11e].copy_from_slice(&512_u16.to_le_bytes());
+    image
+}
+
 /// The standard z64 (big-endian) N64 dump signature.
 const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
 
@@ -171,6 +193,33 @@ fn loose_msx_cartridges_are_discovered_and_resolved_by_generation() {
         Some("MSX2")
     );
     assert_eq!(report.stats.loose_roms, 2);
+}
+
+#[test]
+fn pc98_hdi_and_nhd_are_discovered_only_with_folder_identity() {
+    let parent = source_dir("pc98-hard-disks");
+    let pc98 = parent.path().join("pc98");
+    std::fs::create_dir(&pc98).unwrap();
+    std::fs::write(pc98.join("disk.hdi"), minimal_hdi()).unwrap();
+    std::fs::write(pc98.join("disk.nhd"), minimal_nhd()).unwrap();
+    let report = discover_source(&pc98).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    for item in &report.items {
+        assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+        assert_eq!(item.platform_hint.as_deref(), Some("PC-98"));
+        assert_eq!(item.validation_state, ValidationState::Accepted);
+    }
+
+    let bare = source_dir("bare-pc98-hard-disks");
+    std::fs::write(bare.path().join("disk.hdi"), minimal_hdi()).unwrap();
+    std::fs::write(bare.path().join("disk.nhd"), minimal_nhd()).unwrap();
+    let report = discover_source(bare.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert!(report.items.iter().all(|item| {
+        item.platform_hint.is_none()
+            && item.validation_state == ValidationState::Skipped
+            && item.skip_reason == Some(SkipReason::RecognizedContentNoIdentityMatch)
+    }));
 }
 
 #[test]

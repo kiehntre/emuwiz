@@ -12,6 +12,51 @@ use crate::platform::{
 };
 use std::path::PathBuf;
 
+fn hdi_image(
+    header_size: u32,
+    sector_size: u32,
+    sectors: u32,
+    heads: u32,
+    cylinders: u32,
+) -> Vec<u8> {
+    let payload = u64::from(sector_size)
+        .checked_mul(u64::from(sectors))
+        .and_then(|value| value.checked_mul(u64::from(heads)))
+        .and_then(|value| value.checked_mul(u64::from(cylinders)))
+        .unwrap() as usize;
+    let mut image = vec![0; header_size as usize + payload];
+    image[8..12].copy_from_slice(&header_size.to_le_bytes());
+    image[12..16].copy_from_slice(&(payload as u32).to_le_bytes());
+    image[16..20].copy_from_slice(&sector_size.to_le_bytes());
+    image[20..24].copy_from_slice(&sectors.to_le_bytes());
+    image[24..28].copy_from_slice(&heads.to_le_bytes());
+    image[28..32].copy_from_slice(&cylinders.to_le_bytes());
+    image
+}
+
+fn nhd_image(
+    header_size: u32,
+    sector_size: u16,
+    sectors: u16,
+    heads: u16,
+    cylinders: u32,
+) -> Vec<u8> {
+    let payload = u64::from(sector_size)
+        .checked_mul(u64::from(sectors))
+        .and_then(|value| value.checked_mul(u64::from(heads)))
+        .and_then(|value| value.checked_mul(u64::from(cylinders)))
+        .unwrap() as usize;
+    let mut image = vec![0; header_size as usize + payload];
+    image[..15].copy_from_slice(b"T98HDDIMAGE.R0\0");
+    image[0x110..0x114].copy_from_slice(&header_size.to_le_bytes());
+    image[0x114..0x118].copy_from_slice(&cylinders.to_le_bytes());
+    image[0x118..0x11a].copy_from_slice(&heads.to_le_bytes());
+    image[0x11a..0x11c].copy_from_slice(&sectors.to_le_bytes());
+    image[0x11c..0x11e].copy_from_slice(&sector_size.to_le_bytes());
+    image[0x10..0x18].copy_from_slice(b"TEST NHD");
+    image
+}
+
 /// A throwaway tree with a trusted library root and an untrusted one beside it.
 struct Fixture {
     root: PathBuf,
@@ -1955,4 +2000,97 @@ fn trdos_media_reaches_platform_detection_as_confirmed_zx_spectrum() {
         assert_eq!(report.platform, Some("ZX Spectrum"), "{name}");
         assert_eq!(report.confidence, DetectionConfidence::Confirmed, "{name}");
     }
+}
+
+#[test]
+fn hdi_and_nhd_validate_geometry_without_proving_pc98() {
+    let fixture = Fixture::new("hdi-nhd-positive");
+    let hdi = fixture.write("library/disk.hdi", &hdi_image(0x20, 512, 1, 1, 1));
+    let nhd = fixture.write("library/disk.nhd", &nhd_image(0x200, 512, 1, 1, 1));
+
+    let hdi_evidence = fixture.inspect(&hdi);
+    assert_eq!(hdi_evidence.format, Some(DiskFormat::HdiContainer));
+    assert_eq!(hdi_evidence.platform, Some("PC-98"));
+    assert_eq!(hdi_evidence.confidence, DetectionConfidence::Probable);
+    assert!(!hdi_evidence.conclusive);
+    assert!(
+        hdi_evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("0x00000000"))
+    );
+    assert!(matches!(
+        hdi_evidence.metadata,
+        Some(DiskFormatMetadata::Hdi(_))
+    ));
+
+    let nhd_evidence = fixture.inspect(&nhd);
+    assert_eq!(nhd_evidence.format, Some(DiskFormat::NhdContainer));
+    assert_eq!(nhd_evidence.confidence, DetectionConfidence::Probable);
+    assert!(!nhd_evidence.conclusive);
+    assert!(
+        nhd_evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("TEST NHD"))
+    );
+    assert!(matches!(
+        nhd_evidence.metadata,
+        Some(DiskFormatMetadata::Nhd(_))
+    ));
+}
+
+#[test]
+fn hdi_and_nhd_folder_context_confirms_existing_pc98_equivalence() {
+    let fixture = Fixture::new("hdi-nhd-context");
+    for folder in ["PC-98", "NEC PC-9801"] {
+        let hdi = fixture.write(
+            &format!("library/{folder}/disk.hdi"),
+            &hdi_image(0x20, 512, 1, 1, 1),
+        );
+        let nhd = fixture.write(
+            &format!("library/{folder}/disk.nhd"),
+            &nhd_image(0x200, 512, 1, 1, 1),
+        );
+        for path in [hdi, nhd] {
+            let evidence = fixture.inspect_in_folder(&path, folder);
+            assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+            assert!(evidence.conclusive);
+            assert_eq!(evidence.platform, Some("PC-98"));
+        }
+    }
+}
+
+#[test]
+fn malformed_hdi_and_nhd_structures_fail_closed() {
+    let fixture = Fixture::new("hdi-nhd-negative");
+    let cases = [
+        ("truncated.hdi", vec![0; 12]),
+        ("bad-signature.nhd", vec![0; 512]),
+        ("zero-geometry.hdi", hdi_image(0x20, 512, 0, 1, 1)),
+        ("bad-sector-size.hdi", hdi_image(0x20, 123, 1, 1, 1)),
+        ("random.nhd", vec![0x5a; 1024]),
+    ];
+    for (name, bytes) in cases {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        assert!(
+            fixture.inspect(&path).format.is_none(),
+            "{name} must be refused"
+        );
+    }
+
+    let mut bad_offset = hdi_image(0x20, 512, 1, 1, 1);
+    bad_offset[8..12].copy_from_slice(&0x1000_u32.to_le_bytes());
+    let path = fixture.write("library/bad-offset.hdi", &bad_offset);
+    assert!(fixture.inspect(&path).format.is_none());
+
+    let mut bad_payload = hdi_image(0x20, 512, 1, 1, 1);
+    bad_payload[12..16].copy_from_slice(&0_u32.to_le_bytes());
+    let path = fixture.write("library/bad-payload.hdi", &bad_payload);
+    assert!(fixture.inspect(&path).format.is_none());
+
+    let mut overflow = nhd_image(0x200, 512, 1, 1, 1);
+    overflow[0x114..0x118].copy_from_slice(&u32::MAX.to_le_bytes());
+    let path = fixture.write("library/overflow.nhd", &overflow);
+    assert!(fixture.inspect(&path).format.is_none());
 }

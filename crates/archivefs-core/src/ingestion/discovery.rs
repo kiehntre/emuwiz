@@ -581,6 +581,9 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
     if extension == "d88" {
         return discover_d88_image(path, source_root);
     }
+    if matches!(extension.as_str(), "hdi" | "nhd") {
+        return discover_hard_disk_image(path, source_root, &extension);
+    }
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
     }
@@ -1019,6 +1022,71 @@ fn discover_d88_image(path: &Path, source_root: &Path) -> GameDiscovery {
                     .unwrap_or_else(|| "not a recognised D88 disk container".to_string()),
             ),
             "This file is not a readable D88 disk container.".to_string(),
+        ),
+    }
+}
+
+/// HDI and NHD headers prove only a coherent hard-disk container. They are
+/// shared image formats, so platform identity still comes from folder/DAT/hash
+/// evidence and never from capacity or the extension.
+fn discover_hard_disk_image(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let expected = if extension == "hdi" {
+        DiskFormat::HdiContainer
+    } else {
+        DiskFormat::NhdContainer
+    };
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!(".{extension} hard-disk container"));
+    match evidence.format {
+        Some(format) if format == expected => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Valid .{extension} hard-disk container; platform identified from other evidence. {detail}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid .{extension} hard-disk container, but its header does not prove PC-98 or any other platform. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| format!("not a recognised .{extension} container")),
+            ),
+            format!("This .{extension} file is not a readable hard-disk container."),
         ),
     }
 }

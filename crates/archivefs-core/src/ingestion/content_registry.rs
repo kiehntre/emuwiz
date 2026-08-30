@@ -131,6 +131,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("msa", ContentKind::ComputerDisk),
     cf("ipf", ContentKind::ComputerDisk),
     cf("hdi", ContentKind::ComputerDisk),
+    cf("nhd", ContentKind::ComputerDisk),
     cf("ima", ContentKind::ComputerDisk),
     cf("img", ContentKind::ComputerDisk),
     cf("d88", ContentKind::ComputerDisk),
@@ -221,6 +222,18 @@ mod tests {
     fn d88_is_computer_disk_content() {
         assert_eq!(
             content_kind_for_extension("d88"),
+            Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn pc98_hard_disk_extensions_are_computer_disks() {
+        assert_eq!(
+            content_kind_for_extension("hdi"),
+            Some(ContentKind::ComputerDisk)
+        );
+        assert_eq!(
+            content_kind_for_extension("nhd"),
             Some(ContentKind::ComputerDisk)
         );
     }

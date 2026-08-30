@@ -144,6 +144,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         kind: ArchiveKind::DirectGameImage,
     },
     MediaFormat {
+        extension: "hdi",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "nhd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
         extension: "cdt",
         kind: ArchiveKind::DirectGameImage,
     },
@@ -456,6 +464,17 @@ mod tests {
             kind_for_extension("mx2"),
             Some(ArchiveKind::DirectGameImage)
         );
+    }
+
+    #[test]
+    fn pc98_hard_disk_extensions_are_direct_game_images() {
+        for extension in ["hdi", "nhd"] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be a direct game image"
+            );
+        }
     }
 
     #[test]
