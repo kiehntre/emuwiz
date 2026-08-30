@@ -135,9 +135,14 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0007_discovery_details.sql"),
     },
     Migration {
-        version: 8,
         description: "persist per-library-item DAT identity results (library_dat_identities), source-scoped, so the selected-item path reconstructs LibraryDatIdentitySummary without re-auditing",
         sql: include_str!("migrations/0008_library_dat_identities.sql"),
+        version: 8,
+    },
+    Migration {
+        version: 9,
+        description: "persist DAT set-completeness and dependency verdicts with source provenance",
+        sql: include_str!("migrations/0009_set_audit_verdicts.sql"),
     },
 ];
 
@@ -148,6 +153,51 @@ fn latest_known_version(migrations: &[Migration]) -> i64 {
         .unwrap_or(0)
 }
 
+fn persisted_set_result_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedSetAuditResult> {
+    let path_bytes: Vec<u8> = row.get(2)?;
+    let state: String = row.get(6)?;
+    let dependency_state: String = row.get(7)?;
+    let ecosystem: Option<String> = row.get(8)?;
+    Ok(PersistedSetAuditResult {
+        id: row.get(0)?,
+        archive_id: row.get(1)?,
+        archive_path: PathBuf::from(OsString::from_vec(path_bytes)),
+        source_id: row.get(3)?,
+        game_name: row.get(4)?,
+        platform: row.get(5)?,
+        state: serde_json::from_str(&state).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        dependency_state: serde_json::from_str(&dependency_state).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        ecosystem: ecosystem
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        dat_revision: row.get(9)?,
+        audited_at: row.get(10)?,
+        stale: row.get::<_, i64>(11)? != 0,
+        exhaustive: row.get::<_, i64>(12)? != 0,
+    })
+}
+
 /// An open connection to the EmuWiz library database, with all pending
 /// migrations already applied. The inner `rusqlite::Connection` is private;
 /// nothing outside this module touches it directly.
@@ -155,6 +205,38 @@ fn latest_known_version(migrations: &[Migration]) -> i64 {
 pub struct Database {
     connection: Connection,
     path: PathBuf,
+}
+
+/// A durable, source-scoped DAT set verdict. `exhaustive` is explicit because
+/// a partial audit must never be mistaken for proof that a dependency is
+/// missing; current consumers should treat non-exhaustive rows as
+/// informational only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PersistedSetAuditResult {
+    pub id: i64,
+    pub archive_id: Option<i64>,
+    pub archive_path: PathBuf,
+    pub source_id: String,
+    pub game_name: String,
+    pub platform: Option<String>,
+    pub state: crate::dat::set::SetState,
+    pub dependency_state: crate::dat::dependency::DependencyState,
+    pub ecosystem: Option<crate::dat::model::DatEcosystem>,
+    pub dat_revision: Option<String>,
+    pub audited_at: String,
+    pub stale: bool,
+    pub exhaustive: bool,
+}
+
+/// One normalized dependency from a persisted set verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PersistedSetAuditDependency {
+    pub id: i64,
+    pub result_id: i64,
+    pub kind: crate::dat::dependency::DependencyKind,
+    pub outcome: crate::dat::dependency::DependencyOutcome,
+    pub target: crate::dat::dependency::DependencyTarget,
+    pub via_member: Option<String>,
 }
 
 impl Database {
@@ -2570,6 +2652,248 @@ impl Database {
             )?);
         }
         Ok(summary)
+    }
+
+    /// Replaces the current set/dependency verdicts produced by one source.
+    /// A run with an incomplete catalogue, traversal, or archive pass writes
+    /// nothing: in particular it cannot manufacture durable `Missing` facts.
+    pub fn persist_dat_audit_results(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+    ) -> Result<usize> {
+        use crate::dat::archive::ArchivePassCompletion;
+
+        let exhaustive = !outcome.truncated
+            && outcome.unreadable_catalogues.is_empty()
+            && outcome
+                .archives
+                .iter()
+                .all(|archive| matches!(archive.completion, ArchivePassCompletion::Complete));
+        if !exhaustive {
+            return Ok(0);
+        }
+
+        let archive_ids: Vec<Option<i64>> = outcome
+            .sets
+            .iter()
+            .map(|set| self.find_archive_id_by_absolute_path(&set.archive_path))
+            .collect::<Result<Vec<_>>>()?;
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|error| db_error("failed to start DAT set-result transaction", error))?;
+        let audited_at = now_utc_string();
+        let mut written = 0;
+        for (set, archive_id) in outcome.sets.iter().zip(archive_ids) {
+            let state = serde_json::to_string(&set.state).map_err(|error| {
+                ArchiveFsError::Database(format!("failed to encode set state: {error}"))
+            })?;
+            let dependency_state =
+                serde_json::to_string(&set.dependencies.state).map_err(|error| {
+                    ArchiveFsError::Database(format!("failed to encode dependency state: {error}"))
+                })?;
+            let ecosystem = outcome
+                .catalogue_ecosystem
+                .map(|value| serde_json::to_string(&value))
+                .transpose()
+                .map_err(|error| {
+                    ArchiveFsError::Database(format!("failed to encode DAT ecosystem: {error}"))
+                })?;
+            let path_bytes = set.archive_path.as_os_str().as_bytes();
+            tx.execute(
+                "INSERT INTO dat_set_audit_results
+                 (archive_id, archive_path, source_id, game_name, platform,
+                  set_state_json, dependency_state_json, ecosystem, dat_revision,
+                  audited_at, stale, exhaustive)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 1)
+                 ON CONFLICT(archive_path, source_id, game_name) DO UPDATE SET
+                  archive_id = excluded.archive_id, platform = excluded.platform,
+                  set_state_json = excluded.set_state_json,
+                  dependency_state_json = excluded.dependency_state_json,
+                  ecosystem = excluded.ecosystem, dat_revision = excluded.dat_revision,
+                  audited_at = excluded.audited_at, stale = 0, exhaustive = 1",
+                params![
+                    archive_id,
+                    path_bytes,
+                    outcome.source_id,
+                    set.identity.game_name,
+                    outcome.platform,
+                    state,
+                    dependency_state,
+                    ecosystem,
+                    outcome.catalogue_version,
+                    audited_at,
+                ],
+            )
+            .map_err(|error| db_error("failed to persist DAT set verdict", error))?;
+            let result_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM dat_set_audit_results WHERE archive_path = ?1 AND source_id = ?2 AND game_name = ?3",
+                    params![path_bytes, outcome.source_id, set.identity.game_name],
+                    |row| row.get(0),
+                )
+                .map_err(|error| db_error("failed to read persisted DAT set verdict id", error))?;
+            tx.execute(
+                "DELETE FROM dat_set_audit_dependencies WHERE result_id = ?1",
+                params![result_id],
+            )
+            .map_err(|error| db_error("failed to replace DAT dependency details", error))?;
+            for requirement in &set.dependencies.requirements {
+                let kind = serde_json::to_string(&requirement.kind).unwrap_or_default();
+                let outcome_json = serde_json::to_string(&requirement.outcome).unwrap_or_default();
+                let target = serde_json::to_string(&requirement.target).map_err(|error| {
+                    ArchiveFsError::Database(format!("failed to encode dependency target: {error}"))
+                })?;
+                tx.execute(
+                    "INSERT INTO dat_set_audit_dependencies
+                     (result_id, dependency_kind, dependency_outcome, target_json, via_member)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        result_id,
+                        kind.trim_matches('"'),
+                        outcome_json.trim_matches('"'),
+                        target,
+                        requirement.via_member
+                    ],
+                )
+                .map_err(|error| db_error("failed to persist DAT dependency detail", error))?;
+            }
+            written += 1;
+        }
+        tx.commit()
+            .map_err(|error| db_error("failed to commit DAT set verdicts", error))?;
+        Ok(written)
+    }
+
+    /// Marks current results stale when a managed source advances to a known
+    /// revision. Unknown revisions do not invalidate anything by inference.
+    pub fn mark_dat_set_results_stale(
+        &mut self,
+        source_id: &str,
+        current_revision: Option<&str>,
+    ) -> Result<usize> {
+        let Some(current_revision) = current_revision else {
+            return Ok(0);
+        };
+        self.connection
+            .execute(
+                "UPDATE dat_set_audit_results SET stale = 1
+                 WHERE source_id = ?1 AND (dat_revision IS NULL OR dat_revision <> ?2)",
+                params![source_id, current_revision],
+            )
+            .map_err(|error| db_error("failed to mark DAT set results stale", error))
+    }
+
+    pub fn set_audit_result(
+        &self,
+        archive_path: &Path,
+        source_id: &str,
+        game_name: &str,
+    ) -> Result<Option<PersistedSetAuditResult>> {
+        self.connection
+            .query_row(
+                "SELECT id, archive_id, archive_path, source_id, game_name, platform,
+                        set_state_json, dependency_state_json, ecosystem, dat_revision,
+                        audited_at, stale, exhaustive
+                 FROM dat_set_audit_results
+                 WHERE archive_path = ?1 AND source_id = ?2 AND game_name = ?3",
+                params![archive_path.as_os_str().as_bytes(), source_id, game_name],
+                persisted_set_result_from_row,
+            )
+            .optional()
+            .map_err(|error| db_error("failed to query DAT set verdict", error))
+    }
+
+    pub fn set_audit_results_for_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<PersistedSetAuditResult>> {
+        self.query_set_audit_results(
+            "WHERE source_id = ?1 ORDER BY archive_path, game_name",
+            params![source_id],
+        )
+    }
+
+    pub fn stale_set_audit_results(&self) -> Result<Vec<PersistedSetAuditResult>> {
+        self.query_set_audit_results(
+            "WHERE stale = 1 ORDER BY source_id, archive_path, game_name",
+            [],
+        )
+    }
+
+    pub fn set_audit_results_by_state(
+        &self,
+        state: &crate::dat::set::SetState,
+    ) -> Result<Vec<PersistedSetAuditResult>> {
+        let encoded = serde_json::to_string(state).map_err(|error| {
+            ArchiveFsError::Database(format!("failed to encode set-state query: {error}"))
+        })?;
+        self.query_set_audit_results(
+            "WHERE set_state_json = ?1 ORDER BY source_id, archive_path, game_name",
+            params![encoded],
+        )
+    }
+
+    pub fn set_audit_dependencies(
+        &self,
+        result_id: i64,
+    ) -> Result<Vec<PersistedSetAuditDependency>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, result_id, dependency_kind, dependency_outcome, target_json, via_member
+             FROM dat_set_audit_dependencies WHERE result_id = ?1 ORDER BY id",
+            )
+            .map_err(|error| db_error("failed to prepare DAT dependency query", error))?;
+        let rows = statement
+            .query_map(params![result_id], |row| {
+                let kind: String = row.get(2)?;
+                let outcome: String = row.get(3)?;
+                let target: String = row.get(4)?;
+                Ok((row.get(0)?, row.get(1)?, kind, outcome, target, row.get(5)?))
+            })
+            .map_err(|error| db_error("failed to query DAT dependency details", error))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, result_id, kind, outcome, target, via_member) =
+                row.map_err(|error| db_error("failed to read DAT dependency detail", error))?;
+            result.push(PersistedSetAuditDependency {
+                id,
+                result_id,
+                kind: serde_json::from_str(&format!("\"{kind}\"")).map_err(|error| {
+                    ArchiveFsError::Database(format!("invalid dependency kind: {error}"))
+                })?,
+                outcome: serde_json::from_str(&format!("\"{outcome}\"")).map_err(|error| {
+                    ArchiveFsError::Database(format!("invalid dependency outcome: {error}"))
+                })?,
+                target: serde_json::from_str(&target).map_err(|error| {
+                    ArchiveFsError::Database(format!("invalid dependency target: {error}"))
+                })?,
+                via_member,
+            });
+        }
+        Ok(result)
+    }
+
+    fn query_set_audit_results(
+        &self,
+        clause: &str,
+        parameters: impl rusqlite::Params,
+    ) -> Result<Vec<PersistedSetAuditResult>> {
+        let sql = format!(
+            "SELECT id, archive_id, archive_path, source_id, game_name, platform,
+                    set_state_json, dependency_state_json, ecosystem, dat_revision,
+                    audited_at, stale, exhaustive FROM dat_set_audit_results {clause}"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|error| db_error("failed to prepare DAT set verdict query", error))?;
+        let rows = statement
+            .query_map(parameters, persisted_set_result_from_row)
+            .map_err(|error| db_error("failed to query DAT set verdicts", error))?;
+        rows.map(|row| row.map_err(|error| db_error("failed to read DAT set verdict", error)))
+            .collect()
     }
 
     pub fn current_platform_identity_evidence(
@@ -5407,6 +5731,8 @@ mod tests {
             vec![
                 "archive_scan_observations",
                 "archives",
+                "dat_set_audit_dependencies",
+                "dat_set_audit_results",
                 "discovery_details",
                 "library_dat_identities",
                 "platform_aliases",
@@ -9911,6 +10237,146 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn dat_set_verdicts_persist_dependencies_provenance_and_staleness() {
+        use crate::dat::audit::{AuditReport, AuditSummary};
+        use crate::dat::dependency::{
+            DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget,
+            SetDependencyReport,
+        };
+        use crate::dat::model::DatEcosystem;
+        use crate::dat::set::{SetIdentity, SetResolution, SetState};
+        use crate::dat::sources::audit_run::DatAuditOutcome;
+
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-set-verdict-persistence");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let mut outcome = DatAuditOutcome {
+            source_id: "mame-arcade".to_string(),
+            source_display_name: "MAME Arcade".to_string(),
+            dat_path: "/catalogues/mame.dat".to_string(),
+            scan_root: root.display().to_string(),
+            catalogue_names: vec!["MAME".to_string()],
+            catalogue_entries: 1,
+            catalogue_roms: 1,
+            catalogue_version: Some("0.267".to_string()),
+            catalogue_author: None,
+            catalogue_homepage: None,
+            catalogue_ecosystem: Some(DatEcosystem::MAMEArcade),
+            unreadable_catalogues: Vec::new(),
+            report: AuditReport {
+                entries: Vec::new(),
+                summary: AuditSummary::default(),
+            },
+            evidence_sources: Vec::new(),
+            archives: Vec::new(),
+            sets: vec![SetResolution {
+                identity: SetIdentity {
+                    source_id: "mame-arcade".to_string(),
+                    game_name: "game".to_string(),
+                },
+                archive_path: archive.absolute_path.clone(),
+                state: SetState::Incomplete,
+                members_required: vec!["game.rom".to_string()],
+                members_verified: Vec::new(),
+                members_bad: Vec::new(),
+                members_optional: Vec::new(),
+                members_borrowed: vec!["parent.rom".to_string()],
+                disks_required: Vec::new(),
+                disks_verified: Vec::new(),
+                disks_parent_required: Vec::new(),
+                dependencies: SetDependencyReport::from_requirements(vec![DependencyRequirement {
+                    kind: DependencyKind::ParentSet,
+                    target: DependencyTarget::Set {
+                        name: "parent".to_string(),
+                    },
+                    outcome: DependencyOutcome::Missing,
+                    via_member: Some("parent.rom".to_string()),
+                }]),
+            }],
+            unhashed: Vec::new(),
+            files_scanned: 1,
+            bytes_hashed: 0,
+            archive_bytes_hashed: 0,
+            truncated: false,
+            policy: None,
+            content: Default::default(),
+            platform: Some("Arcade".to_string()),
+            cache: Default::default(),
+        };
+
+        assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 1);
+        let saved = database
+            .set_audit_result(&archive.absolute_path, "mame-arcade", "game")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.dat_revision.as_deref(), Some("0.267"));
+        assert_eq!(saved.ecosystem, Some(DatEcosystem::MAMEArcade));
+        assert!(!saved.stale);
+        assert!(saved.exhaustive);
+        let dependencies = database.set_audit_dependencies(saved.id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].kind, DependencyKind::ParentSet);
+        assert_eq!(dependencies[0].outcome, DependencyOutcome::Missing);
+        assert_eq!(
+            dependencies[0].target,
+            DependencyTarget::Set {
+                name: "parent".to_string()
+            }
+        );
+
+        assert_eq!(
+            database
+                .mark_dat_set_results_stale("mame-arcade", Some("0.268"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(database.stale_set_audit_results().unwrap().len(), 1);
+        outcome.catalogue_version = Some("0.268".to_string());
+        assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 1);
+        let refreshed = database
+            .set_audit_result(&archive.absolute_path, "mame-arcade", "game")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.dat_revision.as_deref(), Some("0.268"));
+        assert!(!refreshed.stale);
+
+        outcome.source_id = "fbneo".to_string();
+        outcome.source_display_name = "FBNeo".to_string();
+        outcome.catalogue_ecosystem = Some(DatEcosystem::FBNeo);
+        assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 1);
+        assert_eq!(
+            database
+                .set_audit_results_for_source("mame-arcade")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .set_audit_results_for_source("fbneo")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        outcome.truncated = true;
+        assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 0);
+        assert_eq!(
+            database
+                .set_audit_results_for_source("fbneo")
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     // -------------------------------------------------------------------
     // `source_assignment_is_compatible` (registry-driven, media/platform
     // review): the compatibility gate must delegate entirely to the
@@ -11518,13 +11984,17 @@ mod tests {
         }
 
         #[test]
-        fn migration_0008_is_registered_and_last() {
-            assert_eq!(latest_known_version(MIGRATIONS), 8);
+        fn migrations_0008_and_0009_are_registered_in_order() {
+            assert_eq!(latest_known_version(MIGRATIONS), 9);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 8
                     && migration
                         .sql
                         .contains("CREATE TABLE library_dat_identities")
+            }));
+            assert!(MIGRATIONS.iter().any(|migration| {
+                migration.version == 9
+                    && migration.sql.contains("CREATE TABLE dat_set_audit_results")
             }));
         }
     }

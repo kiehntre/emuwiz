@@ -73,7 +73,7 @@
 //!   nothing here reads the resolution list to decide what evidence exists.
 //!   No dependency rule needs revisiting when that follow-up lands.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::set::{NeedsReviewReason, SetState};
 
@@ -102,7 +102,7 @@ pub const BIOS_RUNTIME_SELECTION_NOT_MODELLED: bool = true;
 /// tempting and wrong: each one fails differently, and a resolver that treats
 /// `cloneof` as `romof` (or `disk merge=` as a CHD parent) will report a set
 /// complete on evidence that never addressed the real requirement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyKind {
     /// `<game cloneof="...">` - a hierarchy statement. It asserts the parent
@@ -151,7 +151,7 @@ impl DependencyKind {
 /// CHD's own header SHA-1. No variant is a filesystem path or a display name
 /// used as identity: a same-named file in an unrelated set can never resolve
 /// any of these.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyTarget {
     /// A whole catalogue set, by its DAT `<game name>`.
@@ -181,7 +181,7 @@ pub enum DependencyTarget {
 /// Ordered weakest-blocking to strongest-blocking for roll-up purposes; see
 /// [`DependencyState::roll_up`]. Only [`DependencyOutcome::Satisfied`] permits
 /// a `Complete` set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyOutcome {
     /// Proven: the required declaration resolved uniquely and the content it
@@ -219,7 +219,7 @@ impl DependencyOutcome {
 }
 
 /// One resolved dependency relationship.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyRequirement {
     pub kind: DependencyKind,
     pub target: DependencyTarget,
@@ -231,7 +231,7 @@ pub struct DependencyRequirement {
 }
 
 /// The roll-up of every requirement belonging to one set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyState {
     /// The set declares no dependency relationships at all. This is the
@@ -313,7 +313,7 @@ fn severity(outcome: DependencyOutcome) -> u8 {
 /// GUI rollup) has to be able to say *which* parent set, BIOS, device, sample
 /// set, or parent CHD is missing, and to distinguish "provably missing" from
 /// "the catalogue is ambiguous here" from "this stage cannot see that yet".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetDependencyReport {
     pub state: DependencyState,
     /// Every relationship considered, in a deterministic order fixed by the

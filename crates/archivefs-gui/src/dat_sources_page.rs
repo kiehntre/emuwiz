@@ -4430,14 +4430,17 @@ impl DatSourcesPageState {
                     } else if let Some(database_path) = database_path {
                         match archivefs_core::Database::open_or_create(&database_path).and_then(
                             |mut database| {
-                                database.enrich_platforms_from_dat_audit(&outcome, generation)
+                                let persisted = database.persist_dat_audit_results(&outcome)?;
+                                let enrichment = database
+                                    .enrich_platforms_from_dat_audit(&outcome, generation)?;
+                                Ok((persisted, enrichment))
                             },
                         ) {
-                            Ok(enrichment) => {
+                            Ok((persisted, enrichment)) => {
                                 send_progress(
                                     &sender,
                                     JobMessage::Progress(format!(
-                                        "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                                        "Persisted {persisted} set verdict(s). Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
                                         enrichment.applied,
                                         enrichment.unchanged,
                                         enrichment.manual_preserved,

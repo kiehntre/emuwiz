@@ -143,7 +143,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::archive::ArchivePassCompletion;
 use super::audit::AuditVerdict;
@@ -189,7 +189,7 @@ pub struct SetIdentity {
 }
 
 /// Why a `nodump`/`baddump` rom disqualifies a set from `Complete`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BadMetadataReason {
     /// The DAT declares this rom unverifiable; it can never be "missing"
@@ -202,7 +202,7 @@ pub enum BadMetadataReason {
 }
 
 /// Why a set cannot be classified `Complete` or `Incomplete` with confidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NeedsReviewReason {
     /// A member's cryptographic hash matched more than one DAT entry; this
@@ -265,7 +265,7 @@ pub enum NeedsReviewReason {
 ///
 /// `Complete` is deliberately the least reachable state: every other variant
 /// is what a mixed or partial result degrades to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetState {
     /// Every locally required physical member was strongly verified, or the

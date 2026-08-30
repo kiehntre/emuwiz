@@ -1466,16 +1466,16 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 
 /// Doctor stores nothing, so it must not add, renumber, or modify a
 /// migration. The integrated Wii identity feature legitimately owns 0006,
-/// the unrelated Collection Discovery paging feature legitimately owns
-/// 0007 (`migrations/0007_discovery_details.sql`), and the unrelated
-/// per-item DAT identity persistence feature legitimately owns 0008
-/// (`migrations/0008_library_dat_identities.sql`) - all in `database.rs`,
-/// not this module; this guard lists them while still proving Doctor
-/// itself introduced no migration of its own (the string scan below, over
-/// Doctor's own source files only).
+/// and the unrelated Collection Discovery paging feature legitimately owns
+/// 0007 (`migrations/0007_discovery_details.sql`, introduced by
+/// `collection_discovery_page`'s persisted-details work - see `database.rs`,
+/// not this module), followed by 0008's per-item DAT identity persistence and
+/// 0009's set-audit persistence; this guard lists all application migrations while still
+/// proving Doctor itself introduced no migration of its own (the string
+/// scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 8] = [
+    const EXPECTED: [&str; 9] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1484,6 +1484,7 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0006_game_identity_reports.sql"),
         include_str!("../migrations/0007_discovery_details.sql"),
         include_str!("../migrations/0008_library_dat_identities.sql"),
+        include_str!("../migrations/0009_set_audit_verdicts.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
