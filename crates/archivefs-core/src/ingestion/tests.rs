@@ -142,6 +142,50 @@ fn loose_wonderswan_color_rom_is_discovered_with_its_existing_platform_context()
 }
 
 #[test]
+fn loose_msx_cartridges_are_discovered_and_resolved_by_generation() {
+    let dir = source_dir("msx-cartridges");
+    std::fs::write(dir.path().join("cart.mx1"), b"MSX1 cartridge bytes").unwrap();
+    std::fs::write(dir.path().join("cart.mx2"), b"MSX2 cartridge bytes").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    for item in &report.items {
+        assert_eq!(item.container, ContainerKind::DirectFile);
+        assert_eq!(item.content, Some(ContentKind::RomCartridge));
+        assert_eq!(item.validation_state, ValidationState::Accepted);
+    }
+    assert_eq!(
+        report
+            .items
+            .iter()
+            .find(|item| item.path.extension().and_then(|ext| ext.to_str()) == Some("mx1"))
+            .and_then(|item| item.platform_hint.as_deref()),
+        Some("MSX")
+    );
+    assert_eq!(
+        report
+            .items
+            .iter()
+            .find(|item| item.path.extension().and_then(|ext| ext.to_str()) == Some("mx2"))
+            .and_then(|item| item.platform_hint.as_deref()),
+        Some("MSX2")
+    );
+    assert_eq!(report.stats.loose_roms, 2);
+}
+
+#[test]
+fn ambiguous_msx_rom_and_bin_files_do_not_self_resolve() {
+    let dir = source_dir("msx-ambiguous");
+    std::fs::write(dir.path().join("cart.rom"), b"shared ROM bytes").unwrap();
+    std::fs::write(dir.path().join("cart.bin"), b"shared binary bytes").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    assert!(report.items.iter().all(|item| item.platform_hint.is_none()));
+    assert!(report.items.iter().all(|item| item.content.is_none()));
+}
+
+#[test]
 fn zip_containing_a_game_boy_rom_is_discovered_with_the_same_content_kind_as_loose() {
     let dir = source_dir("zip-gb");
     write_zip_containing(dir.path(), "Pokemon.zip", "Pokemon.gb", b"gb rom bytes");

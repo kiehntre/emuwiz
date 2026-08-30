@@ -93,6 +93,9 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     // --- Sega ---
     cf("sms", ContentKind::RomCartridge),
     cf("gg", ContentKind::RomCartridge),
+    // --- MSX ---
+    cf("mx1", ContentKind::RomCartridge),
+    cf("mx2", ContentKind::RomCartridge),
     cf("md", ContentKind::RomCartridge),
     cf("gen", ContentKind::RomCartridge),
     // WonderSwan cartridge images are distinct extensions. Shared `.bin`
@@ -194,5 +197,18 @@ mod tests {
     fn cue_and_bin_are_never_registered_here() {
         assert_eq!(content_kind_for_extension("cue"), None);
         assert_eq!(content_kind_for_extension("bin"), None);
+    }
+
+    #[test]
+    fn msx_cartridges_are_rom_content() {
+        assert_eq!(
+            content_kind_for_extension("mx1"),
+            Some(ContentKind::RomCartridge)
+        );
+        assert_eq!(
+            content_kind_for_extension("mx2"),
+            Some(ContentKind::RomCartridge)
+        );
+        assert_eq!(content_kind_for_extension("rom"), None);
     }
 }

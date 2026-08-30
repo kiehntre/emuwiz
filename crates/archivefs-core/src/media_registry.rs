@@ -246,6 +246,18 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "wsc",
         kind: ArchiveKind::DirectGameImage,
     },
+    // --- MSX cartridge images ---
+    // `.mx1` and `.mx2` are generation-specific cartridge formats. The
+    // platform registry decides whether they are MSX or MSX2; `.rom`/`.bin`
+    // remain shared and corroboration-only.
+    MediaFormat {
+        extension: "mx1",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "mx2",
+        kind: ArchiveKind::DirectGameImage,
+    },
 ];
 
 /// Extensions that never resolve to an [`ArchiveKind`] on their own - they
@@ -412,6 +424,18 @@ mod tests {
     }
 
     #[test]
+    fn msx_cartridge_extensions_are_recognized() {
+        assert_eq!(
+            kind_for_extension("mx1"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            kind_for_extension("mx2"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
     fn n64_variants_are_all_recognized() {
         assert_eq!(
             kind_for_extension("n64"),
@@ -439,6 +463,7 @@ mod tests {
         assert_eq!(kind_for_extension("md"), None);
         assert_eq!(kind_for_extension("bin"), None);
         assert_eq!(kind_for_extension("gen"), None);
+        assert_eq!(kind_for_extension("rom"), None);
         // They are still watch-relevant though.
         assert!(is_watch_relevant_extension("md"));
         assert!(is_watch_relevant_extension("bin"));

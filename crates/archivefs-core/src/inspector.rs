@@ -115,7 +115,7 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     // Cartridge/ROM dump extensions.
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "3ds", "cia", "gg",
     "sms", "gen", "32x", "pce", "ws", "wsc", "ngp", "ngc", "a26", "a52", "a78", "j64", "col",
-    "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom",
+    "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom", "mx1", "mx2",
     // Disc-image extensions.
     "iso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd", "gdi",
     "cdi", "pbp", "ecm", // Executable/installer extensions.
@@ -813,6 +813,18 @@ mod tests {
         assert!(!is_inspectable(Path::new("/roms/game.7z")));
         assert!(!is_inspectable(Path::new("/roms/game.rar")));
         assert!(!is_inspectable(Path::new("/roms/game.txt")));
+    }
+
+    #[test]
+    fn msx_cartridges_are_likely_content() {
+        assert_eq!(
+            classify_entry("cart.mx1", false),
+            InspectorEntryClassification::LikelyContent
+        );
+        assert_eq!(
+            classify_entry("cart.mx2", false),
+            InspectorEntryClassification::LikelyContent
+        );
     }
 }
 

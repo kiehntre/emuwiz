@@ -5414,17 +5414,12 @@ pub fn detect_platform_with_details(
 ///
 /// `Confirmed` evidence (an explicit assignment or a magic-byte
 /// signature) is always used. `Probable` evidence - typically a strong
-/// extension alone - is used only when the resolved platform's own
-/// [`platform::Platform::conflicts_with`] is empty: a `.gba` file is
-/// unambiguously Game Boy Advance, but a `.rvz`/`.wbfs` file is strong
-/// extension evidence shared between GameCube and Wii (each lists the
-/// other in `conflicts_with`), and this codebase deliberately leaves that
-/// specific ambiguity for a person to resolve (see
-/// `database::provenance_priority` and the source-platform-assignment
-/// workflow) rather than silently picking one. This is not a blanket "any
-/// strong extension is confirmed" rule - it only auto-resolves the
-/// platforms the registry itself already declares to have no known
-/// look-alike.
+/// extension alone - is used when the extension has exactly one platform
+/// owner and the platform has no known look-alike, with the MSX/MSX2
+/// generation-specific `.mx1`/`.mx2` pair as the explicit exception.
+/// A `.rvz`/`.wbfs` file remains subject to the existing GameCube/Wii
+/// conflict handling, so this is not a blanket "any strong extension is
+/// confirmed" rule.
 fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<String> {
     let mut request = platform::DetectionRequest::new(path, source_root);
     request.read_signatures = true;
@@ -5433,8 +5428,22 @@ fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<Stri
     match report.confidence {
         platform::DetectionConfidence::Confirmed => Some(platform.to_string()),
         platform::DetectionConfidence::Probable => {
-            let unambiguous = platform::platform_by_id(platform)
-                .is_some_and(|entry| entry.conflicts_with.is_empty());
+            // A single platform-specific extension is enough for this
+            // registry fallback, even when the platform has a related
+            // generation listed in `conflicts_with` (for example `.mx1`
+            // versus `.mx2`). Shared strong extensions still produce an
+            // Ambiguous report before reaching this branch.
+            let unambiguous = platform::platform_candidates_for_extension(
+                &path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default(),
+            )
+            .len()
+                == 1
+                && (platform::platform_by_id(platform)
+                    .is_some_and(|entry| entry.conflicts_with.is_empty())
+                    || matches!(platform, "MSX" | "MSX2"));
             unambiguous.then(|| platform.to_string())
         }
         platform::DetectionConfidence::Unknown | platform::DetectionConfidence::Ambiguous => None,
@@ -11075,6 +11084,55 @@ mod tests {
         .expect("a .gba file should resolve via the registry fallback");
         assert_eq!(detection.platform, "Game Boy Advance");
         assert_eq!(detection.provenance, PlatformProvenance::RegistryDetector);
+    }
+
+    #[test]
+    fn msx_cartridge_extensions_resolve_via_the_registry_fallback() {
+        let root = "/mnt/msx-roms/curated-set";
+        let mx1 = detect_platform_with_details(format!("{root}/cart.mx1"), root)
+            .expect(".mx1 should resolve without a folder alias");
+        assert_eq!(mx1.platform, "MSX");
+        assert_eq!(mx1.provenance, PlatformProvenance::RegistryDetector);
+
+        let mx2 = detect_platform_with_details(format!("{root}/cart.mx2"), root)
+            .expect(".mx2 should resolve without a folder alias");
+        assert_eq!(mx2.platform, "MSX2");
+        assert_eq!(mx2.provenance, PlatformProvenance::RegistryDetector);
+    }
+
+    #[test]
+    fn msx_cartridge_boundaries_remain_fail_closed() {
+        let root = "/mnt/msx-roms/curated-set";
+        assert_eq!(detect_platform(format!("{root}/cart.rom"), root), None);
+        assert_eq!(detect_platform(format!("{root}/cart.bin"), root), None);
+        assert_eq!(
+            detect_platform(format!("{root}/msx-turbo/Game.zip"), root),
+            None
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/cart.mx2"), root),
+            Some("MSX2".to_string())
+        );
+    }
+
+    #[test]
+    fn msx2_folder_keeps_priority_over_contradicting_mx1_extension() {
+        let root = "/mnt/msx-roms";
+        let path = format!("{root}/MSX2/cart.mx1");
+        let report = platform::detect_platform_report(&platform::DetectionRequest::new(
+            std::path::Path::new(&path),
+            std::path::Path::new(root),
+        ));
+        assert_eq!(report.platform, Some("MSX2"));
+        assert_eq!(
+            report.deciding_source,
+            Some(platform::DetectionSource::FolderAlias)
+        );
+        assert!(report.evidence.iter().any(|evidence| {
+            evidence.source == platform::DetectionSource::StrongExtension
+                && evidence.platform == "MSX"
+        }));
+        assert_eq!(detect_platform(path, root), Some("MSX2".to_string()));
     }
 
     #[test]
