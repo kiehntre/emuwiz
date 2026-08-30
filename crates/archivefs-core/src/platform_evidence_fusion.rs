@@ -200,12 +200,6 @@ use RequiredFact::{AnyOfKind, Exact, ValuePrefix};
 /// - **PKG alone**: same reasoning, same outcome - no rule keys off
 ///   `ContentSignature = "PKG"` by itself; the PS3 rule below requires the
 ///   full `PS3_GAME` + `SELF` + `PARAM.SFO`-derived product-code combo.
-/// - **PC-FX**: [`crate::pcfx_boot_evidence`] emits real, `Strong`
-///   `BootStructure` evidence, but no canonical platform id for PC-FX
-///   exists in [`crate::platform::PLATFORMS`] today - a genuine registry
-///   gap, out of this module's scope to fix (see the crate-level milestone
-///   report). No rule references it; PC-FX evidence always resolves
-///   [`FusionOutcome::Unknown`] through this module today.
 pub const RULES: &[FusionRule] = &[
     // -- Sega optical: single-leg, each already Strong+platform-specific --
     FusionRule {
@@ -257,6 +251,17 @@ pub const RULES: &[FusionRule] = &[
             min_confidence: STRONG,
         }],
         explanation: "a validated Opera filesystem volume header is 3DO-specific strong evidence",
+    },
+    // -- NEC optical: single-leg, already Strong + platform-specific --
+    FusionRule {
+        id: "pcfx_boot_signature",
+        platform: "PC-FX",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "PC-FX:Hu_CD-ROM",
+            min_confidence: STRONG,
+        }],
+        explanation: "the `PC-FX:Hu_CD-ROM` boot-sector magic at the start of the first data track is PC-FX-specific strong evidence on its own - the exact string Mednafen's own PC-FX core checks in `TestMagicCD()` (see crate::pcfx_boot_evidence)",
     },
     // -- Sega 8-bit family: magic alone is Family-scope; region-confirmed
     //    resolves to one of the two systems it names --

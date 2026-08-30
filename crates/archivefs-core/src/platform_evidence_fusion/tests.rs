@@ -99,6 +99,37 @@ fn saturn_signature_alone_resolves() {
 }
 
 #[test]
+fn pcfx_boot_signature_alone_resolves_to_canonical_pcfx() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "PC-FX:Hu_CD-ROM")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("PC-FX"));
+    assert!(
+        explanation
+            .fired_candidates
+            .iter()
+            .any(|candidate| candidate.rule_id == "pcfx_boot_signature" && candidate.has_strong_leg)
+    );
+}
+
+#[test]
+fn pcfx_boot_magic_below_strong_confidence_does_not_resolve() {
+    // The rule requires the Strong tier that `pcfx_boot_evidence` actually
+    // emits; anything weaker stays unresolved rather than guessing PC-FX.
+    let explanation = fuse_platform_evidence([corroborated(BootStructure, "PC-FX:Hu_CD-ROM")]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    assert_ne!(explanation.resolved_platform, Some("PC-FX"));
+}
+
+#[test]
+fn the_pcfx_secondary_magic_is_not_its_own_rule_leg() {
+    // Only the primary `PC-FX:Hu_CD-ROM` string is a rule leg - no extra
+    // evidence legs were invented for the secondary photo-CD magic.
+    let explanation =
+        fuse_platform_evidence([strong(BootStructure, "PPPPHHHHOOOOTTTTOOOO____CCCCDDDD")]);
+    assert_ne!(explanation.resolved_platform, Some("PC-FX"));
+}
+
+#[test]
 fn resolved_explanation_retains_input_evidence() {
     let input = strong(BootStructure, "SEGA SEGASATURN");
     let explanation = fuse_platform_evidence([input.clone()]);

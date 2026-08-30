@@ -783,6 +783,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::Dreamcast
                     | IdentityPlatform::SegaCd
                     | IdentityPlatform::ThreeDo
+                    | IdentityPlatform::Pcfx
             ) =>
         {
             inspect_disc_chd(&mut report, trusted);
@@ -4191,15 +4192,29 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
 
     if matches!(
         report.platform,
-        IdentityPlatform::Saturn | IdentityPlatform::Dreamcast | IdentityPlatform::SegaCd
+        IdentityPlatform::Saturn
+            | IdentityPlatform::Dreamcast
+            | IdentityPlatform::SegaCd
+            | IdentityPlatform::Pcfx
     ) {
+        // Every one of these platforms identifies from a bounded read at the
+        // start of the decoded data track, so they all reuse the exact
+        // `MediaSource` over the track `open_chd_iso9660` already returned -
+        // the same single-track, zero-pregap, fail-closed contract that path
+        // enforces. PC-FX joins here: `inspect_pcfx_source` reads sector 0
+        // for the `PC-FX:Hu_CD-ROM` boot magic and the documented disc hash,
+        // never a filename. A PC-FX `.chd` whose track is not ISO 9660, is
+        // not track 1, or carries a pregap is refused by `open_chd_iso9660`
+        // above rather than guessed at.
         let mut source = MediaSource::new(media);
         if report.platform == IdentityPlatform::Saturn {
             inspect_saturn_source(report, &mut source, None, None);
         } else if report.platform == IdentityPlatform::Dreamcast {
             inspect_dreamcast_source(report, &mut source, None, None);
-        } else {
+        } else if report.platform == IdentityPlatform::SegaCd {
             inspect_sega_cd_source(report, &mut source, None, None);
+        } else {
+            inspect_pcfx_source(report, &mut source, None, None);
         }
         report.bytes_read = report.bytes_read.max(source.bytes_read());
         return;
@@ -4539,6 +4554,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
             IdentityPlatform::Dreamcast => IdentityKind::DreamcastProductCode,
             IdentityPlatform::SegaCd => IdentityKind::SegaCdProductCode,
             IdentityPlatform::ThreeDo => IdentityKind::ThreeDoDiscId,
+            IdentityPlatform::Pcfx => IdentityKind::PcfxDiscHash,
             _ => IdentityKind::Ps1Serial,
         },
         status,
@@ -9515,6 +9531,236 @@ mod tests {
         let report = inspect_catalogued_game_identity(&path, Some("PC-FX"));
         assert_eq!(report.verified_pcfx_disc_hash(), None);
         assert!(!report.complete);
+    }
+
+    /// A PC-FX disc image that is *also* a minimal valid ISO 9660 volume, so
+    /// it can be wrapped by [`ps1_chd`] and read back through the shared
+    /// `open_chd_iso9660` path exactly as a real PC-FX disc would be. The
+    /// PC-FX identity bytes (primary magic at sector 0, volume header at
+    /// sector 1, header-directed boot code) sit ahead of the ISO 9660 PVD at
+    /// sector 16, just as they do on a real disc.
+    fn pcfx_iso9660_fixture(boot_sector: u32, boot_sector_count: u32, seed: u8) -> Vec<u8> {
+        const SECTORS: usize = 32;
+        let mut iso = vec![0_u8; SECTORS * ISO_SECTOR_SIZE as usize];
+
+        iso[..PCFX_PRIMARY_MAGIC.len()].copy_from_slice(PCFX_PRIMARY_MAGIC);
+        let volume = PCFX_BOOT_SECTOR_BYTES;
+        iso[volume + 32..volume + 36].copy_from_slice(&boot_sector.to_le_bytes());
+        iso[volume + 36..volume + 40].copy_from_slice(&boot_sector_count.to_le_bytes());
+        let boot_start = boot_sector as usize * PCFX_BOOT_SECTOR_BYTES;
+        let boot_end = boot_start + boot_sector_count as usize * PCFX_BOOT_SECTOR_BYTES;
+        for (index, byte) in iso[boot_start..boot_end].iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        iso[pvd + 128..pvd + 130].copy_from_slice(&2048_u16.to_le_bytes());
+        iso[pvd + 130..pvd + 132].copy_from_slice(&2048_u16.to_be_bytes());
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+        iso
+    }
+
+    /// Replaces the first occurrence of `needle` with `replacement` in place.
+    /// Used to corrupt a single field of an otherwise-valid CHD metadata
+    /// string without changing its byte length.
+    fn replace_once_in_place(haystack: &mut [u8], needle: &[u8], replacement: &[u8]) {
+        assert_eq!(needle.len(), replacement.len());
+        let position = haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("needle must be present");
+        haystack[position..position + needle.len()].copy_from_slice(replacement);
+    }
+
+    #[test]
+    fn pcfx_chd_reaches_real_identity_inspection_instead_of_deferred() {
+        let directory = FixtureDir::new("pcfx-chd-valid");
+        let image = pcfx_iso9660_fixture(2, 2, 0x40);
+
+        let raw_path = write_fixture(&directory, "raw-disc.iso", &image);
+        let raw = inspect_catalogued_game_identity(&raw_path, Some("PC-FX"));
+        assert_eq!(raw.format, IdentityImageFormat::Iso);
+        assert!(raw.verified_pcfx_disc_hash().is_some());
+        assert!(raw.complete);
+
+        // Deliberately misleading name: identity must come from the decoded
+        // CHD track content, never the filename.
+        let chd_path = write_fixture(&directory, "Totally A PS1 Game (USA).chd", &ps1_chd(&image));
+        let chd = inspect_catalogued_game_identity(&chd_path, Some("PC-FX"));
+        assert_eq!(chd.platform, IdentityPlatform::Pcfx);
+        assert_eq!(
+            chd.format,
+            IdentityImageFormat::Chd,
+            "a PC-FX .chd must no longer fall through to Deferred"
+        );
+        assert_ne!(chd.format, IdentityImageFormat::Deferred);
+        assert_eq!(chd.verified_pcfx_disc_hash(), raw.verified_pcfx_disc_hash());
+        assert!(chd.complete);
+        assert!(
+            chd.evidence.iter().any(|evidence| {
+                evidence.kind == IdentityKind::PcfxDiscHash
+                    && evidence.status == IdentityStatus::Verified
+            }),
+            "the existing PcfxDiscHash evidence must still appear for a CHD"
+        );
+        assert!(!chd.evidence.iter().any(|evidence| {
+            evidence.kind == IdentityKind::PcfxDiscHash
+                && evidence.confidence == IdentityConfidence::FilenameOnly
+        }));
+    }
+
+    #[test]
+    fn pcfx_chd_hint_over_non_pcfx_iso_contents_fails_closed() {
+        // A genuine, openable ISO 9660 PS1 CHD asked for as PC-FX: sector 0
+        // carries no PC-FX boot magic, so `inspect_pcfx_source` must reject
+        // it rather than emit a bogus disc hash.
+        let directory = FixtureDir::new("pcfx-chd-wrong-contents");
+        let ps1 = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let path = write_fixture(&directory, "mislabelled.chd", &ps1_chd(&ps1));
+        let report = inspect_catalogued_game_identity(&path, Some("PC-FX"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn an_unrelated_chd_with_a_pcfx_like_filename_is_not_identified_as_pcfx() {
+        let directory = FixtureDir::new("pcfx-chd-filename-lie");
+        let ps1 = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let path = write_fixture(
+            &directory,
+            "Zenki FX - Vajra Fight (Japan) PC-FX.chd",
+            &ps1_chd(&ps1),
+        );
+
+        // Asked as PC-FX: the PS1 contents have no PC-FX boot magic.
+        let as_pcfx = inspect_catalogued_game_identity(&path, Some("PC-FX"));
+        assert_eq!(as_pcfx.verified_pcfx_disc_hash(), None);
+        assert!(!as_pcfx.complete);
+
+        // Asked as PlayStation: still a normal PS1 CHD, unaffected by the
+        // PC-FX-flavoured filename.
+        let as_ps1 = inspect_catalogued_game_identity(&path, Some("PlayStation"));
+        assert_eq!(as_ps1.verified_ps1_serial(), Some("SLUS-12345"));
+        assert!(as_ps1.verified_pcfx_disc_hash().is_none());
+    }
+
+    #[test]
+    fn malformed_or_truncated_pcfx_chd_fails_closed() {
+        let directory = FixtureDir::new("pcfx-chd-malformed");
+
+        // Not a CHD container at all.
+        let garbage = write_fixture(&directory, "garbage.chd", &[0xAB_u8; 4096]);
+        let report = inspect_catalogued_game_identity(&garbage, Some("PC-FX"));
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
+
+        // A real CHD whose decoded track is not ISO 9660 - `open_chd_iso9660`
+        // refuses it, so PC-FX stays unsupported rather than guessed.
+        let non_iso = write_fixture(
+            &directory,
+            "raw-track.chd",
+            &uncompressed_mode1_raw_chd(&pcfx_fixture(2, 2, 0x51)),
+        );
+        let report = inspect_catalogued_game_identity(&non_iso, Some("PC-FX"));
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
+
+        // A CHD file truncated inside its own header.
+        let mut truncated = ps1_chd(&pcfx_iso9660_fixture(2, 2, 0x52));
+        truncated.truncate(48);
+        let truncated_path = write_fixture(&directory, "truncated.chd", &truncated);
+        let report = inspect_catalogued_game_identity(&truncated_path, Some("PC-FX"));
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn pcfx_chd_with_an_unsupported_track_position_or_pregap_stays_unsupported() {
+        let directory = FixtureDir::new("pcfx-chd-track-limits");
+        let image = pcfx_iso9660_fixture(2, 2, 0x60);
+
+        let mut non_track_one = ps1_chd(&image);
+        replace_once_in_place(&mut non_track_one, b"TRACK:1 ", b"TRACK:2 ");
+        let path = write_fixture(&directory, "track2.chd", &non_track_one);
+        let report = inspect_catalogued_game_identity(&path, Some("PC-FX"));
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
+
+        let mut non_zero_pregap = ps1_chd(&image);
+        replace_once_in_place(&mut non_zero_pregap, b"PREGAP:0 ", b"PREGAP:9 ");
+        let path = write_fixture(&directory, "pregap.chd", &non_zero_pregap);
+        let report = inspect_catalogued_game_identity(&path, Some("PC-FX"));
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn adding_pcfx_chd_dispatch_leaves_neighbouring_optical_platforms_unchanged() {
+        let directory = FixtureDir::new("pcfx-chd-neighbours");
+
+        let saturn = write_fixture(&directory, "s.chd", &ps1_chd(&saturn_iso(b"T-7101G")));
+        assert_eq!(
+            inspect_game_identity(&saturn, Some("Saturn")).verified_saturn_product_number(),
+            Some("T-7101G")
+        );
+
+        let dreamcast = write_fixture(&directory, "d.chd", &ps1_chd(&dreamcast_iso(b"T-8109N")));
+        assert_eq!(
+            inspect_game_identity(&dreamcast, Some("Dreamcast")).verified_dreamcast_product_code(),
+            Some("T-8109N")
+        );
+
+        let sega_cd = write_fixture(
+            &directory,
+            "m.chd",
+            &ps1_chd(&sega_cd_iso(b"GM T-12345 -00")),
+        );
+        assert_eq!(
+            inspect_game_identity(&sega_cd, Some("Sega CD")).verified_sega_cd_product_code(),
+            Some("GM T-12345-00")
+        );
+
+        let ps1 = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let ps1_path = write_fixture(&directory, "p.chd", &ps1_chd(&ps1));
+        assert_eq!(
+            inspect_game_identity(&ps1_path, Some("PlayStation")).verified_ps1_serial(),
+            Some("SLUS-12345")
+        );
+
+        let threedo = write_fixture(
+            &directory,
+            "t.chd",
+            &threedo_chd(&threedo_fixture(0x1111_2222, 0x3333_4444, 1)),
+        );
+        assert!(
+            inspect_game_identity(&threedo, Some("3DO"))
+                .verified_threedo_disc_id()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_pcfx_chd_never_infers_the_platform_from_the_extension_alone() {
+        // No platform hint at all: a `.chd` must not become PC-FX just
+        // because its bytes happen to be a PC-FX disc.
+        let directory = FixtureDir::new("pcfx-chd-no-hint");
+        let path = write_fixture(
+            &directory,
+            "game.chd",
+            &ps1_chd(&pcfx_iso9660_fixture(2, 2, 0x70)),
+        );
+        let report = inspect_catalogued_game_identity(&path, None);
+        assert_ne!(report.platform, IdentityPlatform::Pcfx);
+        assert_eq!(report.verified_pcfx_disc_hash(), None);
     }
 }
 

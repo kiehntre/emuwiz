@@ -474,6 +474,15 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation_provenance: None,
         dat_validation: None,
     },
+    PlatformEvidenceCoverage {
+        canonical_id: "PC-FX",
+        detector_modules: &["pcfx_boot_evidence"],
+        normalization: false,
+        real_validation: ValidationStatus::SyntheticValidated,
+        notes: "PcfxDiscHash detector + inspect_pcfx_source proven against synthetic fixtures (pcfx_fixture) for raw ISO/CUE and, now, the safe .chd path; no real PC-FX specimen recorded as validated in this project's history",
+        real_validation_provenance: None,
+        dat_validation: None,
+    },
 ];
 
 /// The number of canonical platforms in [`crate::platform::PLATFORMS`] -

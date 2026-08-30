@@ -1335,6 +1335,19 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "A CD-ROM² title shares every disc extension with other CD systems, so folder or cue-sheet context is what identifies it. Never merged with cartridge PC Engine.",
     },
     Platform {
+        id: "PC-FX",
+        display_name: "PC-FX",
+        folder_aliases: &["pcfx", "necpcfx"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["iso", "cue", "bin", "chd", "img"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["PC Engine CD", "Sega CD", "PSX"],
+        preferred_emulator: None,
+        explanation: "A PC-FX title is a CD image, so it shares every disc extension with other CD systems - the `PC-FX:Hu_CD-ROM` boot-sector magic in the disc content is what confirms it. Kept a separate canonical platform from PC Engine CD, whose software is not interchangeable.",
+    },
+    Platform {
         id: "Philips CD-i",
         display_name: "Philips CD-i",
         folder_aliases: &[

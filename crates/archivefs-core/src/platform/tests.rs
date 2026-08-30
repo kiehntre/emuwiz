@@ -1770,6 +1770,37 @@ fn bare_neocd_alias_resolves_to_neo_geo_cd_and_never_to_cartridge_neo_geo() {
     assert_ne!(platform_for_alias("neocd").map(|p| p.id), Some("NeoGeo"));
 }
 
+/// The new canonical `PC-FX` row exists and every reviewed alias spelling
+/// resolves to it - closing the registry gap the PC-FX identity stack
+/// (`pcfx_boot_evidence`, `inspect_pcfx_source`, `evidence_bridge`) already
+/// depended on.
+#[test]
+fn pcfx_canonical_row_and_aliases_resolve() {
+    assert!(platform_by_id("PC-FX").is_some());
+    assert_eq!(
+        platform_by_id("PC-FX").map(|p| p.display_name),
+        Some("PC-FX")
+    );
+    for hint in [
+        "PC-FX",
+        "pc-fx",
+        "pcfx",
+        "PCFX",
+        "nec pc-fx",
+        "NEC PCFX",
+        "necpcfx",
+    ] {
+        assert_eq!(
+            platform_for_alias(hint).map(|p| p.id),
+            Some("PC-FX"),
+            "`{hint}` should resolve to PC-FX"
+        );
+    }
+    // A shared optical extension alone never names PC-FX (or anything).
+    assert!(!platform_by_id("PC-FX").unwrap().has_strong_extension("chd"));
+    assert!(platform_by_id("PC-FX").unwrap().has_weak_extension("chd"));
+}
+
 #[test]
 fn mame_software_list_suffix_strip_uses_a_fixed_allowlist_only() {
     for (raw, expected_base) in [
