@@ -42,6 +42,7 @@ use super::profiles::{
     findings_from_xenia_readiness, not_checked_from_emulator_profiles,
 };
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
+use super::verified_identity::{ArchiveIdentityFactStatus, findings_from_verified_identity_facts};
 use super::{
     CoverageStatus, DEFERRED_CHECKS, DeferredCheck, DoctorCategory, DoctorSeverity,
     DoctorSubsystem, Finding, MountRootSafety, NotCheckedCheck, SubsystemCoverage,
@@ -142,6 +143,12 @@ pub struct DoctorScanInputs<'a> {
     pub rpcs3_readiness: Gathered<&'a [Rpcs3ReadinessAssessment]>,
     /// From `managed::scan_managed_entries`.
     pub managed_entries: Gathered<&'a ManagedEntryScan>,
+    /// Per-archive persisted verified-identity facts, each already paired
+    /// with its freshness against the archive file's current identity
+    /// (gathered outside this pure runner, like every other input here).
+    /// A read-only projection of [`crate::verified_identity_cache`]; never a
+    /// launch trust anchor.
+    pub verified_identity: Gathered<&'a [ArchiveIdentityFactStatus]>,
     /// The free-space thresholds to apply. Not a `Gathered`: policy is always
     /// available, and the default is the documented one.
     pub free_space_policy: FreeSpacePolicy,
@@ -189,6 +196,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             managed_entries: Gathered::NotLoaded(
                 "EmuWiz-managed cheat entries have not been scanned yet.",
+            ),
+            verified_identity: Gathered::NotLoaded(
+                "The verified-identity fact cache has not been loaded in this session.",
             ),
             free_space_policy: FreeSpacePolicy::default(),
         }
@@ -539,6 +549,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::ManagedEntries,
         DoctorSubsystem::ManagedEntries,
         |scan: &&ManagedEntryScan| findings_from_managed_entries(scan)
+    );
+    subsystem!(
+        inputs.verified_identity,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |statuses: &&[ArchiveIdentityFactStatus]| findings_from_verified_identity_facts(statuses)
     );
 
     let mut not_checked = inputs

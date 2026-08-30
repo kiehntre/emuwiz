@@ -5669,6 +5669,11 @@ impl ArchiveFsApp {
             ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),
             rpcs3_readiness: borrowed(&gathered.rpcs3_readiness, |value| value.as_slice()),
             managed_entries: borrowed(&gathered.managed_entries, |value| value),
+            // The verified-identity fact cache is not gathered by the GUI
+            // Doctor worker yet; a later typed consumer will supply it.
+            verified_identity: Gathered::NotLoaded(
+                "not gathered: the GUI Doctor worker does not load the identity cache yet",
+            ),
             free_space_policy: FreeSpacePolicy::default(),
         };
         let scan = run_doctor_scan(&inputs);

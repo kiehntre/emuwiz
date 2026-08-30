@@ -144,6 +144,13 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist DAT set-completeness and dependency verdicts with source provenance",
         sql: include_str!("migrations/0009_set_audit_verdicts.sql"),
     },
+    // Verified identity facts are migration 0010 after the separately
+    // integrated library-DAT and set-verdict persistence migrations.
+    Migration {
+        version: 10,
+        description: "persist verified per-game identity facts (verified_identity_facts) as a catalogue-side cache/projection - never a launch trust anchor",
+        sql: include_str!("migrations/0010_verified_identity_facts.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -1774,6 +1781,67 @@ fn system_time_to_unix_seconds(time: SystemTime) -> Option<i64> {
 
 fn db_error(context: &str, error: rusqlite::Error) -> ArchiveFsError {
     ArchiveFsError::Database(format!("{context}: {error}"))
+}
+
+/// Builds a [`crate::verified_identity_cache::PersistedIdentityFact`] from a
+/// `verified_identity_facts` row selected as
+/// `kind, value, confidence, method, member_path, observed_at,
+///  file_device, file_inode, file_size_bytes, file_modified_unix_seconds`.
+/// `None` when the stored `kind`/`confidence` machine name no longer parses
+/// (a forward-compat guard, not an error).
+fn row_to_persisted_identity_fact(
+    archive_id: i64,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<crate::verified_identity_cache::PersistedIdentityFact>> {
+    use crate::verified_identity_cache::{
+        PersistedIdentityFact, identity_confidence_from_db, identity_kind_from_db,
+    };
+    let kind_db: String = row.get(0)?;
+    let confidence_db: String = row.get(2)?;
+    let (Some(kind), Some(confidence)) = (
+        identity_kind_from_db(&kind_db),
+        identity_confidence_from_db(&confidence_db),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(PersistedIdentityFact {
+        archive_id,
+        kind,
+        value: row.get(1)?,
+        confidence,
+        method: row.get(3)?,
+        member_path: row.get(4)?,
+        observed_at: row.get(5)?,
+        file_device: row.get::<_, i64>(6)? as u64,
+        file_inode: row.get::<_, i64>(7)? as u64,
+        file_size_bytes: row.get::<_, i64>(8)? as u64,
+        file_modified_unix_seconds: row.get(9)?,
+    }))
+}
+
+/// Counts from one [`Database::persist_verified_identity_facts`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedIdentityFactPersistOutcome {
+    pub inserted: usize,
+    pub updated: usize,
+    /// Kinds removed because a *complete* inspection no longer produced
+    /// them. Always `0` for an incomplete inspection.
+    pub removed: usize,
+    /// Whether the inspection that produced these facts was complete.
+    pub inspection_complete: bool,
+    /// `true` when the inspection was incomplete and a stored fact kind it
+    /// did not re-produce was deliberately left in place (fail-closed).
+    pub preserved_incomplete: bool,
+}
+
+/// One archive's cached verified identity facts, for the Doctor consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveVerifiedIdentityFacts {
+    pub archive_id: i64,
+    pub display_name: String,
+    /// The archive's current canonical platform assignment, if any.
+    pub platform_id: Option<String>,
+    pub facts: Vec<crate::verified_identity_cache::PersistedIdentityFact>,
 }
 
 fn format_archive_ids(ids: &[i64]) -> String {
@@ -4283,6 +4351,259 @@ impl Database {
         Ok(Some(persisted.reconstruct_summary(current_hashes, context)))
     }
 
+    // Verified identity fact cache (migration 0010).
+    //
+    // A catalogue-side projection of the `Verified` identity facts a
+    // `GameIdentityReport` produces, so read-only consumers (Library,
+    // Doctor) can explain identity/readiness without re-inspecting content.
+    // NEVER a launch/cheat trust anchor - those paths keep re-verifying
+    // from a fresh report and never read this table.
+    // -------------------------------------------------------------------
+
+    /// Persists (inserts / updates) the verified identity facts in `report`
+    /// for `archive_id`, snapshotting `file_identity` alongside each.
+    ///
+    /// Atomic per archive:
+    /// - only genuinely `Verified`, persistable, non-`FilenameOnly` facts are
+    ///   stored, and a report that carries two disagreeing verified values
+    ///   for one kind stores neither (see
+    ///   [`crate::verified_identity_cache::persistable_verified_facts`]);
+    /// - when the inspection was **complete**
+    ///   ([`GameIdentityReport::complete`]), fact kinds no longer present are
+    ///   removed - the stored set is replaced wholesale in one transaction;
+    ///   when it was **incomplete / partial**, nothing is deleted - a
+    ///   previously good cache is preserved fail-closed.
+    pub fn persist_verified_identity_facts(
+        &mut self,
+        archive_id: i64,
+        report: &GameIdentityReport,
+        file_identity: &crate::launch::process_spawn::CapturedFileIdentity,
+    ) -> Result<VerifiedIdentityFactPersistOutcome> {
+        use crate::verified_identity_cache::{
+            identity_confidence_to_db, identity_kind_to_db, persistable_verified_facts,
+        };
+
+        let facts = persistable_verified_facts(report);
+        let now = now_utc_string();
+        let modified = file_identity.modified.and_then(system_time_to_unix_seconds);
+        let device = file_identity.device as i64;
+        let inode = file_identity.inode as i64;
+        let size = file_identity.size as i64;
+
+        let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut statement = self
+                .connection
+                .prepare("SELECT kind FROM verified_identity_facts WHERE archive_id = ?1")
+                .map_err(|error| {
+                    db_error("failed to prepare existing identity fact query", error)
+                })?;
+            let rows = statement
+                .query_map(params![archive_id], |row| row.get::<_, String>(0))
+                .map_err(|error| db_error("failed to query existing identity facts", error))?;
+            for row in rows {
+                existing.insert(
+                    row.map_err(|error| db_error("failed to read existing identity fact", error))?,
+                );
+            }
+        }
+
+        let new_kinds: Vec<String> = facts
+            .iter()
+            .map(|fact| identity_kind_to_db(fact.kind))
+            .collect();
+
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error("failed to start verified identity fact transaction", error)
+        })?;
+
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        for fact in &facts {
+            let kind = identity_kind_to_db(fact.kind);
+            tx.execute(
+                "INSERT INTO verified_identity_facts \
+                 (archive_id, kind, value, confidence, method, member_path, observed_at, \
+                  file_device, file_inode, file_size_bytes, file_modified_unix_seconds, \
+                  created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12) \
+                 ON CONFLICT(archive_id, kind) DO UPDATE SET \
+                  value = excluded.value, confidence = excluded.confidence, \
+                  method = excluded.method, member_path = excluded.member_path, \
+                  observed_at = excluded.observed_at, file_device = excluded.file_device, \
+                  file_inode = excluded.file_inode, file_size_bytes = excluded.file_size_bytes, \
+                  file_modified_unix_seconds = excluded.file_modified_unix_seconds, \
+                  updated_at = excluded.updated_at",
+                params![
+                    archive_id,
+                    kind,
+                    fact.value,
+                    identity_confidence_to_db(fact.confidence),
+                    fact.method,
+                    fact.member_path,
+                    now,
+                    device,
+                    inode,
+                    size,
+                    modified,
+                    now,
+                ],
+            )
+            .map_err(|error| db_error("failed to persist verified identity fact", error))?;
+            if existing.contains(&kind) {
+                updated += 1;
+            } else {
+                inserted += 1;
+            }
+        }
+
+        let mut removed = 0usize;
+        if report.complete {
+            // Replace the whole set: drop stored kinds this complete
+            // inspection no longer produced.
+            for stale_kind in existing.iter().filter(|kind| !new_kinds.contains(kind)) {
+                removed += tx
+                    .execute(
+                        "DELETE FROM verified_identity_facts WHERE archive_id = ?1 AND kind = ?2",
+                        params![archive_id, stale_kind],
+                    )
+                    .map_err(|error| {
+                        db_error("failed to remove stale verified identity fact", error)
+                    })?;
+            }
+        }
+
+        tx.commit().map_err(|error| {
+            db_error("failed to commit verified identity fact transaction", error)
+        })?;
+
+        Ok(VerifiedIdentityFactPersistOutcome {
+            inserted,
+            updated,
+            removed,
+            inspection_complete: report.complete,
+            preserved_incomplete: !report.complete
+                && !existing.is_empty()
+                && existing.iter().any(|kind| !new_kinds.contains(kind)),
+        })
+    }
+
+    /// Every cached verified identity fact for one archive, ordered by kind.
+    pub fn verified_identity_facts_for_archive(
+        &self,
+        archive_id: i64,
+    ) -> Result<Vec<crate::verified_identity_cache::PersistedIdentityFact>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, value, confidence, method, member_path, observed_at, \
+                 file_device, file_inode, file_size_bytes, file_modified_unix_seconds \
+                 FROM verified_identity_facts WHERE archive_id = ?1 ORDER BY kind",
+            )
+            .map_err(|error| db_error("failed to prepare identity fact query", error))?;
+        let rows = statement
+            .query_map(params![archive_id], |row| {
+                row_to_persisted_identity_fact(archive_id, row)
+            })
+            .map_err(|error| db_error("failed to query identity facts", error))?;
+        let mut facts = Vec::new();
+        for row in rows {
+            if let Some(fact) =
+                row.map_err(|error| db_error("failed to read identity fact row", error))?
+            {
+                facts.push(fact);
+            }
+        }
+        Ok(facts)
+    }
+
+    /// One cached verified identity fact for an archive and a specific kind.
+    pub fn verified_identity_fact_for_archive(
+        &self,
+        archive_id: i64,
+        kind: crate::game_identity::IdentityKind,
+    ) -> Result<Option<crate::verified_identity_cache::PersistedIdentityFact>> {
+        let kind_db = crate::verified_identity_cache::identity_kind_to_db(kind);
+        self.connection
+            .query_row(
+                "SELECT kind, value, confidence, method, member_path, observed_at, \
+                 file_device, file_inode, file_size_bytes, file_modified_unix_seconds \
+                 FROM verified_identity_facts WHERE archive_id = ?1 AND kind = ?2",
+                params![archive_id, kind_db],
+                |row| row_to_persisted_identity_fact(archive_id, row),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read identity fact", error))?
+            .flatten()
+            .map(Ok)
+            .transpose()
+    }
+
+    /// Every cached verified identity fact for one archive, each paired with
+    /// its [`crate::verified_identity_cache::IdentityFactFreshness`] against
+    /// `current` (the archive file's current identity, `None` when
+    /// unavailable).
+    pub fn verified_identity_facts_for_archive_with_freshness(
+        &self,
+        archive_id: i64,
+        current: Option<&crate::launch::process_spawn::CapturedFileIdentity>,
+    ) -> Result<
+        Vec<(
+            crate::verified_identity_cache::PersistedIdentityFact,
+            crate::verified_identity_cache::IdentityFactFreshness,
+        )>,
+    > {
+        Ok(self
+            .verified_identity_facts_for_archive(archive_id)?
+            .into_iter()
+            .map(|fact| {
+                let freshness = fact.freshness(current);
+                (fact, freshness)
+            })
+            .collect())
+    }
+
+    /// Every archive that has at least one cached verified identity fact,
+    /// with its display name, current platform assignment (if any) and its
+    /// facts. For the Doctor consumer - freshness is left to the caller,
+    /// which is the only layer that can stat the live file.
+    pub fn archives_with_verified_identity_facts(
+        &self,
+    ) -> Result<Vec<ArchiveVerifiedIdentityFacts>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.id, a.display_name, \
+                 (SELECT platform FROM platform_assignments p \
+                  WHERE p.archive_id = a.id AND p.is_current = 1) \
+                 FROM archives a \
+                 WHERE EXISTS (SELECT 1 FROM verified_identity_facts f WHERE f.archive_id = a.id) \
+                 ORDER BY a.id",
+            )
+            .map_err(|error| db_error("failed to prepare identity fact archive query", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| db_error("failed to query archives with identity facts", error))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (archive_id, display_name, platform) =
+                row.map_err(|error| db_error("failed to read identity fact archive", error))?;
+            out.push(ArchiveVerifiedIdentityFacts {
+                archive_id,
+                display_name,
+                platform_id: platform,
+                facts: self.verified_identity_facts_for_archive(archive_id)?,
+            });
+        }
+        Ok(out)
+    }
+
     fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
         self.connection
             .query_row(
@@ -5713,6 +6034,388 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // -----------------------------------------------------------------
+    // Verified-identity fact cache (`verified_identity_facts`).
+    // -----------------------------------------------------------------
+
+    use crate::game_identity::{
+        IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityKind,
+        IdentityProvenance, IdentityStatus,
+    };
+    use crate::launch::process_spawn::CapturedFileIdentity;
+    use crate::verified_identity_cache::IdentityFactFreshness;
+
+    fn verified_evidence(kind: IdentityKind, value: &str) -> IdentityEvidence {
+        IdentityEvidence {
+            kind,
+            status: IdentityStatus::Verified,
+            value: Some(value.to_string()),
+            confidence: IdentityConfidence::ExactBytes,
+            provenance: IdentityProvenance {
+                archive_path: PathBuf::from("/example/roms/ZooCube.rvz"),
+                member_path: None,
+                member_index: None,
+                method: "test fixture".to_string(),
+            },
+            diagnostic: "test fixture evidence".to_string(),
+        }
+    }
+
+    fn identity_report(evidence: Vec<IdentityEvidence>, complete: bool) -> GameIdentityReport {
+        GameIdentityReport {
+            archive_path: PathBuf::from("/example/roms/ZooCube.rvz"),
+            platform: IdentityPlatform::GameCube,
+            format: IdentityImageFormat::Rvz,
+            evidence,
+            warnings: Vec::new(),
+            bytes_read: 4096,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete,
+        }
+    }
+
+    fn captured(device: u64, inode: u64, size: u64, mtime: u64) -> CapturedFileIdentity {
+        CapturedFileIdentity {
+            device,
+            inode,
+            size,
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime)),
+        }
+    }
+
+    /// A minimal v07 database with one archive (`id = 1`) already present,
+    /// so the identity-fact tests have a real `archives.id` to anchor to.
+    fn database_with_one_archive(name: &str) -> (PathBuf, Database) {
+        let root = temp_dir(name);
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 7);
+        let database = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+        (root, database)
+    }
+
+    #[test]
+    fn v07_schema_upgrades_additively_to_the_provisional_v08() {
+        // The migration adds a table and keeps every prior row intact.
+        let (root, mut database) = database_with_one_archive("v07-to-v08");
+        assert_eq!(
+            database.load_archives().unwrap()[0].platform.as_deref(),
+            Some("GameCube")
+        );
+        let outcome = database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![verified_evidence(IdentityKind::DolphinGameId, "GZLE01")],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+        assert_eq!(outcome.inserted, 1);
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verified_identity_facts_persist_and_reload() {
+        let (root, mut database) = database_with_one_archive("identity-facts-round-trip");
+        let file_identity = captured(66, 100, 5_000, 1_700_000_000);
+        let outcome = database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![
+                        verified_evidence(IdentityKind::DolphinGameId, "GZLE01"),
+                        verified_evidence(IdentityKind::DolphinRegion, "NTSC-U"),
+                        // Not persistable: Candidate status.
+                        IdentityEvidence {
+                            status: IdentityStatus::Candidate,
+                            ..verified_evidence(IdentityKind::DolphinRevision, "2")
+                        },
+                    ],
+                    true,
+                ),
+                &file_identity,
+            )
+            .unwrap();
+        assert_eq!(outcome.inserted, 2);
+        assert_eq!(outcome.updated, 0);
+        assert_eq!(outcome.removed, 0);
+
+        let facts = database.verified_identity_facts_for_archive(1).unwrap();
+        assert_eq!(facts.len(), 2, "the Candidate revision was not stored");
+        let game_id = database
+            .verified_identity_fact_for_archive(1, IdentityKind::DolphinGameId)
+            .unwrap()
+            .expect("the Dolphin Game ID was stored");
+        assert_eq!(game_id.value, "GZLE01");
+        assert_eq!(game_id.confidence, IdentityConfidence::ExactBytes);
+        assert_eq!(game_id.file_device, 66);
+        assert_eq!(game_id.file_inode, 100);
+        assert_eq!(game_id.file_size_bytes, 5_000);
+        assert_eq!(game_id.file_modified_unix_seconds, Some(1_700_000_000));
+
+        // Freshness derives against the current file identity.
+        let with_freshness = database
+            .verified_identity_facts_for_archive_with_freshness(1, Some(&file_identity))
+            .unwrap();
+        assert!(
+            with_freshness
+                .iter()
+                .all(|(_, freshness)| *freshness == IdentityFactFreshness::Current)
+        );
+        let changed = captured(66, 100, 9_999, 1_700_000_000);
+        let stale = database
+            .verified_identity_facts_for_archive_with_freshness(1, Some(&changed))
+            .unwrap();
+        assert!(
+            stale
+                .iter()
+                .all(|(_, freshness)| *freshness == IdentityFactFreshness::Stale)
+        );
+
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn facts_survive_a_database_reopen() {
+        let (root, mut database) = database_with_one_archive("identity-facts-reopen");
+        let path = root.join("library.sqlite3");
+        database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![verified_evidence(IdentityKind::DolphinGameId, "GZLE01")],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+        database.close().unwrap();
+
+        let reopened = Database::open_or_create(&path).unwrap();
+        let facts = reopened.verified_identity_facts_for_archive(1).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].value, "GZLE01");
+        reopened.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_complete_reinspection_replaces_the_fact_set_atomically() {
+        let (root, mut database) = database_with_one_archive("identity-facts-replace");
+        database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![
+                        verified_evidence(IdentityKind::DolphinGameId, "GZLE01"),
+                        verified_evidence(IdentityKind::DolphinRegion, "NTSC-U"),
+                    ],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+
+        // A later complete inspection: Game ID changed, region no longer
+        // produced. The region fact must be removed, not left behind.
+        let outcome = database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![verified_evidence(IdentityKind::DolphinGameId, "GZLP01")],
+                    true,
+                ),
+                &captured(66, 100, 5_050, 1_700_000_500),
+            )
+            .unwrap();
+        assert_eq!(outcome.updated, 1);
+        assert_eq!(outcome.inserted, 0);
+        assert_eq!(outcome.removed, 1);
+        assert!(!outcome.preserved_incomplete);
+
+        let facts = database.verified_identity_facts_for_archive(1).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].kind, IdentityKind::DolphinGameId);
+        assert_eq!(facts[0].value, "GZLP01");
+        assert_eq!(facts[0].file_size_bytes, 5_050);
+
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_incomplete_reinspection_preserves_previously_good_facts() {
+        let (root, mut database) = database_with_one_archive("identity-facts-fail-closed");
+        database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![
+                        verified_evidence(IdentityKind::DolphinGameId, "GZLE01"),
+                        verified_evidence(IdentityKind::DolphinRegion, "NTSC-U"),
+                    ],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+
+        // An inspection that did not finish (no evidence, `complete = false`)
+        // must not erase the good cache.
+        let outcome = database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(Vec::new(), false),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert!(!outcome.inspection_complete);
+        assert!(outcome.preserved_incomplete);
+
+        let facts = database.verified_identity_facts_for_archive(1).unwrap();
+        assert_eq!(facts.len(), 2, "fail-closed: both prior facts are kept");
+
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_conflicting_report_stores_no_value_for_the_conflicted_kind() {
+        let (root, mut database) = database_with_one_archive("identity-facts-conflict");
+        let outcome = database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![
+                        verified_evidence(IdentityKind::DolphinGameId, "GZLE01"),
+                        verified_evidence(IdentityKind::DolphinGameId, "GZLP01"),
+                    ],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+        assert_eq!(outcome.inserted, 0);
+        assert!(
+            database
+                .verified_identity_facts_for_archive(1)
+                .unwrap()
+                .is_empty(),
+            "a report that disagrees with itself promotes nothing"
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn archives_with_verified_identity_facts_lists_only_populated_archives() {
+        let (root, mut database) = database_with_one_archive("identity-facts-index");
+        assert!(
+            database
+                .archives_with_verified_identity_facts()
+                .unwrap()
+                .is_empty()
+        );
+        database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![verified_evidence(IdentityKind::DolphinGameId, "GZLE01")],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+        let listed = database.archives_with_verified_identity_facts().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].archive_id, 1);
+        assert_eq!(listed[0].platform_id.as_deref(), Some("GameCube"));
+        assert_eq!(listed[0].facts.len(), 1);
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cached_fact_never_lets_a_launch_planner_skip_reverification() {
+        // The catalogue cache holds a genuine verified PS2 serial...
+        let (root, mut database) = database_with_one_archive("identity-facts-no-bypass");
+        database
+            .persist_verified_identity_facts(
+                1,
+                &identity_report(
+                    vec![verified_evidence(IdentityKind::Ps2Serial, "SLUS-20946")],
+                    true,
+                ),
+                &captured(66, 100, 5_000, 1_700_000_000),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .verified_identity_fact_for_archive(1, IdentityKind::Ps2Serial)
+                .unwrap()
+                .map(|fact| fact.value),
+            Some("SLUS-20946".to_string()),
+        );
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        // ...but the PCSX2 command planner takes its verified serial as an
+        // explicit argument and never reads a database. Given `None`, it
+        // still blocks, exactly as it does today.
+        use crate::launch::pcsx2_command::build_pcsx2_command_plan;
+        use crate::launch::planning::{
+            CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
+            LaunchContentKind, LaunchContentRef, LaunchTarget, ResolvedIdentity,
+        };
+        use crate::launch::readiness::{FirmwareReadiness, LaunchBlockerKind, LaunchReadiness};
+        use crate::patch_manager::{Pcsx2NativeLaunchBinding, Pcsx2UserDirectoryMode};
+
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PS2".to_string(),
+            game_key: "SLUS-20946".to_string(),
+        });
+        let candidate = LaunchCandidate {
+            target: LaunchTarget::Standalone {
+                adapter_id: "pcsx2",
+                profile_id: "pcsx2-native".to_string(),
+                profile_path: None,
+            },
+            content: LaunchContentRef {
+                kind: Some(LaunchContentKind::OpticalDisc),
+                container: Some(LaunchContainerKind::PlainFile),
+                resolved_path: Some(PathBuf::from("/games/game.iso")),
+                requires_mount: false,
+                provenance: "already resolved".to_string(),
+            },
+            firmware: FirmwareReadiness::Verified,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            readiness: LaunchReadiness::Ready,
+            preference: CandidatePreference::SoleEligible,
+        };
+        let binding = Ok(Pcsx2NativeLaunchBinding {
+            executable: PathBuf::from("/usr/bin/pcsx2-qt"),
+            user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+        });
+
+        let plan = build_pcsx2_command_plan(&identity, None, &candidate, &binding);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::Pcsx2SerialMissing),
+            "the planner must still require a freshly verified serial: {:?}",
+            plan.blockers
+        );
+        assert!(plan.command.is_none(), "a blocked plan produces no command");
+    }
+
     #[test]
     fn library_schema_contains_no_cheat_catalogue_journal_or_backup_tables() {
         let root = temp_dir("library-schema-boundary");
@@ -5740,6 +6443,7 @@ mod tests {
                 "scan_runs",
                 "schema_migrations",
                 "source_folders",
+                "verified_identity_facts",
             ]
         );
         drop(statement);
@@ -11984,8 +12688,8 @@ mod tests {
         }
 
         #[test]
-        fn migrations_0008_and_0009_are_registered_in_order() {
-            assert_eq!(latest_known_version(MIGRATIONS), 9);
+        fn migrations_0008_through_0010_are_registered_in_order() {
+            assert_eq!(latest_known_version(MIGRATIONS), 10);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 8
                     && migration
@@ -11995,6 +12699,12 @@ mod tests {
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 9
                     && migration.sql.contains("CREATE TABLE dat_set_audit_results")
+            }));
+            assert!(MIGRATIONS.iter().any(|migration| {
+                migration.version == 10
+                    && migration
+                        .sql
+                        .contains("CREATE TABLE verified_identity_facts")
             }));
         }
     }

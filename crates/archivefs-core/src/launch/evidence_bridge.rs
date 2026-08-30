@@ -68,7 +68,7 @@ use crate::{ArchiveKind, ArchiveRecord, MountState};
 /// contribute to [`ResolvedIdentity::game_key`] or a [`VerifiedIdentityFact`] -
 /// this is the one place that distinction is made, so nothing downstream
 /// has to re-derive it.
-fn is_identity_conferring(kind: IdentityKind) -> bool {
+pub(crate) fn is_identity_conferring(kind: IdentityKind) -> bool {
     matches!(
         kind,
         IdentityKind::Ps1Serial

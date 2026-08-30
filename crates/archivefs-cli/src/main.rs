@@ -4842,6 +4842,11 @@ fn gather_doctor_scan() -> DoctorScan {
             Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
             Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
         },
+        // The verified-identity fact cache is not loaded by the CLI Doctor
+        // path yet; a later typed consumer will supply it.
+        verified_identity: Gathered::NotLoaded(
+            "the verified-identity fact cache has not been loaded in this CLI session.",
+        ),
         free_space_policy: FreeSpacePolicy::default(),
     };
     run_doctor_scan(&inputs)

@@ -72,6 +72,7 @@ pub mod managed;
 pub mod profiles;
 pub mod repair;
 pub mod runner;
+pub mod verified_identity;
 
 #[cfg(test)]
 mod tests;

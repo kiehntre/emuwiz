@@ -1465,17 +1465,15 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 // --- 24. No migration ---------------------------------------------------
 
 /// Doctor stores nothing, so it must not add, renumber, or modify a
-/// migration. The integrated Wii identity feature legitimately owns 0006,
-/// and the unrelated Collection Discovery paging feature legitimately owns
-/// 0007 (`migrations/0007_discovery_details.sql`, introduced by
-/// `collection_discovery_page`'s persisted-details work - see `database.rs`,
-/// not this module), followed by 0008's per-item DAT identity persistence and
-/// 0009's set-audit persistence; this guard lists all application migrations while still
-/// proving Doctor itself introduced no migration of its own (the string
-/// scan below, over Doctor's own source files only).
+/// migration. Unrelated additions already accounted for as legitimate
+/// (see `database.rs`): 0006 (Wii identity), 0007 (Collection Discovery
+/// paging), 0008 (library DAT identities), 0009 (set-audit persistence), and
+/// 0010 (verified identity facts). This guard still proves Doctor itself
+/// introduced no migration of its own
+/// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 9] = [
+    const EXPECTED: [&str; 10] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1485,6 +1483,7 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0007_discovery_details.sql"),
         include_str!("../migrations/0008_library_dat_identities.sql"),
         include_str!("../migrations/0009_set_audit_verdicts.sql"),
+        include_str!("../migrations/0010_verified_identity_facts.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
@@ -1719,15 +1718,17 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
     // Storage, filesystem mount state, emulator profiles, Linux installation
     // evidence, xemu/Xenia/PPSSPP/
-    // RPCS3 launch readiness and managed entries are not gathered by this
+    // RPCS3 launch readiness, managed entries and the verified-identity fact
+    // cache are not gathered by this
     // test, so they must appear as unavailable alongside the snapshot,
     // setup and RetroArch subsystems - never as passes. All four launch
     // readiness checks share one (category, subsystem) tag but each carries
     // different "not gathered" wording, so they count as four entries here,
-    // not one.
+    // not one; the verified-identity cache shares that same tag and adds
+    // one more.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        12,
+        13,
         "{:?}",
         scan.coverage
     );

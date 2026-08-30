@@ -393,6 +393,12 @@ pub mod emulator_environment;
 /// boundary.
 pub mod launch;
 
+/// Read-only persistence of already-verified [`game_identity`] facts as a
+/// catalogue-side cache / user-visible projection. Never a trust anchor:
+/// launch and cheat/mod execution keep re-verifying from a fresh
+/// [`game_identity::GameIdentityReport`].
+pub mod verified_identity_cache;
+
 #[derive(Debug)]
 pub enum ArchiveFsError {
     Config(String),
