@@ -95,6 +95,8 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("gb", ContentKind::RomCartridge),
     cf("gbc", ContentKind::RomCartridge),
     cf("gba", ContentKind::RomCartridge),
+    cf("ngp", ContentKind::RomCartridge),
+    cf("ngc", ContentKind::RomCartridge),
     cf("nds", ContentKind::RomCartridge),
     cf("z64", ContentKind::RomCartridge),
     cf("n64", ContentKind::RomCartridge),
@@ -319,6 +321,12 @@ mod tests {
             );
         }
         assert_eq!(content_kind_for_extension("cas"), None);
+    }
+
+    #[test]
+    fn neo_geo_pocket_extensions_are_cartridge_content() {
+        assert_eq!(content_kind_for_extension("ngp"), Some(ContentKind::RomCartridge));
+        assert_eq!(content_kind_for_extension("ngc"), Some(ContentKind::RomCartridge));
     }
 
     #[test]

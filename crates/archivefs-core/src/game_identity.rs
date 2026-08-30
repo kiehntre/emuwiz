@@ -37,6 +37,7 @@ use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use crate::n64_cic_evidence::{cic_lookup, validate_crc1_crc2};
 use crate::n64_header_evidence::parse_n64_header;
 use crate::neogeocd_boot_evidence::{MAX_IPL_TXT_BYTES, parse_ipl_txt};
+use crate::ngp_header_evidence::{NGP_HEADER_BYTES, NgpSystemFlag, parse_ngp_header};
 use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
 use crate::param_sfo::parse_param_sfo;
 use crate::pcengine_cd_boot_evidence::{
@@ -335,6 +336,8 @@ pub enum IdentityPlatform {
     Pcfx,
     PcEngineCd,
     NeoGeoCd,
+    Ngp,
+    Ngpc,
     Atari2600,
     Atari5200,
     Atari7800,
@@ -401,6 +404,8 @@ impl IdentityPlatform {
             | "turboduo" => Self::PcEngineCd,
             "neo geo cd" | "neogeocd" | "neo-geo cd" | "neo geo cd-rom" | "snk neo geo cd"
             | "ngcd" | "neocd" | "neo cd" | "neocdz" => Self::NeoGeoCd,
+            "neo geo pocket" | "neogeopocket" | "ngp" => Self::Ngp,
+            "neo geo pocket color" | "neogeopocketcolor" | "ngpc" => Self::Ngpc,
             "atari 2600" | "atari2600" | "a2600" | "atari vcs" | "atarivcs" => Self::Atari2600,
             "atari 5200" | "atari5200" | "a5200" => Self::Atari5200,
             "atari 7800" | "atari7800" | "a7800" => Self::Atari7800,
@@ -447,6 +452,8 @@ impl IdentityPlatform {
             Self::Pcfx => "PC-FX",
             Self::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
             Self::NeoGeoCd => "Neo Geo CD",
+            Self::Ngp => "Neo Geo Pocket",
+            Self::Ngpc => "Neo Geo Pocket Color",
             Self::Atari2600 => "Atari 2600",
             Self::Atari5200 => "Atari 5200",
             Self::Atari7800 => "Atari 7800",
@@ -834,6 +841,8 @@ fn inspect_game_identity_with_platform_trust(
             | IdentityPlatform::Atari8Bit
             | IdentityPlatform::AtariLynx
             | IdentityPlatform::AtariJaguar
+            | IdentityPlatform::Ngp
+            | IdentityPlatform::Ngpc
     ) {
         inspect_loose_rom(&mut report, trusted_platform, trusted);
         return report;
@@ -1010,6 +1019,8 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::AtariLynx, "lyx") => Some("lyx"),
         (IdentityPlatform::AtariJaguar, "j64") => Some("j64"),
         (IdentityPlatform::AtariJaguar, "jag") => Some("jag"),
+        (IdentityPlatform::Ngp, "ngp" | "ngc") => Some("ngp"),
+        (IdentityPlatform::Ngpc, "ngp" | "ngc") => Some("ngc"),
         _ => None,
     }
 }
@@ -1148,6 +1159,7 @@ fn inspect_loose_rom(
     let mut nes_header = None;
     let mut atari7800_header = None;
     let mut lynx_header = None;
+    let mut ngp_header = None;
     if report.platform == IdentityPlatform::Nes && format == "nes" {
         nes_header = inspect_nes_header(&mut file, before.len);
     }
@@ -1169,6 +1181,38 @@ fn inspect_loose_rom(
         if file.read_exact(&mut header).is_ok() {
             lynx_header = parse_lynx_header(&header);
         }
+    }
+    if matches!(report.platform, IdentityPlatform::Ngp | IdentityPlatform::Ngpc) {
+        file.seek(SeekFrom::Start(0)).ok();
+        let mut header = [0_u8; NGP_HEADER_BYTES];
+        let valid = if file.read_exact(&mut header).is_ok() {
+            parse_ngp_header(&header).filter(|fact| fact.copyright_recognized)
+        } else {
+            None
+        };
+        file.seek(SeekFrom::Start(0)).ok();
+        let Some(fact) = valid else {
+            add_loose_rom_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "the NGP/NGPC header did not validate against the file",
+            );
+            return;
+        };
+        let platform = match fact.system_flag {
+            NgpSystemFlag::Monochrome => IdentityPlatform::Ngp,
+            NgpSystemFlag::Color => IdentityPlatform::Ngpc,
+            NgpSystemFlag::Unknown(_) => {
+                add_loose_rom_unavailable(
+                    report,
+                    IdentityStatus::Invalid,
+                    "the NGP/NGPC header contains an unknown system flag",
+                );
+                return;
+            }
+        };
+        report.platform = platform;
+        ngp_header = Some(fact);
     }
     if (format == "a78" && atari7800_header.is_none()) || (format == "lnx" && lynx_header.is_none())
     {
@@ -1306,6 +1350,20 @@ fn inspect_loose_rom(
                 fact.version, fact.bank0_page_size, fact.bank1_page_size, fact.cart_name
             ),
             "lynx_header_evidence::parse_lynx_header",
+        ));
+    }
+    if let Some(fact) = ngp_header {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::Platform,
+            IdentityStatus::Verified,
+            Some(report.platform.label().to_string()),
+            IdentityConfidence::StructuredMetadata,
+            &format!(
+                "NGP cartridge header validated: system flag {:?}, software ID {:#06x}, version {}, title {:?}",
+                fact.system_flag, fact.software_id, fact.version, fact.title
+            ),
+            "ngp_header_evidence::parse_ngp_header",
         ));
     }
     if let Some(bytes) = whole_file_bytes.as_deref() {
@@ -1898,6 +1956,8 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::Pcfx
         | IdentityPlatform::PcEngineCd
         | IdentityPlatform::NeoGeoCd
+        | IdentityPlatform::Ngp
+        | IdentityPlatform::Ngpc
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -3061,6 +3121,8 @@ fn inspect_iso_source(
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
+        | IdentityPlatform::Ngp
+        | IdentityPlatform::Ngpc
         | IdentityPlatform::Other => {}
     }
 }
@@ -5894,6 +5956,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::Pcfx => &[IdentityKind::PcfxDiscHash],
         IdentityPlatform::PcEngineCd => &[IdentityKind::PceCdBootStructure],
         IdentityPlatform::NeoGeoCd => &[IdentityKind::NeoGeoCdBootStructure],
+        IdentityPlatform::Ngp | IdentityPlatform::Ngpc => &[IdentityKind::LooseRomSha256],
         IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -6110,6 +6173,8 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::Pcfx
         | IdentityPlatform::PcEngineCd
         | IdentityPlatform::NeoGeoCd
+        | IdentityPlatform::Ngp
+        | IdentityPlatform::Ngpc
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
@@ -11611,6 +11676,86 @@ mod tests {
                 "{alias}"
             );
         }
+    }
+
+    fn ngp_image(system_flag: u8) -> Vec<u8> {
+        let mut bytes = vec![0_u8; crate::ngp_header_evidence::NGP_HEADER_BYTES + 16];
+        bytes[..28].copy_from_slice(b"COPYRIGHT BY SNK CORPORATION");
+        bytes[0x1c..0x20].copy_from_slice(&0x1000_u32.to_le_bytes());
+        bytes[0x20..0x22].copy_from_slice(&0x0042_u16.to_le_bytes());
+        bytes[0x22] = 1;
+        bytes[0x23] = system_flag;
+        bytes[0x24..0x2c].copy_from_slice(b"TESTGAME");
+        bytes
+    }
+
+    #[test]
+    fn ngp_identity_aliases_round_trip() {
+        assert_eq!(
+            IdentityPlatform::from_catalogue(Some("Neo Geo Pocket")),
+            IdentityPlatform::Ngp
+        );
+        assert_eq!(
+            IdentityPlatform::from_catalogue(Some("ngp")),
+            IdentityPlatform::Ngp
+        );
+        assert_eq!(
+            IdentityPlatform::from_catalogue(Some("Neo Geo Pocket Color")),
+            IdentityPlatform::Ngpc
+        );
+        assert_eq!(
+            IdentityPlatform::from_catalogue(Some("ngpc")),
+            IdentityPlatform::Ngpc
+        );
+    }
+
+    #[test]
+    fn ngp_header_controls_platform_over_crossed_extensions() {
+        let directory = FixtureDir::new("ngp-crossed-extensions");
+        let ngp = write_fixture(&directory, "colour.ngp", &ngp_image(0x10));
+        let ngc = write_fixture(&directory, "mono.ngc", &ngp_image(0x00));
+
+        let colour = inspect_catalogued_game_identity(&ngp, Some("Neo Geo Pocket"));
+        assert_eq!(colour.platform, IdentityPlatform::Ngpc);
+        assert!(colour.complete);
+        assert!(colour.verified_loose_rom_sha256().is_some());
+
+        let mono = inspect_catalogued_game_identity(&ngc, Some("Neo Geo Pocket Color"));
+        assert_eq!(mono.platform, IdentityPlatform::Ngp);
+        assert!(mono.complete);
+        assert!(mono.verified_loose_rom_sha256().is_some());
+    }
+
+    #[test]
+    fn ngp_unknown_or_truncated_header_fails_closed() {
+        let directory = FixtureDir::new("ngp-invalid-header");
+        for (name, bytes) in [
+            ("unknown.ngp", ngp_image(0x55)),
+            ("unknown.ngc", ngp_image(0x55)),
+            ("truncated.ngp", ngp_image(0x00)[..32].to_vec()),
+        ] {
+            let path = write_fixture(&directory, name, &bytes);
+            let hint = if name.ends_with(".ngc") {
+                "Neo Geo Pocket Color"
+            } else {
+                "Neo Geo Pocket"
+            };
+            let report = inspect_catalogued_game_identity(&path, Some(hint));
+            assert!(!report.complete, "{name}");
+            assert_eq!(report.verified_loose_rom_sha256(), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn ngp_identity_never_uses_filename_without_validated_header() {
+        let directory = FixtureDir::new("ngp-filename-only");
+        let path = write_fixture(&directory, "Neo Geo Pocket Color.ngp", b"not a header");
+        let report = inspect_catalogued_game_identity(&path, Some("Neo Geo Pocket"));
+        assert!(!report.complete);
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(report.evidence.iter().all(|item| {
+            item.kind != IdentityKind::LooseRomTitle || item.status != IdentityStatus::Verified
+        }));
     }
 }
 

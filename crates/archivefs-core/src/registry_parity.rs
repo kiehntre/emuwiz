@@ -44,6 +44,8 @@ const IDENTITY_PLATFORMS: &[IdentityPlatform] = &[
     IdentityPlatform::GameBoyColor,
     IdentityPlatform::GameBoyAdvance,
     IdentityPlatform::N64,
+    IdentityPlatform::Ngp,
+    IdentityPlatform::Ngpc,
 ];
 
 fn identity_dispatches(extension: &str) -> bool {

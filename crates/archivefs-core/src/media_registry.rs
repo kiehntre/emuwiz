@@ -123,6 +123,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "xex",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "ngp",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "ngc",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // Loose Commodore floppy-disk images. Neither is a container format
     // EmuWiz can mount or unwrap - catalogued directly, like every other
     // `DirectGameImage` entry. Which Commodore platform a given file
@@ -520,6 +528,12 @@ mod tests {
             kind_for_extension("gba"),
             Some(ArchiveKind::DirectGameImage)
         );
+    }
+
+    #[test]
+    fn neo_geo_pocket_extensions_are_direct_game_images() {
+        assert_eq!(kind_for_extension("ngp"), Some(ArchiveKind::DirectGameImage));
+        assert_eq!(kind_for_extension("ngc"), Some(ArchiveKind::DirectGameImage));
     }
 
     #[test]

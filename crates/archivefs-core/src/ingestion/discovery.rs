@@ -723,6 +723,9 @@ fn discover_direct_file(
     if extension == "exe" {
         return discover_dos_executable(path, source_root);
     }
+    if matches!(extension.as_str(), "ngp" | "ngc") {
+        return discover_ngp_cartridge(path, source_root, &extension);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -764,6 +767,63 @@ fn discover_direct_file(
             skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
         },
     }
+}
+
+/// NGP/NGPC extensions identify cartridge content, but never the platform.
+/// The platform hint passed to the existing identity reader is only a bounded
+/// candidate selected from the extension; the parsed header's system flag is
+/// authoritative and may cross-correct it.
+fn discover_ngp_cartridge(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {
+    let content = ContentKind::RomCartridge;
+    let existing_identity = identity_for(path, source_root);
+    // `ngc` is also a reviewed GameCube folder alias. Preserve that stronger
+    // catalogue context; the bare extension must not hijack it into NGP/NGPC.
+    if existing_identity
+        .as_ref()
+        .and_then(|summary| summary.platform.as_deref())
+        == Some("GameCube")
+    {
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            existing_identity,
+            format!("{}.", content.label()),
+        );
+    }
+    let candidate = if extension == "ngp" {
+        "Neo Geo Pocket"
+    } else {
+        "Neo Geo Pocket Color"
+    };
+    let report = crate::game_identity::inspect_catalogued_game_identity(path, Some(candidate));
+    if report.complete {
+        let mut identity = existing_identity;
+        if let Some(summary) = identity.as_mut() {
+            summary.platform = Some(report.platform.label().to_string());
+        }
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            identity,
+            format!(
+                "{} cartridge header validated (system flag selects the platform).",
+                content.label()
+            ),
+        );
+    }
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(content),
+        SkipReason::InvalidContent(format!(
+            ".{extension} did not pass its NGP/NGPC cartridge-header checks"
+        )),
+        format!(
+            "This .{extension} file was recognised as cartridge content, but its NGP/NGPC header did not validate."
+        ),
+    )
 }
 
 fn discover_xbox_content(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {

@@ -171,6 +171,8 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::Pcfx
         | IdentityPlatform::PcEngineCd
         | IdentityPlatform::NeoGeoCd
+        | IdentityPlatform::Ngp
+        | IdentityPlatform::Ngpc
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800

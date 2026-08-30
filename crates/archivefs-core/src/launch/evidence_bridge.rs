@@ -159,6 +159,8 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::Pcfx => Some("PC-FX"),
         IdentityPlatform::PcEngineCd => Some("PC Engine CD"),
         IdentityPlatform::NeoGeoCd => Some("Neo Geo CD"),
+        IdentityPlatform::Ngp => Some("Neo Geo Pocket"),
+        IdentityPlatform::Ngpc => Some("Neo Geo Pocket Color"),
         IdentityPlatform::Atari2600 => Some("Atari2600"),
         IdentityPlatform::Atari5200 => Some("Atari5200"),
         IdentityPlatform::Atari7800 => Some("Atari7800"),
@@ -278,7 +280,9 @@ fn resolved_identity_for_platform(
         | IdentityPlatform::Nes
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
-        | IdentityPlatform::GameBoyAdvance => {
+        | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::Ngp
+        | IdentityPlatform::Ngpc => {
             // A verified full-file SHA-256 is a genuine opaque game key, but
             // `VerifiedIdentityFact` has no cartridge-hash variant - no
             // adapter-request projector reads a generic hash today, so

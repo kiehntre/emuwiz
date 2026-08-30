@@ -85,6 +85,28 @@ fn verified_ps2_serial_resolves_with_a_matching_fact() {
 }
 
 #[test]
+fn verified_ngp_hash_resolves_without_promoting_header_metadata() {
+    let source = report(
+        IdentityPlatform::Ngpc,
+        vec![evidence(
+            IdentityKind::LooseRomSha256,
+            IdentityStatus::Verified,
+            Some("deadbeef"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+    let (status, facts) = canonical_identity_from_game_report(&source);
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Neo Geo Pocket Color".to_string(),
+            game_key: "deadbeef".to_string(),
+        })
+    );
+    assert!(facts.is_empty());
+}
+
+#[test]
 fn verified_psp_disc_id_resolves_to_ppsspp_fact() {
     let source = report(
         IdentityPlatform::Psp,

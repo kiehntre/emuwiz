@@ -591,6 +591,36 @@ mod tests {
     }
 
     #[test]
+    fn ngp_archive_member_uses_the_same_header_evidence_as_loose_roms() {
+        let mut mono = vec![0_u8; crate::ngp_header_evidence::NGP_HEADER_BYTES + 16];
+        mono[..28].copy_from_slice(b"COPYRIGHT BY SNK CORPORATION");
+        mono[0x1c..0x20].copy_from_slice(&0x1000_u32.to_le_bytes());
+        mono[0x20..0x22].copy_from_slice(&0x0042_u16.to_le_bytes());
+        mono[0x22] = 1;
+        mono[0x23] = 0x00;
+        let mut color = mono.clone();
+        color[0x23] = 0x10;
+
+        let path = temp_zip_path("ngp-platform-parity");
+        write_zip(&path, &[("mono.ngp", &mono), ("color.ngc", &color)]);
+        let observation = observe_zip_member_content(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let mono_evidence = &observation.members[0].evidence;
+        let color_evidence = &observation.members[1].evidence;
+        assert!(mono_evidence.iter().any(|item| item.value == "Monochrome (NGP)"));
+        assert!(color_evidence.iter().any(|item| item.value == "Color (NGPC)"));
+        assert_eq!(
+            crate::ngp_header_evidence::parse_ngp_header(&mono).unwrap().system_flag,
+            crate::ngp_header_evidence::NgpSystemFlag::Monochrome
+        );
+        assert_eq!(
+            crate::ngp_header_evidence::parse_ngp_header(&color).unwrap().system_flag,
+            crate::ngp_header_evidence::NgpSystemFlag::Color
+        );
+    }
+
+    #[test]
     fn unrelated_bytes_member_yields_no_evidence() {
         let path = temp_zip_path("unrelated-member");
         write_zip(&path, &[("data.bin", b"just some arbitrary bytes")]);

@@ -1046,6 +1046,45 @@ fn loose_commodore_disks_are_discovered_as_computer_disks() {
 }
 
 #[test]
+fn neo_geo_pocket_loose_extensions_are_reachable_as_direct_content() {
+    let root = source_dir("ngp-direct-discovery");
+    let mut bytes = vec![0_u8; 0x50];
+    bytes[..28].copy_from_slice(b"COPYRIGHT BY SNK CORPORATION");
+    bytes[0x23] = 0x00;
+    bytes[0x24..0x2c].copy_from_slice(b"TESTGAME");
+    std::fs::write(root.path().join("mono.ngp"), &bytes).unwrap();
+    bytes[0x23] = 0x10;
+    std::fs::write(root.path().join("colour.ngc"), &bytes).unwrap();
+
+    let report = discover_source(root.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert!(report.items.iter().all(|item| {
+        item.content == Some(ContentKind::RomCartridge)
+            && item.validation_state == ValidationState::Accepted
+    }));
+    assert!(report.items.iter().any(|item| {
+        item.platform_hint.as_deref() == Some("Neo Geo Pocket")
+    }));
+    assert!(report.items.iter().any(|item| {
+        item.platform_hint.as_deref() == Some("Neo Geo Pocket Color")
+    }));
+}
+
+#[test]
+fn bare_ngc_under_gamecube_alias_stays_gamecube() {
+    let root = source_dir("ngc-gamecube-alias");
+    let gamecube = root.path().join("ngc");
+    std::fs::create_dir_all(&gamecube).unwrap();
+    std::fs::write(gamecube.join("game.ngc"), b"gamecube content").unwrap();
+
+    let report = discover_source(&gamecube).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::RomCartridge));
+    assert_eq!(report.items[0].platform_hint.as_deref(), Some("GameCube"));
+    assert_eq!(report.items[0].validation_state, ValidationState::Accepted);
+}
+
+#[test]
 fn crt_is_structurally_discovered_but_needs_folder_platform_evidence() {
     let bare = source_dir("crt-bare");
     std::fs::write(bare.path().join("cart.crt"), minimal_crt()).unwrap();
