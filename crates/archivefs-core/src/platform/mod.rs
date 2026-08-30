@@ -551,7 +551,12 @@ pub const PLATFORMS: &[Platform] = &[
         filename_aliases: &[],
         strong_extensions: &["cdt"],
         weak_extensions: &["dsk", "sna", "tap", "voc"],
-        magic: &[],
+        magic: &[MagicRule {
+            offset: 0,
+            bytes: b"ZXTape!\x1a",
+            description: "TZX/CDT tape containers begin with the literal `ZXTape!` signature",
+            confidence: MagicConfidence::Corroborated,
+        }],
         layout: &[],
         conflicts_with: &["ZX Spectrum", "AtariST"],
         preferred_emulator: None,

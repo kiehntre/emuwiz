@@ -2328,6 +2328,12 @@ const REVIEWED_MAGIC_CONFIDENCE: &[(&str, u64, &[u8], MagicConfidence)] = &[
         b"ZXTape!\x1a",
         MagicConfidence::Corroborated,
     ),
+    (
+        "Amstrad CPC",
+        0,
+        b"ZXTape!\x1a",
+        MagicConfidence::Corroborated,
+    ),
 ];
 
 #[test]
@@ -2458,7 +2464,7 @@ fn a_platform_with_mixed_confidence_rules_reports_its_best_match() {
 }
 
 #[test]
-fn total_magic_rule_coverage_is_unchanged_at_twenty_rules_across_seventeen_platforms() {
+fn total_magic_rule_coverage_is_twenty_one_rules_across_eighteen_platforms() {
     let mut rule_count = 0usize;
     let mut platform_count = 0usize;
     for platform in PLATFORMS {
@@ -2467,10 +2473,10 @@ fn total_magic_rule_coverage_is_unchanged_at_twenty_rules_across_seventeen_platf
         }
         rule_count += platform.magic.len();
     }
-    assert_eq!(rule_count, 20, "no new MagicRule coverage may be added");
+    assert_eq!(rule_count, 21);
     assert_eq!(
-        platform_count, 17,
-        "no new platform may gain magic coverage"
+        platform_count, 18,
+        "the CPC parity rule adds shared coverage to an existing platform"
     );
 }
 
@@ -2489,6 +2495,94 @@ fn zxtape_is_corroborated_not_strong() {
          platform family; it must not be treated as unique ZX Spectrum \
          platform evidence"
     );
+}
+
+#[test]
+fn bare_tzx_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
+    let tree = TempTree::new("zxtape-tzx-parity");
+    let path = tree.file("unsorted/game.tzx", b"ZXTape!\x1a");
+    let report = detect_platform_report(
+        &DetectionRequest::new(&path, tree.path()).inspecting_content(),
+    );
+
+    assert_eq!(report.platform, None);
+    assert_eq!(report.confidence, DetectionConfidence::Ambiguous);
+    assert_eq!(
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.platform)
+            .collect::<Vec<_>>(),
+        vec!["Amstrad CPC", "ZX Spectrum"]
+    );
+}
+
+#[test]
+fn bare_cdt_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
+    let tree = TempTree::new("zxtape-cdt-parity");
+    let path = tree.file("unsorted/game.cdt", b"ZXTape!\x1a");
+    let report = detect_platform_report(
+        &DetectionRequest::new(&path, tree.path()).inspecting_content(),
+    );
+
+    assert_eq!(report.platform, None);
+    assert_eq!(report.confidence, DetectionConfidence::Ambiguous);
+    assert_eq!(
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.platform)
+            .collect::<Vec<_>>(),
+        vec!["Amstrad CPC", "ZX Spectrum"]
+    );
+}
+
+#[test]
+fn zxtape_folder_aliases_break_the_spectrum_cpc_tie() {
+    let tree = TempTree::new("zxtape-folder-parity");
+    let spectrum = tree.file("spectrum/game.tzx", b"ZXTape!\x1a");
+    let cpc = tree.file("cpc/game.cdt", b"ZXTape!\x1a");
+
+    let spectrum_report = detect_platform_report(
+        &DetectionRequest::new(&spectrum, tree.path()).inspecting_content(),
+    );
+    let cpc_report = detect_platform_report(
+        &DetectionRequest::new(&cpc, tree.path()).inspecting_content(),
+    );
+
+    assert_eq!(spectrum_report.platform, Some("ZX Spectrum"));
+    assert_eq!(cpc_report.platform, Some("Amstrad CPC"));
+}
+
+#[test]
+fn trusted_cpc_metadata_breaks_zxtape_tie() {
+    let tree = TempTree::new("zxtape-trusted-parity");
+    let path = tree.file("unsorted/game.tzx", b"ZXTape!\x1a");
+    let report = detect_platform_report(
+        &DetectionRequest::new(&path, tree.path())
+            .inspecting_content()
+            .with_trusted_platform(Some("Amstrad CPC")),
+    );
+
+    assert_eq!(report.platform, Some("Amstrad CPC"));
+    assert_eq!(
+        report.deciding_source,
+        Some(DetectionSource::TrustedMetadata)
+    );
+}
+
+#[test]
+fn content_without_zxtape_signature_adds_no_cpc_signature_evidence() {
+    let tree = TempTree::new("zxtape-no-signature");
+    let path = tree.file("unsorted/random.bin", b"not a tape container");
+    let report = detect_platform_report(
+        &DetectionRequest::new(&path, tree.path()).inspecting_content(),
+    );
+
+    assert_ne!(report.platform, Some("Amstrad CPC"));
+    assert!(!report.evidence.iter().any(|evidence| {
+        evidence.platform == "Amstrad CPC" && evidence.source == DetectionSource::Signature
+    }));
 }
 
 #[test]
