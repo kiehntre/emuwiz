@@ -25,6 +25,9 @@ use crate::executable_signatures::{
     parse_xbe_header, xbe_certificate_file_offset,
 };
 use crate::gb_header_evidence::{GB_HEADER_BYTES, GbColorSupport, parse_gb_header};
+use crate::header_normalization::{
+    HeaderNormalizationKind, recognize_snes_copier_candidate, strip_known_header,
+};
 use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
@@ -50,6 +53,7 @@ use crate::raw_cd_logical_media::{
 };
 use crate::saturn_boot_evidence::{SATURN_SYSTEM_ID_BYTES, parse_saturn_system_id};
 use crate::segacd_boot_evidence::{SEGA_CD_DISC_ID_BYTES, parse_segacd_product_code};
+use crate::snes_header_evidence::{SnesHeaderFact, SnesMapMode, parse_snes_header_candidate};
 use crate::threedo_boot_evidence::{OPERA_HEADER_BYTES, parse_opera_volume_header};
 
 pub const MAX_BYTES_READ: u64 = 64 * 1024 * 1024;
@@ -236,6 +240,9 @@ pub enum IdentityKind {
     /// Parsed iNES/NES 2.0 header metadata; exact release identity remains
     /// authoritative only when established by DAT/hash evidence.
     NesHeader,
+    /// Parsed, checksum/complement-validated SNES internal-header metadata;
+    /// exact release identity remains authoritative only via DAT/hash.
+    SnesHeader,
     /// The established PC-FX custom disc-identification hash. It is derived
     /// from PC-FX sector/header/boot content, never from a filename.
     PcfxDiscHash,
@@ -269,6 +276,7 @@ impl fmt::Display for IdentityKind {
             Self::PceCdBootStructure => "PC Engine CD boot structure",
             Self::NeoGeoCdBootStructure => "Neo Geo CD boot structure",
             Self::NesHeader => "NES header",
+            Self::SnesHeader => "SNES header",
             Self::PcfxDiscHash => "PC-FX disc hash",
         };
         f.write_str(value)
@@ -611,6 +619,13 @@ impl GameIdentityReport {
 
     pub fn verified_pcfx_disc_hash(&self) -> Option<&str> {
         self.verified_value(IdentityKind::PcfxDiscHash)
+    }
+
+    /// The validated SNES internal-header map mode. Header metadata is
+    /// structural evidence only; exact release identity remains DAT/hash-
+    /// driven.
+    pub fn verified_snes_header(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::SnesHeader)
     }
 
     pub fn verified_ps1_serial(&self) -> Option<&str> {
@@ -975,6 +990,28 @@ fn inspect_nes_header(file: &mut File, file_len: u64) -> Option<InesHeaderFact> 
     (required <= file_len).then_some(fact)
 }
 
+/// Returns the existing validated SNES header and whether a 512-byte copier
+/// header was removed before parsing. The size rule only selects the already-
+/// supported reversible candidate; checksum/complement validation is the proof.
+fn inspect_snes_header(bytes: &[u8]) -> Option<(SnesHeaderFact, bool)> {
+    if recognize_snes_copier_candidate(bytes.len())
+        && let Ok(normalized) = strip_known_header(bytes, HeaderNormalizationKind::SnesCopier512)
+        && let Some(fact) = unique_validated_snes_header(&normalized.bytes)
+    {
+        return Some((fact, true));
+    }
+    unique_validated_snes_header(bytes).map(|fact| (fact, false))
+}
+
+fn unique_validated_snes_header(bytes: &[u8]) -> Option<SnesHeaderFact> {
+    let mut candidates = SnesMapMode::ALL
+        .into_iter()
+        .filter_map(|mode| parse_snes_header_candidate(bytes, mode))
+        .filter(|fact| fact.checksum_valid() && fact.map_mode_matches())
+        .collect::<Vec<_>>();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
 /// Whether a `.gb`-hinted cartridge's own header proves it cannot actually
 /// run on original Game Boy hardware - a genuine, structural
 /// platform/content contradiction, never a guess.
@@ -1097,7 +1134,9 @@ fn inspect_loose_rom(
         return;
     }
     let is_n64 = report.platform == IdentityPlatform::N64;
-    let needs_whole_file = is_n64 || atari7800_header.is_some() || lynx_header.is_some();
+    let is_snes = report.platform == IdentityPlatform::Snes;
+    let needs_whole_file =
+        is_n64 || is_snes || atari7800_header.is_some() || lynx_header.is_some();
     let mut whole_file_bytes: Option<Vec<u8>> = None;
     let digest = if needs_whole_file {
         // N64 needs the raw bytes afterward for byte-order detection and
@@ -1226,8 +1265,11 @@ fn inspect_loose_rom(
     if let Some(bytes) = whole_file_bytes.as_deref() {
         if is_n64 {
             push_n64_canonical_evidence(report, bytes);
-        } else {
+        } else if !is_snes {
             push_header_canonical_evidence(report, bytes);
+        }
+        if is_snes {
+            push_snes_header_evidence(report, bytes);
         }
     }
     report.evidence.push(evidence(
@@ -1311,6 +1353,39 @@ fn push_header_canonical_evidence(report: &mut GameIdentityReport, bytes: &[u8])
         IdentityConfidence::ExactBytes,
         "SHA-256 of the reversibly header-stripped Atari cartridge representation; distinct from the physical-file SHA-256",
         normalized.transform_id,
+    ));
+}
+
+/// Promotes the existing checksum/complement-validated SNES header parser into
+/// the production report. Internal title and header fields remain metadata,
+/// not exact release identity.
+fn push_snes_header_evidence(report: &mut GameIdentityReport, bytes: &[u8]) {
+    let Some((fact, copier_header)) = inspect_snes_header(bytes) else {
+        return;
+    };
+    let diagnostic = format!(
+        "SNES {} header: title {:?}, map mode {:#04x}, cartridge type {:#04x}, ROM size code {:#04x}, RAM size code {:#04x}, destination {:#04x}, developer {:#04x}, version {:#04x}, checksum {:#06x}, complement {:#06x}, copier header {}",
+        fact.mode.label(),
+        fact.title,
+        fact.map_mode_low_nibble,
+        fact.cartridge_type,
+        fact.rom_size_code,
+        fact.ram_size_code,
+        fact.destination_code,
+        fact.developer_id,
+        fact.version,
+        fact.checksum,
+        fact.checksum_complement,
+        copier_header,
+    );
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::SnesHeader,
+        IdentityStatus::Verified,
+        Some(fact.mode.label().to_string()),
+        IdentityConfidence::StructuredMetadata,
+        &diagnostic,
+        "snes_header_evidence::best_snes_header_candidate",
     ));
 }
 
@@ -8592,6 +8667,100 @@ mod tests {
             let expected = sha256_hex(&bytes);
             assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
         }
+    }
+
+    fn production_snes_fixture(mode: SnesMapMode, copier_header: bool) -> Vec<u8> {
+        let minimum_len = mode.base_offset() + crate::snes_header_evidence::SNES_HEADER_LEN;
+        let payload_len = minimum_len.div_ceil(32 * 1024) * (32 * 1024);
+        let mut payload = vec![0u8; payload_len];
+        let base = mode.base_offset();
+        payload[base..base + 15].copy_from_slice(b"PRODUCTION SNES");
+        payload[base + 0x15] = match mode {
+            SnesMapMode::LoRom => 0x20,
+            SnesMapMode::HiRom => 0x21,
+            SnesMapMode::ExHiRom => 0x25,
+        };
+        payload[base + 0x16] = 0x01;
+        payload[base + 0x17] = 0x0c;
+        payload[base + 0x18] = 0x03;
+        payload[base + 0x19] = 0x01;
+        payload[base + 0x1a] = 0x33;
+        payload[base + 0x1b] = 0x00;
+        let checksum = 0x1234u16;
+        payload[base + 0x1c..base + 0x1e].copy_from_slice(&(checksum ^ 0xffff).to_le_bytes());
+        payload[base + 0x1e..base + 0x20].copy_from_slice(&checksum.to_le_bytes());
+        if copier_header {
+            let mut bytes = vec![0u8; 512];
+            bytes.extend_from_slice(&payload);
+            bytes
+        } else {
+            payload
+        }
+    }
+
+    #[test]
+    fn valid_snes_headers_reach_production_identity() {
+        let directory = FixtureDir::new("snes-production-headers");
+        for (extension, mode) in [("sfc", SnesMapMode::LoRom), ("smc", SnesMapMode::HiRom)] {
+            let path = write_fixture(
+                &directory,
+                &format!("Headered {extension}.{extension}"),
+                &production_snes_fixture(mode, false),
+            );
+            let report = inspect_catalogued_game_identity(&path, Some("SNES"));
+            assert_eq!(report.verified_snes_header(), Some(mode.label()));
+            let evidence = report
+                .evidence
+                .iter()
+                .find(|item| item.kind == IdentityKind::SnesHeader)
+                .unwrap();
+            assert!(evidence.diagnostic.contains("PRODUCTION SNES"));
+            assert!(evidence.diagnostic.contains("ROM size code 0x0c"));
+            assert!(evidence.diagnostic.contains("checksum 0x1234"));
+        }
+    }
+
+    #[test]
+    fn snes_copier_header_is_structurally_recognised() {
+        let directory = FixtureDir::new("snes-copier-production");
+        let path = write_fixture(
+            &directory,
+            "same.smc",
+            &production_snes_fixture(SnesMapMode::LoRom, true),
+        );
+        let report = inspect_catalogued_game_identity(&path, Some("SNES"));
+        assert_eq!(report.verified_snes_header(), Some("LoROM"));
+        let evidence = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::SnesHeader)
+            .unwrap();
+        assert!(evidence.diagnostic.contains("copier header true"));
+        assert!(evidence.diagnostic.contains("PRODUCTION SNES"));
+    }
+
+    #[test]
+    fn random_truncated_and_ambiguous_snes_headers_fail_closed_in_production() {
+        let directory = FixtureDir::new("snes-production-negative");
+        for (name, bytes) in [
+            ("SNES title only.sfc", b"SNES title only".to_vec()),
+            ("random.smc", vec![0xa5; 128 * 1024]),
+            (
+                "truncated.sfc",
+                production_snes_fixture(SnesMapMode::LoRom, false)[..0x7fc0].to_vec(),
+            ),
+        ] {
+            let path = write_fixture(&directory, name, &bytes);
+            let report = inspect_catalogued_game_identity(&path, Some("SNES"));
+            assert_eq!(report.verified_snes_header(), None, "{name}");
+        }
+
+        let mut ambiguous = production_snes_fixture(SnesMapMode::HiRom, false);
+        let lorom = production_snes_fixture(SnesMapMode::LoRom, false);
+        ambiguous[0x7fc0..0x7fc0 + 0x20].copy_from_slice(&lorom[0x7fc0..0x7fc0 + 0x20]);
+        let path = write_fixture(&directory, "ambiguous.sfc", &ambiguous);
+        let report = inspect_catalogued_game_identity(&path, Some("SNES"));
+        assert_eq!(report.verified_snes_header(), None);
     }
 
     #[test]
