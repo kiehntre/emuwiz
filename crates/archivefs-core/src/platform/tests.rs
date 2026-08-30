@@ -656,7 +656,6 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
         ("gba", "Game Boy Advance"),
         ("col", "ColecoVision"),
         ("vec", "Vectrex"),
-        ("cdt", "Amstrad CPC"),
         ("a26", "Atari2600"),
         ("a52", "Atari5200"),
         ("a78", "Atari7800"),
@@ -2535,6 +2534,45 @@ fn bare_cdt_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
             .collect::<Vec<_>>(),
         vec!["Amstrad CPC", "ZX Spectrum"]
     );
+}
+
+#[test]
+fn unsigned_tape_extensions_do_not_prefer_spectrum_or_cpc() {
+    let tree = TempTree::new("unsigned-tape-parity");
+    for extension in ["tzx", "cdt"] {
+        let path = tree.file(&format!("unsorted/game.{extension}"), b"not a signed tape");
+        let report = detect_platform_report(
+            &DetectionRequest::new(&path, tree.path()).inspecting_content(),
+        );
+        assert_eq!(report.platform, None, ".{extension} selected a platform");
+        assert_eq!(report.confidence, DetectionConfidence::Ambiguous, ".{extension}");
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .map(|candidate| candidate.platform)
+                .collect::<Vec<_>>(),
+            vec!["Amstrad CPC", "ZX Spectrum"],
+            ".{extension} must retain both tape-platform candidates"
+        );
+    }
+}
+
+#[test]
+fn generic_voc_does_not_identify_amstrad_cpc() {
+    let report = detect(&format!("{ROOT}/unsorted/game.voc"));
+    assert_ne!(report.platform, Some("Amstrad CPC"));
+    assert!(!report.candidates.iter().any(|candidate| candidate.platform == "Amstrad CPC"));
+}
+
+#[test]
+fn commodore_prg_remains_ambiguous_and_not_strong_c64_evidence() {
+    let report = detect(&format!("{ROOT}/unsorted/game.prg"));
+    assert_ne!(report.platform, Some("Commodore 64"));
+    assert!(matches!(
+        report.confidence,
+        DetectionConfidence::Ambiguous | DetectionConfidence::Unknown
+    ));
 }
 
 #[test]
