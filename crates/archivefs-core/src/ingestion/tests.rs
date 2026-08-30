@@ -183,9 +183,21 @@ fn chd_is_discovered_as_a_disc_image_candidate() {
 
 #[test]
 fn dsk_and_cdt_are_recognised_media_without_platform_guessing() {
-    for (name, expected) in [
-        ("unknown-platform.dsk", ContentKind::ComputerDisk),
-        ("unknown-platform.cdt", ContentKind::TapeImage),
+    // `.dsk` now goes through the shared structural disk layer: 13 garbage
+    // bytes are not a CPCEMU container at all, so this is an `InvalidContent`
+    // skip rather than "recognised, no identity". Both leave the platform
+    // unset, which is the property this test is really guarding.
+    for (name, expected, expected_reason) in [
+        (
+            "unknown-platform.dsk",
+            ContentKind::ComputerDisk,
+            SkipReason::InvalidContent(String::new()),
+        ),
+        (
+            "unknown-platform.cdt",
+            ContentKind::TapeImage,
+            SkipReason::RecognizedContentNoIdentityMatch,
+        ),
     ] {
         let dir = source_dir(name);
         std::fs::write(dir.path().join(name), b"fixture bytes").unwrap();
@@ -198,8 +210,8 @@ fn dsk_and_cdt_are_recognised_media_without_platform_guessing() {
             "{name} must not infer a platform"
         );
         assert_eq!(
-            item.skip_reason,
-            Some(SkipReason::RecognizedContentNoIdentityMatch)
+            std::mem::discriminant(item.skip_reason.as_ref().unwrap()),
+            std::mem::discriminant(&expected_reason)
         );
     }
 }
@@ -559,4 +571,154 @@ fn every_registered_content_extension_is_discovered_end_to_end() {
             "extension {extension} was registered but discovery reported no content kind"
         );
     }
+}
+
+// --- ZX Spectrum snapshots + +3 disks ---------------------------------
+
+fn z80_v1_uncompressed() -> Vec<u8> {
+    let mut file = vec![0u8; 30 + 49152];
+    file[7] = 0x80; // PC = 0x8000 (non-zero -> v1)
+    file[9] = 0xC0; // SP = 0xC000
+    file[27] = 1; // IFF1
+    file[28] = 1; // IFF2
+    file[29] = 1; // interrupt mode 1
+    file
+}
+
+fn sna_128k() -> Vec<u8> {
+    let mut file = vec![0u8; 27 + 49152 + 4 + (5 * 16384)];
+    file[24] = 0x80; // SP = 0x8000
+    file[25] = 1; // interrupt mode
+    file[26] = 7; // border
+    file
+}
+
+/// A minimal standard CPCEMU `.dsk`; when `plus3` is set, track 0 sector 1
+/// carries a valid +3DOS disk specification.
+fn dsk(tracks: u8, sides: u8, plus3: bool) -> Vec<u8> {
+    let spt = 9usize;
+    let track_size = 256 + spt * 512;
+    let mut info = vec![0u8; 256];
+    info[..0x22].copy_from_slice(b"MV - CPCEMU Disk-File\r\nDisk-Info\r\n");
+    info[0x30] = tracks;
+    info[0x31] = sides;
+    info[0x32..0x34].copy_from_slice(&(track_size as u16).to_le_bytes());
+    let mut image = info;
+    for t in 0..(usize::from(tracks) * usize::from(sides)) {
+        let mut h = vec![0u8; 256];
+        h[..0x0C].copy_from_slice(b"Track-Info\r\n");
+        h[0x10] = (t / usize::from(sides)) as u8;
+        h[0x11] = (t % usize::from(sides)) as u8;
+        h[0x14] = 2;
+        h[0x15] = spt as u8;
+        for s in 0..spt {
+            let b = 0x18 + s * 8;
+            h[b + 2] = 0xC1 + s as u8;
+            h[b + 3] = 2;
+        }
+        image.extend_from_slice(&h);
+        let mut data = vec![0xE5u8; spt * 512];
+        if t == 0 && plus3 {
+            data[0] = 0; // disk type: Spectrum +3 SS
+            data[2] = tracks;
+            data[3] = spt as u8;
+            data[4] = 2;
+            for byte in data.iter_mut().take(15).skip(10) {
+                *byte = 0;
+            }
+        }
+        image.extend_from_slice(&data);
+    }
+    image
+}
+
+#[test]
+fn z80_v1_snapshot_is_discovered_as_a_zx_spectrum_machine_snapshot() {
+    let dir = source_dir("z80");
+    std::fs::write(
+        dir.path().join("Manic Miner (1983).z80"),
+        z80_v1_uncompressed(),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::MachineSnapshot));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert!(item.explanation.contains("48K"));
+    assert_eq!(report.stats.snapshots, 1);
+}
+
+#[test]
+fn sna_128k_snapshot_is_discovered() {
+    let dir = source_dir("sna");
+    std::fs::write(dir.path().join("unrelated name.sna"), sna_128k()).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::MachineSnapshot));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+}
+
+#[test]
+fn random_bytes_named_like_a_spectrum_snapshot_are_not_accepted() {
+    let dir = source_dir("z80-lie");
+    std::fs::write(
+        dir.path().join("Some Spectrum Game.z80"),
+        b"not a snapshot at all",
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert!(!item.explanation.contains("48K"));
+}
+
+#[test]
+fn plus3_dsk_is_discovered_as_zx_spectrum() {
+    let dir = source_dir("plus3-dsk");
+    std::fs::write(dir.path().join("Game (1988).dsk"), dsk(40, 1, true)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert!(item.explanation.contains("+3"));
+}
+
+#[test]
+fn generic_cpc_dsk_stays_ambiguous_and_is_never_forced_to_spectrum() {
+    let dir = source_dir("generic-dsk");
+    std::fs::write(dir.path().join("data disk.dsk"), dsk(80, 2, false)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_ne!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+}
+
+#[test]
+fn truncated_dsk_fails_closed() {
+    let dir = source_dir("trunc-dsk");
+    let mut image = dsk(40, 1, true);
+    image.truncate(image.len() - 2048);
+    std::fs::write(dir.path().join("game.dsk"), image).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert_eq!(item.platform_hint, None);
 }

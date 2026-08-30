@@ -733,13 +733,7 @@ fn a_pasti_track_table_longer_than_the_budget_stops_at_the_bound() {
 #[test]
 fn an_unhandled_extension_is_refused_without_opening_the_file() {
     let fixture = Fixture::new("dispatch");
-    for name in [
-        "game.bin",
-        "game.iso",
-        "game.dsk",
-        "RESOURCE.GEN",
-        "game.msa",
-    ] {
+    for name in ["game.bin", "game.iso", "RESOURCE.GEN", "game.msa"] {
         let path = fixture.write(&format!("library/{name}"), &st_720k());
         let evidence = fixture.inspect(&path);
         assert_eq!(evidence.format, None, "{name} has no adapter");
@@ -749,6 +743,15 @@ fn an_unhandled_extension_is_refused_without_opening_the_file() {
         );
         assert_eq!(evidence.bytes_inspected, 0);
     }
+    // `.dsk` now has an adapter, so a non-DSK payload under it is a
+    // *malformed* refusal, not a missing adapter - but still no format claim.
+    let path = fixture.write("library/not-really.dsk", &st_720k());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
     // And a file with no extension at all.
     let path = fixture.write("library/plain", &st_720k());
     assert_eq!(
@@ -1181,4 +1184,249 @@ fn the_database_schema_and_migrations_are_unchanged() {
         vec![1_i64, 2, 3, 4, 5, 6, 7],
         "migrations must remain exactly 0001 through 0007"
     );
+}
+
+// --- CPCEMU DSK / ZX Spectrum +3 ---------------------------------------
+
+const DSK_INFO: usize = 256;
+
+/// One CPCEMU `.dsk`, built exactly from a geometry. When `plus3dos` is set,
+/// track 0's first sector carries a valid +3DOS/PCW disk-specification block
+/// of the given `disk_type`; when `bootable` is also set the whole first
+/// sector is tuned so its byte sum mod 256 is 3.
+fn dsk_image(
+    extended: bool,
+    tracks: u8,
+    sides: u8,
+    sectors_per_track: u8,
+    plus3dos: Option<(u8 /*disk_type*/, bool /*bootable*/)>,
+) -> Vec<u8> {
+    let sector_bytes = 512usize;
+    let track_size = DSK_INFO + usize::from(sectors_per_track) * sector_bytes;
+    let entries = usize::from(tracks) * usize::from(sides);
+
+    let mut info = vec![0u8; DSK_INFO];
+    if extended {
+        info[..0x22].copy_from_slice(b"EXTENDED CPC DSK File\r\nDisk-Info\r\n");
+    } else {
+        info[..0x22].copy_from_slice(b"MV - CPCEMU Disk-File\r\nDisk-Info\r\n");
+    }
+    info[0x22..0x30].copy_from_slice(b"archivefs test");
+    info[0x30] = tracks;
+    info[0x31] = sides;
+    if extended {
+        let hi = u8::try_from(track_size / 256).expect("track fits in a byte*256");
+        for entry in 0..entries {
+            info[0x34 + entry] = hi;
+        }
+    } else {
+        info[0x32..0x34].copy_from_slice(&u16::try_from(track_size).unwrap().to_le_bytes());
+    }
+
+    let mut image = info;
+    for track_index in 0..entries {
+        let track = u8::try_from(track_index / usize::from(sides)).unwrap();
+        let side = u8::try_from(track_index % usize::from(sides)).unwrap();
+        let mut header = vec![0u8; DSK_INFO];
+        header[..0x0C].copy_from_slice(b"Track-Info\r\n");
+        header[0x10] = track;
+        header[0x11] = side;
+        header[0x14] = 2; // sector size code -> 512
+        header[0x15] = sectors_per_track;
+        header[0x16] = 0x4E; // GAP#3
+        header[0x17] = 0xE5; // filler
+        for sector in 0..usize::from(sectors_per_track) {
+            let base = 0x18 + sector * 8;
+            header[base] = track;
+            header[base + 1] = side;
+            header[base + 2] = 0xC1 + u8::try_from(sector).unwrap(); // sector ID
+            header[base + 3] = 2; // N
+            if extended {
+                header[base + 6..base + 8].copy_from_slice(&512u16.to_le_bytes());
+            }
+        }
+        image.extend_from_slice(&header);
+        let mut data = vec![0xE5u8; usize::from(sectors_per_track) * sector_bytes];
+
+        if track_index == 0
+            && let Some((disk_type, bootable)) = plus3dos
+        {
+            // +3DOS / PCW disk specification in the first 16 bytes of the
+            // first sector (which starts at image offset 0x200).
+            data[0] = disk_type;
+            data[1] = 0; // sidedness: single
+            data[2] = tracks;
+            data[3] = sectors_per_track;
+            data[4] = 2; // log2(512) - 7
+            data[5] = 1; // reserved tracks
+            data[6] = 3; // block shift
+            data[7] = 2; // directory blocks
+            data[8] = 0x2A; // gap r/w
+            data[9] = 0x52; // gap format
+            for byte in data.iter_mut().take(15).skip(10) {
+                *byte = 0; // reserved
+            }
+            data[15] = 0; // spec-block checksum slot (not validated here)
+            if bootable {
+                let sum: u32 = data[..512].iter().map(|b| u32::from(*b)).sum();
+                let want = 3u32;
+                let have = sum % 256;
+                // Nudge a scratch byte well outside the spec block.
+                data[64] = data[64].wrapping_add(((want + 256 - have) % 256) as u8);
+            }
+        }
+        image.extend_from_slice(&data);
+    }
+    image
+}
+
+/// A standard 40-track single-sided +3 "CF2" disk with a bootable +3DOS spec.
+fn plus3_cf2_disk() -> Vec<u8> {
+    dsk_image(false, 40, 1, 9, Some((0, true)))
+}
+
+/// A plain double-sided 80-track CPC data disk: valid container, no +3DOS.
+fn cpc_data_disk() -> Vec<u8> {
+    dsk_image(false, 80, 2, 9, None)
+}
+
+#[test]
+fn dsk_standard_container_is_recognised_but_not_a_platform() {
+    let fixture = Fixture::new("dsk-standard");
+    let path = fixture.write("library/game.dsk", &cpc_data_disk());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::CpcEmuDsk));
+    assert!(!evidence.conclusive, "a bare .dsk never settles a platform");
+    assert_eq!(evidence.confidence, DetectionConfidence::Probable);
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert!(!layout.extended);
+    assert!(!layout.plus3dos_disk_spec);
+    assert_eq!(layout.declared_tracks, 80);
+    assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
+}
+
+#[test]
+fn dsk_extended_container_is_recognised() {
+    let fixture = Fixture::new("dsk-extended");
+    let image = dsk_image(true, 42, 1, 9, None);
+    let path = fixture.write("library/game.dsk", &image);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::CpcEmuDsk));
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert!(layout.extended);
+    assert!(!layout.plus3dos_disk_spec);
+}
+
+#[test]
+fn dsk_with_plus3dos_disk_spec_is_zx_spectrum() {
+    let fixture = Fixture::new("dsk-plus3");
+    let path = fixture.write("library/Game (1987).dsk", &plus3_cf2_disk());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumPlus3Disk));
+    assert_eq!(evidence.platform, Some("ZX Spectrum"));
+    assert!(evidence.conclusive);
+    assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert!(layout.plus3dos_disk_spec);
+    assert_eq!(layout.plus3dos_disk_type, Some(0));
+    assert!(layout.plus3_bootable);
+}
+
+#[test]
+fn cpc_disk_type_in_the_spec_block_is_never_spectrum() {
+    let fixture = Fixture::new("dsk-cpc-spec");
+    // disk type 2 = CPC data - the spec block validates structurally but must
+    // not be read as ZX Spectrum.
+    let path = fixture.write(
+        "library/game.dsk",
+        &dsk_image(false, 40, 1, 9, Some((2, false))),
+    );
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::CpcEmuDsk));
+    assert_ne!(evidence.platform, Some("ZX Spectrum"));
+    let Some(DiskFormatMetadata::Dsk(layout)) = evidence.metadata else {
+        panic!("expected dsk layout");
+    };
+    assert_eq!(layout.plus3dos_disk_type, Some(2));
+}
+
+#[test]
+fn a_plus3_disk_in_an_amstrad_cpc_folder_is_reported_ambiguous_not_forced() {
+    let fixture = Fixture::new("dsk-plus3-cpc-folder");
+    let path = fixture.write("library/game.dsk", &plus3_cf2_disk());
+    let evidence = fixture.inspect_in_folder(&path, "Amstrad CPC");
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumPlus3Disk));
+    assert_eq!(evidence.confidence, DetectionConfidence::Ambiguous);
+    assert!(!evidence.conclusive);
+}
+
+#[test]
+fn dsk_truncated_into_its_track_data_is_a_geometry_mismatch() {
+    let fixture = Fixture::new("dsk-truncated");
+    let mut image = cpc_data_disk();
+    image.truncate(image.len() - 4096);
+    let path = fixture.write("library/game.dsk", &image);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+}
+
+#[test]
+fn dsk_random_bytes_and_zip_are_refused() {
+    let fixture = Fixture::new("dsk-random");
+    let path = fixture.write("library/game.dsk", &vec![0x5Au8; 8192]);
+    assert_eq!(fixture.inspect(&path).format, None);
+
+    let mut zip = vec![0u8; 8192];
+    zip[..4].copy_from_slice(b"PK\x03\x04");
+    let path = fixture.write("library/z.dsk", &zip);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn dsk_absurd_geometry_is_refused_without_huge_allocation() {
+    let fixture = Fixture::new("dsk-absurd");
+    let mut info = vec![0u8; DSK_INFO];
+    info[..8].copy_from_slice(b"MV - CPC");
+    info[0x30] = 255; // 255 tracks
+    info[0x31] = 2;
+    info[0x32..0x34].copy_from_slice(&0xFFFFu16.to_le_bytes()); // 64KB tracks
+    // File is tiny; the declared geometry cannot possibly fit.
+    let path = fixture.write("library/evil.dsk", &info);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert!(evidence.refusal.is_some());
+    assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
+}
+
+#[test]
+fn dsk_detection_reaches_platform_detection_for_a_plus3_disk_only() {
+    let fixture = Fixture::new("dsk-platform");
+    // A +3 disk resolves to ZX Spectrum through the shared structural layer.
+    let plus3 = fixture.write("library/unsorted/game.dsk", &plus3_cf2_disk());
+    let report = detect_platform_report(
+        &DetectionRequest::new(&plus3, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted()),
+    );
+    assert_eq!(report.platform, Some("ZX Spectrum"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+
+    // A generic CPC data disk does not force any platform.
+    let cpc = fixture.write("library/unsorted/data.dsk", &cpc_data_disk());
+    let report = detect_platform_report(
+        &DetectionRequest::new(&cpc, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted()),
+    );
+    assert_ne!(report.platform, Some("ZX Spectrum"));
 }

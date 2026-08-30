@@ -475,6 +475,7 @@ fn content_label(content: ContentKind) -> &'static str {
         ContentKind::AmigaImage => "Amiga image",
         ContentKind::ComputerDisk => "Computer disk image",
         ContentKind::TapeImage => "Cassette/tape image",
+        ContentKind::MachineSnapshot => "Machine snapshot",
         ContentKind::WhdloadInstall => "WHDLoad install",
         ContentKind::ExtractedGameFolder => "Game folder",
     }

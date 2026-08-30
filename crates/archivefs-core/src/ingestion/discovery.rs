@@ -183,6 +183,8 @@ pub struct DiscoveryStats {
     pub disc_images: usize,
     pub amiga_images: usize,
     pub computer_disks: usize,
+    /// Machine-state snapshots (`.z80`, `.sna`, `.szx`, ...).
+    pub snapshots: usize,
     pub game_folders: usize,
     pub unknown: usize,
 }
@@ -196,6 +198,7 @@ impl DiscoveryStats {
         self.disc_images += other.disc_images;
         self.amiga_images += other.amiga_images;
         self.computer_disks += other.computer_disks;
+        self.snapshots += other.snapshots;
         self.game_folders += other.game_folders;
         self.unknown += other.unknown;
     }
@@ -212,6 +215,7 @@ impl DiscoveryStats {
             Some(ContentKind::ComputerDisk) | Some(ContentKind::TapeImage) => {
                 self.computer_disks += 1
             }
+            Some(ContentKind::MachineSnapshot) => self.snapshots += 1,
             Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
                 self.game_folders += 1
             }
@@ -568,6 +572,12 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
     if matches!(extension.as_str(), "hdf" | "hdfx") {
         return discover_ambiguous_disk_image(path, source_root);
     }
+    if matches!(extension.as_str(), "z80" | "sna" | "szx") {
+        return discover_spectrum_snapshot(path, source_root);
+    }
+    if extension == "dsk" {
+        return discover_dsk_image(path, source_root);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -809,6 +819,142 @@ fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> Ga
         reason,
         explanation,
     )
+}
+
+/// `.z80` / `.sna` / `.szx` are ZX Spectrum machine snapshots. The category
+/// is known from the extension; the Sinclair family and any machine subtype
+/// come only from parsing the bytes via
+/// [`crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file`]. A file
+/// that merely ends in one of these extensions never reaches
+/// [`ValidationState::Accepted`] here without that structural proof, and a
+/// snapshot never yields a unique game identity.
+fn discover_spectrum_snapshot(path: &Path, source_root: &Path) -> GameDiscovery {
+    match crate::zx_spectrum_snapshot::inspect_spectrum_snapshot_file(path) {
+        Ok(inspection) => {
+            let machine = inspection
+                .machine()
+                .map(|machine| machine.label().to_string());
+            let subtype = if inspection.machine_subtype_is_encoded() {
+                machine.clone().unwrap_or_else(|| "unknown".to_string())
+            } else {
+                machine
+                    .clone()
+                    .map(|label| format!("{label} (implied by the snapshot form, not encoded)"))
+                    .unwrap_or_else(|| "machine subtype not encoded".to_string())
+            };
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::MachineSnapshot),
+                // The snapshot structure is authoritative for the Sinclair
+                // platform family, ahead of any filename signal.
+                platform_hint: Some(
+                    crate::zx_spectrum_snapshot::SpectrumMachine::PLATFORM.to_string(),
+                ),
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation: format!(
+                    "{} - {subtype}. Structural platform/media evidence only; exact game \
+                     identity still needs a DAT/catalogue match.",
+                    inspection.facts.format.label()
+                ),
+                skip_reason: None,
+            }
+        }
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::MachineSnapshot),
+            SkipReason::InvalidContent(format!("{error}")),
+            format!(
+                "This file is named like a ZX Spectrum snapshot but its contents did not \
+                 validate as one: {error}."
+            ),
+        ),
+    }
+}
+
+/// `.dsk` is a CPCEMU container shared by the Amstrad CPC, ZX Spectrum +3 and
+/// Amstrad PCW. It is resolved from contents through the shared structural
+/// disk layer ([`crate::disk_format::inspect_disk_format`]):
+///
+/// 1. a valid `+3DOS`/PCW disk specification on track 0 -> accepted as a
+///    ZX Spectrum disk;
+/// 2. a valid bare CPCEMU container with a platform otherwise identified
+///    (folder alias) -> accepted under that platform as a computer disk;
+/// 3. a valid bare container with nothing else -> stays ambiguous
+///    ([`SkipReason::RecognizedContentNoIdentityMatch`]), never forced to a
+///    platform;
+/// 4. not a valid container -> refused.
+fn discover_dsk_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let explanation = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "CPCEMU .dsk container".to_string());
+
+    match evidence.format {
+        Some(DiskFormat::SpectrumPlus3Disk) => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::ComputerDisk),
+            platform_hint: Some("ZX Spectrum".to_string()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: format!("ZX Spectrum +3 disk. {explanation}."),
+            skip_reason: None,
+        },
+        Some(DiskFormat::CpcEmuDsk) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Computer disk image (CPCEMU .dsk container; shared by CPC / +3 / PCW, \
+                         platform identified from other evidence). {explanation}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid CPCEMU .dsk container, but it is shared by the Amstrad CPC, \
+                         ZX Spectrum +3 and Amstrad PCW and nothing else identifies which. \
+                         {explanation}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised CPCEMU .dsk container".to_string()),
+            ),
+            "This .dsk file is not a readable CPCEMU disk container.".to_string(),
+        ),
+    }
 }
 
 fn identity_for(path: &Path, source_root: &Path) -> Option<IdentitySummary> {

@@ -326,6 +326,13 @@ pub mod ngp_header_evidence;
 /// evidence, including an opt-in whole-ROM checksum verifier.
 pub mod ws_header_evidence;
 
+/// Pure, read-only structural parsing of ZX Spectrum machine snapshots
+/// (`.z80` v1/v2/v3, `.sna` 48K/128K, `.szx`) into content/structural
+/// evidence - a valid container, a supported Sinclair family, and a machine
+/// subtype only where the format genuinely encodes one. Never a game
+/// identity.
+pub mod zx_spectrum_snapshot;
+
 /// Evidence *scope*: whether an observed content fact could ever
 /// discriminate between platforms (Generic/Family/PlatformSpecific) -
 /// deliberately a separate axis from

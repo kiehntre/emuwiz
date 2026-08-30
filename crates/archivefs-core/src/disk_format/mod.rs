@@ -49,6 +49,7 @@ use crate::safe_read::{SafeFile, TrustedRoots, open_bounded_read};
 
 pub mod atari_st;
 pub mod atari_stx;
+pub mod dsk;
 
 #[cfg(test)]
 mod tests;
@@ -88,6 +89,19 @@ pub const FLOPPY_SECTOR_BYTES: u32 = 512;
 /// already beyond any real Atari ST disk.
 pub const MAX_PASTI_TRACK_RECORDS: usize = 168;
 
+/// The largest file this module will treat as a CPCEMU `.dsk` image. A
+/// double-sided 80-track extended disk with oversized tracks is comfortably
+/// under this; anything larger is not a floppy image.
+pub const MAX_DSK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most `track x side` entries a `.dsk` header may declare. 85 tracks on
+/// two sides is already past any real drive.
+pub const MAX_DSK_TRACK_ENTRIES: usize = 170;
+
+/// The fixed size of a `.dsk` disk-information block and of each track-
+/// information block.
+pub const DSK_INFO_BLOCK_BYTES: usize = 256;
+
 /// Which structural format was recognised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +111,18 @@ pub enum DiskFormat {
     AtariStRawFloppy,
     /// The Pasti (`.stx`) preservation container.
     AtariStPasti,
+    /// A CPCEMU `.dsk` container (standard or extended), recognised from its
+    /// `MV - CPC`/`EXTENDED CPC DSK` disk-information block and a track table
+    /// that is internally consistent with the file's length. This container
+    /// is shared by the Amstrad CPC, ZX Spectrum +3, Amstrad PCW and other
+    /// systems, so on its own it does **not** settle a platform.
+    CpcEmuDsk,
+    /// A CPCEMU `.dsk` container whose track 0 additionally carries a valid
+    /// `+3DOS`/`PCW` disk-specification block (disk type, geometry and
+    /// reserved fields all consistent, and agreeing with the container's own
+    /// track descriptors). That structure is specific to the Spectrum +3 /
+    /// PCW disk family; Amstrad CPC AMSDOS disks do not carry it.
+    SpectrumPlus3Disk,
 }
 
 impl DiskFormat {
@@ -104,6 +130,8 @@ impl DiskFormat {
         match self {
             Self::AtariStRawFloppy => "Atari ST raw floppy image",
             Self::AtariStPasti => "Atari ST Pasti (STX) image",
+            Self::CpcEmuDsk => "CPCEMU DSK disk image",
+            Self::SpectrumPlus3Disk => "ZX Spectrum +3 (+3DOS) disk image",
         }
     }
 
@@ -111,6 +139,11 @@ impl DiskFormat {
     pub fn platform(self) -> &'static str {
         match self {
             Self::AtariStRawFloppy | Self::AtariStPasti => "AtariST",
+            // The bare CPCEMU container narrows towards Amstrad CPC (its
+            // authoring system and dominant use) without settling it - see
+            // `proves_platform`, which is `false` here.
+            Self::CpcEmuDsk => "Amstrad CPC",
+            Self::SpectrumPlus3Disk => "ZX Spectrum",
         }
     }
 
@@ -120,10 +153,16 @@ impl DiskFormat {
     /// structure a PC DOS floppy of the same geometry carries, so the structure
     /// narrows the answer without settling it. `true` for Pasti, which exists
     /// only for Atari ST media.
+    ///
+    /// `false` for a bare CPCEMU `.dsk`: the container is shared across the
+    /// CPC, Spectrum +3 and PCW families, so a valid one narrows without
+    /// settling. `true` for a `.dsk` carrying a valid +3DOS/PCW disk
+    /// specification - that structure is specific to that disk family and
+    /// AMSDOS/CPC disks do not have it.
     pub fn proves_platform(self) -> bool {
         match self {
-            Self::AtariStRawFloppy => false,
-            Self::AtariStPasti => true,
+            Self::AtariStRawFloppy | Self::CpcEmuDsk => false,
+            Self::AtariStPasti | Self::SpectrumPlus3Disk => true,
         }
     }
 }
@@ -254,6 +293,30 @@ pub struct PastiLayout {
     pub declared_sectors: u32,
 }
 
+/// What one CPCEMU `.dsk` declared and what was walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DskLayout {
+    /// `true` for an `EXTENDED CPC DSK` container, `false` for the standard
+    /// `MV - CPC` one.
+    pub extended: bool,
+    pub declared_tracks: u8,
+    pub declared_sides: u8,
+    /// Track-information blocks actually walked and found internally
+    /// consistent with the file's length.
+    pub validated_tracks: usize,
+    /// Sectors the validated track descriptors declare between them.
+    pub declared_sectors: u32,
+    /// `true` when track 0 carries a valid `+3DOS`/`PCW` disk-specification
+    /// block. Never `true` for a CPC AMSDOS disk.
+    pub plus3dos_disk_spec: bool,
+    /// The disk-type byte from that specification, when present (0 / 3 =
+    /// Spectrum +3 / PCW family, 1 / 2 = Amstrad CPC family).
+    pub plus3dos_disk_type: Option<u8>,
+    /// `true` when the first sector's whole-sector checksum marks it a
+    /// bootable Spectrum +3 disk (sum of the 512 bytes mod 256 == 3).
+    pub plus3_bootable: bool,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -261,6 +324,7 @@ pub struct PastiLayout {
 pub enum DiskFormatMetadata {
     Floppy(FloppyGeometry),
     Pasti(PastiLayout),
+    Dsk(DskLayout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -362,6 +426,7 @@ pub fn inspect_disk_format(
     let adapter = match extension.as_str() {
         "st" => Adapter::AtariStRawFloppy,
         "stx" => Adapter::AtariStPasti,
+        "dsk" => Adapter::CpcEmuDsk,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -383,6 +448,7 @@ pub fn inspect_disk_format(
     let mut evidence = match adapter {
         Adapter::AtariStRawFloppy => atari_st::inspect(&mut reader, context, cancel),
         Adapter::AtariStPasti => atari_stx::inspect(&mut reader, context, cancel),
+        Adapter::CpcEmuDsk => dsk::inspect(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -397,6 +463,7 @@ pub fn inspect_disk_format(
 enum Adapter {
     AtariStRawFloppy,
     AtariStPasti,
+    CpcEmuDsk,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

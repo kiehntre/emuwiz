@@ -33,6 +33,11 @@ pub enum ContentKind {
     /// platform: `.tap` and `.tzx` are shared by several 8-bit families and
     /// `.cdt` needs separate platform evidence too.
     TapeImage,
+    /// A machine-state snapshot (`.z80`, `.sna`, `.szx`, ...): a frozen
+    /// memory + register dump rather than a ROM, disc or tape. Category
+    /// only - the Sinclair family it belongs to comes from parsing the
+    /// bytes, not from this table.
+    MachineSnapshot,
     /// A folder that is itself a WHDLoad installation (contains a
     /// `.slave` file), not a folder to recurse into.
     WhdloadInstall,
@@ -52,6 +57,7 @@ impl ContentKind {
             Self::AmigaImage => "Amiga image",
             Self::ComputerDisk => "Computer disk image",
             Self::TapeImage => "Cassette/tape image",
+            Self::MachineSnapshot => "Machine snapshot",
             Self::WhdloadInstall => "WHDLoad install",
             Self::ExtractedGameFolder => "Game folder",
         }
@@ -121,6 +127,15 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("cdt", ContentKind::TapeImage),
     cf("tap", ContentKind::TapeImage),
     cf("tzx", ContentKind::TapeImage),
+    // --- Sinclair-family machine snapshots ---
+    // The category is knowable from the extension; the machine family is not,
+    // and is confirmed by `crate::zx_spectrum_snapshot` parsing the bytes in
+    // `super::discovery::discover_direct_file`. `.szx` is included because it
+    // has a self-identifying `ZXST` header; `.trd`/`.scl` (TR-DOS disks) are
+    // deliberately still absent pending a filesystem-level parser.
+    cf("z80", ContentKind::MachineSnapshot),
+    cf("sna", ContentKind::MachineSnapshot),
+    cf("szx", ContentKind::MachineSnapshot),
 ];
 
 const fn cf(extension: &'static str, kind: ContentKind) -> ContentFormat {
