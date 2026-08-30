@@ -189,6 +189,11 @@ pub struct DiscoveryStats {
     pub computer_disks: usize,
     /// Machine-state snapshots (`.z80`, `.sna`, `.szx`, ...).
     pub snapshots: usize,
+    /// Loose executables (`.exe`) with a structurally valid DOS MZ header.
+    /// Counted as a distinct category because a bare executable is
+    /// recognised structurally but is not, on its own, an identifiable
+    /// game.
+    pub executables: usize,
     pub game_folders: usize,
     pub unknown: usize,
 }
@@ -203,6 +208,7 @@ impl DiscoveryStats {
         self.amiga_images += other.amiga_images;
         self.computer_disks += other.computer_disks;
         self.snapshots += other.snapshots;
+        self.executables += other.executables;
         self.game_folders += other.game_folders;
         self.unknown += other.unknown;
     }
@@ -220,7 +226,8 @@ impl DiscoveryStats {
                 self.computer_disks += 1
             }
             Some(ContentKind::MachineSnapshot) => self.snapshots += 1,
-            Some(ContentKind::Archive) | Some(ContentKind::Executable) => self.archives += 1,
+            Some(ContentKind::Executable) => self.executables += 1,
+            Some(ContentKind::Archive) => self.archives += 1,
             Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
                 self.game_folders += 1
             }
@@ -712,6 +719,9 @@ fn discover_direct_file(
     }
     if matches!(extension.as_str(), "img" | "ima") {
         return discover_dos_boot_media(path, source_root);
+    }
+    if extension == "exe" {
+        return discover_dos_executable(path, source_root);
     }
 
     let Some(content) = content_kind_for_extension(&extension) else {
@@ -1778,6 +1788,105 @@ fn discover_dos_boot_media(path: &Path, source_root: &Path) -> GameDiscovery {
              DAT/catalogue match. {detail}."
         ),
         skip_reason: None,
+    }
+}
+
+/// `.exe` is a DOS MZ / Windows-era executable container. It is registered
+/// as [`ContentKind::Executable`] so it is a first-class discovery item and
+/// its header reaches structural inspection
+/// ([`crate::executable_signatures::parse_mz_header`]), but the extension is
+/// weak/generic and a bare MZ header never resolves DOS:
+///
+/// 1. no readable MZ header -> refused (`InvalidContent`);
+/// 2. a structurally valid MZ header, with a platform already identified by
+///    independent evidence (a DOS folder alias, a `dosbox.conf` layout, ...)
+///    -> accepted under that platform, the MZ structure corroborating it;
+/// 3. a valid MZ header with nothing else identifying a platform -> visible
+///    but [`SkipReason::RecognizedContentNoIdentityMatch`]: `MZ` alone is
+///    shared by DOS and every Windows-era executable.
+fn discover_dos_executable(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::executable_signatures::parse_mz_header;
+
+    const MZ_PROBE_BYTES: usize = 512;
+
+    let header = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .ok()
+        .and_then(|mut file| {
+            let file_len = file.len();
+            let want = (file_len as usize).min(MZ_PROBE_BYTES);
+            if want == 0 {
+                return None;
+            }
+            file.read_exact_at(0, want, MZ_PROBE_BYTES)
+                .map(|bytes| (bytes, file_len))
+        });
+
+    let Some((bytes, file_len)) = header else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent("empty file or unreadable header".to_string()),
+            "This .exe file is empty or its header could not be read.".to_string(),
+        );
+    };
+
+    let Some(fact) = parse_mz_header(&bytes, Some(file_len)) else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Executable),
+            SkipReason::InvalidContent("no valid DOS MZ executable header".to_string()),
+            "This file is named .exe but has no valid DOS MZ executable header.".to_string(),
+        );
+    };
+
+    let stub_note = if fact.has_extended_header_pointer {
+        " It carries an NE/PE/LE extended-header pointer (a Windows-era executable with an MZ \
+         stub); only the MZ stub was inspected."
+    } else {
+        ""
+    };
+
+    let identity = identity_for(path, source_root);
+    let identified_platform = identity
+        .as_ref()
+        .and_then(|summary| summary.platform.clone());
+
+    match identified_platform {
+        Some(platform) => {
+            let corroboration = if platform == "DOS" {
+                " The MZ executable structure corroborates the DOS identification from other \
+                 evidence."
+            } else {
+                ""
+            };
+            accepted(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::Executable,
+                identity,
+                format!(
+                    "Executable ({platform} identified from other evidence; \
+                     valid DOS MZ header, load module {} bytes).{corroboration}{stub_note}",
+                    fact.load_module_bytes
+                ),
+            )
+        }
+        None => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::Executable),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "Valid DOS MZ executable, but a bare MZ header is shared by DOS and every \
+                 Windows-era executable, and nothing else identifies the platform or game. \
+                 MZ structure alone is not DOS evidence.{stub_note}"
+            ),
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        },
     }
 }
 

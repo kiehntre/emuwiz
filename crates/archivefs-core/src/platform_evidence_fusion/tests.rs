@@ -254,6 +254,29 @@ fn dos_system_file_pair_below_strong_confidence_does_not_resolve() {
 }
 
 #[test]
+fn a_bare_mz_signature_never_resolves_dos_or_anything() {
+    let explanation = fuse_platform_evidence([weak(ContentSignature, "MZ")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+    assert_ne!(explanation.resolved_platform, Some("DOS"));
+    assert!(explanation.fired_candidates.is_empty());
+}
+
+#[test]
+fn an_mz_signature_alongside_a_dos_boot_pair_does_not_block_dos_resolution() {
+    // MZ is Weak/Generic - it must neither resolve DOS on its own nor
+    // prevent the independently-strong DOS boot-file pair from resolving.
+    let explanation = fuse_platform_evidence([
+        weak(ContentSignature, "MZ"),
+        strong(
+            BootStructure,
+            crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+        ),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("DOS"));
+}
+
+#[test]
 fn a_bare_command_com_string_is_not_a_dos_rule_leg() {
     // COMMAND.COM ships with every DOS and is corroboration only - no rule
     // keys off it.

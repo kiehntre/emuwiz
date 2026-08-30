@@ -1581,3 +1581,103 @@ fn random_bytes_named_img_fail_closed_in_discovery() {
         Some(SkipReason::InvalidContent(_))
     ));
 }
+
+// --- DOS MZ executables (.exe) ----------------------------------------
+
+/// A minimal, structurally valid DOS MZ executable header, padded to
+/// `total` bytes. `lfanew` non-zero adds a Windows-style NE/PE stub
+/// pointer at 0x3C.
+fn mz_exe(total: usize, lfanew: u32) -> Vec<u8> {
+    let mut data = vec![0u8; total.max(0x40)];
+    data[0x00..0x02].copy_from_slice(b"MZ");
+    data[0x02..0x04].copy_from_slice(&0u16.to_le_bytes()); // last page full
+    data[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // 1 page
+    data[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // no relocations
+    data[0x08..0x0A].copy_from_slice(&2u16.to_le_bytes()); // 2 paragraphs
+    data[0x0C..0x0E].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    data[0x18..0x1A].copy_from_slice(&0x1Cu16.to_le_bytes());
+    if lfanew != 0 {
+        data[0x3C..0x40].copy_from_slice(&lfanew.to_le_bytes());
+    }
+    data
+}
+
+#[test]
+fn a_bare_valid_exe_in_an_unaliased_folder_stays_platform_unresolved() {
+    let dir = source_dir("exe-bare");
+    std::fs::write(dir.path().join("SETUP.EXE"), mz_exe(512, 0)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+    assert!(item.explanation.contains("not DOS evidence"));
+    assert_eq!(report.stats.executables, 1);
+}
+
+#[test]
+fn a_valid_exe_in_a_dos_folder_keeps_the_dos_resolution() {
+    let dir = source_dir("exe-dos-folder");
+    let dos = dir.path().join("dos");
+    std::fs::create_dir_all(&dos).unwrap();
+    std::fs::write(dos.join("GAME.EXE"), mz_exe(1024, 0)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("DOS"));
+    assert!(item.explanation.contains("corroborates"));
+}
+
+#[test]
+fn a_windows_style_mz_stub_does_not_become_dos_on_its_own() {
+    let dir = source_dir("exe-pe-stub");
+    std::fs::write(dir.path().join("WINAPP.EXE"), mz_exe(4096, 0x80)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(item.explanation.contains("extended-header pointer"));
+}
+
+#[test]
+fn an_exe_filename_containing_dos_is_irrelevant() {
+    let dir = source_dir("exe-dos-name");
+    std::fs::write(dir.path().join("MEGA-DOS-PACK.EXE"), mz_exe(512, 0)).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+}
+
+#[test]
+fn random_bytes_named_exe_fail_closed() {
+    let dir = source_dir("exe-noise");
+    std::fs::write(dir.path().join("mystery.exe"), vec![0x33u8; 4096]).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::Executable));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert_eq!(item.platform_hint, None);
+}
+
+#[test]
+fn a_truncated_mz_header_named_exe_is_refused() {
+    let dir = source_dir("exe-trunc");
+    std::fs::write(dir.path().join("cut.exe"), &mz_exe(512, 0)[..10]).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}

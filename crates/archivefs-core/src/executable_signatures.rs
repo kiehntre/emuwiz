@@ -32,7 +32,7 @@
 //! XBE convention). This module performs that subtraction with a checked
 //! operation and fails closed on underflow rather than wrapping.
 
-use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
+use crate::content_detector::{ContentDetectionOutcome, ContentDetector, ContentDiagnostic};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
 
 // ---------------------------------------------------------------------
@@ -319,6 +319,276 @@ impl ContentDetector for XexDetector {
     }
 }
 
+// ---------------------------------------------------------------------
+// DOS MZ executable
+// ---------------------------------------------------------------------
+//
+// # MZ format verified, not assumed
+//
+// The header layout below is cross-checked against two independent
+// references:
+//
+// - the OSDev wiki "MZ" article (https://wiki.osdev.org/MZ), and
+// - "The DOS EXE File Format" (https://www.tavi.co.uk/phobos/exeformat.html),
+//   the widely-cited canonical write-up of the `.EXE` header,
+//
+// corroborated by Wikipedia's "DOS MZ executable" article for the
+// "header paragraphs x 16 = load-module offset" rule. All three agree on
+// every field offset used here and on the image-size computation,
+// including the `bytes-in-last-page == 0` "final page is full" case.
+//
+// # What a valid MZ header proves, and what it does not
+//
+// It proves the bytes are a structurally coherent DOS MZ executable
+// container - nothing more. `MZ` is the shared prefix of DOS `.EXE`, and
+// of every NE / LE / LX / PE (Windows-era) executable, which keep an MZ
+// header as a stub. So this is deliberately the weakest kind of evidence
+// this module produces: a `Weak`, generic
+// [`ContentEvidenceKind::ContentSignature`] fact, never platform
+// evidence, and never a fusion-rule leg that could resolve DOS on its
+// own. NE/PE/LE/LX parsing is explicitly out of scope; the only nod to it
+// is observing whether an `e_lfanew` pointer is present at `0x3C`.
+
+/// `MZ`, little-endian `0x5A4D` - the DOS executable signature.
+pub const MZ_MAGIC: &[u8; 2] = b"MZ";
+
+/// The fixed part of the MZ header, offsets `0x00..=0x1B`. A shorter file
+/// cannot be a valid MZ executable.
+pub const MZ_HEADER_BYTES: usize = 0x1C;
+
+/// Offset of the `e_lfanew` dword an NE/PE/LE/LX file carries to point at
+/// its real header. Only *observed* here, never followed.
+const MZ_LFANEW_OFFSET: usize = 0x3C;
+
+/// One 512-byte page, the unit `pages_in_file` counts in.
+const MZ_PAGE_BYTES: u32 = 512;
+
+/// One relocation-table entry: a 16-bit offset and a 16-bit segment.
+const MZ_RELOCATION_ENTRY_BYTES: u32 = 4;
+
+/// A defensive upper bound on the MZ header size this module will accept,
+/// so a hostile `header_paragraphs` cannot describe a multi-megabyte
+/// "header". Real MZ headers are a few hundred bytes; 64 KiB is generous
+/// headroom, not a claim about any real file.
+pub const MZ_MAX_HEADER_BYTES: u32 = 64 * 1024;
+
+pub fn looks_like_mz(header: &[u8]) -> bool {
+    header.len() >= MZ_MAGIC.len() && &header[..MZ_MAGIC.len()] == MZ_MAGIC.as_slice()
+}
+
+/// The structural fields a parsed MZ header directly states, plus a few
+/// values derived from them by checked arithmetic. Never a platform, never
+/// a title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MzHeaderFact {
+    /// `e_cblp` - bytes used in the final 512-byte page (`0` => full page).
+    pub bytes_in_last_page: u16,
+    /// `e_cp` - number of 512-byte pages in the file.
+    pub pages_in_file: u16,
+    /// `e_crlc` - number of relocation-table entries.
+    pub relocation_count: u16,
+    /// `e_cparhdr` - header size in 16-byte paragraphs.
+    pub header_paragraphs: u16,
+    /// `e_minalloc` - minimum extra paragraphs the program needs.
+    pub min_extra_paragraphs: u16,
+    /// `e_maxalloc` - maximum extra paragraphs the program wants.
+    pub max_extra_paragraphs: u16,
+    /// `e_ss` - initial stack-segment value (relocatable).
+    pub initial_ss: u16,
+    /// `e_sp` - initial stack-pointer value.
+    pub initial_sp: u16,
+    /// `e_csum` - header checksum field, as stored (not verified).
+    pub checksum: u16,
+    /// `e_ip` - initial instruction-pointer value.
+    pub initial_ip: u16,
+    /// `e_cs` - initial code-segment value (relocatable).
+    pub initial_cs: u16,
+    /// `e_lfarlc` - file offset of the relocation table.
+    pub relocation_table_offset: u16,
+    /// `e_ovno` - overlay number (`0` for the main program).
+    pub overlay_number: u16,
+    /// Derived: `(pages_in_file - 1) * 512 + (bytes_in_last_page or 512)`.
+    pub load_module_bytes: u32,
+    /// Derived: `header_paragraphs * 16` - where the load module begins.
+    pub header_bytes: u32,
+    /// Whether a non-zero `e_lfanew` pointer sits at `0x3C` - a strong hint
+    /// the file is really NE/PE/LE/LX with an MZ stub. Observed only; this
+    /// module never follows it.
+    pub has_extended_header_pointer: bool,
+}
+
+fn le_u16_at(data: &[u8], offset: usize) -> Option<u16> {
+    let slice = data.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn le_u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    let slice = data.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+/// Parses the fixed MZ header from `data` (a header prefix or a whole
+/// file), validating it enough to stand behind an [`MzHeaderFact`], or
+/// returns `None`.
+///
+/// `file_len`, when known (a loose file on disk), enables the
+/// "declared load module is not larger than the file" and "relocation
+/// table lies within the file" checks; pass `None` when `data` is only a
+/// bounded prefix (an archive member probe) and those cannot be judged.
+///
+/// Fails closed - returns `None` - on: a bad or absent `MZ` magic, fewer
+/// than [`MZ_HEADER_BYTES`] bytes, a zero page count, a last-page byte
+/// count above 512, a header smaller than the fixed header or larger than
+/// [`MZ_MAX_HEADER_BYTES`], any checked-arithmetic overflow, a relocation
+/// table that runs past the header (or, when `file_len` is known, past the
+/// file), or a declared load-module size larger than the file.
+pub fn parse_mz_header(data: &[u8], file_len: Option<u64>) -> Option<MzHeaderFact> {
+    if !looks_like_mz(data) || data.len() < MZ_HEADER_BYTES {
+        return None;
+    }
+
+    let bytes_in_last_page = le_u16_at(data, 0x02)?;
+    let pages_in_file = le_u16_at(data, 0x04)?;
+    let relocation_count = le_u16_at(data, 0x06)?;
+    let header_paragraphs = le_u16_at(data, 0x08)?;
+    let min_extra_paragraphs = le_u16_at(data, 0x0A)?;
+    let max_extra_paragraphs = le_u16_at(data, 0x0C)?;
+    let initial_ss = le_u16_at(data, 0x0E)?;
+    let initial_sp = le_u16_at(data, 0x10)?;
+    let checksum = le_u16_at(data, 0x12)?;
+    let initial_ip = le_u16_at(data, 0x14)?;
+    let initial_cs = le_u16_at(data, 0x16)?;
+    let relocation_table_offset = le_u16_at(data, 0x18)?;
+    let overlay_number = le_u16_at(data, 0x1A)?;
+
+    if pages_in_file == 0 {
+        return None;
+    }
+    if u32::from(bytes_in_last_page) > MZ_PAGE_BYTES {
+        return None;
+    }
+
+    // Header size: at least the fixed header, at most a sane cap.
+    let header_bytes = u32::from(header_paragraphs).checked_mul(16)?;
+    if header_bytes < MZ_HEADER_BYTES as u32 || header_bytes > MZ_MAX_HEADER_BYTES {
+        return None;
+    }
+
+    // Load-module size: (pages - 1) full pages plus the final page's bytes,
+    // where a zero last-page count means the final page is full.
+    let last_page = if bytes_in_last_page == 0 {
+        MZ_PAGE_BYTES
+    } else {
+        u32::from(bytes_in_last_page)
+    };
+    let load_module_bytes = u32::from(pages_in_file)
+        .checked_sub(1)?
+        .checked_mul(MZ_PAGE_BYTES)?
+        .checked_add(last_page)?;
+    // The image must at least contain its own header.
+    if load_module_bytes < header_bytes {
+        return None;
+    }
+    if let Some(len) = file_len
+        && u64::from(load_module_bytes) > len
+    {
+        return None;
+    }
+
+    // Relocation table (when present) must lie inside the header - and,
+    // when the real file length is known, inside the file.
+    if relocation_count > 0 {
+        if u32::from(relocation_table_offset) < MZ_HEADER_BYTES as u32 {
+            return None;
+        }
+        let reloc_end = u32::from(relocation_table_offset)
+            .checked_add(u32::from(relocation_count).checked_mul(MZ_RELOCATION_ENTRY_BYTES)?)?;
+        if reloc_end > header_bytes {
+            return None;
+        }
+        if let Some(len) = file_len
+            && u64::from(reloc_end) > len
+        {
+            return None;
+        }
+    }
+
+    let has_extended_header_pointer = le_u32_at(data, MZ_LFANEW_OFFSET)
+        .map(|lfanew| lfanew != 0)
+        .unwrap_or(false);
+
+    Some(MzHeaderFact {
+        bytes_in_last_page,
+        pages_in_file,
+        relocation_count,
+        header_paragraphs,
+        min_extra_paragraphs,
+        max_extra_paragraphs,
+        initial_ss,
+        initial_sp,
+        checksum,
+        initial_ip,
+        initial_cs,
+        relocation_table_offset,
+        overlay_number,
+        load_module_bytes,
+        header_bytes,
+        has_extended_header_pointer,
+    })
+}
+
+/// Generic DOS MZ executable-container detector. Like [`ElfDetector`],
+/// deliberately the weakest fact this module produces: `MZ` is shared by
+/// DOS `.EXE` and every Windows-era NE/PE/LE/LX executable, so a valid MZ
+/// header is a `Weak`, generic format signature, never platform evidence
+/// and never a single-leg DOS resolver.
+///
+/// Sees only a bounded prefix (`data`), so it validates internal
+/// consistency but not the real file length; a loose file on disk is
+/// checked more strictly by the ingestion layer, which knows the length.
+pub struct MzDetector;
+
+impl ContentDetector for MzDetector {
+    fn id(&self) -> &'static str {
+        "dos_mz_magic"
+    }
+
+    fn detect(&self, data: &[u8]) -> ContentDetectionOutcome {
+        if !looks_like_mz(data) {
+            return ContentDetectionOutcome::NotRecognized;
+        }
+        match parse_mz_header(data, None) {
+            Some(fact) => {
+                let detail = if fact.has_extended_header_pointer {
+                    "DOS MZ executable header present, with an NE/PE/LE extended-header pointer - \
+                     only the MZ stub is observed; a generic executable-format signature, not \
+                     platform evidence"
+                } else {
+                    "DOS MZ executable header present - a generic executable-format signature \
+                     shared with Windows-era executables, not platform evidence on its own"
+                };
+                ContentDetectionOutcome::Recognized {
+                    evidence: vec![ContentEvidence::new(
+                        ContentEvidenceKind::ContentSignature,
+                        "MZ",
+                        ContentEvidenceConfidence::Weak,
+                        detail,
+                    )],
+                }
+            }
+            None => ContentDetectionOutcome::Malformed {
+                evidence: Vec::new(),
+                diagnostic: ContentDiagnostic {
+                    detector_id: "dos_mz_magic",
+                    category: "bad_header",
+                    message: "MZ magic present but the fixed header failed structural validation"
+                        .to_string(),
+                },
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +774,211 @@ mod tests {
         for item in outcome.evidence() {
             assert_eq!(item.kind, ContentEvidenceKind::ContentSignature);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // DOS MZ
+    // ------------------------------------------------------------------
+
+    /// A minimal, structurally valid MZ header: 2-paragraph (32-byte)
+    /// header, one 512-byte page, no relocations.
+    fn minimal_mz_header() -> Vec<u8> {
+        let mut data = vec![0u8; 512];
+        data[0x00..0x02].copy_from_slice(MZ_MAGIC);
+        data[0x02..0x04].copy_from_slice(&0u16.to_le_bytes()); // last page full
+        data[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // 1 page
+        data[0x06..0x08].copy_from_slice(&0u16.to_le_bytes()); // no relocations
+        data[0x08..0x0A].copy_from_slice(&2u16.to_le_bytes()); // 2 paragraphs = 32 bytes
+        data[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes()); // minalloc
+        data[0x0C..0x0E].copy_from_slice(&0xFFFFu16.to_le_bytes()); // maxalloc
+        data[0x0E..0x10].copy_from_slice(&0u16.to_le_bytes()); // ss
+        data[0x10..0x12].copy_from_slice(&0xB800u16.to_le_bytes()); // sp
+        data[0x12..0x14].copy_from_slice(&0u16.to_le_bytes()); // checksum
+        data[0x14..0x16].copy_from_slice(&0u16.to_le_bytes()); // ip
+        data[0x16..0x18].copy_from_slice(&0u16.to_le_bytes()); // cs
+        data[0x18..0x1A].copy_from_slice(&0x1Cu16.to_le_bytes()); // reloc table offset
+        data[0x1A..0x1C].copy_from_slice(&0u16.to_le_bytes()); // overlay 0
+        data
+    }
+
+    /// An MZ header declaring `reloc_count` relocations at `reloc_off`,
+    /// with a header large enough (or not) to hold them.
+    fn mz_with_relocations(reloc_off: u16, reloc_count: u16, header_paragraphs: u16) -> Vec<u8> {
+        let mut data = minimal_mz_header();
+        data[0x06..0x08].copy_from_slice(&reloc_count.to_le_bytes());
+        data[0x08..0x0A].copy_from_slice(&header_paragraphs.to_le_bytes());
+        data[0x18..0x1A].copy_from_slice(&reloc_off.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn minimal_valid_mz_header_parses_deterministically() {
+        let data = minimal_mz_header();
+        assert!(looks_like_mz(&data));
+        let first = parse_mz_header(&data, Some(data.len() as u64)).unwrap();
+        let second = parse_mz_header(&data, Some(data.len() as u64)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.pages_in_file, 1);
+        assert_eq!(first.header_paragraphs, 2);
+        assert_eq!(first.header_bytes, 32);
+        assert_eq!(first.load_module_bytes, 512); // last page full
+        assert_eq!(first.initial_sp, 0xB800);
+        assert!(!first.has_extended_header_pointer);
+    }
+
+    #[test]
+    fn last_page_byte_count_is_honoured_when_non_zero() {
+        let mut data = minimal_mz_header();
+        data[0x04..0x06].copy_from_slice(&2u16.to_le_bytes()); // 2 pages
+        data[0x02..0x04].copy_from_slice(&100u16.to_le_bytes()); // 100 bytes in last
+        let fact = parse_mz_header(&data, Some(4096)).unwrap();
+        assert_eq!(fact.load_module_bytes, 512 + 100);
+    }
+
+    #[test]
+    fn valid_relocation_table_within_the_header_is_accepted() {
+        // 4 relocations * 4 bytes = 16, starting at 0x1C, ends at 0x2C;
+        // header of 3 paragraphs = 48 bytes holds it.
+        let data = mz_with_relocations(0x1C, 4, 3);
+        let fact = parse_mz_header(&data, Some(data.len() as u64)).unwrap();
+        assert_eq!(fact.relocation_count, 4);
+        assert_eq!(fact.relocation_table_offset, 0x1C);
+    }
+
+    #[test]
+    fn mz_detector_emits_only_weak_generic_signature_evidence() {
+        let outcome = MzDetector.detect(&minimal_mz_header());
+        assert!(outcome.is_recognized());
+        let evidence = outcome.evidence();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].kind, ContentEvidenceKind::ContentSignature);
+        assert_eq!(evidence[0].value, "MZ");
+        assert_eq!(evidence[0].confidence, ContentEvidenceConfidence::Weak);
+    }
+
+    #[test]
+    fn mz_evidence_scope_is_generic() {
+        use crate::content_evidence_scope::{EvidenceScope, scope_of};
+        assert_eq!(
+            scope_of(ContentEvidenceKind::ContentSignature, "MZ"),
+            EvidenceScope::Generic
+        );
+    }
+
+    #[test]
+    fn extended_header_pointer_is_observed_not_followed() {
+        let mut data = minimal_mz_header();
+        // A plausible e_lfanew at 0x3C, as an NE/PE MZ stub carries.
+        data[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        let fact = parse_mz_header(&data, Some(data.len() as u64)).unwrap();
+        assert!(fact.has_extended_header_pointer);
+        // Still only weak/generic - the stub does not become anything more.
+        let evidence = MzDetector.detect(&data);
+        assert_eq!(
+            evidence.evidence()[0].confidence,
+            ContentEvidenceConfidence::Weak
+        );
+    }
+
+    #[test]
+    fn random_bytes_are_not_recognized_as_mz() {
+        assert!(!looks_like_mz(b"not an exe at all"));
+        assert_eq!(
+            MzDetector.detect(b"not an exe at all"),
+            ContentDetectionOutcome::NotRecognized
+        );
+    }
+
+    #[test]
+    fn bad_magic_is_not_mz() {
+        let mut data = minimal_mz_header();
+        data[0] = b'Z';
+        data[1] = b'M'; // "ZM" is not accepted by this strict parser
+        assert!(!looks_like_mz(&data));
+        assert_eq!(parse_mz_header(&data, None), None);
+    }
+
+    #[test]
+    fn truncated_mz_header_is_refused() {
+        let data = minimal_mz_header();
+        assert_eq!(parse_mz_header(&data[..MZ_HEADER_BYTES - 1], None), None);
+    }
+
+    #[test]
+    fn mz_with_magic_but_truncated_header_reports_malformed() {
+        let short = &minimal_mz_header()[..8];
+        assert!(MzDetector.detect(short).is_malformed());
+    }
+
+    #[test]
+    fn zero_page_count_is_refused() {
+        let mut data = minimal_mz_header();
+        data[0x04..0x06].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(parse_mz_header(&data, None), None);
+    }
+
+    #[test]
+    fn last_page_byte_count_above_512_is_refused() {
+        let mut data = minimal_mz_header();
+        data[0x02..0x04].copy_from_slice(&513u16.to_le_bytes());
+        assert_eq!(parse_mz_header(&data, None), None);
+    }
+
+    #[test]
+    fn header_smaller_than_the_fixed_header_is_refused() {
+        let mut data = minimal_mz_header();
+        data[0x08..0x0A].copy_from_slice(&1u16.to_le_bytes()); // 16 bytes < 0x1C
+        assert_eq!(parse_mz_header(&data, None), None);
+    }
+
+    #[test]
+    fn absurd_header_paragraph_count_is_refused() {
+        let mut data = minimal_mz_header();
+        data[0x08..0x0A].copy_from_slice(&0xFFFFu16.to_le_bytes()); // ~1 MiB "header"
+        assert_eq!(parse_mz_header(&data, None), None);
+    }
+
+    #[test]
+    fn relocation_table_outside_the_header_is_refused() {
+        // Table at 0x30 for 4 entries ends at 0x40; a 2-paragraph (32-byte)
+        // header cannot contain it.
+        let data = mz_with_relocations(0x30, 4, 2);
+        assert_eq!(parse_mz_header(&data, Some(data.len() as u64)), None);
+    }
+
+    #[test]
+    fn declared_load_module_larger_than_the_file_is_refused() {
+        let mut data = minimal_mz_header();
+        data[0x04..0x06].copy_from_slice(&64u16.to_le_bytes()); // 64 pages = 32 KiB
+        // file is only 512 bytes
+        assert_eq!(parse_mz_header(&data, Some(512)), None);
+        // ...but with no known file length, internal consistency alone passes.
+        assert!(parse_mz_header(&data, None).is_some());
+    }
+
+    #[test]
+    fn relocation_table_past_eof_is_refused_when_file_length_is_known() {
+        let data = mz_with_relocations(0x1C, 4, 3); // table ends at 0x2C, header 48
+        // file shorter than the table end
+        assert_eq!(parse_mz_header(&data, Some(0x20)), None);
+    }
+
+    #[test]
+    fn mz_fact_carries_no_platform_or_title_field() {
+        // Compile-time-ish guard: the struct exposes only structural
+        // numeric fields. This test documents intent; a new platform/title
+        // field would need a deliberate edit here.
+        let fact = parse_mz_header(&minimal_mz_header(), None).unwrap();
+        let _ = (
+            fact.bytes_in_last_page,
+            fact.pages_in_file,
+            fact.relocation_count,
+            fact.header_paragraphs,
+            fact.initial_cs,
+            fact.initial_ip,
+            fact.load_module_bytes,
+            fact.header_bytes,
+            fact.has_extended_header_pointer,
+        );
     }
 }

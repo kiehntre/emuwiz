@@ -170,6 +170,9 @@ pub(crate) fn member_detectors() -> Vec<Box<dyn ContentDetector>> {
         Box::new(crate::atari7800_header_evidence::Atari7800HeaderDetector),
         Box::new(crate::lynx_header_evidence::LynxHeaderDetector),
         Box::new(crate::ngp_header_evidence::NgpHeaderDetector),
+        // Generic DOS MZ executable structure - Weak, non-platform
+        // evidence (an archived `.exe`); never resolves DOS on its own.
+        Box::new(crate::executable_signatures::MzDetector),
     ]
 }
 
