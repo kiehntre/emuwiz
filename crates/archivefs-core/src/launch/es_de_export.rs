@@ -175,6 +175,21 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_fullname: "Commodore Amiga",
     },
     EsDeSystemMapping {
+        platform_id: "Game Boy",
+        es_de_system: "gb",
+        es_de_fullname: "Nintendo Game Boy",
+    },
+    EsDeSystemMapping {
+        platform_id: "Game Boy Color",
+        es_de_system: "gbc",
+        es_de_fullname: "Nintendo Game Boy Color",
+    },
+    EsDeSystemMapping {
+        platform_id: "Game Boy Advance",
+        es_de_system: "gba",
+        es_de_fullname: "Nintendo Game Boy Advance",
+    },
+    EsDeSystemMapping {
         platform_id: "NES",
         es_de_system: "nes",
         es_de_fullname: "Nintendo Entertainment System",
@@ -190,6 +205,11 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         platform_id: "MegaDrive",
         es_de_system: "megadrive",
         es_de_fullname: "Sega Mega Drive",
+    },
+    EsDeSystemMapping {
+        platform_id: "N64",
+        es_de_system: "n64",
+        es_de_fullname: "Nintendo 64",
     },
 ];
 
@@ -448,9 +468,13 @@ mod tests {
             "Sega CD",
             "AtariST",
             "Amiga",
+            "Game Boy",
+            "Game Boy Color",
+            "Game Boy Advance",
             "NES",
             "SNES",
             "MegaDrive",
+            "N64",
         ] {
             assert!(
                 es_de_system_for_platform(platform_id).is_some(),
@@ -478,6 +502,34 @@ mod tests {
     fn megadrive_maps_to_megadrive_not_genesis() {
         let mapping = es_de_system_for_platform("MegaDrive").unwrap();
         assert_eq!(mapping.es_de_system, "megadrive");
+    }
+
+    #[test]
+    fn classic_nintendo_platforms_map_to_es_de_exactly() {
+        for (platform_id, system, fullname) in [
+            ("Game Boy", "gb", "Nintendo Game Boy"),
+            ("Game Boy Color", "gbc", "Nintendo Game Boy Color"),
+            ("Game Boy Advance", "gba", "Nintendo Game Boy Advance"),
+            ("N64", "n64", "Nintendo 64"),
+        ] {
+            let mapping = es_de_system_for_platform(platform_id)
+                .unwrap_or_else(|| panic!("missing ES-DE mapping for {platform_id}"));
+            assert_eq!(mapping.es_de_system, system);
+            assert_eq!(mapping.es_de_fullname, fullname);
+        }
+    }
+
+    #[test]
+    fn classic_nintendo_resolved_identity_produces_a_ready_entry() {
+        for platform_id in ["Game Boy", "Game Boy Color", "Game Boy Advance", "N64"] {
+            let outcome = build_es_de_entry_plan(&resolved(platform_id), &usable_content(), None);
+            let EsDeExportOutcome::Entry(plan) = outcome else {
+                panic!("expected an ES-DE entry for {platform_id}");
+            };
+            assert_eq!(plan.status, EsDeEntryStatus::Ready);
+            assert!(plan.path_usable);
+            assert!(plan.blockers.is_empty());
+        }
     }
 
     #[test]
