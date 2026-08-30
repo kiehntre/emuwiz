@@ -27,6 +27,7 @@
 
 use serde::Serialize;
 
+use super::arcade_dat_version::{ArcadeEmulatorDatReadiness, findings_from_arcade_dat_version};
 use super::environment::{
     FreeSpacePolicy, StorageAssessment, findings_from_free_space,
     findings_from_read_only_filesystems, not_checked_from_storage,
@@ -133,6 +134,11 @@ pub struct DoctorScanInputs<'a> {
     pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
     /// Bounded installation-form evidence gathered outside this pure runner.
     pub linux_emulator_installations: Gathered<&'a [LinuxEmulatorInstallationEvidence]>,
+    /// From `arcade_dat_version::arcade_dat_version_readiness` - advisory
+    /// MAME / FBNeo emulator-vs-DAT version compatibility, assembled outside
+    /// this pure runner from the installation evidence and configured arcade
+    /// DAT catalogue versions.
+    pub arcade_dat_version: Gathered<&'a [ArcadeEmulatorDatReadiness]>,
     /// From `profiles::assess_xemu_readiness`.
     pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
     /// From `profiles::assess_xenia_readiness`.
@@ -181,6 +187,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             linux_emulator_installations: Gathered::NotLoaded(
                 "Linux emulator installation evidence has not been gathered in this session.",
+            ),
+            arcade_dat_version: Gathered::NotLoaded(
+                "Arcade emulator / DAT version compatibility has not been assembled in this session.",
             ),
             xemu_readiness: Gathered::NotLoaded(
                 "xemu launch readiness has not been checked in this session.",
@@ -519,6 +528,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         |evidence: &&[LinuxEmulatorInstallationEvidence]| {
             findings_from_linux_emulator_installations(evidence)
         }
+    );
+    subsystem!(
+        inputs.arcade_dat_version,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&[ArcadeEmulatorDatReadiness]| { findings_from_arcade_dat_version(readiness) }
     );
     subsystem!(
         inputs.xemu_readiness,

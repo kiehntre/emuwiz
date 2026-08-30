@@ -167,6 +167,12 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
             &["xenia_canary", "xenia"][..],
             "com.xenia_project.Xenia",
         ),
+        ("MAME", &["mame"][..], "org.mamedev.MAME"),
+        (
+            "FinalBurn Neo",
+            &["fbneo", "fbn"][..],
+            "com.github.libretro.FBNeo",
+        ),
     ];
     let mut evidence = Vec::new();
     for (emulator, names, app_id) in definitions {

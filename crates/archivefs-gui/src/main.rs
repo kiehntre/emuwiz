@@ -1844,6 +1844,8 @@ struct DoctorGathered {
     storage: Gathered<StorageAssessment>,
     emulator_profiles: Gathered<ProfileAssessmentReport>,
     linux_emulator_installations: Gathered<Vec<LinuxEmulatorInstallationEvidence>>,
+    arcade_dat_version:
+        Gathered<Vec<archivefs_core::diagnostics::arcade_dat_version::ArcadeEmulatorDatReadiness>>,
     xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,
     xenia_readiness: Gathered<Vec<XeniaReadinessAssessment>>,
     ppsspp_readiness: Gathered<Vec<PpssppReadinessAssessment>>,
@@ -2104,7 +2106,20 @@ fn gather_doctor_inputs() -> DoctorGathered {
         Ok(discovery) => Gathered::Ready(assess_rpcs3_readiness(Some(discovery))),
         Err(error) => Gathered::Failed(error.clone()),
     };
-    let linux_emulator_installations = Gathered::Ready(discover_linux_emulator_installations());
+    let installations = discover_linux_emulator_installations();
+    // Advisory arcade emulator / DAT version compatibility. Assembled purely
+    // from the installation evidence just gathered; no emulator is executed
+    // and no DAT file is parsed here, so the DAT revision side stays
+    // `unknown` until a caller supplies a captured `mame -version` output
+    // and the configured arcade DAT `<version>` headers.
+    let arcade_dat_version = Gathered::Ready(
+        archivefs_core::diagnostics::arcade_dat_version::arcade_dat_version_readiness(
+            &installations,
+            &[],
+            &[],
+        ),
+    );
+    let linux_emulator_installations = Gathered::Ready(installations);
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -2153,6 +2168,7 @@ fn gather_doctor_inputs() -> DoctorGathered {
         ))),
         emulator_profiles: Gathered::Ready(profile_report),
         linux_emulator_installations,
+        arcade_dat_version,
         xemu_readiness,
         xenia_readiness,
         ppsspp_readiness,
@@ -5585,6 +5601,9 @@ impl ArchiveFsApp {
                             linux_emulator_installations: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            arcade_dat_version: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             xemu_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -5666,6 +5685,7 @@ impl ArchiveFsApp {
                 &gathered.linux_emulator_installations,
                 |value| value.as_slice(),
             ),
+            arcade_dat_version: borrowed(&gathered.arcade_dat_version, |value| value.as_slice()),
             xemu_readiness: borrowed(&gathered.xemu_readiness, |value| value.as_slice()),
             xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
             ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),

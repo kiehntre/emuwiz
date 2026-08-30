@@ -1717,15 +1717,14 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // recorded as unavailable rather than as passes.
     assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
     // Storage, filesystem mount state, emulator profiles, Linux installation
-    // evidence, xemu/Xenia/PPSSPP/
-    // RPCS3 launch readiness, managed entries and the verified-identity fact
-    // cache are not gathered by this
-    // test, so they must appear as unavailable alongside the snapshot,
-    // setup and RetroArch subsystems - never as passes. All four launch
-    // readiness checks share one (category, subsystem) tag but each carries
-    // different "not gathered" wording, so they count as four entries here,
-    // not one; the verified-identity cache shares that same tag and adds
-    // one more.
+    // evidence, arcade emulator/DAT version compatibility,
+    // xemu/Xenia/PPSSPP/RPCS3 launch readiness, managed entries, and the
+    // verified-identity fact cache are not gathered by this test, so they
+    // must appear as unavailable alongside the snapshot, setup and
+    // RetroArch subsystems - never as passes. All four launch readiness
+    // checks share one (category, subsystem) tag but each carries different
+    // "not gathered" wording, so they count as four entries here, not one;
+    // the verified-identity cache adds one more.
     assert_eq!(
         scan.unavailable_subsystems().len(),
         13,

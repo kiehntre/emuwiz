@@ -67,6 +67,7 @@ use crate::{
     SourceHealthIssue,
 };
 
+pub mod arcade_dat_version;
 pub mod environment;
 pub mod managed;
 pub mod profiles;

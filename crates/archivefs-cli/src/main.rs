@@ -4822,6 +4822,12 @@ fn gather_doctor_scan() -> DoctorScan {
         linux_emulator_installations: Gathered::NotLoaded(
             "Linux emulator installation evidence has not been gathered in this CLI session.",
         ),
+        // Arcade emulator / DAT version compatibility is assembled from that
+        // installation evidence, so it is likewise not gathered by the
+        // diagnostics-only CLI Doctor scan.
+        arcade_dat_version: Gathered::NotLoaded(
+            "Arcade emulator / DAT version compatibility has not been assembled in this CLI session.",
+        ),
         // Emulator launch-readiness assessment walks discovered install
         // directories, which is a scan. Doctor never starts one from the
         // CLI (the same reason RetroArch discovery above is NotLoaded).
