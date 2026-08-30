@@ -1480,17 +1480,19 @@ fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
 
 /// Test 45: this milestone (Atari ST/STX detection) adds no migration of
 /// its own. The migration list is still pinned exactly, so an *unrelated*
-/// future change that quietly adds one here is still caught; migration
-/// 0007 (`migrations/0007_discovery_details.sql`) is already accounted for
-/// as a legitimately accepted, unrelated addition (Collection Discovery
-/// paging - see `database.rs`), not something this milestone introduced.
+/// future change that quietly adds one here is still caught; migrations
+/// 0007 (`migrations/0007_discovery_details.sql`, Collection Discovery
+/// paging) and 0008 (`migrations/0008_library_dat_identities.sql`,
+/// per-item DAT identity persistence) are already accounted for as
+/// legitimately accepted, unrelated additions - see `database.rs` - not
+/// something this milestone introduced.
 #[test]
 fn the_database_schema_and_migrations_are_unchanged() {
     let versions = crate::database::migration_versions_for_tests();
     assert_eq!(
         versions,
-        vec![1_i64, 2, 3, 4, 5, 6, 7],
-        "migrations must remain exactly 0001 through 0007"
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8],
+        "migrations must remain exactly 0001 through 0008"
     );
 }
 

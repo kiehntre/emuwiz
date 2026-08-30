@@ -134,6 +134,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist every ingestion-discovery item per scan run for paged Collection Discovery browsing",
         sql: include_str!("migrations/0007_discovery_details.sql"),
     },
+    Migration {
+        version: 8,
+        description: "persist per-library-item DAT identity results (library_dat_identities), source-scoped, so the selected-item path reconstructs LibraryDatIdentitySummary without re-auditing",
+        sql: include_str!("migrations/0008_library_dat_identities.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -1776,6 +1781,20 @@ fn enrichment_source(
         (false, true) => Some(ROMM_PLATFORM_SOURCE),
         (false, false) => None,
     }
+}
+
+/// What [`Database::persist_library_dat_identity`] did with one per-item DAT
+/// identity result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryDatIdentityPersistOutcome {
+    /// No prior row for this `(item, source)` existed; a new one was written.
+    Inserted,
+    /// A prior row for this `(item, source)` was replaced atomically.
+    Updated,
+    /// The incoming result was from a partial/cancelled audit and carried no
+    /// identity, and a prior row for this `(item, source)` did carry one, so
+    /// the prior row was left untouched.
+    SkippedProtectedPriorResult,
 }
 
 /// What persisting one current-generation platform identity resolution did.
@@ -3704,6 +3723,242 @@ impl Database {
         Ok(())
     }
 
+    // -------------------------------------------------------------------
+    // Per-library-item DAT identity persistence (migration 0008).
+    //
+    // Stores just enough of a completed DAT audit's per-item result to
+    // rebuild a `LibraryDatIdentitySummary` later without re-auditing,
+    // reopening a DAT file, or rehashing. Source-scoped, so results from
+    // different DAT ecosystems never overwrite each other; honesty-guarded,
+    // so a partial/cancelled run never clobbers a positive prior result
+    // with a false no-match.
+    // -------------------------------------------------------------------
+
+    /// Persists (inserts or replaces) one library item's DAT identity result
+    /// for one DAT source.
+    ///
+    /// A `DatAuditCompleteness::Partial` run may only add or improve: if a
+    /// stored row for this `(archive_id, source)` already carries an
+    /// identity (any state other than `NoMatch` / `NoUsableEvidence`) and
+    /// the incoming partial result carries none, the write is skipped and
+    /// the prior row is left intact - see
+    /// [`LibraryDatIdentityPersistOutcome`].
+    pub fn persist_library_dat_identity(
+        &mut self,
+        archive_id: i64,
+        persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+    ) -> Result<LibraryDatIdentityPersistOutcome> {
+        use crate::dat::library_identity_summary::DatAuditCompleteness;
+
+        let source_id = persisted.source.source_id.clone();
+        let existing = self.library_dat_identity_for_item(archive_id, &source_id)?;
+
+        if persisted.completeness == DatAuditCompleteness::Partial
+            && !persisted.carries_identity()
+            && existing
+                .as_ref()
+                .is_some_and(|prior| prior.carries_identity())
+        {
+            return Ok(LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult);
+        }
+
+        let facts_json = serde_json::to_vec(persisted).map_err(|error| {
+            ArchiveFsError::Database(format!("failed to serialize library DAT identity: {error}"))
+        })?;
+        let ecosystem = persisted
+            .source
+            .ecosystem
+            .and_then(|value| serde_json::to_value(value).ok())
+            .and_then(|value| value.as_str().map(str::to_string));
+        let state = serde_json::to_value(&persisted.verification_state)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("state")
+                    .and_then(|state| state.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let completeness = match persisted.completeness {
+            DatAuditCompleteness::Exhaustive => "exhaustive",
+            DatAuditCompleteness::Partial => "partial",
+        };
+        let now = now_utc_string();
+
+        let outcome = if existing.is_some() {
+            LibraryDatIdentityPersistOutcome::Updated
+        } else {
+            LibraryDatIdentityPersistOutcome::Inserted
+        };
+
+        self.connection
+            .execute(
+                "INSERT INTO library_dat_identities \
+                 (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
+                  completeness, audited_at, revision_marked_stale, facts_json, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9) \
+                 ON CONFLICT(archive_id, dat_source_id) DO UPDATE SET \
+                  dat_ecosystem = excluded.dat_ecosystem, \
+                  source_revision = excluded.source_revision, \
+                  verification_state = excluded.verification_state, \
+                  completeness = excluded.completeness, \
+                  audited_at = excluded.audited_at, \
+                  revision_marked_stale = 0, \
+                  facts_json = excluded.facts_json, \
+                  updated_at = excluded.updated_at",
+                params![
+                    archive_id,
+                    source_id,
+                    ecosystem,
+                    persisted.source.source_revision,
+                    state,
+                    completeness,
+                    persisted.audited_at,
+                    facts_json,
+                    now,
+                ],
+            )
+            .map_err(|error| db_error("failed to persist library DAT identity", error))?;
+
+        Ok(outcome)
+    }
+
+    /// The stored DAT identity for one library item and one DAT source, if
+    /// any.
+    pub fn library_dat_identity_for_item(
+        &self,
+        archive_id: i64,
+        dat_source_id: &str,
+    ) -> Result<Option<crate::dat::library_identity_summary::PersistedLibraryDatIdentity>> {
+        self.connection
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities \
+                 WHERE archive_id = ?1 AND dat_source_id = ?2",
+                params![archive_id, dat_source_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read library DAT identity", error))?
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "stored library DAT identity is unreadable: {error}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// Every stored DAT identity for one library item, one per DAT source,
+    /// newest audit first. More than one row means the item was audited
+    /// against more than one source (No-Intro *and* Redump, say); callers
+    /// present that truthfully rather than picking a winner.
+    pub fn library_dat_identities_for_item(
+        &self,
+        archive_id: i64,
+    ) -> Result<Vec<crate::dat::library_identity_summary::PersistedLibraryDatIdentity>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT facts_json FROM library_dat_identities \
+                 WHERE archive_id = ?1 ORDER BY audited_at DESC, dat_source_id ASC",
+            )
+            .map_err(|error| db_error("failed to prepare library DAT identities query", error))?;
+        let rows = statement
+            .query_map(params![archive_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| db_error("failed to query library DAT identities", error))?;
+        let mut identities = Vec::new();
+        for row in rows {
+            let bytes =
+                row.map_err(|error| db_error("failed to read library DAT identity row", error))?;
+            identities.push(serde_json::from_slice(&bytes).map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "stored library DAT identity is unreadable: {error}"
+                ))
+            })?);
+        }
+        Ok(identities)
+    }
+
+    /// Marks every stored DAT identity for `dat_source_id` whose audited
+    /// catalogue revision differs from `current_revision` as revision-stale.
+    /// This never deletes a row and never changes its identity: a marked row
+    /// still reconstructs its full prior identity, just with
+    /// `DatProvenanceFreshness::Stale`. Returns the number of rows marked.
+    ///
+    /// A row whose audited revision already equals `current_revision` is
+    /// left unmarked (and any prior mark on it is cleared, so a source that
+    /// is re-audited at the new revision goes back to current).
+    pub fn mark_library_dat_identity_stale_for_source_revision(
+        &mut self,
+        dat_source_id: &str,
+        current_revision: Option<&str>,
+    ) -> Result<usize> {
+        // Mark only rows whose audited revision is *known* and differs: a
+        // row audited without a recorded revision is not bulk-marked here -
+        // its freshness stays driven by the read-time hash comparison.
+        let marked = self
+            .connection
+            .execute(
+                "UPDATE library_dat_identities SET revision_marked_stale = 1, updated_at = ?3 \
+                 WHERE dat_source_id = ?1 \
+                   AND revision_marked_stale = 0 \
+                   AND source_revision IS NOT NULL \
+                   AND (?2 IS NULL OR source_revision <> ?2)",
+                params![dat_source_id, current_revision, now_utc_string()],
+            )
+            .map_err(|error| db_error("failed to mark library DAT identities stale", error))?;
+        // A row that already matches the new revision goes back to current.
+        self.connection
+            .execute(
+                "UPDATE library_dat_identities SET revision_marked_stale = 0, updated_at = ?3 \
+                 WHERE dat_source_id = ?1 \
+                   AND revision_marked_stale = 1 \
+                   AND source_revision IS ?2",
+                params![dat_source_id, current_revision, now_utc_string()],
+            )
+            .map_err(|error| db_error("failed to clear library DAT identity stale marks", error))?;
+        Ok(marked)
+    }
+
+    /// Rebuilds a [`crate::dat::library_identity_summary::LibraryDatIdentitySummary`]
+    /// for one library item and one DAT source from the persisted snapshot
+    /// plus whatever is known about the item and source right now - no
+    /// re-audit, no DAT file, no rehash.
+    ///
+    /// `current_hashes` (the item's live hashes, when the caller has them)
+    /// and `current_source_revision` (the source's configured catalogue
+    /// version, when known) drive freshness; `source_available` is `false`
+    /// when the DAT source is no longer configured.
+    pub fn library_dat_identity_summary_for_item(
+        &self,
+        archive_id: i64,
+        dat_source_id: &str,
+        current_hashes: Option<&crate::dat::library_identity_summary::LibraryItemHashes>,
+        current_source_revision: Option<&str>,
+        source_available: bool,
+    ) -> Result<Option<crate::dat::library_identity_summary::LibraryDatIdentitySummary>> {
+        let revision_marked_stale: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT revision_marked_stale FROM library_dat_identities \
+                 WHERE archive_id = ?1 AND dat_source_id = ?2",
+                params![archive_id, dat_source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read library DAT identity stale mark", error))?;
+        let Some(persisted) = self.library_dat_identity_for_item(archive_id, dat_source_id)? else {
+            return Ok(None);
+        };
+        let context = crate::dat::library_identity_summary::SourceFreshnessContext {
+            current_source_revision,
+            source_available,
+            revision_marked_stale: revision_marked_stale == Some(1),
+        };
+        Ok(Some(persisted.reconstruct_summary(current_hashes, context)))
+    }
+
     fn current_platform_for_archive(&self, archive_id: i64) -> Result<Option<String>> {
         self.connection
             .query_row(
@@ -4718,7 +4973,7 @@ mod tests {
     }
 
     fn create_representative_older_database(path: &Path, schema_version: usize) {
-        assert!(matches!(schema_version, 3 | 4));
+        assert!(matches!(schema_version, 3 | 4 | 7));
         let mut connection = open_connection(path).unwrap();
         apply_migrations(&mut connection, &MIGRATIONS[..schema_version]).unwrap();
         connection
@@ -5153,6 +5408,7 @@ mod tests {
                 "archive_scan_observations",
                 "archives",
                 "discovery_details",
+                "library_dat_identities",
                 "platform_aliases",
                 "platform_assignments",
                 "scan_runs",
@@ -10367,5 +10623,909 @@ mod tests {
         // deliberate and not an oversight, for anyone extending that list
         // in the future.
         assert!(MIGRATIONS.iter().any(|migration| migration.version == 7));
+    }
+
+    // -----------------------------------------------------------------
+    // Per-library-item DAT identity persistence (migration 0008).
+    // -----------------------------------------------------------------
+
+    mod library_dat_identity {
+        use super::*;
+        use crate::dat::library_identity_summary::{
+            DatAuditCompleteness, DatCanonicalIdentity, DatHashEvidenceSummary,
+            DatProvenanceFreshness, DatSetDependencySummary, DatSourceProvenance,
+            DatVerificationState, DurableDatEntryRef, LibraryDatIdentitySummary, LibraryItemHashes,
+            PersistedLibraryDatIdentity,
+        };
+        use crate::dat::model::DatEcosystem;
+
+        fn open(name: &str) -> (PathBuf, Database) {
+            let root = temp_dir(name);
+            let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+            (root, database)
+        }
+
+        fn seed_archive(database: &Database, file_name: &str) -> i64 {
+            database
+                .connection
+                .execute(
+                    "INSERT OR IGNORE INTO source_folders \
+                     (id, path, first_seen_at, last_seen_in_config_at) \
+                     VALUES (1, ?1, 'now', 'now')",
+                    [b"/roms".as_slice()],
+                )
+                .unwrap();
+            database
+                .connection
+                .execute(
+                    "INSERT INTO archives \
+                     (source_folder_id, relative_path, absolute_path_cached, file_name_cached, \
+                      archive_kind, display_name, normalized_name, last_known_health, \
+                      first_seen_at, last_seen_at, created_at, updated_at) \
+                     VALUES (1, ?1, ?2, ?3, 'DirectGameImage', ?4, ?4, 'Present', \
+                             'now', 'now', 'now', 'now')",
+                    params![
+                        file_name.as_bytes(),
+                        format!("/roms/{file_name}").into_bytes(),
+                        file_name.as_bytes(),
+                        file_name,
+                    ],
+                )
+                .unwrap();
+            database.connection.last_insert_rowid()
+        }
+
+        fn hashes() -> LibraryItemHashes {
+            LibraryItemHashes {
+                size_bytes: Some(65_536),
+                crc32: Some("abcd1234".into()),
+                md5: Some("d41d8cd98f00b204e9800998ecf8427e".into()),
+                sha1: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into()),
+                sha256: None,
+            }
+        }
+
+        fn source(
+            id: &str,
+            ecosystem: DatEcosystem,
+            revision: Option<&str>,
+        ) -> DatSourceProvenance {
+            DatSourceProvenance {
+                source_id: id.into(),
+                source_name: format!("{id} display"),
+                ecosystem: Some(ecosystem),
+                source_revision: revision.map(str::to_string),
+                author: Some("Publisher".into()),
+                catalogue_names: vec![format!("{id} catalogue")],
+                dat_path: format!("/dats/{id}.dat"),
+            }
+        }
+
+        fn verified(
+            source_id: &str,
+            ecosystem: DatEcosystem,
+            revision: Option<&str>,
+            game_name: &str,
+            completeness: DatAuditCompleteness,
+        ) -> PersistedLibraryDatIdentity {
+            PersistedLibraryDatIdentity {
+                verification_state: DatVerificationState::VerifiedSingleMatch {
+                    algorithm: "SHA-1".into(),
+                },
+                source: source(source_id, ecosystem, revision),
+                canonical: DatCanonicalIdentity {
+                    canonical_dat_name: Some(game_name.into()),
+                    canonical_rom_name: Some(format!("{game_name}.rom")),
+                    region: Some("USA".into()),
+                    revision: Some("Rev 1".into()),
+                },
+                hash_evidence: DatHashEvidenceSummary {
+                    matched_algorithm: Some("SHA-1".into()),
+                    matched_value: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into()),
+                    available_algorithms: vec!["SHA-1".into(), "MD5".into(), "CRC32".into()],
+                },
+                ambiguous_candidates: Vec::new(),
+                matched_entries: vec![DurableDatEntryRef {
+                    source_id: source_id.into(),
+                    game_name: game_name.into(),
+                    rom_name: Some(format!("{game_name}.rom")),
+                    checksums: vec![(
+                        "SHA-1".into(),
+                        "da39a3ee5e6b4b0d3255bfef95601890afd80709".into(),
+                    )],
+                }],
+                audited_hashes: hashes(),
+                audited_at: "2026-05-01T00:00:00Z".into(),
+                completeness,
+            }
+        }
+
+        fn no_match(
+            source_id: &str,
+            completeness: DatAuditCompleteness,
+        ) -> PersistedLibraryDatIdentity {
+            PersistedLibraryDatIdentity {
+                verification_state: DatVerificationState::NoMatch,
+                source: source(source_id, DatEcosystem::NoIntro, Some("20240501")),
+                canonical: DatCanonicalIdentity::default(),
+                hash_evidence: DatHashEvidenceSummary {
+                    matched_algorithm: None,
+                    matched_value: None,
+                    available_algorithms: vec!["SHA-1".into()],
+                },
+                ambiguous_candidates: Vec::new(),
+                matched_entries: Vec::new(),
+                audited_hashes: hashes(),
+                audited_at: "2026-06-01T00:00:00Z".into(),
+                completeness,
+            }
+        }
+
+        fn summary_for(
+            database: &Database,
+            archive_id: i64,
+            source_id: &str,
+        ) -> LibraryDatIdentitySummary {
+            database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    source_id,
+                    Some(&hashes()),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .expect("a stored summary")
+        }
+
+        #[test]
+        fn persist_and_reconstruct_a_verified_single_match() {
+            let (root, mut database) = open("persist-verified");
+            let archive_id = seed_archive(&database, "Zelda.nes");
+            let outcome = database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("20240501"),
+                        "The Legend of Zelda (USA) (Rev 1)",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(outcome, LibraryDatIdentityPersistOutcome::Inserted);
+
+            let summary = summary_for(&database, archive_id, "no-intro-nes");
+            assert!(summary.is_verified());
+            assert_eq!(
+                summary.verification_state,
+                DatVerificationState::VerifiedSingleMatch {
+                    algorithm: "SHA-1".into()
+                }
+            );
+            assert_eq!(
+                summary.canonical.canonical_dat_name.as_deref(),
+                Some("The Legend of Zelda (USA) (Rev 1)")
+            );
+            assert_eq!(summary.canonical.region.as_deref(), Some("USA"));
+            assert_eq!(summary.canonical.revision.as_deref(), Some("Rev 1"));
+            assert_eq!(summary.source.source_id, "no-intro-nes");
+            assert_eq!(summary.source.ecosystem, Some(DatEcosystem::NoIntro));
+            assert_eq!(summary.source.source_revision.as_deref(), Some("20240501"));
+            assert_eq!(
+                summary.hash_evidence.matched_algorithm.as_deref(),
+                Some("SHA-1")
+            );
+            assert_eq!(
+                summary.hash_evidence.matched_value.as_deref(),
+                Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+            );
+            assert_eq!(
+                summary.provenance_freshness,
+                DatProvenanceFreshness::Current
+            );
+            assert!(matches!(
+                summary.set_dependency,
+                DatSetDependencySummary::Pending { .. }
+            ));
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn ambiguous_candidates_survive_reload_without_a_winner() {
+            let (root, mut database) = open("persist-ambiguous");
+            let archive_id = seed_archive(&database, "Game.nes");
+            let mut persisted = verified(
+                "no-intro-nes",
+                DatEcosystem::NoIntro,
+                Some("v1"),
+                "unused",
+                DatAuditCompleteness::Exhaustive,
+            );
+            persisted.verification_state = DatVerificationState::AmbiguousMultipleCandidates {
+                algorithm: "SHA-1".into(),
+                candidate_count: 2,
+            };
+            persisted.canonical = DatCanonicalIdentity::default();
+            persisted.ambiguous_candidates = vec!["Game (USA)".into(), "Game (Europe)".into()];
+            persisted.matched_entries = vec![
+                DurableDatEntryRef {
+                    source_id: "no-intro-nes".into(),
+                    game_name: "Game (USA)".into(),
+                    rom_name: None,
+                    checksums: Vec::new(),
+                },
+                DurableDatEntryRef {
+                    source_id: "no-intro-nes".into(),
+                    game_name: "Game (Europe)".into(),
+                    rom_name: None,
+                    checksums: Vec::new(),
+                },
+            ];
+            database
+                .persist_library_dat_identity(archive_id, &persisted)
+                .unwrap();
+
+            let reloaded = database
+                .library_dat_identity_for_item(archive_id, "no-intro-nes")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reloaded.ambiguous_candidates,
+                vec!["Game (USA)".to_string(), "Game (Europe)".to_string()]
+            );
+            assert_eq!(reloaded.matched_entries.len(), 2);
+            assert_eq!(reloaded.canonical.canonical_dat_name, None);
+
+            let summary = summary_for(&database, archive_id, "no-intro-nes");
+            assert!(summary.is_ambiguous());
+            assert!(!summary.is_verified());
+            assert_eq!(summary.ambiguous_candidates.len(), 2);
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn no_match_survives_reload_and_filename_only_stays_not_verified() {
+            let (root, mut database) = open("persist-nomatch");
+            let a = seed_archive(&database, "Unknown.nes");
+            database
+                .persist_library_dat_identity(
+                    a,
+                    &no_match("no-intro-nes", DatAuditCompleteness::Exhaustive),
+                )
+                .unwrap();
+            let no_match_summary = summary_for(&database, a, "no-intro-nes");
+            assert_eq!(
+                no_match_summary.verification_state,
+                DatVerificationState::NoMatch
+            );
+            assert!(no_match_summary.is_no_match());
+            assert_eq!(no_match_summary.canonical.canonical_dat_name, None);
+
+            let b = seed_archive(&database, "NamedOnly.nes");
+            let mut filename_only = verified(
+                "no-intro-nes",
+                DatEcosystem::NoIntro,
+                Some("v1"),
+                "Named Game (Europe)",
+                DatAuditCompleteness::Exhaustive,
+            );
+            filename_only.verification_state = DatVerificationState::FilenameOnlyNotVerified;
+            filename_only.hash_evidence = DatHashEvidenceSummary {
+                matched_algorithm: None,
+                matched_value: None,
+                available_algorithms: Vec::new(),
+            };
+            database
+                .persist_library_dat_identity(b, &filename_only)
+                .unwrap();
+            let filename_summary = summary_for(&database, b, "no-intro-nes");
+            assert_eq!(
+                filename_summary.verification_state,
+                DatVerificationState::FilenameOnlyNotVerified
+            );
+            assert!(!filename_summary.is_verified());
+            assert_eq!(
+                filename_summary.canonical.canonical_dat_name.as_deref(),
+                Some("Named Game (Europe)")
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn optional_metadata_stays_optional_across_reload() {
+            let (root, mut database) = open("persist-optional");
+            let archive_id = seed_archive(&database, "Bare.nes");
+            let mut persisted = verified(
+                "generic",
+                DatEcosystem::GenericLogiqx,
+                None,
+                "Bare Game",
+                DatAuditCompleteness::Exhaustive,
+            );
+            persisted.source.ecosystem = None;
+            persisted.source.author = None;
+            persisted.source.catalogue_names = Vec::new();
+            persisted.canonical.region = None;
+            persisted.canonical.revision = None;
+            database
+                .persist_library_dat_identity(archive_id, &persisted)
+                .unwrap();
+
+            let reloaded = database
+                .library_dat_identity_for_item(archive_id, "generic")
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.source.ecosystem, None);
+            assert_eq!(reloaded.source.author, None);
+            assert!(reloaded.source.catalogue_names.is_empty());
+            assert_eq!(reloaded.source.source_revision, None);
+            assert_eq!(reloaded.canonical.region, None);
+            assert_eq!(reloaded.canonical.revision, None);
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn freshness_is_current_stale_or_unknown_from_the_hash_snapshot() {
+            let (root, mut database) = open("persist-freshness");
+            let archive_id = seed_archive(&database, "Fresh.nes");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("20240501"),
+                        "Fresh Game",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+
+            // Current: live hash equals the audited snapshot.
+            let current = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&hashes()),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.provenance_freshness,
+                DatProvenanceFreshness::Current
+            );
+
+            // Stale: live hash differs.
+            let mut changed = hashes();
+            changed.sha1 = Some("0000000000000000000000000000000000000000".into());
+            let stale = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&changed),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.provenance_freshness, DatProvenanceFreshness::Stale);
+
+            // Unknown: no live hash snapshot.
+            let unknown = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    None,
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                unknown.provenance_freshness,
+                DatProvenanceFreshness::Unknown
+            );
+
+            // Unknown: source no longer available.
+            let gone = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&hashes()),
+                    Some("20240501"),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(gone.provenance_freshness, DatProvenanceFreshness::Unknown);
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_source_revision_drift_makes_the_stored_identity_stale_not_gone() {
+            let (root, mut database) = open("persist-revision-drift");
+            let archive_id = seed_archive(&database, "Drift.nes");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("20240501"),
+                        "Drift Game",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+
+            // Read with a newer configured revision -> Stale, identity intact.
+            let drifted = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&hashes()),
+                    Some("20240901"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(drifted.provenance_freshness, DatProvenanceFreshness::Stale);
+            assert_eq!(
+                drifted.canonical.canonical_dat_name.as_deref(),
+                Some("Drift Game")
+            );
+            assert!(drifted.is_verified());
+
+            // Bulk-mark, then confirm the row is still there and still stale.
+            let marked = database
+                .mark_library_dat_identity_stale_for_source_revision(
+                    "no-intro-nes",
+                    Some("20240901"),
+                )
+                .unwrap();
+            assert_eq!(marked, 1);
+            let still_there = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&hashes()),
+                    // Even reading with the *old* revision, the persisted mark wins.
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                still_there.provenance_freshness,
+                DatProvenanceFreshness::Stale
+            );
+            assert!(still_there.is_verified());
+
+            // Re-auditing at the new revision clears the mark and goes current.
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("20240901"),
+                        "Drift Game",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            let refreshed = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&hashes()),
+                    Some("20240901"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                refreshed.provenance_freshness,
+                DatProvenanceFreshness::Current
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn different_dat_sources_stay_isolated_and_are_all_returned() {
+            let (root, mut database) = open("persist-multi-source");
+            let archive_id = seed_archive(&database, "Multi.zip");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro",
+                        DatEcosystem::NoIntro,
+                        Some("ni-1"),
+                        "Game (No-Intro name)",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "redump",
+                        DatEcosystem::Redump,
+                        Some("rd-9"),
+                        "Game (Redump name)",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            // A MAME and an FBNeo result for the same item stay separate too.
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "mame",
+                        DatEcosystem::MAMEArcade,
+                        Some("mame-0.270"),
+                        "sf2",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "fbneo",
+                        DatEcosystem::FBNeo,
+                        Some("fbn-1.0"),
+                        "sf2",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+
+            let all = database
+                .library_dat_identities_for_item(archive_id)
+                .unwrap();
+            assert_eq!(all.len(), 4);
+            let names: std::collections::BTreeSet<&str> = all
+                .iter()
+                .map(|row| row.source.source_id.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                ["fbneo", "mame", "no-intro", "redump"]
+                    .into_iter()
+                    .collect()
+            );
+
+            let no_intro = summary_for(&database, archive_id, "no-intro");
+            assert_eq!(
+                no_intro.canonical.canonical_dat_name.as_deref(),
+                Some("Game (No-Intro name)")
+            );
+            let redump = summary_for(&database, archive_id, "redump");
+            assert_eq!(
+                redump.canonical.canonical_dat_name.as_deref(),
+                Some("Game (Redump name)")
+            );
+            // MAME and FBNeo remain source-separated.
+            assert_eq!(
+                database
+                    .library_dat_identity_for_item(archive_id, "mame")
+                    .unwrap()
+                    .unwrap()
+                    .source
+                    .ecosystem,
+                Some(DatEcosystem::MAMEArcade)
+            );
+            assert_eq!(
+                database
+                    .library_dat_identity_for_item(archive_id, "fbneo")
+                    .unwrap()
+                    .unwrap()
+                    .source
+                    .ecosystem,
+                Some(DatEcosystem::FBNeo)
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_repeated_exhaustive_audit_replaces_only_its_own_source_row() {
+            let (root, mut database) = open("persist-replace");
+            let archive_id = seed_archive(&database, "Replace.nes");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro",
+                        DatEcosystem::NoIntro,
+                        Some("v1"),
+                        "Old Name",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "redump",
+                        DatEcosystem::Redump,
+                        Some("v1"),
+                        "Redump Untouched",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+
+            let outcome = database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro",
+                        DatEcosystem::NoIntro,
+                        Some("v2"),
+                        "New Name",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(outcome, LibraryDatIdentityPersistOutcome::Updated);
+
+            assert_eq!(
+                database
+                    .library_dat_identities_for_item(archive_id)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                database
+                    .library_dat_identity_for_item(archive_id, "no-intro")
+                    .unwrap()
+                    .unwrap()
+                    .canonical
+                    .canonical_dat_name
+                    .as_deref(),
+                Some("New Name")
+            );
+            assert_eq!(
+                database
+                    .library_dat_identity_for_item(archive_id, "redump")
+                    .unwrap()
+                    .unwrap()
+                    .canonical
+                    .canonical_dat_name
+                    .as_deref(),
+                Some("Redump Untouched")
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_partial_audit_never_clobbers_a_positive_prior_result() {
+            let (root, mut database) = open("persist-partial-guard");
+            let archive_id = seed_archive(&database, "Guard.nes");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro",
+                        DatEcosystem::NoIntro,
+                        Some("v1"),
+                        "Verified Game",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+
+            // A cancelled/partial pass that reached this item without a match
+            // must NOT overwrite the good prior identity.
+            let outcome = database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &no_match("no-intro", DatAuditCompleteness::Partial),
+                )
+                .unwrap();
+            assert_eq!(
+                outcome,
+                LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult
+            );
+            let still_verified = summary_for(&database, archive_id, "no-intro");
+            assert!(still_verified.is_verified());
+            assert_eq!(
+                still_verified.canonical.canonical_dat_name.as_deref(),
+                Some("Verified Game")
+            );
+
+            // But an *exhaustive* no-match is authoritative and does replace it.
+            let outcome = database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &no_match("no-intro", DatAuditCompleteness::Exhaustive),
+                )
+                .unwrap();
+            assert_eq!(outcome, LibraryDatIdentityPersistOutcome::Updated);
+            assert!(summary_for(&database, archive_id, "no-intro").is_no_match());
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_partial_audit_with_a_new_identity_is_still_stored() {
+            let (root, mut database) = open("persist-partial-improve");
+            let archive_id = seed_archive(&database, "Improve.nes");
+            // No prior row: a partial run that DID find an identity still stores it.
+            let outcome = database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro",
+                        DatEcosystem::NoIntro,
+                        Some("v1"),
+                        "Found Game",
+                        DatAuditCompleteness::Partial,
+                    ),
+                )
+                .unwrap();
+            assert_eq!(outcome, LibraryDatIdentityPersistOutcome::Inserted);
+            assert!(summary_for(&database, archive_id, "no-intro").is_verified());
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn results_survive_a_database_reopen_roundtrip() {
+            let root = temp_dir("persist-reopen");
+            let db_path = root.join("library.sqlite3");
+            let archive_id;
+            {
+                let mut database = Database::open_or_create(&db_path).unwrap();
+                archive_id = seed_archive(&database, "Reopen.nes");
+                database
+                    .persist_library_dat_identity(
+                        archive_id,
+                        &verified(
+                            "no-intro",
+                            DatEcosystem::NoIntro,
+                            Some("v1"),
+                            "Persistent Game (USA)",
+                            DatAuditCompleteness::Exhaustive,
+                        ),
+                    )
+                    .unwrap();
+                database.close().unwrap();
+            }
+            let database = Database::open_or_create(&db_path).unwrap();
+            let summary = summary_for(&database, archive_id, "no-intro");
+            assert!(summary.is_verified());
+            assert_eq!(
+                summary.canonical.canonical_dat_name.as_deref(),
+                Some("Persistent Game (USA)")
+            );
+            assert_eq!(summary.source.ecosystem, Some(DatEcosystem::NoIntro));
+            assert_eq!(summary.source.source_revision.as_deref(), Some("v1"));
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn the_from_summary_builder_keeps_a_durable_matched_entry_and_snapshot() {
+            let summary = LibraryDatIdentitySummary {
+                verification_state: DatVerificationState::VerifiedSingleMatch {
+                    algorithm: "MD5".into(),
+                },
+                source: source("no-intro", DatEcosystem::NoIntro, Some("v1")),
+                canonical: DatCanonicalIdentity {
+                    canonical_dat_name: Some("Game (USA)".into()),
+                    canonical_rom_name: Some("game.nes".into()),
+                    region: Some("USA".into()),
+                    revision: None,
+                },
+                hash_evidence: DatHashEvidenceSummary {
+                    matched_algorithm: Some("MD5".into()),
+                    matched_value: Some("d41d8cd98f00b204e9800998ecf8427e".into()),
+                    available_algorithms: vec!["MD5".into()],
+                },
+                provenance_freshness: DatProvenanceFreshness::Current,
+                ambiguous_candidates: Vec::new(),
+                set_dependency: DatSetDependencySummary::Pending {
+                    reason: "n/a".into(),
+                },
+            };
+            let persisted = PersistedLibraryDatIdentity::from_summary(
+                &summary,
+                &[],
+                &hashes(),
+                "2026-01-01T00:00:00Z",
+                DatAuditCompleteness::Exhaustive,
+            );
+            assert_eq!(persisted.matched_entries.len(), 1);
+            assert_eq!(persisted.matched_entries[0].game_name, "Game (USA)");
+            assert_eq!(persisted.audited_hashes, hashes());
+            assert_eq!(persisted.audited_at, "2026-01-01T00:00:00Z");
+            // Round-trips through the reconstruction unchanged (bar freshness).
+            let rebuilt = persisted.reconstruct_summary(
+                Some(&hashes()),
+                crate::dat::library_identity_summary::SourceFreshnessContext {
+                    current_source_revision: Some("v1"),
+                    source_available: true,
+                    revision_marked_stale: false,
+                },
+            );
+            assert_eq!(rebuilt.verification_state, summary.verification_state);
+            assert_eq!(rebuilt.canonical, summary.canonical);
+            assert_eq!(
+                rebuilt.provenance_freshness,
+                DatProvenanceFreshness::Current
+            );
+        }
+
+        #[test]
+        fn v08_schema_upgrades_additively_from_v07_and_keeps_prior_rows() {
+            let root = temp_dir("v08-upgrade");
+            let database_path = root.join("library.sqlite3");
+            create_representative_older_database(&database_path, 7);
+
+            let mut database = Database::open_or_create(&database_path).unwrap();
+            assert_eq!(database.schema_version().unwrap(), latest_schema_version());
+            // Prior data preserved.
+            assert_eq!(database.load_archives().unwrap().len(), 1);
+            // New table is usable.
+            let archive_id = 1;
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro",
+                        DatEcosystem::NoIntro,
+                        Some("v1"),
+                        "Upgraded Game",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            assert!(summary_for(&database, archive_id, "no-intro").is_verified());
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn migration_0008_is_registered_and_last() {
+            assert_eq!(latest_known_version(MIGRATIONS), 8);
+            assert!(MIGRATIONS.iter().any(|migration| {
+                migration.version == 8
+                    && migration
+                        .sql
+                        .contains("CREATE TABLE library_dat_identities")
+            }));
+        }
     }
 }

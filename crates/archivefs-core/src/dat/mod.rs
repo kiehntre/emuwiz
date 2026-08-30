@@ -42,6 +42,7 @@ pub mod firmware_evidence;
 pub mod hash;
 pub mod identity;
 pub mod index;
+pub mod library_identity_summary;
 pub mod limits;
 pub mod managed_sources;
 pub mod model;
