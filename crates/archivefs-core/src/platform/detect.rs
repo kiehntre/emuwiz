@@ -779,6 +779,20 @@ fn structural_format_evidence(
     ) {
         return Vec::new();
     }
+    if format == crate::disk_format::DiskFormat::CommodoreCrt {
+        return ["Commodore 64", "Commodore 128", "VIC-20"]
+            .into_iter()
+            .map(|platform| DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: false,
+                platform,
+                detail: format!(
+                    "{}; CRT cartridge hardware is shared across the Commodore 8-bit family, so folder evidence is required to select a machine",
+                    inspected.evidence.first().cloned().unwrap_or_else(|| "CRT structure is internally consistent".to_string())
+                ),
+            })
+            .collect();
+    }
     // One evidence item per structural match, carrying the layer's own verdict on
     // whether the structure settles the platform.
     let detail = format!(

@@ -49,6 +49,7 @@ use crate::safe_read::{SafeFile, TrustedRoots, open_bounded_read};
 
 pub mod atari_st;
 pub mod atari_stx;
+pub mod crt;
 pub mod d88;
 pub mod dfs;
 pub mod dsk;
@@ -179,6 +180,9 @@ pub enum DiskFormat {
     /// A valid raw Acorn DFS catalogue in an `.ssd` or `.dsd` sector dump.
     /// DFS is shared by BBC-family machines and never settles one machine.
     AcornDfsDisk,
+    /// A structurally valid VICE/CCS64 C64 CRT cartridge container. The
+    /// cartridge may be usable across more than one Commodore 8-bit machine.
+    CommodoreCrt,
 }
 
 impl DiskFormat {
@@ -194,6 +198,7 @@ impl DiskFormat {
             Self::HdiContainer => "HDI hard-disk container",
             Self::NhdContainer => "NHD hard-disk container",
             Self::AcornDfsDisk => "Acorn DFS disk image",
+            Self::CommodoreCrt => "Commodore CRT cartridge",
         }
     }
 
@@ -210,6 +215,7 @@ impl DiskFormat {
             Self::D88Container => "NEC PC-8801",
             Self::HdiContainer | Self::NhdContainer => "PC-98",
             Self::AcornDfsDisk => "BBC Micro",
+            Self::CommodoreCrt => "Commodore 64",
         }
     }
 
@@ -235,6 +241,7 @@ impl DiskFormat {
             Self::D88Container => false,
             Self::HdiContainer | Self::NhdContainer => false,
             Self::AcornDfsDisk => false,
+            Self::CommodoreCrt => false,
         }
     }
 }
@@ -479,6 +486,21 @@ pub struct DfsLayout {
     pub sides: Vec<DfsSideLayout>,
 }
 
+/// The validated fixed header and CHIP packets of a CRT cartridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CrtLayout {
+    pub header_length: u32,
+    pub version: u16,
+    pub hardware_type: u16,
+    pub exrom: u8,
+    pub game: u8,
+    pub cartridge_name: String,
+    pub packets: usize,
+    pub chip_types: Vec<u16>,
+    pub banks: Vec<u16>,
+    pub total_image_bytes: u64,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -493,6 +515,7 @@ pub enum DiskFormatMetadata {
     Hdi(HardDiskLayout),
     Nhd(HardDiskLayout),
     Dfs(DfsLayout),
+    Crt(CrtLayout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -604,6 +627,7 @@ pub fn inspect_disk_format(
             double_sided: false,
         },
         "dsd" => Adapter::AcornDfs { double_sided: true },
+        "crt" => Adapter::Crt,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -634,6 +658,7 @@ pub fn inspect_disk_format(
         Adapter::AcornDfs { double_sided } => {
             dfs::inspect(&mut reader, context, cancel, double_sided)
         }
+        Adapter::Crt => crt::inspect(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -655,6 +680,7 @@ enum Adapter {
     Hdi,
     Nhd,
     AcornDfs { double_sided: bool },
+    Crt,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
@@ -727,6 +753,58 @@ impl<'a> BoundedReader<'a> {
                 detail: format!(
                     "reading {length} more bytes would exceed the \
                      {MAX_DISK_FORMAT_BYTES_READ}-byte inspection budget"
+                ),
+            });
+        }
+        let bytes = self
+            .file
+            .read_exact_at(offset, length, MAX_DISK_FORMAT_READ_CHUNK)
+            .ok_or(DiskFormatRefusal::Truncated {
+                offset,
+                wanted: length,
+            })?;
+        self.bytes_read = would_read;
+        Ok(bytes)
+    }
+
+    /// CRT CHIP headers may be chained through a larger, but still bounded,
+    /// cartridge image. Keep that exception local to CRT rather than relaxing
+    /// the established offset bound for floppy and hard-disk adapters.
+    pub(crate) fn read_exact_at_crt(
+        &mut self,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, DiskFormatRefusal> {
+        self.read_exact_at_with_offset_limit(offset, length, 32 * 1024 * 1024)
+    }
+
+    fn read_exact_at_with_offset_limit(
+        &mut self,
+        offset: u64,
+        length: usize,
+        offset_limit: u64,
+    ) -> Result<Vec<u8>, DiskFormatRefusal> {
+        if length == 0 || length > MAX_DISK_FORMAT_READ_CHUNK {
+            return Err(DiskFormatRefusal::Malformed {
+                detail: format!(
+                    "a {length}-byte read is outside the {MAX_DISK_FORMAT_READ_CHUNK}-byte chunk limit"
+                ),
+            });
+        }
+        if offset > offset_limit {
+            return Err(DiskFormatRefusal::Malformed {
+                detail: format!("offset {offset} is past the {offset_limit}-byte inspection limit"),
+            });
+        }
+        let would_read = self.bytes_read.checked_add(length as u64).ok_or_else(|| {
+            DiskFormatRefusal::Malformed {
+                detail: "the read budget overflowed".to_string(),
+            }
+        })?;
+        if would_read > MAX_DISK_FORMAT_BYTES_READ {
+            return Err(DiskFormatRefusal::Malformed {
+                detail: format!(
+                    "reading {length} more bytes would exceed the {MAX_DISK_FORMAT_BYTES_READ}-byte inspection budget"
                 ),
             });
         }

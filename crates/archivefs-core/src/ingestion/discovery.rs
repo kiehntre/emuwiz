@@ -682,6 +682,9 @@ fn discover_direct_file(
     if extension == "d88" {
         return discover_d88_image(path, source_root);
     }
+    if extension == "crt" {
+        return discover_crt_cartridge(path, source_root);
+    }
     if matches!(extension.as_str(), "hdi" | "nhd") {
         return discover_hard_disk_image(path, source_root, &extension);
     }
@@ -1182,6 +1185,67 @@ fn discover_d88_image(path: &Path, source_root: &Path) -> GameDiscovery {
                     .unwrap_or_else(|| "not a recognised D88 disk container".to_string()),
             ),
             "This file is not a readable D88 disk container.".to_string(),
+        ),
+    }
+}
+
+/// `.crt` is a structurally validated C64 CRT container, but CRT hardware is
+/// shared across the Commodore 8-bit family. A folder alias may corroborate a
+/// machine; a bare valid CRT remains visible as recognized content without a
+/// guessed platform.
+fn discover_crt_cartridge(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Commodore CRT cartridge".to_string());
+    match evidence.format {
+        Some(DiskFormat::CommodoreCrt) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Valid Commodore CRT cartridge; platform identified from folder evidence. {detail}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid Commodore CRT cartridge, but CRT hardware is shared across the Commodore 8-bit family and no platform corroboration was found. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised CRT cartridge".to_string()),
+            ),
+            "This .crt file is not a readable Commodore CRT cartridge.".to_string(),
         ),
     }
 }

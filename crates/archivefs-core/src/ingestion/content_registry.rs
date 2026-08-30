@@ -145,6 +145,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("g64", ContentKind::ComputerDisk),
     cf("d71", ContentKind::ComputerDisk),
     cf("d81", ContentKind::ComputerDisk),
+    cf("crt", ContentKind::ComputerDisk),
     cf("ssd", ContentKind::ComputerDisk),
     cf("dsd", ContentKind::ComputerDisk),
     cf("st", ContentKind::ComputerDisk),

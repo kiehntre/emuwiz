@@ -57,6 +57,30 @@ fn nhd_image(
     image
 }
 
+fn crt_image(version: u16, hardware_type: u16, packets: &[(u16, u16, u16, usize)]) -> Vec<u8> {
+    let packet_bytes: usize = packets.iter().map(|(_, _, _, size)| 0x10 + size).sum();
+    let mut image = vec![0; 0x40 + packet_bytes];
+    image[..16].copy_from_slice(b"C64 CARTRIDGE   ");
+    image[0x10..0x14].copy_from_slice(&0x40u32.to_be_bytes());
+    image[0x14..0x16].copy_from_slice(&version.to_be_bytes());
+    image[0x16..0x18].copy_from_slice(&hardware_type.to_be_bytes());
+    image[0x18] = 0;
+    image[0x19] = 1;
+    image[0x20..0x2a].copy_from_slice(b"TEST CART\0");
+    let mut cursor = 0x40;
+    for (chip_type, bank, load_address, size) in packets {
+        image[cursor..cursor + 4].copy_from_slice(b"CHIP");
+        image[cursor + 4..cursor + 8].copy_from_slice(&(0x10u32 + *size as u32).to_be_bytes());
+        image[cursor + 8..cursor + 10].copy_from_slice(&chip_type.to_be_bytes());
+        image[cursor + 10..cursor + 12].copy_from_slice(&bank.to_be_bytes());
+        image[cursor + 12..cursor + 14].copy_from_slice(&load_address.to_be_bytes());
+        image[cursor + 14..cursor + 16].copy_from_slice(&(*size as u16).to_be_bytes());
+        image[cursor + 0x10..cursor + 0x10 + *size].fill(0xea);
+        cursor += 0x10 + size;
+    }
+    image
+}
+
 /// A throwaway tree with a trusted library root and an untrusted one beside it.
 struct Fixture {
     root: PathBuf,
@@ -504,6 +528,98 @@ fn a_minimal_d88_container_is_recognised_without_platform_identity() {
         }
         metadata => panic!("expected D88 metadata, got {metadata:?}"),
     }
+}
+
+#[test]
+fn crt_header_and_multiple_chip_packets_are_recognised_as_shared_commodore_evidence() {
+    let fixture = Fixture::new("crt-valid");
+    let image = fixture.write(
+        "library/game.crt",
+        &crt_image(
+            0x0200,
+            0x0020,
+            &[(0, 0, 0x8000, 0x20), (2, 1, 0xa000, 0x10)],
+        ),
+    );
+    let evidence = fixture.inspect(&image);
+    assert_eq!(evidence.format, Some(DiskFormat::CommodoreCrt));
+    assert_eq!(evidence.platform, Some("Commodore 64"));
+    assert_eq!(evidence.confidence, DetectionConfidence::Probable);
+    assert!(!evidence.conclusive);
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("TEST CART"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("shared across"))
+    );
+    match evidence.metadata {
+        Some(DiskFormatMetadata::Crt(layout)) => {
+            assert_eq!(layout.version, 0x0200);
+            assert_eq!(layout.hardware_type, 0x0020);
+            assert_eq!(layout.packets, 2);
+            assert_eq!(layout.banks, vec![0, 1]);
+            assert_eq!(layout.total_image_bytes, 0x30);
+        }
+        metadata => panic!("expected CRT metadata, got {metadata:?}"),
+    }
+}
+
+#[test]
+fn crt_accepts_documented_versions_chip_types_and_unknown_hardware_id() {
+    let fixture = Fixture::new("crt-versions");
+    for (index, version) in [0x0100, 0x0101, 0x0200].into_iter().enumerate() {
+        let image = fixture.write(
+            &format!("library/version-{index}.crt"),
+            &crt_image(version, 0xfefe, &[(index as u16, index as u16, 0x8000, 1)]),
+        );
+        assert_eq!(
+            fixture.inspect(&image).format,
+            Some(DiskFormat::CommodoreCrt)
+        );
+    }
+}
+
+#[test]
+fn malformed_crt_structures_fail_closed() {
+    let fixture = Fixture::new("crt-invalid");
+    let valid = crt_image(0x0200, 0, &[(0, 0, 0x8000, 4)]);
+    let mut bad_signature = valid.clone();
+    bad_signature[0] = b'X';
+    let mut bad_header_length = valid.clone();
+    bad_header_length[0x10..0x14].copy_from_slice(&0x20u32.to_be_bytes());
+    let mut bad_version = valid.clone();
+    bad_version[0x14..0x16].copy_from_slice(&0x0300u16.to_be_bytes());
+    let mut bad_chip_signature = valid.clone();
+    bad_chip_signature[0x40] = b'X';
+    let mut bad_packet_length = valid.clone();
+    bad_packet_length[0x44..0x48].copy_from_slice(&0x0fu32.to_be_bytes());
+    let mut bad_image_size = valid.clone();
+    bad_image_size[0x4e..0x50].copy_from_slice(&0x20u16.to_be_bytes());
+    let mut trailing = valid.clone();
+    trailing.push(0xff);
+    for (label, bytes) in [
+        ("signature", bad_signature),
+        ("header", bad_header_length),
+        ("version", bad_version),
+        ("chip-signature", bad_chip_signature),
+        ("packet-length", bad_packet_length),
+        ("image-size", bad_image_size),
+        ("trailing", trailing),
+    ] {
+        let image = fixture.write(&format!("library/{label}.crt"), &bytes);
+        assert!(
+            fixture.inspect(&image).refusal.is_some(),
+            "{label} accepted"
+        );
+    }
+    let truncated = fixture.write("library/truncated.crt", &valid[..0x4f]);
+    assert!(fixture.inspect(&truncated).refusal.is_some());
 }
 
 #[test]

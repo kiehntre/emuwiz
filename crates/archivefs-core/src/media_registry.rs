@@ -136,6 +136,10 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         kind: ArchiveKind::DirectGameImage,
     },
     MediaFormat {
+        extension: "crt",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
         extension: "ssd",
         kind: ArchiveKind::DirectGameImage,
     },

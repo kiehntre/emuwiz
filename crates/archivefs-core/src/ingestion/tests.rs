@@ -31,6 +31,23 @@ fn minimal_nhd() -> Vec<u8> {
     image
 }
 
+fn minimal_crt() -> Vec<u8> {
+    let mut image = vec![0; 0x40 + 0x10 + 4];
+    image[..16].copy_from_slice(b"C64 CARTRIDGE   ");
+    image[0x10..0x14].copy_from_slice(&0x40u32.to_be_bytes());
+    image[0x14..0x16].copy_from_slice(&0x0200u16.to_be_bytes());
+    image[0x18] = 0;
+    image[0x19] = 1;
+    image[0x40..0x44].copy_from_slice(b"CHIP");
+    image[0x44..0x48].copy_from_slice(&0x14u32.to_be_bytes());
+    image[0x48..0x4a].copy_from_slice(&0u16.to_be_bytes());
+    image[0x4a..0x4c].copy_from_slice(&0u16.to_be_bytes());
+    image[0x4c..0x4e].copy_from_slice(&0x8000u16.to_be_bytes());
+    image[0x4e..0x50].copy_from_slice(&4u16.to_be_bytes());
+    image[0x50..].fill(0xea);
+    image
+}
+
 /// The standard z64 (big-endian) N64 dump signature.
 const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
 
@@ -951,6 +968,58 @@ fn loose_commodore_disks_are_discovered_as_computer_disks() {
             && item.validation_state == ValidationState::Accepted
     }));
     assert_eq!(report.stats.computer_disks, 4);
+}
+
+#[test]
+fn crt_is_structurally_discovered_but_needs_folder_platform_evidence() {
+    let bare = source_dir("crt-bare");
+    std::fs::write(bare.path().join("cart.crt"), minimal_crt()).unwrap();
+    let report = discover_source(bare.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert_eq!(report.items[0].platform_hint, None);
+    assert_eq!(report.items[0].validation_state, ValidationState::Skipped);
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+
+    let c64 = source_dir("crt-c64");
+    let folder = c64.path().join("c64");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("cart.crt"), minimal_crt()).unwrap();
+    let report = discover_source(&folder).unwrap();
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert_eq!(
+        report.items[0].platform_hint.as_deref(),
+        Some("Commodore 64")
+    );
+    assert_eq!(report.items[0].validation_state, ValidationState::Accepted);
+}
+
+#[test]
+fn random_crt_does_not_gain_identity_from_its_filename() {
+    let root = source_dir("crt-random");
+    std::fs::write(root.path().join("c64.crt"), vec![0x5a; 128]).unwrap();
+    let report = discover_source(root.path()).unwrap();
+    assert_eq!(report.items[0].platform_hint, None);
+    assert_eq!(report.items[0].validation_state, ValidationState::Skipped);
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(SkipReason::InvalidContent(
+            "CRT signature is not `C64 CARTRIDGE   `".to_string()
+        ))
+    );
+}
+
+#[test]
+fn archive_member_crt_is_discovered_as_computer_disk_content() {
+    let dir = source_dir("zip-crt");
+    write_zip_containing(dir.path(), "Cartridges.zip", "Game.crt", b"CRT bytes");
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert!(matches!(report.items[0].container, ContainerKind::Archive(_)));
 }
 
 #[test]
