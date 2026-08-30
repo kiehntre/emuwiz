@@ -117,8 +117,9 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "sms", "gen", "32x", "pce", "ws", "wsc", "ngp", "ngc", "a26", "a52", "a78", "j64", "col",
     "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom", "mx1", "mx2",
     "d88", "hdi", "nhd", // Disc-image extensions.
-    "iso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd", "gdi",
-    "cdi", "pbp", "ecm", // Apple II and Macintosh media/archive extensions.
+    "iso", "xiso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd",
+    "gdi", "cdi", "pbp", "ecm", "xbe",
+    "xex", // Apple II and Macintosh media/archive extensions.
     "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
     // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",

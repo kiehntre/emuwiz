@@ -477,6 +477,7 @@ fn content_label(content: ContentKind) -> &'static str {
         ContentKind::TapeImage => "Cassette/tape image",
         ContentKind::MachineSnapshot => "Machine snapshot",
         ContentKind::Archive => "Archive",
+        ContentKind::Executable => "Game executable",
         ContentKind::WhdloadInstall => "WHDLoad install",
         ContentKind::ExtractedGameFolder => "Game folder",
     }

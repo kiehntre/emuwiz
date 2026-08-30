@@ -101,6 +101,18 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "ciso",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "xiso",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "xbe",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "xex",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // Loose Commodore floppy-disk images. Neither is a container format
     // EmuWiz can mount or unwrap - catalogued directly, like every other
     // `DirectGameImage` entry. Which Commodore platform a given file
@@ -508,6 +520,18 @@ mod tests {
             Some(ArchiveKind::DirectGameImage)
         );
         assert_eq!(kind_for_extension("bin"), None);
+    }
+
+    #[test]
+    fn xbox_executables_and_xiso_are_direct_media() {
+        for extension in ["xbe", "xex", "xiso"] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be a direct game image"
+            );
+        }
+        assert_eq!(kind_for_extension("god"), None);
     }
 
     #[test]

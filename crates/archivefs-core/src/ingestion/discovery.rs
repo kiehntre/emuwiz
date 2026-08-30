@@ -219,7 +219,7 @@ impl DiscoveryStats {
                 self.computer_disks += 1
             }
             Some(ContentKind::MachineSnapshot) => self.snapshots += 1,
-            Some(ContentKind::Archive) => self.archives += 1,
+            Some(ContentKind::Archive) | Some(ContentKind::Executable) => self.archives += 1,
             Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
                 self.game_folders += 1
             }
@@ -691,6 +691,9 @@ fn discover_direct_file(
     if matches!(extension.as_str(), "ssd" | "dsd") {
         return discover_dfs_media(path, source_root);
     }
+    if matches!(extension.as_str(), "xbe" | "xex" | "xiso") {
+        return discover_xbox_content(path, source_root, &extension);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -732,6 +735,42 @@ fn discover_direct_file(
             skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
         },
     }
+}
+
+fn discover_xbox_content(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {
+    let (platform, content) = match extension {
+        "xbe" => ("Xbox", ContentKind::Executable),
+        "xex" => ("Xbox360", ContentKind::Executable),
+        "xiso" => ("Xbox", ContentKind::DiscImage),
+        _ => unreachable!("called only for registered Xbox extensions"),
+    };
+    let identity = crate::game_identity::inspect_catalogued_game_identity(path, Some(platform));
+    if identity.complete
+        && identity.platform
+            == crate::game_identity::IdentityPlatform::from_catalogue(Some(platform))
+    {
+        return accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            content,
+            identity_for(path, source_root),
+            format!(
+                "{} content validated by its existing bounded identity path.",
+                content.label()
+            ),
+        );
+    }
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(content),
+        SkipReason::InvalidContent(format!(
+            ".{extension} did not pass its Xbox identity checks"
+        )),
+        format!(
+            "This .{extension} file was recognised, but its Xbox structure or identity did not validate."
+        ),
+    )
 }
 
 /// `.rdb` is registered unconditionally as [`ContentKind::AmigaImage`] (see

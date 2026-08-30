@@ -40,6 +40,9 @@ pub enum ContentKind {
     MachineSnapshot,
     /// An archive format recognised as game content, but not a disk image.
     Archive,
+    /// A directly stored console game executable. The executable's own
+    /// format parser still decides whether identity is valid.
+    Executable,
     /// A folder that is itself a WHDLoad installation (contains a
     /// `.slave` file), not a folder to recurse into.
     WhdloadInstall,
@@ -61,6 +64,7 @@ impl ContentKind {
             Self::TapeImage => "Cassette/tape image",
             Self::MachineSnapshot => "Machine snapshot",
             Self::Archive => "Archive",
+            Self::Executable => "Game executable",
             Self::WhdloadInstall => "WHDLoad install",
             Self::ExtractedGameFolder => "Game folder",
         }
@@ -117,6 +121,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("chd", ContentKind::DiscImage),
     cf("gdi", ContentKind::DiscImage),
     cf("cdi", ContentKind::DiscImage),
+    cf("xiso", ContentKind::DiscImage),
+    // Console executables are direct content, not archives or disc images.
+    cf("xbe", ContentKind::Executable),
+    cf("xex", ContentKind::Executable),
     // --- Amiga ---
     // `.hdf`/`.hdfx` are deliberately NOT registered here: they are a
     // real-world extension collision (Sharp X68000 hard-disk images also
@@ -281,5 +289,22 @@ mod tests {
             content_kind_for_extension("sit"),
             Some(ContentKind::Archive)
         );
+    }
+
+    #[test]
+    fn xbox_executables_and_xiso_have_distinct_content_categories() {
+        assert_eq!(
+            content_kind_for_extension("xbe"),
+            Some(ContentKind::Executable)
+        );
+        assert_eq!(
+            content_kind_for_extension("xex"),
+            Some(ContentKind::Executable)
+        );
+        assert_eq!(
+            content_kind_for_extension("xiso"),
+            Some(ContentKind::DiscImage)
+        );
+        assert_eq!(content_kind_for_extension("god"), None);
     }
 }
