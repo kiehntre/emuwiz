@@ -4900,6 +4900,12 @@ impl ArchiveFsApp {
         self.tools_overlay = ToolsOverlay::None;
     }
 
+    fn navigate_to_missing_catalogue_review(&mut self) {
+        self.navigate_to_library_tab(LibraryTab::Archives);
+        administration_pages::set_missing_review_mode(&mut self.library_filters, true);
+        self.archive_context.clear_selection();
+    }
+
     /// `ProblemsRepairTab`'s exact counterpart to `navigate_to_library_tab` -
     /// same synchronization rule, same reason for existing (called by the
     /// consolidated page's own tab row).
@@ -6164,7 +6170,12 @@ impl ArchiveFsApp {
                 }
             }
             ProblemsRepairTab::Diagnostics => {
+                let stale_review_clicked =
+                    problems_repair_page::show_stale_library_review_entry(ui, &self.doctor_scan);
                 self.show_doctor_page_body(ui, context);
+                if stale_review_clicked {
+                    self.navigate_to_missing_catalogue_review();
+                }
             }
             ProblemsRepairTab::Repair => {
                 // Review and History are rendered together rather than as a
@@ -17942,8 +17953,7 @@ impl ArchiveFsApp {
                     self.refresh_diagnostics(context);
                 }
                 HealthDashboardAction::OpenMissingReview => {
-                    self.navigate_to_library_tab(LibraryTab::Archives);
-                    self.library_filters.missing = true;
+                    self.navigate_to_missing_catalogue_review();
                 }
                 HealthDashboardAction::OpenDuplicateReview => {
                     self.navigate_to_library_tab(LibraryTab::Duplicates);

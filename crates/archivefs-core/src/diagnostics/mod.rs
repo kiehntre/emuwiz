@@ -964,7 +964,7 @@ fn health_issue_recovery(issue: &HealthIssue) -> Option<KnownRecovery> {
         )),
         None if issue.category == HealthCategory::Missing => Some(KnownRecovery::new(
             None,
-            "Library → Health, Review missing archives",
+            "Problems & Repair, Review stale library entries",
         )),
         None => None,
     }

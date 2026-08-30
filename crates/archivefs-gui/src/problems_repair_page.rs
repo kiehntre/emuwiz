@@ -121,3 +121,58 @@ pub(crate) fn show_problems_repair_overview(
     });
     go_to
 }
+
+/// Shows the safe, navigation-only front door for catalogue entries that were
+/// not seen by the latest successful scan.  The actual review and removal
+/// controls remain on Library -> Archives, where the existing selection,
+/// validation, and confirmation flow owns them.
+pub(crate) fn show_stale_library_review_entry(
+    ui: &mut egui::Ui,
+    doctor_scan: &DoctorScanState,
+) -> bool {
+    let count = stale_library_entry_count(doctor_scan);
+    if count == 0 {
+        return false;
+    }
+
+    let mut clicked = false;
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{count} stale library entr{}",
+                    if count == 1 { "y" } else { "ies" }
+                ))
+                .strong(),
+            );
+            if widgets::action_button(
+                ui,
+                format!("Review stale library entries ({count})"),
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                clicked = true;
+            }
+        });
+        ui.add(egui::Label::new(
+            "These catalogue entries were not seen during the latest successful scan. Review them before removing stale entries from EmuWiz. Original ROM and archive files are never deleted by this action.",
+        ).wrap());
+    });
+    clicked
+}
+
+pub(crate) fn stale_library_entry_count(doctor_scan: &DoctorScanState) -> usize {
+    doctor_scan
+        .displayed()
+        .map(|outcome| {
+            outcome
+                .scan
+                .findings
+                .iter()
+                .filter(|finding| finding.id == "library.archive_missing")
+                .count()
+        })
+        .unwrap_or(0)
+}

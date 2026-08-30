@@ -971,30 +971,39 @@ pub(crate) fn show_loaded_data(
                     && !library_filters.present
                     && !library_filters.awaiting_validation;
                 let selected_missing = selected_missing_paths(cached, selected_archives);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("Missing catalogue entries: {missing_count}"));
-                    if ui
-                        .checkbox(&mut missing_only, "Show missing only")
-                        .changed()
-                    {
-                        set_missing_review_mode(library_filters, missing_only);
-                    }
-                    let enabled = missing_removal_available && selected_missing.is_ok();
-                    let response =
-                        ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
-                    if !enabled && let Err(reason) = &selected_missing {
-                        response.clone().on_hover_text(reason);
-                    }
-                    if response.clicked()
-                        && let Ok(paths) = &selected_missing
-                    {
-                        *confirm_remove_missing = Some(paths.clone());
-                    }
-                    if missing_removal_busy {
-                        ui.spinner();
-                        ui.label("Removing catalogue entries...");
-                    }
-                });
+                if !missing_only {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("Missing catalogue entries: {missing_count}"));
+                        if ui
+                            .checkbox(&mut missing_only, "Show missing only")
+                            .changed()
+                        {
+                            set_missing_review_mode(library_filters, missing_only);
+                        }
+                        let enabled = missing_removal_available && selected_missing.is_ok();
+                        let response = ui
+                            .add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
+                        if !enabled && let Err(reason) = &selected_missing {
+                            response.clone().on_hover_text(reason);
+                        }
+                        if response.clicked()
+                            && let Ok(paths) = &selected_missing
+                        {
+                            *confirm_remove_missing = Some(paths.clone());
+                        }
+                        if missing_removal_busy {
+                            ui.spinner();
+                            ui.label("Removing catalogue entries...");
+                        }
+                    });
+                }
+                if missing_only && missing_count > 0 {
+                    // The action is repeated below the filter card when this
+                    // review mode is active so it is visible without opening
+                    // More filters. Keep the explanatory text here as well
+                    // for the ordinary in-card transition into this mode.
+                    ui.label("Showing missing entries only.");
+                }
 
                 if let Some(paths) = confirm_remove_missing.clone() {
                     let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
@@ -1040,6 +1049,38 @@ pub(crate) fn show_loaded_data(
                 }
             });
     });
+    let missing_count = merged_rows
+        .iter()
+        .filter(|row| row.origin == RowOrigin::CachedMissing)
+        .count();
+    let missing_only =
+        library_filters.missing && !library_filters.present && !library_filters.awaiting_validation;
+    if missing_only && missing_count > 0 {
+        let selected_missing = selected_missing_paths(cached, selected_archives);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Missing catalogue entries: {missing_count}"));
+            let enabled = missing_removal_available && selected_missing.is_ok();
+            let response = ui.add_enabled(enabled, egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL));
+            if !enabled && let Err(reason) = &selected_missing {
+                response.clone().on_hover_text(reason);
+            }
+            if response.clicked()
+                && let Ok(paths) = &selected_missing
+            {
+                *confirm_remove_missing = Some(paths.clone());
+            }
+            if missing_removal_busy {
+                ui.spinner();
+                ui.label("Removing catalogue entries...");
+            }
+        });
+        ui.add(
+            egui::Label::new(
+                "Reviewing stale catalogue entries only. Removing them changes EmuWiz's catalogue, not original ROM/archive files, source folders, symlinks, or mounts. A file can be catalogued again after a later successful scan; removal has no persistent undo journal.",
+            )
+            .wrap(),
+        );
+    }
     ui.add_space(8.0);
 
     let base_indices: Vec<usize> = filtered_rows

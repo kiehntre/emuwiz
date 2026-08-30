@@ -2241,6 +2241,18 @@ fn doctor_page_shows_evidence_only_for_the_selected_finding() {
 }
 
 #[test]
+fn stale_catalogue_entry_count_is_present_only_for_missing_findings() {
+    let missing = doctor_outcome(doctor_scan_from(&[
+        doctor_health_issue("/roms/a.zip", HealthCategory::Missing),
+        doctor_health_issue("/roms/b.zip", HealthCategory::Missing),
+    ]));
+    assert_eq!(problems_repair_page::stale_library_entry_count(&missing), 2);
+
+    let healthy = doctor_outcome(doctor_scan_from(&[]));
+    assert_eq!(problems_repair_page::stale_library_entry_count(&healthy), 0);
+}
+
+#[test]
 fn doctor_page_shows_why_it_matters_and_the_next_step_when_one_exists() {
     let setup = SetupDiagnostics {
         config_path: Some(PathBuf::from("/config/config.toml")),
