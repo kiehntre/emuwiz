@@ -334,10 +334,10 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
     },
     PlatformEvidenceCoverage {
         canonical_id: "N64",
-        detector_modules: &["n64_byte_order", "n64_header_evidence"],
+        detector_modules: &["n64_byte_order", "n64_header_evidence", "n64_cic_evidence"],
         normalization: true,
         real_validation: ValidationStatus::RealValidated,
-        notes: "Real specimens: Aerofighters Assault (z64) and 1080 Snowboarding (v64) - Resolved through fusion (Batch 4/5)",
+        notes: "Real specimens: Aerofighters Assault (z64) and 1080 Snowboarding (v64) validate existing byte-order/fusion paths (Batch 4/5); N64 CIC real-retail coverage is fingerprint metadata only because no legally distributable IPL3 bytes are checked in, and full-ROM CRC1/CRC2 remains unvalidated against a real image",
         real_validation_provenance: None,
         dat_validation: Some(RealDatValidation {
             dat_family: "TOSEC",

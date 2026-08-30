@@ -43,10 +43,11 @@
 //! algorithm over the ROM's boot code, seeded differently per CIC chip -
 //! they are read here as plain header fields, exactly as declared, and
 //! **never** treated as, or compared against, a whole-file hash of any
-//! kind. This module does not attempt to recompute or validate them (doing
-//! so correctly requires CIC detection, which this milestone's own scope
-//! notes explicitly defer rather than invent) - they are reported as raw
-//! facts a resolver could later use, nothing more.
+//! kind. This module does not attempt to recompute or validate them - that
+//! responsibility belongs to [`crate::n64_cic_evidence`] - they are reported as raw
+//! facts a resolver could later use, nothing more. CIC identification and
+//! CIC-specific validation live separately in
+//! [`crate::n64_cic_evidence`].
 
 use crate::cartridge_header::ascii_field;
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};

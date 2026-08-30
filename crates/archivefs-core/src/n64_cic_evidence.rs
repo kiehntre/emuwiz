@@ -145,7 +145,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verified_bootcode_crc_fixtures_map_without_a_default() {
+    fn published_real_retail_fingerprints_map_without_a_default() {
+        // Fingerprint-only corpus: the source projects publish the real
+        // retail IPL3 CRC32 values, while copyrighted IPL3 bytes are not
+        // redistributed in this repository.
         let fixtures = [
             ("6170a4a1", CicVariant::Nus6101),
             ("90bb6cb5", CicVariant::Nus6102Or7101),
