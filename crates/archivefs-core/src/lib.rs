@@ -5418,12 +5418,11 @@ pub fn detect_platform_with_details(
 ///
 /// `Confirmed` evidence (an explicit assignment or a magic-byte
 /// signature) is always used. `Probable` evidence - typically a strong
-/// extension alone - is used when the extension has exactly one platform
-/// owner and the platform has no known look-alike, with the MSX/MSX2
-/// generation-specific `.mx1`/`.mx2` pair as the explicit exception.
-/// A `.rvz`/`.wbfs` file remains subject to the existing GameCube/Wii
-/// conflict handling, so this is not a blanket "any strong extension is
-/// confirmed" rule.
+/// extension alone - is used only when the resolved platform's own
+/// `conflicts_with` is empty, with MSX/MSX2 and the Apple II/Macintosh
+/// media family as explicit registry-policy exceptions. A `.rvz`/`.wbfs`
+/// file remains subject to the existing GameCube/Wii conflict handling, so
+/// this is not a blanket "any strong extension is confirmed" rule.
 fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<String> {
     let mut request = platform::DetectionRequest::new(path, source_root);
     request.read_signatures = true;
@@ -5432,21 +5431,15 @@ fn detect_platform_from_registry(path: &Path, source_root: &Path) -> Option<Stri
     match report.confidence {
         platform::DetectionConfidence::Confirmed => Some(platform.to_string()),
         platform::DetectionConfidence::Probable => {
-            // A single platform-specific extension is enough for this
-            // registry fallback, even when the platform has a related
-            // generation listed in `conflicts_with` (for example `.mx1`
-            // versus `.mx2`). Shared strong extensions still produce an
-            // Ambiguous report before reaching this branch.
-            let unambiguous = platform::platform_candidates_for_extension(
-                &path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or_default(),
-            )
-            .len()
-                == 1
-                && (platform::platform_by_id(platform)
-                    .is_some_and(|entry| entry.conflicts_with.is_empty())
+            // Apple II and Macintosh are the one paired family whose strong
+            // media extensions remain discoverable as registry candidates
+            // while declaring their mutual conflict. Folder aliases are
+            // handled earlier and continue to outrank this tier.
+            let apple_family = matches!(platform, "Apple II" | "Macintosh");
+            let unambiguous = report.candidates.len() == 1
+                && (apple_family
+                    || platform::platform_by_id(platform)
+                        .is_some_and(|entry| entry.conflicts_with.is_empty())
                     || matches!(platform, "MSX" | "MSX2"));
             unambiguous.then(|| platform.to_string())
         }

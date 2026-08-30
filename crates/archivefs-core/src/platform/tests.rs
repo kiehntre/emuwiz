@@ -678,6 +678,68 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
 }
 
 #[test]
+fn apple_and_macintosh_strong_extensions_are_registry_candidates() {
+    for (extension, expected) in [
+        ("do", "Apple II"),
+        ("po", "Apple II"),
+        ("woz", "Apple II"),
+        ("2mg", "Apple II"),
+        ("nib", "Apple II"),
+        ("hfv", "Macintosh"),
+        ("dc42", "Macintosh"),
+        ("sit", "Macintosh"),
+    ] {
+        let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
+        assert_eq!(report.platform, Some(expected), ".{extension}");
+        assert_eq!(
+            report.deciding_source,
+            Some(DetectionSource::StrongExtension)
+        );
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+    }
+}
+
+#[test]
+fn apple_and_macintosh_conflicting_folder_evidence_keeps_folder_precedence() {
+    for (folder, extension, expected, conflict) in [
+        ("macintosh", "woz", "Macintosh", "Apple II"),
+        ("apple2", "dc42", "Apple II", "Macintosh"),
+    ] {
+        let report = detect(&format!("{ROOT}/{folder}/game.{extension}"));
+        assert_eq!(report.platform, Some(expected));
+        assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|e| e.source == DetectionSource::StrongExtension && e.platform == conflict)
+        );
+    }
+}
+
+#[test]
+fn shared_extensions_and_unsupported_apple_aliases_fail_closed() {
+    for (extension, forbidden) in [
+        ("dsk", "Apple II"),
+        ("dsk", "Macintosh"),
+        ("img", "Apple II"),
+        ("img", "Macintosh"),
+        ("bin", "Macintosh"),
+        ("iso", "Macintosh"),
+    ] {
+        let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
+        assert_ne!(report.platform, Some(forbidden));
+    }
+    for alias in ["apple-lisa", "apple-pippin"] {
+        assert_eq!(
+            platform_for_folder(alias),
+            None,
+            "{alias} must stay unsupported"
+        );
+    }
+}
+
+#[test]
 fn commodore_1571_and_1581_extensions_resolve_to_c128() {
     for extension in ["d71", "d81"] {
         let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));

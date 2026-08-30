@@ -118,7 +118,9 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom", "mx1", "mx2",
     "d88", "hdi", "nhd", // Disc-image extensions.
     "iso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd", "gdi",
-    "cdi", "pbp", "ecm", // Executable/installer extensions.
+    "cdi", "pbp", "ecm", // Apple II and Macintosh media/archive extensions.
+    "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
+    // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",
 ];
 
@@ -680,6 +682,17 @@ mod tests {
                 classify_entry(&format!("inner.{extension}"), false),
                 InspectorEntryClassification::NestedArchive,
                 "extension {extension} must classify as a nested archive"
+            );
+        }
+    }
+
+    #[test]
+    fn apple_media_extensions_are_likely_content() {
+        for extension in ["do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit"] {
+            assert_eq!(
+                classify_entry(&format!("game.{extension}"), false),
+                InspectorEntryClassification::LikelyContent,
+                ".{extension} must be discoverable content"
             );
         }
     }

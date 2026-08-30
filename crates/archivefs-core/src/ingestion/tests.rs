@@ -711,6 +711,43 @@ fn fds_is_discovered_as_nes_computer_disk_media() {
 }
 
 #[test]
+fn apple_media_is_discovered_with_platform_and_sit_keeps_archive_content() {
+    let root = source_dir("apple-media");
+    for extension in ["do", "po", "woz", "2mg", "nib"] {
+        std::fs::write(
+            root.path().join(format!("game.{extension}")),
+            b"fixture bytes",
+        )
+        .unwrap();
+    }
+    let mac = source_dir("macintosh-media");
+    for extension in ["hfv", "dc42", "sit"] {
+        std::fs::write(
+            mac.path().join(format!("game.{extension}")),
+            b"fixture bytes",
+        )
+        .unwrap();
+    }
+
+    let mut items = discover_source(root.path()).unwrap().items;
+    items.extend(discover_source(mac.path()).unwrap().items);
+    assert_eq!(items.len(), 8);
+    for item in &items {
+        assert_eq!(item.validation_state, ValidationState::Accepted, "{item:?}");
+        if item.path.extension().and_then(|e| e.to_str()) == Some("sit") {
+            assert_eq!(item.content, Some(ContentKind::Archive));
+            assert_eq!(item.platform_hint.as_deref(), Some("Macintosh"));
+        } else if ["hfv", "dc42"].contains(&item.path.extension().unwrap().to_str().unwrap()) {
+            assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+            assert_eq!(item.platform_hint.as_deref(), Some("Macintosh"));
+        } else {
+            assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+            assert_eq!(item.platform_hint.as_deref(), Some("Apple II"));
+        }
+    }
+}
+
+#[test]
 fn loose_commodore_disks_are_discovered_as_computer_disks() {
     let root = source_dir("commodore-disks");
     let dir = root.path().join("c128");

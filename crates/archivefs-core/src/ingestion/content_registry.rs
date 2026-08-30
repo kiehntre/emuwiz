@@ -38,6 +38,8 @@ pub enum ContentKind {
     /// only - the Sinclair family it belongs to comes from parsing the
     /// bytes, not from this table.
     MachineSnapshot,
+    /// An archive format recognised as game content, but not a disk image.
+    Archive,
     /// A folder that is itself a WHDLoad installation (contains a
     /// `.slave` file), not a folder to recurse into.
     WhdloadInstall,
@@ -58,6 +60,7 @@ impl ContentKind {
             Self::ComputerDisk => "Computer disk image",
             Self::TapeImage => "Cassette/tape image",
             Self::MachineSnapshot => "Machine snapshot",
+            Self::Archive => "Archive",
             Self::WhdloadInstall => "WHDLoad install",
             Self::ExtractedGameFolder => "Game folder",
         }
@@ -136,6 +139,16 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("ima", ContentKind::ComputerDisk),
     cf("img", ContentKind::ComputerDisk),
     cf("d88", ContentKind::ComputerDisk),
+    // Apple II disk images.
+    cf("do", ContentKind::ComputerDisk),
+    cf("po", ContentKind::ComputerDisk),
+    cf("woz", ContentKind::ComputerDisk),
+    cf("2mg", ContentKind::ComputerDisk),
+    cf("nib", ContentKind::ComputerDisk),
+    // Macintosh disk images and archives.
+    cf("hfv", ContentKind::ComputerDisk),
+    cf("dc42", ContentKind::ComputerDisk),
+    cf("sit", ContentKind::Archive),
     // ZX Spectrum TR-DOS media. The *category* is a computer disk/archive;
     // the ZX Spectrum platform is confirmed only when
     // `crate::disk_format::inspect_disk_format` validates the TR-DOS system
@@ -244,6 +257,21 @@ mod tests {
         assert_eq!(
             content_kind_for_extension("nhd"),
             Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn apple_disk_extensions_are_computer_disks_and_sit_is_an_archive() {
+        for extension in ["do", "po", "woz", "2mg", "nib", "hfv", "dc42"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::ComputerDisk),
+                ".{extension} must be a computer disk"
+            );
+        }
+        assert_eq!(
+            content_kind_for_extension("sit"),
+            Some(ContentKind::Archive)
         );
     }
 }

@@ -1416,6 +1416,7 @@ fn content_db_str(content: crate::ingestion::ContentKind) -> &'static str {
         ContentKind::ComputerDisk => "computer_disk",
         ContentKind::TapeImage => "tape_image",
         ContentKind::MachineSnapshot => "machine_snapshot",
+        ContentKind::Archive => "archive",
         ContentKind::WhdloadInstall => "whdload_install",
         ContentKind::ExtractedGameFolder => "extracted_game_folder",
     }
@@ -1430,6 +1431,7 @@ fn content_from_db_str(value: &str) -> Option<crate::ingestion::ContentKind> {
         "computer_disk" => ContentKind::ComputerDisk,
         "tape_image" => ContentKind::TapeImage,
         "machine_snapshot" => ContentKind::MachineSnapshot,
+        "archive" => ContentKind::Archive,
         "whdload_install" => ContentKind::WhdloadInstall,
         "extracted_game_folder" => ContentKind::ExtractedGameFolder,
         _ => return None,

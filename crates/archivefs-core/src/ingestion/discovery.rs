@@ -216,6 +216,7 @@ impl DiscoveryStats {
                 self.computer_disks += 1
             }
             Some(ContentKind::MachineSnapshot) => self.snapshots += 1,
+            Some(ContentKind::Archive) => self.archives += 1,
             Some(ContentKind::WhdloadInstall) | Some(ContentKind::ExtractedGameFolder) => {
                 self.game_folders += 1
             }

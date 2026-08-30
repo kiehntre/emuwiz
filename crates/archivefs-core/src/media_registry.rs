@@ -167,6 +167,42 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "d88",
         kind: ArchiveKind::DirectGameImage,
     },
+    // Apple II disk images. The platform registry supplies the Apple II
+    // identity; this registry only records the media projection.
+    MediaFormat {
+        extension: "do",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "po",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "woz",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "2mg",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "nib",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    // Macintosh disk images and StuffIt archives are media registrations;
+    // `.sit` retains its Archive content classification in ingestion.
+    MediaFormat {
+        extension: "hfv",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "dc42",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "sit",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // CHD (MAME Compressed Hunks of Data). Shared by many disc-based
     // platforms (Neo Geo CD, Sega CD, arcade sets, redump CD/DVD sets...);
     // resolving *which* platform a `.chd` belongs to is, again, the
@@ -485,6 +521,17 @@ mod tests {
                 kind_for_extension(extension),
                 Some(ArchiveKind::DirectGameImage),
                 ".{extension} must be a direct game image"
+            );
+        }
+    }
+
+    #[test]
+    fn apple_media_extensions_are_recognized_as_direct_game_images() {
+        for extension in ["do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit"] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be a direct media registration"
             );
         }
     }
