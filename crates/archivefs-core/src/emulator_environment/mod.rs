@@ -31,6 +31,7 @@
 //! does not import from, or get imported by, [`retroarch`].
 
 pub mod es_de;
+pub mod mame;
 pub mod retroarch;
 
 use std::ffi::OsString;

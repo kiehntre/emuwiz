@@ -74,6 +74,8 @@ pub mod flycast_command;
 pub mod flycast_execution;
 pub mod input_projection;
 pub mod integration;
+pub mod mame_command;
+pub mod mame_execution;
 pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;
@@ -149,6 +151,13 @@ pub use input_projection::{
 };
 pub use integration::{
     DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,
+};
+pub use mame_command::{
+    MAME_SUPPORTED_PLATFORM_ID, MameCommand, MameCommandPlan, build_mame_command_plan,
+};
+pub use mame_execution::{
+    MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
+    preflight_and_launch_mame, preflight_mame_launch, spawn_mame,
 };
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,

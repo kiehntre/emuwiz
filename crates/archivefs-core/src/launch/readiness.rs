@@ -263,6 +263,24 @@ pub enum LaunchBlockerKind {
     /// see the blocker detail for the underlying
     /// [`crate::patch_manager::XemuLaunchBlockerKind`].
     XemuBindingUnavailable,
+    /// A MAME launch requires a resolved Arcade platform.
+    MamePlatformMismatch,
+    /// No unique DAT-backed MAME set identity is available.
+    MameSetIdentityUnavailable,
+    /// More than one DAT-backed MAME set identity remains possible.
+    MameSetIdentityAmbiguous,
+    /// The selected MAME set is not storage-complete.
+    MameSetIncomplete,
+    /// The selected set's dependency resolver reports a blocking state.
+    MameDependencyBlocked,
+    /// Set/dependency evidence was not trustworthy enough to launch.
+    MameSetVerdictUnavailable,
+    /// No executable binding was discovered for MAME.
+    MameEmulatorUnavailable,
+    /// The configured MAME ROM/search-path arrangement is not explicit.
+    MameSearchPathUnconfigured,
+    /// The requested launch arrangement is outside this native MAME slice.
+    MameLaunchArrangementUnsupported,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
