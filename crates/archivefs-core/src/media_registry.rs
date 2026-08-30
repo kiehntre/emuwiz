@@ -115,6 +115,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "g64",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "d71",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "d81",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // Computer disks and cassette images are recognised media families, but
     // their extensions are deliberately not platform authority. A `.dsk`,
     // `.img`, `.tap`, or `.cdt` remains platform-unresolved until evidence
@@ -361,6 +369,17 @@ mod tests {
             kind_for_extension("gba"),
             Some(ArchiveKind::DirectGameImage)
         );
+    }
+
+    #[test]
+    fn commodore_disk_extensions_are_recognized_as_direct_game_images() {
+        for extension in ["d64", "g64", "d71", "d81"] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be a direct game image"
+            );
+        }
     }
 
     #[test]

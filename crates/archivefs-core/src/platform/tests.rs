@@ -674,6 +674,40 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
     }
 }
 
+#[test]
+fn commodore_1571_and_1581_extensions_resolve_to_c128() {
+    for extension in ["d71", "d81"] {
+        let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
+        assert_eq!(report.platform, Some("Commodore 128"), ".{extension}");
+        assert_eq!(report.confidence, DetectionConfidence::Probable);
+    }
+}
+
+#[test]
+fn c128_folder_precedence_keeps_d64_and_g64_on_c128() {
+    for extension in ["d64", "g64"] {
+        let report = detect(&format!("{ROOT}/c128/game.{extension}"));
+        assert_eq!(report.platform, Some("Commodore 128"), ".{extension}");
+        assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+    }
+}
+
+#[test]
+fn d81_in_c64_folder_surfaces_the_conflicting_c128_extension_evidence() {
+    let report = detect(&format!("{ROOT}/c64/game.d81"));
+    assert_eq!(report.platform, Some("Commodore 64"));
+    assert_eq!(report.deciding_source, Some(DetectionSource::FolderAlias));
+    assert!(report.evidence.iter().any(|e| {
+        e.source == DetectionSource::StrongExtension && e.platform == "Commodore 128"
+    }));
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "Commodore 128")
+    );
+}
+
 /// Test 23
 #[test]
 fn a_folder_alias_defeats_a_contradicting_weak_extension() {

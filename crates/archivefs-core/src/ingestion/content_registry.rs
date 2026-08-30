@@ -123,6 +123,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("lha", ContentKind::AmigaImage),
     // --- Computer formats already supported elsewhere in EmuWiz ---
     cf("dsk", ContentKind::ComputerDisk),
+    cf("d64", ContentKind::ComputerDisk),
+    cf("g64", ContentKind::ComputerDisk),
+    cf("d71", ContentKind::ComputerDisk),
+    cf("d81", ContentKind::ComputerDisk),
     cf("st", ContentKind::ComputerDisk),
     cf("msa", ContentKind::ComputerDisk),
     cf("ipf", ContentKind::ComputerDisk),

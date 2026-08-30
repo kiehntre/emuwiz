@@ -649,6 +649,46 @@ fn every_registered_content_extension_is_discovered_end_to_end() {
     }
 }
 
+#[test]
+fn loose_commodore_disks_are_discovered_as_computer_disks() {
+    let root = source_dir("commodore-disks");
+    let dir = root.path().join("c128");
+    std::fs::create_dir_all(&dir).unwrap();
+    for extension in ["d64", "g64", "d71", "d81"] {
+        std::fs::write(dir.join(format!("fixture.{extension}")), b"fixture bytes").unwrap();
+    }
+
+    let report = discover_source(&dir).unwrap();
+    assert_eq!(
+        report.items.len(),
+        4,
+        "all four Commodore disks must be visible"
+    );
+    assert!(report.items.iter().all(|item| {
+        item.content == Some(ContentKind::ComputerDisk)
+            && item.validation_state == ValidationState::Accepted
+    }));
+    assert_eq!(report.stats.computer_disks, 4);
+}
+
+#[test]
+fn c128_folder_keeps_d64_and_g64_as_c128_ingestion_items() {
+    let root = source_dir("c128-folder");
+    let c128 = root.path().join("c128");
+    std::fs::create_dir_all(&c128).unwrap();
+    for extension in ["d64", "g64"] {
+        std::fs::write(c128.join(format!("game.{extension}")), b"fixture bytes").unwrap();
+    }
+
+    let report = discover_source(&c128).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert!(report.items.iter().all(|item| {
+        item.content == Some(ContentKind::ComputerDisk)
+            && item.platform_hint.as_deref() == Some("Commodore 128")
+            && item.validation_state == ValidationState::Accepted
+    }));
+}
+
 // --- ZX Spectrum snapshots + +3 disks ---------------------------------
 
 fn z80_v1_uncompressed() -> Vec<u8> {
