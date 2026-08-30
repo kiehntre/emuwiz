@@ -1075,11 +1075,18 @@ pub(crate) fn show_loaded_data(
             }
         });
         ui.add(
-            egui::Label::new(
-                "Reviewing stale catalogue entries only. Removing them changes EmuWiz's catalogue, not original ROM/archive files, source folders, symlinks, or mounts. A file can be catalogued again after a later successful scan; removal has no persistent undo journal.",
-            )
-            .wrap(),
-        );
+                egui::Label::new(
+                    "Reviewing stale catalogue entries only. Removing them changes EmuWiz's catalogue, not original ROM/archive files, source folders, symlinks, or mounts. A file can be catalogued again after a later successful scan; removal has no persistent undo journal.",
+                )
+                .wrap(),
+            );
+        if !missing_removal_available {
+            ui.weak(
+                    "Removal is temporarily unavailable while the catalogue is loading or another operation is active.",
+                );
+        } else if selected_archives.is_empty() {
+            ui.weak("Select one or more missing entries to enable removal.");
+        }
     }
     ui.add_space(8.0);
 

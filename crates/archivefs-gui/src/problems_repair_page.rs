@@ -159,6 +159,9 @@ pub(crate) fn show_stale_library_review_entry(
         ui.add(egui::Label::new(
             "These catalogue entries were not seen during the latest successful scan. Review them before removing stale entries from EmuWiz. Original ROM and archive files are never deleted by this action.",
         ).wrap());
+        ui.weak(
+            "The Library review may include a small number of retained legacy companion-file entries that Doctor does not report as separate missing games.",
+        );
     });
     clicked
 }
