@@ -50,6 +50,8 @@ use crate::safe_read::{SafeFile, TrustedRoots, open_bounded_read};
 pub mod atari_st;
 pub mod atari_stx;
 pub mod dsk;
+pub mod scl;
+pub mod trd;
 
 #[cfg(test)]
 mod tests;
@@ -84,6 +86,25 @@ pub const MAX_PASTI_BYTES: u64 = 32 * 1024 * 1024;
 /// always 512-byte sectors; accepting others would weaken the check for no real
 /// coverage.
 pub const FLOPPY_SECTOR_BYTES: u32 = 512;
+
+/// A TR-DOS sector is always 256 bytes; a TR-DOS track is always 16 of them.
+pub const TRDOS_SECTOR_BYTES: u64 = 256;
+pub const TRDOS_TRACK_BYTES: u64 = 16 * TRDOS_SECTOR_BYTES;
+
+/// The largest `.trd` this module will treat as a TR-DOS disk. The biggest
+/// standard geometry is 80 tracks x 2 sides x 16 sectors x 256 = 655360; the
+/// slack covers over-formatted disks (a few extra tracks) without admitting
+/// anything hard-disk sized.
+pub const MAX_TRD_BYTES: u64 = 1024 * 1024;
+
+/// The largest `.scl` this module will read. An `.scl` can hold up to a full
+/// double-sided 80-track disk of files plus its own table and checksum; the
+/// slack keeps unusual packers inside the bound.
+pub const MAX_SCL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most files a TR-DOS catalogue (and therefore an `.scl` archive) can
+/// hold: the directory area is 8 sectors of 16-byte entries.
+pub const TRDOS_MAX_FILES: u8 = 128;
 
 /// The most track records a Pasti table may declare. Two sides of 84 tracks is
 /// already beyond any real Atari ST disk.
@@ -123,6 +144,17 @@ pub enum DiskFormat {
     /// track descriptors). That structure is specific to the Spectrum +3 /
     /// PCW disk family; Amstrad CPC AMSDOS disks do not carry it.
     SpectrumPlus3Disk,
+    /// A raw TR-DOS disk image (`.trd`), recognised from the Beta Disk
+    /// system/volume descriptor in track 0's ninth sector (the `0x10`
+    /// TR-DOS identifier, a documented disk-type byte, and geometry that
+    /// agrees with the file's length). TR-DOS is a ZX Spectrum-family
+    /// filesystem; no other platform writes this descriptor.
+    SpectrumTrDosDisk,
+    /// The `.scl` ("SINCLAIR") archive of TR-DOS files: an 8-byte signature,
+    /// a one-byte file count, a bounded 14-byte-per-entry directory, and a
+    /// payload whose size the entries account for exactly. Specific to the
+    /// TR-DOS / ZX Spectrum ecosystem.
+    SpectrumSclArchive,
 }
 
 impl DiskFormat {
@@ -132,6 +164,8 @@ impl DiskFormat {
             Self::AtariStPasti => "Atari ST Pasti (STX) image",
             Self::CpcEmuDsk => "CPCEMU DSK disk image",
             Self::SpectrumPlus3Disk => "ZX Spectrum +3 (+3DOS) disk image",
+            Self::SpectrumTrDosDisk => "ZX Spectrum TR-DOS disk image",
+            Self::SpectrumSclArchive => "ZX Spectrum SCL (SINCLAIR) archive",
         }
     }
 
@@ -144,6 +178,7 @@ impl DiskFormat {
             // `proves_platform`, which is `false` here.
             Self::CpcEmuDsk => "Amstrad CPC",
             Self::SpectrumPlus3Disk => "ZX Spectrum",
+            Self::SpectrumTrDosDisk | Self::SpectrumSclArchive => "ZX Spectrum",
         }
     }
 
@@ -162,7 +197,10 @@ impl DiskFormat {
     pub fn proves_platform(self) -> bool {
         match self {
             Self::AtariStRawFloppy | Self::CpcEmuDsk => false,
-            Self::AtariStPasti | Self::SpectrumPlus3Disk => true,
+            Self::AtariStPasti
+            | Self::SpectrumPlus3Disk
+            | Self::SpectrumTrDosDisk
+            | Self::SpectrumSclArchive => true,
         }
     }
 }
@@ -317,6 +355,39 @@ pub struct DskLayout {
     pub plus3_bootable: bool,
 }
 
+/// What one TR-DOS disk's system/volume descriptor (track 0, sector 9)
+/// declared. Every field is read from that one 256-byte sector; nothing is
+/// derived from a directory walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TrDosDescriptor {
+    /// Documented disk-type byte: `0x16` 80-track DS, `0x17` 40-track DS,
+    /// `0x18` 80-track SS, `0x19` 40-track SS.
+    pub disk_type: u8,
+    pub tracks_per_side: u16,
+    pub sides: u8,
+    /// Number of catalogued files (0..=128).
+    pub file_count: u8,
+    /// Free-space cursor, as the descriptor states it.
+    pub first_free_sector: u8,
+    pub first_free_track: u16,
+    pub free_sectors: u16,
+    /// The 8-byte disk label, when it is printable ASCII.
+    pub label: Option<[u8; 8]>,
+}
+
+/// What one `.scl` archive's header and directory declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SclLayout {
+    pub file_count: u8,
+    /// Total 256-byte sectors the directory entries account for between them.
+    pub declared_sectors: u32,
+    /// `true` when the file length matches "directory + payload + 4-byte
+    /// trailing checksum" rather than "directory + payload" exactly. The
+    /// checksum value itself is not verified (that needs a whole-file read,
+    /// outside this module's budget).
+    pub has_trailing_checksum: bool,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -325,6 +396,8 @@ pub enum DiskFormatMetadata {
     Floppy(FloppyGeometry),
     Pasti(PastiLayout),
     Dsk(DskLayout),
+    TrDos(TrDosDescriptor),
+    Scl(SclLayout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -427,6 +500,8 @@ pub fn inspect_disk_format(
         "st" => Adapter::AtariStRawFloppy,
         "stx" => Adapter::AtariStPasti,
         "dsk" => Adapter::CpcEmuDsk,
+        "trd" => Adapter::SpectrumTrDos,
+        "scl" => Adapter::SpectrumScl,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -449,6 +524,8 @@ pub fn inspect_disk_format(
         Adapter::AtariStRawFloppy => atari_st::inspect(&mut reader, context, cancel),
         Adapter::AtariStPasti => atari_stx::inspect(&mut reader, context, cancel),
         Adapter::CpcEmuDsk => dsk::inspect(&mut reader, context, cancel),
+        Adapter::SpectrumTrDos => trd::inspect(&mut reader, context, cancel),
+        Adapter::SpectrumScl => scl::inspect(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -464,6 +541,8 @@ enum Adapter {
     AtariStRawFloppy,
     AtariStPasti,
     CpcEmuDsk,
+    SpectrumTrDos,
+    SpectrumScl,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

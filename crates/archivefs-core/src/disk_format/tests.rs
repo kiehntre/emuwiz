@@ -1307,6 +1307,48 @@ fn dsk_standard_container_is_recognised_but_not_a_platform() {
     assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
 }
 
+// --- ZX Spectrum SCL ("SINCLAIR") archive -----------------------------
+
+/// Build an `.scl` from a list of per-file sector counts.
+fn scl_archive(files: &[u8], with_checksum: bool) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"SINCLAIR");
+    v.push(u8::try_from(files.len()).expect("<=128 files"));
+    for &sectors in files {
+        let mut entry = [0u8; 14];
+        entry[..8].copy_from_slice(b"GAME    ");
+        entry[8] = b'C';
+        entry[13] = sectors; // length in 256-byte sectors
+        v.extend_from_slice(&entry);
+    }
+    let payload: usize = files.iter().map(|&s| usize::from(s) * 256).sum();
+    v.extend(std::iter::repeat_n(0u8, payload));
+    if with_checksum {
+        let sum = v
+            .iter()
+            .fold(0u32, |acc, &b| acc.wrapping_add(u32::from(b)));
+        v.extend_from_slice(&sum.to_le_bytes());
+    }
+    v
+}
+
+#[test]
+fn scl_empty_archive_is_valid_zx_spectrum_evidence() {
+    let fixture = Fixture::new("scl-empty");
+    let path = fixture.write("library/empty.scl", &scl_archive(&[], false));
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumSclArchive));
+    assert_eq!(evidence.platform, Some("ZX Spectrum"));
+    assert!(evidence.conclusive);
+    assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+    let Some(DiskFormatMetadata::Scl(layout)) = evidence.metadata else {
+        panic!("expected scl layout");
+    };
+    assert_eq!(layout.file_count, 0);
+    assert_eq!(layout.declared_sectors, 0);
+    assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
+}
+
 #[test]
 fn dsk_extended_container_is_recognised() {
     let fixture = Fixture::new("dsk-extended");
@@ -1381,6 +1423,101 @@ fn dsk_truncated_into_its_track_data_is_a_geometry_mismatch() {
 }
 
 #[test]
+fn scl_one_and_many_file_archives_validate_with_and_without_checksum() {
+    let fixture = Fixture::new("scl-files");
+    let one = fixture.write("library/one.scl", &scl_archive(&[4], false));
+    let ev = fixture.inspect(&one);
+    assert_eq!(ev.format, Some(DiskFormat::SpectrumSclArchive));
+    let Some(DiskFormatMetadata::Scl(layout)) = ev.metadata else {
+        panic!()
+    };
+    assert_eq!(layout.file_count, 1);
+    assert_eq!(layout.declared_sectors, 4);
+    assert!(!layout.has_trailing_checksum);
+
+    let many = fixture.write("library/many.scl", &scl_archive(&[1, 2, 3, 9], true));
+    let ev = fixture.inspect(&many);
+    let Some(DiskFormatMetadata::Scl(layout)) = ev.metadata else {
+        panic!()
+    };
+    assert_eq!(layout.file_count, 4);
+    assert_eq!(layout.declared_sectors, 15);
+    assert!(layout.has_trailing_checksum);
+}
+
+#[test]
+fn scl_wrong_magic_is_refused() {
+    let fixture = Fixture::new("scl-magic");
+    let mut bytes = scl_archive(&[1], false);
+    bytes[3] = b'X';
+    let path = fixture.write("library/x.scl", &bytes);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
+}
+
+#[test]
+fn scl_truncated_header_is_refused() {
+    let fixture = Fixture::new("scl-short-header");
+    let path = fixture.write("library/short.scl", b"SINCL");
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("too_small")
+    );
+}
+
+#[test]
+fn scl_directory_table_beyond_eof_is_refused() {
+    let fixture = Fixture::new("scl-table-oob");
+    // Claims 50 files but carries no directory at all.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SINCLAIR");
+    bytes.push(50);
+    let path = fixture.write("library/liar.scl", &bytes);
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
+}
+
+#[test]
+fn scl_payload_shorter_or_longer_than_declared_is_refused() {
+    let fixture = Fixture::new("scl-payload");
+    let mut short = scl_archive(&[4], false);
+    short.truncate(short.len() - 300); // lose part of the declared payload
+    let path = fixture.write("library/short.scl", &short);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+
+    let mut long = scl_archive(&[2], false);
+    long.extend_from_slice(&[0u8; 64]); // trailing bytes the entries do not account for
+    let path = fixture.write("library/long.scl", &long);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+}
+
+#[test]
 fn dsk_random_bytes_and_zip_are_refused() {
     let fixture = Fixture::new("dsk-random");
     let path = fixture.write("library/game.dsk", &vec![0x5Au8; 8192]);
@@ -1389,6 +1526,17 @@ fn dsk_random_bytes_and_zip_are_refused() {
     let mut zip = vec![0u8; 8192];
     zip[..4].copy_from_slice(b"PK\x03\x04");
     let path = fixture.write("library/z.dsk", &zip);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn scl_absurd_file_count_is_refused() {
+    let fixture = Fixture::new("scl-absurd");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SINCLAIR");
+    bytes.push(200); // over the 128-entry TR-DOS maximum
+    bytes.extend(std::iter::repeat_n(0u8, 200 * 14));
+    let path = fixture.write("library/big.scl", &bytes);
     assert_eq!(fixture.inspect(&path).format, None);
 }
 
@@ -1405,6 +1553,82 @@ fn dsk_absurd_geometry_is_refused_without_huge_allocation() {
     let evidence = fixture.inspect(&path);
     assert_eq!(evidence.format, None);
     assert!(evidence.refusal.is_some());
+}
+
+#[test]
+fn scl_random_bytes_named_scl_are_refused() {
+    let fixture = Fixture::new("scl-random");
+    let path = fixture.write("library/game.scl", &vec![0x5Au8; 4096]);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+// --- ZX Spectrum TR-DOS disk image ----------------------------------
+
+fn trd_geometry(disk_type: u8) -> (u16, u8) {
+    match disk_type {
+        0x16 => (80, 2),
+        0x17 => (40, 2),
+        0x18 => (80, 1),
+        0x19 => (40, 1),
+        _ => panic!("unsupported test disk type"),
+    }
+}
+
+/// Build a structurally valid TR-DOS image, then let `tweak` corrupt it.
+fn trd_disk(
+    disk_type: u8,
+    file_count: u8,
+    label: &[u8; 8],
+    tweak: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
+    let (tps, sides) = trd_geometry(disk_type);
+    let total_tracks = u64::from(tps) * u64::from(sides);
+    let total_sectors = total_tracks * 16;
+    let mut v = vec![0u8; usize::try_from(total_sectors * 256).unwrap()];
+
+    if file_count > 0 {
+        v[0..8].copy_from_slice(b"BOOT    ");
+        v[8] = b'B';
+        v[13] = 1;
+    }
+
+    let d = 0x800usize;
+    v[d] = 0; // catalogue end marker
+    let first_free_track = 1u16;
+    let first_free_sector = 0u8;
+    let free_sectors = u16::try_from(total_sectors - 16).unwrap(); // whole disk bar track 0
+    v[d + 0xE1] = first_free_sector;
+    v[d + 0xE2] = u8::try_from(first_free_track).unwrap();
+    v[d + 0xE3] = disk_type;
+    v[d + 0xE4] = file_count;
+    v[d + 0xE5..d + 0xE7].copy_from_slice(&free_sectors.to_le_bytes());
+    v[d + 0xE7] = 0x10;
+    v[d + 0xF5..d + 0xF5 + 8].copy_from_slice(label);
+
+    tweak(&mut v);
+    v
+}
+
+#[test]
+fn trd_standard_double_sided_image_is_valid_zx_spectrum_evidence() {
+    let fixture = Fixture::new("trd-80ds");
+    let path = fixture.write(
+        "library/Game (1989).trd",
+        &trd_disk(0x16, 5, b"MYDISK  ", |_| {}),
+    );
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::SpectrumTrDosDisk));
+    assert_eq!(evidence.platform, Some("ZX Spectrum"));
+    assert!(evidence.conclusive);
+    assert_eq!(evidence.confidence, DetectionConfidence::Confirmed);
+    let Some(DiskFormatMetadata::TrDos(descriptor)) = evidence.metadata else {
+        panic!("expected trdos descriptor");
+    };
+    assert_eq!(descriptor.disk_type, 0x16);
+    assert_eq!(descriptor.tracks_per_side, 80);
+    assert_eq!(descriptor.sides, 2);
+    assert_eq!(descriptor.file_count, 5);
+    assert_eq!(descriptor.label, Some(*b"MYDISK  "));
     assert!(evidence.bytes_inspected <= MAX_DISK_FORMAT_BYTES_READ);
 }
 
@@ -1429,4 +1653,201 @@ fn dsk_detection_reaches_platform_detection_for_a_plus3_disk_only() {
             .with_trusted_roots(fixture.trusted()),
     );
     assert_ne!(report.platform, Some("ZX Spectrum"));
+}
+
+#[test]
+fn trd_all_four_documented_geometries_validate() {
+    let fixture = Fixture::new("trd-geometries");
+    for (disk_type, tps, sides) in [(0x16, 80, 2), (0x17, 40, 2), (0x18, 80, 1), (0x19, 40, 1)] {
+        let path = fixture.write(
+            &format!("library/type{disk_type:02x}.trd"),
+            &trd_disk(disk_type, 0, b"        ", |_| {}),
+        );
+        let evidence = fixture.inspect(&path);
+        assert_eq!(
+            evidence.format,
+            Some(DiskFormat::SpectrumTrDosDisk),
+            "disk type 0x{disk_type:02X}"
+        );
+        let Some(DiskFormatMetadata::TrDos(descriptor)) = evidence.metadata else {
+            panic!()
+        };
+        assert_eq!(descriptor.tracks_per_side, tps);
+        assert_eq!(descriptor.sides, sides);
+        assert_eq!(descriptor.label, None); // all spaces -> no label
+    }
+}
+
+#[test]
+fn trd_truncated_to_used_sectors_is_still_accepted() {
+    // Archives commonly trim trailing free sectors; the descriptor is intact.
+    let fixture = Fixture::new("trd-trimmed");
+    let mut image = trd_disk(0x19, 3, b"TRIMMED ", |_| {});
+    image.truncate(image.len() - 40 * 256); // drop 40 trailing sectors
+    let path = fixture.write("library/trimmed.trd", &image);
+    assert_eq!(
+        fixture.inspect(&path).format,
+        Some(DiskFormat::SpectrumTrDosDisk)
+    );
+}
+
+#[test]
+fn trd_missing_or_wrong_id_byte_is_refused() {
+    let fixture = Fixture::new("trd-id");
+    let path = fixture.write(
+        "library/noid.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE7] = 0x00),
+    );
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, None);
+    assert_eq!(
+        evidence.refusal.as_ref().map(DiskFormatRefusal::code),
+        Some("malformed")
+    );
+}
+
+#[test]
+fn trd_undocumented_disk_type_is_refused() {
+    let fixture = Fixture::new("trd-type");
+    let path = fixture.write(
+        "library/badtype.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE3] = 0x99),
+    );
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_impossible_file_count_or_free_cursor_is_refused() {
+    let fixture = Fixture::new("trd-impossible");
+    let count = fixture.write(
+        "library/count.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE4] = 200),
+    );
+    assert_eq!(fixture.inspect(&count).format, None);
+
+    let sector = fixture.write(
+        "library/sector.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE1] = 40),
+    );
+    assert_eq!(fixture.inspect(&sector).format, None);
+
+    let track = fixture.write(
+        "library/track.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| v[0x800 + 0xE2] = 250),
+    );
+    assert_eq!(fixture.inspect(&track).format, None);
+}
+
+#[test]
+fn trd_inconsistent_free_space_is_refused() {
+    let fixture = Fixture::new("trd-freespace");
+    // Free-sector count that does not reconcile with the free cursor.
+    let path = fixture.write(
+        "library/free.trd",
+        &trd_disk(0x16, 1, b"X       ", |v| {
+            v[0x800 + 0xE5] = 0x00;
+            v[0x800 + 0xE6] = 0x00; // claims zero free but the cursor says otherwise
+        }),
+    );
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_geometry_larger_than_the_disk_type_allows_is_refused() {
+    let fixture = Fixture::new("trd-toobig");
+    let mut image = trd_disk(0x19, 0, b"        ", |_| {}); // 40 SS -> 163840
+    image.extend(std::iter::repeat_n(0u8, 4096)); // one track too many
+    let path = fixture.write("library/toobig.trd", &image);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("geometry_mismatch")
+    );
+}
+
+#[test]
+fn trd_truncated_below_the_descriptor_and_unaligned_lengths_are_refused() {
+    let fixture = Fixture::new("trd-short");
+    let mut image = trd_disk(0x19, 0, b"        ", |_| {});
+    let full = image.clone();
+
+    image.truncate(0x880); // descriptor sector no longer present
+    let path = fixture.write("library/tiny.trd", &image);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("too_small")
+    );
+
+    let mut unaligned = full;
+    unaligned.truncate(unaligned.len() - 100); // not a whole number of sectors
+    let path = fixture.write("library/unaligned.trd", &unaligned);
+    assert_eq!(
+        fixture
+            .inspect(&path)
+            .refusal
+            .as_ref()
+            .map(DiskFormatRefusal::code),
+        Some("not_sector_aligned")
+    );
+}
+
+#[test]
+fn trd_random_correctly_sized_image_is_not_spectrum_evidence() {
+    let fixture = Fixture::new("trd-random");
+    // Exactly the size of an 80-track DS TR-DOS disk, but random content.
+    let bytes: Vec<u8> = (0..655360).map(|i| (i * 131 + 7) as u8).collect();
+    let path = fixture.write("library/game.trd", &bytes);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_recognition_does_not_swallow_an_mgt_sam_coupe_image() {
+    let fixture = Fixture::new("trd-mgt");
+    // A common MGT/SAM Coupe size (80 x 2 x 10 x 512), 256-aligned, but with
+    // no TR-DOS descriptor - must not be read as ZX Spectrum TR-DOS media.
+    let bytes = vec![0xE5u8; 819200];
+    let path = fixture.write("library/sam.trd", &bytes);
+    assert_eq!(fixture.inspect(&path).format, None);
+}
+
+#[test]
+fn trd_and_scl_in_an_amstrad_cpc_folder_report_ambiguous_not_forced() {
+    let fixture = Fixture::new("trdos-cpc-folder");
+    let trd = fixture.write("library/game.trd", &trd_disk(0x16, 1, b"X       ", |_| {}));
+    let ev = fixture.inspect_in_folder(&trd, "Amstrad CPC");
+    assert_eq!(ev.format, Some(DiskFormat::SpectrumTrDosDisk));
+    assert_eq!(ev.confidence, DetectionConfidence::Ambiguous);
+    assert!(!ev.conclusive);
+
+    let scl = fixture.write("library/game.scl", &scl_archive(&[2], false));
+    let ev = fixture.inspect_in_folder(&scl, "Amstrad CPC");
+    assert_eq!(ev.confidence, DetectionConfidence::Ambiguous);
+}
+
+#[test]
+fn trdos_media_reaches_platform_detection_as_confirmed_zx_spectrum() {
+    let fixture = Fixture::new("trdos-platform");
+    for (name, bytes) in [
+        (
+            "library/unsorted/a.trd",
+            trd_disk(0x16, 2, b"DISK    ", |_| {}),
+        ),
+        ("library/unsorted/b.scl", scl_archive(&[1, 1], false)),
+    ] {
+        let path = fixture.write(name, &bytes);
+        let report = detect_platform_report(
+            &DetectionRequest::new(&path, &fixture.path("library"))
+                .inspecting_content()
+                .with_trusted_roots(fixture.trusted()),
+        );
+        assert_eq!(report.platform, Some("ZX Spectrum"), "{name}");
+        assert_eq!(report.confidence, DetectionConfidence::Confirmed, "{name}");
+    }
 }

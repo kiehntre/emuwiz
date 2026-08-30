@@ -578,6 +578,9 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
     if extension == "dsk" {
         return discover_dsk_image(path, source_root);
     }
+    if matches!(extension.as_str(), "trd" | "scl") {
+        return discover_trdos_media(path, source_root);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -953,6 +956,60 @@ fn discover_dsk_image(path: &Path, source_root: &Path) -> GameDiscovery {
                     .unwrap_or_else(|| "not a recognised CPCEMU .dsk container".to_string()),
             ),
             "This .dsk file is not a readable CPCEMU disk container.".to_string(),
+        ),
+    }
+}
+
+/// `.trd` (raw TR-DOS disk image) and `.scl` (SINCLAIR archive of TR-DOS
+/// files) are ZX Spectrum-family media. Neither is proven by its extension:
+/// resolution runs through the shared structural disk layer, which validates
+/// the TR-DOS system descriptor or SINCLAIR archive arithmetic before claiming
+/// anything.
+fn discover_trdos_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "TR-DOS media".to_string());
+
+    match evidence.format {
+        Some(DiskFormat::SpectrumTrDosDisk) | Some(DiskFormat::SpectrumSclArchive) => {
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::ComputerDisk),
+                platform_hint: Some("ZX Spectrum".to_string()),
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation: format!(
+                    "ZX Spectrum TR-DOS media. {detail}. Structural platform/media evidence only; \
+                     exact game identity still needs a DAT/catalogue match."
+                ),
+                skip_reason: None,
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised TR-DOS disk or SCL archive".to_string()),
+            ),
+            "This file is named like ZX Spectrum TR-DOS media but its contents did not validate \
+             as a TR-DOS disk or an SCL archive."
+                .to_string(),
         ),
     }
 }

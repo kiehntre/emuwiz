@@ -661,6 +661,69 @@ fn sna_128k_snapshot_is_discovered() {
     assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
 }
 
+// --- ZX Spectrum TR-DOS media (.trd / .scl) --------------------------
+
+fn scl_archive(files: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"SINCLAIR");
+    v.push(files.len() as u8);
+    for &sectors in files {
+        let mut e = [0u8; 14];
+        e[..8].copy_from_slice(b"GAME    ");
+        e[8] = b'C';
+        e[13] = sectors;
+        v.extend_from_slice(&e);
+    }
+    v.extend(std::iter::repeat_n(
+        0u8,
+        files.iter().map(|&s| usize::from(s) * 256).sum(),
+    ));
+    v
+}
+
+fn trd_disk_40ss() -> Vec<u8> {
+    // 40-track single-sided: 40 * 16 * 256 = 163840 bytes.
+    let total_sectors = 40u64 * 16;
+    let mut v = vec![0u8; (total_sectors * 256) as usize];
+    v[0..8].copy_from_slice(b"BOOT    ");
+    v[8] = b'B';
+    v[13] = 1;
+    let d = 0x800usize;
+    v[d + 0xE1] = 0; // first free sector
+    v[d + 0xE2] = 1; // first free track
+    v[d + 0xE3] = 0x19; // 40 SS
+    v[d + 0xE4] = 1; // one file
+    let free = (total_sectors - 16) as u16;
+    v[d + 0xE5..d + 0xE7].copy_from_slice(&free.to_le_bytes());
+    v[d + 0xE7] = 0x10; // TR-DOS id
+    v[d + 0xF5..d + 0xFD].copy_from_slice(b"SPECCY  ");
+    v
+}
+
+#[test]
+fn scl_archive_is_discovered_as_zx_spectrum_media() {
+    let dir = source_dir("scl");
+    std::fs::write(dir.path().join("Some Collection.scl"), scl_archive(&[2, 4])).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert!(item.explanation.contains("TR-DOS"));
+}
+
+#[test]
+fn trd_disk_is_discovered_as_zx_spectrum_media() {
+    let dir = source_dir("trd");
+    std::fs::write(dir.path().join("unrelated name.trd"), trd_disk_40ss()).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+}
+
 #[test]
 fn random_bytes_named_like_a_spectrum_snapshot_are_not_accepted() {
     let dir = source_dir("z80-lie");
@@ -713,6 +776,47 @@ fn truncated_dsk_fails_closed() {
     let mut image = dsk(40, 1, true);
     image.truncate(image.len() - 2048);
     std::fs::write(dir.path().join("game.dsk"), image).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert_eq!(item.platform_hint, None);
+}
+
+#[test]
+fn random_bytes_named_trd_or_scl_are_not_spectrum_evidence() {
+    let dir = source_dir("trdos-lies");
+    // Correctly sized for an 80-track DS TR-DOS disk, but random.
+    std::fs::write(
+        dir.path().join("Speccy Game.trd"),
+        (0..655360u32)
+            .map(|i| (i * 91 + 5) as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("Speccy Archive.scl"), vec![0x11u8; 8192]).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in &report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped, "{item:?}");
+        assert_eq!(item.platform_hint, None);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+    }
+}
+
+#[test]
+fn truncated_trd_fails_closed_in_discovery() {
+    let dir = source_dir("trd-trunc");
+    let mut image = trd_disk_40ss();
+    image.truncate(0x400); // descriptor sector gone
+    std::fs::write(dir.path().join("game.trd"), image).unwrap();
     let report = discover_source(dir.path()).unwrap();
     let item = &report.items[0];
     assert_eq!(item.validation_state, ValidationState::Skipped);

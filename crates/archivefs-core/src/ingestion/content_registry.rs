@@ -122,6 +122,13 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("hdi", ContentKind::ComputerDisk),
     cf("ima", ContentKind::ComputerDisk),
     cf("img", ContentKind::ComputerDisk),
+    // ZX Spectrum TR-DOS media. The *category* is a computer disk/archive;
+    // the ZX Spectrum platform is confirmed only when
+    // `crate::disk_format::inspect_disk_format` validates the TR-DOS system
+    // descriptor (`.trd`) or the SINCLAIR archive layout (`.scl`) - see
+    // `super::discovery::discover_trdos_media`.
+    cf("trd", ContentKind::ComputerDisk),
+    cf("scl", ContentKind::ComputerDisk),
     // These extensions identify a media family, not a system. Keep them out
     // of platform extension evidence unless another source can prove it.
     cf("cdt", ContentKind::TapeImage),
