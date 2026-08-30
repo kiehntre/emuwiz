@@ -474,6 +474,84 @@ fn missing_removal_availability_requires_a_healthy_idle_database() {
 }
 
 #[test]
+fn missing_removal_disabled_reason_prioritises_database_state() {
+    let mut app = app_for_operation_tests();
+    let (_sender, receiver) = mpsc::channel();
+    app.database_state = DatabaseState::Loading {
+        generation: DatabaseGeneration::INITIAL,
+        receiver,
+        worker: None,
+        previous: None,
+        scanning: false,
+    };
+    assert_eq!(
+        app.missing_removal_unavailable_reason().as_deref(),
+        Some("Catalogue is still loading. Removal will be available when loading completes.")
+    );
+
+    app.database_state = DatabaseState::Outdated {
+        health: DatabaseHealth {
+            resolved_path: PathBuf::from("/tmp/library.sqlite3"),
+            database_exists: true,
+            database_opens: true,
+            schema_version: Some(6),
+            migrations_current: false,
+            foreign_keys_enabled: true,
+            error: None,
+        },
+        previous: None,
+    };
+    assert_eq!(
+        app.missing_removal_unavailable_reason().as_deref(),
+        Some("Catalogue data needs to be refreshed before stale entries can be removed.")
+    );
+
+    app.database_state = DatabaseState::Error {
+        message: "catalogue read failed".to_string(),
+        previous: None,
+    };
+    assert_eq!(
+        app.missing_removal_unavailable_reason().as_deref(),
+        Some("catalogue read failed")
+    );
+}
+
+#[test]
+fn missing_removal_disabled_reason_prioritises_competing_work_and_selection() {
+    let mut app = app_for_operation_tests();
+    app.database_state = DatabaseState::Ready {
+        snapshot: Box::new(cached_snapshot(Vec::new())),
+        last_scan_summary: None,
+    };
+    assert_eq!(app.missing_removal_unavailable_reason(), None);
+    assert_eq!(
+        missing_removal_disabled_reason(None, 0, None),
+        Some("Select one or more missing catalogue entries to remove.")
+    );
+    assert_eq!(missing_removal_disabled_reason(None, 1, None), None);
+
+    let (_sender, receiver) = mpsc::channel();
+    app.alias_action = Some(RunningAliasAction {
+        action: AliasAction::Remove {
+            alias: "busy".to_string(),
+        },
+        receiver,
+    });
+    assert_eq!(
+        app.missing_removal_unavailable_reason().as_deref(),
+        Some("Another catalogue operation is currently running.")
+    );
+    assert_eq!(
+        missing_removal_disabled_reason(
+            app.missing_removal_unavailable_reason().as_deref(),
+            0,
+            Some("selection is invalid"),
+        ),
+        Some("Another catalogue operation is currently running.")
+    );
+}
+
+#[test]
 fn successful_missing_removal_records_one_activity_and_refreshes_without_resetting_view() {
     let path = PathBuf::from("/roms/missing.zip");
     let mut app = app_for_operation_tests();

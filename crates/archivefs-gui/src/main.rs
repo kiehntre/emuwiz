@@ -9257,6 +9257,37 @@ impl ArchiveFsApp {
             && matches!(self.database_state, DatabaseState::Ready { .. })
     }
 
+    fn missing_removal_unavailable_reason(&self) -> Option<String> {
+        match &self.database_state {
+            DatabaseState::Loading { .. } => Some(
+                "Catalogue is still loading. Removal will be available when loading completes."
+                    .to_string(),
+            ),
+            DatabaseState::Outdated { .. } => Some(
+                "Catalogue data needs to be refreshed before stale entries can be removed."
+                    .to_string(),
+            ),
+            DatabaseState::Error { message, .. } => Some(message.clone()),
+            DatabaseState::NotCreated { .. } => Some(
+                "Catalogue is not available yet. Create or load the catalogue before removing stale entries."
+                    .to_string(),
+            ),
+            DatabaseState::Ready { .. } => {
+                if self.missing_removal.is_some()
+                    || self.platform_action.is_some()
+                    || self.bulk_platform_action.is_some()
+                    || self.alias_action.is_some()
+                    || self.source_action.is_some()
+                    || self.library_view_action.is_some()
+                {
+                    Some("Another catalogue operation is currently running.".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     fn start_missing_removal(&mut self, context: egui::Context, archive_paths: Vec<PathBuf>) {
         if !self.missing_removal_action_available() || archive_paths.is_empty() {
             return;
@@ -17813,6 +17844,8 @@ impl ArchiveFsApp {
                         });
                     }
                     LoadState::Ready(data) => {
+                        let missing_removal_unavailable_reason =
+                            self.missing_removal_unavailable_reason();
                         requested_action = show_loaded_data(
                             ui,
                             data,
@@ -17863,6 +17896,7 @@ impl ArchiveFsApp {
                                 bulk_platform_choice: &mut self.bulk_platform_choice,
                                 bulk_platform_busy: self.bulk_platform_action.is_some(),
                                 missing_removal_available,
+                                missing_removal_unavailable_reason,
                                 missing_removal_busy: self.missing_removal.is_some(),
                                 confirm_remove_missing: &mut self.confirm_remove_missing,
                                 missing_removal_typed_count: &mut self.missing_removal_typed_count,

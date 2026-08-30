@@ -62,6 +62,7 @@ pub(crate) fn show_loaded_data(
         bulk_platform_choice,
         bulk_platform_busy,
         missing_removal_available,
+        missing_removal_unavailable_reason,
         missing_removal_busy,
         confirm_remove_missing,
         missing_removal_typed_count,
@@ -1080,12 +1081,13 @@ pub(crate) fn show_loaded_data(
                 )
                 .wrap(),
             );
-        if !missing_removal_available {
-            ui.weak(
-                    "Removal is temporarily unavailable while the catalogue is loading or another operation is active.",
-                );
-        } else if selected_archives.is_empty() {
-            ui.weak("Select one or more missing entries to enable removal.");
+        let selection_reason = selected_missing.as_ref().err().map(String::as_str);
+        if let Some(reason) = missing_removal_disabled_reason(
+            missing_removal_unavailable_reason.as_deref(),
+            selected_archives.len(),
+            selection_reason,
+        ) {
+            ui.weak(reason);
         }
     }
     ui.add_space(8.0);

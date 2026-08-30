@@ -2046,6 +2046,7 @@ impl RealLoadedDataHarness {
                         bulk_platform_choice: &mut bulk_platform_choice,
                         bulk_platform_busy: false,
                         missing_removal_available: false,
+                        missing_removal_unavailable_reason: None,
                         missing_removal_busy: false,
                         confirm_remove_missing: &mut confirm_remove_missing,
                         missing_removal_typed_count: &mut missing_removal_typed_count,

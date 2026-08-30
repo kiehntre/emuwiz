@@ -3945,6 +3945,7 @@ pub(super) struct LoadedViewState<'a> {
     pub(super) bulk_platform_choice: &'a mut Option<String>,
     pub(super) bulk_platform_busy: bool,
     pub(super) missing_removal_available: bool,
+    pub(super) missing_removal_unavailable_reason: Option<String>,
     pub(super) missing_removal_busy: bool,
     pub(super) confirm_remove_missing: &'a mut Option<Vec<PathBuf>>,
     pub(super) missing_removal_typed_count: &'a mut String,
@@ -4013,6 +4014,20 @@ pub(super) fn selected_missing_paths(
         }
     }
     Ok(paths)
+}
+
+pub(super) fn missing_removal_disabled_reason<'a>(
+    database_reason: Option<&'a str>,
+    selected_count: usize,
+    selection_reason: Option<&'a str>,
+) -> Option<&'a str> {
+    database_reason.or_else(|| {
+        if selected_count == 0 {
+            Some("Select one or more missing catalogue entries to remove.")
+        } else {
+            selection_reason
+        }
+    })
 }
 
 pub(super) fn missing_removal_confirmation_text(count: usize) -> String {
