@@ -1490,6 +1490,7 @@ fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
         database_path: PathBuf::from("/config/library.sqlite3"),
         schema_version: latest_schema_version(),
         archives,
+        dat_identities: HashMap::new(),
         platform_details,
         stats: empty_catalogue_stats(),
         last_completed_scan: None,

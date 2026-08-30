@@ -93,6 +93,7 @@ pub(crate) fn show_selected_archive(
     ui: &mut egui::Ui,
     record: Option<&ArchiveRecord>,
     persisted: Option<&PersistedArchive>,
+    dat_identities: &[archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary],
     platform_details: Option<&PlatformProvenanceDetails>,
     source_path: Option<&Path>,
     view_state: SelectedArchiveViewState<'_>,
@@ -163,6 +164,7 @@ pub(crate) fn show_selected_archive(
                     inspect_request = Some(persisted.absolute_path.clone());
                 }
             }
+            show_dat_identity_section(ui, dat_identities);
             let action = show_platform_section(
                 ui,
                 persisted,
@@ -247,6 +249,7 @@ pub(crate) fn show_selected_archive(
                 }
             });
 
+        show_dat_identity_section(ui, dat_identities);
         ui.add_space(6.0);
         let can_lazy_unmount = lazy_unmount_available(record, lazy_unmount_offers, busy);
         let remount_offered = remount_is_offered(record, remount_offers);

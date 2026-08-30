@@ -263,6 +263,10 @@ pub(crate) fn show_loaded_data(
     // page between the results banners and the filter card (manual smoke
     // feedback). Collapsed by default; state persists for the session.
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
+    let selected_dat_identities = selected_persisted
+        .and_then(|archive| cached.and_then(|snapshot| snapshot.dat_identities.get(&archive.id)))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
     let selected_actions = if let Some(path) = selected_archive.as_deref() {
@@ -279,6 +283,7 @@ pub(crate) fn show_loaded_data(
                             ui,
                             selected_record(&data.records, selected_archive.as_deref()),
                             selected_persisted,
+                            selected_dat_identities,
                             selected_platform_details(cached, selected_persisted),
                             selected_source_path,
                             SelectedArchiveViewState {

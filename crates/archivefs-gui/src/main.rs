@@ -16,6 +16,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use archivefs_core::dat::library_identity_summary::LibraryDatIdentitySummary;
 use archivefs_core::diagnostics::environment::{
     FreeSpacePolicy, StorageAssessment, assess_storage, mount_table, storage_resources,
 };
@@ -146,6 +147,8 @@ mod navigation;
 use navigation::*;
 mod selected_game_panel;
 use selected_game_panel::*;
+mod dat_identity_panel;
+use dat_identity_panel::*;
 pub mod bulk_confirmation;
 pub(crate) mod cheat_sources_page;
 mod collection_discovery_page;
@@ -2474,6 +2477,9 @@ struct CachedLibrarySnapshot {
     database_path: PathBuf,
     schema_version: i64,
     archives: Vec<PersistedArchive>,
+    /// Reconstructed persisted DAT identity, keyed by archive id. Rendering
+    /// reads this cache and never audits, hashes, or opens content.
+    dat_identities: HashMap<i64, Vec<LibraryDatIdentitySummary>>,
     platform_details: HashMap<i64, PlatformProvenanceDetails>,
     stats: CatalogueStats,
     last_completed_scan: Option<CompletedScanSummary>,
@@ -2721,6 +2727,39 @@ fn load_snapshot_from(
     };
     let schema_version = database.schema_version().map_err(to_failed)?;
     let archives = database.load_archives().map_err(to_failed)?;
+    let configured_dat_source_ids =
+        archivefs_core::dat::sources::load_dat_sources_config_from(config_path)
+            .ok()
+            .and_then(|config| config.sources)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|source| source.id)
+            .collect::<HashSet<_>>();
+    let mut dat_identities = HashMap::new();
+    for archive in &archives {
+        let persisted = database
+            .library_dat_identities_for_item(archive.id)
+            .map_err(to_failed)?;
+        let mut summaries = Vec::with_capacity(persisted.len());
+        for identity in persisted {
+            let source_id = identity.source.source_id;
+            if let Some(summary) = database
+                .library_dat_identity_summary_for_item(
+                    archive.id,
+                    &source_id,
+                    None,
+                    None,
+                    configured_dat_source_ids.contains(&source_id),
+                )
+                .map_err(to_failed)?
+            {
+                summaries.push(summary);
+            }
+        }
+        if !summaries.is_empty() {
+            dat_identities.insert(archive.id, summaries);
+        }
+    }
     let platform_details = database
         .load_platform_provenance_details(&archives)
         .map_err(to_failed)?;
@@ -2740,6 +2779,7 @@ fn load_snapshot_from(
         database_path: database_path.to_path_buf(),
         schema_version,
         archives,
+        dat_identities,
         platform_details,
         stats,
         last_completed_scan,

@@ -265,6 +265,7 @@ fn context_menu_disabled_mount_reason_matches_the_main_button_reason() {
                 ui,
                 Some(&record),
                 None,
+                &[],
                 None,
                 None,
                 SelectedArchiveViewState {
@@ -3093,6 +3094,7 @@ fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport(
                     ui,
                     Some(&record),
                     None,
+                    &[],
                     None,
                     None,
                     SelectedArchiveViewState {

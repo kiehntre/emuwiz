@@ -2591,6 +2591,7 @@ fn inspect_contents_button_is_absent_when_nothing_is_selected() {
                 ui,
                 None,
                 None,
+                &[],
                 None,
                 None,
                 SelectedArchiveViewState {
@@ -2642,6 +2643,7 @@ fn selected_archive_tools_include_inspection_and_cheats_mods() {
                 ui,
                 Some(&record),
                 None,
+                &[],
                 None,
                 None,
                 SelectedArchiveViewState {
@@ -2695,6 +2697,7 @@ fn render_selected_archive_with_reason(
                 ui,
                 Some(record),
                 None,
+                &[],
                 None,
                 None,
                 SelectedArchiveViewState {
