@@ -27,6 +27,7 @@
 //! (a managed block/section) to scan for, since neither has install/cheat-
 //! write support yet.
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,17 +46,235 @@ use crate::launch::readiness::{FirmwareReadiness, rpcs3_firmware_readiness};
 use crate::patch_manager::{
     DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DuckStationProfileDiscovery,
     DuckStationProfileDiscoveryRoots, EmulatorProfileSelection, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, PpssppLaunchBlocker, PpssppLaunchBlockerKind,
-    PpssppProfileDiscovery, PpssppProfileDiscoveryRoots, Rpcs3GameRequest, Rpcs3LaunchBlocker,
-    Rpcs3LaunchBlockerKind, Rpcs3ProfileDiscovery, Rpcs3ProfileDiscoveryRoots, XemuGameRequest,
-    XemuLaunchBlocker, XemuLaunchBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots,
-    XemuSystemFileState, XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, discover_dolphin_profiles, discover_duckstation_profiles,
-    discover_pcsx2_profiles, discover_ppsspp_profiles, discover_rpcs3_profiles,
-    discover_xemu_profiles, discover_xenia_profiles, inspect_rpcs3_game, inspect_xemu_game,
+    Pcsx2ProfileDiscoveryRoots, PpssppInstallationType, PpssppLaunchBlocker,
+    PpssppLaunchBlockerKind, PpssppProfileDiscovery, PpssppProfileDiscoveryRoots, Rpcs3GameRequest,
+    Rpcs3InstallationType, Rpcs3LaunchBlocker, Rpcs3LaunchBlockerKind, Rpcs3ProfileDiscovery,
+    Rpcs3ProfileDiscoveryRoots, XemuGameRequest, XemuInstallationType, XemuLaunchBlocker,
+    XemuLaunchBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots, XemuSystemFileState,
+    XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaProfileDiscovery, XeniaProfileDiscoveryRoots,
+    discover_dolphin_profiles, discover_duckstation_profiles, discover_pcsx2_profiles,
+    discover_ppsspp_profiles, discover_rpcs3_profiles, discover_xemu_profiles,
+    discover_xenia_profiles, inspect_rpcs3_game, inspect_xemu_game,
     resolve_ppsspp_native_launch_binding, resolve_rpcs3_native_launch_binding,
     resolve_xemu_native_launch_binding, resolve_xenia_launch_binding, select_dolphin_profile,
 };
+
+/// Read-only evidence about an emulator installation form. This is separate
+/// from launch readiness: finding a Flatpak or AppImage is useful to the user
+/// but does not authorize EmuWiz to spawn it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinuxEmulatorInstallationEvidence {
+    pub emulator: String,
+    pub installation_form: String,
+    pub executable: Option<EncodedPath>,
+    pub profile: Option<EncodedPath>,
+    pub detail: String,
+}
+
+fn safe_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn first_executable(home: &Path, names: &[&str]) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("PATH") {
+        candidates.extend(
+            env::split_paths(&path)
+                .take(128)
+                .flat_map(|directory| names.iter().map(move |name| directory.join(name))),
+        );
+    }
+    for directory in [
+        home.join("Applications"),
+        home.join(".local/bin"),
+        home.join(".local/share/applications"),
+        home.join("AppImages"),
+        home.join("bin"),
+    ] {
+        candidates.extend(names.iter().map(|name| directory.join(name)));
+        candidates.extend(names.iter().map(|name| directory.join(name).join(name)));
+    }
+    candidates.into_iter().find(|path| safe_executable(path))
+}
+
+fn flatpak_metadata(home: &Path, app_id: &str) -> Option<&'static str> {
+    let user = home.join(".local/share/flatpak/app").join(app_id);
+    if fs::symlink_metadata(&user)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Some("Flatpak (user installation)");
+    }
+    let system = Path::new("/var/lib/flatpak/app").join(app_id);
+    if fs::symlink_metadata(&system)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Some("Flatpak (system installation)");
+    }
+    None
+}
+
+/// Gathers bounded, read-only installation evidence for the Emulator Setup
+/// page. It checks exact PATH names, five fixed user directories, and the
+/// standard Flatpak deployment roots; it never recursively walks HOME or
+/// executes an emulator.
+pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationEvidence> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let definitions = [
+        (
+            "Dolphin",
+            &["dolphin-emu", "Dolphin"][..],
+            "org.DolphinEmu.dolphin-emu",
+        ),
+        (
+            "PCSX2",
+            &["pcsx2-qt", "pcsx2", "PCSX2"][..],
+            "net.pcsx2.PCSX2",
+        ),
+        (
+            "PPSSPP",
+            &["PPSSPPSDL", "PPSSPPQt", "ppsspp"][..],
+            "org.ppsspp.PPSSPP",
+        ),
+        ("RPCS3", &["rpcs3", "RPCS3"][..], "net.rpcs3.RPCS3"),
+        ("xemu", &["xemu", "xemu-kvm"][..], "app.xemu.xemu"),
+        (
+            "DuckStation",
+            &["duckstation-qt", "duckstation-nogui", "duckstation"][..],
+            "org.duckstation.DuckStation",
+        ),
+        ("RetroArch", &["retroarch"][..], "org.libretro.RetroArch"),
+        ("ScummVM", &["scummvm"][..], "org.scummvm.ScummVM"),
+        (
+            "Xenia",
+            &["xenia_canary", "xenia"][..],
+            "com.xenia_project.Xenia",
+        ),
+    ];
+    let mut evidence = Vec::new();
+    for (emulator, names, app_id) in definitions {
+        let executable = first_executable(&home, names);
+        if let Some(path) = executable {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: emulator.to_string(),
+                installation_form: "Native/PATH".to_string(),
+                executable: Some(EncodedPath::from_path(&path)),
+                profile: None,
+                detail: format!("Executable found at {}", path.display()),
+            });
+        }
+        if let Some(form) = flatpak_metadata(&home, app_id) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: emulator.to_string(),
+                installation_form: form.to_string(),
+                executable: Some(EncodedPath::from_path(Path::new("/usr/bin/flatpak"))),
+                profile: None,
+                detail: format!("Flatpak application metadata found for {app_id}"),
+            });
+        }
+    }
+    for (emulator, path) in [
+        (
+            "Dolphin",
+            home.join("Applications/Dolphin/Dolphin.AppImage"),
+        ),
+        ("PCSX2", home.join("Applications/PCSX2/PCSX2.AppImage")),
+        ("PPSSPP", home.join("Applications/PPSSPP/PPSSPP.AppImage")),
+        ("RPCS3", home.join("Applications/RPCS3/RPCS3.AppImage")),
+        ("xemu", home.join("Applications/xemu.AppImage")),
+        (
+            "DuckStation",
+            home.join("Applications/DuckStation/DuckStation.AppImage"),
+        ),
+        ("Xenia", home.join("Applications/Xenia.AppImage")),
+    ] {
+        if safe_executable(&path) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: emulator.to_string(),
+                installation_form: "AppImage".to_string(),
+                executable: Some(EncodedPath::from_path(&path)),
+                profile: None,
+                detail: format!("AppImage found at {}", path.display()),
+            });
+        }
+    }
+    if let Some(path) = [home.join(".config/scummvm"), home.join(".config/ScummVM")]
+        .into_iter()
+        .find(|path| {
+            fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        })
+    {
+        evidence.push(LinuxEmulatorInstallationEvidence {
+            emulator: "ScummVM".to_string(),
+            installation_form: "Native/PATH".to_string(),
+            executable: None,
+            profile: Some(EncodedPath::from_path(&path)),
+            detail: format!("Configuration directory found at {}", path.display()),
+        });
+    }
+    if fs::symlink_metadata(&home.join("Desktop/xenia-canary.config.toml"))
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        evidence.push(LinuxEmulatorInstallationEvidence {
+            emulator: "Xenia".to_string(),
+            installation_form: "AppImage/config evidence".to_string(),
+            executable: None,
+            profile: Some(EncodedPath::from_path(
+                &home.join("Desktop/xenia-canary.config.toml"),
+            )),
+            detail:
+                "Xenia configuration evidence is present, but no native Linux binding is authorized"
+                    .to_string(),
+        });
+    }
+    evidence
+}
+
+pub fn findings_from_linux_emulator_installations(
+    evidence: &[LinuxEmulatorInstallationEvidence],
+) -> Vec<Finding> {
+    evidence
+        .iter()
+        .map(|item| {
+            let mut finding = Finding::new(
+                format!("emulator_installation.{}", item.emulator.to_lowercase()),
+                DoctorCategory::EmulatorProfiles,
+                DoctorSubsystem::EmulatorReadiness,
+                DoctorSeverity::Info,
+                format!("{} installation found", item.emulator),
+                item.detail.clone(),
+            )
+            .with_evidence([format!("Installation form: {}", item.installation_form)]);
+            if let Some(executable) = &item.executable {
+                finding = finding.with_evidence([format!("Executable: {}", executable.display)]);
+            }
+            if let Some(profile) = &item.profile {
+                finding = finding.with_evidence([format!("Profile/config: {}", profile.display)]);
+            }
+            finding
+        })
+        .collect()
+}
 
 /// At most this many profiles are reported individually; beyond it Doctor
 /// summarises. A machine with dozens of Flatpak and portable installs must not
@@ -1155,7 +1374,24 @@ pub fn assess_xemu_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding.as_ref().err().map(xemu_binding_problem),
+                binding_problem: binding.as_ref().err().map(|blocker| {
+                    if let Some(candidate) = profile.executable_candidates.iter().find(|candidate| {
+                        candidate.installation_type != XemuInstallationType::Native
+                    }) {
+                        format!(
+                            "{} executable found at {}; EmuWiz has not enabled direct launch for this installation form",
+                            match candidate.installation_type {
+                                XemuInstallationType::Portable => "Portable/AppImage xemu",
+                                XemuInstallationType::FlatpakUser => "Flatpak xemu",
+                                XemuInstallationType::Explicit => "Configured xemu",
+                                XemuInstallationType::Native => "Native xemu",
+                            },
+                            candidate.path.display()
+                        )
+                    } else {
+                        xemu_binding_problem(blocker)
+                    }
+                }),
                 mcpx: health.mcpx,
                 flash_bios: health.flash_bios,
                 eeprom: health.eeprom,
@@ -1531,7 +1767,24 @@ pub fn assess_ppsspp_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding.as_ref().err().map(ppsspp_binding_problem),
+                binding_problem: binding.as_ref().err().map(|blocker| {
+                    if let Some(candidate) = profile.executable_candidates.iter().find(|candidate| {
+                        candidate.installation_type != PpssppInstallationType::Native
+                    }) {
+                        format!(
+                            "{} executable found at {}; EmuWiz has not enabled direct launch for this installation form",
+                            match candidate.installation_type {
+                                PpssppInstallationType::Portable => "Portable/AppImage PPSSPP",
+                                PpssppInstallationType::FlatpakUser => "Flatpak PPSSPP",
+                                PpssppInstallationType::Explicit => "Configured PPSSPP",
+                                PpssppInstallationType::Native => "Native PPSSPP",
+                            },
+                            candidate.path.display()
+                        )
+                    } else {
+                        ppsspp_binding_problem(blocker)
+                    }
+                }),
             }
         })
         .collect()
@@ -1688,7 +1941,24 @@ pub fn assess_rpcs3_readiness(
                     .as_ref()
                     .ok()
                     .map(|binding| EncodedPath::from_path(&binding.executable)),
-                binding_problem: binding.as_ref().err().map(rpcs3_binding_problem),
+                binding_problem: binding.as_ref().err().map(|blocker| {
+                    if let Some(candidate) = profile.executable_candidates.iter().find(|candidate| {
+                        candidate.installation_type != Rpcs3InstallationType::Native
+                    }) {
+                        format!(
+                            "{} executable found at {}; EmuWiz has not enabled direct launch for this installation form",
+                            match candidate.installation_type {
+                                Rpcs3InstallationType::Portable => "Portable/AppImage RPCS3",
+                                Rpcs3InstallationType::FlatpakUser => "Flatpak RPCS3",
+                                Rpcs3InstallationType::Explicit => "Configured RPCS3",
+                                Rpcs3InstallationType::Native => "Native RPCS3",
+                            },
+                            candidate.path.display()
+                        )
+                    } else {
+                        rpcs3_binding_problem(blocker)
+                    }
+                }),
                 firmware: rpcs3_firmware_readiness(&health.firmware),
             }
         })

@@ -600,6 +600,24 @@ fn validate_profile(
 
 fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckStationExecutable> {
     let mut candidates = roots.explicit_executables.clone();
+    for directory in [
+        roots.home.join("Applications"),
+        roots.home.join(".local/bin"),
+        roots.home.join(".local/share/applications"),
+        roots.home.join("AppImages"),
+        roots.home.join("bin"),
+    ] {
+        candidates.extend([
+            directory.join("DuckStation"),
+            directory.join("duckstation"),
+            directory.join("duckstation-qt"),
+            directory.join("duckstation-nogui"),
+            directory.join("DuckStation.AppImage"),
+            directory.join("duckstation.AppImage"),
+            directory.join("DuckStation").join("DuckStation.AppImage"),
+            directory.join("DuckStation").join("duckstation-qt"),
+        ]);
+    }
     if let Some(directory) = &roots.appimage_directory {
         candidates.extend([
             directory.join("DuckStation.AppImage"),
@@ -627,6 +645,9 @@ fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckSta
                 .appimage_directory
                 .as_ref()
                 .is_some_and(|root| path.starts_with(root))
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "AppImage")
             {
                 DuckStationInstallationType::Portable
             } else {

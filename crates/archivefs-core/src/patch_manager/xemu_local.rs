@@ -605,6 +605,20 @@ fn validate_profile(candidate: Candidate, executables: &[XemuExecutable]) -> Xem
 
 fn discover_executables(roots: &XemuProfileDiscoveryRoots) -> Vec<XemuExecutable> {
     let mut paths = roots.explicit_executables.clone();
+    for directory in [
+        roots.home.join("Applications"),
+        roots.home.join(".local/bin"),
+        roots.home.join(".local/share/applications"),
+        roots.home.join("AppImages"),
+        roots.home.join("bin"),
+    ] {
+        paths.extend([
+            directory.join("xemu"),
+            directory.join("xemu.AppImage"),
+            directory.join("Xemu.AppImage"),
+            directory.join("xemu-kvm"),
+        ]);
+    }
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([directory.join("xemu.AppImage"), directory.join("xemu")]);
     }
@@ -625,6 +639,9 @@ fn discover_executables(roots: &XemuProfileDiscoveryRoots) -> Vec<XemuExecutable
                 .appimage_directory
                 .as_ref()
                 .is_some_and(|root| path.starts_with(root))
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "AppImage")
             {
                 XemuInstallationType::Portable
             } else {

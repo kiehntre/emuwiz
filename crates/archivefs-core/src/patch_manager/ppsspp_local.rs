@@ -685,6 +685,25 @@ fn validate_profile(
 
 fn discover_executables(roots: &PpssppProfileDiscoveryRoots) -> Vec<PpssppExecutable> {
     let mut paths = roots.explicit_executables.clone();
+    for directory in [
+        roots.home.join("Applications"),
+        roots.home.join(".local/bin"),
+        roots.home.join(".local/share/applications"),
+        roots.home.join("AppImages"),
+        roots.home.join("bin"),
+    ] {
+        paths.extend([
+            directory.join("PPSSPP"),
+            directory.join("PPSSPPQt"),
+            directory.join("PPSSPPSDL"),
+            directory.join("ppsspp"),
+            directory.join("PPSSPP.AppImage"),
+            directory.join("ppsspp.AppImage"),
+            directory.join("PPSSPP").join("PPSSPP.AppImage"),
+            directory.join("PPSSPP").join("PPSSPPSDL"),
+            directory.join("PPSSPP").join("PPSSPPQt"),
+        ]);
+    }
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([directory.join("PPSSPP.AppImage"), directory.join("ppsspp")]);
     }
@@ -709,6 +728,9 @@ fn discover_executables(roots: &PpssppProfileDiscoveryRoots) -> Vec<PpssppExecut
                 .appimage_directory
                 .as_ref()
                 .is_some_and(|directory| path.starts_with(directory))
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "AppImage")
             {
                 PpssppInstallationType::Portable
             } else {

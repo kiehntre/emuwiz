@@ -35,8 +35,9 @@ use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
 use super::profiles::{
-    PpssppReadinessAssessment, ProfileAssessmentReport, Rpcs3ReadinessAssessment,
-    XemuReadinessAssessment, XeniaReadinessAssessment, findings_from_emulator_profiles,
+    LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment, ProfileAssessmentReport,
+    Rpcs3ReadinessAssessment, XemuReadinessAssessment, XeniaReadinessAssessment,
+    findings_from_emulator_profiles, findings_from_linux_emulator_installations,
     findings_from_ppsspp_readiness, findings_from_rpcs3_readiness, findings_from_xemu_readiness,
     findings_from_xenia_readiness, not_checked_from_emulator_profiles,
 };
@@ -129,6 +130,8 @@ pub struct DoctorScanInputs<'a> {
     pub storage: Gathered<&'a StorageAssessment>,
     /// From `profiles::assess_emulator_profiles`.
     pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
+    /// Bounded installation-form evidence gathered outside this pure runner.
+    pub linux_emulator_installations: Gathered<&'a [LinuxEmulatorInstallationEvidence]>,
     /// From `profiles::assess_xemu_readiness`.
     pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
     /// From `profiles::assess_xenia_readiness`.
@@ -168,6 +171,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             emulator_profiles: Gathered::NotLoaded(
                 "Emulator profiles have not been discovered in this session.",
+            ),
+            linux_emulator_installations: Gathered::NotLoaded(
+                "Linux emulator installation evidence has not been gathered in this session.",
             ),
             xemu_readiness: Gathered::NotLoaded(
                 "xemu launch readiness has not been checked in this session.",
@@ -495,6 +501,14 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::EmulatorProfiles,
         DoctorSubsystem::EmulatorProfiles,
         |report: &&ProfileAssessmentReport| findings_from_emulator_profiles(report)
+    );
+    subsystem!(
+        inputs.linux_emulator_installations,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |evidence: &&[LinuxEmulatorInstallationEvidence]| {
+            findings_from_linux_emulator_installations(evidence)
+        }
     );
     subsystem!(
         inputs.xemu_readiness,

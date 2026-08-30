@@ -21,11 +21,11 @@ use archivefs_core::diagnostics::environment::{
 };
 use archivefs_core::diagnostics::managed::{ManagedEntryScan, scan_managed_entries};
 use archivefs_core::diagnostics::profiles::{
-    DiscoveredProfiles, PpssppReadinessAssessment, ProfileAssessmentReport,
-    Rpcs3ReadinessAssessment, XemuReadinessAssessment, XeniaReadinessAssessment,
-    assess_emulator_profiles, assess_ppsspp_readiness, assess_rpcs3_readiness,
-    assess_xemu_readiness, assess_xenia_readiness, managed_scan_targets,
-    profile_destination_directories,
+    DiscoveredProfiles, LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment,
+    ProfileAssessmentReport, Rpcs3ReadinessAssessment, XemuReadinessAssessment,
+    XeniaReadinessAssessment, assess_emulator_profiles, assess_ppsspp_readiness,
+    assess_rpcs3_readiness, assess_xemu_readiness, assess_xenia_readiness,
+    discover_linux_emulator_installations, managed_scan_targets, profile_destination_directories,
 };
 use archivefs_core::diagnostics::repair::{
     DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRejection,
@@ -1843,6 +1843,7 @@ struct DoctorGathered {
     transactions: Gathered<SharedHistoryReport>,
     storage: Gathered<StorageAssessment>,
     emulator_profiles: Gathered<ProfileAssessmentReport>,
+    linux_emulator_installations: Gathered<Vec<LinuxEmulatorInstallationEvidence>>,
     xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,
     xenia_readiness: Gathered<Vec<XeniaReadinessAssessment>>,
     ppsspp_readiness: Gathered<Vec<PpssppReadinessAssessment>>,
@@ -2103,6 +2104,7 @@ fn gather_doctor_inputs() -> DoctorGathered {
         Ok(discovery) => Gathered::Ready(assess_rpcs3_readiness(Some(discovery))),
         Err(error) => Gathered::Failed(error.clone()),
     };
+    let linux_emulator_installations = Gathered::Ready(discover_linux_emulator_installations());
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -2150,6 +2152,7 @@ fn gather_doctor_inputs() -> DoctorGathered {
             &profile_destination_directories(&profile_report),
         ))),
         emulator_profiles: Gathered::Ready(profile_report),
+        linux_emulator_installations,
         xemu_readiness,
         xenia_readiness,
         ppsspp_readiness,
@@ -5571,6 +5574,9 @@ impl ArchiveFsApp {
                             emulator_profiles: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            linux_emulator_installations: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             xemu_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -5648,6 +5654,10 @@ impl ArchiveFsApp {
             },
             storage: borrowed(&gathered.storage, |value| value),
             emulator_profiles: borrowed(&gathered.emulator_profiles, |value| value),
+            linux_emulator_installations: borrowed(
+                &gathered.linux_emulator_installations,
+                |value| value.as_slice(),
+            ),
             xemu_readiness: borrowed(&gathered.xemu_readiness, |value| value.as_slice()),
             xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
             ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),
@@ -5998,6 +6008,13 @@ impl ArchiveFsApp {
     /// "Problems & Repair". Per-emulator rows appear in the scan's
     /// "Emulators" / "Emulator profiles" categories once the check has run.
     fn show_emulator_setup_page(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        // RetroArch has a dedicated, cached discovery lane because its
+        // profile/environment scan is also used by Cheats & Mods. Starting
+        // it here makes Emulator Setup truthful on first use without moving
+        // filesystem work into the pure Doctor runner.
+        if matches!(self.retroarch_profiles, RetroArchProfilesState::NotScanned) {
+            self.start_retroarch_profile_scan(context.clone());
+        }
         widgets::page_header_with_icon(
             ui,
             crate::ui::icons::CHECK,
@@ -6006,9 +6023,34 @@ impl ArchiveFsApp {
              for each one. This page keeps library diagnostics out of the way.",
         );
         ui.add_space(theme::SECTION_GAP);
-        show_emulator_setup_summary(ui, self.doctor_scan.displayed());
+        show_emulator_setup_summary(ui, self.doctor_scan.displayed(), &self.retroarch_profiles);
         ui.add_space(theme::SECTION_GAP);
-        fn show_emulator_setup_summary(ui: &mut egui::Ui, outcome: Option<&DoctorScanOutcome>) {
+        ui.horizontal_wrapped(|ui| {
+            let (label, tone) = retroarch_integration_presentation(&self.retroarch_profiles);
+            widgets::status_badge(ui, label, tone);
+            let action = if matches!(
+                self.retroarch_profiles,
+                RetroArchProfilesState::Ready(_) | RetroArchProfilesState::Error(_)
+            ) {
+                "Rescan RetroArch"
+            } else {
+                "Scan RetroArch"
+            };
+            if ui.button(action).clicked()
+                && !matches!(
+                    self.retroarch_profiles,
+                    RetroArchProfilesState::Scanning { .. }
+                )
+            {
+                self.start_retroarch_profile_scan(context.clone());
+            }
+        });
+        ui.add_space(theme::SECTION_GAP);
+        fn show_emulator_setup_summary(
+            ui: &mut egui::Ui,
+            outcome: Option<&DoctorScanOutcome>,
+            retroarch_profiles: &RetroArchProfilesState,
+        ) {
             widgets::card(ui, |ui| {
                 ui.heading("Emulator readiness");
                 ui.label("Only the emulator/profile evidence gathered by Doctor is shown here. A missing row is never treated as installed.");
@@ -6021,6 +6063,7 @@ impl ArchiveFsApp {
                     "Xenia",
                     "DuckStation",
                     "RetroArch",
+                    "ScummVM",
                 ];
                 for name in emulators {
                     ui.horizontal_wrapped(|ui| {
@@ -6056,6 +6099,14 @@ impl ArchiveFsApp {
                                 widgets::status_badge(ui, label, widgets::StatusTone::Pending);
                                 ui.weak(finding.explanation.clone());
                             }
+                            None if name == "RetroArch" => {
+                                let (label, tone) =
+                                    retroarch_integration_presentation(retroarch_profiles);
+                                widgets::status_badge(ui, label, tone);
+                                ui.weak(
+                                    "RetroArch profile discovery is shared with Cheats & Mods.",
+                                );
+                            }
                             None => {
                                 widgets::status_badge(
                                     ui,
@@ -6065,6 +6116,17 @@ impl ArchiveFsApp {
                                 ui.weak(
                                     "No emulator-specific evidence was returned by the last scan.",
                                 );
+                            }
+                        }
+                        if let Some(evidence) = outcome.and_then(|result| {
+                            result.scan.findings.iter().find(|finding| {
+                                finding.category == DoctorCategory::EmulatorProfiles
+                                    && finding.title == format!("{name} installation found")
+                            })
+                        }) {
+                            ui.weak("Installation evidence:");
+                            for line in &evidence.evidence {
+                                ui.weak(line.clone());
                             }
                         }
                     });

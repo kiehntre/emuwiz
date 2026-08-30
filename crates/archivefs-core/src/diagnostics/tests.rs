@@ -1714,7 +1714,8 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // Seven subsystems were genuinely checked, and the rest are honestly
     // recorded as unavailable rather than as passes.
     assert_eq!(scan.checked_subsystems().len(), 7, "{:?}", scan.coverage);
-    // Storage, filesystem mount state, emulator profiles, xemu/Xenia/PPSSPP/
+    // Storage, filesystem mount state, emulator profiles, Linux installation
+    // evidence, xemu/Xenia/PPSSPP/
     // RPCS3 launch readiness and managed entries are not gathered by this
     // test, so they must appear as unavailable alongside the snapshot,
     // setup and RetroArch subsystems - never as passes. All four launch
@@ -1723,7 +1724,7 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // not one.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        11,
+        12,
         "{:?}",
         scan.coverage
     );

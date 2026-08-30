@@ -520,6 +520,22 @@ fn validate_profile(candidate: ProfileCandidate, executables: &[Rpcs3Executable]
 
 fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executable> {
     let mut paths = roots.explicit_executables.clone();
+    for directory in [
+        roots.home.join("Applications"),
+        roots.home.join(".local/bin"),
+        roots.home.join(".local/share/applications"),
+        roots.home.join("AppImages"),
+        roots.home.join("bin"),
+    ] {
+        paths.extend([
+            directory.join("rpcs3"),
+            directory.join("RPCS3"),
+            directory.join("RPCS3.AppImage"),
+            directory.join("rpcs3.AppImage"),
+            directory.join("RPCS3").join("RPCS3.AppImage"),
+            directory.join("RPCS3").join("rpcs3"),
+        ]);
+    }
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([directory.join("RPCS3.AppImage"), directory.join("rpcs3")]);
     }
@@ -540,6 +556,9 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
                 .appimage_directory
                 .as_ref()
                 .is_some_and(|directory| path.starts_with(directory))
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "AppImage")
             {
                 Rpcs3InstallationType::Portable
             } else {
