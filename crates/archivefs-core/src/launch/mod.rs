@@ -65,6 +65,7 @@
 pub mod dolphin_command;
 pub mod dolphin_execution;
 pub mod dosbox_command;
+pub mod dosbox_execution;
 pub mod duckstation_command;
 pub mod duckstation_execution;
 pub mod es_de_export;
@@ -115,6 +116,11 @@ pub use dosbox_command::{
     discover_dosbox_config, dosbox_config_status_from_inspection, dosbox_variant_from_id,
     resolve_dosbox_native_launch_binding, resolve_dosbox_native_launch_binding_at,
     resolve_dosbox_native_launch_binding_from_id,
+};
+pub use dosbox_execution::{
+    DosBoxLaunchExecutionError, DosBoxLaunchExitReport, DosBoxLaunchPreflightError,
+    DosBoxLaunchPreflightErrorKind, DosBoxLaunchRequest, DosBoxLaunchSpawnError,
+    LaunchedDosBoxProcess, preflight_and_launch_dosbox, preflight_dosbox_launch, spawn_dosbox,
 };
 pub use duckstation_command::{
     DUCKSTATION_SUPPORTED_PLATFORM_ID, DuckStationCommand, DuckStationCommandPlan,
