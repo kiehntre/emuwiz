@@ -2071,6 +2071,11 @@ fn load_pcsx2_firmware_evidence_from_registry()
 /// the mount root's modification time. Doctor borrows the already-computed
 /// `SetupDiagnostics` from `self.diagnostics` instead, so opening Doctor
 /// never performs that write.
+///
+/// The one child process started from here is `arcade_version_probe`'s
+/// bounded, no-shell `mame -version` query (output- and timeout-capped, no
+/// config written). It is a diagnostic probe, not an emulator launch - see
+/// that module's docs.
 fn gather_doctor_inputs() -> DoctorGathered {
     let config = Config::load_default();
 
@@ -2107,16 +2112,41 @@ fn gather_doctor_inputs() -> DoctorGathered {
         Err(error) => Gathered::Failed(error.clone()),
     };
     let installations = discover_linux_emulator_installations();
-    // Advisory arcade emulator / DAT version compatibility. Assembled purely
-    // from the installation evidence just gathered; no emulator is executed
-    // and no DAT file is parsed here, so the DAT revision side stays
-    // `unknown` until a caller supplies a captured `mame -version` output
-    // and the configured arcade DAT `<version>` headers.
+    // Advisory arcade emulator / DAT version compatibility, now on live inputs:
+    //
+    // - DAT revision: the arcade `<version>` headers persisted on each DAT
+    //   source's health record the last time it was validated. Read from the
+    //   already-saved registry; no DAT file is reopened here
+    //   (`arcade_dat_catalogues_from_source_health` is pure).
+    // - Emulator version: a bounded, no-shell `mame -version` probe
+    //   (`arcade_version_probe`) with output and timeout caps - a diagnostic
+    //   query, never a normal launch. FinalBurn Neo is not probed, so it stays
+    //   "detected, version unknown" unless a version is supplied another way.
+    //
+    // Both sides fail soft to "unknown"; a version difference is only ever an
+    // Info finding and never changes ROM-set completeness.
+    let arcade_dat_catalogues = archivefs_core::dat::sources::load_dat_sources_config_default()
+        .ok()
+        .map(|config| {
+            let (registry, _warnings) =
+                archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
+            archivefs_core::diagnostics::arcade_dat_version::arcade_dat_catalogues_from_source_health(
+                registry
+                    .entries()
+                    .iter()
+                    .flat_map(|entry| entry.health.arcade_catalogue_revisions.iter()),
+            )
+        })
+        .unwrap_or_default();
+    let arcade_version_outputs =
+        archivefs_core::diagnostics::arcade_version_probe::probe_arcade_emulator_versions(
+            &installations,
+        );
     let arcade_dat_version = Gathered::Ready(
         archivefs_core::diagnostics::arcade_dat_version::arcade_dat_version_readiness(
             &installations,
-            &[],
-            &[],
+            &arcade_dat_catalogues,
+            &arcade_version_outputs,
         ),
     );
     let linux_emulator_installations = Gathered::Ready(installations);

@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::dat::model::DatEcosystem;
+
 pub use crate::dat::policy::{DatPolicyConfig, default_dat_policy};
 pub use config::{
     DatSourceConfigEntry, DatSourcesConfig, default_dat_sources_config_path,
@@ -181,6 +183,88 @@ impl DatHealthState {
     }
 }
 
+/// One arcade DAT catalogue's `<version>` header, observed when a source was
+/// last validated and retained on the health record.
+///
+/// It exists so Doctor's advisory MAME / FinalBurn Neo "does the catalogue I
+/// audited against match the emulator I have installed?" check can read a
+/// persisted revision instead of reopening the DAT during a scan. One entry
+/// per distinct arcade [`DatEcosystem`] present in the source; `version` is
+/// `None` when the DAT declared no `<version>` header at all (still recorded,
+/// so "arcade catalogue configured, revision unknown" stays distinct from
+/// "no arcade catalogue configured").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeCatalogueRevision {
+    pub ecosystem: DatEcosystem,
+    pub version: Option<String>,
+}
+
+impl ArcadeCatalogueRevision {
+    /// Whether an ecosystem is one this record tracks (MAME arcade / MAME
+    /// software list / FinalBurn Neo). Every other ecosystem is ignored: an
+    /// emulator-version comparison does not apply to it.
+    pub fn is_arcade_ecosystem(ecosystem: DatEcosystem) -> bool {
+        matches!(
+            ecosystem,
+            DatEcosystem::MAMEArcade | DatEcosystem::MAMESoftwareList | DatEcosystem::FBNeo
+        )
+    }
+
+    fn ecosystem_key(ecosystem: DatEcosystem) -> Option<&'static str> {
+        match ecosystem {
+            DatEcosystem::MAMEArcade => Some("mame_arcade"),
+            DatEcosystem::MAMESoftwareList => Some("mame_software_list"),
+            DatEcosystem::FBNeo => Some("fbneo"),
+            _ => None,
+        }
+    }
+
+    fn ecosystem_from_key(key: &str) -> Option<DatEcosystem> {
+        match key {
+            "mame_arcade" => Some(DatEcosystem::MAMEArcade),
+            "mame_software_list" => Some(DatEcosystem::MAMESoftwareList),
+            "fbneo" => Some(DatEcosystem::FBNeo),
+            _ => None,
+        }
+    }
+
+    /// The flat `"<ecosystem-key>=<version>"` scalar form persisted in the
+    /// config file, so the health block stays free of TOML sub-tables. An
+    /// absent `<version>` header serialises as a trailing `=` and nothing
+    /// after it.
+    fn encode(&self) -> Option<String> {
+        let key = Self::ecosystem_key(self.ecosystem)?;
+        Some(match self.version.as_deref().map(str::trim) {
+            Some(version) if !version.is_empty() => format!("{key}={version}"),
+            _ => format!("{key}="),
+        })
+    }
+
+    /// The inverse of [`encode`]. Unknown ecosystem keys are dropped rather
+    /// than guessed.
+    fn decode(text: &str) -> Option<Self> {
+        let (key, version) = text.split_once('=')?;
+        let ecosystem = Self::ecosystem_from_key(key.trim())?;
+        let version = version.trim();
+        Some(Self {
+            ecosystem,
+            version: (!version.is_empty()).then(|| version.to_string()),
+        })
+    }
+
+    pub(crate) fn encode_all(revisions: &[Self]) -> Option<Vec<String>> {
+        let encoded: Vec<String> = revisions.iter().filter_map(Self::encode).collect();
+        (!encoded.is_empty()).then_some(encoded)
+    }
+
+    pub(crate) fn decode_all(encoded: &[String]) -> Vec<Self> {
+        encoded
+            .iter()
+            .filter_map(|text| Self::decode(text))
+            .collect()
+    }
+}
+
 /// The result of the last validation run, as persisted.
 ///
 /// `observed_size_bytes` / `observed_modified_unix_seconds` describe the DAT
@@ -202,6 +286,11 @@ pub struct DatSourceHealth {
     pub formats: Option<Vec<String>>,
     pub observed_size_bytes: Option<u64>,
     pub observed_modified_unix_seconds: Option<i64>,
+    /// The `<version>` header of each arcade DAT catalogue in the source, kept
+    /// so Doctor can compare it against the installed MAME / FinalBurn Neo
+    /// without reopening the DAT. Empty for a source with no arcade catalogue.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arcade_catalogue_revisions: Vec<ArcadeCatalogueRevision>,
 }
 
 impl DatSourceHealth {

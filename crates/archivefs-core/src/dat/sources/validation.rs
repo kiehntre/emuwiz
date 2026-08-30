@@ -44,7 +44,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-use super::{DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, now_unix};
+use super::{
+    ArcadeCatalogueRevision, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
+    now_unix,
+};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatFormat};
 use crate::dat::parser::DiagnosticSeverity;
@@ -470,8 +473,45 @@ impl DatValidationReport {
             formats: (!self.formats.is_empty()).then(|| self.formats.clone()),
             observed_size_bytes: size,
             observed_modified_unix_seconds: modified,
+            arcade_catalogue_revisions: arcade_catalogue_revisions(&self.files),
         }
     }
+}
+
+/// The `<version>` header of each arcade DAT catalogue this run parsed, one
+/// entry per distinct arcade ecosystem. This never reparses anything: it
+/// reads the ecosystem and `<version>` the run already recorded on each
+/// [`DatFileReport`]. When a folder holds two files of the same arcade
+/// ecosystem, the one that actually declares a `<version>` is kept.
+pub(crate) fn arcade_catalogue_revisions(files: &[DatFileReport]) -> Vec<ArcadeCatalogueRevision> {
+    let mut revisions: Vec<ArcadeCatalogueRevision> = Vec::new();
+    for file in files {
+        let DatFileOutcome::Parsed {
+            ecosystem, version, ..
+        } = &file.outcome
+        else {
+            continue;
+        };
+        if !ArcadeCatalogueRevision::is_arcade_ecosystem(*ecosystem) {
+            continue;
+        }
+        let version = version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        match revisions.iter_mut().find(|r| r.ecosystem == *ecosystem) {
+            Some(existing) if existing.version.is_none() && version.is_some() => {
+                existing.version = version;
+            }
+            Some(_) => {}
+            None => revisions.push(ArcadeCatalogueRevision {
+                ecosystem: *ecosystem,
+                version,
+            }),
+        }
+    }
+    revisions
 }
 
 fn observe_file(path: &Path) -> (Option<u64>, Option<i64>) {

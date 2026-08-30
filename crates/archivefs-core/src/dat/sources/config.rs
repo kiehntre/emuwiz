@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, DatSourceOwnership,
-    MIN_DAT_PRIORITY,
+    ArcadeCatalogueRevision, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
+    DatSourceOwnership, MIN_DAT_PRIORITY,
 };
 use crate::ArchiveFsError;
 use crate::dat::policy::config::DatPolicyConfig;
@@ -121,6 +121,13 @@ pub struct DatSourceConfigEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_observed_modified_unix_seconds: Option<i64>,
 
+    /// Arcade DAT catalogue `<version>` headers observed at validation time,
+    /// one flat `"<ecosystem-key>=<version>"` string each (see
+    /// [`ArcadeCatalogueRevision`]). Kept as scalars, not a sub-table, so the
+    /// health block's TOML ordering rules are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_arcade_catalogue_revisions: Option<Vec<String>>,
+
     /// Keys inside this entry that a newer build wrote.
     #[serde(flatten)]
     pub unknown_fields: toml::Table,
@@ -162,6 +169,11 @@ impl DatSourceConfigEntry {
                 formats: self.health_formats,
                 observed_size_bytes: self.health_observed_size_bytes,
                 observed_modified_unix_seconds: self.health_observed_modified_unix_seconds,
+                arcade_catalogue_revisions: ArcadeCatalogueRevision::decode_all(
+                    self.health_arcade_catalogue_revisions
+                        .as_deref()
+                        .unwrap_or(&[]),
+                ),
             },
             unknown_fields: self.unknown_fields,
         }
@@ -188,6 +200,9 @@ impl DatSourceConfigEntry {
             health_formats: entry.health.formats.clone(),
             health_observed_size_bytes: entry.health.observed_size_bytes,
             health_observed_modified_unix_seconds: entry.health.observed_modified_unix_seconds,
+            health_arcade_catalogue_revisions: ArcadeCatalogueRevision::encode_all(
+                &entry.health.arcade_catalogue_revisions,
+            ),
             unknown_fields: entry.unknown_fields.clone(),
         }
     }

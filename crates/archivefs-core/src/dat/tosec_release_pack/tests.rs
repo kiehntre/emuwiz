@@ -318,6 +318,7 @@ fn local_source(id: &str, path: &str) -> DatSourceConfigEntry {
         health_formats: None,
         health_observed_size_bytes: None,
         health_observed_modified_unix_seconds: None,
+        health_arcade_catalogue_revisions: None,
         unknown_fields: toml::Table::new(),
     }
 }

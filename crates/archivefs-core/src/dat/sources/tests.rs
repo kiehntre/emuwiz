@@ -32,7 +32,9 @@ use super::config::{
     DatSourceConfigEntry, DatSourcesConfig, dat_sources_config_path_in,
     load_dat_sources_config_from, save_dat_sources_config_to,
 };
-use super::validation::{DatFileOutcome, sniff_dat_format};
+use super::validation::{
+    DatFileOutcome, DatFileReport, arcade_catalogue_revisions, sniff_dat_format,
+};
 use super::*;
 use crate::dat::limits::DatLimits;
 use crate::dat::model::DatFormat;
@@ -1221,6 +1223,7 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         health_formats: None,
         health_observed_size_bytes: None,
         health_observed_modified_unix_seconds: None,
+        health_arcade_catalogue_revisions: None,
         unknown_fields: toml::Table::new(),
     }
 }
@@ -3725,5 +3728,116 @@ fn combined_audit_zip_member_identity_and_rename_are_unaffected_by_rar_support()
     assert_eq!(
         plan.proposals[0].proposed_basename.as_deref(),
         Some("Game (World).zip")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Arcade DAT catalogue revision provenance
+// ---------------------------------------------------------------------------
+
+use crate::dat::model::DatEcosystem;
+
+fn parsed_file(name: &str, ecosystem: DatEcosystem, version: Option<&str>) -> DatFileReport {
+    DatFileReport {
+        path: format!("/dats/{name}"),
+        file_name: name.to_string(),
+        outcome: DatFileOutcome::Parsed {
+            format: DatFormat::Logiqx,
+            ecosystem,
+            name: Some(name.to_string()),
+            version: version.map(str::to_string),
+            entry_count: 1,
+            rom_count: 1,
+            diagnostics: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn arcade_revisions_are_taken_from_arcade_files_only() {
+    let files = [
+        parsed_file("mame.xml", DatEcosystem::MAMEArcade, Some("0.216")),
+        parsed_file("fbneo.dat", DatEcosystem::FBNeo, Some("v1.0.0.02")),
+        parsed_file("nointro.dat", DatEcosystem::NoIntro, Some("2024-01-01")),
+    ];
+    let revisions = arcade_catalogue_revisions(&files);
+    assert_eq!(revisions.len(), 2, "{revisions:?}");
+    assert_eq!(revisions[0].ecosystem, DatEcosystem::MAMEArcade);
+    assert_eq!(revisions[0].version.as_deref(), Some("0.216"));
+    assert_eq!(revisions[1].ecosystem, DatEcosystem::FBNeo);
+    assert_eq!(revisions[1].version.as_deref(), Some("v1.0.0.02"));
+}
+
+#[test]
+fn an_arcade_file_without_a_version_header_is_still_recorded() {
+    let files = [parsed_file("mame.xml", DatEcosystem::MAMEArcade, None)];
+    let revisions = arcade_catalogue_revisions(&files);
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].ecosystem, DatEcosystem::MAMEArcade);
+    assert_eq!(revisions[0].version, None);
+}
+
+#[test]
+fn a_folder_with_two_mame_files_keeps_the_one_that_declares_a_version() {
+    let files = [
+        parsed_file("a.xml", DatEcosystem::MAMEArcade, None),
+        parsed_file("b.xml", DatEcosystem::MAMEArcade, Some("0.270")),
+    ];
+    let revisions = arcade_catalogue_revisions(&files);
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].version.as_deref(), Some("0.270"));
+}
+
+#[test]
+fn arcade_revisions_round_trip_through_the_config_file() {
+    let dir = temp();
+    let path = write(dir.path(), "mame.dat", LOGIQX);
+    let mut entry = entry_for(&path, DatSourceKind::File);
+    entry.health = DatSourceHealth {
+        state: Some(DatHealthState::Valid),
+        arcade_catalogue_revisions: vec![
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::MAMEArcade,
+                version: Some("0.216".to_string()),
+            },
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::FBNeo,
+                version: None,
+            },
+        ],
+        ..DatSourceHealth::default()
+    };
+    let mut registry = DatSourceRegistry::new();
+    registry.add(entry).unwrap();
+
+    let target = dir.path().join("dat_sources.toml");
+    save_dat_sources_config_to(&target, &registry.to_config()).unwrap();
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        text.contains("mame_arcade=0.216"),
+        "a versioned arcade revision is persisted as a flat scalar:\n{text}"
+    );
+    assert!(
+        text.contains("fbneo="),
+        "an arcade catalogue with no version header is still persisted:\n{text}"
+    );
+
+    let reloaded = load_dat_sources_config_from(&target).unwrap();
+    let (registry, problems) = DatSourceRegistry::from_config(&reloaded);
+    assert!(problems.is_empty(), "{problems:?}");
+    let health = &registry.entries()[0].health;
+    assert_eq!(
+        health.arcade_catalogue_revisions,
+        vec![
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::MAMEArcade,
+                version: Some("0.216".to_string()),
+            },
+            ArcadeCatalogueRevision {
+                ecosystem: DatEcosystem::FBNeo,
+                version: None,
+            },
+        ]
     );
 }

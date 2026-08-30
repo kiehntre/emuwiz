@@ -421,3 +421,113 @@ fn doctor_finding_says_version_unknown_when_no_output_was_captured() {
             .contains("installed mame version could not be determined")
     );
 }
+
+// --- persisted DAT revision source --------------------------------------
+
+use crate::dat::sources::ArcadeCatalogueRevision;
+
+fn revision(ecosystem: DatEcosystem, version: Option<&str>) -> ArcadeCatalogueRevision {
+    ArcadeCatalogueRevision {
+        ecosystem,
+        version: version.map(str::to_string),
+    }
+}
+
+#[test]
+fn health_revisions_become_catalogues_without_reopening_a_dat() {
+    // Pure transform: only already-loaded health records go in.
+    let revisions = [
+        revision(DatEcosystem::MAMEArcade, Some("0.216")),
+        revision(DatEcosystem::FBNeo, Some("1.0.0.2")),
+    ];
+    let catalogues = arcade_dat_catalogues_from_source_health(&revisions);
+    assert_eq!(catalogues.len(), 2);
+    assert_eq!(
+        catalogues[0],
+        ArcadeDatCatalogueVersion {
+            ecosystem: DatEcosystem::MAMEArcade,
+            version_header: Some("0.216".to_string()),
+        }
+    );
+    assert_eq!(
+        catalogues[1],
+        ArcadeDatCatalogueVersion {
+            ecosystem: DatEcosystem::FBNeo,
+            version_header: Some("1.0.0.2".to_string()),
+        }
+    );
+}
+
+#[test]
+fn health_revisions_keep_mame_and_fbneo_separate_first_wins() {
+    let revisions = [
+        revision(DatEcosystem::MAMEArcade, Some("0.216")),
+        revision(DatEcosystem::MAMEArcade, Some("0.999")),
+        revision(DatEcosystem::FBNeo, Some("1.0.0.2")),
+    ];
+    let catalogues = arcade_dat_catalogues_from_source_health(&revisions);
+    assert_eq!(catalogues.len(), 2);
+    assert_eq!(catalogues[0].ecosystem, DatEcosystem::MAMEArcade);
+    assert_eq!(catalogues[0].version_header.as_deref(), Some("0.216"));
+    assert_eq!(catalogues[1].ecosystem, DatEcosystem::FBNeo);
+}
+
+#[test]
+fn a_persisted_revision_with_no_version_header_stays_unknown() {
+    let revisions = [revision(DatEcosystem::MAMEArcade, None)];
+    let catalogues = arcade_dat_catalogues_from_source_health(&revisions);
+    assert_eq!(catalogues.len(), 1);
+    assert_eq!(catalogues[0].ecosystem, DatEcosystem::MAMEArcade);
+    assert_eq!(catalogues[0].version_header, None);
+}
+
+#[test]
+fn persisted_revision_plus_probe_output_drives_the_comparator() {
+    // The whole live pipe: persisted MAME DAT revision + a captured
+    // `mame -version` string -> the typed comparator, per ecosystem.
+    let catalogues = arcade_dat_catalogues_from_source_health(&[
+        revision(DatEcosystem::MAMEArcade, Some("0.270")),
+        revision(DatEcosystem::FBNeo, Some("1.0.0.2")),
+    ]);
+    let outputs = [(ArcadeEmulator::Mame, "0.270 (mame0270)".to_string())];
+    let readiness = arcade_dat_version_readiness(
+        &[install("MAME"), install("FinalBurn Neo")],
+        &catalogues,
+        &outputs,
+    );
+
+    let mame = readiness
+        .iter()
+        .find(|r| r.emulator == ArcadeEmulator::Mame)
+        .unwrap();
+    assert_eq!(mame.compatibility, ArcadeDatVersionCompatibility::Matching);
+    assert_eq!(mame.emulator_version.as_deref(), Some("0.270"));
+    assert_eq!(mame.dat_revision.as_deref(), Some("0.270"));
+
+    // FBNeo has a persisted revision but no probe output -> version unknown.
+    let fbneo = readiness
+        .iter()
+        .find(|r| r.emulator == ArcadeEmulator::Fbneo)
+        .unwrap();
+    assert_eq!(fbneo.compatibility, ArcadeDatVersionCompatibility::Unknown);
+    assert_eq!(fbneo.emulator_version, None);
+    assert_eq!(fbneo.dat_revision.as_deref(), Some("1.0.0.2"));
+}
+
+#[test]
+fn persisted_older_dat_revision_reports_older_not_broken() {
+    let catalogues = arcade_dat_catalogues_from_source_health(&[revision(
+        DatEcosystem::MAMEArcade,
+        Some("0.106u2"),
+    )]);
+    let outputs = [(ArcadeEmulator::Mame, "0.270".to_string())];
+    let readiness = arcade_dat_version_readiness(&[install("MAME")], &catalogues, &outputs);
+    let mame = &readiness[0];
+    assert_eq!(
+        mame.compatibility,
+        ArcadeDatVersionCompatibility::DatOlderThanEmulator
+    );
+    // Advisory only: still an Info finding.
+    let findings = findings_from_arcade_dat_version(&readiness);
+    assert!(findings.iter().all(|f| f.severity == DoctorSeverity::Info));
+}

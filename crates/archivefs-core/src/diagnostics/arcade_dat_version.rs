@@ -302,6 +302,34 @@ pub struct ArcadeDatCatalogueVersion {
     pub version_header: Option<String>,
 }
 
+/// Builds the arcade DAT catalogue-version inputs from the DAT-source health
+/// records persisted the last time each source was validated
+/// ([`crate::dat::sources::ArcadeCatalogueRevision`]).
+///
+/// Pure: it consumes health records that are already in memory, opens no
+/// file, and parses no DAT - the "no DAT XML is reopened during a Doctor
+/// scan" rule is satisfied by construction. One catalogue per distinct
+/// arcade ecosystem (the first occurrence wins), so a MAME revision and an
+/// FBNeo revision are never merged into one comparison.
+pub fn arcade_dat_catalogues_from_source_health<'a>(
+    revisions: impl IntoIterator<Item = &'a crate::dat::sources::ArcadeCatalogueRevision>,
+) -> Vec<ArcadeDatCatalogueVersion> {
+    let mut catalogues: Vec<ArcadeDatCatalogueVersion> = Vec::new();
+    for revision in revisions {
+        if catalogues
+            .iter()
+            .any(|catalogue| catalogue.ecosystem == revision.ecosystem)
+        {
+            continue;
+        }
+        catalogues.push(ArcadeDatCatalogueVersion {
+            ecosystem: revision.ecosystem,
+            version_header: revision.version.clone(),
+        });
+    }
+    catalogues
+}
+
 /// A truthful readiness fact for one arcade emulator + its DAT catalogue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArcadeEmulatorDatReadiness {

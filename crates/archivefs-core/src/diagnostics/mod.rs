@@ -68,6 +68,7 @@ use crate::{
 };
 
 pub mod arcade_dat_version;
+pub mod arcade_version_probe;
 pub mod environment;
 pub mod managed;
 pub mod profiles;
