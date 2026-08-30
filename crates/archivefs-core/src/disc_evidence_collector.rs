@@ -167,6 +167,35 @@ pub fn open_chd_iso9660(
     Ok((media, filesystem))
 }
 
+/// Opens already-read `.chd` bytes as a raw decoded data-track
+/// [`LogicalMedia`] - the identical CHD container discipline
+/// [`open_chd_iso9660`] performs (`looks_like_chd`, `observe_chd_identity`,
+/// the `ChdMetadataOutcome::Observed` requirement, the
+/// specialist-optical-backend refusal, `select_candidate_data_track`, then
+/// the pure-Rust track decoder), stopping *before* the ISO 9660 filesystem
+/// gate. Factored out for a caller whose on-disc identity structure is not
+/// ISO 9660 - notably [`crate::game_identity`]'s 3DO path, whose authority
+/// is the OperaFS volume header at logical offset 0, a bounded sector-0
+/// read that never needs (and never has) an ISO 9660 filesystem. Every
+/// CHD-container safety and resource bound [`open_chd_iso9660`] enforces is
+/// enforced here identically; only the trailing `looks_like_iso9660` /
+/// `observe_iso9660` steps are omitted.
+pub fn open_chd_raw_track(bytes: &[u8]) -> Result<ChdTrackLogicalMedia<'_>, DiscCollectionRefusal> {
+    if !looks_like_chd(bytes) {
+        return Err(DiscCollectionRefusal::NotRecognizedContainer);
+    }
+    let observation = observe_chd_identity(bytes)
+        .map_err(|error| DiscCollectionRefusal::ChdHeaderDidNotParse(error.to_string()))?;
+    let ChdMetadataOutcome::Observed(chd_metadata) = &observation.metadata else {
+        return Err(DiscCollectionRefusal::NoLogicalReaderAvailable);
+    };
+    if needs_specialist_optical_backend(chd_metadata) {
+        return Err(DiscCollectionRefusal::NoLogicalReaderAvailable);
+    }
+    let _ = select_candidate_data_track(chd_metadata);
+    open_chd_track_logical_media(bytes).map_err(|_| DiscCollectionRefusal::NoLogicalReaderAvailable)
+}
+
 /// Whether `bytes` (not yet known to be readable by [`open_chd_iso9660`])
 /// is a multi-track GD-ROM CHD whose real game data lives in a
 /// high-density track beyond the low-density track

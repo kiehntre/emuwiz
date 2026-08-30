@@ -16,7 +16,7 @@ use zip::ZipArchive;
 
 use crate::disc_evidence_collector::{
     DiscCollectionRefusal, chd_needs_specialist_optical_backend, open_chd_iso9660,
-    read_bounded_chd_bytes,
+    open_chd_raw_track, read_bounded_chd_bytes,
 };
 use crate::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
 use crate::executable_signatures::{
@@ -782,6 +782,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::Saturn
                     | IdentityPlatform::Dreamcast
                     | IdentityPlatform::SegaCd
+                    | IdentityPlatform::ThreeDo
             ) =>
         {
             inspect_disc_chd(&mut report, trusted);
@@ -4158,6 +4159,28 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         }
     }
 
+    if report.platform == IdentityPlatform::ThreeDo {
+        // 3DO discs carry a Panasonic OperaFS volume, not ISO 9660, so the
+        // `open_chd_iso9660` path below always refuses them. The raw
+        // data-track reader applies the identical CHD container safety and
+        // resource bounds, and 3DO identity is a single bounded read of the
+        // OperaFS volume header at logical offset 0 - the exact same
+        // `inspect_threedo_source` the raw ISO/CUE paths already use, so a
+        // 3DO `.chd` and a plain 3DO disc produce an equivalent
+        // `ThreeDoDiscId`.
+        let media = match open_chd_raw_track(&bytes) {
+            Ok(media) => media,
+            Err(refusal) => {
+                push_disc_chd_refusal(report, &refusal);
+                return;
+            }
+        };
+        let mut source = MediaSource::new(media);
+        inspect_threedo_source(report, &mut source, None, None);
+        report.bytes_read = report.bytes_read.max(source.bytes_read());
+        return;
+    }
+
     let (media, filesystem) = match open_chd_iso9660(&bytes) {
         Ok(pair) => pair,
         Err(refusal) => {
@@ -4515,6 +4538,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
             IdentityPlatform::Saturn => IdentityKind::SaturnProductNumber,
             IdentityPlatform::Dreamcast => IdentityKind::DreamcastProductCode,
             IdentityPlatform::SegaCd => IdentityKind::SegaCdProductCode,
+            IdentityPlatform::ThreeDo => IdentityKind::ThreeDoDiscId,
             _ => IdentityKind::Ps1Serial,
         },
         status,
@@ -5680,19 +5704,24 @@ mod tests {
         iso
     }
 
-    /// Wraps an ISO9660 image (e.g. from [`ps1_iso`]) into a genuine,
-    /// `open_chd_track_logical_media`-openable uncompressed CHD v5 file, so
-    /// PS1 CHD identity tests exercise the real bounded CHD decode path
-    /// rather than a shortcut. This deliberately re-derives the same
-    /// minimal CHD v5 header/metadata/map/hunk-data layout that
-    /// `chd_logical_media`'s own private test-only `build_uncompressed_chd`
-    /// uses (that helper cannot be imported across module boundaries) - it
-    /// is not a second CHD *reader*, only a second CHD *test fixture
-    /// writer*, mirroring one that already exists and is already trusted.
-    /// Each `LOGICAL_BLOCK_BYTES` (2048-byte) block of `image` becomes one
-    /// `RAW_SECTOR_BYTES` (2352-byte) MODE1_RAW sector, matching
-    /// `chd_logical_media`'s own `mode1_sectors_for` test helper.
-    fn ps1_chd(image: &[u8]) -> Vec<u8> {
+    /// Wraps a 2048-byte-sectored `image` into a genuine,
+    /// `open_chd_track_logical_media`-openable uncompressed CHD v5 file (one
+    /// MODE1_RAW track, track 1, zero pregap - the exact single-track shape
+    /// the pure-Rust CHD reader supports), so CHD identity tests exercise
+    /// the real bounded CHD decode path rather than a shortcut. This
+    /// deliberately re-derives the same minimal CHD v5 header/metadata/map/
+    /// hunk-data layout that `chd_logical_media`'s own private test-only
+    /// `build_uncompressed_chd` uses (that helper cannot be imported across
+    /// module boundaries) - it is not a second CHD *reader*, only a second
+    /// CHD *test fixture writer*, mirroring one that already exists and is
+    /// already trusted. Each `LOGICAL_BLOCK_BYTES` (2048-byte) block of
+    /// `image` becomes one `RAW_SECTOR_BYTES` (2352-byte) MODE1_RAW sector,
+    /// matching `chd_logical_media`'s own `mode1_sectors_for` test helper.
+    /// Makes no assumption that `image` is ISO 9660: [`ps1_chd`] layers the
+    /// one ISO 9660 PVD field its filesystem path needs on top of this,
+    /// while a caller whose on-disc structure is not ISO 9660 (3DO OperaFS -
+    /// see [`threedo_chd`]) wraps the image verbatim.
+    fn uncompressed_mode1_raw_chd(image: &[u8]) -> Vec<u8> {
         use crate::dat::archive::chd::CHD_MAGIC;
         use crate::raw_cd_sector::{LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, RAW_SECTOR_BYTES};
 
@@ -5702,19 +5731,6 @@ mod tests {
         fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
             bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
         }
-
-        // `ps1_iso` never fills in the PVD's logical-block-size field
-        // because the plain-ISO `ByteSource` reader (`find_iso_path`) never
-        // reads it - it works purely off fixed 2048-byte offsets. The CHD
-        // path instead goes through `crate::iso9660::observe_iso9660`,
-        // which - correctly, for a real disc - insists this field says
-        // 2048 both-endian. Patching it here is completing a real ISO9660
-        // field the shared fixture happens to leave zeroed, not working
-        // around a bug.
-        let mut image = image.to_vec();
-        let pvd = 16 * LOGICAL_BLOCK_BYTES;
-        image[pvd + 128..pvd + 130].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_le_bytes());
-        image[pvd + 130..pvd + 132].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_be_bytes());
 
         let sectors: Vec<[u8; RAW_SECTOR_BYTES]> = image
             .chunks(LOGICAL_BLOCK_BYTES)
@@ -5769,6 +5785,34 @@ mod tests {
         put_u64(&mut data, 40, map_offset);
         put_u64(&mut data, 48, meta_offset);
         data
+    }
+
+    /// Wraps an ISO 9660 image (e.g. from [`ps1_iso`]) into a genuine
+    /// uncompressed CHD v5 file, first completing the one PVD
+    /// logical-block-size field the shared plain-ISO fixtures leave zeroed.
+    /// `ps1_iso` omits it because the plain-ISO `ByteSource` reader
+    /// (`find_iso_path`) never reads it - it works purely off fixed
+    /// 2048-byte offsets - whereas the CHD path goes through
+    /// `crate::iso9660::observe_iso9660`, which (correctly, for a real disc)
+    /// insists this field says 2048 both-endian. Completing it here is
+    /// filling in a real ISO 9660 field, not working around a bug.
+    fn ps1_chd(image: &[u8]) -> Vec<u8> {
+        use crate::raw_cd_sector::LOGICAL_BLOCK_BYTES;
+
+        let mut image = image.to_vec();
+        let pvd = 16 * LOGICAL_BLOCK_BYTES;
+        image[pvd + 128..pvd + 130].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_le_bytes());
+        image[pvd + 130..pvd + 132].copy_from_slice(&(LOGICAL_BLOCK_BYTES as u16).to_be_bytes());
+        uncompressed_mode1_raw_chd(&image)
+    }
+
+    /// Wraps a 3DO OperaFS image (e.g. from [`threedo_fixture`]) into the
+    /// same genuine uncompressed single-track CHD v5 file. OperaFS is not
+    /// ISO 9660, so unlike [`ps1_chd`] there is no PVD field to complete -
+    /// the bytes are wrapped verbatim, exactly as a real 3DO CHD's decoded
+    /// data track would present them.
+    fn threedo_chd(image: &[u8]) -> Vec<u8> {
+        uncompressed_mode1_raw_chd(image)
     }
 
     fn ps1_raw_bin(image: &[u8]) -> Vec<u8> {
@@ -6611,7 +6655,8 @@ mod tests {
             assert!(!report.complete, "{name}");
         }
 
-        let mut wrong_executable = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\n", true);
+        let mut wrong_executable =
+            ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
         wrong_executable[22 * ISO_SECTOR_SIZE as usize..22 * ISO_SECTOR_SIZE as usize + 8]
             .copy_from_slice(b"NOT-PSX!");
         let path = write_fixture(&directory, "wrong-executable.iso", &wrong_executable);
@@ -9263,6 +9308,114 @@ mod tests {
             Some("VOL10203040-ROOT50607080-BLOCKS00000001")
         );
         assert!(report.complete);
+    }
+
+    #[test]
+    fn threedo_chd_verifies_the_same_disc_id_as_the_raw_disc() {
+        let directory = FixtureDir::new("threedo-chd-parity");
+        let image = threedo_fixture(0x198E_EB79, 0x1F23_77CF, 1);
+
+        let iso_path = write_fixture(&directory, "raw-disc.iso", &image);
+        let raw = inspect_catalogued_game_identity(&iso_path, Some("3DO"));
+        assert_eq!(raw.format, IdentityImageFormat::Iso);
+        assert_eq!(
+            raw.verified_threedo_disc_id(),
+            Some("VOL198EEB79-ROOT1F2377CF-BLOCKS00000001")
+        );
+        assert!(raw.complete);
+
+        // Deliberately misleading name and extension: identity must come
+        // from the OperaFS volume header inside the decoded CHD track.
+        let chd_path = write_fixture(
+            &directory,
+            "Definitely A PS1 Game (USA).chd",
+            &threedo_chd(&image),
+        );
+        let chd = inspect_catalogued_game_identity(&chd_path, Some("Panasonic 3DO"));
+        assert_eq!(chd.platform, IdentityPlatform::ThreeDo);
+        assert_eq!(chd.format, IdentityImageFormat::Chd);
+        assert_eq!(
+            chd.verified_threedo_disc_id(),
+            raw.verified_threedo_disc_id()
+        );
+        assert!(chd.complete);
+        assert!(!chd.evidence.iter().any(|evidence| {
+            evidence.kind == IdentityKind::ThreeDoDiscId
+                && evidence.confidence == IdentityConfidence::FilenameOnly
+        }));
+    }
+
+    #[test]
+    fn threedo_chd_hint_over_a_non_threedo_disc_fails_closed() {
+        let directory = FixtureDir::new("threedo-chd-wrong-platform");
+        // A genuine, openable ISO 9660 PS1 CHD, asked for as 3DO: the
+        // OperaFS header validation at logical offset 0 must reject it
+        // rather than emit a bogus disc id.
+        let ps1 = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let chd_path = write_fixture(&directory, "mislabelled.chd", &ps1_chd(&ps1));
+        let report = inspect_catalogued_game_identity(&chd_path, Some("3DO"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_threedo_disc_id(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn malformed_or_truncated_threedo_chd_fails_closed() {
+        let directory = FixtureDir::new("threedo-chd-malformed");
+
+        // Not a CHD container at all.
+        let not_chd = write_fixture(&directory, "garbage.chd", &[0xAA_u8; 512]);
+        let report = inspect_catalogued_game_identity(&not_chd, Some("3DO"));
+        assert_eq!(report.verified_threedo_disc_id(), None);
+        assert!(!report.complete);
+
+        // A real CHD whose single decoded sector is not an OperaFS header.
+        let empty_track = write_fixture(&directory, "blank.chd", &threedo_chd(&[0_u8; 2048]));
+        let report = inspect_catalogued_game_identity(&empty_track, Some("3DO"));
+        assert_eq!(report.verified_threedo_disc_id(), None);
+        assert!(!report.complete);
+
+        // A CHD file truncated inside its own header.
+        let mut truncated = threedo_chd(&threedo_fixture(0x1234_5678, 0x9ABC_DEF0, 1));
+        truncated.truncate(60);
+        let truncated_path = write_fixture(&directory, "truncated.chd", &truncated);
+        let report = inspect_catalogued_game_identity(&truncated_path, Some("3DO"));
+        assert_eq!(report.verified_threedo_disc_id(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn adding_threedo_chd_dispatch_leaves_neighbouring_platforms_unchanged() {
+        let directory = FixtureDir::new("threedo-chd-neighbours");
+
+        let saturn = write_fixture(&directory, "s.chd", &ps1_chd(&saturn_iso(b"T-7101G")));
+        assert_eq!(
+            inspect_game_identity(&saturn, Some("Saturn")).verified_saturn_product_number(),
+            Some("T-7101G")
+        );
+
+        let dreamcast = write_fixture(&directory, "d.chd", &ps1_chd(&dreamcast_iso(b"T-8109N")));
+        assert_eq!(
+            inspect_game_identity(&dreamcast, Some("Dreamcast")).verified_dreamcast_product_code(),
+            Some("T-8109N")
+        );
+
+        let sega_cd = write_fixture(
+            &directory,
+            "m.chd",
+            &ps1_chd(&sega_cd_iso(b"GM T-12345 -00")),
+        );
+        assert_eq!(
+            inspect_game_identity(&sega_cd, Some("Sega CD")).verified_sega_cd_product_code(),
+            Some("GM T-12345-00")
+        );
+
+        let ps1 = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let ps1_path = write_fixture(&directory, "p.chd", &ps1_chd(&ps1));
+        assert_eq!(
+            inspect_game_identity(&ps1_path, Some("PlayStation")).verified_ps1_serial(),
+            Some("SLUS-12345")
+        );
     }
 
     fn pcfx_fixture(boot_sector: u32, boot_sector_count: u32, seed: u8) -> Vec<u8> {
