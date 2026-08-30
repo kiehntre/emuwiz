@@ -205,13 +205,13 @@ fn symlink_content_is_rejected() {
 // --- unsupported content format rejected ---------------------------------------------------------
 
 #[test]
-fn non_iso_gcm_extension_is_rejected() {
+fn unsupported_extension_is_rejected() {
     let ready = build_ready_fixture("unsupported-format");
-    let rvz = ready
+    let gcz = ready
         .fixture
-        .write("games/game.rvz", &gamecube_iso_bytes(b"GALE01", 0));
+        .write("games/game.gcz", &gamecube_iso_bytes(b"GALE01", 0));
     let mut request = ready.request.clone();
-    request.selected_content_path = rvz;
+    request.selected_content_path = gcz;
     let error = preflight_dolphin_launch(&request, &ready.roots).unwrap_err();
     assert_eq!(
         error.kind,

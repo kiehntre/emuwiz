@@ -117,6 +117,9 @@ pub enum LaunchBlockerKind {
     /// target `GameCube` - the only platform this native launch slice
     /// supports.
     DolphinPlatformMismatch,
+    /// No verified Dolphin Game ID is available for the selected GameCube/Wii
+    /// content.
+    DolphinGameIdMissing,
     /// The content is not a direct, non-mounted `.iso`/`.gcm` file - no
     /// archive member, no RVZ/CISO/WBFS, no mount-input container.
     DolphinContentFormatUnsupported,

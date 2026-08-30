@@ -7,13 +7,8 @@
 //! - Native Dolphin profiles only - Flatpak, AppImage, and any profile
 //!   [`crate::patch_manager::resolve_dolphin_native_launch_binding`] itself
 //!   refuses are never attempted.
-//! - `GameCube` only - the only platform
-//!   [`crate::launch::dolphin_command::DOLPHIN_SUPPORTED_PLATFORM_ID`] names
-//!   in this phase; Wii is deliberately out of scope even though the
-//!   underlying Dolphin adapter/CLI contract is close, per this phase's own
-//!   review scope.
-//! - One direct loose regular `.iso`/`.gcm` file - no archive members, no
-//!   mounted content, no RVZ/CISO/WBFS.
+//! - Direct loose regular `.iso`/`.gcm`/`.rvz`/`.ciso`/`.wbfs` content - no
+//!   archive members or mounted content.
 //! - Strictly [`LaunchReadiness::Ready`] - `ReadyWithWarnings` and
 //!   `Blocked` are both refused, never silently accepted.
 //! - Exactly one requested, already-discovered Dolphin profile, matched by
@@ -48,8 +43,8 @@ use std::path::{Path, PathBuf};
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::game_identity::inspect_catalogued_game_identity;
 use crate::launch::dolphin_command::{
-    DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, build_dolphin_command_plan,
-    direct_gamecube_extension,
+    DolphinCommand, build_dolphin_command_plan, direct_dolphin_extension,
+    dolphin_supported_platform,
 };
 use crate::launch::evidence_bridge::canonical_identity_from_game_report;
 use crate::launch::planning::{
@@ -239,7 +234,7 @@ impl From<DolphinLaunchSpawnError> for DolphinLaunchExecutionError {
 /// 4. The content is freshly re-identified via
 ///    [`inspect_catalogued_game_identity`] (never a caller-supplied old
 ///    report); the result must resolve to exactly
-///    [`DOLPHIN_SUPPORTED_PLATFORM_ID`] and `request.expected_game_id`.
+///    a supported Dolphin platform and `request.expected_game_id`.
 /// 5. Dolphin local profiles are freshly rediscovered via
 ///    [`discover_dolphin_local_profiles`] - never a caller's cached
 ///    discovery.
@@ -438,10 +433,10 @@ fn inspect_and_capture_content_identity(
             "content path is an outer archive/mount-input path, not direct content",
         ));
     }
-    if !direct_gamecube_extension(path) {
+    if !direct_dolphin_extension(path) {
         return Err(preflight_error(
             DolphinLaunchPreflightErrorKind::ContentFormatUnsupported,
-            "only a direct .iso or .gcm file is supported by this native Dolphin launch slice",
+            "only a direct .iso, .gcm, .rvz, .ciso, or .wbfs file is supported by this native Dolphin launch path",
         ));
     }
     Ok(CapturedFileIdentity::capture(&metadata))
@@ -456,12 +451,20 @@ fn fresh_identity_status(
     // catalogued/identified earlier; the platform hint here is the caller's
     // already-approved identity, never derived from this path's name or
     // extension.
-    let report =
-        inspect_catalogued_game_identity(content_path, Some(DOLPHIN_SUPPORTED_PLATFORM_ID));
-    let (identity_status, _facts) = canonical_identity_from_game_report(&report);
+    // The existing catalogued identity reader uses the platform hint for
+    // minimal synthetic/legacy fixtures that do not carry enough container
+    // bytes to infer a platform on their own. Try both Dolphin platforms in
+    // turn; each reader still validates the actual identity and no filename
+    // or extension is promoted into identity.
+    let report = inspect_catalogued_game_identity(content_path, Some("GameCube"));
+    let (mut identity_status, _facts) = canonical_identity_from_game_report(&report);
+    if matches!(identity_status, CanonicalIdentityStatus::Unknown) {
+        let wii_report = inspect_catalogued_game_identity(content_path, Some("Wii"));
+        (identity_status, _) = canonical_identity_from_game_report(&wii_report);
+    }
     match &identity_status {
         CanonicalIdentityStatus::Resolved(resolved) => {
-            if resolved.platform_id != DOLPHIN_SUPPORTED_PLATFORM_ID
+            if !dolphin_supported_platform(&resolved.platform_id)
                 || resolved.game_key != request.expected_game_id
             {
                 return Err(preflight_error(
@@ -470,7 +473,7 @@ fn fresh_identity_status(
                         "resolved identity {}/{} does not match expected {}/{}",
                         resolved.platform_id,
                         resolved.game_key,
-                        DOLPHIN_SUPPORTED_PLATFORM_ID,
+                        "GameCube or Wii",
                         request.expected_game_id
                     ),
                 ));

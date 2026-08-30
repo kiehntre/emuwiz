@@ -10,11 +10,10 @@
 //!
 //! # Scope
 //!
-//! Only the first supported native Dolphin launch slice: `GameCube`
-//! platform, a direct regular `.iso`/`.gcm` file, a verified Dolphin
-//! GameID, and an exact eligible [`DolphinNativeLaunchBinding`]. Wii,
-//! RVZ/CISO/WBFS, mounted/archive content, Flatpak, and AppImage are all
-//! refused here - never silently widened.
+//! Native Dolphin launch accepts direct regular GameCube/Wii disc images,
+//! a verified Dolphin GameID, and an exact eligible
+//! [`DolphinNativeLaunchBinding`]. Mounted/archive content, Flatpak, and
+//! AppImage remain refused here - never silently widened.
 //!
 //! # Exact argv
 //!
@@ -33,12 +32,13 @@ use crate::patch_manager::{
     DolphinLaunchBlocker, DolphinNativeLaunchBinding, DolphinUserDirectoryMode,
 };
 
-/// The only platform this native launch slice supports.
+/// The historical primary platform identifier retained for compatibility.
 pub const DOLPHIN_SUPPORTED_PLATFORM_ID: &str = "GameCube";
+pub const DOLPHIN_SUPPORTED_PLATFORM_IDS: &[&str] = &["GameCube", "Wii"];
 
-/// The only direct content extensions this slice supports (lowercase, no
-/// dot) - RVZ/CISO/WBFS and any archive/mount-input format are refused.
-const DOLPHIN_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "gcm"];
+/// Direct Dolphin disc-image extensions (lowercase, no dot). Identity remains
+/// authoritative; an extension alone never makes a candidate launchable.
+const DOLPHIN_SUPPORTED_EXTENSIONS: &[&str] = &["iso", "gcm", "rvz", "ciso", "wbfs"];
 
 /// The executable invocation data for a Dolphin launch that has passed
 /// every fail-closed check. This is data only: no type in this module
@@ -84,7 +84,7 @@ fn blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker 
     LaunchBlocker::new(kind, detail)
 }
 
-pub(crate) fn direct_gamecube_extension(path: &std::path::Path) -> bool {
+pub(crate) fn direct_dolphin_extension(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -92,6 +92,10 @@ pub(crate) fn direct_gamecube_extension(path: &std::path::Path) -> bool {
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
+}
+
+pub(crate) fn dolphin_supported_platform(platform_id: &str) -> bool {
+    DOLPHIN_SUPPORTED_PLATFORM_IDS.contains(&platform_id)
 }
 
 /// Builds a safe Dolphin argv plan from only an already-authorized launch
@@ -128,15 +132,23 @@ pub fn build_dolphin_command_plan(
         }
     };
     if let Some(resolved) = resolved
-        && resolved.platform_id != DOLPHIN_SUPPORTED_PLATFORM_ID
+        && !dolphin_supported_platform(&resolved.platform_id)
     {
         blockers.push(blocker(
             LaunchBlockerKind::DolphinPlatformMismatch,
             format!(
-                "resolved identity targets {}, but only {DOLPHIN_SUPPORTED_PLATFORM_ID} is \
-                 supported by this native Dolphin launch slice",
+                "resolved identity targets {}, but only GameCube or Wii is supported by this \
+                 native Dolphin launch path",
                 resolved.platform_id
             ),
+        ));
+    }
+    if let Some(resolved) = resolved
+        && resolved.game_key.is_empty()
+    {
+        blockers.push(blocker(
+            LaunchBlockerKind::DolphinGameIdMissing,
+            "a verified Dolphin Game ID is required for native Dolphin launch",
         ));
     }
 
@@ -193,10 +205,20 @@ pub fn build_dolphin_command_plan(
                 LaunchBlockerKind::DolphinContentFormatUnsupported,
                 "content path is an outer archive/mount-input path, not direct content",
             ));
-        } else if !direct_gamecube_extension(path) {
+        } else if !direct_dolphin_extension(path) {
             blockers.push(blocker(
                 LaunchBlockerKind::DolphinContentFormatUnsupported,
-                "only a direct .iso or .gcm file is supported by this native Dolphin launch slice",
+                "only a direct .iso, .gcm, .rvz, .ciso, or .wbfs file is supported by this native Dolphin launch path",
+            ));
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wbfs"))
+            && resolved.is_some_and(|identity| identity.platform_id != "Wii")
+        {
+            blockers.push(blocker(
+                LaunchBlockerKind::DolphinContentFormatUnsupported,
+                "WBFS content is supported only for a verified Wii identity",
             ));
         }
     }

@@ -1087,12 +1087,44 @@ fn wrong_standalone_emulator_has_no_launch_dolphin_button() {
 }
 
 #[test]
-fn wii_candidate_has_no_launch_dolphin_button_while_core_is_gamecube_only() {
-    let candidate = dolphin_candidate("dolphin:/whatever", Path::new("/library/game.iso"));
+fn eligible_native_wii_candidate_shows_launch_dolphin_button() {
+    let ready = build_ready_dolphin_fixture("wii");
+    let candidate = dolphin_candidate(&ready.profile_id, &ready.content_path);
     let mut plan = dolphin_plan_with(vec![candidate], "RALE01");
     plan.platform_id = Some("Wii".to_string());
-    let output = render(&dolphin_plan_input(plan, empty_dolphin_context()));
+    let output = render(&dolphin_plan_input(plan, ready.context));
+    assert!(rendered_text_contains(&output, "Launch Dolphin"));
+}
+
+#[test]
+fn direct_dolphin_containers_are_visible_only_with_matching_verified_platform() {
+    for extension in ["rvz", "ciso"] {
+        let ready = build_ready_dolphin_fixture(extension);
+        let candidate = dolphin_candidate(
+            &ready.profile_id,
+            Path::new(&format!("/library/game.{extension}")),
+        );
+        let plan = dolphin_plan_with(vec![candidate], "GALE01");
+        let output = render(&dolphin_plan_input(plan, ready.context));
+        assert!(
+            rendered_text_contains(&output, "Launch Dolphin"),
+            "{extension}"
+        );
+    }
+
+    let ready = build_ready_dolphin_fixture("wbfs-gamecube");
+    let wbfs = dolphin_candidate(&ready.profile_id, Path::new("/library/game.wbfs"));
+    let mut gamecube_plan = dolphin_plan_with(vec![wbfs], "GALE01");
+    gamecube_plan.platform_id = Some("GameCube".to_string());
+    let output = render(&dolphin_plan_input(gamecube_plan, ready.context));
     assert!(!rendered_text_contains(&output, "Launch Dolphin"));
+
+    let ready = build_ready_dolphin_fixture("wbfs-wii");
+    let wbfs = dolphin_candidate(&ready.profile_id, Path::new("/library/game.wbfs"));
+    let mut wii_plan = dolphin_plan_with(vec![wbfs], "RALE01");
+    wii_plan.platform_id = Some("Wii".to_string());
+    let output = render(&dolphin_plan_input(wii_plan, ready.context));
+    assert!(rendered_text_contains(&output, "Launch Dolphin"));
 }
 
 #[test]

@@ -546,19 +546,27 @@ impl Pcsx2LaunchState {
     }
 }
 
-/// Whether `path`'s extension is `.iso`/`.gcm` (case-insensitive) - the only
-/// direct GameCube content this native launch slice supports. Kept as a
+/// Whether `path` has a directly launchable Dolphin disc-image extension
+/// (case-insensitive). Kept as a
 /// small local re-derivation rather than reaching into
 /// `archivefs_core::launch::dolphin_command`'s private extension check: this
 /// is only ever used to decide whether to *show* the button, never to
 /// authorize a launch - core's own preflight re-checks this independently
 /// and is the only thing that can actually refuse a launch on this basis.
-fn is_direct_gamecube_extension(path: &Path) -> bool {
+fn is_direct_dolphin_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("iso") || extension.eq_ignore_ascii_case("gcm")
+            ["iso", "gcm", "rvz", "ciso", "wbfs"]
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported))
         })
+}
+
+fn is_wbfs(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wbfs"))
 }
 
 /// The single eligibility rule for the "Launch Dolphin" button, and the
@@ -566,11 +574,10 @@ fn is_direct_gamecube_extension(path: &Path) -> bool {
 /// can never show for a request core's own preflight would refuse. `Some`
 /// only when every current Dolphin Phase-2 condition holds:
 /// [`LaunchTarget::Standalone`] for adapter id `"dolphin"`, the resolved
-/// plan platform is exactly [`DOLPHIN_SUPPORTED_PLATFORM_ID`] (`GameCube` -
-/// `Wii` is refused here, not just deferred, until core's own scope grows),
+/// plan platform is `GameCube` or `Wii`,
 /// strictly [`LaunchReadiness::Ready`], direct loose/plain content
-/// ([`LaunchContainerKind::PlainFile`], `requires_mount == false`, a
-/// `.iso`/`.gcm` extension), no blockers, no warnings, the named profile is
+/// ([`LaunchContainerKind::PlainFile`], `requires_mount == false`, a direct
+/// Dolphin extension), no blockers, no warnings, the named profile is
 /// still present in `context.discovery`, and
 /// [`resolve_dolphin_native_launch_binding`] proves a real launch binding
 /// for it right now (this is what actually excludes Flatpak/AppImage/
@@ -584,7 +591,7 @@ fn dolphin_launch_request(
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
         return None;
     };
-    if platform_id != DOLPHIN_SUPPORTED_PLATFORM_ID {
+    if platform_id != DOLPHIN_SUPPORTED_PLATFORM_ID && platform_id != "Wii" {
         return None;
     }
     if candidate.readiness != LaunchReadiness::Ready {
@@ -600,7 +607,10 @@ fn dolphin_launch_request(
         return None;
     }
     let content_path = candidate.content.resolved_path.clone()?;
-    if !is_direct_gamecube_extension(&content_path) {
+    if !is_direct_dolphin_extension(&content_path) {
+        return None;
+    }
+    if is_wbfs(&content_path) && platform_id != "Wii" {
         return None;
     }
     let LaunchTarget::Standalone {
@@ -709,7 +719,7 @@ fn dolphin_launch_error_message(error: &DolphinLaunchExecutionError) -> (&'stati
 
 /// Whether `path`'s extension is `.iso` (case-insensitive) - the only
 /// direct PS2 content this native launch slice supports (no CHD yet). Same
-/// reasoning as [`is_direct_gamecube_extension`]: only ever decides whether
+/// reasoning as [`is_direct_dolphin_extension`]: only ever decides whether
 /// to *show* the button, never authorizes a launch.
 fn is_direct_ps2_extension(path: &Path) -> bool {
     path.extension()

@@ -8,9 +8,13 @@ use crate::launch::readiness::{FirmwareReadiness, LaunchReadiness};
 use crate::patch_manager::DolphinLaunchBlockerKind;
 
 fn resolved() -> CanonicalIdentityStatus {
+    resolved_platform("GameCube", "GALE01")
+}
+
+fn resolved_platform(platform_id: &str, game_key: &str) -> CanonicalIdentityStatus {
     CanonicalIdentityStatus::Resolved(ResolvedIdentity {
-        platform_id: "GameCube".to_string(),
-        game_key: "GALE01".to_string(),
+        platform_id: platform_id.to_string(),
+        game_key: game_key.to_string(),
     })
 }
 
@@ -116,10 +120,10 @@ fn gcm_extension_is_accepted() {
 }
 
 #[test]
-fn non_gamecube_extension_is_rejected() {
+fn unsupported_extension_is_rejected() {
     let plan = build_dolphin_command_plan(
         &resolved(),
-        &candidate(Some(PathBuf::from("/games/game.rvz"))),
+        &candidate(Some(PathBuf::from("/games/game.zip"))),
         &default_native_binding("/usr/bin/dolphin-emu"),
     );
     assert!(plan.command.is_none());
@@ -131,10 +135,7 @@ fn non_gamecube_extension_is_rejected() {
 
 #[test]
 fn wrong_platform_is_rejected() {
-    let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
-        platform_id: "Wii".to_string(),
-        game_key: "RALE01".to_string(),
-    });
+    let identity = resolved_platform("PlayStation 2", "SLUS-12345");
     let plan = build_dolphin_command_plan(
         &identity,
         &candidate(Some(PathBuf::from("/games/game.iso"))),
@@ -145,6 +146,55 @@ fn wrong_platform_is_rejected() {
         &plan,
         LaunchBlockerKind::DolphinPlatformMismatch
     ));
+}
+
+#[test]
+fn rvz_and_ciso_accept_verified_gamecube_or_wii_identities() {
+    for (platform, game_id) in [("GameCube", "GALE01"), ("Wii", "RMCE01")] {
+        for extension in ["rvz", "ciso"] {
+            let plan = build_dolphin_command_plan(
+                &resolved_platform(platform, game_id),
+                &candidate(Some(PathBuf::from(format!("/games/game.{extension}")))),
+                &default_native_binding("/usr/bin/dolphin-emu"),
+            );
+            assert!(
+                plan.command.is_some(),
+                "{platform} .{extension} should be ready"
+            );
+        }
+    }
+}
+
+#[test]
+fn wbfs_requires_a_verified_wii_identity() {
+    let wii = build_dolphin_command_plan(
+        &resolved_platform("Wii", "RMCE01"),
+        &candidate(Some(PathBuf::from("/games/game.wbfs"))),
+        &default_native_binding("/usr/bin/dolphin-emu"),
+    );
+    assert!(wii.command.is_some());
+
+    let gamecube = build_dolphin_command_plan(
+        &resolved(),
+        &candidate(Some(PathBuf::from("/games/game.wbfs"))),
+        &default_native_binding("/usr/bin/dolphin-emu"),
+    );
+    assert!(gamecube.command.is_none());
+    assert!(has_blocker(
+        &gamecube,
+        LaunchBlockerKind::DolphinContentFormatUnsupported
+    ));
+}
+
+#[test]
+fn empty_game_id_is_not_launchable_even_with_a_supported_extension() {
+    let plan = build_dolphin_command_plan(
+        &resolved_platform("GameCube", ""),
+        &candidate(Some(PathBuf::from("/games/game.rvz"))),
+        &default_native_binding("/usr/bin/dolphin-emu"),
+    );
+    assert!(plan.command.is_none());
+    assert!(has_blocker(&plan, LaunchBlockerKind::DolphinGameIdMissing));
 }
 
 #[test]
