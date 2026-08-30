@@ -699,6 +699,9 @@ fn discover_direct_file(
     if extension == "d64" {
         return discover_d64_image(path, source_root);
     }
+    if extension == "dc42" {
+        return discover_dc42_image(path, source_root);
+    }
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
     }
@@ -955,6 +958,40 @@ fn discover_ps3_pkg(path: &Path, source_root: &Path) -> GameDiscovery {
     }
 }
 
+fn discover_dc42_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    match evidence.format {
+        Some(DiskFormat::MacintoshDiskCopy42) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity_for(path, source_root),
+            format!(
+                "Valid Macintosh Disk Copy 4.2 image. {} Structural media evidence only; exact release/game identity still needs a DAT/catalogue match.",
+                evidence.evidence.first().cloned().unwrap_or_default()
+            ),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a valid DC42 image".to_string()),
+            ),
+            "This file is named like a Macintosh Disk Copy 4.2 image but its bounded structure did not validate.".to_string(),
+        ),
+    }
+}
 /// `.rdb` is registered unconditionally as [`ContentKind::AmigaImage`] (see
 /// `content_registry`) - RDB is Amiga-specific, unlike `.hdf`/`.hdfx` (see
 /// [`discover_ambiguous_disk_image`]). Still runs

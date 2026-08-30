@@ -53,6 +53,7 @@ pub mod crt;
 pub mod d88;
 pub mod dfs;
 pub mod d64;
+pub mod dc42;
 pub mod dsk;
 pub mod hdi;
 pub mod scl;
@@ -70,7 +71,7 @@ mod tests;
 /// The most this module will ever read from one file, across every step of one
 /// inspection. Chosen so a full inspection is a handful of small reads: a boot
 /// sector, or one header plus a bounded table of record headers.
-pub const MAX_DISK_FORMAT_BYTES_READ: u64 = 64 * 1024;
+pub const MAX_DISK_FORMAT_BYTES_READ: u64 = 4 * 1024 * 1024;
 
 /// The largest single read.
 pub const MAX_DISK_FORMAT_READ_CHUNK: usize = 1024;
@@ -125,6 +126,7 @@ pub const MAX_DSK_BYTES: u64 = 8 * 1024 * 1024;
 /// The most `track x side` entries a `.dsk` header may declare. 85 tracks on
 /// two sides is already past any real drive.
 pub const MAX_DSK_TRACK_ENTRIES: usize = 170;
+pub const MAX_DC42_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The largest file this module will treat as a D88 floppy container.
 pub const MAX_D88_BYTES: u64 = 8 * 1024 * 1024;
@@ -194,6 +196,8 @@ pub enum DiskFormat {
     X68000Xdf,
     /// A structurally validated X68000 DIM container.
     X68000Dim,
+    /// A structurally valid Macintosh Disk Copy 4.2 image.
+    MacintoshDiskCopy42,
 }
 
 impl DiskFormat {
@@ -213,6 +217,7 @@ impl DiskFormat {
             Self::CommodoreCrt => "Commodore CRT cartridge",
             Self::X68000Xdf => "Sharp X68000 XDF floppy image",
             Self::X68000Dim => "Sharp X68000 DIM floppy container",
+            Self::MacintoshDiskCopy42 => "Macintosh Disk Copy 4.2 image",
         }
     }
 
@@ -232,6 +237,7 @@ impl DiskFormat {
             Self::AcornDfsDisk => "BBC Micro",
             Self::CommodoreCrt => "Commodore 64",
             Self::X68000Xdf | Self::X68000Dim => "Sharp X68000",
+            Self::MacintoshDiskCopy42 => "Macintosh",
         }
     }
 
@@ -253,7 +259,8 @@ impl DiskFormat {
             Self::AtariStPasti
             | Self::SpectrumPlus3Disk
             | Self::SpectrumTrDosDisk
-            | Self::SpectrumSclArchive => true,
+            | Self::SpectrumSclArchive
+            | Self::MacintoshDiskCopy42 => true,
             Self::D88Container => false,
             Self::HdiContainer | Self::NhdContainer => false,
             Self::AcornDfsDisk => false,
@@ -556,6 +563,26 @@ pub struct X68000Layout {
     pub payload_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MacintoshFilesystem {
+    Hfs,
+    Mfs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Dc42Layout {
+    pub name_length: u8,
+    pub data_size: u32,
+    pub tag_size: u32,
+    pub data_checksum: u32,
+    pub tag_checksum: u32,
+    pub encoding: u8,
+    pub format_byte: u8,
+    pub payload_offset: u64,
+    pub filesystem: Option<MacintoshFilesystem>,
+    pub checksums_verified: bool,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -573,6 +600,7 @@ pub enum DiskFormatMetadata {
     Dfs(DfsLayout),
     Crt(CrtLayout),
     X68000(X68000Layout),
+    Dc42(Dc42Layout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -688,6 +716,7 @@ pub fn inspect_disk_format(
         "crt" => Adapter::Crt,
         "xdf" => Adapter::X68000Xdf,
         "dim" => Adapter::X68000Dim,
+        "dc42" => Adapter::MacintoshDiskCopy42,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -722,6 +751,7 @@ pub fn inspect_disk_format(
         Adapter::Crt => crt::inspect(&mut reader, context, cancel),
         Adapter::X68000Xdf => x68000::inspect_xdf(&mut reader, context, cancel),
         Adapter::X68000Dim => x68000::inspect_dim(&mut reader, context, cancel),
+        Adapter::MacintoshDiskCopy42 => dc42::inspect(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -747,6 +777,7 @@ enum Adapter {
     Crt,
     X68000Xdf,
     X68000Dim,
+    MacintoshDiskCopy42,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
@@ -851,6 +882,17 @@ impl<'a> BoundedReader<'a> {
         self.read_exact_at_with_offset_limit(offset, length, 32 * 1024 * 1024)
     }
 
+    /// DC42 checksum verification streams a standard floppy payload through
+    /// the same bounded reader, while retaining the ordinary offset limit for
+    /// every other disk adapter.
+    pub(crate) fn read_exact_at_dc42(
+        &mut self,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, DiskFormatRefusal> {
+        self.read_exact_at_with_offset_limit(offset, length, MAX_DC42_BYTES)
+    }
+
     fn read_exact_at_with_offset_limit(
         &mut self,
         offset: u64,
@@ -906,6 +948,18 @@ pub(crate) fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(4)?;
     let slice = bytes.get(offset..end)?;
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+pub(crate) fn be_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let slice = bytes.get(offset..end)?;
+    Some(u16::from_be_bytes([slice[0], slice[1]]))
+}
+
+pub(crate) fn be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let slice = bytes.get(offset..end)?;
+    Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 /// The confidence a recognised format deserves, given what else is known.

@@ -2595,3 +2595,119 @@ fn malformed_hdi_and_nhd_structures_fail_closed() {
     let path = fixture.write("library/overflow.nhd", &overflow);
     assert!(fixture.inspect(&path).format.is_none());
 }
+
+fn dc42_checksum(bytes: &[u8], skip: usize) -> u32 {
+    let mut sum = 0u32;
+    for pair in bytes[skip..].chunks(2) {
+        let word = ((pair[0] as u32) << 8) | pair.get(1).copied().unwrap_or(0) as u32;
+        sum = sum.wrapping_add(word).rotate_right(1);
+    }
+    sum
+}
+
+fn dc42_image(mutate: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let data_size = 409_600usize;
+    let tag_size = 9_600usize;
+    let mut data = vec![0u8; data_size];
+    data[1024..1026].copy_from_slice(&0x4244u16.to_be_bytes());
+    let tags = vec![0u8; tag_size];
+    let mut image = vec![0u8; 84];
+    image[0] = 4;
+    image[1..5].copy_from_slice(b"Test");
+    image[0x40..0x44].copy_from_slice(&(data_size as u32).to_be_bytes());
+    image[0x44..0x48].copy_from_slice(&(tag_size as u32).to_be_bytes());
+    image[0x48..0x4c].copy_from_slice(&dc42_checksum(&data, 0).to_be_bytes());
+    image[0x4c..0x50].copy_from_slice(&dc42_checksum(&tags, 12).to_be_bytes());
+    image[0x50] = 0;
+    image[0x51] = 0x02;
+    image[0x52..0x54].copy_from_slice(&0x0100u16.to_be_bytes());
+    image.extend(data);
+    image.extend(tags);
+    mutate(&mut image);
+    image
+}
+
+#[test]
+fn valid_dc42_reports_macintosh_and_hfs_without_release_identity() {
+    let fixture = Fixture::new("dc42-valid");
+    let path = fixture.write("library/System 6.dc42", &dc42_image(|_| {}));
+    let evidence = fixture.inspect(&path);
+    assert_eq!(evidence.format, Some(DiskFormat::MacintoshDiskCopy42));
+    assert_eq!(evidence.platform, Some("Macintosh"));
+    assert!(evidence.conclusive);
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("HFS signature"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("provenance only"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|line| line.contains("checksums verified"))
+    );
+}
+
+#[test]
+fn dc42_refuses_truncation_layout_checksum_and_encoding_errors() {
+    let fixture = Fixture::new("dc42-negative");
+    let valid = dc42_image(|_| {});
+    for (name, bytes, expected) in [
+        ("random.dc42", vec![0x5a; 84], "disk-name length"),
+        ("truncated.dc42", valid[..83].to_vec(), "below"),
+        (
+            "checksum.dc42",
+            dc42_image(|image| image[0x48] ^= 1),
+            "checksum mismatch",
+        ),
+        (
+            "encoding.dc42",
+            dc42_image(|image| image[0x50] = 0xff),
+            "encoding is unsupported",
+        ),
+    ] {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        let evidence = fixture.inspect(&path);
+        assert!(evidence.format.is_none(), "{name} was accepted");
+        assert!(
+            evidence
+                .refusal
+                .as_ref()
+                .unwrap()
+                .detail()
+                .contains(expected),
+            "{name}: {:?}",
+            evidence.refusal
+        );
+    }
+    let path = fixture.write(
+        "library/beyond-eof.dc42",
+        &dc42_image(|image| {
+            image[0x44..0x48].copy_from_slice(&1u32.to_be_bytes());
+        }),
+    );
+    assert!(fixture.inspect(&path).format.is_none());
+}
+
+#[test]
+fn non_macintosh_disk_extensions_remain_unclaimed() {
+    let fixture = Fixture::new("dc42-negative-shared");
+    for (name, bytes) in [
+        ("apple.woz", b"WOZ1".to_vec()),
+        ("generic.img", vec![0; 1024]),
+        ("shared.dsk", vec![0; 1024]),
+    ] {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        assert!(
+            fixture.inspect(&path).format.is_none(),
+            "{name} gained a DC42 claim"
+        );
+    }
+}
