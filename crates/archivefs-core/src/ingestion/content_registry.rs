@@ -161,7 +161,6 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("a78", ContentKind::RomCartridge),
     cf("atr", ContentKind::ComputerDisk),
     cf("atx", ContentKind::ComputerDisk),
-    cf("xex", ContentKind::RomCartridge),
     cf("xfd", ContentKind::ComputerDisk),
     cf("lnx", ContentKind::RomCartridge),
     cf("lyx", ContentKind::RomCartridge),
