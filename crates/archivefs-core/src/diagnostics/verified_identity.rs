@@ -178,6 +178,9 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
         | IdentityPlatform::Other => return None,
     };
     Some(requirement)

@@ -168,7 +168,12 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::AtariST => Some("AtariST"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
-        IdentityPlatform::Other => None,
+        // Modern Nintendo platforms are catalogue foundations only; no
+        // launch identity kind exists for them yet.
+        IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
+        | IdentityPlatform::Other => None,
     }
 }
 
@@ -366,6 +371,9 @@ fn resolved_identity_for_platform(
         // `launch_platform_id`), so a launcher can pick an emulator;
         // identity simply stays `Unknown`.
         IdentityPlatform::NeoGeoCd => None,
+        // These catalogue platforms have no structural identity parser or
+        // launch identity kind yet, so they remain deliberately unresolved.
+        IdentityPlatform::WiiU | IdentityPlatform::ThreeDS | IdentityPlatform::Switch => None,
         IdentityPlatform::Other => None,
     }
 }

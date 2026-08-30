@@ -297,6 +297,9 @@ pub enum IdentityPlatform {
     SegaCd,
     GameCube,
     Wii,
+    WiiU,
+    ThreeDS,
+    Switch,
     MegaDrive,
     Snes,
     Nes,
@@ -335,6 +338,9 @@ impl IdentityPlatform {
             "sega cd" | "sega-cd" | "segacd" | "mega cd" | "mega-cd" | "megacd" => Self::SegaCd,
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" => Self::GameCube,
             "wii" | "nintendo wii" => Self::Wii,
+            "wiiu" | "wii u" | "nintendo wii u" => Self::WiiU,
+            "3ds" | "nintendo 3ds" | "new 3ds" | "new3ds" => Self::ThreeDS,
+            "switch" | "nintendo switch" => Self::Switch,
             "megadrive" | "mega drive" | "genesis" | "sega mega drive" | "sega genesis" => {
                 Self::MegaDrive
             }
@@ -403,6 +409,9 @@ impl IdentityPlatform {
             Self::SegaCd => "Sega Mega-CD / Sega CD",
             Self::GameCube => "GameCube",
             Self::Wii => "Wii",
+            Self::WiiU => "Wii U",
+            Self::ThreeDS => "Nintendo 3DS",
+            Self::Switch => "Nintendo Switch",
             Self::MegaDrive => "Mega Drive / Genesis",
             Self::Snes => "SNES",
             Self::Nes => "NES",
@@ -1690,6 +1699,9 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
@@ -2764,6 +2776,9 @@ fn inspect_iso_source(
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
@@ -5608,6 +5623,9 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
         | IdentityPlatform::Other => &[],
     };
     for kind in kinds {
@@ -5793,6 +5811,9 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
         | IdentityPlatform::Xbox
         | IdentityPlatform::ScummVM
         | IdentityPlatform::Pcfx
@@ -9179,6 +9200,54 @@ mod tests {
                 "{hint} must resolve to IdentityPlatform::N64"
             );
         }
+    }
+
+    #[test]
+    fn modern_nintendo_catalogue_platforms_round_trip_aliases_and_serde() {
+        for (aliases, expected, label) in [
+            (
+                &["WiiU", "Wii U", "Nintendo Wii U"][..],
+                IdentityPlatform::WiiU,
+                "Wii U",
+            ),
+            (
+                &["3DS", "Nintendo 3DS", "New 3DS"][..],
+                IdentityPlatform::ThreeDS,
+                "Nintendo 3DS",
+            ),
+            (
+                &["Switch", "Nintendo Switch"][..],
+                IdentityPlatform::Switch,
+                "Nintendo Switch",
+            ),
+        ] {
+            for alias in aliases {
+                assert_eq!(IdentityPlatform::from_catalogue(Some(alias)), expected);
+            }
+            assert_eq!(expected.label(), label);
+            let encoded = serde_json::to_string(&expected).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IdentityPlatform>(&encoded).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn modern_nintendo_platform_context_stays_unsupported_without_a_parser() {
+        let directory = FixtureDir::new("modern-nintendo-unsupported");
+        let path = write_fixture(&directory, "Mario.xci", b"not a Switch parser fixture");
+        let report = inspect_catalogued_game_identity(&path, Some("Nintendo Switch"));
+        assert_eq!(report.platform, IdentityPlatform::Switch);
+        assert_eq!(report.verified_value(IdentityKind::Ps3TitleId), None);
+        assert!(!report.complete);
+        let (status, facts) =
+            crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+        assert!(matches!(
+            status,
+            crate::launch::planning::CanonicalIdentityStatus::Unknown
+        ));
+        assert!(facts.is_empty());
     }
 
     #[test]
