@@ -398,6 +398,11 @@ pub mod platform_artwork;
 
 pub mod patch_manager;
 
+/// Read-only inspection and deterministic planning for caller-supplied local
+/// game-mod package directories. This is intentionally separate from the
+/// cheat/emulator patch manager: it never applies a change or creates history.
+pub mod mod_package;
+
 pub mod emulator_environment;
 
 /// Unified Launch Planning, Phase 1: canonical-platform → standalone-
