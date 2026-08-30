@@ -156,6 +156,8 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("ima", ContentKind::ComputerDisk),
     cf("img", ContentKind::ComputerDisk),
     cf("d88", ContentKind::ComputerDisk),
+    cf("xdf", ContentKind::ComputerDisk),
+    cf("dim", ContentKind::ComputerDisk),
     // --- Atari ---
     cf("a26", ContentKind::RomCartridge),
     cf("a52", ContentKind::RomCartridge),

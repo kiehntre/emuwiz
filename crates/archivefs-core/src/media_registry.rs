@@ -191,6 +191,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "d88",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "xdf",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "dim",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // --- Atari ---
     MediaFormat {
         extension: "a26",

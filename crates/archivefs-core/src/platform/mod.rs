@@ -1604,8 +1604,11 @@ pub const PLATFORMS: &[Platform] = &[
             "x68000compact",
         ],
         filename_aliases: &[],
-        strong_extensions: &["xdf", "dim", "d88x"],
-        weak_extensions: &["dsk", "hdf", "hdm", "zip"],
+        // XDF/DIM are structurally checked by disk_format. Their suffixes
+        // remain weak so a renamed/random file cannot become X68000 merely
+        // from its filename. Keep the historical d88x detector unchanged.
+        strong_extensions: &["d88x"],
+        weak_extensions: &["xdf", "dim", "dsk", "hdf", "hdm", "zip"],
         magic: &[],
         layout: &[],
         conflicts_with: &["NEC PC-9801"],

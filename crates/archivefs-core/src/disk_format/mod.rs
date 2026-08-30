@@ -57,6 +57,7 @@ pub mod dsk;
 pub mod hdi;
 pub mod scl;
 pub mod trd;
+pub mod x68000;
 
 #[cfg(test)]
 mod tests;
@@ -189,6 +190,10 @@ pub enum DiskFormat {
     /// A structurally valid VICE/CCS64 C64 CRT cartridge container. The
     /// cartridge may be usable across more than one Commodore 8-bit machine.
     CommodoreCrt,
+    /// A structurally validated raw X68000 XDF floppy image.
+    X68000Xdf,
+    /// A structurally validated X68000 DIM container.
+    X68000Dim,
 }
 
 impl DiskFormat {
@@ -206,6 +211,8 @@ impl DiskFormat {
             Self::NhdContainer => "NHD hard-disk container",
             Self::AcornDfsDisk => "Acorn DFS disk image",
             Self::CommodoreCrt => "Commodore CRT cartridge",
+            Self::X68000Xdf => "Sharp X68000 XDF floppy image",
+            Self::X68000Dim => "Sharp X68000 DIM floppy container",
         }
     }
 
@@ -224,6 +231,7 @@ impl DiskFormat {
             Self::HdiContainer | Self::NhdContainer => "PC-98",
             Self::AcornDfsDisk => "BBC Micro",
             Self::CommodoreCrt => "Commodore 64",
+            Self::X68000Xdf | Self::X68000Dim => "Sharp X68000",
         }
     }
 
@@ -250,6 +258,7 @@ impl DiskFormat {
             Self::HdiContainer | Self::NhdContainer => false,
             Self::AcornDfsDisk => false,
             Self::CommodoreCrt => false,
+            Self::X68000Xdf | Self::X68000Dim => true,
         }
     }
 }
@@ -533,6 +542,20 @@ pub struct CrtLayout {
     pub total_image_bytes: u64,
 }
 
+/// Validated Sharp X68000 floppy layout. DIM stores only present tracks after
+/// its header; XDF is a complete raw 2HD image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct X68000Layout {
+    pub format_name: &'static str,
+    pub bytes_per_sector: u16,
+    pub sectors_per_track: u16,
+    pub tracks_per_cylinder: u8,
+    pub cylinders: u16,
+    pub header_bytes: u64,
+    pub stored_tracks: u16,
+    pub payload_bytes: u64,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -549,6 +572,7 @@ pub enum DiskFormatMetadata {
     Nhd(HardDiskLayout),
     Dfs(DfsLayout),
     Crt(CrtLayout),
+    X68000(X68000Layout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -662,6 +686,8 @@ pub fn inspect_disk_format(
         },
         "dsd" => Adapter::AcornDfs { double_sided: true },
         "crt" => Adapter::Crt,
+        "xdf" => Adapter::X68000Xdf,
+        "dim" => Adapter::X68000Dim,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -694,6 +720,8 @@ pub fn inspect_disk_format(
             dfs::inspect(&mut reader, context, cancel, double_sided)
         }
         Adapter::Crt => crt::inspect(&mut reader, context, cancel),
+        Adapter::X68000Xdf => x68000::inspect_xdf(&mut reader, context, cancel),
+        Adapter::X68000Dim => x68000::inspect_dim(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -717,6 +745,8 @@ enum Adapter {
     Nhd,
     AcornDfs { double_sided: bool },
     Crt,
+    X68000Xdf,
+    X68000Dim,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

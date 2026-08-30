@@ -697,6 +697,9 @@ fn discover_direct_file(
     if matches!(extension.as_str(), "ssd" | "dsd") {
         return discover_dfs_media(path, source_root);
     }
+    if matches!(extension.as_str(), "xdf" | "dim") {
+        return discover_x68000_media(path, source_root);
+    }
     if matches!(extension.as_str(), "xbe" | "xex" | "xiso") {
         return discover_xbox_content(path, source_root, &extension);
     }
@@ -1184,6 +1187,62 @@ fn discover_d64_image(path: &Path, source_root: &Path) -> GameDiscovery {
             SkipReason::AmbiguousPlatform,
             format!(
                 "Valid Commodore 1541 disk media, but D64 is shared by C64, C128 and VIC-20; no platform evidence selected one. {detail}."
+            ),
+        ),
+    }
+}
+
+/// XDF and DIM are accepted only after bounded X68000 structure validation.
+/// A suffix or same-size raw image is never sufficient evidence.
+fn discover_x68000_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "X68000 floppy media".to_string());
+    if !matches!(
+        evidence.format,
+        Some(DiskFormat::X68000Xdf | DiskFormat::X68000Dim)
+    ) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised X68000 floppy image".to_string()),
+            ),
+            "This X68000 floppy image did not pass its bounded XDF/DIM structural checks."
+                .to_string(),
+        );
+    }
+    let identity = identity_for(path, source_root);
+    match &identity {
+        Some(summary) if summary.platform.is_some() => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity,
+            format!("Valid Sharp X68000 floppy image. {detail}."),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::RecognizedContentNoIdentityMatch,
+            format!(
+                "Valid X68000 floppy structure, but no platform identity was available. {detail}."
             ),
         ),
     }

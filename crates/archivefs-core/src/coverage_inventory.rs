@@ -492,6 +492,15 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation_provenance: None,
         dat_validation: None,
     },
+    PlatformEvidenceCoverage {
+        canonical_id: "Sharp X68000",
+        detector_modules: &["xdf_dim_evidence"],
+        normalization: false,
+        real_validation: ValidationStatus::SyntheticValidated,
+        notes: "Bounded XDF 2HD BPB/geometry and DIM DIFC-container fixtures validated; no real specimen is recorded in this workspace",
+        real_validation_provenance: None,
+        dat_validation: None,
+    },
 ];
 
 /// The number of canonical platforms in [`crate::platform::PLATFORMS`] -
