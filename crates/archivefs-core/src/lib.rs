@@ -204,6 +204,12 @@ pub mod dreamcast_boot_evidence;
 /// documented DOS system-file pairs, never on FAT geometry.
 pub mod dos_boot_evidence;
 
+/// Pure, read-only structural evidence for DOSBox configuration files -
+/// replaces name-only `dosbox.conf` trust with a verified `[autoexec]`
+/// check; corroborating DOS evidence only, never a resolver, never
+/// executed.
+pub mod dosbox_config_evidence;
+
 /// Shared, pure, read-only executable/container header observers: ELF,
 /// PS3 SELF, Xbox XBE, Xbox 360 XEX2.
 pub mod executable_signatures;

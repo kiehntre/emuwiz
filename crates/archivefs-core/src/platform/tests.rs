@@ -923,6 +923,98 @@ fn a_scummvm_directory_layout_identifies_scummvm_from_its_files() {
     assert_eq!(report.deciding_source, Some(DetectionSource::Layout));
 }
 
+/// A directory whose only DOS signal is a structurally verified
+/// `dosbox.conf` (real `[autoexec]` section) identifies DOS from layout.
+#[test]
+fn a_verified_dosbox_conf_identifies_dos_from_layout() {
+    let tree = TempTree::new("dosbox-verified");
+    let target = tree.file("unsorted/keen/KEEN.EXE", b"MZ not really parsed here");
+    tree.file(
+        "unsorted/keen/dosbox.conf",
+        b"[dosbox]\nmemsize=16\n[autoexec]\nmount c .\nc:\nkeen.exe\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_eq!(
+        report.platform,
+        Some("DOS"),
+        "a verified dosbox.conf should identify DOS from layout: {:?}",
+        report.evidence
+    );
+    assert_eq!(report.deciding_source, Some(DetectionSource::Layout));
+}
+
+/// A file merely *named* `dosbox.conf`, whose contents do not parse as a
+/// DOSBox config, is no longer sufficient to identify DOS.
+#[test]
+fn a_filename_only_dosbox_conf_no_longer_identifies_dos() {
+    let tree = TempTree::new("dosbox-name-only");
+    let target = tree.file("unsorted/mystery/thing.dat", b"not an exe");
+    tree.file(
+        "unsorted/mystery/dosbox.conf",
+        b"this file is called dosbox.conf but is just notes, no sections at all\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_ne!(
+        report.platform,
+        Some("DOS"),
+        "a bare dosbox.conf filename must not identify DOS: {:?}",
+        report.evidence
+    );
+    assert!(
+        !report
+            .evidence
+            .iter()
+            .any(|item| item.platform == "DOS" && item.source == DetectionSource::Layout)
+    );
+}
+
+/// An empty `dosbox.conf` is likewise not evidence.
+#[test]
+fn an_empty_dosbox_conf_is_not_dos_layout_evidence() {
+    let tree = TempTree::new("dosbox-empty");
+    let target = tree.file("unsorted/g/g.dat", b"x");
+    tree.file("unsorted/g/dosbox.conf", b"");
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_ne!(report.platform, Some("DOS"));
+}
+
+/// A `[dosbox]`-only config with no `[autoexec]` is not DOS layout evidence.
+#[test]
+fn a_dosbox_conf_without_autoexec_is_not_dos_layout_evidence() {
+    let tree = TempTree::new("dosbox-no-autoexec");
+    let target = tree.file("unsorted/g/g.dat", b"x");
+    tree.file(
+        "unsorted/g/dosbox.conf",
+        b"[dosbox]\nmemsize=16\n[cpu]\ncycles=max\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_ne!(report.platform, Some("DOS"));
+}
+
+/// A DOS folder alias plus a verified `dosbox.conf`: the folder alias wins
+/// the deciding tier, and DOS is the answer either way.
+#[test]
+fn a_dos_folder_alias_and_a_verified_dosbox_conf_agree_on_dos() {
+    let tree = TempTree::new("dosbox-folder-and-config");
+    let target = tree.file("dos/keen/KEEN.EXE", b"MZ");
+    tree.file(
+        "dos/keen/dosbox.conf",
+        b"[autoexec]\nmount c .\nc:\nkeen.exe\n",
+    );
+
+    let report =
+        detect_platform_report(&DetectionRequest::new(&target, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("DOS"));
+}
+
 /// Test 30
 #[test]
 fn a_real_mega_drive_rom_is_still_detected_from_its_cartridge_header() {

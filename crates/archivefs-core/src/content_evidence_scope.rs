@@ -412,6 +412,15 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         value: crate::dos_boot_evidence::DOS_PCDOS_SYSTEM_FILES,
         scope: EvidenceScope::PlatformSpecific("DOS"),
     },
+    // dosbox_config_evidence.rs: a structurally verified DOSBox config with
+    // a real [autoexec] section. DOSBox runs DOS software only, so the fact
+    // is DOS-specific - but it is emitted at Corroborated and used as a
+    // candidate leg only, never a resolver.
+    ScopeEntry {
+        kind: BootStructure,
+        value: crate::dosbox_config_evidence::DOSBOX_CONFIG_AUTOEXEC,
+        scope: EvidenceScope::PlatformSpecific("DOS"),
+    },
 ];
 
 /// Classifies `(kind, value)` by exact match against [`SCOPE_CATALOG`].

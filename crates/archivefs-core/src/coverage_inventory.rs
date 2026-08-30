@@ -503,10 +503,10 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
     },
     PlatformEvidenceCoverage {
         canonical_id: "DOS",
-        detector_modules: &["dos_boot_evidence"],
+        detector_modules: &["dos_boot_evidence", "dosbox_config_evidence"],
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
-        notes: "FAT12/FAT16 BPB + bounded root-directory walk keyed strictly on the documented DOS system-file pairs (IO.SYS+MSDOS.SYS, IBMBIO.COM+IBMDOS.COM); proven against synthetic FAT12 and FAT16 images. FAT geometry alone never proves DOS; exact release identity stays DAT/hash-driven",
+        notes: "FAT12/FAT16 BPB + bounded root-directory walk keyed strictly on the documented DOS system-file pairs (IO.SYS+MSDOS.SYS, IBMBIO.COM+IBMDOS.COM); plus content-verified dosbox.conf ([autoexec] section) as candidate-only DOS corroboration replacing name-only trust. Proven against synthetic fixtures. FAT geometry / a bare filename never proves DOS; exact release identity stays DAT/hash-driven",
         real_validation_provenance: None,
         dat_validation: None,
     },

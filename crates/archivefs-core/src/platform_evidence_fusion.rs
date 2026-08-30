@@ -693,6 +693,25 @@ pub const RULES: &[FusionRule] = &[
         }],
         explanation: "IBMBIO.COM and IBMDOS.COM both present as regular files in a validated FAT12/FAT16 root directory - the documented IBM PC DOS / DR-DOS system-file pair (see crate::dos_boot_evidence)",
     },
+    // -- DOSBox configuration: a file named `dosbox.conf` proves nothing;
+    //    this leg fires only on a structurally validated DOSBox config that
+    //    carries a real `[autoexec]` section (see
+    //    crate::dosbox_config_evidence). DOSBox runs DOS software only, so
+    //    that is honest DOS corroboration - but it is Corroborated, not
+    //    Strong, so this rule can only ever register DOS as a *candidate*
+    //    (FusionOutcome::Ambiguous), never resolve it. A verified DOS
+    //    boot-file pair still resolves DOS on its own; a bare Weak MZ still
+    //    resolves nothing; strong-vs-strong conflict safety is untouched.
+    FusionRule {
+        id: "dosbox_config_autoexec_candidate",
+        platform: "DOS",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: crate::dosbox_config_evidence::DOSBOX_CONFIG_AUTOEXEC,
+            min_confidence: CORROBORATED,
+        }],
+        explanation: "a structurally valid DOSBox configuration with a real [autoexec] section - DOSBox-only, so DOS corroboration, but candidate-only (no Strong leg)",
+    },
 ];
 
 /// The four outcomes this milestone requires - see the module documentation

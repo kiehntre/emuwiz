@@ -352,7 +352,7 @@ pub fn detect_platform_report(request: &DetectionRequest<'_>) -> PlatformDetecti
 
     // 5. Layout evidence from the containing directory.
     if request.inspect_layout {
-        evidence.extend(layout_evidence(request.path));
+        evidence.extend(layout_evidence(request.path, &request.trusted_roots));
     }
 
     // 6. Emulator context.
@@ -673,8 +673,11 @@ fn signature_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvide
 }
 
 /// Layout evidence from the file's containing directory: one bounded
-/// `read_dir`, filenames only, no file contents.
-fn layout_evidence(path: &Path) -> Vec<DetectionEvidence> {
+/// `read_dir` of filenames, plus - for the one rule that needs it - a
+/// single bounded read of `dosbox.conf` to verify it structurally rather
+/// than trust its name (see [`crate::dosbox_config_evidence`]). Every other
+/// layout rule stays filename-only.
+fn layout_evidence(path: &Path, trusted: &TrustedRoots) -> Vec<DetectionEvidence> {
     let Some(directory) = containing_directory(path) else {
         return Vec::new();
     };
@@ -684,26 +687,75 @@ fn layout_evidence(path: &Path) -> Vec<DetectionEvidence> {
     // Bounded: a game directory with more entries than this is not going to be
     // identified by its layout anyway.
     const MAX_LAYOUT_ENTRIES: usize = 4096;
-    let mut names: Vec<String> = Vec::new();
+    // Lowercased name for matching, real name for the one rule that reads.
+    let mut entries: Vec<(String, std::ffi::OsString)> = Vec::new();
     for entry in read_dir.filter_map(Result::ok).take(MAX_LAYOUT_ENTRIES) {
-        names.push(entry.file_name().to_string_lossy().to_ascii_lowercase());
+        let real = entry.file_name();
+        entries.push((real.to_string_lossy().to_ascii_lowercase(), real));
     }
-    names.sort();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let names: Vec<String> = entries.iter().map(|(lower, _)| lower.clone()).collect();
 
     let mut evidence = Vec::new();
     for platform in PLATFORMS {
         for rule in platform.layout {
-            if let Some(matched) = matching_layout_file(rule, &names) {
+            let Some(matched) = matching_layout_file(rule, &names) else {
+                continue;
+            };
+
+            // Content verification for the DOS `dosbox.conf` rule only:
+            // a file with that name is not evidence unless it actually
+            // parses as a DOSBox config with a real `[autoexec]` section.
+            if matched == "dosbox.conf" && platform.id == "DOS" {
+                let Some(detail) = verified_dosbox_conf_detail(&directory, &entries, trusted)
+                else {
+                    continue;
+                };
                 evidence.push(DetectionEvidence {
                     source: DetectionSource::Layout,
                     conclusive: DetectionSource::Layout.is_decisive(),
                     platform: platform.id,
-                    detail: format!("{} (`{matched}`)", rule.description),
+                    detail,
                 });
+                continue;
             }
+
+            evidence.push(DetectionEvidence {
+                source: DetectionSource::Layout,
+                conclusive: DetectionSource::Layout.is_decisive(),
+                platform: platform.id,
+                detail: format!("{} (`{matched}`)", rule.description),
+            });
         }
     }
     evidence
+}
+
+/// One bounded read of the directory's `dosbox.conf`. Returns the evidence
+/// detail string only when the file is a structurally valid DOSBox config
+/// with a real `[autoexec]` section; `None` (no evidence) for a missing,
+/// empty, binary, malformed, or `[autoexec]`-less file.
+fn verified_dosbox_conf_detail(
+    directory: &Path,
+    entries: &[(String, std::ffi::OsString)],
+    trusted: &TrustedRoots,
+) -> Option<String> {
+    let real_name = entries
+        .iter()
+        .find(|(lower, _)| lower == "dosbox.conf")
+        .map(|(_, real)| real.clone())?;
+    let config_path = directory.join(real_name);
+    let inspection =
+        crate::dosbox_config_evidence::inspect_dosbox_config(&config_path, trusted, None);
+    let fact = inspection.fact?;
+    if !fact.is_verified_dos_layout() {
+        return None;
+    }
+    Some(format!(
+        "A verified DOSBox configuration sits alongside the game (`dosbox.conf` with an \
+         [autoexec] section, {} command line(s))",
+        fact.autoexec_command_lines
+    ))
 }
 
 fn matching_layout_file(rule: &LayoutRule, names: &[String]) -> Option<String> {

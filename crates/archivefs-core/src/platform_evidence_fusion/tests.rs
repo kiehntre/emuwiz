@@ -277,6 +277,79 @@ fn an_mz_signature_alongside_a_dos_boot_pair_does_not_block_dos_resolution() {
 }
 
 #[test]
+fn a_verified_dosbox_config_is_a_dos_candidate_not_a_resolver() {
+    let explanation = fuse_platform_evidence([corroborated(
+        BootStructure,
+        crate::dosbox_config_evidence::DOSBOX_CONFIG_AUTOEXEC,
+    )]);
+    // Corroborated, no Strong leg: DOS is a candidate, never resolved.
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    assert_ne!(explanation.outcome, FusionOutcome::Unknown);
+    assert!(
+        explanation
+            .fired_candidates
+            .iter()
+            .any(
+                |candidate| candidate.rule_id == "dosbox_config_autoexec_candidate"
+                    && candidate.platform == "DOS"
+                    && !candidate.has_strong_leg
+            )
+    );
+}
+
+#[test]
+fn a_filename_only_dosbox_conf_string_is_not_a_dos_rule_leg() {
+    // The rule keys on the verified-config value, not on the bare filename.
+    let explanation = fuse_platform_evidence([corroborated(BootStructure, "dosbox.conf")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+    assert_ne!(explanation.resolved_platform, Some("DOS"));
+}
+
+#[test]
+fn a_verified_dosbox_config_below_corroborated_confidence_does_not_fire() {
+    let explanation = fuse_platform_evidence([weak(
+        BootStructure,
+        crate::dosbox_config_evidence::DOSBOX_CONFIG_AUTOEXEC,
+    )]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn verified_dosbox_config_plus_mz_corroborate_dos_without_resolving_it() {
+    let explanation = fuse_platform_evidence([
+        weak(ContentSignature, "MZ"),
+        corroborated(
+            BootStructure,
+            crate::dosbox_config_evidence::DOSBOX_CONFIG_AUTOEXEC,
+        ),
+    ]);
+    // Both are non-Strong: DOS surfaces as a candidate, never Resolved.
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    assert!(
+        explanation
+            .fired_candidates
+            .iter()
+            .any(|candidate| candidate.platform == "DOS")
+    );
+}
+
+#[test]
+fn a_dos_boot_pair_still_resolves_dos_even_alongside_a_verified_dosbox_config() {
+    let explanation = fuse_platform_evidence([
+        corroborated(
+            BootStructure,
+            crate::dosbox_config_evidence::DOSBOX_CONFIG_AUTOEXEC,
+        ),
+        strong(
+            BootStructure,
+            crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+        ),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("DOS"));
+}
+
+#[test]
 fn a_bare_command_com_string_is_not_a_dos_rule_leg() {
     // COMMAND.COM ships with every DOS and is corroboration only - no rule
     // keys off it.

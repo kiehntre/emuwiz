@@ -938,7 +938,7 @@ pub const PLATFORMS: &[Platform] = &[
         }],
         conflicts_with: &["PC", "ScummVM"],
         preferred_emulator: None,
-        explanation: "`.exe`/`.com` are shared with every Windows-era release, so DOS is identified from folder evidence or a DOSBox configuration rather than from an extension.",
+        explanation: "`.exe`/`.com` are shared with every Windows-era release, so DOS is identified from folder evidence or a DOSBox configuration rather than from an extension. A file merely named `dosbox.conf` is not enough: it is read and must parse as a real DOSBox config with an `[autoexec]` section (see `crate::dosbox_config_evidence`) before it counts as layout evidence.",
     },
     Platform {
         id: "MSX",
