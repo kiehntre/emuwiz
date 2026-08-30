@@ -183,9 +183,9 @@ pub use ppsspp_execution::{
 pub use readiness::{
     FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchReadiness, LaunchWarning,
     LaunchWarningKind, duckstation_firmware_readiness, flycast_firmware_readiness,
-    hatari_firmware_readiness, pcsx2_firmware_readiness, ppsspp_firmware_readiness,
-    retroarch_core_firmware_readiness, rpcs3_firmware_readiness, xemu_firmware_readiness,
-    xenia_firmware_readiness,
+    hatari_firmware_readiness, pcengine_cd_firmware_readiness, pcsx2_firmware_readiness,
+    ppsspp_firmware_readiness, retroarch_core_firmware_readiness, rpcs3_firmware_readiness,
+    xemu_firmware_readiness, xenia_firmware_readiness,
 };
 pub use retroarch_command::{
     RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,

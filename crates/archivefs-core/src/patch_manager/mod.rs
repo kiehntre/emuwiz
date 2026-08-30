@@ -61,6 +61,7 @@ mod gecko_document;
 mod hatari_local;
 mod import_safety;
 mod matching;
+mod pcengine_cd_firmware;
 mod pcsx2;
 mod pcsx2_firmware;
 mod pcsx2_identity;
@@ -458,6 +459,13 @@ pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
     ImportSourceKind, ImportTrustState, LocalSafetyScanningState, UNKNOWN_CODE_POLICY,
     automatic_execution_allowed, classify_active_content, trust_after_inspection,
+};
+pub use pcengine_cd_firmware::{
+    KNOWN_SYSTEM_CARDS, KnownSystemCard, MAX_SYSTEM_CARD_BYTES, MAX_SYSTEM_CARD_CANDIDATES,
+    PceCdEmulatorFirmwarePolicy, PceCdFirmwareOutcome, PceCdFirmwareReadiness,
+    PceCdTitleRequirement, SystemCardClass, SystemCardRegion, VerifiedSystemCard,
+    any_unverified_candidate_present, best_verified_card_class, classify_system_card_file,
+    inventory_system_cards, match_known_system_card, resolve_pcengine_cd_firmware,
 };
 pub use pcsx2::{
     HostReadOnlyFilesystem, Pcsx2CandidateKind, Pcsx2DiscoveryConfidence, Pcsx2DiscoveryRoots,

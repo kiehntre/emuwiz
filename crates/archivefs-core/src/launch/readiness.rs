@@ -20,8 +20,8 @@
 
 use crate::emulator_environment::retroarch::CoreInfoFinding;
 use crate::patch_manager::{
-    DuckStationBiosState, FlycastSystemFileState, HatariTosHealth, Pcsx2BiosVerification,
-    Rpcs3FirmwareStatus, XemuSystemFileState,
+    DuckStationBiosState, FlycastSystemFileState, HatariTosHealth, PceCdFirmwareReadiness,
+    Pcsx2BiosVerification, Rpcs3FirmwareStatus, XemuSystemFileState,
 };
 
 /// Whether a platform's firmware/BIOS/TOS requirement is currently
@@ -336,6 +336,26 @@ pub fn pcsx2_firmware_readiness(state: Pcsx2BiosVerification) -> FirmwareReadine
         Pcsx2BiosVerification::PresentUnverified => FirmwareReadiness::PresentUnverified,
         Pcsx2BiosVerification::Missing => FirmwareReadiness::Missing,
         Pcsx2BiosVerification::Unreadable => FirmwareReadiness::Unknown,
+    }
+}
+
+/// Projects [`PceCdFirmwareReadiness`] onto [`FirmwareReadiness`].
+///
+/// `VerifiedSufficient` -> `Verified` (produced only by
+/// `patch_manager::pcengine_cd_firmware`'s real MAME + Mednafen dual-sourced
+/// hash match, never by this projection). `VerifiedButRequirementUnknown`
+/// and `EmulatorRequirementUnknown` -> `Unknown`: honest uncertainty, never
+/// a proven pass or a proven failure, because this build has no per-title
+/// PC Engine CD compatibility table. `NoVerifiedFirmware` -> `Missing` only
+/// when the selected emulator is known to load an external System Card.
+pub fn pcengine_cd_firmware_readiness(status: PceCdFirmwareReadiness) -> FirmwareReadiness {
+    match status {
+        PceCdFirmwareReadiness::EmulatorProvidesFirmware => FirmwareReadiness::NotRequired,
+        PceCdFirmwareReadiness::VerifiedSufficient { .. } => FirmwareReadiness::Verified,
+        PceCdFirmwareReadiness::CandidatePresentHashUnknown => FirmwareReadiness::PresentUnverified,
+        PceCdFirmwareReadiness::NoVerifiedFirmware => FirmwareReadiness::Missing,
+        PceCdFirmwareReadiness::VerifiedButRequirementUnknown { .. }
+        | PceCdFirmwareReadiness::EmulatorRequirementUnknown => FirmwareReadiness::Unknown,
     }
 }
 
