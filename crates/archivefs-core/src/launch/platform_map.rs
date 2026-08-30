@@ -263,24 +263,44 @@ pub fn retroarch_platform_candidate(info: &CoreInfoFinding) -> Option<&'static s
 
 /// Whether a core's reviewed `.info` metadata explicitly names `platform_id`.
 ///
-/// Genesis Plus GX advertises its shared hardware family in `systemname` as
-/// `Sega - MS/GG/MD/CD`, whose first resolvable segment is Game Gear. Its
-/// database field separately names the exact `Sega - Mega-CD - Sega CD`
-/// database. The Sega CD launch path therefore checks that exact database
-/// field as an additional, platform-specific match without changing the
-/// existing single-candidate behaviour for other platforms.
+/// A single-system core resolves straight through
+/// [`retroarch_platform_candidate`]. A multi-system core, though, advertises
+/// a whole hardware family in one `database` value: Genesis Plus GX's real
+/// `systemname` is `Sega 8/16-bit (Various)` (which resolves to nothing) and
+/// its `database` is the `|`-separated list `Sega - Game Gear|Sega - Master
+/// System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|
+/// ...`, whose *first* resolvable entry is Master System. Gambatte's is
+/// `Nintendo - Game Boy|Nintendo - Game Boy Color`; mGBA's adds
+/// `|Nintendo - Game Boy Advance`. [`retroarch_platform_candidate`] can only
+/// name one platform, so on its own it hides every other system the core
+/// genuinely runs.
+///
+/// When the single candidate does not match the requested platform, this
+/// also checks each `|`-separated `database` alternative through the same
+/// exact-alias [`resolve_info_text`] resolution and returns `true` when any
+/// of them names `platform_id` exactly. Nothing here is fuzzy: an
+/// alternative that does not resolve exactly contributes nothing, an absent
+/// or empty `database` contributes nothing, and `corename`, `manufacturer`,
+/// `categories`, and the core's filename are still never consulted.
+///
+/// A multi-system core is therefore a legitimate candidate for every
+/// platform its own `database` explicitly names - intended. The candidate
+/// still has to pass every readiness/firmware/content check unchanged, and
+/// disambiguation among several matching cores is left to
+/// [`LaunchCompatibility::retroarch_core_hints`] exactly as before. (The
+/// previous Sega CD-only form of this check is now just one case of the
+/// general rule.)
 pub fn retroarch_platform_matches(info: &CoreInfoFinding, platform_id: &str) -> bool {
     if retroarch_platform_candidate(info) == Some(platform_id) {
         return true;
     }
-    platform_id == "Sega CD"
-        && matches!(
-            info,
-            CoreInfoFinding::Found { database: Some(database), .. }
-                if database
-                    .split('|')
-                    .any(|alternative| resolve_info_text(alternative) == Some("Sega CD"))
-        )
+    matches!(
+        info,
+        CoreInfoFinding::Found { database: Some(database), .. }
+            if database
+                .split('|')
+                .any(|alternative| resolve_info_text(alternative) == Some(platform_id))
+    )
 }
 
 /// Whether `extension` (already lowercased, no dot) is plausible content
@@ -447,5 +467,117 @@ mod tests {
         assert!(extension_narrows_candidate("iso", "PSX"));
         assert!(extension_narrows_candidate("iso", "PS2"));
         assert!(!extension_narrows_candidate("z64", "PSX"));
+    }
+
+    // Real libretro-core-info metadata: `systemname` is a shared-family
+    // display string that resolves to nothing (or to the wrong first
+    // platform), and `database` is the authoritative `|`-separated list.
+
+    fn genesis_plus_gx_real() -> CoreInfoFinding {
+        found(
+            Some("Sega 8/16-bit (Various)"),
+            Some(
+                "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - SG-1000",
+            ),
+        )
+    }
+
+    fn gambatte_real() -> CoreInfoFinding {
+        found(
+            Some("Game Boy/Game Boy Color"),
+            Some("Nintendo - Game Boy|Nintendo - Game Boy Color"),
+        )
+    }
+
+    fn mgba_real() -> CoreInfoFinding {
+        found(
+            Some("Game Boy/Game Boy Color/Game Boy Advance"),
+            Some("Nintendo - Game Boy|Nintendo - Game Boy Color|Nintendo - Game Boy Advance"),
+        )
+    }
+
+    #[test]
+    fn genesis_plus_gx_real_metadata_matches_every_database_platform() {
+        let info = genesis_plus_gx_real();
+        // Its single resolvable candidate is not Mega Drive.
+        assert_ne!(retroarch_platform_candidate(&info), Some("MegaDrive"));
+        // But every platform its own database names is now a match.
+        assert!(retroarch_platform_matches(&info, "MegaDrive"));
+        assert!(retroarch_platform_matches(&info, "MasterSystem"));
+        assert!(retroarch_platform_matches(&info, "GameGear"));
+        assert!(retroarch_platform_matches(&info, "Sega CD"));
+    }
+
+    #[test]
+    fn gambatte_real_metadata_matches_game_boy_and_game_boy_color() {
+        let info = gambatte_real();
+        assert!(retroarch_platform_matches(&info, "Game Boy"));
+        assert!(retroarch_platform_matches(&info, "Game Boy Color"));
+    }
+
+    #[test]
+    fn mgba_real_metadata_matches_gb_gbc_and_gba() {
+        let info = mgba_real();
+        assert!(retroarch_platform_matches(&info, "Game Boy"));
+        assert!(retroarch_platform_matches(&info, "Game Boy Color"));
+        assert!(retroarch_platform_matches(&info, "Game Boy Advance"));
+    }
+
+    #[test]
+    fn multi_system_core_does_not_match_an_unrelated_platform() {
+        assert!(!retroarch_platform_matches(&genesis_plus_gx_real(), "PSX"));
+        assert!(!retroarch_platform_matches(&genesis_plus_gx_real(), "N64"));
+        assert!(!retroarch_platform_matches(&gambatte_real(), "Game Boy Advance"));
+        assert!(!retroarch_platform_matches(&mgba_real(), "SNES"));
+    }
+
+    #[test]
+    fn empty_or_malformed_database_never_creates_a_match() {
+        // No database at all: only the single resolvable candidate matches.
+        let systemname_only = found(Some("Game Boy/Game Boy Color/Game Boy Advance"), None);
+        assert!(retroarch_platform_matches(&systemname_only, "Game Boy"));
+        assert!(!retroarch_platform_matches(&systemname_only, "Game Boy Color"));
+        assert!(!retroarch_platform_matches(&systemname_only, "Game Boy Advance"));
+
+        for junk in ["", "|||", "   |   ", "Not - A - Real - System|also nonsense"] {
+            let info = found(None, Some(junk));
+            assert!(!retroarch_platform_matches(&info, "MegaDrive"));
+            assert!(!retroarch_platform_matches(&info, "Game Boy"));
+        }
+
+        assert!(!retroarch_platform_matches(&CoreInfoFinding::Missing, "NES"));
+    }
+
+    #[test]
+    fn sega_cd_database_alternative_still_matches() {
+        // The previous Sega CD-only special case is preserved by the general rule,
+        // for both the real and the older fabricated systemname shapes.
+        assert!(retroarch_platform_matches(&genesis_plus_gx_real(), "Sega CD"));
+        let fabricated = found(
+            Some("Sega - MS/GG/MD/CD"),
+            Some(
+                "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis",
+            ),
+        );
+        assert!(retroarch_platform_matches(&fabricated, "Sega CD"));
+    }
+
+    #[test]
+    fn single_system_core_matches_only_its_own_platform() {
+        // Stella: systemname resolves directly; database names just one system.
+        let stella = found(Some("Atari 2600"), Some("Atari - 2600"));
+        assert_eq!(retroarch_platform_candidate(&stella), Some("Atari2600"));
+        assert!(retroarch_platform_matches(&stella, "Atari2600"));
+        assert!(!retroarch_platform_matches(&stella, "Atari7800"));
+        assert!(!retroarch_platform_matches(&stella, "MegaDrive"));
+
+        // snes9x-style: header-style systemname, single-system database.
+        let snes9x = found(
+            Some("Nintendo - SNES / SFC"),
+            Some("Nintendo - Super Nintendo Entertainment System"),
+        );
+        assert!(retroarch_platform_matches(&snes9x, "SNES"));
+        assert!(!retroarch_platform_matches(&snes9x, "NES"));
+        assert!(!retroarch_platform_matches(&snes9x, "Game Boy"));
     }
 }
