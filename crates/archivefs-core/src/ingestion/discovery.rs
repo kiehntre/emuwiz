@@ -18,6 +18,7 @@ use crate::identity_source::whdload::{
     WhdloadDatContext, inspect_whdload_slave_file, reconcile_whdload_slaves,
 };
 use crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation;
+use crate::psp_pbp_evidence::{PBP_HEADER_BYTES, parse_pbp_header, validate_pbp_offsets};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -703,6 +704,9 @@ fn discover_direct_file(
     if matches!(extension.as_str(), "xbe" | "xex" | "xiso") {
         return discover_xbox_content(path, source_root, &extension);
     }
+    if extension == "pbp" {
+        return discover_pbp(path, source_root);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -780,6 +784,78 @@ fn discover_xbox_content(path: &Path, source_root: &Path, extension: &str) -> Ga
             "This .{extension} file was recognised, but its Xbox structure or identity did not validate."
         ),
     )
+}
+
+/// `.pbp` is a shared PSP/PS1 Classics container. Validate its fixed header
+/// and section table before accepting it as recognised content; the extension
+/// and the container do not settle which PlayStation platform it belongs to.
+fn discover_pbp(path: &Path, source_root: &Path) -> GameDiscovery {
+    let safe =
+        match crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none()) {
+            Ok(safe) => safe,
+            Err(error) => {
+                return skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::DiscImage),
+                    SkipReason::InvalidContent(error.detail()),
+                    "This .pbp file could not be opened safely.".to_string(),
+                );
+            }
+        };
+    let file_len = safe.len();
+    let mut file = safe.into_file();
+    let mut prefix = vec![0_u8; file_len.min(crate::game_identity::MAX_BYTES_READ) as usize];
+    if let Err(error) = std::io::Read::read_exact(&mut file, &mut prefix) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::InvalidContent(error.to_string()),
+            "This .pbp file could not be read completely within the bounded inspection."
+                .to_string(),
+        );
+    }
+    let Some(header) = parse_pbp_header(&prefix[..prefix.len().min(PBP_HEADER_BYTES)]) else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::InvalidContent("malformed or truncated PBP fixed header".to_string()),
+            "This .pbp file does not contain a valid PBP fixed header.".to_string(),
+        );
+    };
+    if let Err(error) = validate_pbp_offsets(&header, file_len) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::DiscImage),
+            SkipReason::InvalidContent(error.to_string()),
+            "This .pbp file has an invalid section-offset table.".to_string(),
+        );
+    }
+
+    let identity = identity_for(path, source_root);
+    let platform = identity.as_ref().and_then(|item| item.platform.clone());
+    match platform {
+        Some(platform) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::DiscImage,
+            identity,
+            format!("Valid PBP container; platform context identifies {platform}."),
+        ),
+        None => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::DiscImage),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation: "Valid PBP container, but PSP and PS1 Classics are both possible and no platform corroboration was found.".to_string(),
+            skip_reason: Some(SkipReason::AmbiguousPlatform),
+        },
+    }
 }
 
 /// `.rdb` is registered unconditionally as [`ContentKind::AmigaImage`] (see

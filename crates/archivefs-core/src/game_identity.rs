@@ -48,6 +48,10 @@ use crate::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
 use crate::ps3_disc_evidence::observe_ps3_directory;
+use crate::psp_pbp_evidence::{
+    PBP_HEADER_BYTES, observe_pbp_evidence, parse_pbp_header, read_pbp_param_sfo,
+    validate_pbp_offsets,
+};
 use crate::raw_cd_logical_media::{
     open_cooked_cd_file_logical_media, open_raw_cd_file_logical_media,
 };
@@ -496,6 +500,10 @@ pub enum IdentityImageFormat {
     /// Requires the `dreamcast-cdi` build feature (default-on); without
     /// it, this reports [`Self::Unsupported`] instead, never a guess.
     Cdi,
+    /// A bounded PSP/PS1 `EBOOT.PBP` container. The container and any
+    /// embedded PSP product code are inspected, but PSAR payloads are not
+    /// decompressed or traversed.
+    Pbp,
     /// An extracted ScummVM game folder verified by the installed ScummVM
     /// detector. No archive or folder name is used as identity evidence.
     ScummVmDirectory,
@@ -885,6 +893,14 @@ fn inspect_game_identity_with_platform_trust(
             if platform != IdentityPlatform::Xbox360 && platform != IdentityPlatform::Xbox =>
         {
             inspect_direct_iso(&mut report, trusted)
+        }
+        "pbp"
+            if matches!(
+                platform,
+                IdentityPlatform::PlayStation | IdentityPlatform::Psp
+            ) =>
+        {
+            inspect_pbp(&mut report, trusted)
         }
         "xex" if platform == IdentityPlatform::Xbox360 => inspect_direct_xex(&mut report, trusted),
         "zip" if platform == IdentityPlatform::Xbox360 => inspect_zip_xex(&mut report, trusted),
@@ -2798,6 +2814,96 @@ fn ps3_directory_paths_are_regular(root: &Path) -> bool {
                         || (path.extension().is_none() && metadata.is_dir()))
             })
         })
+}
+
+/// Inspects a direct `.pbp` using the existing bounded PBP container parser.
+/// The complete file is never required: the fixed header and the beginning of
+/// the declared sections are read through the normal 64 MiB identity bound.
+/// A PBP is shared by native PSP content and PS1 Classics, so this routine
+/// never turns the extension or the container alone into a PSP/PS1 identity.
+fn inspect_pbp(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::Pbp;
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let file_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let read_len = file_len.min(MAX_BYTES_READ);
+    let mut bytes = Vec::with_capacity(read_len as usize);
+    if let Err(error) = file.take(read_len).read_to_end(&mut bytes) {
+        add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+        return;
+    }
+    report.bytes_read = bytes.len() as u64;
+    let Some(header) = parse_pbp_header(&bytes[..bytes.len().min(PBP_HEADER_BYTES)]) else {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "PBP fixed header is malformed or truncated",
+        );
+        return;
+    };
+    if let Err(error) = validate_pbp_offsets(&header, file_len) {
+        add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+        return;
+    }
+    let sfo = read_pbp_param_sfo(&bytes, &header);
+    let container_detail = observe_pbp_evidence(sfo.as_ref())
+        .into_iter()
+        .next()
+        .map(|item| item.detail)
+        .unwrap_or_else(|| "PBP fixed header and section offsets validated".to_string());
+    report.warnings.push(container_detail);
+
+    if report.platform == IdentityPlatform::Psp {
+        let Some(raw_id) = sfo.as_ref().and_then(|value| value.get_text("DISC_ID")) else {
+            add_unavailable(
+                report,
+                IdentityStatus::Missing,
+                "PBP PARAM.SFO has no DISC_ID",
+            );
+            return;
+        };
+        let id = raw_id.trim().to_ascii_uppercase();
+        let valid = id.len() == 9
+            && id.as_bytes()[..4].iter().all(u8::is_ascii_uppercase)
+            && id.as_bytes()[4..].iter().all(u8::is_ascii_digit);
+        if !valid {
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "PBP PARAM.SFO DISC_ID is not a valid product identifier",
+            );
+            return;
+        }
+        push_with_source(
+            report,
+            IdentityKind::PspDiscId,
+            IdentityStatus::Verified,
+            Some(id),
+            IdentityConfidence::StructuredMetadata,
+            None,
+            None,
+            "PBP fixed header plus PARAM.SFO DISC_ID",
+            "verified from a structurally valid PBP container",
+        );
+        report.complete = true;
+    } else {
+        add_unavailable(
+            report,
+            IdentityStatus::Unsupported,
+            "PBP structure is shared with PS1 Classics; no PS1 serial is manufactured from PSAR markers",
+        );
+    }
 }
 
 fn inspect_iso_source(
@@ -6308,6 +6414,21 @@ mod tests {
         iso
     }
 
+    fn psp_pbp(disc_id: &[u8]) -> Vec<u8> {
+        let sfo = psp_sfo(disc_id);
+        let sfo_start = crate::psp_pbp_evidence::PBP_HEADER_BYTES as u32;
+        let sfo_end = sfo_start + sfo.len() as u32;
+        let mut offsets = [sfo_end; crate::psp_pbp_evidence::PBP_SECTION_COUNT];
+        offsets[crate::psp_pbp_evidence::PBP_SECTION_PARAM_SFO] = sfo_start;
+        let mut out = vec![0_u8; crate::psp_pbp_evidence::PBP_HEADER_BYTES];
+        out[..4].copy_from_slice(crate::psp_pbp_evidence::PBP_MAGIC);
+        for (index, offset) in offsets.iter().enumerate() {
+            out[8 + index * 4..12 + index * 4].copy_from_slice(&offset.to_le_bytes());
+        }
+        out.extend_from_slice(&sfo);
+        out
+    }
+
     fn saturn_iso(product_number: &[u8]) -> Vec<u8> {
         let mut iso = vec![0_u8; 24 * ISO_SECTOR_SIZE as usize];
         let mut system_id = vec![b' '; SATURN_SYSTEM_ID_BYTES];
@@ -7225,6 +7346,30 @@ mod tests {
                 .iter()
                 .all(|item| item.status != IdentityStatus::Verified)
         );
+    }
+
+    #[test]
+    fn psp_pbp_verifies_disc_id_but_ps1_context_stays_without_serial() {
+        let directory = FixtureDir::new("psp-pbp");
+        let path = write_fixture(&directory, "EBOOT.pbp", &psp_pbp(b"ULUS10000"));
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.format, IdentityImageFormat::Pbp);
+        assert_eq!(report.verified_psp_disc_id(), Some("ULUS10000"));
+        assert!(report.complete);
+
+        let ps1 = inspect_game_identity(&path, Some("PS1"));
+        assert_eq!(ps1.format, IdentityImageFormat::Pbp);
+        assert_eq!(ps1.verified_ps1_serial(), None);
+    }
+
+    #[test]
+    fn malformed_pbp_does_not_produce_psp_identity() {
+        let directory = FixtureDir::new("psp-pbp-invalid");
+        let path = write_fixture(&directory, "EBOOT.pbp", b"not a PBP");
+        let report = inspect_game_identity(&path, Some("PSP"));
+        assert_eq!(report.format, IdentityImageFormat::Pbp);
+        assert_eq!(report.verified_psp_disc_id(), None);
+        assert!(!report.complete);
     }
 
     #[test]

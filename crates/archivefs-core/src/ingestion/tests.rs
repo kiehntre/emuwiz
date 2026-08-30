@@ -87,6 +87,16 @@ fn minimal_d64() -> Vec<u8> {
     image
 }
 
+fn minimal_pbp() -> Vec<u8> {
+    let mut image = vec![0_u8; 0x28];
+    image[..4].copy_from_slice(b"\0PBP");
+    image[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    for index in 0..8 {
+        image[8 + index * 4..12 + index * 4].copy_from_slice(&0x28_u32.to_le_bytes());
+    }
+    image
+}
+
 /// The standard z64 (big-endian) N64 dump signature.
 const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
 
@@ -499,6 +509,32 @@ fn a_non_amiga_hdf_with_no_platform_evidence_is_flagged_ambiguous_not_amiga() {
     let item = &report.items[0];
     assert_ne!(item.content, Some(ContentKind::AmigaImage));
     assert_eq!(item.skip_reason, Some(SkipReason::AmbiguousPlatform));
+}
+
+#[test]
+fn valid_bare_pbp_is_structurally_discovered_but_platform_ambiguous() {
+    let dir = source_dir("pbp-valid");
+    std::fs::write(dir.path().join("EBOOT.pbp"), minimal_pbp()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::DiscImage));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.skip_reason, Some(SkipReason::AmbiguousPlatform));
+}
+
+#[test]
+fn random_pbp_is_rejected_by_structural_discovery() {
+    let dir = source_dir("pbp-invalid");
+    std::fs::write(dir.path().join("random.pbp"), b"not a pbp").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
 }
 
 #[test]

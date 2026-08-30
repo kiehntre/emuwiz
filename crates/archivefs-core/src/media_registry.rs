@@ -82,6 +82,10 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         kind: ArchiveKind::DirectGameImage,
     },
     MediaFormat {
+        extension: "pbp",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
         extension: "gcm",
         kind: ArchiveKind::DirectGameImage,
     },

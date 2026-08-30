@@ -119,6 +119,9 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("wbfs", ContentKind::DiscImage),
     cf("ciso", ContentKind::DiscImage),
     cf("chd", ContentKind::DiscImage),
+    // PSP/PS1 EBOOT.PBP is a bounded container; its platform and exact
+    // identity still require structural or catalogue evidence.
+    cf("pbp", ContentKind::DiscImage),
     cf("gdi", ContentKind::DiscImage),
     cf("cdi", ContentKind::DiscImage),
     cf("xiso", ContentKind::DiscImage),
