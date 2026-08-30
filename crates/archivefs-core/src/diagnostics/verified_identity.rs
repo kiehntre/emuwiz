@@ -170,6 +170,7 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Pcfx
         | IdentityPlatform::PcEngineCd
+        | IdentityPlatform::NeoGeoCd
         | IdentityPlatform::Other => return None,
     };
     Some(requirement)
