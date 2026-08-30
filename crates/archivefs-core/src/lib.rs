@@ -199,6 +199,11 @@ pub mod playstation_boot_evidence;
 /// [`content_evidence`] facts, never a platform.
 pub mod dreamcast_boot_evidence;
 
+/// Pure, read-only FAT12/FAT16 root-directory observation for DOS-family
+/// boot media - neutral [`content_evidence`] facts keyed strictly on
+/// documented DOS system-file pairs, never on FAT geometry.
+pub mod dos_boot_evidence;
+
 /// Shared, pure, read-only executable/container header observers: ELF,
 /// PS3 SELF, Xbox XBE, Xbox 360 XEX2.
 pub mod executable_signatures;

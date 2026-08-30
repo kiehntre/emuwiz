@@ -218,6 +218,70 @@ fn generic_iso9660_never_resolves_to_neogeocd() {
 }
 
 #[test]
+fn dos_msdos_system_file_pair_resolves_to_canonical_dos() {
+    let explanation = fuse_platform_evidence([strong(
+        BootStructure,
+        crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+    )]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("DOS"));
+    assert!(
+        explanation
+            .fired_candidates
+            .iter()
+            .any(|candidate| candidate.rule_id == "dos_msdos_system_files"
+                && candidate.has_strong_leg)
+    );
+}
+
+#[test]
+fn dos_pcdos_system_file_pair_resolves_to_canonical_dos() {
+    let explanation = fuse_platform_evidence([strong(
+        BootStructure,
+        crate::dos_boot_evidence::DOS_PCDOS_SYSTEM_FILES,
+    )]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("DOS"));
+}
+
+#[test]
+fn dos_system_file_pair_below_strong_confidence_does_not_resolve() {
+    let explanation = fuse_platform_evidence([corroborated(
+        BootStructure,
+        crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+    )]);
+    assert_ne!(explanation.resolved_platform, Some("DOS"));
+}
+
+#[test]
+fn a_bare_command_com_string_is_not_a_dos_rule_leg() {
+    // COMMAND.COM ships with every DOS and is corroboration only - no rule
+    // keys off it.
+    let explanation = fuse_platform_evidence([strong(BootStructure, "COMMAND.COM")]);
+    assert_ne!(explanation.resolved_platform, Some("DOS"));
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn dos_system_files_do_not_win_over_another_conflicting_strong_platform() {
+    // A DOS system-file pair is a strong-eligible rule like any other, so it
+    // is bound by the non-negotiable strong-vs-strong fail-closed rule:
+    // paired with another non-equivalent platform's strong rule it must
+    // never silently resolve to DOS. (PC itself has no strong fusion rule
+    // in this crate; any strong, non-equivalent platform demonstrates the
+    // mechanism that also protects the DOS <-> PC case.)
+    let explanation = fuse_platform_evidence([
+        strong(
+            BootStructure,
+            crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+        ),
+        strong(BootStructure, "SEGA SEGASATURN"),
+    ]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    assert_ne!(explanation.resolved_platform, Some("DOS"));
+}
+
+#[test]
 fn resolved_explanation_retains_input_evidence() {
     let input = strong(BootStructure, "SEGA SEGASATURN");
     let explanation = fuse_platform_evidence([input.clone()]);

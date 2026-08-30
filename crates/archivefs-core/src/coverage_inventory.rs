@@ -501,6 +501,15 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation_provenance: None,
         dat_validation: None,
     },
+    PlatformEvidenceCoverage {
+        canonical_id: "DOS",
+        detector_modules: &["dos_boot_evidence"],
+        normalization: false,
+        real_validation: ValidationStatus::SyntheticValidated,
+        notes: "FAT12/FAT16 BPB + bounded root-directory walk keyed strictly on the documented DOS system-file pairs (IO.SYS+MSDOS.SYS, IBMBIO.COM+IBMDOS.COM); proven against synthetic FAT12 and FAT16 images. FAT geometry alone never proves DOS; exact release identity stays DAT/hash-driven",
+        real_validation_provenance: None,
+        dat_validation: None,
+    },
 ];
 
 /// The number of canonical platforms in [`crate::platform::PLATFORMS`] -

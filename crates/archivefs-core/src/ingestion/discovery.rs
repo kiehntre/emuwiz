@@ -710,6 +710,9 @@ fn discover_direct_file(
     if extension == "pkg" {
         return discover_ps3_pkg(path, source_root);
     }
+    if matches!(extension.as_str(), "img" | "ima") {
+        return discover_dos_boot_media(path, source_root);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -1651,6 +1654,130 @@ fn discover_dfs_media(path: &Path, source_root: &Path) -> GameDiscovery {
              validate."
                 .to_string(),
         ),
+    }
+}
+
+/// `.img` / `.ima` are raw disk-image extensions shared by DOS, the Atari
+/// ST, NEC PC-98, Sharp X68000, digital cameras and more - they are
+/// deliberately *weak* DOS extensions, never strong ones. Resolution runs
+/// through [`crate::dos_boot_evidence`], which validates a FAT12/FAT16 boot
+/// sector and walks the root directory:
+///
+/// 1. a documented DOS system-file pair (`IO.SYS`+`MSDOS.SYS` or
+///    `IBMBIO.COM`+`IBMDOS.COM`) and no other, conflicting platform
+///    already identified -> accepted as DOS-family boot media;
+/// 2. the same pair, but other evidence already names a different platform
+///    -> that platform wins (the existing DOS <-> PC and folder-alias
+///    conflict handling is preserved, never overridden here);
+/// 3. a valid FAT filesystem with no such pair -> a generic computer disk
+///    image, never forced to DOS;
+/// 4. not a readable FAT12/FAT16 boot sector -> refused.
+fn discover_dos_boot_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::dos_boot_evidence::inspect_dos_boot_media;
+
+    let inspection = inspect_dos_boot_media(path, &crate::safe_read::TrustedRoots::none(), None);
+
+    let Some(volume) = inspection.filesystem else {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                inspection
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a readable FAT12/FAT16 boot sector".to_string()),
+            ),
+            "This .img/.ima file is not a readable FAT12/FAT16 disk image.".to_string(),
+        );
+    };
+
+    let detail = inspection
+        .observations
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{} filesystem", volume.fat_type.label()));
+    let identity = identity_for(path, source_root);
+    let identified_platform = identity
+        .as_ref()
+        .and_then(|summary| summary.platform.clone());
+
+    if inspection.boot_families.is_empty() {
+        // Valid FAT, no documented DOS system-file pair: a generic disk.
+        return match &identified_platform {
+            Some(platform) => accepted(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::ComputerDisk,
+                identity,
+                format!(
+                    "Computer disk image (valid {} filesystem; platform identified from other \
+                     evidence as {platform}). {detail}.",
+                    volume.fat_type.label()
+                ),
+            ),
+            None => GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::ComputerDisk),
+                platform_hint: None,
+                identity_candidate: identity,
+                validation_state: ValidationState::Skipped,
+                explanation: format!(
+                    "Valid {} disk image, but it carries no IO.SYS+MSDOS.SYS or \
+                     IBMBIO.COM+IBMDOS.COM pair and nothing else identifies a platform. A FAT \
+                     filesystem alone is not DOS evidence. {detail}.",
+                    volume.fat_type.label()
+                ),
+                skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+            },
+        };
+    }
+
+    let families: Vec<&str> = inspection
+        .boot_families
+        .iter()
+        .map(|family| family.label())
+        .collect();
+    let family_text = families.join(" and ");
+
+    // A documented DOS system-file pair is present. If other evidence has
+    // already resolved a *different* platform, defer to it rather than
+    // override - this is what preserves the DOS <-> PC conflict behaviour
+    // (and every folder-alias case) unchanged.
+    if let Some(platform) = &identified_platform
+        && platform != "DOS"
+    {
+        return GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::ComputerDisk),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "{family_text} system files are present in the FAT root directory, but other \
+                 evidence identifies this as {platform}, which conflicts with DOS. Left \
+                 unresolved rather than overridden. {detail}."
+            ),
+            skip_reason: Some(SkipReason::AmbiguousPlatform),
+        };
+    }
+
+    GameDiscovery {
+        path: path.to_path_buf(),
+        container: ContainerKind::DirectFile,
+        content: Some(ContentKind::ComputerDisk),
+        platform_hint: Some("DOS".to_string()),
+        identity_candidate: identity,
+        validation_state: ValidationState::Accepted,
+        explanation: format!(
+            "{family_text} boot media ({family_text} system files in the FAT root directory). \
+             Structural DOS-family boot evidence only; exact game identity still needs a \
+             DAT/catalogue match. {detail}."
+        ),
+        skip_reason: None,
     }
 }
 

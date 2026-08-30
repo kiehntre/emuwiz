@@ -1467,3 +1467,117 @@ fn truncated_trd_fails_closed_in_discovery() {
     ));
     assert_eq!(item.platform_hint, None);
 }
+
+// --- DOS boot media (.img / .ima) --------------------------------------
+
+/// A 1.44 MB FAT12 floppy image: a real BPB, the boot signature, and the
+/// given 8.3 root-directory entries written at the computed root offset.
+fn dos_fat12_floppy(entries: &[(&str, &str)]) -> Vec<u8> {
+    const SECTOR: usize = 512;
+    let mut img = vec![0u8; 2880 * SECTOR];
+    img[0x00] = 0xEB;
+    img[0x01] = 0x3C;
+    img[0x02] = 0x90;
+    img[0x03..0x0B].copy_from_slice(b"MSDOS5.0");
+    img[0x0B..0x0D].copy_from_slice(&512u16.to_le_bytes());
+    img[0x0D] = 1; // sectors per cluster
+    img[0x0E..0x10].copy_from_slice(&1u16.to_le_bytes()); // reserved
+    img[0x10] = 2; // FATs
+    img[0x11..0x13].copy_from_slice(&224u16.to_le_bytes()); // root entries
+    img[0x13..0x15].copy_from_slice(&2880u16.to_le_bytes()); // total sectors
+    img[0x15] = 0xF0; // media descriptor
+    img[0x16..0x18].copy_from_slice(&9u16.to_le_bytes()); // sectors per FAT
+    img[0x18..0x1A].copy_from_slice(&18u16.to_le_bytes()); // sectors per track
+    img[0x1A..0x1C].copy_from_slice(&2u16.to_le_bytes()); // heads
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    let root = (1 + 2 * 9) * SECTOR; // 9728
+    for (i, (base, ext)) in entries.iter().enumerate() {
+        let e = root + i * 32;
+        img[e..e + 11].fill(b' ');
+        img[e..e + base.len()].copy_from_slice(base.as_bytes());
+        img[e + 8..e + 8 + ext.len()].copy_from_slice(ext.as_bytes());
+        img[e + 11] = 0x07; // system|hidden|read-only
+    }
+    img
+}
+
+#[test]
+fn img_with_msdos_system_files_is_discovered_as_dos_boot_media() {
+    let dir = source_dir("dos-img");
+    std::fs::write(
+        dir.path().join("Boot Disk.img"),
+        dos_fat12_floppy(&[("IO", "SYS"), ("MSDOS", "SYS")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("DOS"));
+    assert!(item.explanation.contains("MS-DOS"));
+    assert!(item.explanation.contains("DAT/catalogue match"));
+}
+
+#[test]
+fn ima_with_pc_dos_system_files_is_discovered_as_dos_boot_media() {
+    let dir = source_dir("dos-ima");
+    std::fs::write(
+        dir.path().join("pcdos.ima"),
+        dos_fat12_floppy(&[("IBMBIO", "COM"), ("IBMDOS", "COM")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("DOS"));
+    assert!(item.explanation.contains("PC DOS"));
+}
+
+#[test]
+fn valid_fat_img_without_a_dos_system_file_pair_is_never_forced_to_dos() {
+    let dir = source_dir("dos-img-plain");
+    std::fs::write(
+        dir.path().join("data.img"),
+        dos_fat12_floppy(&[("README", "TXT"), ("COMMAND", "COM")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(
+        item.skip_reason,
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
+    );
+    assert!(item.explanation.contains("not DOS evidence"));
+}
+
+#[test]
+fn img_filename_containing_dos_does_not_make_a_generic_fat_image_dos() {
+    let dir = source_dir("dos-img-name");
+    std::fs::write(
+        dir.path().join("MEGA DOS COLLECTION.img"),
+        dos_fat12_floppy(&[("SETUP", "EXE")]),
+    )
+    .unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+}
+
+#[test]
+fn random_bytes_named_img_fail_closed_in_discovery() {
+    let dir = source_dir("dos-img-noise");
+    std::fs::write(dir.path().join("mystery.img"), vec![0x11u8; 4096]).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}

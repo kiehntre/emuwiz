@@ -396,6 +396,22 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         value: "GBA cartridge header",
         scope: EvidenceScope::PlatformSpecific("Game Boy Advance"),
     },
+    // dos_boot_evidence.rs: a documented DOS system-file pair found in a
+    // validated FAT12/FAT16 root directory. Both MS-DOS (IO.SYS +
+    // MSDOS.SYS) and PC DOS / DR-DOS (IBMBIO.COM + IBMDOS.COM) map to the
+    // one canonical `DOS` platform - the pair names the family, not a
+    // release. A valid FAT filesystem on its own is never listed here and
+    // falls through to Generic, which is the whole point of the module.
+    ScopeEntry {
+        kind: BootStructure,
+        value: crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+        scope: EvidenceScope::PlatformSpecific("DOS"),
+    },
+    ScopeEntry {
+        kind: BootStructure,
+        value: crate::dos_boot_evidence::DOS_PCDOS_SYSTEM_FILES,
+        scope: EvidenceScope::PlatformSpecific("DOS"),
+    },
 ];
 
 /// Classifies `(kind, value)` by exact match against [`SCOPE_CATALOG`].

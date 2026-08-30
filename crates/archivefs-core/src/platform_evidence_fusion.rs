@@ -664,6 +664,35 @@ pub const RULES: &[FusionRule] = &[
         ],
         explanation: "PS3_GAME layout, a PARAM.SFO-derived TITLE_ID, and PS3 SELF executable magic together",
     },
+    // -- DOS boot media: a documented system-file pair in a FAT12/FAT16
+    //    root directory. FAT geometry, OEM string, volume label and the
+    //    image's extension prove nothing on their own (see
+    //    crate::dos_boot_evidence); only the pair does. Both MS-DOS and
+    //    PC DOS / DR-DOS resolve to the one canonical `DOS` platform - the
+    //    pair distinguishes the family, not a release. The existing DOS <->
+    //    PC `conflicts_with` relationship still fails these closed against
+    //    any conflicting Strong PC evidence, exactly as for every other
+    //    strong-vs-strong pair.
+    FusionRule {
+        id: "dos_msdos_system_files",
+        platform: "DOS",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: crate::dos_boot_evidence::DOS_MSDOS_SYSTEM_FILES,
+            min_confidence: STRONG,
+        }],
+        explanation: "IO.SYS and MSDOS.SYS both present as regular files in a validated FAT12/FAT16 root directory - the documented MS-DOS system-file pair (see crate::dos_boot_evidence)",
+    },
+    FusionRule {
+        id: "dos_pcdos_system_files",
+        platform: "DOS",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: crate::dos_boot_evidence::DOS_PCDOS_SYSTEM_FILES,
+            min_confidence: STRONG,
+        }],
+        explanation: "IBMBIO.COM and IBMDOS.COM both present as regular files in a validated FAT12/FAT16 root directory - the documented IBM PC DOS / DR-DOS system-file pair (see crate::dos_boot_evidence)",
+    },
 ];
 
 /// The four outcomes this milestone requires - see the module documentation
