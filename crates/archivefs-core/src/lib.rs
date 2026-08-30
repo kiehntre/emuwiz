@@ -302,6 +302,10 @@ pub mod gba_header_evidence;
 /// canonical `Z64` byte order; see [`n64_byte_order`] for normalization.
 pub mod n64_header_evidence;
 
+/// Pure, read-only Nintendo 64 CIC bootcode identification and CIC-specific
+/// CRC1/CRC2 validation over canonical `Z64` bytes.
+pub mod n64_cic_evidence;
+
 /// Pure, read-only Sega Mega Drive / Genesis cartridge header field
 /// decoding, deeper than the platform registry's own magic-only `SEGA`
 /// check. Includes an opt-in, whole-ROM checksum verifier.

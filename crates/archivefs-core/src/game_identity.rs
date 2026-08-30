@@ -34,6 +34,8 @@ use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::lynx_header_evidence::{LYNX_HEADER_BYTES, parse_lynx_header};
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
+use crate::n64_cic_evidence::{cic_lookup, validate_crc1_crc2};
+use crate::n64_header_evidence::parse_n64_header;
 use crate::neogeocd_boot_evidence::{MAX_IPL_TXT_BYTES, parse_ipl_txt};
 use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
 use crate::param_sfo::parse_param_sfo;
@@ -230,6 +232,11 @@ pub enum IdentityKind {
     /// volume identifier, root unique identifier, and declared block count.
     /// These are on-disc fields, not a filename or title-database lookup.
     ThreeDoDiscId,
+    /// CIC-NUS bootcode security metadata; this never identifies a title,
+    /// release, region, or exact game.
+    N64Cic,
+    /// CIC-specific validation result for the N64 header's CRC1/CRC2 fields.
+    N64CrcValidation,
     /// The PC Engine CD-ROM² / TurboGrafx-CD IPL boot-record signature was
     /// present and structurally valid. Platform/media evidence only - it
     /// carries no serial, title or release identity (the IPL header has
@@ -277,6 +284,8 @@ impl fmt::Display for IdentityKind {
             Self::XexMediaId => "Xbox 360 Media ID",
             Self::ScummVmGameId => "ScummVM game ID",
             Self::ThreeDoDiscId => "3DO disc identity",
+            Self::N64Cic => "N64 CIC",
+            Self::N64CrcValidation => "N64 CRC1/CRC2 validation",
             Self::PceCdBootStructure => "PC Engine CD boot structure",
             Self::NeoGeoCdBootStructure => "Neo Geo CD boot structure",
             Self::NesHeader => "NES header",
@@ -638,6 +647,12 @@ impl GameIdentityReport {
     /// driven.
     pub fn verified_snes_header(&self) -> Option<&str> {
         self.verified_value(IdentityKind::SnesHeader)
+    }
+
+    /// The verified CIC-NUS bootcode family, reported as hardware/security
+    /// metadata only - never a title, release, region, or exact game ID.
+    pub fn verified_n64_cic(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::N64Cic)
     }
 
     pub fn verified_ps1_serial(&self) -> Option<&str> {
@@ -1468,6 +1483,39 @@ fn push_n64_canonical_evidence(report: &mut GameIdentityReport, bytes: &[u8]) {
          physical-file SHA-256, and identical across z64/v64/n64 dumps of the same ROM",
         "byte-order detection + n64_byte_order::normalize_to_z64",
     ));
+    let Some(cic) = cic_lookup(&normalized.bytes) else {
+        return;
+    };
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::N64Cic,
+        IdentityStatus::Verified,
+        Some(cic.label().to_string()),
+        IdentityConfidence::StructuredMetadata,
+        "canonical IPL3 bootcode CRC32 matches a bounded, two-source-verified CIC lookup; CIC is hardware/security metadata only",
+        "n64_cic_evidence::cic_lookup",
+    ));
+    if let Some(header) = parse_n64_header(&normalized.bytes)
+        && let Some(valid) = validate_crc1_crc2(&normalized.bytes, &header, cic)
+    {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::N64CrcValidation,
+            if valid {
+                IdentityStatus::Verified
+            } else {
+                IdentityStatus::Invalid
+            },
+            Some(if valid { "valid" } else { "invalid" }.to_string()),
+            IdentityConfidence::StructuredMetadata,
+            if valid {
+                "header CRC1/CRC2 match the CIC-specific IPL3 checksum over the first 1 MiB after the boot area"
+            } else {
+                "header CRC1/CRC2 do not match the CIC-specific IPL3 checksum; no release identity is inferred"
+            },
+            "n64_cic_evidence::validate_crc1_crc2",
+        ));
+    }
 }
 
 fn loose_rom_read_was_stable(
