@@ -94,6 +94,23 @@ fn minimal_amiga_hdf() -> Vec<u8> {
     b
 }
 
+fn minimal_valid_dfs_image() -> Vec<u8> {
+    let mut image = vec![0_u8; 400 * 256];
+    image[0..8].copy_from_slice(b"TEST DFS");
+    image[256..260].copy_from_slice(b"    ");
+    image[260] = 0x12;
+    image[261] = 8;
+    image[262] = 1;
+    image[263] = 0x90;
+    image[8..15].copy_from_slice(b"!BOOT  ");
+    image[15] = b'$';
+    image[264..266].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[266..268].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[268..270].copy_from_slice(&3_u16.to_le_bytes());
+    image[271] = 2;
+    image
+}
+
 fn write_zip_containing(dir: &Path, zip_name: &str, member_name: &str, member_bytes: &[u8]) {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
@@ -245,6 +262,19 @@ fn zip_containing_a_game_boy_rom_is_discovered_with_the_same_content_kind_as_loo
     assert!(matches!(item.container, ContainerKind::Archive(_)));
     assert_eq!(item.content, Some(ContentKind::RomCartridge));
     assert_eq!(report.stats.archives, 1);
+}
+
+#[test]
+fn archive_member_ssd_and_dsd_extensions_are_likely_computer_disks() {
+    let dir = source_dir("zip-dfs");
+    write_zip_containing(dir.path(), "Disks.zip", "Game.ssd", b"not inspected");
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
+    assert!(matches!(
+        report.items[0].container,
+        ContainerKind::Archive(_)
+    ));
 }
 
 #[test]
@@ -787,6 +817,40 @@ fn c128_folder_keeps_d64_and_g64_as_c128_ingestion_items() {
     }));
 }
 
+#[test]
+fn valid_dfs_disks_are_accepted_with_bbc_and_electron_folder_context() {
+    for (folder, expected) in [
+        ("bbcmicro", "BBC Micro"),
+        ("bbcmaster", "BBC Micro"),
+        ("electron", "Acorn Electron"),
+    ] {
+        let root = source_dir(&format!("dfs-{folder}"));
+        let directory = root.path().join(folder);
+        std::fs::create_dir_all(&directory).unwrap();
+        for extension in ["ssd", "dsd"] {
+            let image = if extension == "ssd" {
+                minimal_valid_dfs_image()
+            } else {
+                let side = minimal_valid_dfs_image();
+                let mut dsd = vec![0_u8; 800 * 256];
+                dsd[..512].copy_from_slice(&side[..512]);
+                dsd[0x0a00..0x0a00 + 512].copy_from_slice(&side[..512]);
+                dsd
+            };
+            std::fs::write(directory.join(format!("game.{extension}")), image).unwrap();
+        }
+        let report = discover_source(&directory).unwrap();
+        assert_eq!(report.items.len(), 2);
+        assert!(
+            report.items.iter().all(|item| {
+                item.content == Some(ContentKind::ComputerDisk)
+                    && item.platform_hint.as_deref() == Some(expected)
+                    && item.validation_state == ValidationState::Accepted
+            }),
+            "{report:?}"
+        );
+    }
+}
 // --- ZX Spectrum snapshots + +3 disks ---------------------------------
 
 fn z80_v1_uncompressed() -> Vec<u8> {

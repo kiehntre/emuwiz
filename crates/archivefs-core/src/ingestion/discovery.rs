@@ -588,6 +588,9 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
     }
+    if matches!(extension.as_str(), "ssd" | "dsd") {
+        return discover_dfs_media(path, source_root);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -1141,6 +1144,72 @@ fn discover_trdos_media(path: &Path, source_root: &Path) -> GameDiscovery {
             ),
             "This file is named like ZX Spectrum TR-DOS media but its contents did not validate \
              as a TR-DOS disk or an SCL archive."
+                .to_string(),
+        ),
+    }
+}
+
+/// `.ssd` and `.dsd` are raw Acorn DFS catalogues. A valid catalogue proves
+/// Acorn/BBC-family disk media, but not BBC Micro versus Acorn Electron; a
+/// containing folder may provide that corroboration. A bare valid image stays
+/// visible but ambiguous, like the shared CPCEMU disk path.
+fn discover_dfs_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Acorn DFS media".to_string());
+
+    match evidence.format {
+        Some(DiskFormat::AcornDfsDisk) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Acorn DFS computer disk ({detail}; BBC-family and Electron media, \
+                         platform resolved from folder context)."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid Acorn DFS disk, but DFS is shared by BBC Micro/BBC Master and \
+                         Acorn Electron and no folder evidence identifies which. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::AmbiguousPlatform),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised Acorn DFS disk".to_string()),
+            ),
+            "This file is named like Acorn DFS media but its catalogue and geometry did not \
+             validate."
                 .to_string(),
         ),
     }

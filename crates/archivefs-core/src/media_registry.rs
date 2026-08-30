@@ -123,6 +123,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "d81",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "ssd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "dsd",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // Computer disks and cassette images are recognised media families, but
     // their extensions are deliberately not platform authority. A `.dsk`,
     // `.img`, `.tap`, or `.cdt` remains platform-unresolved until evidence

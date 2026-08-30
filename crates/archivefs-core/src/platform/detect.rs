@@ -781,18 +781,33 @@ fn structural_format_evidence(
     }
     // One evidence item per structural match, carrying the layer's own verdict on
     // whether the structure settles the platform.
+    let detail = format!(
+        "{} validated from its header structure: {}",
+        format.label(),
+        inspected
+            .evidence
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "structure is internally consistent".to_string())
+    );
+    if format == crate::disk_format::DiskFormat::AcornDfsDisk {
+        return ["BBC Micro", "Acorn Electron"]
+            .into_iter()
+            .map(|platform| DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: false,
+                platform,
+                detail: format!(
+                    "{detail}; DFS is shared by the BBC family and Acorn Electron, so this is \
+                     family evidence rather than a machine claim"
+                ),
+            })
+            .collect();
+    }
     vec![DetectionEvidence {
         source: DetectionSource::Signature,
         conclusive: inspected.conclusive,
         platform,
-        detail: format!(
-            "{} validated from its header structure: {}",
-            format.label(),
-            inspected
-                .evidence
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "structure is internally consistent".to_string())
-        ),
+        detail,
     }]
 }

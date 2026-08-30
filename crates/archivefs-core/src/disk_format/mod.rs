@@ -50,6 +50,7 @@ use crate::safe_read::{SafeFile, TrustedRoots, open_bounded_read};
 pub mod atari_st;
 pub mod atari_stx;
 pub mod d88;
+pub mod dfs;
 pub mod dsk;
 pub mod hdi;
 pub mod scl;
@@ -175,6 +176,9 @@ pub enum DiskFormat {
     HdiContainer,
     /// A structurally valid T98-Next NHD hard-disk container.
     NhdContainer,
+    /// A valid raw Acorn DFS catalogue in an `.ssd` or `.dsd` sector dump.
+    /// DFS is shared by BBC-family machines and never settles one machine.
+    AcornDfsDisk,
 }
 
 impl DiskFormat {
@@ -189,6 +193,7 @@ impl DiskFormat {
             Self::D88Container => "D88 disk container",
             Self::HdiContainer => "HDI hard-disk container",
             Self::NhdContainer => "NHD hard-disk container",
+            Self::AcornDfsDisk => "Acorn DFS disk image",
         }
     }
 
@@ -204,6 +209,7 @@ impl DiskFormat {
             Self::SpectrumTrDosDisk | Self::SpectrumSclArchive => "ZX Spectrum",
             Self::D88Container => "NEC PC-8801",
             Self::HdiContainer | Self::NhdContainer => "PC-98",
+            Self::AcornDfsDisk => "BBC Micro",
         }
     }
 
@@ -228,6 +234,7 @@ impl DiskFormat {
             | Self::SpectrumSclArchive => true,
             Self::D88Container => false,
             Self::HdiContainer | Self::NhdContainer => false,
+            Self::AcornDfsDisk => false,
         }
     }
 }
@@ -442,9 +449,39 @@ pub struct HardDiskLayout {
     pub version: Option<u8>,
 }
 
+/// A validated standard Acorn DFS catalogue side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DfsSideLayout {
+    pub total_sectors: u16,
+    pub file_count: u8,
+    pub title: String,
+    pub boot_option: u8,
+    pub files: Vec<DfsFileEntry>,
+}
+
+/// A DFS file entry. The data payload is not read; its declared extent is
+/// checked against the side geometry before this fact is emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DfsFileEntry {
+    pub directory: String,
+    pub filename: String,
+    pub locked: bool,
+    pub load_address: u32,
+    pub execution_address: u32,
+    pub length: u32,
+    pub start_sector: u16,
+}
+
+/// The validated catalogue sides in an `.ssd` or `.dsd` image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DfsLayout {
+    pub double_sided: bool,
+    pub sides: Vec<DfsSideLayout>,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum DiskFormatMetadata {
     Floppy(FloppyGeometry),
@@ -455,6 +492,7 @@ pub enum DiskFormatMetadata {
     D88(D88Layout),
     Hdi(HardDiskLayout),
     Nhd(HardDiskLayout),
+    Dfs(DfsLayout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -562,6 +600,10 @@ pub fn inspect_disk_format(
         "d88" => Adapter::D88,
         "hdi" => Adapter::Hdi,
         "nhd" => Adapter::Nhd,
+        "ssd" => Adapter::AcornDfs {
+            double_sided: false,
+        },
+        "dsd" => Adapter::AcornDfs { double_sided: true },
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -589,6 +631,9 @@ pub fn inspect_disk_format(
         Adapter::D88 => d88::inspect(&mut reader, context, cancel),
         Adapter::Hdi => hdi::inspect_hdi(&mut reader, context, cancel),
         Adapter::Nhd => hdi::inspect_nhd(&mut reader, context, cancel),
+        Adapter::AcornDfs { double_sided } => {
+            dfs::inspect(&mut reader, context, cancel, double_sided)
+        }
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -609,6 +654,7 @@ enum Adapter {
     D88,
     Hdi,
     Nhd,
+    AcornDfs { double_sided: bool },
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

@@ -7913,6 +7913,8 @@ mod tests {
             vec![0_u8; 278_234],
         )
         .unwrap();
+        fs::write(root.join("DFS Game.ssd"), vec![0_u8; 100 * 1024]).unwrap();
+        fs::write(root.join("DFS Game.dsd"), vec![0_u8; 200 * 1024]).unwrap();
         fs::write(root.join("gamelist.xml"), b"<gameList/>").unwrap();
         fs::write(
             root.join("images").join("BurgerWhop-boxart.png"),
@@ -7937,8 +7939,8 @@ mod tests {
 
         assert_eq!(
             discovery.archives.len(),
-            2,
-            "only the two recognised loose disk images may be discovered - got {:?}",
+            4,
+            "only the four recognised loose disk images may be discovered - got {:?}",
             discovery
                 .archives
                 .iter()
@@ -7957,7 +7959,7 @@ mod tests {
                 .archives
                 .iter()
                 .all(|archive| archive.identity.platform.as_deref() == Some("Commodore 128")),
-            "the `c128` folder alias must resolve both `.d64` and `.g64` to Commodore 128, \
+            "the `c128` folder alias must resolve all four loose media files to Commodore 128, \
              exactly like every other weak/shared extension already does"
         );
         assert!(
@@ -7971,6 +7973,18 @@ mod tests {
                 .path
                 .ends_with("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64")
         }));
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("DFS Game.ssd"))
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("DFS Game.dsd"))
+        );
         assert!(
             discovery.archives.iter().all(|archive| !archive
                 .path

@@ -165,6 +165,164 @@ impl Drop for Fixture {
     }
 }
 
+fn dfs_side(total_sectors: u16, title: &str, filename: &[u8; 7], start: u16) -> Vec<u8> {
+    let mut image = vec![0_u8; usize::from(total_sectors) * 256];
+    let title = title.as_bytes();
+    image[0..8].fill(b' ');
+    image[0..title.len().min(8)].copy_from_slice(&title[..title.len().min(8)]);
+    image[256..260].fill(b' ');
+    if title.len() > 8 {
+        image[256..256 + (title.len() - 8).min(4)].copy_from_slice(&title[8..title.len().min(12)]);
+    }
+    image[260] = 0x12; // valid BCD catalogue cycle number
+    image[261] = 8; // one eight-byte entry
+    image[262] = 1; // 400 sectors: high two sector bits = 1, boot option 0
+    image[263] = 0x90;
+    image[8..15].copy_from_slice(filename);
+    image[15] = b'$' | 0x80; // root directory, locked
+    let details = 256 + 8;
+    image[details..details + 2].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[details + 2..details + 4].copy_from_slice(&0x1900_u16.to_le_bytes());
+    image[details + 4..details + 6].copy_from_slice(&3_u16.to_le_bytes());
+    image[details + 6] = ((start >> 8) & 3) as u8;
+    image[details + 7] = start as u8;
+    image
+}
+
+fn valid_dfs_ssd() -> Vec<u8> {
+    dfs_side(400, "EXAMPLE DFS", b"!BOOT  ", 2)
+}
+
+fn valid_dfs_dsd() -> Vec<u8> {
+    let mut image = vec![0_u8; 800 * 256];
+    let side0 = dfs_side(400, "SIDE ZERO", b"ONE    ", 2);
+    let side1 = dfs_side(400, "SIDE ONE", b"TWO    ", 2);
+    image[..512].copy_from_slice(&side0[..512]);
+    image[0x0a00..0x0a00 + 512].copy_from_slice(&side1[..512]);
+    image
+}
+
+#[test]
+fn standard_dfs_ssd_catalogue_is_valid_and_exposes_title_and_entry_metadata() {
+    let fixture = Fixture::new("dfs-ssd");
+    let path = fixture.write("library/example.ssd", &valid_dfs_ssd());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(
+        evidence.format,
+        Some(DiskFormat::AcornDfsDisk),
+        "{evidence:?}"
+    );
+    assert!(!evidence.conclusive);
+    let Some(DiskFormatMetadata::Dfs(layout)) = evidence.metadata else {
+        panic!("expected DFS metadata: {:?}", evidence.metadata);
+    };
+    assert_eq!(layout.sides.len(), 1);
+    assert_eq!(layout.sides[0].title, "EXAMPLE DFS");
+    assert_eq!(layout.sides[0].files[0].filename, "!BOOT");
+    assert!(layout.sides[0].files[0].locked);
+    assert_eq!(layout.sides[0].files[0].start_sector, 2);
+    assert_eq!(layout.sides[0].files[0].load_address, 0x1900);
+}
+
+#[test]
+fn standard_dfs_dsd_catalogues_validate_on_both_interleaved_sides() {
+    let fixture = Fixture::new("dfs-dsd");
+    let path = fixture.write("library/example.dsd", &valid_dfs_dsd());
+    let evidence = fixture.inspect(&path);
+    assert_eq!(
+        evidence.format,
+        Some(DiskFormat::AcornDfsDisk),
+        "{evidence:?}"
+    );
+    let Some(DiskFormatMetadata::Dfs(layout)) = evidence.metadata else {
+        panic!("expected DFS metadata: {:?}", evidence.metadata);
+    };
+    assert!(layout.double_sided);
+    assert_eq!(layout.sides.len(), 2);
+    assert_eq!(layout.sides[0].title, "SIDE ZERO");
+    assert_eq!(layout.sides[1].title, "SIDE ONE");
+}
+
+#[test]
+fn dfs_random_truncated_and_impossible_entries_fail_closed() {
+    let fixture = Fixture::new("dfs-negative");
+    for (extension, size) in [("ssd", 100 * 1024), ("dsd", 200 * 1024)] {
+        let random = fixture.write(&format!("library/random.{extension}"), &vec![0xA5; size]);
+        assert!(!fixture.inspect(&random).is_recognised());
+    }
+    let short = fixture.write("library/short.ssd", &vec![0; 511]);
+    assert!(!fixture.inspect(&short).is_recognised());
+    let mut impossible = valid_dfs_ssd();
+    impossible[256 + 8 + 6] = 1; // start sector 0x190, past a 400-sector side once length is applied
+    impossible[256 + 8 + 7] = 0x90;
+    impossible[256 + 8 + 4] = 0xff;
+    impossible[256 + 8 + 5] = 0xff;
+    let impossible = fixture.write("library/impossible.ssd", &impossible);
+    assert!(!fixture.inspect(&impossible).is_recognised());
+    let mut malformed = valid_dfs_ssd();
+    malformed[8] = 0x01; // control byte in a declared filename
+    let malformed = fixture.write("library/malformed.ssd", &malformed);
+    assert!(!fixture.inspect(&malformed).is_recognised());
+}
+
+#[test]
+fn dfs_inspection_reads_only_bounded_catalogue_data_and_not_adfs_extensions() {
+    let fixture = Fixture::new("dfs-bounds");
+    let path = fixture.write("library/example.ssd", &valid_dfs_ssd());
+    let evidence = fixture.inspect(&path);
+    assert!(evidence.bytes_inspected <= 2048);
+    for extension in ["adl", "adf"] {
+        let path = fixture.write(&format!("library/not-dfs.{extension}"), &valid_dfs_ssd());
+        assert_eq!(
+            fixture
+                .inspect(&path)
+                .refusal
+                .as_ref()
+                .map(DiskFormatRefusal::code),
+            Some("no_adapter")
+        );
+    }
+}
+
+#[test]
+fn dfs_structure_is_ambiguous_but_folder_evidence_resolves_the_canonical_platform() {
+    let fixture = Fixture::new("dfs-platform");
+    let bare = fixture.write("library/unsorted/example.ssd", &valid_dfs_ssd());
+    let bare_report = detect_platform_report(
+        &DetectionRequest::new(&bare, &fixture.path("library"))
+            .inspecting_content()
+            .with_trusted_roots(fixture.trusted()),
+    );
+    assert_eq!(bare_report.platform, None);
+    assert_eq!(bare_report.confidence, DetectionConfidence::Ambiguous);
+    assert!(
+        bare_report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "BBC Micro")
+    );
+    assert!(
+        bare_report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "Acorn Electron")
+    );
+
+    for (folder, expected) in [
+        ("bbcmicro", "BBC Micro"),
+        ("bbcmaster", "BBC Micro"),
+        ("electron", "Acorn Electron"),
+    ] {
+        let path = fixture.write(&format!("library/{folder}/example.ssd"), &valid_dfs_ssd());
+        let report = detect_platform_report(
+            &DetectionRequest::new(&path, &fixture.path("library"))
+                .inspecting_content()
+                .with_trusted_roots(fixture.trusted()),
+        );
+        assert_eq!(report.platform, Some(expected), "folder {folder}");
+    }
+}
+
 // --- Image builders -------------------------------------------------------
 
 /// One Atari ST floppy image, built exactly from a geometry.
