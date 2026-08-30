@@ -29,6 +29,7 @@ use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
+use crate::neogeocd_boot_evidence::{MAX_IPL_TXT_BYTES, parse_ipl_txt};
 use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
 use crate::param_sfo::parse_param_sfo;
 use crate::pcengine_cd_boot_evidence::{
@@ -223,6 +224,12 @@ pub enum IdentityKind {
     /// carries no serial, title or release identity (the IPL header has
     /// none). Exact game identity stays DAT/hash-driven.
     PceCdBootStructure,
+    /// A structurally valid Neo Geo CD `IPL.TXT` load manifest was present
+    /// on the disc (bounded entry list, terminator byte present). Platform/
+    /// media evidence only - the IPL manifest carries no serial, title or
+    /// product code, so exact game identity stays DAT/hash-driven. A file
+    /// merely named `IPL.TXT` that does not parse never produces this.
+    NeoGeoCdBootStructure,
     /// Parsed iNES/NES 2.0 header metadata; exact release identity remains
     /// authoritative only when established by DAT/hash evidence.
     NesHeader,
@@ -257,6 +264,7 @@ impl fmt::Display for IdentityKind {
             Self::ScummVmGameId => "ScummVM game ID",
             Self::ThreeDoDiscId => "3DO disc identity",
             Self::PceCdBootStructure => "PC Engine CD boot structure",
+            Self::NeoGeoCdBootStructure => "Neo Geo CD boot structure",
             Self::NesHeader => "NES header",
             Self::PcfxDiscHash => "PC-FX disc hash",
         };
@@ -299,6 +307,7 @@ pub enum IdentityPlatform {
     ThreeDo,
     Pcfx,
     PcEngineCd,
+    NeoGeoCd,
     Other,
 }
 
@@ -353,6 +362,8 @@ impl IdentityPlatform {
             | "super cd-rom2"
             | "turbo duo"
             | "turboduo" => Self::PcEngineCd,
+            "neo geo cd" | "neogeocd" | "neo-geo cd" | "neo geo cd-rom" | "snk neo geo cd"
+            | "ngcd" | "neocd" | "neo cd" | "neocdz" => Self::NeoGeoCd,
             _ => Self::Other,
         }
     }
@@ -381,6 +392,7 @@ impl IdentityPlatform {
             Self::ThreeDo => "3DO",
             Self::Pcfx => "PC-FX",
             Self::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
+            Self::NeoGeoCd => "Neo Geo CD",
             Self::Other => "Unsupported platform",
         }
     }
@@ -635,6 +647,15 @@ impl GameIdentityReport {
     pub fn verified_pcengine_cd_boot_structure(&self) -> Option<&str> {
         self.verified_value(IdentityKind::PceCdBootStructure)
     }
+
+    /// A structurally valid Neo Geo CD `IPL.TXT` load manifest was found in
+    /// the disc's ISO 9660 root. The returned value is the fixed `"IPL.TXT"`
+    /// marker, not a serial or title - the Neo Geo CD IPL manifest carries
+    /// no release identity, so exact game identity still comes from DAT/hash
+    /// matching.
+    pub fn verified_neogeocd_boot_structure(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::NeoGeoCdBootStructure)
+    }
 }
 
 pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameIdentityReport {
@@ -794,6 +815,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::ThreeDo
                     | IdentityPlatform::Pcfx
                     | IdentityPlatform::PcEngineCd
+                    | IdentityPlatform::NeoGeoCd
             ) =>
         {
             inspect_cue(&mut report, trusted);
@@ -830,6 +852,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::ThreeDo
                     | IdentityPlatform::Pcfx
                     | IdentityPlatform::PcEngineCd
+                    | IdentityPlatform::NeoGeoCd
             ) =>
         {
             inspect_disc_chd(&mut report, trusted);
@@ -1495,6 +1518,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Pcfx
         | IdentityPlatform::PcEngineCd
+        | IdentityPlatform::NeoGeoCd
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -2539,6 +2563,9 @@ fn inspect_iso_source(
         IdentityPlatform::PcEngineCd => {
             inspect_pcengine_cd_source(report, source, member_path, member_index)
         }
+        IdentityPlatform::NeoGeoCd => {
+            inspect_neogeocd_source(report, source, member_path, member_index)
+        }
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -3285,6 +3312,124 @@ fn inspect_pcengine_cd_source(
              evidence only - exact game identity comes from a DAT/hash match.",
             fact.boot_sector_count, fact.boot_start_sector
         ),
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
+/// Neo Geo CD structural identity from the disc's own `IPL.TXT` load
+/// manifest in the ISO 9660 root directory. Neo Geo CD discs are plain
+/// ISO 9660 CD-ROMs (the filesystem proves nothing on its own - PSX, Sega
+/// CD, CD-i, 3DO and PC Engine CD share it); the authority is the parsed,
+/// structurally validated `IPL.TXT` (bounded entry list, terminator byte
+/// present), read through the *existing* bounded ISO 9660 reader
+/// ([`iso_root`]/[`find_iso_path`]) and the *existing* bounded
+/// [`parse_ipl_txt`] parser. No new IPL or optical parser: this only turns
+/// their results into an [`IdentityStatus`]. No serial, title or region is
+/// read - the IPL manifest carries none - so exact game identity still
+/// comes from a DAT/hash match. A file merely *named* `IPL.TXT` that does
+/// not parse fails closed, never `Verified`, and the filename is never
+/// consulted.
+fn inspect_neogeocd_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let root = match iso_root(source) {
+        Ok(root) => root,
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::NeoGeoCdBootStructure,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "Neo Geo CD ISO 9660 root directory lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    let ipl_record = match find_iso_path(source, root, &[b"IPL.TXT"]) {
+        Ok(Some(record)) if !record.directory => record,
+        Ok(Some(_)) | Ok(None) => {
+            push_with_source(
+                report,
+                IdentityKind::NeoGeoCdBootStructure,
+                IdentityStatus::Missing,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "Neo Geo CD IPL.TXT root lookup",
+                "the ISO 9660 root directory has no IPL.TXT file",
+            );
+            return;
+        }
+        Err((status, diagnostic)) => {
+            push_with_source(
+                report,
+                IdentityKind::NeoGeoCdBootStructure,
+                status,
+                None,
+                IdentityConfidence::Unavailable,
+                member_path,
+                member_index,
+                "Neo Geo CD IPL.TXT root lookup",
+                &diagnostic,
+            );
+            return;
+        }
+    };
+    let want = (ipl_record.size as usize).min(MAX_IPL_TXT_BYTES);
+    let mut buffer = vec![0_u8; want];
+    if let Err(error) = read_iso_record_prefix(source, ipl_record, &mut buffer) {
+        push_with_source(
+            report,
+            IdentityKind::NeoGeoCdBootStructure,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Neo Geo CD IPL.TXT bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let fact = parse_ipl_txt(&buffer);
+    if !fact.is_structurally_valid() {
+        push_with_source(
+            report,
+            IdentityKind::NeoGeoCdBootStructure,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "Neo Geo CD IPL.TXT structural validation",
+            "a file named IPL.TXT is present but does not parse as a valid Neo Geo CD load manifest (empty/over-long entry list, or the 0x1A terminator byte is absent)",
+        );
+        return;
+    }
+    let detail = if fact.has_required_extensions() {
+        "IPL.TXT parsed with a valid entry list, terminator byte present, and all five loader-required file types (PRG/FIX/SPR/Z80/PCM) present. Structural platform/media evidence only - exact game identity comes from a DAT/hash match."
+    } else {
+        "IPL.TXT parsed with a valid entry list and terminator byte present, though not every loader-required file type was found. Structural platform/media evidence only - exact game identity comes from a DAT/hash match."
+    };
+    push_with_source(
+        report,
+        IdentityKind::NeoGeoCdBootStructure,
+        IdentityStatus::Verified,
+        Some("IPL.TXT".to_string()),
+        IdentityConfidence::StructuredMetadata,
+        member_path,
+        member_index,
+        "Neo Geo CD IPL.TXT load manifest",
+        detail,
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -4401,16 +4546,21 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             | IdentityPlatform::Dreamcast
             | IdentityPlatform::SegaCd
             | IdentityPlatform::Pcfx
+            | IdentityPlatform::NeoGeoCd
     ) {
-        // Every one of these platforms identifies from a bounded read at the
-        // start of the decoded data track, so they all reuse the exact
-        // `MediaSource` over the track `open_chd_iso9660` already returned -
-        // the same single-track, zero-pregap, fail-closed contract that path
+        // Every one of these platforms identifies from a bounded read over
+        // the decoded data track, so they all reuse the exact `MediaSource`
+        // over the track `open_chd_iso9660` already returned - the same
+        // single-track, zero-pregap, fail-closed contract that path
         // enforces. PC-FX joins here: `inspect_pcfx_source` reads sector 0
         // for the `PC-FX:Hu_CD-ROM` boot magic and the documented disc hash,
         // never a filename. A PC-FX `.chd` whose track is not ISO 9660, is
         // not track 1, or carries a pregap is refused by `open_chd_iso9660`
-        // above rather than guessed at.
+        // above rather than guessed at. Neo Geo CD also joins here: its
+        // discs *are* ISO 9660 (unlike PC Engine CD / 3DO), so
+        // `inspect_neogeocd_source` looks up the root `IPL.TXT` file through
+        // the same bounded ISO 9660 reader the raw ISO/CUE path uses and
+        // validates its parsed manifest - never a filename.
         let mut source = MediaSource::new(media);
         if report.platform == IdentityPlatform::Saturn {
             inspect_saturn_source(report, &mut source, None, None);
@@ -4418,6 +4568,8 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             inspect_dreamcast_source(report, &mut source, None, None);
         } else if report.platform == IdentityPlatform::SegaCd {
             inspect_sega_cd_source(report, &mut source, None, None);
+        } else if report.platform == IdentityPlatform::NeoGeoCd {
+            inspect_neogeocd_source(report, &mut source, None, None);
         } else {
             inspect_pcfx_source(report, &mut source, None, None);
         }
@@ -4760,6 +4912,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
             IdentityPlatform::SegaCd => IdentityKind::SegaCdProductCode,
             IdentityPlatform::ThreeDo => IdentityKind::ThreeDoDiscId,
             IdentityPlatform::PcEngineCd => IdentityKind::PceCdBootStructure,
+            IdentityPlatform::NeoGeoCd => IdentityKind::NeoGeoCdBootStructure,
             IdentityPlatform::Pcfx => IdentityKind::PcfxDiscHash,
             _ => IdentityKind::Ps1Serial,
         },
@@ -5249,6 +5402,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::ThreeDo => &[IdentityKind::ThreeDoDiscId],
         IdentityPlatform::Pcfx => &[IdentityKind::PcfxDiscHash],
         IdentityPlatform::PcEngineCd => &[IdentityKind::PceCdBootStructure],
+        IdentityPlatform::NeoGeoCd => &[IdentityKind::NeoGeoCdBootStructure],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -5451,6 +5605,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::ScummVM
         | IdentityPlatform::Pcfx
         | IdentityPlatform::PcEngineCd
+        | IdentityPlatform::NeoGeoCd
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Other => {}
     }
@@ -10126,6 +10281,223 @@ mod tests {
             assert_eq!(report.verified_pcengine_cd_boot_structure(), None, "{name}");
             assert!(!report.complete, "{name}");
         }
+    }
+
+    // --- Neo Geo CD ------------------------------------------------------
+
+    /// A minimal but genuine ISO 9660 image whose root directory carries an
+    /// `IPL.TXT` file with `ipl` as its exact contents - the same fixed
+    /// sector layout as [`ps1_iso`] (PVD at 16, terminator at 17, root dir
+    /// at 20, one file at 21).
+    fn neogeocd_iso(ipl: &[u8]) -> Vec<u8> {
+        const SECTORS: usize = 24;
+        let mut iso = vec![0_u8; SECTORS * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        iso[pvd] = 1;
+        iso[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        iso[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        iso[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        iso[terminator] = 255;
+        iso[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        iso[terminator + 6] = 1;
+
+        let root_offset = 20 * ISO_SECTOR_SIZE as usize;
+        let ipl_record = directory_record(b"IPL.TXT;1", 21, ipl.len() as u32, false);
+        iso[root_offset..root_offset + ipl_record.len()].copy_from_slice(&ipl_record);
+        iso[root_offset + ipl_record.len()] = 0;
+        let ipl_offset = 21 * ISO_SECTOR_SIZE as usize;
+        iso[ipl_offset..ipl_offset + ipl.len()].copy_from_slice(ipl);
+        iso
+    }
+
+    fn valid_ipl_txt() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MAIN.PRG,0,00000000\r\n");
+        bytes.extend_from_slice(b"MAIN.FIX,0,00010000\r\n");
+        bytes.extend_from_slice(b"MAIN.SPR,1,00000000\r\n");
+        bytes.extend_from_slice(b"MAIN.Z80,0,00000000\r\n");
+        bytes.extend_from_slice(b"MAIN.PCM,2,00000000\r\n");
+        bytes.push(0x1A);
+        bytes
+    }
+
+    #[test]
+    fn neogeocd_iso_cue_and_chd_verify_the_ipl_txt_boot_structure() {
+        let directory = FixtureDir::new("neogeocd-valid");
+        let ipl = valid_ipl_txt();
+        let image = neogeocd_iso(&ipl);
+
+        let iso = write_fixture(&directory, "Totally Unrelated Title.iso", &image);
+        let iso_report = inspect_catalogued_game_identity(&iso, Some("Neo Geo CD"));
+        assert_eq!(iso_report.platform, IdentityPlatform::NeoGeoCd);
+        assert_eq!(
+            iso_report.verified_neogeocd_boot_structure(),
+            Some("IPL.TXT")
+        );
+        assert!(iso_report.complete);
+
+        fs::write(directory.0.join("disc.bin"), &image).unwrap();
+        let cue = write_fixture(
+            &directory,
+            "renamed.cue",
+            b"FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        let cue_report = inspect_catalogued_game_identity(&cue, Some("Neo Geo CD"));
+        assert_eq!(
+            cue_report.verified_neogeocd_boot_structure(),
+            Some("IPL.TXT")
+        );
+        assert!(cue_report.complete);
+
+        let chd = write_fixture(&directory, "disc.chd", &ps1_chd(&image));
+        let chd_report = inspect_catalogued_game_identity(&chd, Some("Neo Geo CD"));
+        assert_eq!(chd_report.format, IdentityImageFormat::Chd);
+        assert_eq!(
+            chd_report.verified_neogeocd_boot_structure(),
+            Some("IPL.TXT")
+        );
+        assert!(chd_report.complete);
+    }
+
+    #[test]
+    fn neogeocd_identity_is_structural_only_never_a_serial_or_dat_release() {
+        let directory = FixtureDir::new("neogeocd-structural-only");
+        let image = neogeocd_iso(&valid_ipl_txt());
+        let iso = write_fixture(&directory, "game.iso", &image);
+        let report = inspect_catalogued_game_identity(&iso, Some("Neo Geo CD"));
+        // The only verified content-derived fact is the structural boot
+        // marker (`Platform` is catalogue context, not read from bytes); no
+        // serial, product code, or title is ever asserted from content.
+        let verified_from_content: Vec<_> = report
+            .evidence
+            .iter()
+            .filter(|e| e.status == IdentityStatus::Verified && e.kind != IdentityKind::Platform)
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            verified_from_content,
+            vec![IdentityKind::NeoGeoCdBootStructure]
+        );
+        assert_eq!(report.verified_neogeocd_boot_structure(), Some("IPL.TXT"));
+        // No serial/product-code identity kind is present at all.
+        assert!(!report.evidence.iter().any(|e| matches!(
+            e.kind,
+            IdentityKind::Ps1Serial
+                | IdentityKind::SegaCdProductCode
+                | IdentityKind::SaturnProductNumber
+                | IdentityKind::PceCdBootStructure
+        )));
+    }
+
+    #[test]
+    fn neogeocd_malformed_ipl_txt_fails_closed() {
+        let directory = FixtureDir::new("neogeocd-malformed-ipl");
+        // Present, named IPL.TXT, but no terminator byte and unparseable
+        // lines - structurally invalid.
+        let image = neogeocd_iso(b"this is not a load manifest at all\r\nnope\r\n");
+        let iso = write_fixture(&directory, "game.iso", &image);
+        let report = inspect_catalogued_game_identity(&iso, Some("Neo Geo CD"));
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|e| {
+            e.kind == IdentityKind::NeoGeoCdBootStructure && e.status == IdentityStatus::Invalid
+        }));
+    }
+
+    #[test]
+    fn neogeocd_filename_only_ipl_txt_does_not_prove_the_platform() {
+        let directory = FixtureDir::new("neogeocd-filename-only");
+        // A disc whose IPL.TXT contents are just its own name repeated -
+        // the filename convention alone is never structural proof.
+        let image = neogeocd_iso(b"IPL.TXT IPL.TXT IPL.TXT");
+        let iso = write_fixture(&directory, "Neo Geo CD (Japan) IPL.TXT.iso", &image);
+        let report = inspect_catalogued_game_identity(&iso, Some("Neo Geo CD"));
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn neogeocd_missing_ipl_txt_fails_closed() {
+        let directory = FixtureDir::new("neogeocd-missing-ipl");
+        // A real ISO 9660 disc (a PS1 one) with no IPL.TXT in its root.
+        let image = ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true);
+        let iso = write_fixture(&directory, "not-neogeo.iso", &image);
+        let report = inspect_catalogued_game_identity(&iso, Some("Neo Geo CD"));
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
+        assert!(!report.complete);
+        assert!(report.evidence.iter().any(|e| {
+            e.kind == IdentityKind::NeoGeoCdBootStructure && e.status == IdentityStatus::Missing
+        }));
+    }
+
+    #[test]
+    fn neogeocd_truncated_or_non_chd_bytes_refuse_never_verified() {
+        let directory = FixtureDir::new("neogeocd-bad-chd");
+
+        // Not a CHD container at all.
+        let garbage = write_fixture(&directory, "garbage.chd", &[0xAB_u8; 4096]);
+        let report = inspect_catalogued_game_identity(&garbage, Some("Neo Geo CD"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
+        assert!(!report.complete);
+
+        // A real CHD truncated inside its own header.
+        let mut truncated = ps1_chd(&neogeocd_iso(&valid_ipl_txt()));
+        truncated.truncate(60);
+        let truncated_path = write_fixture(&directory, "truncated.chd", &truncated);
+        let report = inspect_catalogued_game_identity(&truncated_path, Some("Neo Geo CD"));
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn neogeocd_dispatch_leaves_sega_cd_identity_unchanged() {
+        let directory = FixtureDir::new("neogeocd-segacd-regression");
+
+        // A genuine Sega CD disc, hinted as Sega CD, still verifies its own
+        // product code - the new Neo Geo CD arm never intercepts it.
+        let segacd = write_fixture(&directory, "segacd.iso", &sega_cd_iso(b"GM T-12345 -00"));
+        let segacd_report = inspect_catalogued_game_identity(&segacd, Some("Sega CD"));
+        assert_eq!(segacd_report.platform, IdentityPlatform::SegaCd);
+        assert!(segacd_report.verified_sega_cd_product_code().is_some());
+
+        // A Neo Geo CD disc mis-hinted as Sega CD carries no SEGADISCSYSTEM
+        // boot sector, so it fails closed rather than cross-resolving.
+        let ngcd = write_fixture(&directory, "ngcd.iso", &neogeocd_iso(&valid_ipl_txt()));
+        let ngcd_as_segacd = inspect_catalogued_game_identity(&ngcd, Some("Sega CD"));
+        assert!(ngcd_as_segacd.verified_sega_cd_product_code().is_none());
+        assert!(!ngcd_as_segacd.complete);
+
+        // And a Sega CD disc mis-hinted as Neo Geo CD has no IPL.TXT, so it
+        // also fails closed.
+        let segacd_as_ngcd = inspect_catalogued_game_identity(&segacd, Some("Neo Geo CD"));
+        assert_eq!(segacd_as_ngcd.verified_neogeocd_boot_structure(), None);
+        assert!(!segacd_as_ngcd.complete);
+    }
+
+    #[test]
+    fn neogeocd_generic_iso_without_ipl_txt_stays_ambiguous_not_neogeocd() {
+        let directory = FixtureDir::new("neogeocd-generic-iso");
+        // An ISO 9660 image with only a SYSTEM.CNF-less unrelated file:
+        // generic optical content, no Neo Geo CD proof.
+        let image = ps2_iso(b"BOOT2=cdrom0:\\UNUSED;1\r\n", false, None);
+        let iso = write_fixture(&directory, "generic.iso", &image);
+        let report = inspect_catalogued_game_identity(&iso, Some("Neo Geo CD"));
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn neogeocd_never_inferred_from_extension_without_a_platform_hint() {
+        let directory = FixtureDir::new("neogeocd-no-hint");
+        let iso = write_fixture(&directory, "game.iso", &neogeocd_iso(&valid_ipl_txt()));
+        // No catalogue platform: a `.iso` must not become Neo Geo CD just
+        // because it happens to contain an IPL.TXT.
+        let report = inspect_game_identity(&iso, None);
+        assert_ne!(report.platform, IdentityPlatform::NeoGeoCd);
+        assert_eq!(report.verified_neogeocd_boot_structure(), None);
     }
 }
 

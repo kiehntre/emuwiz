@@ -276,6 +276,18 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         value: "PC Engine CD-ROM SYSTEM",
         scope: EvidenceScope::PlatformSpecific("PC Engine CD"),
     },
+    // neogeocd_boot_evidence.rs: a structurally validated IPL.TXT load
+    // manifest (entry list within bounds, terminator byte present). The
+    // filesystem it lives on (ISO 9660) is shared with every other CD
+    // system, but the parsed manifest is Neo Geo CD's own boot structure -
+    // no other platform in this crate reads an IPL.TXT. A file merely
+    // *named* IPL.TXT that does not parse emits no evidence at all, so this
+    // scope only ever applies to the validated fact.
+    ScopeEntry {
+        kind: BootStructure,
+        value: "IPL.TXT",
+        scope: EvidenceScope::PlatformSpecific("Neo Geo CD"),
+    },
     ScopeEntry {
         kind: ContentSignature,
         value: "XBEH",

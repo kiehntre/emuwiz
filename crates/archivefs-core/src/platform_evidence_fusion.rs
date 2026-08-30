@@ -273,6 +273,17 @@ pub const RULES: &[FusionRule] = &[
         }],
         explanation: "the `PC Engine CD-ROM SYSTEM` IPL boot-record signature at offset 32 of the first data track's second sector is PC Engine CD/TurboGrafx-CD-specific strong evidence (layout verified against RetroAchievements rcheevos and the Hudson Hu7 CD System BIOS manual - see crate::pcengine_cd_boot_evidence); it shares no value with the PC-FX `PC-FX:Hu_CD-ROM` string",
     },
+    // -- SNK optical: single-leg, already Strong + platform-specific --
+    FusionRule {
+        id: "neogeocd_ipl_txt_boot_structure",
+        platform: "Neo Geo CD",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "IPL.TXT",
+            min_confidence: STRONG,
+        }],
+        explanation: "a structurally validated Neo Geo CD `IPL.TXT` load manifest (bounded entry list, terminator byte present) is Neo Geo CD-specific strong evidence - crate::neogeocd_boot_evidence only emits this Strong `BootStructure` fact when the manifest parses, never for a file merely named IPL.TXT; it carries no serial/product code (the manifest has none), so exact release identity stays DAT/hash-driven",
+    },
     // -- Sega 8-bit family: magic alone is Family-scope; region-confirmed
     //    resolves to one of the two systems it names --
     FusionRule {

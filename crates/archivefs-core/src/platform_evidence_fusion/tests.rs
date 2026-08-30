@@ -163,6 +163,60 @@ fn the_pcfx_secondary_magic_is_not_its_own_rule_leg() {
     assert_ne!(explanation.resolved_platform, Some("PC-FX"));
 }
 
+// ----------------------------------------------------------------------
+// Neo Geo CD - validated IPL.TXT BootStructure resolves the platform
+// ----------------------------------------------------------------------
+
+#[test]
+fn neogeocd_validated_ipl_txt_boot_structure_alone_resolves() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "IPL.TXT")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("Neo Geo CD"));
+    assert!(
+        explanation
+            .fired_candidates
+            .iter()
+            .any(
+                |candidate| candidate.rule_id == "neogeocd_ipl_txt_boot_structure"
+                    && candidate.has_strong_leg
+            )
+    );
+}
+
+#[test]
+fn neogeocd_ipl_txt_below_strong_confidence_does_not_resolve() {
+    // The rule requires the Strong tier that `neogeocd_boot_evidence` only
+    // emits for a structurally validated manifest; a bare IPL.TXT filename
+    // fact (anything weaker) stays unresolved rather than guessing.
+    let explanation = fuse_platform_evidence([corroborated(BootStructure, "IPL.TXT")]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    assert_ne!(explanation.resolved_platform, Some("Neo Geo CD"));
+}
+
+#[test]
+fn neogeocd_ipl_txt_never_cross_resolves_to_sega_cd_and_vice_versa() {
+    let ngcd = fuse_platform_evidence([strong(BootStructure, "IPL.TXT")]);
+    assert_ne!(ngcd.resolved_platform, Some("Sega CD"));
+    let segacd = fuse_platform_evidence([strong(BootStructure, "SEGADISCSYSTEM")]);
+    assert_eq!(segacd.resolved_platform, Some("Sega CD"));
+    assert_ne!(segacd.resolved_platform, Some("Neo Geo CD"));
+}
+
+#[test]
+fn neogeocd_and_segacd_strong_together_conflict_never_silently_pick_one() {
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "IPL.TXT"),
+        strong(BootStructure, "SEGADISCSYSTEM"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+}
+
+#[test]
+fn generic_iso9660_never_resolves_to_neogeocd() {
+    let explanation = fuse_platform_evidence([strong(Filesystem, "ISO9660")]);
+    assert_ne!(explanation.resolved_platform, Some("Neo Geo CD"));
+}
+
 #[test]
 fn resolved_explanation_retains_input_evidence() {
     let input = strong(BootStructure, "SEGA SEGASATURN");
