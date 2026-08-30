@@ -71,7 +71,7 @@ use crate::dat::model::{DatEcosystem, DatGameEntry, DatPackingPolicy, ParsedDat}
 use crate::dat::parsers::parse_dat_file;
 use crate::dat::policy::candidate::candidate_for_rom;
 use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
-use crate::dat::set::{SetResolution, classify_archive_sets};
+use crate::dat::set::{SetResolution, classify_archive_sets, classify_disk_only_sets};
 use crate::identity_source::hashing::{HashRefusal, hash_file_reporting};
 use crate::safe_read::TrustedRoots;
 
@@ -660,6 +660,16 @@ pub fn run_dat_audit_with_cache(
                 &request.source_id,
             )?
         };
+
+    // Disk-only sets (a game declaring `<disk>`s and zero `<rom>`s) are never
+    // reached through the per-archive ROM-evidence path above, so classify
+    // them once from the run-wide CHD evidence through the same classifier.
+    sets.extend(classify_disk_only_sets(
+        &disk_evidence,
+        disk_scan_complete,
+        &catalogue_games,
+        &request.source_id,
+    ));
 
     // ---- 4b. Resolve dependencies (Stage 2d) -----------------------------
     // Runs only now, because a dependency is satisfied by evidence that may

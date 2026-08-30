@@ -51,10 +51,11 @@
 //!   CHD evidence never counts - mirrors R2's ROM rule. A CHD's own
 //!   `parent_required()` fact is surfaced (`disks_parent_required`) but never
 //!   blocks or is required for this slot's storage completeness -
-//!   parent-chain resolution is Stage 2d's job. Disk evidence in this batch
-//!   only *verifies slots for sets already touched by ROM evidence*; a game
-//!   declaring disks and no ROMs at all is not yet reachable through this
-//!   entry point (see the module's "What this batch does not attempt"). An
+//!   parent-chain resolution is Stage 2d's job. A game declaring disks and no
+//!   ROMs at all is reached through [`classify_disk_only_sets`], which seeds
+//!   set membership from disk evidence the same way [`classify_archive_sets`]
+//!   seeds it from ROM evidence, and routes both through the one
+//!   [`classify_one_set`] classifier. An
 //!   incomplete disk scan (`disk_scan_complete = false`) blocks `Complete`
 //!   only for a set that actually declares a required disk - it never
 //!   downgrades an unrelated ROM-only set just because some other directory
@@ -132,13 +133,11 @@
 //!   [`SetResolution::disks_parent_required`], never located, opened, or
 //!   verified.
 //! - Classifying a set touched only by disk evidence with zero ROM
-//!   declarations. This batch's `classify_archive_sets` still seeds set
-//!   membership from ROM verdicts only (R1); CHD evidence verifies disk
-//!   slots for sets a ROM verdict already touched. A disk-only game (no
-//!   `<rom>` children at all) is simply never emitted by this function
-//!   today, the same silent-absence behaviour an untouched ROM-only game
-//!   already has, not a false verdict. Extending set membership to be
-//!   disk-evidence-driven too is left to a follow-up batch.
+//!   declarations is handled by [`classify_disk_only_sets`], the disk-evidence
+//!   counterpart of `classify_archive_sets`'s ROM-evidence seeding. A
+//!   disk-only game with no CHD evidence at all stays silently absent - the
+//!   same fail-closed negative an untouched ROM-only game already has, not a
+//!   false verdict.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -615,302 +614,389 @@ pub(crate) fn classify_archive_sets(
     source_id: &str,
 ) -> Vec<SetResolution> {
     let touched = attribute_archive_members(archive, games);
-
     let archive_pass_complete = matches!(archive.completion, ArchivePassCompletion::Complete);
     let disk_summary = summarize_disk_evidence(disk_evidence, games);
 
     let mut resolutions = Vec::with_capacity(touched.len());
-    for (game_name, touch) in touched {
-        let identity = SetIdentity {
-            source_id: source_id.to_string(),
-            game_name: game_name.clone(),
-        };
+    for (game_name, touch) in &touched {
+        if let Some(resolution) = classify_one_set(
+            game_name,
+            touch,
+            &archive.archive_path,
+            archive_pass_complete,
+            &disk_summary,
+            disk_scan_complete,
+            games,
+            source_id,
+        ) {
+            resolutions.push(resolution);
+        }
+    }
+    resolutions
+}
 
-        // Item 2: a `game_name` that is not unique in the DAT cannot be
-        // resolved by picking the first match - that would silently bind
-        // this set's completeness to whichever entry happens to sort first,
-        // which is exactly the positional-identity risk `SetIdentity` is
-        // designed never to have. Every candidate is left unresolved.
-        let matching_games: Vec<(usize, &DatGameEntry)> = games
+/// Classifies every disk-only catalogue set (a game declaring `<disk>` members
+/// and zero `<rom>` members) that this run's CHD disk evidence touched.
+///
+/// [`attribute_archive_members`] seeds set membership from ROM verdicts only
+/// (R1), so a disk-only game is never reached through the per-archive
+/// [`classify_archive_sets`] path. It is classified exactly once here, from
+/// the whole run's disk evidence, through the same [`classify_one_set`]
+/// classifier every other set uses - never a second, disk-specific
+/// implementation.
+///
+/// Only games with zero ROM declarations are eligible: a mixed ROM+disk set is
+/// reached through its ROM evidence (or stays silently absent when its ROM was
+/// never matched), so its behaviour is unchanged. A disk-only game with no CHD
+/// evidence at all is likewise not touched here and stays silently absent -
+/// the same fail-closed negative an untouched ROM-only game has.
+pub(crate) fn classify_disk_only_sets(
+    disk_evidence: &[DatDiskAudit],
+    disk_scan_complete: bool,
+    games: &[DatGameEntry],
+    source_id: &str,
+) -> Vec<SetResolution> {
+    let disk_summary = summarize_disk_evidence(disk_evidence, games);
+
+    // Deterministic candidate ordering: a BTreeSet of every game name the disk
+    // evidence touched, so result order never depends on map iteration order.
+    let mut candidate_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for name in disk_summary.touched_game_names() {
+        candidate_names.insert(name);
+    }
+
+    let mut resolutions = Vec::new();
+    for game_name in candidate_names {
+        // Only an unambiguous, unique, disk-only game is eligible here. A
+        // duplicated game name cannot be proven disk-only, and a game with any
+        // ROM declaration is reached through the ROM path instead - both are
+        // left to their existing fail-closed behaviour rather than guessed.
+        let candidates: Vec<(usize, &DatGameEntry)> = games
             .iter()
             .enumerate()
             .filter(|(_, candidate)| candidate.name == game_name)
             .collect();
-        let (game_index, game) = match matching_games.as_slice() {
-            // The verdict named a game that isn't in our own game list. Both
-            // come from the same DatIndex build in every real caller; fail
-            // closed on the mismatch rather than guess or panic.
-            [] => continue,
-            [only] => *only,
-            _ => {
-                let reason = if archive_pass_complete {
-                    NeedsReviewReason::DuplicateGameName
-                } else {
-                    NeedsReviewReason::PartialArchivePass
-                };
-                resolutions.push(empty_resolution(
-                    identity,
-                    &archive.archive_path,
-                    SetState::NeedsReview(reason),
-                ));
-                continue;
-            }
+        let is_disk_only = match candidates.as_slice() {
+            [only] => declared_roms(only.0, only.1).next().is_none(),
+            _ => false,
         };
-
-        let classified_roms: Vec<(DatMemberKey, &DatRomEntry, MemberClass)> =
-            declared_roms(game_index, game)
-                .map(|(key, rom)| (key, rom, classify_rom_member(rom)))
-                .collect();
-        let classified_disks: Vec<(DatDiskKey, &DatDiskEntry, MemberClass)> =
-            declared_disks(game_index, game)
-                .map(|(key, disk)| (key, disk, classify_disk_member(disk)))
-                .collect();
-        let verified_disk_keys = disk_summary
-            .verified
-            .get(game_name.as_str())
-            .cloned()
-            .unwrap_or_default();
-        let parent_required_disk_keys = disk_summary
-            .parent_required
-            .get(game_name.as_str())
-            .cloned()
-            .unwrap_or_default();
-
-        let mut members_required = Vec::new();
-        let mut members_optional = Vec::new();
-        let mut members_borrowed = Vec::new();
-        let mut disks_required = Vec::new();
-        let mut disks_verified = Vec::new();
-        let mut disks_parent_required = Vec::new();
-        let mut members_bad = Vec::new();
-        let mut has_contradictory = false;
-        let mut has_unknown_loadflag = false;
-        let mut has_non_file_or_optional = false;
-
-        for (key, rom, class) in &classified_roms {
-            match class {
-                MemberClass::PhysicalRequired => members_required.push(rom.name.clone()),
-                MemberClass::OptionalPhysical => {
-                    has_non_file_or_optional = true;
-                    if member_slot_verified(&touch, *key, &rom.name) {
-                        members_optional.push(rom.name.clone());
-                    }
-                }
-                MemberClass::Borrowed => members_borrowed.push(rom.name.clone()),
-                MemberClass::NonFile => has_non_file_or_optional = true,
-                MemberClass::UnverifiableNodump => {
-                    members_bad.push(SetBadMember {
-                        rom_name: rom.name.clone(),
-                        reason: BadMetadataReason::NoDump,
-                    });
-                }
-                MemberClass::KnownBad => {
-                    members_bad.push(SetBadMember {
-                        rom_name: rom.name.clone(),
-                        reason: BadMetadataReason::BadDump,
-                    });
-                }
-                MemberClass::Contradictory => has_contradictory = true,
-                MemberClass::UnknownLoadflag => has_unknown_loadflag = true,
-            }
+        if !is_disk_only {
+            continue;
         }
-
-        for (key, disk, class) in &classified_disks {
-            let name = disk.name.clone().unwrap_or_default();
-            match class {
-                MemberClass::PhysicalRequired => {
-                    disks_required.push(name.clone());
-                    if verified_disk_keys.contains(key) {
-                        disks_verified.push(name.clone());
-                        if parent_required_disk_keys.contains(key) {
-                            disks_parent_required.push(name);
-                        }
-                    }
-                }
-                MemberClass::OptionalPhysical => has_non_file_or_optional = true,
-                MemberClass::Borrowed => members_borrowed.push(name),
-                MemberClass::UnverifiableNodump => members_bad.push(SetBadMember {
-                    rom_name: name,
-                    reason: BadMetadataReason::NoDump,
-                }),
-                MemberClass::KnownBad => members_bad.push(SetBadMember {
-                    rom_name: name,
-                    reason: BadMetadataReason::BadDump,
-                }),
-                MemberClass::Contradictory => has_contradictory = true,
-                MemberClass::NonFile | MemberClass::UnknownLoadflag => {
-                    // Disk classification never produces these variants.
-                    has_contradictory = true;
-                }
-            }
+        let touch = TouchedSet::default();
+        if let Some(resolution) = classify_one_set(
+            game_name,
+            &touch,
+            std::path::Path::new(""),
+            true,
+            &disk_summary,
+            disk_scan_complete,
+            games,
+            source_id,
+        ) {
+            resolutions.push(resolution);
         }
+    }
+    resolutions
+}
 
-        let members_verified: Vec<String> = classified_roms
-            .iter()
-            .filter(|(key, rom, class)| {
-                *class == MemberClass::PhysicalRequired
-                    && member_slot_verified(&touch, *key, &rom.name)
-            })
-            .map(|(_, rom, _)| rom.name.clone())
+/// Classifies one catalogue set, shared by the ROM-evidence path
+/// ([`classify_archive_sets`]) and the disk-evidence path
+/// ([`classify_disk_only_sets`]). Returns `None` only when `game_name` names no
+/// game in `games` (a defensive mismatch that must not panic); every other
+/// outcome is a [`SetResolution`], including the duplicate-game-name refusal.
+#[allow(clippy::too_many_arguments)]
+fn classify_one_set(
+    game_name: &str,
+    touch: &TouchedSet,
+    archive_path: &std::path::Path,
+    archive_pass_complete: bool,
+    disk_summary: &DiskEvidenceSummary,
+    disk_scan_complete: bool,
+    games: &[DatGameEntry],
+    source_id: &str,
+) -> Option<SetResolution> {
+    let identity = SetIdentity {
+        source_id: source_id.to_string(),
+        game_name: game_name.to_string(),
+    };
+
+    // Item 2: a `game_name` that is not unique in the DAT cannot be
+    // resolved by picking the first match - that would silently bind
+    // this set's completeness to whichever entry happens to sort first,
+    // which is exactly the positional-identity risk `SetIdentity` is
+    // designed never to have. Every candidate is left unresolved.
+    let matching_games: Vec<(usize, &DatGameEntry)> = games
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.name == game_name)
+        .collect();
+    let (game_index, game) = match matching_games.as_slice() {
+        // The verdict named a game that isn't in our own game list. Both
+        // come from the same DatIndex build in every real caller; fail
+        // closed on the mismatch rather than guess or panic.
+        [] => return None,
+        [only] => *only,
+        _ => {
+            let reason = if archive_pass_complete {
+                NeedsReviewReason::DuplicateGameName
+            } else {
+                NeedsReviewReason::PartialArchivePass
+            };
+            return Some(empty_resolution(
+                identity,
+                archive_path,
+                SetState::NeedsReview(reason),
+            ));
+        }
+    };
+
+    let classified_roms: Vec<(DatMemberKey, &DatRomEntry, MemberClass)> =
+        declared_roms(game_index, game)
+            .map(|(key, rom)| (key, rom, classify_rom_member(rom)))
             .collect();
+    let classified_disks: Vec<(DatDiskKey, &DatDiskEntry, MemberClass)> =
+        declared_disks(game_index, game)
+            .map(|(key, disk)| (key, disk, classify_disk_member(disk)))
+            .collect();
+    let verified_disk_keys = disk_summary
+        .verified
+        .get(game_name)
+        .cloned()
+        .unwrap_or_default();
+    let parent_required_disk_keys = disk_summary
+        .parent_required
+        .get(game_name)
+        .cloned()
+        .unwrap_or_default();
 
-        // S2c transition 1: an incomplete archive pass invalidates confidence
-        // in every later catalogue/evidence decision, for every set it
-        // touched. An incomplete *disk* scan is scoped more narrowly: it
-        // only means "some required disk's true presence is unknown", so it
-        // only invalidates confidence for a set that actually declares a
-        // required disk. A traversal error under an unrelated directory
-        // must not silently downgrade an unrelated ROM-only set that has no
-        // disk requirement at all to sit alongside. Lists remain available
-        // for diagnostics either way, but cannot affect the verdict.
-        let disk_scan_gate_applies = !disks_required.is_empty();
-        let pass_complete =
-            archive_pass_complete && (disk_scan_complete || !disk_scan_gate_applies);
-        if !pass_complete {
-            resolutions.push(SetResolution {
-                identity,
-                archive_path: archive.archive_path.clone(),
-                state: SetState::NeedsReview(NeedsReviewReason::PartialArchivePass),
-                members_required,
-                members_verified,
-                members_bad: Vec::new(),
-                members_optional,
-                members_borrowed,
-                disks_required,
-                disks_verified,
-                disks_parent_required,
-                // Stage 2c never resolves dependencies; the pass that does
-                // runs once the whole collection has been classified.
-                dependencies: SetDependencyReport::not_evaluated(),
-            });
-            continue;
-        }
+    let mut members_required = Vec::new();
+    let mut members_optional = Vec::new();
+    let mut members_borrowed = Vec::new();
+    let mut disks_required = Vec::new();
+    let mut disks_verified = Vec::new();
+    let mut disks_parent_required = Vec::new();
+    let mut members_bad = Vec::new();
+    let mut has_contradictory = false;
+    let mut has_unknown_loadflag = false;
+    let mut has_non_file_or_optional = false;
 
-        // S2c transition 2: state is determined by evidence integrity before
-        // any classification refusal. Member lists are still surfaced for
-        // continuity with Stage 1 diagnostics. Disk evidence integrity
-        // (ambiguous SHA-1 attribution, duplicate CHD evidence) is folded in
-        // exactly like the ROM equivalents - mirrors R2/item 7 for disks.
-        let disk_ambiguous = disk_summary.ambiguous_games.contains(game_name.as_str());
-        let disk_duplicate_evidence = disk_summary
-            .duplicate_evidence_games
-            .contains(game_name.as_str());
-        let evidence_refusal = if touch.duplicate_evidence || disk_duplicate_evidence {
-            Some(NeedsReviewReason::DuplicateArchiveEvidence)
-        } else if touch.ambiguous || disk_ambiguous {
-            Some(NeedsReviewReason::AmbiguousMemberAttribution)
-        } else {
-            None
-        };
-        if let Some(reason) = evidence_refusal {
-            resolutions.push(SetResolution {
-                identity,
-                archive_path: archive.archive_path.clone(),
-                state: SetState::NeedsReview(reason),
-                members_required,
-                members_verified,
-                members_bad: Vec::new(),
-                members_optional,
-                members_borrowed,
-                disks_required,
-                disks_verified,
-                disks_parent_required,
-                // Stage 2c never resolves dependencies; the pass that does
-                // runs once the whole collection has been classified.
-                dependencies: SetDependencyReport::not_evaluated(),
-            });
-            continue;
-        }
-
-        // S2c transition 3: classification contradictions are more specific
-        // than the general structural refusal below.
-        let classification_refusal = if has_contradictory {
-            Some(NeedsReviewReason::ContradictoryMemberFlags)
-        } else if has_unknown_loadflag {
-            Some(NeedsReviewReason::UnknownLoadflag)
-        } else {
-            None
-        };
-
-        let unsupported_structure = game.unsupported_structure
-            || has_unsupported_member_shape(&classified_roms, &classified_disks)
-            || has_unsafe_duplicate_evidence_names(&classified_roms, touch.used_legacy_evidence)
-            || touch
-                .verified_member_keys
-                .iter()
-                .any(|key| key.game_index != game_index)
-            || verified_disk_keys
-                .iter()
-                .any(|key| key.game_index != game_index);
-
-        let supported_refusal = match game.supported.as_deref().map(str::trim) {
-            None => None,
-            Some(value) if value.eq_ignore_ascii_case("yes") => None,
-            Some(value)
-                if value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("partial") =>
-            {
-                Some(NeedsReviewReason::UnsupportedSoftware)
+    for (key, rom, class) in &classified_roms {
+        match class {
+            MemberClass::PhysicalRequired => members_required.push(rom.name.clone()),
+            MemberClass::OptionalPhysical => {
+                has_non_file_or_optional = true;
+                if member_slot_verified(touch, *key, &rom.name) {
+                    members_optional.push(rom.name.clone());
+                }
             }
-            Some(_) => Some(NeedsReviewReason::UnsupportedSoftware),
-        };
+            MemberClass::Borrowed => members_borrowed.push(rom.name.clone()),
+            MemberClass::NonFile => has_non_file_or_optional = true,
+            MemberClass::UnverifiableNodump => {
+                members_bad.push(SetBadMember {
+                    rom_name: rom.name.clone(),
+                    reason: BadMetadataReason::NoDump,
+                });
+            }
+            MemberClass::KnownBad => {
+                members_bad.push(SetBadMember {
+                    rom_name: rom.name.clone(),
+                    reason: BadMetadataReason::BadDump,
+                });
+            }
+            MemberClass::Contradictory => has_contradictory = true,
+            MemberClass::UnknownLoadflag => has_unknown_loadflag = true,
+        }
+    }
 
-        let has_nodump = members_bad
-            .iter()
-            .any(|bad| bad.reason == BadMetadataReason::NoDump);
-        let has_baddump = members_bad
-            .iter()
-            .any(|bad| bad.reason == BadMetadataReason::BadDump);
+    for (key, disk, class) in &classified_disks {
+        let name = disk.name.clone().unwrap_or_default();
+        match class {
+            MemberClass::PhysicalRequired => {
+                disks_required.push(name.clone());
+                if verified_disk_keys.contains(key) {
+                    disks_verified.push(name.clone());
+                    if parent_required_disk_keys.contains(key) {
+                        disks_parent_required.push(name);
+                    }
+                }
+            }
+            MemberClass::OptionalPhysical => has_non_file_or_optional = true,
+            MemberClass::Borrowed => members_borrowed.push(name),
+            MemberClass::UnverifiableNodump => members_bad.push(SetBadMember {
+                rom_name: name,
+                reason: BadMetadataReason::NoDump,
+            }),
+            MemberClass::KnownBad => members_bad.push(SetBadMember {
+                rom_name: name,
+                reason: BadMetadataReason::BadDump,
+            }),
+            MemberClass::Contradictory => has_contradictory = true,
+            MemberClass::NonFile | MemberClass::UnknownLoadflag => {
+                // Disk classification never produces these variants.
+                has_contradictory = true;
+            }
+        }
+    }
 
-        let no_declared_members = classified_roms.is_empty() && classified_disks.is_empty();
-        let only_non_file_or_optional = members_required.is_empty()
-            && members_borrowed.is_empty()
-            && has_non_file_or_optional
-            && !has_nodump
-            && !has_baddump;
-        let all_roms_present = classified_roms.iter().all(|(key, rom, class)| {
-            *class != MemberClass::PhysicalRequired || member_slot_verified(&touch, *key, &rom.name)
-        });
-        let all_disks_present = classified_disks.iter().all(|(key, _, class)| {
-            *class != MemberClass::PhysicalRequired || verified_disk_keys.contains(key)
-        });
-        let all_required_present = all_roms_present && all_disks_present;
+    let members_verified: Vec<String> = classified_roms
+        .iter()
+        .filter(|(key, rom, class)| {
+            *class == MemberClass::PhysicalRequired && member_slot_verified(touch, *key, &rom.name)
+        })
+        .map(|(_, rom, _)| rom.name.clone())
+        .collect();
 
-        let state = if let Some(reason) = classification_refusal {
-            SetState::NeedsReview(reason)
-        } else if unsupported_structure {
-            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
-        } else if let Some(reason) = supported_refusal {
-            SetState::NeedsReview(reason)
-        } else if has_nodump {
-            SetState::BadMetadata(BadMetadataReason::NoDump)
-        } else if has_baddump {
-            SetState::BadMetadata(BadMetadataReason::BadDump)
-        } else if no_declared_members {
-            SetState::NeedsReview(NeedsReviewReason::NoDeclaredMembers)
-        } else if only_non_file_or_optional {
-            SetState::NeedsReview(NeedsReviewReason::OnlyNonFileOrOptionalMembers)
-        } else if !all_required_present {
-            SetState::Incomplete
-        } else {
-            SetState::Complete
-        };
-
-        resolutions.push(SetResolution {
+    // S2c transition 1: an incomplete archive pass invalidates confidence
+    // in every later catalogue/evidence decision, for every set it
+    // touched. An incomplete *disk* scan is scoped more narrowly: it
+    // only means "some required disk's true presence is unknown", so it
+    // only invalidates confidence for a set that actually declares a
+    // required disk. A traversal error under an unrelated directory
+    // must not silently downgrade an unrelated ROM-only set that has no
+    // disk requirement at all to sit alongside. Lists remain available
+    // for diagnostics either way, but cannot affect the verdict.
+    let disk_scan_gate_applies = !disks_required.is_empty();
+    let pass_complete = archive_pass_complete && (disk_scan_complete || !disk_scan_gate_applies);
+    if !pass_complete {
+        return Some(SetResolution {
             identity,
-            archive_path: archive.archive_path.clone(),
-            state,
+            archive_path: archive_path.to_path_buf(),
+            state: SetState::NeedsReview(NeedsReviewReason::PartialArchivePass),
             members_required,
             members_verified,
-            members_bad,
+            members_bad: Vec::new(),
             members_optional,
             members_borrowed,
             disks_required,
             disks_verified,
             disks_parent_required,
+            // Stage 2c never resolves dependencies; the pass that does
+            // runs once the whole collection has been classified.
             dependencies: SetDependencyReport::not_evaluated(),
         });
     }
-    resolutions
+
+    // S2c transition 2: state is determined by evidence integrity before
+    // any classification refusal. Member lists are still surfaced for
+    // continuity with Stage 1 diagnostics. Disk evidence integrity
+    // (ambiguous SHA-1 attribution, duplicate CHD evidence) is folded in
+    // exactly like the ROM equivalents - mirrors R2/item 7 for disks.
+    let disk_ambiguous = disk_summary.ambiguous_games.contains(game_name);
+    let disk_duplicate_evidence = disk_summary.duplicate_evidence_games.contains(game_name);
+    let evidence_refusal = if touch.duplicate_evidence || disk_duplicate_evidence {
+        Some(NeedsReviewReason::DuplicateArchiveEvidence)
+    } else if touch.ambiguous || disk_ambiguous {
+        Some(NeedsReviewReason::AmbiguousMemberAttribution)
+    } else {
+        None
+    };
+    if let Some(reason) = evidence_refusal {
+        return Some(SetResolution {
+            identity,
+            archive_path: archive_path.to_path_buf(),
+            state: SetState::NeedsReview(reason),
+            members_required,
+            members_verified,
+            members_bad: Vec::new(),
+            members_optional,
+            members_borrowed,
+            disks_required,
+            disks_verified,
+            disks_parent_required,
+            // Stage 2c never resolves dependencies; the pass that does
+            // runs once the whole collection has been classified.
+            dependencies: SetDependencyReport::not_evaluated(),
+        });
+    }
+
+    // S2c transition 3: classification contradictions are more specific
+    // than the general structural refusal below.
+    let classification_refusal = if has_contradictory {
+        Some(NeedsReviewReason::ContradictoryMemberFlags)
+    } else if has_unknown_loadflag {
+        Some(NeedsReviewReason::UnknownLoadflag)
+    } else {
+        None
+    };
+
+    let unsupported_structure = game.unsupported_structure
+        || has_unsupported_member_shape(&classified_roms, &classified_disks)
+        || has_unsafe_duplicate_evidence_names(&classified_roms, touch.used_legacy_evidence)
+        || touch
+            .verified_member_keys
+            .iter()
+            .any(|key| key.game_index != game_index)
+        || verified_disk_keys
+            .iter()
+            .any(|key| key.game_index != game_index);
+
+    let supported_refusal = match game.supported.as_deref().map(str::trim) {
+        None => None,
+        Some(value) if value.eq_ignore_ascii_case("yes") => None,
+        Some(value)
+            if value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("partial") =>
+        {
+            Some(NeedsReviewReason::UnsupportedSoftware)
+        }
+        Some(_) => Some(NeedsReviewReason::UnsupportedSoftware),
+    };
+
+    let has_nodump = members_bad
+        .iter()
+        .any(|bad| bad.reason == BadMetadataReason::NoDump);
+    let has_baddump = members_bad
+        .iter()
+        .any(|bad| bad.reason == BadMetadataReason::BadDump);
+
+    let no_declared_members = classified_roms.is_empty() && classified_disks.is_empty();
+    let only_non_file_or_optional = members_required.is_empty()
+        && members_borrowed.is_empty()
+        && has_non_file_or_optional
+        && !has_nodump
+        && !has_baddump;
+    let all_roms_present = classified_roms.iter().all(|(key, rom, class)| {
+        *class != MemberClass::PhysicalRequired || member_slot_verified(touch, *key, &rom.name)
+    });
+    let all_disks_present = classified_disks.iter().all(|(key, _, class)| {
+        *class != MemberClass::PhysicalRequired || verified_disk_keys.contains(key)
+    });
+    let all_required_present = all_roms_present && all_disks_present;
+
+    let state = if let Some(reason) = classification_refusal {
+        SetState::NeedsReview(reason)
+    } else if unsupported_structure {
+        SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
+    } else if let Some(reason) = supported_refusal {
+        SetState::NeedsReview(reason)
+    } else if has_nodump {
+        SetState::BadMetadata(BadMetadataReason::NoDump)
+    } else if has_baddump {
+        SetState::BadMetadata(BadMetadataReason::BadDump)
+    } else if no_declared_members {
+        SetState::NeedsReview(NeedsReviewReason::NoDeclaredMembers)
+    } else if only_non_file_or_optional {
+        SetState::NeedsReview(NeedsReviewReason::OnlyNonFileOrOptionalMembers)
+    } else if !all_required_present {
+        SetState::Incomplete
+    } else {
+        SetState::Complete
+    };
+
+    Some(SetResolution {
+        identity,
+        archive_path: archive_path.to_path_buf(),
+        state,
+        members_required,
+        members_verified,
+        members_bad,
+        members_optional,
+        members_borrowed,
+        disks_required,
+        disks_verified,
+        disks_parent_required,
+        dependencies: SetDependencyReport::not_evaluated(),
+    })
 }
 
 fn empty_resolution(
@@ -1078,6 +1164,27 @@ pub(crate) struct DiskEvidenceSummary {
     /// was unusable, which is a dependency that exists and cannot be
     /// resolved, not an absent dependency.
     pub(crate) verified_parent_identity: std::collections::HashMap<DatDiskKey, Option<String>>,
+}
+
+impl DiskEvidenceSummary {
+    /// Every game name this run's disk evidence touched, for seeding
+    /// candidate-set membership so a disk-only game (zero ROMs) is reachable.
+    ///
+    /// The union of the verified, parent-required, ambiguous, and
+    /// duplicate-evidence name sets. `parent_required` and
+    /// `duplicate_evidence_games` are subsets of `verified` ∪
+    /// `ambiguous_games` by construction, but all four are collected so a
+    /// future change to how those maps are populated cannot silently drop a
+    /// game from the candidate set. Duplicates are possible (a game can be
+    /// both verified and parent-required); callers deduplicate as needed.
+    pub(crate) fn touched_game_names(&self) -> impl Iterator<Item = &str> {
+        self.verified
+            .keys()
+            .chain(self.parent_required.keys())
+            .chain(self.ambiguous_games.iter())
+            .chain(self.duplicate_evidence_games.iter())
+            .map(|name| name.as_str())
+    }
 }
 
 /// Builds [`DiskEvidenceSummary`] from one run's `disk_evidence`.
@@ -2659,6 +2766,364 @@ mod tests {
                 );
                 assert_ne!(resolutions[0].state, SetState::Complete);
             }
+        }
+    }
+
+    mod disk_only_sets {
+        use super::*;
+
+        fn disk_only_game(name: &str, disks: Vec<DatDiskEntry>) -> DatGameEntry {
+            let mut entry = game(name, Vec::new());
+            entry.disks = disks;
+            entry
+        }
+
+        fn disk_entry(name: &str, sha1: &str) -> DatDiskEntry {
+            DatDiskEntry {
+                name: Some(name.to_string()),
+                sha1: Some(sha1.to_string()),
+                ..Default::default()
+            }
+        }
+
+        fn disk_sha1(digit: char) -> String {
+            std::iter::repeat_n(digit, 40).collect()
+        }
+
+        fn disk_ref_for(game_index: usize, game: &DatGameEntry, disk_index: usize) -> DatDiskRef {
+            let disk = &game.disks[disk_index];
+            DatDiskRef {
+                game_index,
+                game_name: game.name.clone(),
+                disk_key: DatDiskKey {
+                    game_index,
+                    location: DiskLocation::TopLevel { disk_index },
+                },
+                disk_name: disk.name.clone().unwrap_or_default(),
+                sha1: DatChecksum::parse(ChecksumAlgorithm::Sha1, disk.sha1.as_deref().unwrap())
+                    .unwrap()
+                    .value,
+                status: disk.status.clone(),
+                merge: disk.merge.clone(),
+                optional: disk.optional.clone(),
+            }
+        }
+
+        fn exact_disk_audit(
+            path: &str,
+            disk_ref: DatDiskRef,
+            parent_required: bool,
+        ) -> DatDiskAudit {
+            DatDiskAudit {
+                chd_path: path.into(),
+                overall_sha1: Some(disk_ref.sha1.clone()),
+                parent_required,
+                parent_sha1: parent_required.then(|| "b".repeat(40)),
+                verdict: Some(DiskAuditVerdict::Exact {
+                    game_name: disk_ref.game_name.clone(),
+                    disk_name: disk_ref.disk_name.clone(),
+                }),
+                matched_refs: vec![disk_ref],
+            }
+        }
+
+        fn ambiguous_disk_audit(path: &str, refs: Vec<DatDiskRef>) -> DatDiskAudit {
+            let game_names = refs.iter().map(|r| r.game_name.clone()).collect();
+            DatDiskAudit {
+                chd_path: path.into(),
+                overall_sha1: refs.first().map(|r| r.sha1.clone()),
+                parent_required: false,
+                parent_sha1: None,
+                verdict: Some(DiskAuditVerdict::ExactMultipleCandidates {
+                    count: refs.len(),
+                    game_names,
+                }),
+                matched_refs: refs,
+            }
+        }
+
+        fn not_in_dat_audit(path: &str, sha1: String) -> DatDiskAudit {
+            DatDiskAudit {
+                chd_path: path.into(),
+                overall_sha1: Some(sha1),
+                parent_required: false,
+                parent_sha1: None,
+                verdict: Some(DiskAuditVerdict::NotInDat),
+                matched_refs: Vec::new(),
+            }
+        }
+
+        // 1: a disk-only set with one verified CHD reaches Complete.
+        #[test]
+        fn disk_only_set_with_one_verified_chd_is_complete() {
+            let games = vec![disk_only_game(
+                "Disc Game",
+                vec![disk_entry("game", &disk_sha1('1'))],
+            )];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/game.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert_eq!(resolutions.len(), 1);
+            assert_eq!(resolutions[0].state, SetState::Complete);
+            assert_eq!(resolutions[0].disks_required, vec!["game"]);
+            assert_eq!(resolutions[0].disks_verified, vec!["game"]);
+            assert!(resolutions[0].members_required.is_empty());
+            assert!(resolutions[0].members_verified.is_empty());
+        }
+
+        // 2: two required disks, both verified -> Complete.
+        #[test]
+        fn disk_only_set_with_two_verified_disks_is_complete() {
+            let games = vec![disk_only_game(
+                "Two Discs",
+                vec![
+                    disk_entry("disc1", &disk_sha1('1')),
+                    disk_entry("disc2", &disk_sha1('2')),
+                ],
+            )];
+            let disk_evidence = vec![
+                exact_disk_audit("/lib/disc1.chd", disk_ref_for(0, &games[0], 0), false),
+                exact_disk_audit("/lib/disc2.chd", disk_ref_for(0, &games[0], 1), false),
+            ];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert_eq!(resolutions[0].state, SetState::Complete);
+            assert_eq!(resolutions[0].disks_required, vec!["disc1", "disc2"]);
+            assert_eq!(resolutions[0].disks_verified, vec!["disc1", "disc2"]);
+        }
+
+        // 3: one of two required disks missing on a complete scan -> Incomplete.
+        #[test]
+        fn disk_only_set_with_one_of_two_disks_missing_is_incomplete() {
+            let games = vec![disk_only_game(
+                "Two Discs",
+                vec![
+                    disk_entry("disc1", &disk_sha1('1')),
+                    disk_entry("disc2", &disk_sha1('2')),
+                ],
+            )];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/disc1.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert_eq!(resolutions[0].state, SetState::Incomplete);
+            assert_eq!(resolutions[0].disks_verified, vec!["disc1"]);
+        }
+
+        // 4 / 20: a partial disk scan must never reach Complete - the absent
+        // second disk's true presence is unknown, so the verdict is
+        // NeedsReview(PartialArchivePass), never Complete and never Incomplete.
+        #[test]
+        fn disk_only_set_on_partial_scan_is_needs_review_not_complete() {
+            let games = vec![disk_only_game(
+                "Two Discs",
+                vec![
+                    disk_entry("disc1", &disk_sha1('1')),
+                    disk_entry("disc2", &disk_sha1('2')),
+                ],
+            )];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/disc1.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, false, &games, "collection");
+
+            assert_eq!(
+                resolutions[0].state,
+                SetState::NeedsReview(NeedsReviewReason::PartialArchivePass)
+            );
+        }
+
+        // 5 / 10: a disk SHA-1 declared by two games is ambiguous attribution,
+        // never Complete.
+        #[test]
+        fn ambiguous_disk_sha1_disk_only_set_is_needs_review() {
+            let shared = disk_sha1('4');
+            let games = vec![
+                disk_only_game("Disc Game A", vec![disk_entry("disk-a", &shared)]),
+                disk_only_game("Disc Game B", vec![disk_entry("disk-b", &shared)]),
+            ];
+            let disk_evidence = vec![ambiguous_disk_audit(
+                "/lib/shared.chd",
+                vec![disk_ref_for(0, &games[0], 0), disk_ref_for(1, &games[1], 0)],
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert!(!resolutions.is_empty());
+            for resolution in &resolutions {
+                assert_eq!(
+                    resolution.state,
+                    SetState::NeedsReview(NeedsReviewReason::AmbiguousMemberAttribution)
+                );
+            }
+        }
+
+        // 9: a CHD whose identity matches no declared disk never reaches the
+        // set, so a disk-only set with only a wrong-SHA-1 CHD stays silently
+        // absent (the correct fail-closed negative).
+        #[test]
+        fn disk_only_set_with_wrong_chd_sha1_is_silently_absent() {
+            let games = vec![disk_only_game(
+                "Disc Game",
+                vec![disk_entry("game", &disk_sha1('1'))],
+            )];
+            let disk_evidence = vec![not_in_dat_audit("/lib/other.chd", disk_sha1('9'))];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert!(resolutions.is_empty());
+        }
+
+        // 14: a disk-only set with no CHD evidence at all is silently absent.
+        #[test]
+        fn disk_only_set_with_no_chd_evidence_is_silently_absent() {
+            let games = vec![disk_only_game(
+                "Disc Game",
+                vec![disk_entry("game", &disk_sha1('1'))],
+            )];
+
+            let resolutions = classify_disk_only_sets(&[], true, &games, "collection");
+
+            assert!(resolutions.is_empty());
+        }
+
+        // 11: a reached disk-only set with a nodump disk follows the existing
+        // R3 rule - nodump blocks Complete unconditionally.
+        #[test]
+        fn disk_only_set_with_nodump_disk_is_bad_metadata_when_reached() {
+            let games = vec![disk_only_game(
+                "Disc Game",
+                vec![
+                    disk_entry("game", &disk_sha1('1')),
+                    DatDiskEntry {
+                        name: Some("nodump-disk".to_string()),
+                        status: Some("nodump".to_string()),
+                        ..Default::default()
+                    },
+                ],
+            )];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/game.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert_eq!(
+                resolutions[0].state,
+                SetState::BadMetadata(BadMetadataReason::NoDump)
+            );
+        }
+
+        // 11: a disk-only set with only an optional disk follows the existing
+        // optional-only rule.
+        #[test]
+        fn disk_only_set_with_only_optional_disk_is_needs_review() {
+            let mut disk = disk_entry("optional-disk", &disk_sha1('1'));
+            disk.optional = Some("yes".to_string());
+            let games = vec![disk_only_game("Disc Game", vec![disk])];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/optional.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert_eq!(
+                resolutions[0].state,
+                SetState::NeedsReview(NeedsReviewReason::OnlyNonFileOrOptionalMembers)
+            );
+        }
+
+        // 12: a parent-required disk still reaches storage Complete, and the
+        // parent requirement is surfaced for the dependency pass.
+        #[test]
+        fn disk_only_parent_required_disk_still_complete_and_surfaces_parent() {
+            let games = vec![disk_only_game(
+                "Disc Game",
+                vec![disk_entry("game", &disk_sha1('1'))],
+            )];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/game.chd",
+                disk_ref_for(0, &games[0], 0),
+                true,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert_eq!(resolutions[0].state, SetState::Complete);
+            assert_eq!(resolutions[0].disks_parent_required, vec!["game"]);
+        }
+
+        // 15: a mixed ROM+disk set is never emitted by the disk-only pass - it
+        // stays on the ROM-evidence path.
+        #[test]
+        fn mixed_rom_disk_set_is_not_emitted_by_disk_only_pass() {
+            let mut entry = game("Disc Game", vec![rom("game.cue", None)]);
+            entry.disks.push(DatDiskEntry {
+                name: Some("game".to_string()),
+                sha1: Some(disk_sha1('1')),
+                ..Default::default()
+            });
+            let games = vec![entry];
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/game.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            assert!(resolutions.is_empty());
+        }
+
+        // 16: a ROM-only set is never emitted by the disk-only pass.
+        #[test]
+        fn rom_only_set_is_not_emitted_by_disk_only_pass() {
+            let games = vec![game("Rom Game", vec![rom("game.bin", None)])];
+
+            let resolutions = classify_disk_only_sets(&[], true, &games, "collection");
+
+            assert!(resolutions.is_empty());
+        }
+
+        // 19: result ordering is deterministic (sorted by game name), never
+        // dependent on map iteration order.
+        #[test]
+        fn disk_only_results_are_deterministically_ordered() {
+            let games = vec![
+                disk_only_game("Zeta", vec![disk_entry("z", &disk_sha1('1'))]),
+                disk_only_game("Alpha", vec![disk_entry("a", &disk_sha1('2'))]),
+                disk_only_game("Mid", vec![disk_entry("m", &disk_sha1('3'))]),
+            ];
+            let disk_evidence = vec![
+                exact_disk_audit("/lib/z.chd", disk_ref_for(0, &games[0], 0), false),
+                exact_disk_audit("/lib/a.chd", disk_ref_for(1, &games[1], 0), false),
+                exact_disk_audit("/lib/m.chd", disk_ref_for(2, &games[2], 0), false),
+            ];
+
+            let resolutions = classify_disk_only_sets(&disk_evidence, true, &games, "collection");
+
+            let names: Vec<&str> = resolutions
+                .iter()
+                .map(|resolution| resolution.identity.game_name.as_str())
+                .collect();
+            assert_eq!(names, vec!["Alpha", "Mid", "Zeta"]);
         }
     }
 
