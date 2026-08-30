@@ -413,8 +413,6 @@ pub fn canonical_platform_for_romm_slug(slug: &str) -> Option<&'static str> {
     // slug, never a pattern.
     const ROMM_SLUG_ALIASES: &[(&str, &str)] = &[
         ("acpc", "Amstrad CPC"),
-        ("c-plus-4", "Commodore 64"),
-        ("c16", "Commodore 64"),
         ("cpc", "Amstrad CPC"),
         ("dc", "Dreamcast"),
         ("fds", "NES"),
@@ -646,5 +644,13 @@ mod tests {
             None,
             "a wildly negative timestamp must not panic or produce a bogus year"
         );
+    }
+
+    #[test]
+    fn c16_and_plus_four_slugs_remain_unresolved_without_canonical_rows() {
+        assert_eq!(canonical_platform_for_romm_slug("c16"), None);
+        assert_eq!(canonical_platform_for_romm_slug("c-plus-4"), None);
+        assert_eq!(canonical_platform_for_romm_slug("commodore-16"), None);
+        assert_eq!(canonical_platform_for_romm_slug("plus-4"), None);
     }
 }

@@ -86,6 +86,22 @@ fn classic_platforms_resolve_to_their_reviewed_romm_slugs() {
     }
 }
 
+#[test]
+fn commodore_64_resolves_to_its_exact_romm_slug() {
+    let overrides = FrontendPlatformMapping::default();
+    assert_eq!(
+        production_romm_slug("Commodore 64", &overrides, None),
+        Some("c64".to_string())
+    );
+    assert_eq!(
+        production_romm_status("Commodore 64", &overrides, None),
+        RommMappingSupportStatus::Mapped
+    );
+    let entry = static_table_entry("Commodore 64").expect("C64 has a reviewed mapping");
+    assert_eq!(entry.slug, Some("c64"));
+    assert!(entry.aliases.is_empty());
+}
+
 // ------------------------------------------------------------------
 // Consistency (section 6)
 // ------------------------------------------------------------------

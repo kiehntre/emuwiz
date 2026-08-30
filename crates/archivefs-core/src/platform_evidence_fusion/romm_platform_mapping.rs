@@ -278,12 +278,10 @@ const STATIC_TABLE: &[RommPlatformMapping] = &[
     },
     RommPlatformMapping {
         canonical_platform_id: "Commodore 64",
-        slug: None,
-        aliases: &["c-plus-4", "c16"],
-        status: RommMappingSupportStatus::Ambiguous,
-        provenance: "two distinct slugs observed (c-plus-4, c16) for the same canonical \
-                     platform, and both names reference different real Commodore models - \
-                     left unresolved rather than guessed",
+        slug: Some("c64"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM canonical Commodore 64 slug: c64; C16 and Plus/4 are separate systems",
     },
     RommPlatformMapping {
         canonical_platform_id: "Sega CD",
