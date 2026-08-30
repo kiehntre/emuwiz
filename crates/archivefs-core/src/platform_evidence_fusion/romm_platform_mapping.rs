@@ -99,6 +99,13 @@ pub struct RommPlatformMapping {
 /// value).
 const STATIC_TABLE: &[RommPlatformMapping] = &[
     RommPlatformMapping {
+        canonical_platform_id: "Amiga",
+        slug: Some("amiga"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM Supported Platforms: Commodore Amiga -> amiga",
+    },
+    RommPlatformMapping {
         canonical_platform_id: "Dreamcast",
         slug: Some("dc"),
         aliases: &[],
@@ -141,6 +148,13 @@ const STATIC_TABLE: &[RommPlatformMapping] = &[
         provenance: "single slug observed in ROMM_SLUG_ALIASES",
     },
     RommPlatformMapping {
+        canonical_platform_id: "NES",
+        slug: Some("nes"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM Supported Platforms: Nintendo Entertainment System -> nes",
+    },
+    RommPlatformMapping {
         canonical_platform_id: "Nintendo DS",
         slug: Some("nds"),
         aliases: &[],
@@ -176,6 +190,13 @@ const STATIC_TABLE: &[RommPlatformMapping] = &[
         provenance: "RomM 5.0 Supported Platforms: PlayStation Portable -> psp",
     },
     RommPlatformMapping {
+        canonical_platform_id: "PS2",
+        slug: Some("ps2"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM Supported Platforms: PlayStation 2 -> ps2",
+    },
+    RommPlatformMapping {
         canonical_platform_id: "PS3",
         slug: Some("ps3"),
         aliases: &[],
@@ -195,6 +216,13 @@ const STATIC_TABLE: &[RommPlatformMapping] = &[
         aliases: &[],
         status: RommMappingSupportStatus::Mapped,
         provenance: "single slug observed in ROMM_SLUG_ALIASES",
+    },
+    RommPlatformMapping {
+        canonical_platform_id: "Saturn",
+        slug: Some("saturn"),
+        aliases: &[],
+        status: RommMappingSupportStatus::Mapped,
+        provenance: "RomM Supported Platforms: Sega Saturn -> saturn",
     },
     RommPlatformMapping {
         canonical_platform_id: "SNES",

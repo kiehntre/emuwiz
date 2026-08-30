@@ -60,6 +60,32 @@ fn modern_console_targets_resolve_to_reviewed_romm_slugs() {
     }
 }
 
+#[test]
+fn classic_platforms_resolve_to_their_reviewed_romm_slugs() {
+    let overrides = FrontendPlatformMapping::default();
+    for (platform, slug) in [
+        ("NES", "nes"),
+        ("PS2", "ps2"),
+        ("Saturn", "saturn"),
+        ("Amiga", "amiga"),
+    ] {
+        assert_eq!(
+            static_table_entry(platform).and_then(|entry| entry.slug),
+            Some(slug),
+            "static RomM mapping missing for {platform}"
+        );
+        assert_eq!(
+            production_romm_slug(platform, &overrides, None),
+            Some(slug.to_string()),
+            "fallback RomM mapping missing for {platform}"
+        );
+        assert_eq!(
+            production_romm_status(platform, &overrides, None),
+            RommMappingSupportStatus::Mapped
+        );
+    }
+}
+
 // ------------------------------------------------------------------
 // Consistency (section 6)
 // ------------------------------------------------------------------
