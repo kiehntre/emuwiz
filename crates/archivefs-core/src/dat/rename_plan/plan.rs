@@ -2349,6 +2349,38 @@ mod tests {
         );
     }
 
+    // Regression: a disk-only set (a game declaring `<disk>`s and no `<rom>`s)
+    // is classified from whole-run CHD evidence, not a per-archive ROM pass,
+    // so it carries an empty `archive_path`. `derive_outer_archive_proposals`
+    // keys resolutions by that path and only ever emits a proposal for a real
+    // `.zip`/`.7z`/`.rar` archive whose own path is the lookup key, so a
+    // disk-only resolution must never manufacture an outer-archive rename -
+    // even when an unrelated archive on disk happens to share the set name.
+    #[test]
+    fn disk_only_set_with_empty_archive_path_produces_no_outer_archive_proposal() {
+        let dir = temp();
+        // A real, fully-audited archive that deliberately shares the disk-only
+        // set's game name: a name-based (rather than path-based) grouping bug
+        // would rename this to "Disk Only Game.zip".
+        let archive = write(dir.path(), "unrelated.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Disk Only Game", 1)];
+        out.sets = vec![set_resolution(
+            Path::new(""),
+            "Disk Only Game",
+            SetState::Complete,
+            0,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            !plan.proposals.iter().any(|proposal| proposal.is_outer_archive),
+            "a disk-only set must never produce an outer-archive rename proposal"
+        );
+    }
+
     #[test]
     fn multiple_sets_in_one_archive_produce_no_proposal() {
         let dir = temp();
