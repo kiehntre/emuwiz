@@ -630,6 +630,19 @@ fn adf_ofs_dos0_is_discovered_as_amiga_from_its_contents() {
     assert!(item.explanation.contains("OFS"));
     assert!(item.explanation.contains("DOS\\0"));
     assert_eq!(report.stats.amiga_images, 1);
+
+    // The `.adf` reached `inspect_amiga_floppy` and its
+    // `structural_amiga_floppy_observation` was produced on the discovery
+    // path: a Strong Amiga platform candidate, never a release.
+    assert_eq!(report.structural_evidence.len(), 1);
+    let evidence = &report.structural_evidence[0];
+    assert_eq!(evidence.path, item.path);
+    assert_eq!(
+        evidence.observation.platform_candidate.as_deref(),
+        Some("Amiga")
+    );
+    assert_eq!(evidence.observation.release_candidate, None);
+    assert_eq!(evidence.observation.hash_or_value, None);
 }
 
 #[test]
@@ -647,6 +660,16 @@ fn adf_ffs_dos1_is_discovered_as_amiga_with_the_ffs_family_named() {
     assert_eq!(item.validation_state, ValidationState::Accepted);
     assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
     assert!(item.explanation.contains("FFS"));
+
+    // The volume label is descriptive provenance in the structural
+    // observation's `notes` only - never a platform, release, or hash.
+    assert_eq!(report.structural_evidence.len(), 1);
+    let observation = &report.structural_evidence[0].observation;
+    assert_eq!(observation.platform_candidate.as_deref(), Some("Amiga"));
+    assert_eq!(observation.release_candidate, None);
+    let notes = observation.notes.as_deref().unwrap_or_default();
+    assert!(notes.contains("FastFileDisk"), "{notes}");
+    assert!(notes.contains("FFS"), "{notes}");
 }
 
 /// Requirement 4: random/unrelated content named like an Amiga game must
@@ -674,6 +697,9 @@ fn random_content_named_like_an_amiga_game_gets_no_amiga_structural_evidence() {
     assert!(!item.explanation.contains("OFS"));
     assert!(!item.explanation.contains("FFS"));
     assert_eq!(report.stats.amiga_images, 1); // still categorised as an Amiga-image attempt
+    // No structural observation is produced from a `.adf` that did not
+    // validate through the OFS/FFS reader.
+    assert!(report.structural_evidence.is_empty());
 }
 
 #[test]
@@ -694,6 +720,124 @@ fn zip_and_truncated_files_renamed_adf_fail_closed() {
             Some(SkipReason::InvalidContent(_))
         ));
     }
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// The `.adf` extension is shared with Acorn ADFS / Archimedes. A file
+/// whose bytes carry no AmigaDOS boot signature must never be classified
+/// Amiga and must produce no Amiga structural evidence - the existing
+/// Acorn-first / fail-closed behaviour is unchanged, it just now also
+/// gates the structural observation.
+#[test]
+fn acorn_adfs_style_adf_is_never_amiga_and_yields_no_structural_evidence() {
+    let dir = source_dir("adf-acorn");
+    // No `DOS` identifier - the shape `amiga_disk::tests` uses for a
+    // non-Amiga `.adf`.
+    let mut acorn = vec![0u8; 2048];
+    acorn[..8].copy_from_slice(b"Hugo\0\0\0\0");
+    std::fs::write(dir.path().join("Zarch (1987).adf"), &acorn).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_ne!(item.validation_state, ValidationState::Accepted);
+    assert!(
+        report.structural_evidence.is_empty(),
+        "an Acorn-style .adf must not enter the Amiga lineage: {:?}",
+        report.structural_evidence
+    );
+}
+
+/// A `.adf` with a real `DOS\x0N` boot signature but a corrupt root block
+/// fails closed at the OFS/FFS reader: refused, and no structural
+/// observation.
+#[test]
+fn malformed_root_block_adf_fails_closed_with_no_structural_evidence() {
+    let dir = source_dir("adf-bad-root");
+    let mut img = minimal_flat_adf(1, b"Broken");
+    let root = 64 * 512; // SECTORS/2 * 512, matching `minimal_flat_adf`
+    img[root..root + 4].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+    std::fs::write(dir.path().join("Broken.adf"), &img).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// A random blob of the same size as a real floppy image, named `.adf`:
+/// refused, no structural evidence.
+#[test]
+fn random_same_size_adf_is_refused_with_no_structural_evidence() {
+    let dir = source_dir("adf-random-samesize");
+    let blob = vec![0x5Au8; 128 * 512];
+    std::fs::write(dir.path().join("Lemmings.adf"), &blob).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_ne!(item.validation_state, ValidationState::Accepted);
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(report.structural_evidence.is_empty());
+}
+
+/// End-to-end: a loose `.adf` placed in a source folder reaches
+/// `inspect_amiga_floppy` during ordinary `discover_source`, and the
+/// resulting `structural_amiga_floppy_observation` is carried on the
+/// report keyed to that exact file.
+#[test]
+fn loose_adf_discovery_reaches_the_amiga_structural_parser() {
+    use crate::platform_evidence_fusion::evidence_lineage::{
+        ClaimStrength, ClaimType, EvidenceChannel, Representation,
+    };
+
+    let dir = source_dir("adf-e2e");
+    let adf = dir.path().join("Agony.adf");
+    std::fs::write(&adf, minimal_flat_adf(3, b"AGONY")).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.structural_evidence.len(), 1);
+    let evidence = &report.structural_evidence[0];
+    assert_eq!(evidence.path, adf);
+    let observation = &evidence.observation;
+    assert_eq!(observation.claim, ClaimType::PlatformCandidate);
+    assert_eq!(observation.claim_strength, ClaimStrength::Strong);
+    assert_eq!(observation.platform_candidate.as_deref(), Some("Amiga"));
+    assert_eq!(observation.release_candidate, None);
+    assert_eq!(observation.hash_or_value, None);
+    assert_eq!(
+        observation.provenance.channel,
+        EvidenceChannel::LocalStructural
+    );
+    assert_eq!(
+        observation.provenance.representation,
+        Representation::StructuralMetadata
+    );
+}
+
+/// The `.hdf` content-inspection path is untouched by the `.adf` wiring:
+/// it is still accepted as an Amiga image, and it never routes through
+/// the floppy observation (structural evidence stays empty for it).
+#[test]
+fn hdf_discovery_is_unchanged_by_the_adf_structural_wiring() {
+    let dir = source_dir("hdf-unaffected");
+    std::fs::write(dir.path().join("Workbench.hdf"), minimal_amiga_hdf()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert!(item.explanation.contains("partition"));
+    assert!(
+        report.structural_evidence.is_empty(),
+        "the floppy observation path is `.adf`-only"
+    );
 }
 
 /// Every extension the content registry recognises must actually be

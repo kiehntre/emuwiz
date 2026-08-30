@@ -13,8 +13,9 @@ use super::container::{
 use super::content_registry::{ContentKind, content_kind_for_extension};
 use super::cue_bin::resolve_cue;
 use crate::ArchiveIdentity;
-use crate::amiga_disk::{self, AmigaDisk};
+use crate::amiga_disk::{self, AmigaDisk, structural_amiga_floppy_observation};
 use crate::identity_source::whdload::inspect_whdload_slave_file;
+use crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -268,12 +269,33 @@ impl SkipReasonCounts {
     }
 }
 
+/// One structural lineage observation produced during discovery, paired
+/// with the file it describes.
+///
+/// This is how a bytes-validated structural fact from discovery enters the
+/// existing identity pipeline
+/// ([`crate::platform_evidence_fusion::evidence_lineage`]) without discovery
+/// itself resolving identity. Currently only
+/// [`structural_amiga_floppy_observation`] for a `.adf` whose OFS/FFS
+/// structures validated - a `Strong` `Amiga` platform candidate, never an
+/// exact release (see that function's own contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredStructuralEvidence {
+    pub path: PathBuf,
+    pub observation: EvidenceObservation,
+}
+
 /// The full, read-only result of discovering one source folder.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SourceDiscoveryReport {
     pub items: Vec<GameDiscovery>,
     pub stats: DiscoveryStats,
     pub skip_reasons: SkipReasonCounts,
+    /// Structural lineage evidence gathered while classifying items - the
+    /// `.adf` content-inspection path's own
+    /// [`structural_amiga_floppy_observation`] output, one per validated
+    /// Amiga floppy. Empty when no such file was seen.
+    pub structural_evidence: Vec<DiscoveredStructuralEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +319,7 @@ pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryEr
     // and excluded from independent classification - see module docs.
     let mut consumed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut items = Vec::new();
+    let mut structural_evidence: Vec<DiscoveredStructuralEvidence> = Vec::new();
 
     for path in &files {
         if extension_lowercase(path).as_deref() != Some("cue") {
@@ -312,7 +335,7 @@ pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryEr
         if extension_lowercase(path).as_deref() == Some("cue") {
             continue; // already handled above
         }
-        items.push(discover_file(path, root));
+        items.push(discover_file(path, root, &mut structural_evidence));
     }
 
     let mut stats = DiscoveryStats::default();
@@ -327,6 +350,7 @@ pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryEr
         items,
         stats,
         skip_reasons,
+        structural_evidence,
     })
 }
 
@@ -422,14 +446,18 @@ fn discover_cue(cue_path: &Path, consumed: &mut BTreeSet<PathBuf>) -> GameDiscov
     }
 }
 
-fn discover_file(path: &Path, source_root: &Path) -> GameDiscovery {
+fn discover_file(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
     let container = detect_container(path, path.is_dir());
     match &container {
         ContainerKind::Folder(FolderRole::WhdloadInstall) => discover_whdload_folder(path),
         ContainerKind::Folder(FolderRole::ExtractedGame) => discover_extracted_folder(path),
         ContainerKind::Folder(FolderRole::Plain) => unreachable!("plain folders are recursed"),
         ContainerKind::Archive(format) => discover_archive(path, *format, source_root),
-        ContainerKind::DirectFile => discover_direct_file(path, source_root),
+        ContainerKind::DirectFile => discover_direct_file(path, source_root, structural_evidence),
     }
 }
 
@@ -553,7 +581,11 @@ fn discover_archive(path: &Path, format: ArchiveFormat, source_root: &Path) -> G
     }
 }
 
-fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
+fn discover_direct_file(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
     let Some(extension) = extension_lowercase(path) else {
         return skipped(
             path.to_path_buf(),
@@ -568,7 +600,7 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
         return discover_amiga_image(path, source_root);
     }
     if extension == "adf" {
-        return discover_amiga_floppy(path, source_root);
+        return discover_amiga_floppy(path, source_root, structural_evidence);
     }
     if matches!(extension.as_str(), "hdf" | "hdfx") {
         return discover_ambiguous_disk_image(path, source_root);
@@ -733,20 +765,37 @@ fn amiga_explanation(disk: &AmigaDisk) -> String {
 ///    visible with that platform, the Amiga claim withheld.
 /// 3. Neither -> refused with the structural failure explained; no Amiga
 ///    identity is produced from the `.adf` extension alone.
-fn discover_amiga_floppy(path: &Path, source_root: &Path) -> GameDiscovery {
+fn discover_amiga_floppy(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
     match amiga_disk::inspect_amiga_floppy(path) {
-        Ok(inspection) => GameDiscovery {
-            path: path.to_path_buf(),
-            container: ContainerKind::DirectFile,
-            content: Some(ContentKind::AmigaImage),
-            // Structural OFS/FFS validation is authoritative for the
-            // platform here, ahead of any filename or folder signal.
-            platform_hint: Some("Amiga".to_string()),
-            identity_candidate: identity_for(path, source_root),
-            validation_state: ValidationState::Accepted,
-            explanation: amiga_floppy_explanation(&inspection),
-            skip_reason: None,
-        },
+        Ok(inspection) => {
+            // The one production caller of `structural_amiga_floppy_observation`:
+            // the validated OFS/FFS inspection becomes a `Strong` `Amiga`
+            // platform candidate in the lineage pipeline. It is the
+            // authority for the platform hint here - ahead of any filename
+            // or folder signal - and it never asserts a release identity
+            // (see that function's contract; the volume label stays in its
+            // descriptive `notes` only).
+            let observation = structural_amiga_floppy_observation(&inspection);
+            let platform_hint = observation.platform_candidate.clone();
+            structural_evidence.push(DiscoveredStructuralEvidence {
+                path: path.to_path_buf(),
+                observation,
+            });
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::AmigaImage),
+                platform_hint,
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation: amiga_floppy_explanation(&inspection),
+                skip_reason: None,
+            }
+        }
         Err(error) => {
             let identity = identity_for(path, source_root);
             match &identity {
