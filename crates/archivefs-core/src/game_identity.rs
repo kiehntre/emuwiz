@@ -507,6 +507,10 @@ pub enum IdentityImageFormat {
     /// An extracted ScummVM game folder verified by the installed ScummVM
     /// detector. No archive or folder name is used as identity evidence.
     ScummVmDirectory,
+    /// A PS3 digital package whose fixed header was structurally validated.
+    /// This observes package identity only; it is not an installed or
+    /// directly runnable PS3 title.
+    Pkg,
     Deferred,
     Unsupported,
 }
@@ -851,6 +855,16 @@ fn inspect_game_identity_with_platform_trust(
         && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
     {
         inspect_ps3_directory_identity(&mut report);
+        return report;
+    }
+
+    if platform == IdentityPlatform::PlayStation3
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("pkg"))
+    {
+        inspect_direct_pkg(&mut report, trusted);
         return report;
     }
 
@@ -1578,6 +1592,41 @@ fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     };
     inspect_iso_source(report, &mut source, None, None);
     report.bytes_read = source.bytes_read;
+}
+
+fn inspect_direct_pkg(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    report.format = IdentityImageFormat::Pkg;
+    let fact = match crate::ps3_disc_evidence::observe_pkg_file(&report.archive_path, trusted) {
+        Ok(fact) => fact,
+        Err(message) => {
+            add_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    report.bytes_read = crate::ps3_disc_evidence::PKG_HEADER_BYTES as u64;
+    let Some(title_id) =
+        crate::ps3_disc_evidence::derive_title_id_from_content_id(&fact.content_id)
+            .filter(|value| valid_ps3_title_id(value))
+    else {
+        add_unavailable(
+            report,
+            IdentityStatus::Missing,
+            "valid PS3 PKG structure found, but its Content ID has no validated TITLE_ID",
+        );
+        return;
+    };
+    push_with_source(
+        report,
+        IdentityKind::Ps3TitleId,
+        IdentityStatus::Verified,
+        Some(title_id),
+        IdentityConfidence::StructuredMetadata,
+        None,
+        None,
+        "bounded PS3 PKG Content ID",
+        "verified from the PKG fixed header; package contents, installation, and release identity remain uninspected",
+    );
+    report.complete = true;
 }
 
 fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
@@ -6177,6 +6226,24 @@ mod tests {
         iso
     }
 
+    fn ps3_pkg(content_id: &str) -> Vec<u8> {
+        let total_size = 0x180_u64;
+        let mut pkg = vec![0_u8; total_size as usize];
+        pkg[..4].copy_from_slice(crate::ps3_disc_evidence::PKG_MAGIC);
+        pkg[4..6].copy_from_slice(&0x8000_u16.to_be_bytes());
+        pkg[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        pkg[8..12].copy_from_slice(&0x80_u32.to_be_bytes());
+        pkg[12..16].copy_from_slice(&1_u32.to_be_bytes());
+        pkg[16..20].copy_from_slice(&0x80_u32.to_be_bytes());
+        pkg[20..24].copy_from_slice(&1_u32.to_be_bytes());
+        pkg[24..32].copy_from_slice(&total_size.to_be_bytes());
+        pkg[32..40].copy_from_slice(&0x90_u64.to_be_bytes());
+        pkg[40..48].copy_from_slice(&0xf0_u64.to_be_bytes());
+        let content_id = content_id.as_bytes();
+        pkg[48..48 + content_id.len()].copy_from_slice(content_id);
+        pkg
+    }
+
     #[test]
     fn ps3_folder_resolves_title_id_from_content_and_bridge() {
         let directory = FixtureDir::new("ps3 – 日本語");
@@ -6229,6 +6296,50 @@ mod tests {
             inspect_game_identity(&filename_only, Some("PS3")).verified_ps3_title_id(),
             None
         );
+    }
+
+    #[test]
+    fn ps3_pkg_production_path_resolves_title_id_without_reading_payload() {
+        let directory = FixtureDir::new("ps3-pkg");
+        let path = write_fixture(
+            &directory,
+            "filename-does-not-matter.pkg",
+            &ps3_pkg("EP0102-NPEB00342_00-CONTENT0000DLPKG"),
+        );
+        let report = inspect_game_identity(&path, Some("PS3"));
+        assert_eq!(report.platform, IdentityPlatform::PlayStation3);
+        assert_eq!(report.format, IdentityImageFormat::Pkg);
+        assert_eq!(report.verified_ps3_title_id(), Some("NPEB00342"));
+        assert_eq!(
+            report.bytes_read,
+            crate::ps3_disc_evidence::PKG_HEADER_BYTES as u64
+        );
+        assert!(report.complete);
+        assert_eq!(
+            crate::detect_platform(&path, &directory.0).as_deref(),
+            Some("PS3")
+        );
+    }
+
+    #[test]
+    fn ps3_pkg_production_path_rejects_truncation_and_bad_structure() {
+        let directory = FixtureDir::new("ps3-pkg-invalid");
+        let truncated = write_fixture(&directory, "truncated.pkg", &[0x7f, b'P', b'K', b'G']);
+        assert_eq!(
+            inspect_game_identity(&truncated, Some("PS3")).verified_ps3_title_id(),
+            None
+        );
+
+        let mut bad_type = ps3_pkg("EP0102-NPEB00342_00-CONTENT0000DLPKG");
+        bad_type[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        let bad_type = write_fixture(&directory, "bad-type.pkg", &bad_type);
+        assert_eq!(
+            inspect_game_identity(&bad_type, Some("PS3")).verified_ps3_title_id(),
+            None
+        );
+
+        let filename_only = write_fixture(&directory, "NPEB00342.pkg", b"not a package");
+        assert_eq!(crate::detect_platform(&filename_only, &directory.0), None);
     }
 
     #[cfg(unix)]

@@ -81,6 +81,12 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "iso",
         kind: ArchiveKind::DirectGameImage,
     },
+    // PS3 digital packages are recognised as media, but platform identity is
+    // granted only by the bounded PKG header observer.
+    MediaFormat {
+        extension: "pkg",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "pbp",
         kind: ArchiveKind::DirectGameImage,

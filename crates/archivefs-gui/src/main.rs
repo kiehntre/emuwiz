@@ -21740,6 +21740,7 @@ fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'static str {
         | IdentityImageFormat::Xbe
         | IdentityImageFormat::ZipContainingXbe
         | IdentityImageFormat::XboxDiscImage
+        | IdentityImageFormat::Pkg
         | IdentityImageFormat::ScummVmDirectory
         | IdentityImageFormat::Pbp
         | IdentityImageFormat::Unsupported => "This file",

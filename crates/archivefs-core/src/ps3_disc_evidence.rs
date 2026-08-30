@@ -65,6 +65,7 @@ use crate::param_sfo::{MAX_SFO_BYTES, parse_param_sfo};
 use crate::ps3_boot_evidence::{
     Ps3LayoutObservation, check_eboot_self_magic, observe_ps3_evidence,
 };
+use crate::safe_read::{TrustedRoots, open_bounded_read};
 
 /// Bounded read for `EBOOT.BIN`'s SELF-magic check - only the leading bytes
 /// are ever read, never the whole (often multi-megabyte) executable.
@@ -266,6 +267,68 @@ pub fn parse_pkg_header(header: &[u8]) -> Option<PkgHeaderFact> {
         data_size: u64_at(PKG_DATA_SIZE_OFFSET),
         content_id,
     })
+}
+
+/// Observes a direct PKG file without opening its metadata table or payload.
+/// The fixed header is accepted only when its PS3 package fields and declared
+/// byte ranges agree with the actual file length. This is the production gate
+/// for PKG platform/identity evidence; [`parse_pkg_header`] remains the small,
+/// in-memory field parser used by focused tests and callers with an already
+/// bounded header.
+pub fn observe_pkg_file(path: &Path, trusted: &TrustedRoots) -> Result<PkgHeaderFact, String> {
+    let mut file = open_bounded_read(path, trusted).map_err(|refusal| refusal.detail())?;
+    let length = file.len();
+    let header = file
+        .read_exact_at(0, PKG_HEADER_BYTES, PKG_HEADER_BYTES)
+        .ok_or_else(|| "PKG file is shorter than its fixed header".to_string())?;
+    let fact = parse_pkg_header(&header)
+        .ok_or_else(|| "PKG magic or fixed header is invalid".to_string())?;
+    validate_pkg_header(&fact, length)?;
+    Ok(fact)
+}
+
+fn validate_pkg_header(fact: &PkgHeaderFact, file_length: u64) -> Result<(), String> {
+    if fact.revision != 0x8000 {
+        return Err(format!(
+            "unsupported PS3 PKG revision 0x{:04x}",
+            fact.revision
+        ));
+    }
+    if fact.package_type != 0x0001 {
+        return Err(format!(
+            "unsupported PS3 PKG type 0x{:04x}",
+            fact.package_type
+        ));
+    }
+    if fact.item_count == 0 {
+        return Err("PS3 PKG contains no declared items".to_string());
+    }
+    if fact.total_size != file_length || fact.total_size < PKG_HEADER_BYTES as u64 {
+        return Err("PS3 PKG declared size does not match the file".to_string());
+    }
+    if fact.header_size < PKG_HEADER_BYTES as u32 || fact.header_size as u64 > fact.total_size {
+        return Err("PS3 PKG header size is outside the package".to_string());
+    }
+    let data_end = fact
+        .data_offset
+        .checked_add(fact.data_size)
+        .ok_or_else(|| "PS3 PKG data range overflows".to_string())?;
+    if fact.data_offset < fact.header_size as u64 || data_end > fact.total_size {
+        return Err("PS3 PKG data range is outside the package".to_string());
+    }
+    if fact.metadata_count != 0 {
+        let metadata_end = (fact.metadata_offset as u64)
+            .checked_add(
+                (fact.metadata_count as u64)
+                    .checked_mul(0x10)
+                    .ok_or_else(|| "PS3 PKG metadata range overflows".to_string())?,
+            )
+            .ok_or_else(|| "PS3 PKG metadata range overflows".to_string())?;
+        if fact.metadata_offset < fact.header_size || metadata_end > fact.total_size {
+            return Err("PS3 PKG metadata range is outside the package".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Sony's Content ID grammar (documented across the PS3/PSN developer

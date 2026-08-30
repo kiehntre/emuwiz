@@ -755,6 +755,25 @@ fn structural_format_evidence(
 ) -> Vec<DetectionEvidence> {
     use crate::disk_format::{DiskFormatContext, inspect_disk_format};
 
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("pkg"))
+    {
+        if let Ok(fact) = crate::ps3_disc_evidence::observe_pkg_file(path, trusted) {
+            return vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform: "PS3",
+                detail: format!(
+                    "PS3 PKG fixed header and declared ranges validated ({} item(s))",
+                    fact.item_count
+                ),
+            }];
+        }
+        return Vec::new();
+    }
+
     let inspected = inspect_disk_format(
         path,
         trusted,

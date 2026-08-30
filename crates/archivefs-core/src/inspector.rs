@@ -121,6 +121,7 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "gdi", "cdi", "pbp", "ecm", "xbe",
     "xex", "jag", "lyx", "atr", "atx", "xfd", "st", "stx", "msa",
     // Apple II and Macintosh media/archive extensions.
+    "pkg",
     "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
     // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",

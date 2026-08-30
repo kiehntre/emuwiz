@@ -204,6 +204,9 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("z80", ContentKind::MachineSnapshot),
     cf("sna", ContentKind::MachineSnapshot),
     cf("szx", ContentKind::MachineSnapshot),
+    // A PKG is a digital package, not an installed PS3 game folder or disc
+    // image. Its platform is established only by bounded header evidence.
+    cf("pkg", ContentKind::Archive),
 ];
 
 const fn cf(extension: &'static str, kind: ContentKind) -> ContentFormat {

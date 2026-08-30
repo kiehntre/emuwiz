@@ -707,6 +707,9 @@ fn discover_direct_file(
     if extension == "pbp" {
         return discover_pbp(path, source_root);
     }
+    if extension == "pkg" {
+        return discover_ps3_pkg(path, source_root);
+    }
 
     let Some(content) = content_kind_for_extension(&extension) else {
         if extension == "bin" {
@@ -855,6 +858,27 @@ fn discover_pbp(path: &Path, source_root: &Path) -> GameDiscovery {
             explanation: "Valid PBP container, but PSP and PS1 Classics are both possible and no platform corroboration was found.".to_string(),
             skip_reason: Some(SkipReason::AmbiguousPlatform),
         },
+    }
+}
+
+fn discover_ps3_pkg(path: &Path, source_root: &Path) -> GameDiscovery {
+    match crate::ps3_disc_evidence::observe_pkg_file(path, &crate::safe_read::TrustedRoots::none())
+    {
+        Ok(_) => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::Archive,
+            identity_for(path, source_root),
+            "PS3 digital package (bounded PKG header validated; contents were not extracted)."
+                .to_string(),
+        ),
+        Err(error) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Archive),
+            SkipReason::InvalidContent(error),
+            "This .pkg file did not pass the bounded PS3 package-header checks.".to_string(),
+        ),
     }
 }
 
