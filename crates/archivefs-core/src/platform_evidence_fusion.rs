@@ -263,6 +263,16 @@ pub const RULES: &[FusionRule] = &[
         }],
         explanation: "the `PC-FX:Hu_CD-ROM` boot-sector magic at the start of the first data track is PC-FX-specific strong evidence on its own - the exact string Mednafen's own PC-FX core checks in `TestMagicCD()` (see crate::pcfx_boot_evidence)",
     },
+    FusionRule {
+        id: "pcengine_cd_ipl_signature",
+        platform: "PC Engine CD",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "PC Engine CD-ROM SYSTEM",
+            min_confidence: STRONG,
+        }],
+        explanation: "the `PC Engine CD-ROM SYSTEM` IPL boot-record signature at offset 32 of the first data track's second sector is PC Engine CD/TurboGrafx-CD-specific strong evidence (layout verified against RetroAchievements rcheevos and the Hudson Hu7 CD System BIOS manual - see crate::pcengine_cd_boot_evidence); it shares no value with the PC-FX `PC-FX:Hu_CD-ROM` string",
+    },
     // -- Sega 8-bit family: magic alone is Family-scope; region-confirmed
     //    resolves to one of the two systems it names --
     FusionRule {

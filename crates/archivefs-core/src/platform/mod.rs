@@ -1324,6 +1324,9 @@ pub const PLATFORMS: &[Platform] = &[
             "pcecd",
             "turbografxcdrom",
             "necturbografxcd",
+            "cdrom2",
+            "supercdrom2",
+            "turboduo",
         ],
         filename_aliases: &[],
         strong_extensions: &[],
@@ -1332,7 +1335,7 @@ pub const PLATFORMS: &[Platform] = &[
         layout: &[],
         conflicts_with: &["PC Engine", "Sega CD", "PSX"],
         preferred_emulator: None,
-        explanation: "A CD-ROM² title shares every disc extension with other CD systems, so folder or cue-sheet context is what identifies it. Never merged with cartridge PC Engine.",
+        explanation: "A CD-ROM² title shares every disc extension with other CD systems, so folder or cue-sheet context is what identifies it - or the disc's own `PC Engine CD-ROM SYSTEM` IPL signature. Never merged with cartridge PC Engine.",
     },
     Platform {
         id: "PC-FX",

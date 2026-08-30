@@ -30,6 +30,9 @@ use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use crate::param_sfo::parse_param_sfo;
+use crate::pcengine_cd_boot_evidence::{
+    PCE_CD_IPL_HEADER_BYTES, PCE_CD_IPL_SECTOR_OFFSET, parse_pce_cd_ipl,
+};
 use crate::pcfx_boot_evidence::{
     PCFX_BOOT_SECTOR_BYTES, PCFX_VOLUME_HEADER_BYTES, parse_pcfx_boot_sector,
     parse_pcfx_volume_header, pcfx_disc_hash,
@@ -214,6 +217,11 @@ pub enum IdentityKind {
     /// volume identifier, root unique identifier, and declared block count.
     /// These are on-disc fields, not a filename or title-database lookup.
     ThreeDoDiscId,
+    /// The PC Engine CD-ROM² / TurboGrafx-CD IPL boot-record signature was
+    /// present and structurally valid. Platform/media evidence only - it
+    /// carries no serial, title or release identity (the IPL header has
+    /// none). Exact game identity stays DAT/hash-driven.
+    PceCdBootStructure,
     /// The established PC-FX custom disc-identification hash. It is derived
     /// from PC-FX sector/header/boot content, never from a filename.
     PcfxDiscHash,
@@ -244,6 +252,7 @@ impl fmt::Display for IdentityKind {
             Self::XexMediaId => "Xbox 360 Media ID",
             Self::ScummVmGameId => "ScummVM game ID",
             Self::ThreeDoDiscId => "3DO disc identity",
+            Self::PceCdBootStructure => "PC Engine CD boot structure",
             Self::PcfxDiscHash => "PC-FX disc hash",
         };
         f.write_str(value)
@@ -284,6 +293,7 @@ pub enum IdentityPlatform {
     ScummVM,
     ThreeDo,
     Pcfx,
+    PcEngineCd,
     Other,
 }
 
@@ -319,6 +329,25 @@ impl IdentityPlatform {
             "scummvm" | "scumm vm" => Self::ScummVM,
             "3do" | "panasonic 3do" | "3do interactive multiplayer" => Self::ThreeDo,
             "pc-fx" | "pcfx" | "nec pc-fx" | "nec pcfx" => Self::Pcfx,
+            "pc engine cd"
+            | "pcenginecd"
+            | "pc-engine cd"
+            | "nec pc engine cd"
+            | "turbografx-cd"
+            | "turbografx cd"
+            | "turbografxcd"
+            | "turbografx-cd-rom"
+            | "tgcd"
+            | "tg-cd"
+            | "pc engine cd-rom\u{b2}"
+            | "pc engine cd-rom2"
+            | "cd-rom\u{b2}"
+            | "cd-rom2"
+            | "cdrom2"
+            | "super cd-rom\u{b2}"
+            | "super cd-rom2"
+            | "turbo duo"
+            | "turboduo" => Self::PcEngineCd,
             _ => Self::Other,
         }
     }
@@ -346,6 +375,7 @@ impl IdentityPlatform {
             Self::ScummVM => "ScummVM",
             Self::ThreeDo => "3DO",
             Self::Pcfx => "PC-FX",
+            Self::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
             Self::Other => "Unsupported platform",
         }
     }
@@ -591,6 +621,15 @@ impl GameIdentityReport {
     pub fn verified_threedo_disc_id(&self) -> Option<&str> {
         self.verified_value(IdentityKind::ThreeDoDiscId)
     }
+
+    /// The PC Engine CD-ROM² / TurboGrafx-CD IPL boot-record was found and
+    /// structurally valid on the disc's first data track. The returned
+    /// value is the fixed signature string, not a serial or title - PC
+    /// Engine CD carries no release identity in its boot record, so exact
+    /// game identity still comes from DAT/hash matching.
+    pub fn verified_pcengine_cd_boot_structure(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::PceCdBootStructure)
+    }
 }
 
 pub fn inspect_game_identity(path: &Path, platform_hint: Option<&str>) -> GameIdentityReport {
@@ -749,6 +788,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::SegaCd
                     | IdentityPlatform::ThreeDo
                     | IdentityPlatform::Pcfx
+                    | IdentityPlatform::PcEngineCd
             ) =>
         {
             inspect_cue(&mut report, trusted);
@@ -784,6 +824,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::SegaCd
                     | IdentityPlatform::ThreeDo
                     | IdentityPlatform::Pcfx
+                    | IdentityPlatform::PcEngineCd
             ) =>
         {
             inspect_disc_chd(&mut report, trusted);
@@ -1397,6 +1438,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::ScummVM
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Pcfx
+        | IdentityPlatform::PcEngineCd
         | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
     };
     let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
@@ -2438,6 +2480,9 @@ fn inspect_iso_source(
             inspect_threedo_source(report, source, member_path, member_index)
         }
         IdentityPlatform::Pcfx => inspect_pcfx_source(report, source, member_path, member_index),
+        IdentityPlatform::PcEngineCd => {
+            inspect_pcengine_cd_source(report, source, member_path, member_index)
+        }
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             inspect_dolphin_header(report, source, member_path, member_index, 0)
         }
@@ -3096,6 +3141,94 @@ fn inspect_pcfx_source(
         member_index,
         "PC-FX documented custom disc hash",
         "hash covers sector-zero signature bytes, the sector-one volume header, and header-directed boot sectors",
+    );
+    report.bytes_read = report.bytes_read.max(source.bytes_read());
+    report.complete = true;
+}
+
+/// PC Engine CD-ROM² / TurboGrafx-CD structural identity from the IPL
+/// boot-record in the first data track's second sector (LBA 1). The only
+/// authority is the fixed `PC Engine CD-ROM SYSTEM` signature at offset 32
+/// plus a self-consistent boot-program pointer; no serial, title or region is
+/// read. All reads are bounded and use the shared logical-media source.
+fn inspect_pcengine_cd_source(
+    report: &mut GameIdentityReport,
+    source: &mut dyn ByteSource,
+    member_path: Option<Vec<u8>>,
+    member_index: Option<usize>,
+) {
+    let mut ipl_record = [0_u8; PCE_CD_IPL_HEADER_BYTES];
+    if let Err(error) = source.read_exact_at(PCE_CD_IPL_SECTOR_OFFSET, &mut ipl_record) {
+        push_with_source(
+            report,
+            IdentityKind::PceCdBootStructure,
+            source_error_status(&error),
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC Engine CD IPL boot-record bounded read",
+            &error.to_string(),
+        );
+        return;
+    }
+    let Some(fact) = parse_pce_cd_ipl(&ipl_record) else {
+        push_with_source(
+            report,
+            IdentityKind::PceCdBootStructure,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC Engine CD IPL signature validation",
+            "the first data track's second sector has no `PC Engine CD-ROM SYSTEM` IPL signature at offset 32",
+        );
+        return;
+    };
+    let Some(boot_span) = fact.boot_span_bytes() else {
+        push_with_source(
+            report,
+            IdentityKind::PceCdBootStructure,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC Engine CD IPL boot-span arithmetic",
+            "the declared boot-program span overflows",
+        );
+        return;
+    };
+    if boot_span > source.len() {
+        push_with_source(
+            report,
+            IdentityKind::PceCdBootStructure,
+            IdentityStatus::Invalid,
+            None,
+            IdentityConfidence::Unavailable,
+            member_path,
+            member_index,
+            "PC Engine CD IPL boot-span validation",
+            "the IPL boot-record points its boot program past the end of the readable data track",
+        );
+        return;
+    }
+    push_with_source(
+        report,
+        IdentityKind::PceCdBootStructure,
+        IdentityStatus::Verified,
+        Some("PC Engine CD-ROM SYSTEM".to_string()),
+        IdentityConfidence::StructuredMetadata,
+        member_path,
+        member_index,
+        "PC Engine CD-ROM² IPL boot-record",
+        &format!(
+            "IPL signature present at offset 32 of the data track's second sector; boot program \
+             {} sector(s) from sector {} lies within the image. Structural platform/media \
+             evidence only - exact game identity comes from a DAT/hash match.",
+            fact.boot_sector_count, fact.boot_start_sector
+        ),
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -4182,6 +4315,22 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         return;
     }
 
+    if report.platform == IdentityPlatform::PcEngineCd {
+        // PC Engine CD discs predate ISO 9660, so use the bounded raw data
+        // track reader and the same IPL inspection as ISO/CUE inputs.
+        let media = match open_chd_raw_track(&bytes) {
+            Ok(media) => media,
+            Err(refusal) => {
+                push_disc_chd_refusal(report, &refusal);
+                return;
+            }
+        };
+        let mut source = MediaSource::new(media);
+        inspect_pcengine_cd_source(report, &mut source, None, None);
+        report.bytes_read = report.bytes_read.max(source.bytes_read());
+        return;
+    }
+
     let (media, filesystem) = match open_chd_iso9660(&bytes) {
         Ok(pair) => pair,
         Err(refusal) => {
@@ -4554,6 +4703,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
             IdentityPlatform::Dreamcast => IdentityKind::DreamcastProductCode,
             IdentityPlatform::SegaCd => IdentityKind::SegaCdProductCode,
             IdentityPlatform::ThreeDo => IdentityKind::ThreeDoDiscId,
+            IdentityPlatform::PcEngineCd => IdentityKind::PceCdBootStructure,
             IdentityPlatform::Pcfx => IdentityKind::PcfxDiscHash,
             _ => IdentityKind::Ps1Serial,
         },
@@ -5042,6 +5192,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
         IdentityPlatform::ThreeDo => &[IdentityKind::ThreeDoDiscId],
         IdentityPlatform::Pcfx => &[IdentityKind::PcfxDiscHash],
+        IdentityPlatform::PcEngineCd => &[IdentityKind::PceCdBootStructure],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -5243,6 +5394,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::Xbox
         | IdentityPlatform::ScummVM
         | IdentityPlatform::Pcfx
+        | IdentityPlatform::PcEngineCd
         | IdentityPlatform::ThreeDo
         | IdentityPlatform::Other => {}
     }
@@ -9761,6 +9913,97 @@ mod tests {
         let report = inspect_catalogued_game_identity(&path, None);
         assert_ne!(report.platform, IdentityPlatform::Pcfx);
         assert_eq!(report.verified_pcfx_disc_hash(), None);
+    }
+
+    // --- PC Engine CD / TurboGrafx-CD ---------------------------------
+    fn pce_cd_image(start_sector: u32, count: u8, seed: u8) -> Vec<u8> {
+        use crate::pcengine_cd_boot_evidence::{PCE_CD_SIGNATURE, PCE_CD_SIGNATURE_OFFSET};
+        assert!(start_sector >= 2);
+        let total_sectors = (start_sector as usize + count as usize).max(8);
+        let mut image = vec![0_u8; total_sectors * 2048];
+        let ipl = 2048;
+        let start = start_sector.to_be_bytes();
+        image[ipl..ipl + 4].copy_from_slice(&[start[1], start[2], start[3], count]);
+        image
+            [ipl + PCE_CD_SIGNATURE_OFFSET..ipl + PCE_CD_SIGNATURE_OFFSET + PCE_CD_SIGNATURE.len()]
+            .copy_from_slice(PCE_CD_SIGNATURE);
+        image[ipl + 106..ipl + 122].copy_from_slice(b"MISLEADING TITLE");
+        for (index, byte) in image[start_sector as usize * 2048..].iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        image
+    }
+
+    fn pce_cd_chd(image: &[u8]) -> Vec<u8> {
+        uncompressed_mode1_raw_chd(image)
+    }
+
+    #[test]
+    fn pce_cd_raw_iso_cue_and_supported_chd_reach_structural_identity() {
+        let directory = FixtureDir::new("pce-cd-valid");
+        let image = pce_cd_image(2, 4, 0x40);
+        let iso = write_fixture(&directory, "Some Turbo Game.iso", &image);
+        let iso_report = inspect_catalogued_game_identity(&iso, Some("PC Engine CD"));
+        assert_eq!(iso_report.platform, IdentityPlatform::PcEngineCd);
+        assert_eq!(
+            iso_report.verified_pcengine_cd_boot_structure(),
+            Some("PC Engine CD-ROM SYSTEM")
+        );
+        assert!(iso_report.complete);
+
+        fs::write(directory.0.join("disc.bin"), &image).unwrap();
+        let cue = write_fixture(
+            &directory,
+            "renamed.cue",
+            b"FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        let cue_report = inspect_catalogued_game_identity(&cue, Some("TurboGrafx-CD"));
+        assert_eq!(
+            cue_report.verified_pcengine_cd_boot_structure(),
+            Some("PC Engine CD-ROM SYSTEM")
+        );
+
+        let chd = write_fixture(&directory, "disc.chd", &pce_cd_chd(&image));
+        let chd_report = inspect_catalogued_game_identity(&chd, Some("PC Engine CD"));
+        assert_eq!(
+            chd_report.verified_pcengine_cd_boot_structure(),
+            Some("PC Engine CD-ROM SYSTEM")
+        );
+    }
+
+    #[test]
+    fn pce_cd_invalid_content_fails_closed_and_never_uses_filename() {
+        let directory = FixtureDir::new("pce-cd-invalid");
+        let random = write_fixture(&directory, "Ys PC Engine CD.iso", &vec![0x5A_u8; 64 * 1024]);
+        let report = inspect_catalogued_game_identity(&random, Some("PC Engine CD"));
+        assert_eq!(report.verified_pcengine_cd_boot_structure(), None);
+        assert!(!report.complete);
+
+        let mut image = pce_cd_image(2, 2, 0x11);
+        image[2048 + 3] = 250;
+        let path = write_fixture(&directory, "oob.iso", &image);
+        let report = inspect_catalogued_game_identity(&path, Some("PC Engine CD"));
+        assert_eq!(report.verified_pcengine_cd_boot_structure(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn other_optical_signatures_do_not_cross_resolve_to_pc_engine_cd() {
+        let directory = FixtureDir::new("pce-cd-cross-platform");
+        for (name, bytes) in [
+            ("saturn.iso", saturn_iso(b"T-7101G")),
+            ("segacd.iso", sega_cd_iso(b"GM T-12345 -00")),
+            ("pcfx.iso", pcfx_fixture(2, 2, 0x31)),
+            (
+                "ps1.iso",
+                ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true),
+            ),
+        ] {
+            let path = write_fixture(&directory, name, &bytes);
+            let report = inspect_catalogued_game_identity(&path, Some("PC Engine CD"));
+            assert_eq!(report.verified_pcengine_cd_boot_structure(), None, "{name}");
+            assert!(!report.complete, "{name}");
+        }
     }
 }
 

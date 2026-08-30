@@ -157,6 +157,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::ScummVM => Some("ScummVM"),
         IdentityPlatform::ThreeDo => Some("3DO"),
         IdentityPlatform::Pcfx => Some("PC-FX"),
+        IdentityPlatform::PcEngineCd => Some("PC Engine CD"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
         IdentityPlatform::Other => None,
@@ -336,6 +337,11 @@ fn resolved_identity_for_platform(
                 vec![VerifiedIdentityFact::PcfxDiscHash(disc_hash.to_string())],
             ))
         }
+        // PC Engine CD's IPL boot-record carries no serial/title, so there
+        // is no resolvable game key here - exact identity is DAT/hash-driven.
+        // The platform is still known (via `launch_platform_id`), so a
+        // launcher can pick an emulator; identity simply stays `Unknown`.
+        IdentityPlatform::PcEngineCd => None,
         IdentityPlatform::Other => None,
     }
 }

@@ -483,6 +483,15 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation_provenance: None,
         dat_validation: None,
     },
+    PlatformEvidenceCoverage {
+        canonical_id: "PC Engine CD",
+        detector_modules: &["pcengine_cd_boot_evidence"],
+        normalization: false,
+        real_validation: ValidationStatus::SyntheticValidated,
+        notes: "IPL boot-record layout verified against two independent sources (RetroAchievements rcheevos hash_disc.c and the Hudson Hu7 CD System BIOS manual); parser + inspect_pcengine_cd_source proven against synthetic fixtures for raw ISO/CUE and the track-1 single-track CHD path - no real PC Engine CD specimen recorded as validated in this project's history",
+        real_validation_provenance: None,
+        dat_validation: None,
+    },
 ];
 
 /// The number of canonical platforms in [`crate::platform::PLATFORMS`] -

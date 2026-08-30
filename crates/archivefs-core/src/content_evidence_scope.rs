@@ -272,6 +272,11 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         scope: EvidenceScope::PlatformSpecific("PC-FX"),
     },
     ScopeEntry {
+        kind: BootStructure,
+        value: "PC Engine CD-ROM SYSTEM",
+        scope: EvidenceScope::PlatformSpecific("PC Engine CD"),
+    },
+    ScopeEntry {
         kind: ContentSignature,
         value: "XBEH",
         scope: EvidenceScope::PlatformSpecific("Xbox"),

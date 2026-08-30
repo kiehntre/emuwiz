@@ -112,6 +112,40 @@ fn pcfx_boot_signature_alone_resolves_to_canonical_pcfx() {
 }
 
 #[test]
+fn pcengine_cd_ipl_signature_alone_resolves() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "PC Engine CD-ROM SYSTEM")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("PC Engine CD"));
+    assert!(
+        explanation
+            .fired_candidates
+            .iter()
+            .any(|candidate| candidate.rule_id == "pcengine_cd_ipl_signature"
+                && candidate.has_strong_leg)
+    );
+}
+
+#[test]
+fn pcengine_cd_ipl_below_strong_confidence_does_not_resolve() {
+    let explanation =
+        fuse_platform_evidence([corroborated(BootStructure, "PC Engine CD-ROM SYSTEM")]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    assert_ne!(explanation.resolved_platform, Some("PC Engine CD"));
+}
+
+#[test]
+fn the_pcfx_signature_never_resolves_to_pc_engine_cd() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "PC-FX:Hu_CD-ROM")]);
+    assert_ne!(explanation.resolved_platform, Some("PC Engine CD"));
+}
+
+#[test]
+fn unrelated_optical_evidence_does_not_resolve_to_pc_engine_cd() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "SEGA SEGASATURN")]);
+    assert_ne!(explanation.resolved_platform, Some("PC Engine CD"));
+}
+
+#[test]
 fn pcfx_boot_magic_below_strong_confidence_does_not_resolve() {
     // The rule requires the Strong tier that `pcfx_boot_evidence` actually
     // emits; anything weaker stays unresolved rather than guessing PC-FX.

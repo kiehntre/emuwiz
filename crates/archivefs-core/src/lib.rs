@@ -268,6 +268,10 @@ pub mod pcfx_boot_evidence;
 /// Pure, read-only Neo Geo CD boot/volume evidence.
 pub mod neogeocd_boot_evidence;
 
+/// Pure, read-only PC Engine CD-ROM² / TurboGrafx-CD IPL boot-record
+/// evidence.
+pub mod pcengine_cd_boot_evidence;
+
 /// Shared, bounded cartridge-header primitives (ASCII field trimming,
 /// wrapping-sum checksums) reused across this crate's cartridge-header
 /// observers. Not a generic framework - each format still owns its own

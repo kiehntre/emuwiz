@@ -374,6 +374,9 @@ fn every_previously_supported_platform_and_alias_still_resolves() {
         ("pc9801", "NEC PC-9801"),
         ("pcenginecd", "PC Engine CD"),
         ("tgcd", "PC Engine CD"),
+        ("cdrom2", "PC Engine CD"),
+        ("supercdrom2", "PC Engine CD"),
+        ("turboduo", "PC Engine CD"),
         ("c128", "Commodore 128"),
         ("vic20", "VIC-20"),
         // libretro-database directory spellings.
