@@ -4815,6 +4815,13 @@ fn gather_doctor_scan() -> DoctorScan {
         },
         storage: Gathered::Ready(&storage),
         emulator_profiles: Gathered::Ready(&profile_report),
+        // Installation-form discovery walks bounded filesystem roots. The
+        // CLI Doctor scan remains diagnostics-only, so it reports this as
+        // not loaded rather than fabricating installation evidence or
+        // silently performing an additional discovery scan.
+        linux_emulator_installations: Gathered::NotLoaded(
+            "Linux emulator installation evidence has not been gathered in this CLI session.",
+        ),
         // Emulator launch-readiness assessment walks discovered install
         // directories, which is a scan. Doctor never starts one from the
         // CLI (the same reason RetroArch discovery above is NotLoaded).
