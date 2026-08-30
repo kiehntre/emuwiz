@@ -81,6 +81,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     // --- Nintendo ---
     cf("nes", ContentKind::RomCartridge),
     cf("unf", ContentKind::RomCartridge),
+    cf("fds", ContentKind::ComputerDisk),
     cf("smc", ContentKind::RomCartridge),
     cf("sfc", ContentKind::RomCartridge),
     cf("gb", ContentKind::RomCartridge),
@@ -203,6 +204,14 @@ mod tests {
     fn cue_and_bin_are_never_registered_here() {
         assert_eq!(content_kind_for_extension("cue"), None);
         assert_eq!(content_kind_for_extension("bin"), None);
+    }
+
+    #[test]
+    fn fds_is_classified_as_a_computer_disk() {
+        assert_eq!(
+            content_kind_for_extension("fds"),
+            Some(ContentKind::ComputerDisk)
+        );
     }
 
     #[test]

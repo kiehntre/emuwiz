@@ -699,6 +699,18 @@ fn every_registered_content_extension_is_discovered_end_to_end() {
 }
 
 #[test]
+fn fds_is_discovered_as_nes_computer_disk_media() {
+    let root = source_dir("fds-discovery");
+    std::fs::write(root.path().join("game.fds"), b"raw FDS fixture").unwrap();
+    let report = discover_source(root.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item.platform_hint.as_deref(), Some("NES"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+}
+
+#[test]
 fn loose_commodore_disks_are_discovered_as_computer_disks() {
     let root = source_dir("commodore-disks");
     let dir = root.path().join("c128");

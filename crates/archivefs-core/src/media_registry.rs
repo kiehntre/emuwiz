@@ -240,6 +240,10 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "unf",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "fds",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // --- Nintendo DS ---
     MediaFormat {
         extension: "nds",
@@ -423,6 +427,14 @@ mod tests {
         );
         assert_eq!(
             kind_for_extension("unf"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn fds_is_recognized_as_a_direct_game_image() {
+        assert_eq!(
+            kind_for_extension("fds"),
             Some(ArchiveKind::DirectGameImage)
         );
     }

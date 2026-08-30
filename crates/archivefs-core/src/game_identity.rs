@@ -29,6 +29,7 @@ use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
+use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
 use crate::param_sfo::parse_param_sfo;
 use crate::pcengine_cd_boot_evidence::{
     PCE_CD_IPL_HEADER_BYTES, PCE_CD_IPL_SECTOR_OFFSET, parse_pce_cd_ipl,
@@ -222,6 +223,9 @@ pub enum IdentityKind {
     /// carries no serial, title or release identity (the IPL header has
     /// none). Exact game identity stays DAT/hash-driven.
     PceCdBootStructure,
+    /// Parsed iNES/NES 2.0 header metadata; exact release identity remains
+    /// authoritative only when established by DAT/hash evidence.
+    NesHeader,
     /// The established PC-FX custom disc-identification hash. It is derived
     /// from PC-FX sector/header/boot content, never from a filename.
     PcfxDiscHash,
@@ -253,6 +257,7 @@ impl fmt::Display for IdentityKind {
             Self::ScummVmGameId => "ScummVM game ID",
             Self::ThreeDoDiscId => "3DO disc identity",
             Self::PceCdBootStructure => "PC Engine CD boot structure",
+            Self::NesHeader => "NES header",
             Self::PcfxDiscHash => "PC-FX disc hash",
         };
         f.write_str(value)
@@ -856,6 +861,8 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Snes, "sfc") => Some("sfc"),
         (IdentityPlatform::Snes, "smc") => Some("smc"),
         (IdentityPlatform::Nes, "nes") => Some("nes"),
+        (IdentityPlatform::Nes, "fds") => Some("fds"),
+        (IdentityPlatform::Nes, "unf") => Some("unf"),
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
         (IdentityPlatform::GameBoyAdvance, "gba") => Some("gba"),
@@ -864,6 +871,28 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::N64, "n64") => Some("n64"),
         _ => None,
     }
+}
+
+/// Parses the existing iNES/NES 2.0 header detector from a loose `.nes`
+/// file, but only promotes it when the declared trainer/PRG/CHR payload fits
+/// within the physical file. The parser remains responsible for header
+/// decoding; this small file-bound check prevents truncated images from
+/// gaining production header evidence.
+fn inspect_nes_header(file: &mut File, file_len: u64) -> Option<InesHeaderFact> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut header = [0u8; INES_HEADER_BYTES];
+    file.read_exact(&mut header).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let fact = parse_ines_header(&header)?;
+    let trainer_bytes = if fact.trainer { 512_u64 } else { 0 };
+    let prg_bytes = u64::from(fact.prg_rom_16k_units).checked_mul(16 * 1024)?;
+    let chr_bytes = u64::from(fact.chr_rom_8k_units).checked_mul(8 * 1024)?;
+    let required = u64::try_from(INES_HEADER_BYTES)
+        .ok()?
+        .checked_add(trainer_bytes)?
+        .checked_add(prg_bytes)?
+        .checked_add(chr_bytes)?;
+    (required <= file_len).then_some(fact)
 }
 
 /// Whether a `.gb`-hinted cartridge's own header proves it cannot actually
@@ -953,6 +982,10 @@ fn inspect_loose_rom(
         );
         return;
     }
+    let mut nes_header = None;
+    if report.platform == IdentityPlatform::Nes && format == "nes" {
+        nes_header = inspect_nes_header(&mut file, before.len);
+    }
     let is_n64 = report.platform == IdentityPlatform::N64;
     let mut whole_file_bytes: Option<Vec<u8>> = None;
     let digest = if is_n64 {
@@ -1020,6 +1053,29 @@ fn inspect_loose_rom(
         "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim",
         "bounded full-file SHA-256",
     ));
+    if let Some(fact) = nes_header {
+        let header_format = if fact.is_nes20 { "NES 2.0" } else { "iNES" };
+        let diagnostic = format!(
+            "{header_format} header: mapper {}, submapper {}, PRG {} x16KiB, CHR {} x8KiB, trainer {}, battery {}, mirroring {:?}",
+            fact.mapper,
+            fact.submapper
+                .map_or_else(|| "none".to_string(), |value| value.to_string()),
+            fact.prg_rom_16k_units,
+            fact.chr_rom_8k_units,
+            fact.trainer,
+            fact.battery,
+            fact.mirroring,
+        );
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::NesHeader,
+            IdentityStatus::Verified,
+            Some(header_format.to_string()),
+            IdentityConfidence::StructuredMetadata,
+            &diagnostic,
+            "nes_header_evidence::parse_ines_header",
+        ));
+    }
     if let Some(bytes) = whole_file_bytes.as_deref() {
         push_n64_canonical_evidence(report, bytes);
     }
@@ -8180,6 +8236,72 @@ mod tests {
                 && item.diagnostic.contains("not a known-good dump claim")
         }));
         assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn valid_ines_header_reaches_production_identity_with_structured_facts() {
+        let directory = FixtureDir::new("ines-production");
+        let mut bytes = vec![0u8; 16 + 512 + 16 * 1024 + 8 * 1024];
+        bytes[0..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1;
+        bytes[5] = 1;
+        bytes[6] = 0x7f;
+        bytes[7] = 0x20;
+        let path = write_fixture(&directory, "Headered.nes", &bytes);
+
+        let report = inspect_catalogued_game_identity(&path, Some("NES"));
+        let header = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::NesHeader)
+            .expect("valid iNES header should be exposed in the production report");
+        assert_eq!(header.value.as_deref(), Some("iNES"));
+        assert!(header.diagnostic.contains("mapper 39"));
+        assert!(header.diagnostic.contains("trainer true"));
+        assert!(header.diagnostic.contains("battery true"));
+        assert!(header.diagnostic.contains("FourScreen"));
+    }
+
+    #[test]
+    fn valid_nes20_header_preserves_mapper_and_submapper_facts() {
+        let directory = FixtureDir::new("nes20-production");
+        let mut bytes = vec![0u8; 16 + 16 * 1024];
+        bytes[0..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1;
+        bytes[6] = 0x10;
+        bytes[7] = 0x08;
+        bytes[8] = 0x52;
+        let path = write_fixture(&directory, "Headered.nes", &bytes);
+
+        let report = inspect_catalogued_game_identity(&path, Some("NES"));
+        let header = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::NesHeader)
+            .expect("valid NES 2.0 header should be exposed");
+        assert_eq!(header.value.as_deref(), Some("NES 2.0"));
+        assert!(header.diagnostic.contains("mapper 513"));
+        assert!(header.diagnostic.contains("submapper 5"));
+    }
+
+    #[test]
+    fn malformed_nes_headers_and_unf_do_not_gain_ines_evidence() {
+        let directory = FixtureDir::new("nes-header-negative");
+        for (name, bytes) in [
+            ("wrong.nes", b"not an ines header".to_vec()),
+            ("truncated.nes", b"NES\x1a\x01".to_vec()),
+            ("unif.unf", b"UNIF\x00not an iNES header".to_vec()),
+        ] {
+            let path = write_fixture(&directory, name, &bytes);
+            let report = inspect_catalogued_game_identity(&path, Some("NES"));
+            assert!(
+                !report
+                    .evidence
+                    .iter()
+                    .any(|item| item.kind == IdentityKind::NesHeader),
+                "{name}"
+            );
+        }
     }
 
     #[test]

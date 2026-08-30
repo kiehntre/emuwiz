@@ -272,7 +272,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         detector_modules: &["header_normalization", "nes_header_evidence"],
         normalization: true,
         real_validation: ValidationStatus::SyntheticValidated,
-        notes: "No real .nes specimen found accessible in the corpus (Batch 4)",
+        notes: "Production loose-ROM wiring now exposes parsed iNES/NES 2.0 facts; no real .nes specimen was accessible in the corpus (synthetic parser/normalization coverage only)",
         real_validation_provenance: None,
         dat_validation: None,
     },

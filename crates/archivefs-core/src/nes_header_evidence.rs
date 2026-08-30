@@ -56,6 +56,7 @@
 
 use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
+use serde::{Deserialize, Serialize};
 
 pub const INES_HEADER_BYTES: usize = 16;
 const INES_MAGIC: &[u8; 4] = b"NES\x1a";
@@ -67,7 +68,7 @@ const FLAGS7_OFFSET: usize = 7;
 const FLAGS8_OFFSET: usize = 8;
 const FLAGS9_OFFSET: usize = 9;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NesMirroring {
     Vertical,
     Horizontal,
@@ -76,7 +77,7 @@ pub enum NesMirroring {
     FourScreen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NesConsoleType {
     Nes,
     VsUnisystem,
@@ -84,7 +85,7 @@ pub enum NesConsoleType {
 }
 
 /// What a parsed iNES/NES 2.0 header directly states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InesHeaderFact {
     pub is_nes20: bool,
     /// PRG ROM size in 16 KiB units - the plain 8-bit iNES 1.0 value, or the
