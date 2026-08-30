@@ -248,6 +248,28 @@ fn mounted_or_archive_content_is_rejected() {
 }
 
 #[test]
+fn ps2_chd_identity_does_not_unlock_pcsx2_chd_launch() {
+    // Identity recognition and emulator launch capability are separate
+    // concerns: EmuWiz can now read verified PS2 evidence from a `.chd`
+    // (see game_identity), but native PCSX2 launch stays ISO-only. A fully
+    // resolved PS2 identity and a real serial must still not produce a
+    // command for `.chd` content.
+    let chd = candidate(Some(PathBuf::from("/games/Final Fantasy X.chd")));
+    let plan = build_pcsx2_command_plan(
+        &resolved(),
+        Some("SLUS-12345"),
+        &chd,
+        &default_native_binding("/usr/bin/pcsx2-qt"),
+    );
+    assert!(plan.command.is_none());
+    assert!(has_blocker(
+        &plan,
+        LaunchBlockerKind::Pcsx2ContentFormatUnsupported
+    ));
+    assert!(PCSX2_SUPPORTED_EXTENSIONS.iter().all(|ext| *ext != "chd"));
+}
+
+#[test]
 fn shell_looking_and_unicode_paths_remain_individual_arguments() {
     let game = PathBuf::from("/games/odd $name; \"quoted\" 日本語.iso");
     let root = "/profiles/odd root; $value \"日本語\"";

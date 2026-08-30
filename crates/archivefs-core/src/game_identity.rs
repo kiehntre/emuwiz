@@ -952,6 +952,7 @@ fn inspect_game_identity_with_platform_trust(
             if matches!(
                 platform,
                 IdentityPlatform::PlayStation
+                    | IdentityPlatform::PlayStation2
                     | IdentityPlatform::Saturn
                     | IdentityPlatform::Dreamcast
                     | IdentityPlatform::SegaCd
@@ -5025,6 +5026,7 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             | IdentityPlatform::SegaCd
             | IdentityPlatform::Pcfx
             | IdentityPlatform::NeoGeoCd
+            | IdentityPlatform::PlayStation2
     ) {
         // Every one of these platforms identifies from a bounded read over
         // the decoded data track, so they all reuse the exact `MediaSource`
@@ -5038,7 +5040,15 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         // discs *are* ISO 9660 (unlike PC Engine CD / 3DO), so
         // `inspect_neogeocd_source` looks up the root `IPL.TXT` file through
         // the same bounded ISO 9660 reader the raw ISO/CUE path uses and
-        // validates its parsed manifest - never a filename.
+        // validates its parsed manifest - never a filename. PlayStation 2
+        // joins here too: PS2 discs are ISO 9660, and `inspect_ps2_iso` is
+        // the exact same function the raw ISO/CUE path already calls - it
+        // reads `SYSTEM.CNF`, parses `BOOT2`, validates the referenced ELF,
+        // and hashes it with the reviewed PCSX2 algorithm, all over the
+        // `MediaSource` `open_chd_iso9660` already returned. A PS2 `.chd`
+        // whose decoded track is not ISO 9660, is not track 1, or carries a
+        // pregap is refused by `open_chd_iso9660` above, exactly as for the
+        // Sega platforms; nothing here is derived from the filename.
         let mut source = MediaSource::new(media);
         if report.platform == IdentityPlatform::Saturn {
             inspect_saturn_source(report, &mut source, None, None);
@@ -5048,6 +5058,8 @@ fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
             inspect_sega_cd_source(report, &mut source, None, None);
         } else if report.platform == IdentityPlatform::NeoGeoCd {
             inspect_neogeocd_source(report, &mut source, None, None);
+        } else if report.platform == IdentityPlatform::PlayStation2 {
+            inspect_ps2_iso(report, &mut source, None, None);
         } else {
             inspect_pcfx_source(report, &mut source, None, None);
         }
@@ -5385,6 +5397,7 @@ fn push_disc_chd_refusal(report: &mut GameIdentityReport, refusal: &DiscCollecti
     push_with_source(
         report,
         match report.platform {
+            IdentityPlatform::PlayStation2 => IdentityKind::Ps2Serial,
             IdentityPlatform::Saturn => IdentityKind::SaturnProductNumber,
             IdentityPlatform::Dreamcast => IdentityKind::DreamcastProductCode,
             IdentityPlatform::SegaCd => IdentityKind::SegaCdProductCode,
@@ -8688,12 +8701,32 @@ mod tests {
     }
 
     #[test]
-    fn ps1_chd_for_a_non_playstation_platform_hint_still_defers() {
+    fn chd_for_a_non_optical_platform_hint_still_defers() {
         // Format/platform guarding: a `.chd` is only ever authoritatively
-        // inspected when the platform hint itself says PlayStation - this
-        // task must not make every CHD look like a PS1 disc.
-        let chd = inspect_game_identity(Path::new("/games/game.chd"), Some("PS2"));
+        // inspected for the specific optical platforms whose backend can
+        // decode it. A platform outside that set (here GameCube, whose CHD
+        // support is honestly deferred) must still fall through to Deferred
+        // rather than be guessed from the `.chd` extension.
+        let chd = inspect_game_identity(Path::new("/games/game.chd"), Some("GameCube"));
         assert_eq!(chd.format, IdentityImageFormat::Deferred);
+    }
+
+    #[test]
+    fn ps2_chd_is_no_longer_categorically_deferred_but_a_missing_file_still_fails_closed() {
+        // A `.chd` with a PS2 platform hint is now inspected through the same
+        // bounded CHD backend as PS1, so it must fail closed on the concrete
+        // "file not readable" reason - never the old blanket deferral, and
+        // never a guessed Verified.
+        let chd = inspect_game_identity(Path::new("/games/does-not-exist.chd"), Some("PS2"));
+        assert_eq!(chd.format, IdentityImageFormat::Chd);
+        assert_eq!(chd.verified_ps2_serial(), None);
+        assert!(!chd.complete);
+        assert!(
+            chd.evidence.iter().any(|item| {
+                item.kind == IdentityKind::Ps2Serial && item.status != IdentityStatus::Verified
+            }),
+            "a missing CHD must never be silently reported Verified"
+        );
     }
 
     #[test]
@@ -8843,6 +8876,224 @@ mod tests {
             crate::launch::input_projection::VerifiedIdentityFact::Ps1Serial(serial)
                 if serial == "SLUS-12345"
         )));
+    }
+
+    // --- PlayStation 2 CHD (reuses the exact PS2 ISO evidence pipeline) ---
+
+    /// A valid PS2 ISO 9660 image (from [`ps2_iso`]) wrapped verbatim into a
+    /// genuine uncompressed single-track CHD v5 file. [`ps1_chd`] is the
+    /// shared ISO->CHD wrapper - it only completes the one PVD
+    /// logical-block-size field the plain-ISO fixtures leave zeroed, which
+    /// `open_chd_iso9660` (correctly, for a real disc) requires.
+    fn ps2_chd(image: &[u8]) -> Vec<u8> {
+        ps1_chd(image)
+    }
+
+    #[test]
+    fn valid_ps2_chd_resolves_playstation2_and_matches_iso_serial_authority() {
+        let directory = FixtureDir::new("ps2-chd-valid");
+        let iso = ps2_iso(b"BOOT2 = cdrom0:\\SLUS_123.45;1\r\n", true, None);
+        let path = write_fixture(&directory, "unrelated-name.chd", &ps2_chd(&iso));
+
+        let report = inspect_game_identity(&path, Some("PlayStation 2"));
+
+        assert_eq!(report.platform, IdentityPlatform::PlayStation2);
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_ps2_serial(), Some("SLUS-12345"));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn valid_ps2_chd_yields_the_same_pcsx2_executable_crc_as_the_equivalent_iso() {
+        let directory = FixtureDir::new("ps2-chd-crc");
+        let iso = ps2_iso(b"BOOT2 = cdrom0:\\SLUS_123.45;1\r\n", true, None);
+        let expected = format!(
+            "{:08X}",
+            pcsx2_executable_crc(&iso[22 * 2048..22 * 2048 + 12])
+        );
+
+        let iso_path = write_fixture(&directory, "disc.iso", &iso);
+        let iso_report = inspect_game_identity(&iso_path, Some("PS2"));
+        assert_eq!(iso_report.verified_pcsx2_crc(), Some(expected.as_str()));
+
+        let chd_path = write_fixture(&directory, "disc.chd", &ps2_chd(&iso));
+        let chd_report = inspect_game_identity(&chd_path, Some("PS2"));
+        assert_eq!(chd_report.verified_pcsx2_crc(), Some(expected.as_str()));
+        assert_eq!(chd_report.verified_ps2_serial(), Some("SLUS-12345"));
+        assert!(chd_report.complete);
+    }
+
+    #[test]
+    fn ps2_chd_verification_ignores_filename_and_folder() {
+        let directory = FixtureDir::new("ps2-chd-filename-disagreement");
+        let iso = ps2_iso(b"BOOT2 = cdrom0:\\SLES_555.55;1\r\n", true, None);
+        let path = write_fixture(&directory, "Totally Unrelated Title.chd", &ps2_chd(&iso));
+
+        let report = inspect_game_identity(&path, Some("PS2"));
+
+        assert_eq!(report.verified_ps2_serial(), Some("SLES-55555"));
+    }
+
+    #[test]
+    fn filename_only_ps2_chd_never_creates_ps2_identity() {
+        let directory = FixtureDir::new("ps2-chd-filename-only");
+        // Not a CHD container at all; the extension and a PS2-looking name
+        // must never manufacture identity.
+        let path = write_fixture(&directory, "SLUS_123.45.chd", b"not a chd at all");
+
+        let report = inspect_game_identity(&path, Some("PS2"));
+
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn malformed_or_truncated_ps2_chd_fails_closed() {
+        let directory = FixtureDir::new("ps2-chd-malformed");
+
+        // Not a CHD container.
+        let garbage = write_fixture(&directory, "garbage.chd", &[0xAB_u8; 4096]);
+        let report = inspect_game_identity(&garbage, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+
+        // A real CHD truncated inside its own header.
+        let iso = ps2_iso(b"BOOT2 = cdrom0:\\SLUS_123.45;1\r\n", true, None);
+        let mut truncated = ps2_chd(&iso);
+        truncated.truncate(48);
+        let truncated_path = write_fixture(&directory, "truncated.chd", &truncated);
+        let report = inspect_game_identity(&truncated_path, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+
+        // A genuine CHD whose decoded track is not ISO 9660 at all -
+        // `open_chd_iso9660` refuses it rather than guessing PS2.
+        let non_iso = write_fixture(
+            &directory,
+            "raw-track.chd",
+            &uncompressed_mode1_raw_chd(&vec![0xCD_u8; 24 * ISO_SECTOR_SIZE as usize]),
+        );
+        let report = inspect_game_identity(&non_iso, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps2_chd_with_unsupported_track_position_or_pregap_stays_unresolved() {
+        // These are enforced by the shared `open_chd_iso9660` backend - the
+        // same single-track, track-1-only, zero-pregap, data-track-only
+        // contract PS1 / PC-FX / Sega CHDs already go through.
+        let directory = FixtureDir::new("ps2-chd-track-limits");
+        let iso = ps2_iso(b"BOOT2 = cdrom0:\\SLUS_123.45;1\r\n", true, None);
+
+        let mut non_track_one = ps2_chd(&iso);
+        replace_once_in_place(&mut non_track_one, b"TRACK:1 ", b"TRACK:2 ");
+        let path = write_fixture(&directory, "track2.chd", &non_track_one);
+        let report = inspect_game_identity(&path, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+
+        let mut non_zero_pregap = ps2_chd(&iso);
+        replace_once_in_place(&mut non_zero_pregap, b"PREGAP:0 ", b"PREGAP:9 ");
+        let path = write_fixture(&directory, "pregap.chd", &non_zero_pregap);
+        let report = inspect_game_identity(&path, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps2_chd_with_iso9660_but_no_system_cnf_does_not_become_verified_ps2() {
+        let directory = FixtureDir::new("ps2-chd-no-cnf");
+        // Valid ISO 9660: PVD + terminator + root directory record, but no
+        // SYSTEM.CNF entry anywhere.
+        let mut image = vec![0u8; 24 * ISO_SECTOR_SIZE as usize];
+        let pvd = 16 * ISO_SECTOR_SIZE as usize;
+        image[pvd] = 1;
+        image[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        image[pvd + 6] = 1;
+        let root = directory_record(&[0], 20, ISO_SECTOR_SIZE as u32, true);
+        image[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let terminator = 17 * ISO_SECTOR_SIZE as usize;
+        image[terminator] = 255;
+        image[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        image[terminator + 6] = 1;
+        let path = write_fixture(&directory, "no-cnf.chd", &ps2_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS2"));
+
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn ps2_chd_with_malformed_boot2_does_not_create_ps2_serial() {
+        let directory = FixtureDir::new("ps2-chd-malformed-boot2");
+        let iso = ps2_iso(b"NOT-A-BOOT2-ASSIGNMENT\r\n", true, None);
+        let path = write_fixture(&directory, "bad-boot2.chd", &ps2_chd(&iso));
+
+        let report = inspect_game_identity(&path, Some("PS2"));
+
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn generic_chd_with_a_ps2_hint_remains_unresolved_not_deferred() {
+        let directory = FixtureDir::new("ps2-chd-generic");
+        let image = vec![0x5A_u8; 24 * ISO_SECTOR_SIZE as usize];
+        let path = write_fixture(&directory, "unknown.chd", &ps1_chd(&image));
+
+        let report = inspect_game_identity(&path, Some("PS2"));
+
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
+    }
+
+    #[test]
+    fn adding_ps2_chd_dispatch_leaves_neighbouring_optical_chd_families_unchanged() {
+        let directory = FixtureDir::new("ps2-chd-neighbours");
+
+        let ps1 = write_fixture(
+            &directory,
+            "ps1.chd",
+            &ps1_chd(&ps1_iso(
+                b"SLUS_123.45;1",
+                b"BOOT=cdrom:\\SLUS_123.45;1\r\n",
+                true,
+            )),
+        );
+        assert_eq!(
+            inspect_game_identity(&ps1, Some("PS1")).verified_ps1_serial(),
+            Some("SLUS-12345")
+        );
+
+        let saturn = write_fixture(&directory, "saturn.chd", &ps1_chd(&saturn_iso(b"T-7101G")));
+        assert_eq!(
+            inspect_game_identity(&saturn, Some("Saturn")).verified_saturn_product_number(),
+            Some("T-7101G")
+        );
+
+        let dreamcast = write_fixture(
+            &directory,
+            "dc.chd",
+            &ps1_chd(&dreamcast_iso(b"T-8109N")),
+        );
+        assert_eq!(
+            inspect_game_identity(&dreamcast, Some("Dreamcast")).verified_dreamcast_product_code(),
+            Some("T-8109N")
+        );
+
+        // A PS2 CHD hint over Saturn disc content must not become PS2.
+        let wrong_family = write_fixture(
+            &directory,
+            "sat-as-ps2.chd",
+            &ps1_chd(&saturn_iso(b"T-7101G")),
+        );
+        let report = inspect_game_identity(&wrong_family, Some("PS2"));
+        assert_eq!(report.verified_ps2_serial(), None);
+        assert!(!report.complete);
     }
 
     #[test]
