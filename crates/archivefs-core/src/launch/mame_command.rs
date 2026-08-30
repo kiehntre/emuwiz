@@ -11,7 +11,11 @@ use crate::dat::set::{SetResolution, SetState};
 use crate::launch::planning::CanonicalIdentityStatus;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind};
 
-pub const MAME_SUPPORTED_PLATFORM_ID: &str = "Arcade";
+/// Canonical platforms whose verified DAT-backed sets may be launched by the
+/// native MAME adapter. NeoGeo cartridge/MVS/AES sets use the same MAME
+/// shortname and dependency gates as Arcade; Neo Geo CD is deliberately not
+/// included because it is a separate optical-media platform.
+pub const MAME_SUPPORTED_PLATFORM_IDS: &[&str] = &["Arcade", "NeoGeo"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MameCommand {
@@ -50,10 +54,13 @@ pub fn build_mame_command_plan(
     let mut blockers = Vec::new();
     match identity {
         CanonicalIdentityStatus::Resolved(identity)
-            if identity.platform_id == MAME_SUPPORTED_PLATFORM_ID => {}
+            if MAME_SUPPORTED_PLATFORM_IDS.contains(&identity.platform_id.as_str()) => {}
         CanonicalIdentityStatus::Resolved(identity) => blockers.push(blocker(
             LaunchBlockerKind::MamePlatformMismatch,
-            format!("resolved platform is {}, not Arcade", identity.platform_id),
+            format!(
+                "resolved platform is {}, not supported by native MAME",
+                identity.platform_id
+            ),
         )),
         CanonicalIdentityStatus::Unknown => blockers.push(blocker(
             LaunchBlockerKind::IdentityUnresolved,
@@ -67,7 +74,7 @@ pub fn build_mame_command_plan(
 
     let identity = match identity {
         CanonicalIdentityStatus::Resolved(identity)
-            if identity.platform_id == MAME_SUPPORTED_PLATFORM_ID =>
+            if MAME_SUPPORTED_PLATFORM_IDS.contains(&identity.platform_id.as_str()) =>
         {
             Some(identity)
         }

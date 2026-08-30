@@ -168,7 +168,7 @@ pub use integration::{
     DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,
 };
 pub use mame_command::{
-    MAME_SUPPORTED_PLATFORM_ID, MameCommand, MameCommandPlan, build_mame_command_plan,
+    MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
 };
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
