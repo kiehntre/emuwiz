@@ -723,6 +723,123 @@ fn a_multi_file_match_produces_one_election_with_launcher_and_companions() {
 }
 
 #[test]
+fn elected_gamecube_two_disc_release_retains_every_disc() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![game("Game Foo (Europe)", None)]);
+    let disc1 = temp.path().join("Game Foo (Disc 1).iso");
+    let disc2 = temp.path().join("Game Foo (Disc 2).iso");
+    let launcher = temp.path().join("Game Foo (Europe).m3u");
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: vec![DatArchiveMatch {
+            archive_path: launcher.clone(),
+            dat_entry_index: 0,
+            companion_paths: vec![disc1.clone(), disc2.clone()],
+        }],
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+
+    let plan = build_playing_library_plan(&request).expect("plan");
+    let elected = &plan.elected_games[0];
+
+    assert_eq!(elected.dat_entry_name, "Game Foo (Europe)");
+    assert_eq!(elected.companion_operations.len(), 2);
+    assert!(
+        elected
+            .companion_operations
+            .iter()
+            .any(|operation| operation.source_path == disc1)
+    );
+    assert!(
+        elected
+            .companion_operations
+            .iter()
+            .any(|operation| operation.source_path == disc2)
+    );
+    assert_eq!(plan.operations.len(), 3);
+}
+
+#[test]
+fn losing_multidisc_region_has_no_disc_materialized() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![
+        game("Game Foo (Europe)", None),
+        game("Game Foo (USA)", Some("Game Foo (Europe)")),
+    ]);
+    let europe_launcher = temp.path().join("Game Foo (Europe).m3u");
+    let europe_disc1 = temp.path().join("Game Foo Europe (Disc 1).iso");
+    let europe_disc2 = temp.path().join("Game Foo Europe (Disc 2).iso");
+    let usa_launcher = temp.path().join("Game Foo (USA).m3u");
+    let usa_disc1 = temp.path().join("Game Foo USA (Disc 1).iso");
+    let usa_disc2 = temp.path().join("Game Foo USA (Disc 2).iso");
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: vec![
+            DatArchiveMatch {
+                archive_path: europe_launcher,
+                dat_entry_index: 0,
+                companion_paths: vec![europe_disc1.clone(), europe_disc2.clone()],
+            },
+            DatArchiveMatch {
+                archive_path: usa_launcher,
+                dat_entry_index: 1,
+                companion_paths: vec![usa_disc1.clone(), usa_disc2.clone()],
+            },
+        ],
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+
+    let plan = build_playing_library_plan(&request).expect("plan");
+    assert_eq!(elected_names(&plan), vec!["Game Foo (Europe)"]);
+    assert_eq!(plan.operations.len(), 3);
+    assert!(
+        plan.operations
+            .iter()
+            .any(|operation| operation.source_path == europe_disc1)
+    );
+    assert!(
+        plan.operations
+            .iter()
+            .any(|operation| operation.source_path == europe_disc2)
+    );
+    assert!(
+        plan.operations
+            .iter()
+            .all(|operation| operation.source_path != usa_disc1
+                && operation.source_path != usa_disc2)
+    );
+}
+
+#[test]
+fn elected_three_disc_release_has_stable_complete_materialization() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dat = synthetic_dat(vec![game("Game Foo (Europe)", None)]);
+    let launcher = temp.path().join("Game Foo (Europe).m3u");
+    let discs = (1..=3)
+        .map(|number| temp.path().join(format!("Game Foo (Disc {number}).iso")))
+        .collect::<Vec<_>>();
+    let request = PlayingLibraryRequest {
+        dat: &dat,
+        matches: vec![DatArchiveMatch {
+            archive_path: launcher,
+            dat_entry_index: 0,
+            companion_paths: discs.clone(),
+        }],
+        destination_root: temp.path().join("playing"),
+        policy: default_policy(),
+    };
+
+    let first = build_playing_library_plan(&request).expect("first plan");
+    let second = build_playing_library_plan(&request).expect("second plan");
+
+    assert_eq!(first, second);
+    assert_eq!(first.elected_games[0].companion_operations.len(), 3);
+    assert_eq!(first.operations.len(), 4);
+}
+
+#[test]
 fn a_companion_destination_collision_excludes_the_whole_release_not_just_the_file() {
     let temp = tempfile::tempdir().expect("temp dir");
     let dat = synthetic_dat(vec![
