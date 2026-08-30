@@ -60,6 +60,14 @@ use archivefs_core::launch::{
     RetroArchLaunchRequest, preflight_and_launch_dolphin, preflight_and_launch_pcsx2,
     preflight_and_launch_retroarch,
 };
+use archivefs_core::launch::{
+    DuckStationLaunchExecutionError, DuckStationLaunchRequest, LaunchedDuckStationProcess,
+    LaunchedPpssppProcess, LaunchedRpcs3Process, LaunchedXemuProcess, LaunchedXeniaProcess,
+    PpssppLaunchExecutionError, PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest,
+    XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
+    preflight_and_launch_duckstation, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
+    preflight_and_launch_xemu, preflight_and_launch_xenia,
+};
 use archivefs_core::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
     Pcsx2ProfileDiscoveryRoots, resolve_dolphin_native_launch_binding,
@@ -115,7 +123,179 @@ pub(crate) enum LaunchReadinessInput {
         /// evidence through to core's own fresh BIOS verification - see
         /// [`pcsx2_launch_request`].
         pcsx2: Option<Pcsx2LaunchContext>,
+        duckstation: Option<DuckStationLaunchContext>,
+        ppsspp: Option<PpssppLaunchContext>,
+        rpcs3: Option<Rpcs3LaunchContext>,
+        xemu: Option<XemuLaunchContext>,
+        xenia: Option<XeniaLaunchContext>,
     },
+}
+
+pub(crate) struct DuckStationLaunchContext {
+    pub(crate) discovery: archivefs_core::patch_manager::DuckStationProfileDiscovery,
+    pub(crate) roots: archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
+    pub(crate) firmware_evidence: Vec<FirmwareIdentityRecord>,
+    pub(crate) verified_ps1_serial: Option<String>,
+}
+pub(crate) struct PpssppLaunchContext {
+    pub(crate) discovery: archivefs_core::patch_manager::PpssppProfileDiscovery,
+    pub(crate) roots: archivefs_core::patch_manager::PpssppProfileDiscoveryRoots,
+    pub(crate) verified_psp_disc_id: Option<String>,
+}
+pub(crate) struct Rpcs3LaunchContext {
+    pub(crate) discovery: archivefs_core::patch_manager::Rpcs3ProfileDiscovery,
+    pub(crate) roots: archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots,
+    pub(crate) verified_ps3_title_id: Option<String>,
+}
+pub(crate) struct XemuLaunchContext {
+    pub(crate) discovery: archivefs_core::patch_manager::XemuProfileDiscovery,
+    pub(crate) roots: archivefs_core::patch_manager::XemuProfileDiscoveryRoots,
+    pub(crate) verified_xbox_title_id: Option<String>,
+}
+pub(crate) struct XeniaLaunchContext {
+    pub(crate) discovery: archivefs_core::patch_manager::XeniaProfileDiscovery,
+    pub(crate) roots: archivefs_core::patch_manager::XeniaProfileDiscoveryRoots,
+    pub(crate) verified_xex_title_id: Option<String>,
+    pub(crate) verified_xex_media_id: Option<String>,
+}
+
+enum StandaloneProcess {
+    DuckStation(LaunchedDuckStationProcess),
+    Ppsspp(LaunchedPpssppProcess),
+    Rpcs3(LaunchedRpcs3Process),
+    Xemu(LaunchedXemuProcess),
+    Xenia(LaunchedXeniaProcess),
+}
+
+enum StandaloneLaunchStage {
+    Starting(Receiver<Result<StandaloneProcess, String>>),
+    Running(StandaloneProcess),
+    Exited(StandaloneProcess),
+    Failed(String),
+}
+
+#[derive(Default)]
+pub(crate) struct StandaloneLaunchState {
+    tracked: Option<(PathBuf, String, StandaloneLaunchStage)>,
+}
+
+impl StandaloneLaunchState {
+    pub(crate) fn poll(&mut self) -> bool {
+        let Some((path, adapter, stage)) = self.tracked.take() else {
+            return false;
+        };
+        let (next, changed) = match stage {
+            StandaloneLaunchStage::Starting(receiver) => match receiver.try_recv() {
+                Ok(Ok(process)) => (StandaloneLaunchStage::Running(process), true),
+                Ok(Err(error)) => (StandaloneLaunchStage::Failed(error), true),
+                Err(TryRecvError::Empty) => (StandaloneLaunchStage::Starting(receiver), false),
+                Err(TryRecvError::Disconnected) => (
+                    StandaloneLaunchStage::Failed("launch worker stopped unexpectedly".into()),
+                    true,
+                ),
+            },
+            StandaloneLaunchStage::Running(mut process) => {
+                let exited = match &mut process {
+                    StandaloneProcess::DuckStation(p) => p.poll().is_some(),
+                    StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
+                    StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
+                    StandaloneProcess::Xemu(p) => p.poll().is_some(),
+                    StandaloneProcess::Xenia(p) => p.poll().is_some(),
+                };
+                (
+                    if exited {
+                        StandaloneLaunchStage::Exited(process)
+                    } else {
+                        StandaloneLaunchStage::Running(process)
+                    },
+                    exited,
+                )
+            }
+            other @ (StandaloneLaunchStage::Exited(_) | StandaloneLaunchStage::Failed(_)) => {
+                (other, false)
+            }
+        };
+        self.tracked = Some((path, adapter, next));
+        changed
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(
+            self.tracked,
+            Some((
+                _,
+                _,
+                StandaloneLaunchStage::Starting(_) | StandaloneLaunchStage::Running(_)
+            ))
+        )
+    }
+
+    fn start(&mut self, request: StandaloneLaunchRequest) {
+        let (path, adapter) = request.key();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = request.execute().map_err(|error| format!("{error:?}"));
+            let _ = sender.send(result);
+        });
+        self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
+    }
+}
+
+enum StandaloneLaunchRequest {
+    DuckStation(
+        DuckStationLaunchRequest,
+        archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
+        Vec<FirmwareIdentityRecord>,
+    ),
+    Ppsspp(
+        PpssppLaunchRequest,
+        archivefs_core::patch_manager::PpssppProfileDiscoveryRoots,
+    ),
+    Rpcs3(
+        Rpcs3LaunchRequest,
+        archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots,
+    ),
+    Xemu(
+        XemuLaunchRequest,
+        archivefs_core::patch_manager::XemuProfileDiscoveryRoots,
+    ),
+    Xenia(
+        XeniaLaunchRequest,
+        archivefs_core::patch_manager::XeniaProfileDiscoveryRoots,
+    ),
+}
+
+impl StandaloneLaunchRequest {
+    fn key(&self) -> (PathBuf, String) {
+        match self {
+            Self::DuckStation(r, _, _) => (r.selected_content_path.clone(), "duckstation".into()),
+            Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
+            Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
+            Self::Xemu(r, _) => (r.selected_content_path.clone(), "xemu".into()),
+            Self::Xenia(r, _) => (r.selected_content_path.clone(), "xenia".into()),
+        }
+    }
+    fn execute(self) -> Result<StandaloneProcess, String> {
+        match self {
+            Self::DuckStation(r, roots, firmware) => {
+                preflight_and_launch_duckstation(&r, &roots, &firmware)
+                    .map(StandaloneProcess::DuckStation)
+                    .map_err(|e: DuckStationLaunchExecutionError| format!("{e:?}"))
+            }
+            Self::Ppsspp(r, roots) => preflight_and_launch_ppsspp(&r, &roots)
+                .map(StandaloneProcess::Ppsspp)
+                .map_err(|e: PpssppLaunchExecutionError| format!("{e:?}")),
+            Self::Rpcs3(r, roots) => preflight_and_launch_rpcs3(&r, &roots)
+                .map(StandaloneProcess::Rpcs3)
+                .map_err(|e: Rpcs3LaunchExecutionError| format!("{e:?}")),
+            Self::Xemu(r, roots) => preflight_and_launch_xemu(&r, &roots)
+                .map(StandaloneProcess::Xemu)
+                .map_err(|e: XemuLaunchExecutionError| format!("{e:?}")),
+            Self::Xenia(r, roots) => preflight_and_launch_xenia(&r, &roots)
+                .map(StandaloneProcess::Xenia)
+                .map_err(|e: XeniaLaunchExecutionError| format!("{e:?}")),
+        }
+    }
 }
 
 /// The real, already-gathered Dolphin discovery this panel needs to compute
@@ -985,6 +1165,7 @@ pub(crate) fn show_launch_readiness_panel(
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
+    standalone_launch_state: &mut StandaloneLaunchState,
 ) {
     widgets::section_header(
         ui,
@@ -1025,14 +1206,25 @@ pub(crate) fn show_launch_readiness_panel(
             plan,
             dolphin,
             pcsx2,
+            duckstation,
+            ppsspp,
+            rpcs3,
+            xemu,
+            xenia,
         } => show_plan(
             ui,
             plan,
             dolphin.as_ref(),
             pcsx2.as_ref(),
+            duckstation.as_ref(),
+            ppsspp.as_ref(),
+            rpcs3.as_ref(),
+            xemu.as_ref(),
+            xenia.as_ref(),
             retroarch_launch_state,
             dolphin_launch_state,
             pcsx2_launch_state,
+            standalone_launch_state,
         ),
     }
 }
@@ -1042,9 +1234,15 @@ fn show_plan(
     plan: &LaunchPlan,
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
+    ppsspp: Option<&PpssppLaunchContext>,
+    rpcs3: Option<&Rpcs3LaunchContext>,
+    xemu: Option<&XemuLaunchContext>,
+    xenia: Option<&XeniaLaunchContext>,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
+    standalone_launch_state: &mut StandaloneLaunchState,
 ) {
     if plan.candidates.is_empty() {
         widgets::empty_state(
@@ -1063,9 +1261,15 @@ fn show_plan(
             candidate,
             dolphin,
             pcsx2,
+            duckstation,
+            ppsspp,
+            rpcs3,
+            xemu,
+            xenia,
             retroarch_launch_state,
             dolphin_launch_state,
             pcsx2_launch_state,
+            standalone_launch_state,
         );
     }
 }
@@ -1119,6 +1323,158 @@ fn target_labels(target: &LaunchTarget) -> (String, String) {
     }
 }
 
+fn standalone_launch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    duckstation: Option<&DuckStationLaunchContext>,
+    ppsspp: Option<&PpssppLaunchContext>,
+    rpcs3: Option<&Rpcs3LaunchContext>,
+    xemu: Option<&XemuLaunchContext>,
+    xenia: Option<&XeniaLaunchContext>,
+) -> Option<StandaloneLaunchRequest> {
+    if candidate.readiness != LaunchReadiness::Ready
+        || !candidate.blockers.is_empty()
+        || !candidate.warnings.is_empty()
+        || candidate.content.requires_mount
+        || candidate.content.container != Some(LaunchContainerKind::PlainFile)
+    {
+        return None;
+    }
+    let path = candidate.content.resolved_path.clone()?;
+    let LaunchTarget::Standalone {
+        adapter_id,
+        profile_id,
+        ..
+    } = &candidate.target
+    else {
+        return None;
+    };
+    let platform = plan.platform_id.clone()?;
+    let game_key = plan.game_key.clone()?;
+    match *adapter_id {
+        "duckstation" => {
+            let context = duckstation?;
+            let serial = context.verified_ps1_serial.clone()?;
+            let profile = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)?;
+            let binding = archivefs_core::patch_manager::resolve_duckstation_native_launch_binding(
+                profile,
+                &context.roots,
+            )
+            .ok()?;
+            Some(StandaloneLaunchRequest::DuckStation(
+                DuckStationLaunchRequest {
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    expected_ps1_serial: serial,
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: binding.executable,
+                    expected_user_directory_mode: binding.user_directory_mode,
+                },
+                context.roots.clone(),
+                context.firmware_evidence.clone(),
+            ))
+        }
+        "ppsspp" => {
+            let context = ppsspp?;
+            let disc_id = context.verified_psp_disc_id.clone()?;
+            let profile = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)?;
+            let binding =
+                archivefs_core::patch_manager::resolve_ppsspp_native_launch_binding(profile)
+                    .ok()?;
+            Some(StandaloneLaunchRequest::Ppsspp(
+                PpssppLaunchRequest {
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    expected_psp_disc_id: disc_id,
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: binding.executable,
+                },
+                context.roots.clone(),
+            ))
+        }
+        "rpcs3" => {
+            let context = rpcs3?;
+            let title_id = context.verified_ps3_title_id.clone()?;
+            let profile = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)?;
+            let binding =
+                archivefs_core::patch_manager::resolve_rpcs3_native_launch_binding(profile).ok()?;
+            Some(StandaloneLaunchRequest::Rpcs3(
+                Rpcs3LaunchRequest {
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    expected_ps3_title_id: title_id,
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: binding.executable,
+                },
+                context.roots.clone(),
+            ))
+        }
+        "xemu" => {
+            let context = xemu?;
+            let title_id = context.verified_xbox_title_id.clone()?;
+            let profile = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)?;
+            let binding =
+                archivefs_core::patch_manager::resolve_xemu_native_launch_binding(profile).ok()?;
+            Some(StandaloneLaunchRequest::Xemu(
+                XemuLaunchRequest {
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    expected_xbox_title_id: title_id,
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: binding.executable,
+                },
+                context.roots.clone(),
+            ))
+        }
+        "xenia" => {
+            let context = xenia?;
+            if context.verified_xex_title_id.is_none() && context.verified_xex_media_id.is_none() {
+                return None;
+            }
+            let profile = context
+                .discovery
+                .profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)?;
+            let binding =
+                archivefs_core::patch_manager::resolve_xenia_launch_binding(profile).ok()?;
+            Some(StandaloneLaunchRequest::Xenia(
+                XeniaLaunchRequest {
+                    selected_content_path: path,
+                    expected_platform_id: platform,
+                    expected_game_key: game_key,
+                    expected_xex_title_id: context.verified_xex_title_id.clone(),
+                    expected_xex_media_id: context.verified_xex_media_id.clone(),
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: binding.executable,
+                },
+                context.roots.clone(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 // One immediate-mode render call: the draw target, the plan/candidate being
 // drawn, the read-only per-emulator contexts, and the mutable per-emulator
 // launch states it toggles. A parameter struct would only rename the same
@@ -1130,9 +1486,15 @@ fn show_candidate(
     candidate: &LaunchCandidate,
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
+    ppsspp: Option<&PpssppLaunchContext>,
+    rpcs3: Option<&Rpcs3LaunchContext>,
+    xemu: Option<&XemuLaunchContext>,
+    xenia: Option<&XeniaLaunchContext>,
     retroarch_launch_state: &mut RetroArchLaunchState,
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
+    standalone_launch_state: &mut StandaloneLaunchState,
 ) {
     widgets::card(ui, |ui| {
         let (name, profile) = target_labels(&candidate.target);
@@ -1204,7 +1566,42 @@ fn show_candidate(
                 context.firmware_evidence.clone(),
             );
         }
+        if let Some(request) =
+            standalone_launch_request(plan, candidate, duckstation, ppsspp, rpcs3, xemu, xenia)
+        {
+            ui.add_space(6.0);
+            show_standalone_launch_action(ui, standalone_launch_state, request);
+        }
     });
+}
+
+fn show_standalone_launch_action(
+    ui: &mut egui::Ui,
+    state: &mut StandaloneLaunchState,
+    request: StandaloneLaunchRequest,
+) {
+    let (path, adapter) = request.key();
+    let same = state
+        .tracked
+        .as_ref()
+        .is_some_and(|(p, a, _)| *p == path && *a == adapter);
+    if same {
+        let label = match state.tracked.as_ref().map(|(_, _, stage)| stage) {
+            Some(StandaloneLaunchStage::Starting(_)) => "Launching…",
+            Some(StandaloneLaunchStage::Running(_)) => "Running",
+            Some(StandaloneLaunchStage::Exited(_)) => "Process exited",
+            Some(StandaloneLaunchStage::Failed(_)) => "Launch failed",
+            None => "Launch",
+        };
+        ui.label(label);
+        if let Some((_, _, StandaloneLaunchStage::Failed(detail))) = state.tracked.as_ref() {
+            ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
+        }
+        return;
+    }
+    if ui.button(format!("Launch {adapter}")).clicked() {
+        state.start(request);
+    }
 }
 
 /// Renders the "Launch RetroArch" action for one eligible candidate,

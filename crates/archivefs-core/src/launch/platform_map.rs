@@ -158,6 +158,17 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &["mame", "mame2003_plus", "fbneo"],
         confidence: MappingConfidence::Exact,
     },
+    // ScummVM's command and execution adapters are complete and require a
+    // detector-verified engine/game identity plus an extracted game folder.
+    // This row only makes that already-reviewed adapter reachable by generic
+    // launch planning; it is not identity evidence and does not infer a game
+    // from a filename or directory name.
+    LaunchCompatibility {
+        platform_id: "ScummVM",
+        standalone_adapters: &["scummvm"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.

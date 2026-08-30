@@ -44,6 +44,11 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         plan,
         dolphin: None,
         pcsx2: None,
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
     }
 }
 
@@ -52,6 +57,11 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         plan,
         dolphin: Some(context),
         pcsx2: None,
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
     }
 }
 
@@ -60,6 +70,11 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         plan,
         dolphin: None,
         pcsx2: Some(context),
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
     }
 }
 
@@ -158,6 +173,7 @@ fn render(input: &LaunchReadinessInput) -> egui::FullOutput {
         &mut RetroArchLaunchState::default(),
         &mut DolphinLaunchState::default(),
         &mut Pcsx2LaunchState::default(),
+        &mut StandaloneLaunchState::default(),
     )
 }
 
@@ -170,6 +186,7 @@ fn render_with_state(
         state,
         &mut DolphinLaunchState::default(),
         &mut Pcsx2LaunchState::default(),
+        &mut StandaloneLaunchState::default(),
     )
 }
 
@@ -182,6 +199,7 @@ fn render_with_dolphin_state(
         &mut RetroArchLaunchState::default(),
         state,
         &mut Pcsx2LaunchState::default(),
+        &mut StandaloneLaunchState::default(),
     )
 }
 
@@ -194,6 +212,7 @@ fn render_with_pcsx2_state(
         &mut RetroArchLaunchState::default(),
         &mut DolphinLaunchState::default(),
         state,
+        &mut StandaloneLaunchState::default(),
     )
 }
 
@@ -202,11 +221,19 @@ fn render_with_states(
     retroarch_state: &mut RetroArchLaunchState,
     dolphin_state: &mut DolphinLaunchState,
     pcsx2_state: &mut Pcsx2LaunchState,
+    standalone_state: &mut StandaloneLaunchState,
 ) -> egui::FullOutput {
     let ctx = egui::Context::default();
     ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            show_launch_readiness_panel(ui, input, retroarch_state, dolphin_state, pcsx2_state);
+            show_launch_readiness_panel(
+                ui,
+                input,
+                retroarch_state,
+                dolphin_state,
+                pcsx2_state,
+                standalone_state,
+            );
         });
     })
 }
@@ -751,6 +778,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
             &mut RetroArchLaunchState,
             &mut DolphinLaunchState,
             &mut Pcsx2LaunchState,
+            &mut StandaloneLaunchState,
         ),
     ) {
     }

@@ -3375,6 +3375,7 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
         plan,
         dolphin,
         pcsx2: _,
+        ..
     } = input
     else {
         panic!("a resolved GameCube identity with RetroArch scanned must produce a Plan");

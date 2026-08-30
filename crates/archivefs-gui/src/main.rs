@@ -4181,6 +4181,7 @@ struct ArchiveFsApp {
     /// The Launch Readiness panel's "Launch PCSX2" tracker - the same
     /// reasoning as `launch_retroarch` above applies unchanged.
     launch_pcsx2: launch_readiness_page::Pcsx2LaunchState,
+    launch_standalone: launch_readiness_page::StandaloneLaunchState,
     /// A tentative archive choice is isolated here until the picker is
     /// applied. It never mutates Library focus or multi-selection.
     cheat_archive_picker: Option<CheatArchivePickerState>,
@@ -4739,6 +4740,7 @@ impl ArchiveFsApp {
             launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
             launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
             launch_pcsx2: launch_readiness_page::Pcsx2LaunchState::default(),
+            launch_standalone: launch_readiness_page::StandaloneLaunchState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
@@ -6496,12 +6498,199 @@ impl ArchiveFsApp {
                 | FlycastProfilesState::Error(_) => Vec::new(),
             };
 
-        let standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
+        let mut standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
             dolphin_standalone_profiles
                 .into_iter()
                 .chain(pcsx2_standalone_profiles)
                 .chain(flycast_standalone_profiles)
                 .collect();
+
+        // The remaining native adapters are additive inputs to the same
+        // shared planner. Discovery and inspection are kept read-only and
+        // bounded by their existing adapters; this block does not rebuild a
+        // command, infer identity, or turn an executable's presence into a
+        // Ready result. A later launch click still invokes that adapter's
+        // own preflight and execution path.
+        let empty_firmware: &[archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord] = &[];
+        if let Ok(roots) =
+            archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_duckstation_profiles(&roots);
+            let request = archivefs_core::patch_manager::DuckStationGameRequest {
+                verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
+                    archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
+                        Some(serial.clone())
+                    }
+                    _ => None,
+                }),
+                ..Default::default()
+            };
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                let inspection =
+                    archivefs_core::patch_manager::inspect_duckstation_game_with_firmware_evidence(
+                        profile,
+                        &request,
+                        empty_firmware,
+                    );
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "duckstation",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: archivefs_core::launch::duckstation_firmware_readiness(
+                        inspection.inspection.health.bios,
+                    ),
+                }
+            }));
+        }
+        if let Ok(roots) =
+            archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_ppsspp_profiles(&roots);
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "ppsspp",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }
+            }));
+        }
+        if let Ok(roots) =
+            archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_rpcs3_profiles(&roots);
+            let request = archivefs_core::patch_manager::Rpcs3GameRequest {
+                verified_ps3_title_id: verified_facts.iter().find_map(|fact| match fact {
+                    archivefs_core::launch::VerifiedIdentityFact::Ps3TitleId(id) => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                }),
+                ..Default::default()
+            };
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                let inspection =
+                    archivefs_core::patch_manager::inspect_rpcs3_game(profile, &request);
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "rpcs3",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: archivefs_core::launch::rpcs3_firmware_readiness(
+                        &inspection.health.firmware,
+                    ),
+                }
+            }));
+        }
+        if let Ok(roots) =
+            archivefs_core::patch_manager::XemuProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_xemu_profiles(&roots);
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "xemu",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    // xemu's command planner performs its own MCPX/BIOS/
+                    // EEPROM/HDD health validation during preflight.
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }
+            }));
+        }
+        if let XeniaProfilesState::Ready(discovery) = &self.xenia_profiles {
+            let (title_id, media_id) = game_identity_report
+                .map(|report| {
+                    (
+                        report.verified_xex_title_id().map(str::to_owned),
+                        report.verified_xex_media_id().map(str::to_owned),
+                    )
+                })
+                .unwrap_or((None, None));
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "xenia",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }
+            }));
+            let _ = (title_id, media_id);
+        }
+
+        let duckstation_context =
+            archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
+                .ok()
+                .map(|roots| launch_readiness_page::DuckStationLaunchContext {
+                    discovery: archivefs_core::patch_manager::discover_duckstation_profiles(&roots),
+                    roots,
+                    firmware_evidence: Vec::new(),
+                    verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
+                        archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
+                            Some(serial.clone())
+                        }
+                        _ => None,
+                    }),
+                });
+        let ppsspp_context =
+            archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
+                .ok()
+                .map(|roots| launch_readiness_page::PpssppLaunchContext {
+                    discovery: archivefs_core::patch_manager::discover_ppsspp_profiles(&roots),
+                    roots,
+                    verified_psp_disc_id: verified_facts.iter().find_map(|fact| match fact {
+                        archivefs_core::launch::VerifiedIdentityFact::PspDiscId(id) => {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    }),
+                });
+        let rpcs3_context =
+            archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots::from_environment()
+                .ok()
+                .map(|roots| launch_readiness_page::Rpcs3LaunchContext {
+                    discovery: archivefs_core::patch_manager::discover_rpcs3_profiles(&roots),
+                    roots,
+                    verified_ps3_title_id: verified_facts.iter().find_map(|fact| match fact {
+                        archivefs_core::launch::VerifiedIdentityFact::Ps3TitleId(id) => {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    }),
+                });
+        let xemu_context =
+            archivefs_core::patch_manager::XemuProfileDiscoveryRoots::from_environment()
+                .ok()
+                .map(|roots| launch_readiness_page::XemuLaunchContext {
+                    discovery: archivefs_core::patch_manager::discover_xemu_profiles(&roots),
+                    roots,
+                    verified_xbox_title_id: verified_facts.iter().find_map(|fact| match fact {
+                        archivefs_core::launch::VerifiedIdentityFact::XboxTitleId(id) => {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    }),
+                });
+        let xenia_context = if let XeniaProfilesState::Ready(discovery) = &self.xenia_profiles {
+            let roots = archivefs_core::patch_manager::XeniaProfileDiscoveryRoots {
+                explicit_configuration_roots: discovery
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.configuration_path.clone())
+                    .collect(),
+            };
+            game_identity_report.map(|report| launch_readiness_page::XeniaLaunchContext {
+                discovery: discovery.clone(),
+                roots,
+                verified_xex_title_id: report.verified_xex_title_id().map(str::to_owned),
+                verified_xex_media_id: report.verified_xex_media_id().map(str::to_owned),
+            })
+        } else {
+            None
+        };
 
         let plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
@@ -6514,6 +6703,11 @@ impl ArchiveFsApp {
             plan,
             dolphin: dolphin_context,
             pcsx2: pcsx2_context,
+            duckstation: duckstation_context,
+            ppsspp: ppsspp_context,
+            rpcs3: rpcs3_context,
+            xemu: xemu_context,
+            xenia: xenia_context,
         }
     }
 
@@ -11440,12 +11634,16 @@ impl ArchiveFsApp {
         if self.launch_pcsx2.poll() || self.launch_pcsx2.is_active() {
             ui.ctx().request_repaint();
         }
+        if self.launch_standalone.poll() || self.launch_standalone.is_active() {
+            ui.ctx().request_repaint();
+        }
         launch_readiness_page::show_launch_readiness_panel(
             ui,
             &launch_readiness_input,
             &mut self.launch_retroarch,
             &mut self.launch_dolphin,
             &mut self.launch_pcsx2,
+            &mut self.launch_standalone,
         );
         ui.add_space(crate::ui::theme::SECTION_GAP);
         let identity_sources_action = identity_sources_page::show_identity_sources_panel(
