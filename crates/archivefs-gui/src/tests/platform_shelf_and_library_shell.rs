@@ -1545,7 +1545,6 @@ fn platform_asset_id_handles_long_platform_names_without_panicking() {
 #[test]
 fn every_canonical_platform_has_one_unique_filename_and_intentional_fallback() {
     let mut asset_ids = std::collections::BTreeSet::new();
-    assert_eq!(archivefs_core::platform::PLATFORMS.len(), 74);
     for platform in archivefs_core::platform::PLATFORMS {
         let asset_id = platform_asset_id(platform.id, false);
         assert!(

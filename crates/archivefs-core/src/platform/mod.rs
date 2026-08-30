@@ -820,8 +820,8 @@ pub const PLATFORMS: &[Platform] = &[
             "amigaecs",
         ],
         filename_aliases: &[],
-        strong_extensions: &["adz", "ipf", "dms", "hdf", "lha"],
-        weak_extensions: &["adf", "zip", "iso", "lzx"],
+        strong_extensions: &["adz", "ipf", "dms", "lha"],
+        weak_extensions: &["adf", "hdf", "zip", "iso", "lzx"],
         magic: &[MagicRule {
             offset: 0,
             bytes: b"DOS\x00",

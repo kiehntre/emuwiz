@@ -101,6 +101,7 @@ pub mod identity_source;
 /// WHDLoad folders, extracted game folders), feeding the existing
 /// identity system rather than replacing it. See the module docs.
 pub mod ingestion;
+pub mod registry_parity;
 
 /// Provider-neutral DAT catalogue parsing and read-only audit.
 ///
