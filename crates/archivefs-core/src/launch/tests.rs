@@ -401,6 +401,164 @@ fn alias_resolvable_systemname_becomes_a_candidate() {
 }
 
 #[test]
+fn reviewed_classic_core_hints_prefer_one_of_two_matching_cores() {
+    for (platform_id, preferred, alternative, system_name, database) in [
+        (
+            "NES",
+            "nestopia",
+            "fceumm",
+            Some("Nintendo - Nintendo Entertainment System"),
+            None,
+        ),
+        (
+            "SNES",
+            "snes9x",
+            "bsnes",
+            Some("Nintendo - SNES / SFC"),
+            None,
+        ),
+        (
+            "Game Boy Color",
+            "gambatte",
+            "sameboy",
+            Some("Game Boy/Game Boy Color"),
+            Some("Nintendo - Game Boy|Nintendo - Game Boy Color"),
+        ),
+        (
+            "Game Boy Advance",
+            "mgba",
+            "vba_next",
+            Some("Game Boy/Game Boy Color/Game Boy Advance"),
+            Some("Nintendo - Game Boy|Nintendo - Game Boy Color|Nintendo - Game Boy Advance"),
+        ),
+        (
+            "MegaDrive",
+            "genesis_plus_gx",
+            "picodrive",
+            Some("Sega 8/16-bit (Various)"),
+            Some("Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega Drive - Genesis"),
+        ),
+        (
+            "N64",
+            "mupen64plus_next",
+            "parallel_n64",
+            Some("Nintendo - Nintendo 64"),
+            None,
+        ),
+        (
+            "Atari2600",
+            "stella",
+            "virtualjaguar",
+            Some("Atari - 2600"),
+            None,
+        ),
+        (
+            "Atari5200",
+            "a5200",
+            "stella",
+            Some("Atari - 5200"),
+            None,
+        ),
+        (
+            "Atari Lynx",
+            "handy",
+            "mednafen_lynx",
+            Some("Atari - Lynx"),
+            None,
+        ),
+    ] {
+        let plan = build_launch_plan(
+            &resolved(platform_id),
+            &resolved_content(),
+            &[],
+            &retroarch_environment_with_cores(vec![
+                core_finding(preferred, system_name, database),
+                core_finding(alternative, system_name, database),
+            ]),
+            &[],
+        );
+        let preferred_candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| {
+                matches!(&candidate.target, LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == preferred)
+            })
+            .expect("preferred core should be a candidate");
+        assert_eq!(
+            preferred_candidate.preference,
+            CandidatePreference::SoleEligible,
+            "{platform_id}"
+        );
+        assert_eq!(preferred_candidate.readiness, LaunchReadiness::Ready);
+        let alternative_candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| {
+                matches!(&candidate.target, LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == alternative)
+            })
+            .expect("alternative core should remain visible");
+        assert_eq!(alternative_candidate.readiness, LaunchReadiness::Ready);
+        assert_eq!(plan.summary.ready, 2);
+    }
+}
+
+#[test]
+fn two_matching_cores_without_a_reviewed_hint_remain_ambiguous() {
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &resolved_content(),
+        &[],
+        &retroarch_environment_with_cores(vec![
+            core_finding("fceumm", Some("Nintendo - Nintendo Entertainment System"), None),
+            core_finding("mesen", Some("Nintendo - Nintendo Entertainment System"), None),
+        ]),
+        &[],
+    );
+    let retroarch_candidates: Vec<_> = plan
+        .candidates
+        .iter()
+        .filter(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
+        .collect();
+    assert_eq!(retroarch_candidates.len(), 2);
+    assert!(retroarch_candidates.iter().all(|candidate| candidate
+        .blockers
+        .iter()
+        .any(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore)));
+}
+
+#[test]
+fn reviewed_core_hint_never_manufactures_identity_or_cross_selects_platform() {
+    let unknown = build_launch_plan(
+        &CanonicalIdentityStatus::Unknown,
+        &resolved_content(),
+        &[],
+        &retroarch_environment_with_cores(vec![core_finding(
+            "nestopia",
+            Some("Nintendo - Nintendo Entertainment System"),
+            None,
+        )]),
+        &[],
+    );
+    assert!(unknown.candidates.is_empty());
+
+    let wrong_platform = build_launch_plan(
+        &resolved("SNES"),
+        &resolved_content(),
+        &[],
+        &retroarch_environment_with_cores(vec![core_finding(
+            "nestopia",
+            Some("Nintendo - Nintendo Entertainment System"),
+            None,
+        )]),
+        &[],
+    );
+    assert!(wrong_platform.candidates.iter().all(|candidate| !matches!(
+        candidate.target,
+        LaunchTarget::RetroArchCore { .. }
+    )));
+}
+
+#[test]
 fn genesis_plus_gx_can_plan_a_sega_cd_candidate_from_reviewed_metadata() {
     let plan = build_launch_plan(
         &resolved("Sega CD"),

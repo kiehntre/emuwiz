@@ -153,6 +153,66 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "NES",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["nestopia"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "SNES",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["snes9x"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Game Boy",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["gambatte"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Game Boy Color",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["gambatte"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Game Boy Advance",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["mgba"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "N64",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["mupen64plus_next"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "MegaDrive",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["genesis_plus_gx"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Atari2600",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["stella"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Atari5200",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["a5200"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Atari Lynx",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["handy"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
         platform_id: "Arcade",
         standalone_adapters: &["mame"],
         retroarch_core_hints: &["mame", "mame2003_plus", "fbneo"],
@@ -360,6 +420,16 @@ mod tests {
             "Dreamcast",
             "AtariST",
             "Amiga",
+            "NES",
+            "SNES",
+            "Game Boy",
+            "Game Boy Color",
+            "Game Boy Advance",
+            "N64",
+            "MegaDrive",
+            "Atari2600",
+            "Atari5200",
+            "Atari Lynx",
         ] {
             assert!(
                 launch_compatibility_for_platform(platform_id).is_some(),
@@ -384,6 +454,27 @@ mod tests {
     #[test]
     fn unsupported_platform_has_no_row() {
         assert!(launch_compatibility_for_platform("Saturn").is_none());
+    }
+
+    #[test]
+    fn classic_console_rows_have_exactly_one_reviewed_hint() {
+        for platform_id in [
+            "NES",
+            "SNES",
+            "Game Boy",
+            "Game Boy Color",
+            "Game Boy Advance",
+            "N64",
+            "MegaDrive",
+            "Atari2600",
+            "Atari5200",
+            "Atari Lynx",
+        ] {
+            let row = launch_compatibility_for_platform(platform_id).unwrap();
+            assert!(row.standalone_adapters.is_empty(), "{platform_id}");
+            assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
+            assert_eq!(row.confidence, MappingConfidence::StronglyKnown);
+        }
     }
 
     #[test]

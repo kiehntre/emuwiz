@@ -346,11 +346,10 @@ fn requested_core_stem_mismatch_is_rejected() {
 // --- candidate ReadyWithWarnings rejected -------------------------------------------
 
 #[test]
-fn a_second_ambiguous_core_downgrades_readiness_and_is_rejected() {
-    // Two distinct cores that both resolve to the same platform make the
-    // candidate `Undetermined`/warn-eligible via `MultipleEligibleProfiles`
-    // rather than a clean `SoleEligible` `Ready` - exercised here by adding
-    // a second Mega Drive-resolving core beside the requested one.
+fn a_reviewed_core_hint_keeps_the_requested_candidate_ready_with_a_second_core() {
+    // Two distinct cores resolve to Mega Drive, but the reviewed
+    // `genesis_plus_gx` hint selects the requested core without changing
+    // the candidate's other readiness checks.
     let ready = build_ready_fixture("ready-with-warnings");
     ready
         .fixture
@@ -358,8 +357,8 @@ fn a_second_ambiguous_core_downgrades_readiness_and_is_rejected() {
     ready
         .fixture
         .write("info/picodrive.info", b"systemname = \"megadrive\"\n");
-    let error = preflight(&ready).unwrap_err();
-    assert_eq!(error.kind, LaunchPreflightErrorKind::CandidateNotReady);
+    let command = preflight(&ready).expect("reviewed hint should keep the requested core ready");
+    assert_eq!(command.selection.core_stem, "genesis_plus_gx");
 }
 
 // --- blocked candidate rejected -----------------------------------------------------

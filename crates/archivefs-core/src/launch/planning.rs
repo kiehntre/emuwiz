@@ -439,6 +439,19 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
         return;
     }
 
+    // `build_retroarch_candidates` has already resolved the reviewed
+    // single-hint case. Preserve that deterministic choice instead of
+    // treating the other, non-preferred RetroArch cores as an ordinary
+    // multi-profile tie below.
+    let hinted_indices: Vec<usize> = eligible_indices
+        .iter()
+        .copied()
+        .filter(|&index| candidates[index].preference == CandidatePreference::SoleEligible)
+        .collect();
+    if hinted_indices.len() == 1 {
+        return;
+    }
+
     if eligible_indices.len() == 1 {
         candidates[eligible_indices[0]].preference = CandidatePreference::SoleEligible;
         return;
