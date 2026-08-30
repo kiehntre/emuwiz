@@ -119,7 +119,8 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "d88", "hdi", "nhd", // Disc-image extensions.
     "iso", "xiso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd",
     "gdi", "cdi", "pbp", "ecm", "xbe",
-    "xex", // Apple II and Macintosh media/archive extensions.
+    "xex", "jag", "lyx", "atr", "atx", "xfd", "st", "stx", "msa",
+    // Apple II and Macintosh media/archive extensions.
     "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
     // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",
@@ -690,6 +691,20 @@ mod tests {
     #[test]
     fn apple_media_extensions_are_likely_content() {
         for extension in ["do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit"] {
+            assert_eq!(
+                classify_entry(&format!("game.{extension}"), false),
+                InspectorEntryClassification::LikelyContent,
+                ".{extension} must be discoverable content"
+            );
+        }
+    }
+
+    #[test]
+    fn atari_media_extensions_are_likely_content() {
+        for extension in [
+            "a26", "a52", "a78", "atr", "atx", "xex", "xfd", "lnx", "lyx", "j64", "jag", "st",
+            "stx", "msa", "ipf",
+        ] {
             assert_eq!(
                 classify_entry(&format!("game.{extension}"), false),
                 InspectorEntryClassification::LikelyContent,

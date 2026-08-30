@@ -187,6 +187,63 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "d88",
         kind: ArchiveKind::DirectGameImage,
     },
+    // --- Atari ---
+    MediaFormat {
+        extension: "a26",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "a52",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "a78",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "atr",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "atx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "xfd",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "lnx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "lyx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "j64",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "jag",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "stx",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "st",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "msa",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "ipf",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // Apple II disk images. The platform registry supplies the Apple II
     // identity; this registry only records the media projection.
     MediaFormat {
@@ -555,6 +612,21 @@ mod tests {
                 ".{extension} must be a direct game image"
             );
         }
+    }
+
+    #[test]
+    fn atari_media_extensions_are_direct_game_images() {
+        for extension in [
+            "a26", "a52", "a78", "atr", "atx", "xex", "xfd", "lnx", "lyx", "j64", "jag", "stx",
+            "st", "msa", "ipf",
+        ] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be a direct Atari media registration"
+            );
+        }
+        assert_eq!(kind_for_extension("cas"), None);
     }
 
     #[test]

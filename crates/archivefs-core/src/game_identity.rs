@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
+use crate::atari7800_header_evidence::{A78_HEADER_BYTES, parse_a78_header};
 use crate::disc_evidence_collector::{
     DiscCollectionRefusal, chd_needs_specialist_optical_backend, open_chd_iso9660,
     open_chd_raw_track, read_bounded_chd_bytes,
@@ -28,6 +29,7 @@ use crate::ingestion::cue_bin::{CueDataTrackMode, resolve_data_track};
 use crate::ingestion::gdi::{GdiDataTrackMode, resolve_gdi_data_track};
 use crate::iso9660::find_path;
 use crate::logical_media::LogicalMedia as _;
+use crate::lynx_header_evidence::{LYNX_HEADER_BYTES, parse_lynx_header};
 use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use crate::neogeocd_boot_evidence::{MAX_IPL_TXT_BYTES, parse_ipl_txt};
 use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
@@ -199,8 +201,9 @@ pub enum IdentityKind {
     DolphinRegion,
     LooseRomSha256,
     /// SHA-256 of the byte-order-normalized (canonical `Z64`) image - only
-    /// ever emitted for a platform with a tested, reversible byte-order
-    /// normalization ([`crate::n64_byte_order`], currently N64 only).
+    /// ever emitted for a platform with a tested, reversible representation
+    /// normalization ([`crate::n64_byte_order`] and
+    /// [`crate::header_normalization`]).
     /// Distinct from [`Self::LooseRomSha256`], which always covers the exact
     /// physical on-disk bytes regardless of byte order.
     LooseRomCanonicalSha256,
@@ -308,6 +311,13 @@ pub enum IdentityPlatform {
     Pcfx,
     PcEngineCd,
     NeoGeoCd,
+    Atari2600,
+    Atari5200,
+    Atari7800,
+    Atari8Bit,
+    AtariLynx,
+    AtariJaguar,
+    AtariST,
     Other,
 }
 
@@ -364,6 +374,20 @@ impl IdentityPlatform {
             | "turboduo" => Self::PcEngineCd,
             "neo geo cd" | "neogeocd" | "neo-geo cd" | "neo geo cd-rom" | "snk neo geo cd"
             | "ngcd" | "neocd" | "neo cd" | "neocdz" => Self::NeoGeoCd,
+            "atari 2600" | "atari2600" | "a2600" | "atari vcs" | "atarivcs" => Self::Atari2600,
+            "atari 5200" | "atari5200" | "a5200" => Self::Atari5200,
+            "atari 7800" | "atari7800" | "a7800" => Self::Atari7800,
+            "atari 8-bit" | "atari8bit" | "atari 8 bit" | "atari 800" | "atari800"
+            | "atari 400" | "atari400" | "atari xe" | "atarixe" | "atari xl" | "atarixl"
+            | "atari xegs" | "atarixegs" | "atari 130xe" | "atari130xe" => Self::Atari8Bit,
+            "atari lynx" | "atarilynx" | "lynx" | "lynx ii" | "lynxii" | "atarilynxlynx" => {
+                Self::AtariLynx
+            }
+            "atari jaguar" | "atarijaguar" | "jaguar" | "jaguar64" | "atarijag" => {
+                Self::AtariJaguar
+            }
+            "atari st" | "atarist" | "atari ste" | "atariste" | "atari tt" | "atarittu"
+            | "atari falcon" | "atarifalcon" => Self::AtariST,
             _ => Self::Other,
         }
     }
@@ -393,6 +417,13 @@ impl IdentityPlatform {
             Self::Pcfx => "PC-FX",
             Self::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
             Self::NeoGeoCd => "Neo Geo CD",
+            Self::Atari2600 => "Atari 2600",
+            Self::Atari5200 => "Atari 5200",
+            Self::Atari7800 => "Atari 7800",
+            Self::Atari8Bit => "Atari 8-bit",
+            Self::AtariLynx => "Atari Lynx",
+            Self::AtariJaguar => "Atari Jaguar",
+            Self::AtariST => "Atari ST",
             Self::Other => "Unsupported platform",
         }
     }
@@ -746,6 +777,12 @@ fn inspect_game_identity_with_platform_trust(
             | IdentityPlatform::GameBoyColor
             | IdentityPlatform::GameBoyAdvance
             | IdentityPlatform::N64
+            | IdentityPlatform::Atari2600
+            | IdentityPlatform::Atari5200
+            | IdentityPlatform::Atari7800
+            | IdentityPlatform::Atari8Bit
+            | IdentityPlatform::AtariLynx
+            | IdentityPlatform::AtariJaguar
     ) {
         inspect_loose_rom(&mut report, trusted_platform, trusted);
         return report;
@@ -892,6 +929,17 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::N64, "z64") => Some("z64"),
         (IdentityPlatform::N64, "v64") => Some("v64"),
         (IdentityPlatform::N64, "n64") => Some("n64"),
+        (IdentityPlatform::Atari2600, "a26") => Some("a26"),
+        (IdentityPlatform::Atari5200, "a52") => Some("a52"),
+        (IdentityPlatform::Atari7800, "a78") => Some("a78"),
+        (IdentityPlatform::Atari8Bit, "atr") => Some("atr"),
+        (IdentityPlatform::Atari8Bit, "atx") => Some("atx"),
+        (IdentityPlatform::Atari8Bit, "xex") => Some("xex"),
+        (IdentityPlatform::Atari8Bit, "xfd") => Some("xfd"),
+        (IdentityPlatform::AtariLynx, "lnx") => Some("lnx"),
+        (IdentityPlatform::AtariLynx, "lyx") => Some("lyx"),
+        (IdentityPlatform::AtariJaguar, "j64") => Some("j64"),
+        (IdentityPlatform::AtariJaguar, "jag") => Some("jag"),
         _ => None,
     }
 }
@@ -1006,17 +1054,56 @@ fn inspect_loose_rom(
         return;
     }
     let mut nes_header = None;
+    let mut atari7800_header = None;
+    let mut lynx_header = None;
     if report.platform == IdentityPlatform::Nes && format == "nes" {
         nes_header = inspect_nes_header(&mut file, before.len);
     }
+    if report.platform == IdentityPlatform::Atari7800 && format == "a78" {
+        file.seek(SeekFrom::Start(0)).ok();
+        let mut header = vec![0_u8; A78_HEADER_BYTES];
+        if file.read_exact(&mut header).is_ok()
+            && let Some(fact) = parse_a78_header(&header)
+            && u64::from(fact.rom_size)
+                .checked_add(A78_HEADER_BYTES as u64)
+                .is_some_and(|required| required <= before.len)
+        {
+            atari7800_header = Some(fact);
+        }
+    }
+    if report.platform == IdentityPlatform::AtariLynx && format == "lnx" {
+        file.seek(SeekFrom::Start(0)).ok();
+        let mut header = vec![0_u8; LYNX_HEADER_BYTES];
+        if file.read_exact(&mut header).is_ok() {
+            lynx_header = parse_lynx_header(&header);
+        }
+    }
+    if (format == "a78" && atari7800_header.is_none()) || (format == "lnx" && lynx_header.is_none())
+    {
+        add_loose_rom_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "the Atari cartridge header did not validate against the file",
+        );
+        return;
+    }
     let is_n64 = report.platform == IdentityPlatform::N64;
+    let needs_whole_file = is_n64 || atari7800_header.is_some() || lynx_header.is_some();
     let mut whole_file_bytes: Option<Vec<u8>> = None;
-    let digest = if is_n64 {
+    let digest = if needs_whole_file {
         // N64 needs the raw bytes afterward for byte-order detection and
         // canonical normalization, not just a hash - read once into memory
         // (already bounded by the `before.len <= MAX_LOOSE_ROM_BYTES` check
         // above) and hash that buffer the exact same way
         // [`hash_bounded_file`] would, rather than reading the file twice.
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            add_loose_rom_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "could not rewind the bounded Atari cartridge read",
+            );
+            return;
+        }
         let mut bytes = Vec::with_capacity(before.len as usize);
         match file
             .by_ref()
@@ -1099,8 +1186,40 @@ fn inspect_loose_rom(
             "nes_header_evidence::parse_ines_header",
         ));
     }
+    if let Some(fact) = atari7800_header {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::Platform,
+            IdentityStatus::Verified,
+            Some(IdentityPlatform::Atari7800.label().to_string()),
+            IdentityConfidence::StructuredMetadata,
+            &format!(
+                "ATARI7800 header validated: version {}, declared ROM payload {} bytes, title {:?}",
+                fact.header_version, fact.rom_size, fact.cart_title
+            ),
+            "atari7800_header_evidence::parse_a78_header",
+        ));
+    }
+    if let Some(fact) = lynx_header {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::Platform,
+            IdentityStatus::Verified,
+            Some(IdentityPlatform::AtariLynx.label().to_string()),
+            IdentityConfidence::StructuredMetadata,
+            &format!(
+                "LYNX header validated: version {}, bank page sizes {} and {}, name {:?}",
+                fact.version, fact.bank0_page_size, fact.bank1_page_size, fact.cart_name
+            ),
+            "lynx_header_evidence::parse_lynx_header",
+        ));
+    }
     if let Some(bytes) = whole_file_bytes.as_deref() {
-        push_n64_canonical_evidence(report, bytes);
+        if is_n64 {
+            push_n64_canonical_evidence(report, bytes);
+        } else {
+            push_header_canonical_evidence(report, bytes);
+        }
     }
     report.evidence.push(evidence(
         report,
@@ -1132,6 +1251,58 @@ fn inspect_loose_rom(
         );
     }
     report.complete = true;
+}
+
+/// Emits the canonical SHA-256 for a verified Atari 7800 or Lynx headered
+/// cartridge by reusing the already-reviewed, reversible header-normalization
+/// transforms. The physical hash remains separate and is always retained.
+fn push_header_canonical_evidence(report: &mut GameIdentityReport, bytes: &[u8]) {
+    use crate::header_normalization::{recognize_header_normalization, strip_known_header};
+
+    let Some(kind) = recognize_header_normalization(bytes)
+        .into_iter()
+        .find(|kind| {
+            matches!(
+                (report.platform, kind),
+                (
+                    IdentityPlatform::Atari7800,
+                    crate::header_normalization::HeaderNormalizationKind::Atari7800_128
+                ) | (
+                    IdentityPlatform::AtariLynx,
+                    crate::header_normalization::HeaderNormalizationKind::Lynx64
+                )
+            )
+        })
+    else {
+        retain_warning(
+            report,
+            "verified Atari header was not available to the canonical normalization pass",
+        );
+        return;
+    };
+    let Ok(normalized) = strip_known_header(bytes, kind) else {
+        retain_warning(
+            report,
+            "verified Atari header could not be reversibly stripped for canonical hashing",
+        );
+        return;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&normalized.bytes);
+    let canonical_sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::LooseRomCanonicalSha256,
+        IdentityStatus::Verified,
+        Some(canonical_sha256),
+        IdentityConfidence::ExactBytes,
+        "SHA-256 of the reversibly header-stripped Atari cartridge representation; distinct from the physical-file SHA-256",
+        normalized.transform_id,
+    ));
 }
 
 /// Emits the canonical (byte-order-normalized `Z64`) SHA-256 for an N64
@@ -1512,6 +1683,13 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Atari2600
+        | IdentityPlatform::Atari5200
+        | IdentityPlatform::Atari7800
+        | IdentityPlatform::Atari8Bit
+        | IdentityPlatform::AtariLynx
+        | IdentityPlatform::AtariJaguar
+        | IdentityPlatform::AtariST
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
@@ -2579,6 +2757,13 @@ fn inspect_iso_source(
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Atari2600
+        | IdentityPlatform::Atari5200
+        | IdentityPlatform::Atari7800
+        | IdentityPlatform::Atari8Bit
+        | IdentityPlatform::AtariLynx
+        | IdentityPlatform::AtariJaguar
+        | IdentityPlatform::AtariST
         | IdentityPlatform::Xbox
         | IdentityPlatform::Xbox360
         | IdentityPlatform::ScummVM
@@ -5403,6 +5588,13 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::Pcfx => &[IdentityKind::PcfxDiscHash],
         IdentityPlatform::PcEngineCd => &[IdentityKind::PceCdBootStructure],
         IdentityPlatform::NeoGeoCd => &[IdentityKind::NeoGeoCdBootStructure],
+        IdentityPlatform::Atari2600
+        | IdentityPlatform::Atari5200
+        | IdentityPlatform::Atari7800
+        | IdentityPlatform::Atari8Bit
+        | IdentityPlatform::AtariLynx
+        | IdentityPlatform::AtariJaguar => &[IdentityKind::LooseRomSha256],
+        IdentityPlatform::AtariST => &[],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -5607,6 +5799,13 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::PcEngineCd
         | IdentityPlatform::NeoGeoCd
         | IdentityPlatform::ThreeDo
+        | IdentityPlatform::Atari2600
+        | IdentityPlatform::Atari5200
+        | IdentityPlatform::Atari7800
+        | IdentityPlatform::Atari8Bit
+        | IdentityPlatform::AtariLynx
+        | IdentityPlatform::AtariJaguar
+        | IdentityPlatform::AtariST
         | IdentityPlatform::Other => {}
     }
 }
@@ -10323,6 +10522,29 @@ mod tests {
         bytes
     }
 
+    fn a78_image(payload: &[u8], declared_size: u32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; A78_HEADER_BYTES + payload.len()];
+        bytes[1..1 + b"ATARI7800".len()].copy_from_slice(b"ATARI7800");
+        bytes[0x11..0x11 + 4].copy_from_slice(b"Test");
+        bytes[0x31..0x35].copy_from_slice(&declared_size.to_be_bytes());
+        bytes[0x35..0x37].copy_from_slice(&1_u16.to_be_bytes());
+        bytes[0x37] = 1;
+        bytes[0x39] = 0;
+        bytes[A78_HEADER_BYTES..].copy_from_slice(payload);
+        bytes
+    }
+
+    fn lnx_image(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; LYNX_HEADER_BYTES + payload.len()];
+        bytes[..4].copy_from_slice(b"LYNX");
+        bytes[4..6].copy_from_slice(&256_u16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[0x0A..0x0A + 4].copy_from_slice(b"Test");
+        bytes[LYNX_HEADER_BYTES..].copy_from_slice(payload);
+        bytes
+    }
+
     #[test]
     fn neogeocd_iso_cue_and_chd_verify_the_ipl_txt_boot_structure() {
         let directory = FixtureDir::new("neogeocd-valid");
@@ -10498,6 +10720,104 @@ mod tests {
         let report = inspect_game_identity(&iso, None);
         assert_ne!(report.platform, IdentityPlatform::NeoGeoCd);
         assert_eq!(report.verified_neogeocd_boot_structure(), None);
+    }
+
+    #[test]
+    fn atari7800_headered_rom_emits_structural_and_canonical_identity() {
+        let directory = FixtureDir::new("atari7800-loose");
+        let payload = b"a78 payload";
+        let bytes = a78_image(payload, payload.len() as u32);
+        let path = write_fixture(&directory, "title.a78", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Atari7800"));
+
+        assert_eq!(report.platform, IdentityPlatform::Atari7800);
+        assert_eq!(
+            report.verified_loose_rom_sha256(),
+            Some(sha256_hex(&bytes).as_str())
+        );
+        assert_eq!(
+            report.verified_loose_rom_canonical_sha256(),
+            Some(sha256_hex(payload).as_str())
+        );
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::Platform
+                && item.status == IdentityStatus::Verified
+                && item.diagnostic.contains("ATARI7800 header validated")
+        }));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn malformed_atari7800_header_is_refused_and_filename_does_not_verify() {
+        let directory = FixtureDir::new("atari7800-malformed");
+        let payload = b"a78 payload";
+        let bytes = a78_image(payload, (payload.len() + 1) as u32);
+        let path = write_fixture(&directory, "Atari 7800 title.a78", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Atari7800"));
+        assert_eq!(report.verified_loose_rom_sha256(), None);
+        assert!(!report.complete);
+
+        let candidate = inspect_game_identity(&path, Some("Atari7800"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert!(!candidate.complete);
+    }
+
+    #[test]
+    fn lynx_headered_rom_emits_structural_and_canonical_identity() {
+        let directory = FixtureDir::new("lynx-loose");
+        let payload = b"lynx payload";
+        let bytes = lnx_image(payload);
+        let path = write_fixture(&directory, "title.lnx", &bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Atari Lynx"));
+
+        assert_eq!(report.platform, IdentityPlatform::AtariLynx);
+        assert_eq!(
+            report.verified_loose_rom_canonical_sha256(),
+            Some(sha256_hex(payload).as_str())
+        );
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::Platform
+                && item.status == IdentityStatus::Verified
+                && item.diagnostic.contains("LYNX header validated")
+        }));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn headerless_lynx_lyx_remains_hash_only_and_untrusted_filename_is_not_identity() {
+        let directory = FixtureDir::new("lynx-headerless");
+        let bytes = b"headerless lynx payload";
+        let path = write_fixture(&directory, "Lynx title.lyx", bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Atari Lynx"));
+        assert_eq!(
+            report.verified_loose_rom_sha256(),
+            Some(sha256_hex(bytes).as_str())
+        );
+        assert_eq!(report.verified_loose_rom_canonical_sha256(), None);
+        assert!(report.complete);
+
+        let candidate = inspect_game_identity(&path, Some("Atari Lynx"));
+        assert_eq!(candidate.verified_loose_rom_sha256(), None);
+        assert!(!candidate.complete);
+    }
+
+    #[test]
+    fn atari_identity_aliases_round_trip_to_their_canonical_rows() {
+        for (alias, expected) in [
+            ("Atari 2600", IdentityPlatform::Atari2600),
+            ("Atari 5200", IdentityPlatform::Atari5200),
+            ("Atari 7800", IdentityPlatform::Atari7800),
+            ("Atari 8-bit", IdentityPlatform::Atari8Bit),
+            ("Atari Lynx", IdentityPlatform::AtariLynx),
+            ("Atari Jaguar", IdentityPlatform::AtariJaguar),
+            ("Atari ST", IdentityPlatform::AtariST),
+        ] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(alias)),
+                expected,
+                "{alias}"
+            );
+        }
     }
 }
 

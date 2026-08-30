@@ -155,6 +155,19 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("ima", ContentKind::ComputerDisk),
     cf("img", ContentKind::ComputerDisk),
     cf("d88", ContentKind::ComputerDisk),
+    // --- Atari ---
+    cf("a26", ContentKind::RomCartridge),
+    cf("a52", ContentKind::RomCartridge),
+    cf("a78", ContentKind::RomCartridge),
+    cf("atr", ContentKind::ComputerDisk),
+    cf("atx", ContentKind::ComputerDisk),
+    cf("xex", ContentKind::RomCartridge),
+    cf("xfd", ContentKind::ComputerDisk),
+    cf("lnx", ContentKind::RomCartridge),
+    cf("lyx", ContentKind::RomCartridge),
+    cf("j64", ContentKind::RomCartridge),
+    cf("jag", ContentKind::RomCartridge),
+    cf("stx", ContentKind::ComputerDisk),
     // Apple II disk images.
     cf("do", ContentKind::ComputerDisk),
     cf("po", ContentKind::ComputerDisk),
@@ -274,6 +287,30 @@ mod tests {
             content_kind_for_extension("nhd"),
             Some(ContentKind::ComputerDisk)
         );
+    }
+
+    #[test]
+    fn atari_extensions_use_only_coarse_content_categories() {
+        for extension in ["a26", "a52", "a78", "lnx", "lyx", "j64", "jag"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::RomCartridge),
+                ".{extension} must be ROM content"
+            );
+        }
+        assert_eq!(
+            content_kind_for_extension("xex"),
+            Some(ContentKind::Executable),
+            ".xex remains Xbox 360 executable content"
+        );
+        for extension in ["atr", "atx", "xfd", "stx"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::ComputerDisk),
+                ".{extension} must be computer-disk content"
+            );
+        }
+        assert_eq!(content_kind_for_extension("cas"), None);
     }
 
     #[test]

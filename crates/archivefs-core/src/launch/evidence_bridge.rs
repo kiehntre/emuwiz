@@ -159,6 +159,13 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::Pcfx => Some("PC-FX"),
         IdentityPlatform::PcEngineCd => Some("PC Engine CD"),
         IdentityPlatform::NeoGeoCd => Some("Neo Geo CD"),
+        IdentityPlatform::Atari2600 => Some("Atari2600"),
+        IdentityPlatform::Atari5200 => Some("Atari5200"),
+        IdentityPlatform::Atari7800 => Some("Atari7800"),
+        IdentityPlatform::Atari8Bit => Some("Atari 8-bit"),
+        IdentityPlatform::AtariLynx => Some("Atari Lynx"),
+        IdentityPlatform::AtariJaguar => Some("Atari Jaguar"),
+        IdentityPlatform::AtariST => Some("AtariST"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
         IdentityPlatform::Other => None,
@@ -338,6 +345,16 @@ fn resolved_identity_for_platform(
                 vec![VerifiedIdentityFact::PcfxDiscHash(disc_hash.to_string())],
             ))
         }
+        IdentityPlatform::Atari2600
+        | IdentityPlatform::Atari5200
+        | IdentityPlatform::Atari7800
+        | IdentityPlatform::Atari8Bit
+        | IdentityPlatform::AtariLynx
+        | IdentityPlatform::AtariJaguar => {
+            let sha256 = find_value(resolved, IdentityKind::LooseRomSha256)?;
+            Some((platform_id, sha256.to_string(), Vec::new()))
+        }
+        IdentityPlatform::AtariST => None,
         // PC Engine CD's IPL boot-record carries no serial/title, so there
         // is no resolvable game key here - exact identity is DAT/hash-driven.
         // The platform is still known (via `launch_platform_id`), so a

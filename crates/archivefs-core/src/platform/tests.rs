@@ -657,11 +657,20 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
         ("col", "ColecoVision"),
         ("vec", "Vectrex"),
         ("cdt", "Amstrad CPC"),
+        ("a26", "Atari2600"),
+        ("a52", "Atari5200"),
+        ("a78", "Atari7800"),
         ("atr", "Atari 8-bit"),
+        ("atx", "Atari 8-bit"),
+        ("xfd", "Atari 8-bit"),
         ("d64", "Commodore 64"),
         ("woz", "Apple II"),
         ("xdf", "Sharp X68000"),
         ("j64", "Atari Jaguar"),
+        ("jag", "Atari Jaguar"),
+        ("lnx", "Atari Lynx"),
+        ("lyx", "Atari Lynx"),
+        ("stx", "AtariST"),
     ] {
         let report = detect(&format!("{ROOT}/unsorted/game.{extension}"));
         assert_eq!(
