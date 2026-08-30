@@ -49,6 +49,7 @@ use crate::safe_read::{SafeFile, TrustedRoots, open_bounded_read};
 
 pub mod atari_st;
 pub mod atari_stx;
+pub mod d88;
 pub mod dsk;
 pub mod scl;
 pub mod trd;
@@ -119,6 +120,15 @@ pub const MAX_DSK_BYTES: u64 = 8 * 1024 * 1024;
 /// two sides is already past any real drive.
 pub const MAX_DSK_TRACK_ENTRIES: usize = 170;
 
+/// The largest file this module will treat as a D88 floppy container.
+pub const MAX_D88_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The fixed D88 header and track-table size.
+pub const D88_HEADER_BYTES: usize = 0x2b0;
+
+/// The maximum number of D88 track-table entries (82 tracks x 2 heads).
+pub const MAX_D88_TRACK_ENTRIES: usize = 164;
+
 /// The fixed size of a `.dsk` disk-information block and of each track-
 /// information block.
 pub const DSK_INFO_BLOCK_BYTES: usize = 256;
@@ -155,6 +165,9 @@ pub enum DiskFormat {
     /// payload whose size the entries account for exactly. Specific to the
     /// TR-DOS / ZX Spectrum ecosystem.
     SpectrumSclArchive,
+    /// A structurally valid D88 disk container shared by Japanese computer
+    /// families; it does not identify a platform by itself.
+    D88Container,
 }
 
 impl DiskFormat {
@@ -166,6 +179,7 @@ impl DiskFormat {
             Self::SpectrumPlus3Disk => "ZX Spectrum +3 (+3DOS) disk image",
             Self::SpectrumTrDosDisk => "ZX Spectrum TR-DOS disk image",
             Self::SpectrumSclArchive => "ZX Spectrum SCL (SINCLAIR) archive",
+            Self::D88Container => "D88 disk container",
         }
     }
 
@@ -179,6 +193,7 @@ impl DiskFormat {
             Self::CpcEmuDsk => "Amstrad CPC",
             Self::SpectrumPlus3Disk => "ZX Spectrum",
             Self::SpectrumTrDosDisk | Self::SpectrumSclArchive => "ZX Spectrum",
+            Self::D88Container => "NEC PC-8801",
         }
     }
 
@@ -201,6 +216,7 @@ impl DiskFormat {
             | Self::SpectrumPlus3Disk
             | Self::SpectrumTrDosDisk
             | Self::SpectrumSclArchive => true,
+            Self::D88Container => false,
         }
     }
 }
@@ -388,6 +404,19 @@ pub struct SclLayout {
     pub has_trailing_checksum: bool,
 }
 
+/// What one D88 container declared and what its bounded track walk validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct D88Layout {
+    /// The fixed-width disk name field, including unused bytes.
+    pub disk_name: [u8; 17],
+    pub write_protected: bool,
+    pub media_type: u8,
+    pub declared_track_entries: usize,
+    pub validated_track_entries: usize,
+    pub declared_sectors: u32,
+    pub declared_data_bytes: u64,
+}
+
 /// Optional format-specific metadata. Only ever the shape the recognised format
 /// actually has - never a lowest common denominator that invents fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -398,6 +427,7 @@ pub enum DiskFormatMetadata {
     Dsk(DskLayout),
     TrDos(TrDosDescriptor),
     Scl(SclLayout),
+    D88(D88Layout),
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -502,6 +532,7 @@ pub fn inspect_disk_format(
         "dsk" => Adapter::CpcEmuDsk,
         "trd" => Adapter::SpectrumTrDos,
         "scl" => Adapter::SpectrumScl,
+        "d88" => Adapter::D88,
         _ => return DiskFormatEvidence::refused(DiskFormatRefusal::NoAdapter { extension }),
     };
     if cancelled(cancel) {
@@ -526,6 +557,7 @@ pub fn inspect_disk_format(
         Adapter::CpcEmuDsk => dsk::inspect(&mut reader, context, cancel),
         Adapter::SpectrumTrDos => trd::inspect(&mut reader, context, cancel),
         Adapter::SpectrumScl => scl::inspect(&mut reader, context, cancel),
+        Adapter::D88 => d88::inspect(&mut reader, context, cancel),
     };
     evidence.bytes_inspected = reader.bytes_read;
     evidence.read_via_symlink = read_via_symlink;
@@ -543,6 +575,7 @@ enum Adapter {
     CpcEmuDsk,
     SpectrumTrDos,
     SpectrumScl,
+    D88,
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

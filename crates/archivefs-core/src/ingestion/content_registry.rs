@@ -133,6 +133,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("hdi", ContentKind::ComputerDisk),
     cf("ima", ContentKind::ComputerDisk),
     cf("img", ContentKind::ComputerDisk),
+    cf("d88", ContentKind::ComputerDisk),
     // ZX Spectrum TR-DOS media. The *category* is a computer disk/archive;
     // the ZX Spectrum platform is confirmed only when
     // `crate::disk_format::inspect_disk_format` validates the TR-DOS system
@@ -214,5 +215,13 @@ mod tests {
             Some(ContentKind::RomCartridge)
         );
         assert_eq!(content_kind_for_extension("rom"), None);
+    }
+
+    #[test]
+    fn d88_is_computer_disk_content() {
+        assert_eq!(
+            content_kind_for_extension("d88"),
+            Some(ContentKind::ComputerDisk)
+        );
     }
 }

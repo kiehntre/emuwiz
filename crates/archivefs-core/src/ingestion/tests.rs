@@ -748,6 +748,72 @@ fn dsk(tracks: u8, sides: u8, plus3: bool) -> Vec<u8> {
     image
 }
 
+fn d88(name: &str) -> Vec<u8> {
+    let header_bytes = 0x2b0usize;
+    let mut image = vec![0u8; header_bytes + 16 + 128];
+    let name_bytes = name.as_bytes();
+    image[..name_bytes.len().min(17)].copy_from_slice(&name_bytes[..name_bytes.len().min(17)]);
+    image[0x1c..0x20].copy_from_slice(&(header_bytes as u32).to_le_bytes());
+    let track = header_bytes;
+    image[track + 2] = 1; // R
+    image[track + 4..track + 6].copy_from_slice(&1u16.to_le_bytes());
+    image[track + 14..track + 16].copy_from_slice(&128u16.to_le_bytes());
+    image[track + 16..].fill(0xe5);
+    image
+}
+
+#[test]
+fn d88_discovery_requires_structure_and_preserves_folder_platform_evidence() {
+    let root = source_dir("d88-discovery");
+    let pc88 = root.path().join("pc88");
+    let pc98 = root.path().join("pc98");
+    std::fs::create_dir_all(&pc88).unwrap();
+    std::fs::create_dir_all(&pc98).unwrap();
+    std::fs::write(pc88.join("named.d88"), d88("PC88 DISK")).unwrap();
+    std::fs::write(pc98.join("named.d88"), d88("PC98 DISK")).unwrap();
+    let pc88_report = discover_source(&pc88).unwrap();
+    let pc98_report = discover_source(&pc98).unwrap();
+    assert_eq!(pc88_report.items.len(), 1, "{:?}", pc88_report.items);
+    assert_eq!(pc98_report.items.len(), 1, "{:?}", pc98_report.items);
+    assert_eq!(
+        pc88_report.items[0].content,
+        Some(ContentKind::ComputerDisk)
+    );
+    assert_eq!(
+        pc98_report.items[0].content,
+        Some(ContentKind::ComputerDisk)
+    );
+    assert_eq!(
+        pc88_report.items[0].platform_hint.as_deref(),
+        Some("NEC PC-8801")
+    );
+    assert_eq!(pc98_report.items[0].platform_hint.as_deref(), Some("PC-98"));
+
+    let bare = source_dir("d88-bare");
+    std::fs::write(bare.path().join("bare.d88"), d88("BARE DISK")).unwrap();
+    std::fs::write(bare.path().join("random.d88"), vec![0x5a; 832]).unwrap();
+    let report = discover_source(bare.path()).unwrap();
+    assert_eq!(report.items.len(), 2, "{:?}", report.items);
+    let item = |name: &str| {
+        report
+            .items
+            .iter()
+            .find(|item| item.path.ends_with(name))
+            .unwrap_or_else(|| panic!("missing {name}: {:?}", report.items))
+    };
+    assert_eq!(item("bare.d88").content, Some(ContentKind::ComputerDisk));
+    assert_eq!(item("bare.d88").platform_hint, None);
+    assert_eq!(item("bare.d88").validation_state, ValidationState::Skipped);
+    assert_eq!(
+        item("random.d88").validation_state,
+        ValidationState::Skipped
+    );
+    assert!(matches!(
+        item("random.d88").skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+}
+
 #[test]
 fn z80_v1_snapshot_is_discovered_as_a_zx_spectrum_machine_snapshot() {
     let dir = source_dir("z80");

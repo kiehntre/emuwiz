@@ -578,6 +578,9 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
     if extension == "dsk" {
         return discover_dsk_image(path, source_root);
     }
+    if extension == "d88" {
+        return discover_d88_image(path, source_root);
+    }
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
     }
@@ -956,6 +959,66 @@ fn discover_dsk_image(path: &Path, source_root: &Path) -> GameDiscovery {
                     .unwrap_or_else(|| "not a recognised CPCEMU .dsk container".to_string()),
             ),
             "This .dsk file is not a readable CPCEMU disk container.".to_string(),
+        ),
+    }
+}
+
+/// `.d88` is a structurally validated container shared by PC-88, PC-98,
+/// FM Towns and X68000. The parser proves only the container; folder evidence
+/// is still required before discovery can accept a platform assignment.
+fn discover_d88_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "D88 disk container".to_string());
+    match evidence.format {
+        Some(DiskFormat::D88Container) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::ComputerDisk,
+                    identity,
+                    format!(
+                        "Valid D88 disk container; platform identified from folder evidence. {detail}."
+                    ),
+                ),
+                _ => GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: None,
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Skipped,
+                    explanation: format!(
+                        "Valid D88 disk container, but D88 is shared by PC-88, PC-98, FM Towns and X68000; no platform corroboration was found. {detail}."
+                    ),
+                    skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+                },
+            }
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised D88 disk container".to_string()),
+            ),
+            "This file is not a readable D88 disk container.".to_string(),
         ),
     }
 }

@@ -11165,6 +11165,19 @@ mod tests {
     }
 
     #[test]
+    fn d88_filenames_do_not_supply_japanese_platform_identity() {
+        let root = "/mnt/japanese-computer/unsorted";
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801 Game.d88"), root),
+            None
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/PC-98 Game.d88"), root),
+            None
+        );
+    }
+
+    #[test]
     fn exact_folder_alias_remains_stronger_than_filename_similarity() {
         assert_eq!(
             detect_platform(

@@ -116,7 +116,7 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "3ds", "cia", "gg",
     "sms", "gen", "32x", "pce", "ws", "wsc", "ngp", "ngc", "a26", "a52", "a78", "j64", "col",
     "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom", "mx1", "mx2",
-    // Disc-image extensions.
+    "d88", // Disc-image extensions.
     "iso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd", "gdi",
     "cdi", "pbp", "ecm", // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",
@@ -823,6 +823,14 @@ mod tests {
         );
         assert_eq!(
             classify_entry("cart.mx2", false),
+            InspectorEntryClassification::LikelyContent
+        );
+    }
+
+    #[test]
+    fn d88_is_likely_content() {
+        assert_eq!(
+            classify_entry("disk.d88", false),
             InspectorEntryClassification::LikelyContent
         );
     }

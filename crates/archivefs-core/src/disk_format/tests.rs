@@ -183,6 +183,30 @@ fn valid_stx() -> Vec<u8> {
     stx_image(3, 10, 64)
 }
 
+/// A minimal one-track, one-sector D88 container.
+fn d88_image(name: &str) -> Vec<u8> {
+    let track_offset = D88_HEADER_BYTES as u32;
+    let track_bytes = 16 + 128;
+    let mut image = vec![0u8; D88_HEADER_BYTES + track_bytes];
+    let name_bytes = name.as_bytes();
+    image[..name_bytes.len().min(17)].copy_from_slice(&name_bytes[..name_bytes.len().min(17)]);
+    image[0x1a] = 0; // write enabled
+    image[0x1b] = 0; // 2D media
+    image[0x1c..0x20].copy_from_slice(&track_offset.to_le_bytes());
+    let track = D88_HEADER_BYTES;
+    image[track] = 0; // C
+    image[track + 1] = 0; // H
+    image[track + 2] = 1; // R
+    image[track + 3] = 0; // N = 128 bytes
+    image[track + 4..track + 6].copy_from_slice(&1u16.to_le_bytes());
+    image[track + 6] = 0; // density
+    image[track + 7] = 0; // deleted-data flag
+    image[track + 8] = 0; // status/CRC
+    image[track + 14..track + 16].copy_from_slice(&128u16.to_le_bytes());
+    image[track + 16..].fill(0xe5);
+    image
+}
+
 // --- Limits ---------------------------------------------------------------
 
 /// Test 1
@@ -240,6 +264,87 @@ fn a_standard_720k_st_image_is_recognised() {
         "the limit of what this proves must be stated: {:?}",
         evidence.evidence
     );
+}
+
+#[test]
+fn a_minimal_d88_container_is_recognised_without_platform_identity() {
+    let fixture = Fixture::new("d88-minimal");
+    let image = fixture.write("library/disk.d88", &d88_image("PC88 TEST DISK"));
+    let evidence = fixture.inspect(&image);
+
+    assert_eq!(evidence.format, Some(DiskFormat::D88Container));
+    assert_eq!(evidence.platform, Some("NEC PC-8801"));
+    assert_eq!(evidence.confidence, DetectionConfidence::Probable);
+    assert!(!evidence.conclusive);
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("PC88 TEST DISK"))
+    );
+    assert!(
+        evidence
+            .evidence
+            .iter()
+            .any(|item| item.contains("write-protect"))
+    );
+    assert!(evidence.evidence.iter().any(|item| item.contains("0x00")));
+    match evidence.metadata {
+        Some(DiskFormatMetadata::D88(layout)) => {
+            assert_eq!(layout.disk_name[..14], *b"PC88 TEST DISK");
+            assert!(!layout.write_protected);
+            assert_eq!(layout.media_type, 0);
+            assert_eq!(layout.declared_track_entries, 1);
+            assert_eq!(layout.validated_track_entries, 1);
+            assert_eq!(layout.declared_sectors, 1);
+            assert_eq!(layout.declared_data_bytes, 128);
+        }
+        metadata => panic!("expected D88 metadata, got {metadata:?}"),
+    }
+}
+
+#[test]
+fn d88_folder_context_does_not_turn_shared_structure_into_machine_proof() {
+    let fixture = Fixture::new("d88-context");
+    let image = fixture.write("library/disk.d88", &d88_image("SHARED"));
+    let evidence = fixture.inspect_in_folder(&image, "PC-98");
+    assert_eq!(evidence.format, Some(DiskFormat::D88Container));
+    assert_eq!(evidence.confidence, DetectionConfidence::Ambiguous);
+    assert!(!evidence.conclusive);
+}
+
+#[test]
+fn malformed_d88_structures_fail_closed() {
+    let fixture = Fixture::new("d88-invalid");
+    let cases = [
+        ("random", vec![0x5a; D88_HEADER_BYTES + 144]),
+        (
+            "truncated",
+            d88_image("TRUNCATED")[..D88_HEADER_BYTES - 1].to_vec(),
+        ),
+        ("past-eof", {
+            let mut bytes = d88_image("PAST EOF");
+            bytes[0x1c..0x20].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            bytes
+        }),
+        ("bad-sector-header", {
+            let mut bytes = d88_image("BAD HEADER");
+            bytes[D88_HEADER_BYTES + 3] = 7;
+            bytes
+        }),
+        ("bad-sector-size", {
+            let mut bytes = d88_image("BAD SIZE");
+            bytes[D88_HEADER_BYTES + 14..D88_HEADER_BYTES + 16]
+                .copy_from_slice(&64u16.to_le_bytes());
+            bytes
+        }),
+    ];
+    for (label, bytes) in cases {
+        let image = fixture.write(&format!("library/{label}.d88"), &bytes);
+        let evidence = fixture.inspect(&image);
+        assert_eq!(evidence.format, None, "{label} was accepted: {evidence:?}");
+        assert!(evidence.refusal.is_some(), "{label} had no refusal");
+    }
 }
 
 /// Test 3

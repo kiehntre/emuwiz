@@ -155,6 +155,10 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "tzx",
         kind: ArchiveKind::DirectGameImage,
     },
+    MediaFormat {
+        extension: "d88",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // CHD (MAME Compressed Hunks of Data). Shared by many disc-based
     // platforms (Neo Geo CD, Sega CD, arcade sets, redump CD/DVD sets...);
     // resolving *which* platform a `.chd` belongs to is, again, the
@@ -487,5 +491,13 @@ mod tests {
         assert!(is_watch_relevant_extension("md"));
         assert!(is_watch_relevant_extension("bin"));
         assert!(is_watch_relevant_extension("gen"));
+    }
+
+    #[test]
+    fn d88_is_a_direct_game_image() {
+        assert_eq!(
+            kind_for_extension("d88"),
+            Some(ArchiveKind::DirectGameImage)
+        );
     }
 }
