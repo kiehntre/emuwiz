@@ -344,4 +344,12 @@ mod tests {
         );
         assert_eq!(content_kind_for_extension("god"), None);
     }
+
+    #[test]
+    fn d64_is_ingestible_as_computer_disk() {
+        assert_eq!(
+            content_kind_for_extension("d64"),
+            Some(ContentKind::ComputerDisk)
+        );
+    }
 }

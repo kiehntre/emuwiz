@@ -663,7 +663,6 @@ fn a_strong_extension_carries_a_detection_on_its_own() {
         ("atr", "Atari 8-bit"),
         ("atx", "Atari 8-bit"),
         ("xfd", "Atari 8-bit"),
-        ("d64", "Commodore 64"),
         ("woz", "Apple II"),
         ("xdf", "Sharp X68000"),
         ("j64", "Atari Jaguar"),
@@ -1975,8 +1974,9 @@ fn an_unknown_extension_has_no_candidates() {
 #[test]
 fn d64_includes_both_c64_and_c128() {
     let candidates = platform_candidates_for_extension("d64");
-    assert!(candidates.contains(&"Commodore 64"));
     assert!(candidates.contains(&"Commodore 128"));
+    assert!(candidates.contains(&"VIC-20"));
+    assert!(!candidates.contains(&"Commodore 64"));
 }
 
 #[test]

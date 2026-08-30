@@ -688,6 +688,9 @@ fn discover_direct_file(
     if matches!(extension.as_str(), "hdi" | "nhd") {
         return discover_hard_disk_image(path, source_root, &extension);
     }
+    if extension == "d64" {
+        return discover_d64_image(path, source_root);
+    }
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
     }
@@ -1125,6 +1128,63 @@ fn discover_dsk_image(path: &Path, source_root: &Path) -> GameDiscovery {
                     .unwrap_or_else(|| "not a recognised CPCEMU .dsk container".to_string()),
             ),
             "This .dsk file is not a readable CPCEMU disk container.".to_string(),
+        ),
+    }
+}
+
+/// A D64 is a shared Commodore 1541-media structure. It is accepted when the
+/// existing folder/metadata evidence identifies a machine, and remains
+/// visible but platform-ambiguous when it does not. The disk title and
+/// internal filenames are provenance only; they never supply release identity
+/// or rename authority.
+fn discover_d64_image(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    let detail = evidence
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Commodore 1541 D64 media".to_string());
+    if evidence.format != Some(DiskFormat::Commodore1541D64) {
+        return skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a recognised D64 image".to_string()),
+            ),
+            "This .d64 file did not validate as a bounded Commodore 1541 disk image.".to_string(),
+        );
+    }
+    let identity = identity_for(path, source_root);
+    match &identity {
+        Some(summary) if summary.platform.is_some() => accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            ContentKind::ComputerDisk,
+            identity,
+            format!(
+                "Commodore 1541 disk media; platform supplied by surrounding evidence. {detail}."
+            ),
+        ),
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::AmbiguousPlatform,
+            format!(
+                "Valid Commodore 1541 disk media, but D64 is shared by C64, C128 and VIC-20; no platform evidence selected one. {detail}."
+            ),
         ),
     }
 }

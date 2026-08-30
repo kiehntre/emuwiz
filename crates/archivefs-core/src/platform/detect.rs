@@ -763,7 +763,7 @@ fn structural_format_evidence(
         // cancellation token to give at this point.
         None,
     );
-    let (Some(format), Some(platform)) = (inspected.format, inspected.platform) else {
+    let Some(format) = inspected.format else {
         // Not recognised, or refused. Either way no claim is made and detection
         // falls back to folder and extension evidence.
         return Vec::new();
@@ -818,6 +818,16 @@ fn structural_format_evidence(
             })
             .collect();
     }
+    if format == crate::disk_format::DiskFormat::Commodore1541D64 {
+        // D64 structure proves shared Commodore 1541 media, not C64/C128/VIC-20.
+        return Vec::new();
+    }
+    let Some(platform) = inspected.platform else {
+        // Some valid structures prove a media family but no machine platform
+        // (notably Commodore 1541 D64, shared by C64/C128/VIC-20). Keep that
+        // evidence in the format layer without fabricating a platform row.
+        return Vec::new();
+    };
     vec![DetectionEvidence {
         source: DetectionSource::Signature,
         conclusive: inspected.conclusive,

@@ -375,6 +375,229 @@ fn st_image(sides: u16, sectors_per_track: u16, tracks: u16) -> Vec<u8> {
     image
 }
 
+fn d64_offset(track: u8, sector: u8) -> usize {
+    let sectors: u16 = (1..track)
+        .map(|t| match t {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        })
+        .sum();
+    (usize::from(sectors) + usize::from(sector)) * 256
+}
+
+/// Minimal real 35-track DOS 2.0 image: BAM, one directory sector, and an
+/// optional PRG chain. The BAM free counts and bitmaps are kept consistent so
+/// the fixture exercises the same invariants as a formatted disk.
+fn d64_image(file_blocks: usize) -> Vec<u8> {
+    let mut image = vec![0_u8; 174_848];
+    let bam_offset = d64_offset(18, 0);
+    image[bam_offset] = 18;
+    image[bam_offset + 1] = 1;
+    image[bam_offset + 2] = 0x41;
+    image[bam_offset + 0x90..bam_offset + 0xA0].copy_from_slice(b"TEST DISK       ");
+    image[bam_offset + 0xA2..bam_offset + 0xA4].copy_from_slice(b"01");
+    image[bam_offset + 0xA5..bam_offset + 0xA7].copy_from_slice(b"2A");
+    for track in 1..=35_u8 {
+        let base = bam_offset + 4 + (usize::from(track) - 1) * 4;
+        let count: u8 = match track {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        };
+        for sector in 0..count {
+            image[base + 1 + usize::from(sector / 8)] |= 1 << (sector % 8);
+        }
+        image[base] = count;
+    }
+    let mut used = vec![(18_u8, 0_u8), (18, 1)];
+    for sector in 0..file_blocks as u8 {
+        used.push((1, sector));
+    }
+    for (track, sector) in used {
+        let base = bam_offset + 4 + (usize::from(track) - 1) * 4;
+        image[base + 1 + usize::from(sector / 8)] &= !(1 << (sector % 8));
+    }
+    for track in 1..=35_u8 {
+        let base = bam_offset + 4 + (usize::from(track) - 1) * 4;
+        let count: u8 = match track {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        };
+        image[base] = (0..count)
+            .filter(|sector| image[base + 1 + usize::from(*sector / 8)] & (1 << (*sector % 8)) != 0)
+            .count() as u8;
+    }
+    let directory = d64_offset(18, 1);
+    image[directory] = 0;
+    image[directory + 1] = 0xFF;
+    if file_blocks > 0 {
+        image[directory + 2] = 0x82; // closed PRG
+        image[directory + 3] = 1;
+        image[directory + 4] = 0;
+        image[directory + 5..directory + 21].copy_from_slice(b"HELLO           ");
+        image[directory + 30..directory + 32].copy_from_slice(&(file_blocks as u16).to_le_bytes());
+        for sector in 0..file_blocks {
+            let current = d64_offset(1, sector as u8);
+            if sector + 1 == file_blocks {
+                image[current] = 0;
+                image[current + 1] = 2;
+            } else {
+                image[current] = 1;
+                image[current + 1] = (sector + 1) as u8;
+            }
+        }
+    }
+    image
+}
+
+#[test]
+fn d64_minimal_bam_directory_and_provenance_validate() {
+    let fixture = Fixture::new("d64-minimal");
+    let evidence = fixture.inspect(&fixture.write("library/minimal.d64", &d64_image(0)));
+    assert_eq!(
+        evidence.format,
+        Some(DiskFormat::Commodore1541D64),
+        "{:?}",
+        evidence.refusal
+    );
+    assert_eq!(evidence.platform, None);
+    assert!(!evidence.conclusive);
+    let Some(DiskFormatMetadata::D64(layout)) = evidence.metadata else {
+        panic!("D64 metadata")
+    };
+    assert_eq!(layout.tracks, 35);
+    assert_eq!(layout.disk_name, *b"TEST DISK       ");
+    assert_eq!(layout.disk_id, *b"01");
+    assert_eq!(layout.dos_type, *b"2A");
+    assert!(layout.directory.is_empty());
+}
+
+#[test]
+fn d64_prg_and_multi_sector_chain_validate() {
+    let fixture = Fixture::new("d64-file");
+    let evidence = fixture.inspect(&fixture.write("library/file.d64", &d64_image(2)));
+    let Some(DiskFormatMetadata::D64(layout)) = evidence.metadata else {
+        panic!("D64 metadata")
+    };
+    assert_eq!(layout.directory.len(), 1);
+    let entry = &layout.directory[0];
+    assert_eq!(
+        (entry.file_type, entry.closed, entry.locked),
+        (2, true, false)
+    );
+    assert_eq!(
+        (entry.start_track, entry.start_sector, entry.blocks),
+        (1, 0, 2)
+    );
+}
+
+#[test]
+fn d64_error_info_tail_is_supported_without_normalising_it() {
+    let fixture = Fixture::new("d64-error-tail");
+    let mut image = d64_image(0);
+    image.extend(std::iter::repeat_n(0xA5, 683));
+    let evidence = fixture.inspect(&fixture.write("library/tail.d64", &image));
+    let Some(DiskFormatMetadata::D64(layout)) = evidence.metadata else {
+        panic!("D64 metadata")
+    };
+    assert!(layout.has_error_info_tail);
+    assert_eq!(evidence.format, Some(DiskFormat::Commodore1541D64));
+}
+
+#[test]
+fn d64_bad_bam_directory_and_file_chain_are_fail_closed() {
+    let fixture = Fixture::new("d64-negative");
+    let path = fixture.write("library/bad.d64", &d64_image(1));
+    let bam = d64_offset(18, 0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[bam + 4] = 0;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+
+    let mut bytes = d64_image(1);
+    let directory = d64_offset(18, 1);
+    bytes[directory] = 99;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+
+    let mut bytes = d64_image(1);
+    bytes[directory] = 18;
+    bytes[directory + 1] = 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+
+    let mut bytes = d64_image(2);
+    let first = d64_offset(1, 0);
+    bytes[first] = 1;
+    bytes[first + 1] = 21;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fixture.inspect(&path).refusal.is_some());
+}
+
+#[test]
+fn d64_random_wrong_size_and_other_commodore_extensions_are_not_claimed() {
+    let fixture = Fixture::new("d64-extensions");
+    let random = fixture.write("library/random.d64", &[0xA5; 174_848]);
+    assert!(fixture.inspect(&random).refusal.is_some());
+    let wrong = fixture.write("library/wrong.d64", &[0; 123]);
+    assert!(fixture.inspect(&wrong).refusal.is_some());
+    for extension in ["g64", "d71", "d81"] {
+        let path = fixture.write(&format!("library/untouched.{extension}"), &[0; 16]);
+        assert_eq!(
+            fixture.inspect(&path).format,
+            None,
+            ".{extension} must not dispatch to D64"
+        );
+    }
+}
+
+#[test]
+fn d64_folder_evidence_selects_c64_or_c128_but_bare_stays_ambiguous() {
+    let fixture = Fixture::new("d64-platform");
+    let bare = fixture.write("library/bare.d64", &d64_image(0));
+    let c64 = fixture.write("library/c64/game.d64", &d64_image(0));
+    let c128 = fixture.write("library/c128/game.d64", &d64_image(0));
+    let source_root = fixture.path("library");
+    let detect = |path: &std::path::Path| {
+        detect_platform_report(&DetectionRequest {
+            path,
+            source_root: &source_root,
+            manual_platform: None,
+            trusted_platform: None,
+            read_signatures: true,
+            inspect_layout: false,
+            emulator_context: None,
+            trusted_roots: fixture.trusted(),
+        })
+    };
+    assert_eq!(detect(&bare).platform, None);
+    assert_eq!(detect(&bare).confidence, DetectionConfidence::Ambiguous);
+    assert_eq!(detect(&c64).platform, Some("Commodore 64"));
+    assert_eq!(detect(&c128).platform, Some("Commodore 128"));
+}
+
+#[test]
+fn d64_ingestion_accepts_media_and_keeps_bare_platform_ambiguous() {
+    let fixture = Fixture::new("d64-ingestion");
+    let root = fixture.path("library");
+    std::fs::write(root.join("bare.d64"), d64_image(0)).unwrap();
+    let report = crate::ingestion::discovery::discover_source(&root).unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(
+        report.items[0].content,
+        Some(crate::ingestion::content_registry::ContentKind::ComputerDisk)
+    );
+    assert_eq!(
+        report.items[0].skip_reason,
+        Some(crate::ingestion::discovery::SkipReason::AmbiguousPlatform)
+    );
+}
+
 /// The standard double-sided 720 KB ST disk.
 fn st_720k() -> Vec<u8> {
     st_image(2, 9, 80)

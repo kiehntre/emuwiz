@@ -52,6 +52,7 @@ pub mod atari_stx;
 pub mod crt;
 pub mod d88;
 pub mod dfs;
+pub mod d64;
 pub mod dsk;
 pub mod hdi;
 pub mod scl;
@@ -73,8 +74,9 @@ pub const MAX_DISK_FORMAT_BYTES_READ: u64 = 64 * 1024;
 /// The largest single read.
 pub const MAX_DISK_FORMAT_READ_CHUNK: usize = 1024;
 
-/// The furthest offset any read starts at. A structural header lives at the
-/// front of a file; nothing here seeks into the body.
+/// The furthest offset any ordinary structural read starts at. D64 opts into
+/// its own larger, still bounded sector offset because its BAM is in the
+/// middle of the image.
 pub const MAX_DISK_FORMAT_OFFSET: u64 = 32 * 1024;
 
 /// The largest file this module will treat as a raw floppy image. An Atari ST
@@ -142,6 +144,10 @@ pub const DSK_INFO_BLOCK_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskFormat {
+    /// A sector-order Commodore 1541 disk image (`.d64`). The media is shared
+    /// by C64, C128 and VIC-20 software, so this is deliberately family-level
+    /// evidence rather than a machine claim.
+    Commodore1541D64,
     /// A raw sector dump of an Atari ST floppy: no container header at all,
     /// recognised from its FAT12 boot-sector geometry and its exact length.
     AtariStRawFloppy,
@@ -188,6 +194,7 @@ pub enum DiskFormat {
 impl DiskFormat {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Commodore1541D64 => "Commodore 1541 D64 disk image",
             Self::AtariStRawFloppy => "Atari ST raw floppy image",
             Self::AtariStPasti => "Atari ST Pasti (STX) image",
             Self::CpcEmuDsk => "CPCEMU DSK disk image",
@@ -205,6 +212,7 @@ impl DiskFormat {
     /// The canonical platform identifier this format belongs to.
     pub fn platform(self) -> &'static str {
         match self {
+            Self::Commodore1541D64 => "Commodore disk media",
             Self::AtariStRawFloppy | Self::AtariStPasti => "AtariST",
             // The bare CPCEMU container narrows towards Amstrad CPC (its
             // authoring system and dominant use) without settling it - see
@@ -233,7 +241,7 @@ impl DiskFormat {
     /// AMSDOS/CPC disks do not have it.
     pub fn proves_platform(self) -> bool {
         match self {
-            Self::AtariStRawFloppy | Self::CpcEmuDsk => false,
+            Self::Commodore1541D64 | Self::AtariStRawFloppy | Self::CpcEmuDsk => false,
             Self::AtariStPasti
             | Self::SpectrumPlus3Disk
             | Self::SpectrumTrDosDisk
@@ -396,6 +404,30 @@ pub struct DskLayout {
     pub plus3_bootable: bool,
 }
 
+/// What a validated sector-order 1541 image declared. Names and directory
+/// filenames are retained as provenance only; they never identify a release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct D64Layout {
+    pub tracks: u8,
+    pub sectors: u16,
+    pub has_error_info_tail: bool,
+    pub disk_name: [u8; 16],
+    pub disk_id: [u8; 2],
+    pub dos_type: [u8; 2],
+    pub directory: Vec<D64DirectoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct D64DirectoryEntry {
+    pub file_type: u8,
+    pub closed: bool,
+    pub locked: bool,
+    pub start_track: u8,
+    pub start_sector: u8,
+    pub blocks: u16,
+    pub filename: [u8; 16],
+}
+
 /// What one TR-DOS disk's system/volume descriptor (track 0, sector 9)
 /// declared. Every field is read from that one 256-byte sector; nothing is
 /// derived from a directory walk.
@@ -506,6 +538,7 @@ pub struct CrtLayout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum DiskFormatMetadata {
+    D64(D64Layout),
     Floppy(FloppyGeometry),
     Pasti(PastiLayout),
     Dsk(DskLayout),
@@ -615,6 +648,7 @@ pub fn inspect_disk_format(
     };
     // Refuse before opening anything when no adapter could use the bytes.
     let adapter = match extension.as_str() {
+        "d64" => Adapter::Commodore1541D64,
         "st" => Adapter::AtariStRawFloppy,
         "stx" => Adapter::AtariStPasti,
         "dsk" => Adapter::CpcEmuDsk,
@@ -647,6 +681,7 @@ pub fn inspect_disk_format(
 
     let mut reader = BoundedReader::new(&mut file);
     let mut evidence = match adapter {
+        Adapter::Commodore1541D64 => d64::inspect(&mut reader, context, cancel),
         Adapter::AtariStRawFloppy => atari_st::inspect(&mut reader, context, cancel),
         Adapter::AtariStPasti => atari_stx::inspect(&mut reader, context, cancel),
         Adapter::CpcEmuDsk => dsk::inspect(&mut reader, context, cancel),
@@ -671,6 +706,7 @@ pub fn inspect_disk_format(
 }
 
 enum Adapter {
+    Commodore1541D64,
     AtariStRawFloppy,
     AtariStPasti,
     CpcEmuDsk,
@@ -695,6 +731,7 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
 pub struct BoundedReader<'a> {
     file: &'a mut SafeFile,
     bytes_read: u64,
+    max_offset: u64,
 }
 
 impl<'a> BoundedReader<'a> {
@@ -702,6 +739,7 @@ impl<'a> BoundedReader<'a> {
         Self {
             file,
             bytes_read: 0,
+            max_offset: MAX_DISK_FORMAT_OFFSET,
         }
     }
 
@@ -716,6 +754,10 @@ impl<'a> BoundedReader<'a> {
 
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
+    }
+
+    pub(crate) fn set_max_offset(&mut self, max_offset: u64) {
+        self.max_offset = max_offset;
     }
 
     /// Reads exactly `length` bytes at `offset`, or refuses.
@@ -736,10 +778,11 @@ impl<'a> BoundedReader<'a> {
                 ),
             });
         }
-        if offset > MAX_DISK_FORMAT_OFFSET {
+        if offset > self.max_offset {
             return Err(DiskFormatRefusal::Malformed {
                 detail: format!(
-                    "offset {offset} is past the {MAX_DISK_FORMAT_OFFSET}-byte inspection limit"
+                    "offset {offset} is past the {}-byte inspection limit",
+                    self.max_offset
                 ),
             });
         }

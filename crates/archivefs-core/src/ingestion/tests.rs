@@ -48,6 +48,45 @@ fn minimal_crt() -> Vec<u8> {
     image
 }
 
+fn minimal_d64() -> Vec<u8> {
+    let mut image = vec![0; 174_848];
+    let sectors_on_track = |track: u8| match track {
+        1..=17 => 21,
+        18..=24 => 19,
+        25..=30 => 18,
+        _ => 17,
+    };
+    let offset = |track: u8, sector: u8| {
+        (1..track)
+            .map(sectors_on_track)
+            .map(usize::from)
+            .sum::<usize>()
+            .saturating_add(usize::from(sector))
+            * 256
+    };
+    let bam = offset(18, 0);
+    image[bam..bam + 3].copy_from_slice(&[18, 1, 0x41]);
+    image[bam + 0x90..bam + 0x9F].copy_from_slice(b"INGESTION TEST ");
+    image[bam + 0xA2..bam + 0xA4].copy_from_slice(b"01");
+    image[bam + 0xA5..bam + 0xA7].copy_from_slice(b"2A");
+    for track in 1..=35_u8 {
+        let count = sectors_on_track(track);
+        let entry = bam + 4 + (usize::from(track) - 1) * 4;
+        image[entry] = count;
+        for sector in 0..count {
+            image[entry + 1 + usize::from(sector / 8)] |= 1 << (sector % 8);
+        }
+    }
+    for (track, sector) in [(18_u8, 0_u8), (18, 1)] {
+        let entry = bam + 4 + (usize::from(track) - 1) * 4;
+        image[entry] -= 1;
+        image[entry + 1 + usize::from(sector / 8)] &= !(1 << (sector % 8));
+    }
+    image[offset(18, 1)] = 0;
+    image[offset(18, 1) + 1] = 0xFF;
+    image
+}
+
 /// The standard z64 (big-endian) N64 dump signature.
 const N64_Z64_MAGIC: [u8; 4] = [0x80, 0x37, 0x12, 0x40];
 
@@ -1027,9 +1066,8 @@ fn c128_folder_keeps_d64_and_g64_as_c128_ingestion_items() {
     let root = source_dir("c128-folder");
     let c128 = root.path().join("c128");
     std::fs::create_dir_all(&c128).unwrap();
-    for extension in ["d64", "g64"] {
-        std::fs::write(c128.join(format!("game.{extension}")), b"fixture bytes").unwrap();
-    }
+    std::fs::write(c128.join("game.d64"), minimal_d64()).unwrap();
+    std::fs::write(c128.join("game.g64"), b"fixture bytes").unwrap();
 
     let report = discover_source(&c128).unwrap();
     assert_eq!(report.items.len(), 2);

@@ -799,7 +799,7 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Commodore 64",
         folder_aliases: &["commodore64", "c64", "commodorec64", "c64gs"],
         filename_aliases: &[],
-        strong_extensions: &["d64", "t64", "prg", "g64", "d81ns"],
+        strong_extensions: &["t64", "prg", "crt", "g64", "d81ns"],
         weak_extensions: &["tap", "cas", "bin", "zip"],
         magic: &[],
         layout: &[],
