@@ -1,12 +1,83 @@
+use super::reconcile::{WhdloadDatContext, WhdloadSlaveMatch, reconcile_whdload_slaves};
+use super::slave::SlaveArtifact;
 use super::{
     exact_slave_match_observation, inspect_whdload_slave_file, parse_whdload_slave,
     structural_slave_observation,
 };
+use crate::dat::index::DatIndex;
+use crate::dat::model::{
+    DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource, ParsedDat,
+};
 use crate::platform_evidence_fusion::evidence_lineage::{
-    ClaimType, EvidenceChannel, LineageRelation, Representation, SourceFamily,
+    ClaimType, EvidenceChannel, LineageRelation, Representation, SourceArtifactIdentity,
+    SourceFamily,
 };
 use std::path::Path;
 use tempfile::tempdir;
+
+// --- DAT reconciliation fixtures ---------------------------------------
+
+/// A one-DAT hash index mapping each `(sha1 -> game name)` pair to a
+/// single-ROM game entry. The reused generic [`DatIndex`], never an
+/// Amiga-specific catalogue.
+fn dat_index(entries: &[(&str, &str)]) -> DatIndex {
+    let games = entries
+        .iter()
+        .map(|(sha1, game)| DatGameEntry {
+            name: (*game).to_string(),
+            roms: vec![DatRomEntry {
+                name: format!("{game}.slave"),
+                sha1: Some((*sha1).to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .collect();
+    let dat = ParsedDat {
+        source: DatSource {
+            format: DatFormat::ClrMamePro,
+            ecosystem: DatEcosystem::GenericClrMamePro,
+            file_path: "whdload.dat".into(),
+            name: Some("Commodore - Amiga - WHDLoad".into()),
+            description: None,
+            version: Some("2024-01-01".into()),
+            author: None,
+            homepage: None,
+            clrmamepro_header: None,
+            entry_count: entries.len(),
+            rom_count: entries.len(),
+            parse_warnings: Vec::new(),
+            packing_policy: DatPackingPolicy::Standard,
+        },
+        games,
+    };
+    DatIndex::build(&dat)
+}
+
+fn retroplay_context<'a>(
+    index: &'a DatIndex,
+    artifact: &'a SourceArtifactIdentity,
+) -> WhdloadDatContext<'a> {
+    WhdloadDatContext {
+        index,
+        source_family: SourceFamily::Retroplay,
+        upstream_version: Some("2024-01-01"),
+        source_artifact: Some(artifact),
+    }
+}
+
+fn dat_artifact() -> SourceArtifactIdentity {
+    SourceArtifactIdentity {
+        source_family: SourceFamily::Retroplay,
+        upstream_version: Some("2024-01-01".to_string()),
+        artifact_sha256: Some("d".repeat(64)),
+        artifact_name: Some("Commodore - Amiga - WHDLoad (2024-01-01).dat".to_string()),
+    }
+}
+
+fn slave_artifact(dir: &Path, name: &str, version: u16) -> SlaveArtifact {
+    inspect_whdload_slave_file(&write(dir, name, &slave(version))).unwrap()
+}
 
 fn put16(v: &mut [u8], at: usize, n: u16) {
     v[at..at + 2].copy_from_slice(&n.to_be_bytes());
@@ -150,7 +221,7 @@ fn artifact_hashes_and_evidence_are_whole_slave_only() {
     assert_eq!(structural.provenance.upstream_source, SourceFamily::WHDLoad);
     assert_eq!(structural.provenance.lineage, LineageRelation::Independent);
     assert_eq!(structural.provenance.upstream_version, None);
-    let exact = exact_slave_match_observation(&a, Some("Game".into()));
+    let exact = exact_slave_match_observation(&a, Some("Game".into()), None);
     assert_eq!(exact.claim, ClaimType::ExactSlaveMatch);
 }
 #[test]
@@ -165,7 +236,335 @@ fn filename_never_changes_identity() {
             .contains("runtime")
     );
     assert_eq!(
-        exact_slave_match_observation(&a, None).release_candidate,
+        exact_slave_match_observation(&a, None, None).release_candidate,
         None
     )
+}
+
+// --- DAT reconciliation (identity_source::whdload::reconcile) -----------
+
+#[test]
+fn parsed_slave_plus_exact_dat_hash_yields_exact_identity() {
+    let d = tempdir().unwrap();
+    let slave = slave_artifact(d.path(), "Superfrog_v1.2_0801.slave", 20);
+    let index = dat_index(&[(&slave.hashes.sha1, "Superfrog (1993)(Team17)")]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(std::slice::from_ref(&slave), Some(&ctx));
+
+    assert!(!result.ambiguous);
+    assert_eq!(result.slaves.len(), 1);
+    assert_eq!(result.slaves[0].outcome, WhdloadSlaveMatch::Exact);
+    assert_eq!(
+        result.slaves[0].matched_release.as_deref(),
+        Some("Superfrog (1993)(Team17)")
+    );
+    assert_eq!(result.agreed_release(), Some("Superfrog (1993)(Team17)"));
+
+    let exact = result
+        .observations
+        .iter()
+        .find(|o| o.claim == ClaimType::ExactSlaveMatch)
+        .expect("an exact-slave-match observation");
+    assert_eq!(
+        exact.release_candidate.as_deref(),
+        Some("Superfrog (1993)(Team17)")
+    );
+    // Attributed to the DAT it came from, carrying the hash actually used.
+    assert_eq!(exact.provenance.channel, EvidenceChannel::LocalDat);
+    assert_eq!(exact.provenance.upstream_source, SourceFamily::Retroplay);
+    assert_eq!(
+        exact.provenance.upstream_version.as_deref(),
+        Some("2024-01-01")
+    );
+    assert_eq!(
+        exact.hash_or_value.as_deref(),
+        Some(slave.hashes.sha1.as_str())
+    );
+    // The structural observation is still present alongside it.
+    assert!(
+        result
+            .observations
+            .iter()
+            .any(|o| o.claim == ClaimType::PlatformCandidate
+                && o.platform_candidate.as_deref() == Some("Amiga"))
+    );
+}
+
+#[test]
+fn valid_slave_with_no_dat_match_is_structural_only() {
+    let d = tempdir().unwrap();
+    let slave = slave_artifact(d.path(), "Unknown_0001.slave", 20);
+    let index = dat_index(&[("0".repeat(40).as_str(), "Some Other Game")]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(std::slice::from_ref(&slave), Some(&ctx));
+
+    assert!(!result.ambiguous);
+    assert_eq!(result.slaves[0].outcome, WhdloadSlaveMatch::StructuralOnly);
+    assert_eq!(result.slaves[0].matched_release, None);
+    assert_eq!(result.agreed_release(), None);
+    assert!(
+        result
+            .observations
+            .iter()
+            .all(|o| o.claim != ClaimType::ExactSlaveMatch)
+    );
+    assert!(
+        result
+            .observations
+            .iter()
+            .any(|o| o.platform_candidate.as_deref() == Some("Amiga"))
+    );
+}
+
+#[test]
+fn no_dat_context_preserves_structural_evidence_only() {
+    let d = tempdir().unwrap();
+    let slave = slave_artifact(d.path(), "Whatever_1649.slave", 16);
+
+    let result = reconcile_whdload_slaves(std::slice::from_ref(&slave), None);
+
+    assert!(!result.ambiguous);
+    assert_eq!(result.slaves[0].outcome, WhdloadSlaveMatch::StructuralOnly);
+    assert_eq!(result.observations.len(), 1);
+    assert_eq!(result.observations[0].claim, ClaimType::PlatformCandidate);
+}
+
+#[test]
+fn malformed_slave_is_refused_by_the_parser_before_reconciliation() {
+    // The reconciler only ever receives already-parsed artifacts; a
+    // truncated slave never becomes one.
+    let mut bytes = slave(20);
+    bytes.truncate(40);
+    assert!(parse_whdload_slave(&bytes).is_err());
+    let d = tempdir().unwrap();
+    assert!(inspect_whdload_slave_file(&write(d.path(), "broken.slave", &bytes)).is_err());
+}
+
+#[test]
+fn a_filename_that_looks_like_a_version_or_aga_never_becomes_identity() {
+    let d = tempdir().unwrap();
+    // Valid slave bytes, misleading name.
+    let slave = slave_artifact(d.path(), "GoldenAxe_v1.4_AGA_0017.slave", 20);
+    let index = dat_index(&[("f".repeat(40).as_str(), "Unrelated")]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(std::slice::from_ref(&slave), Some(&ctx));
+
+    assert_eq!(result.slaves[0].outcome, WhdloadSlaveMatch::StructuralOnly);
+    assert_eq!(result.slaves[0].matched_release, None);
+    let structural = result
+        .observations
+        .iter()
+        .find(|o| o.claim == ClaimType::PlatformCandidate)
+        .unwrap();
+    assert_eq!(structural.release_candidate, None);
+    assert_eq!(structural.platform_candidate.as_deref(), Some("Amiga"));
+    assert!(
+        result
+            .observations
+            .iter()
+            .all(|o| o.claim != ClaimType::ExactSlaveMatch)
+    );
+}
+
+#[test]
+fn two_slaves_matching_the_same_release_do_not_conflict() {
+    let d = tempdir().unwrap();
+    let a = slave_artifact(d.path(), "Turrican2.slave", 20);
+    let b = slave_artifact(d.path(), "Turrican2_alt.slave", 16);
+    assert_ne!(a.hashes.sha1, b.hashes.sha1);
+    let index = dat_index(&[
+        (&a.hashes.sha1, "Turrican II (1991)(Rainbow Arts)"),
+        (&b.hashes.sha1, "Turrican II (1991)(Rainbow Arts)"),
+    ]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(&[a, b], Some(&ctx));
+
+    assert!(
+        !result.ambiguous,
+        "same release from two slaves is corroboration, not conflict"
+    );
+    assert_eq!(
+        result.agreed_release(),
+        Some("Turrican II (1991)(Rainbow Arts)")
+    );
+    assert_eq!(
+        result
+            .observations
+            .iter()
+            .filter(|o| o.claim == ClaimType::ExactSlaveMatch)
+            .count(),
+        2,
+        "each slave contributes its own corroborating exact observation"
+    );
+}
+
+#[test]
+fn two_slaves_matching_conflicting_releases_are_ambiguous() {
+    let d = tempdir().unwrap();
+    let a = slave_artifact(d.path(), "GameA.slave", 20);
+    let b = slave_artifact(d.path(), "GameB.slave", 16);
+    let index = dat_index(&[
+        (&a.hashes.sha1, "Superfrog"),
+        (&b.hashes.sha1, "Pinball Dreams"),
+    ]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(&[a, b], Some(&ctx));
+
+    assert!(result.ambiguous);
+    assert_eq!(result.agreed_release(), None);
+    // Both exact observations are kept for review, not silently dropped.
+    assert_eq!(
+        result
+            .observations
+            .iter()
+            .filter(|o| o.claim == ClaimType::ExactSlaveMatch)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn one_slave_matching_multiple_distinct_releases_is_ambiguous_and_asserts_nothing() {
+    let d = tempdir().unwrap();
+    let slave = slave_artifact(d.path(), "Colliding.slave", 20);
+    // Same SHA-1 recorded by the DAT under two different games (a real
+    // collision the shared index preserves).
+    let index = dat_index(&[
+        (&slave.hashes.sha1, "Release One"),
+        (&slave.hashes.sha1, "Release Two"),
+    ]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(std::slice::from_ref(&slave), Some(&ctx));
+
+    assert!(result.ambiguous);
+    assert_eq!(result.slaves[0].outcome, WhdloadSlaveMatch::ExactAmbiguous);
+    assert!(
+        result
+            .observations
+            .iter()
+            .all(|o| o.claim != ClaimType::ExactSlaveMatch),
+        "a slave that hits two releases asserts no exact identity"
+    );
+}
+
+#[test]
+fn an_unmatched_extra_slave_never_erases_a_valid_exact_match() {
+    let d = tempdir().unwrap();
+    let matched = slave_artifact(d.path(), "Main.slave", 20);
+    let extra = slave_artifact(d.path(), "Loader.slave", 16);
+    let index = dat_index(&[(&matched.hashes.sha1, "Ruff 'n' Tumble")]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(&[matched, extra], Some(&ctx));
+
+    assert!(!result.ambiguous);
+    assert_eq!(result.agreed_release(), Some("Ruff 'n' Tumble"));
+    assert_eq!(result.slaves[0].outcome, WhdloadSlaveMatch::Exact);
+    assert_eq!(result.slaves[1].outcome, WhdloadSlaveMatch::StructuralOnly);
+}
+
+#[test]
+fn matched_dat_source_and_revision_provenance_is_retained() {
+    let d = tempdir().unwrap();
+    let slave = slave_artifact(d.path(), "Zool.slave", 20);
+    let index = dat_index(&[(&slave.hashes.sha1, "Zool")]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let result = reconcile_whdload_slaves(std::slice::from_ref(&slave), Some(&ctx));
+    let exact = result
+        .observations
+        .iter()
+        .find(|o| o.claim == ClaimType::ExactSlaveMatch)
+        .unwrap();
+
+    assert_eq!(
+        exact.provenance.upstream_version.as_deref(),
+        Some("2024-01-01")
+    );
+    let source_artifact = exact
+        .provenance
+        .source_artifact
+        .as_ref()
+        .expect("the matched DAT artifact identity is retained");
+    assert_eq!(source_artifact.source_family, SourceFamily::Retroplay);
+    assert_eq!(
+        source_artifact.artifact_name.as_deref(),
+        Some("Commodore - Amiga - WHDLoad (2024-01-01).dat")
+    );
+    assert_eq!(exact.provenance.lineage, LineageRelation::Independent);
+    assert_eq!(
+        exact.provenance.representation,
+        Representation::WHDLoadSlave
+    );
+}
+
+#[test]
+fn exact_slave_match_observation_has_a_real_production_path_through_discovery() {
+    // `ingestion::discover_source_with_whdload_dat` -> `discover_whdload_folder`
+    // -> `reconcile_whdload_slaves` -> `exact_slave_match_observation`.
+    let d = tempdir().unwrap();
+    let install = d.path().join("Superfrog");
+    std::fs::create_dir_all(&install).unwrap();
+    let slave_path = write(&install, "Superfrog.slave", &slave(20));
+    let inspected = inspect_whdload_slave_file(&slave_path).unwrap();
+    let index = dat_index(&[(&inspected.hashes.sha1, "Superfrog (1993)(Team17)")]);
+    let artifact = dat_artifact();
+    let ctx = retroplay_context(&index, &artifact);
+
+    let report = crate::ingestion::discover_source_with_whdload_dat(d.path(), Some(&ctx)).unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|item| item.content == Some(crate::ingestion::ContentKind::WhdloadInstall))
+        .expect("the WHDLoad install is discovered");
+
+    assert_eq!(
+        item.validation_state,
+        crate::ingestion::ValidationState::Accepted
+    );
+    // Platform hint comes from verified slave structure, not the folder name.
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    // The exact catalogue identity reached the user-visible explanation.
+    assert!(
+        item.explanation
+            .contains("Exact catalogue match: Superfrog (1993)(Team17)."),
+        "{}",
+        item.explanation
+    );
+}
+
+#[test]
+fn discovery_without_a_dat_context_still_gives_structural_amiga_evidence() {
+    let d = tempdir().unwrap();
+    let install = d.path().join("Some Game_v2.0_AGA");
+    std::fs::create_dir_all(&install).unwrap();
+    write(&install, "Game.slave", &slave(20));
+
+    let report = crate::ingestion::discover_source(d.path()).unwrap();
+    let item = report
+        .items
+        .iter()
+        .find(|item| item.content == Some(crate::ingestion::ContentKind::WhdloadInstall))
+        .unwrap();
+
+    assert_eq!(
+        item.validation_state,
+        crate::ingestion::ValidationState::Accepted
+    );
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(!item.explanation.contains("Exact catalogue match"));
 }

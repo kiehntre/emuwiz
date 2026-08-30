@@ -14,7 +14,9 @@ use super::content_registry::{ContentKind, content_kind_for_extension};
 use super::cue_bin::resolve_cue;
 use crate::ArchiveIdentity;
 use crate::amiga_disk::{self, AmigaDisk, structural_amiga_floppy_observation};
-use crate::identity_source::whdload::inspect_whdload_slave_file;
+use crate::identity_source::whdload::{
+    WhdloadDatContext, inspect_whdload_slave_file, reconcile_whdload_slaves,
+};
 use crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -309,6 +311,19 @@ pub enum DiscoveryError {
 /// (folder-alias matching never looks above it), matching the existing
 /// scanner's behaviour.
 pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    discover_source_with_whdload_dat(root, None)
+}
+
+/// [`discover_source`] with an optional generic DAT context for reconciling
+/// any discovered WHDLoad install's verified slave evidence against a
+/// catalogue's own hash index (see
+/// [`crate::identity_source::whdload::reconcile`]). When `whdload_dat` is
+/// `None` - the current catalogue-scan caller - WHDLoad installs still gain
+/// structural Amiga evidence, just no exact catalogue identity.
+pub fn discover_source_with_whdload_dat(
+    root: &Path,
+    whdload_dat: Option<&WhdloadDatContext<'_>>,
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
     if !root.is_dir() {
         return Err(DiscoveryError::NotADirectory);
     }
@@ -335,7 +350,7 @@ pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryEr
         if extension_lowercase(path).as_deref() == Some("cue") {
             continue; // already handled above
         }
-        items.push(discover_file(path, root, &mut structural_evidence));
+        items.push(discover_file(path, root, whdload_dat, &mut structural_evidence));
     }
 
     let mut stats = DiscoveryStats::default();
@@ -449,11 +464,14 @@ fn discover_cue(cue_path: &Path, consumed: &mut BTreeSet<PathBuf>) -> GameDiscov
 fn discover_file(
     path: &Path,
     source_root: &Path,
+    whdload_dat: Option<&WhdloadDatContext<'_>>,
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
 ) -> GameDiscovery {
     let container = detect_container(path, path.is_dir());
     match &container {
-        ContainerKind::Folder(FolderRole::WhdloadInstall) => discover_whdload_folder(path),
+        ContainerKind::Folder(FolderRole::WhdloadInstall) => {
+            discover_whdload_folder(path, whdload_dat)
+        }
         ContainerKind::Folder(FolderRole::ExtractedGame) => discover_extracted_folder(path),
         ContainerKind::Folder(FolderRole::Plain) => unreachable!("plain folders are recursed"),
         ContainerKind::Archive(format) => discover_archive(path, *format, source_root),
@@ -461,7 +479,19 @@ fn discover_file(
     }
 }
 
-fn discover_whdload_folder(path: &Path) -> GameDiscovery {
+/// A discovered WHDLoad install: every readable `.slave` is parsed and
+/// whole-file hashed once (the existing bounded
+/// [`inspect_whdload_slave_file`]), then reconciled against `whdload_dat`
+/// (see [`reconcile_whdload_slaves`]). A structurally valid slave always
+/// yields strong structural Amiga evidence - so the platform hint is
+/// `Amiga` from the slave's own structure, never from the folder name; an
+/// exact whole-`.slave` SHA-1 hit in the catalogue additionally names the
+/// release. The folder is refused only when its first `.slave` cannot be
+/// read as a valid WHDLoad slave, exactly as before.
+fn discover_whdload_folder(
+    path: &Path,
+    whdload_dat: Option<&WhdloadDatContext<'_>>,
+) -> GameDiscovery {
     let slaves = find_slave_files(path);
     let Some(first_slave) = slaves.first() else {
         // classify_folder only returns WhdloadInstall when a `.slave` was
@@ -474,23 +504,61 @@ fn discover_whdload_folder(path: &Path) -> GameDiscovery {
             "This looked like a WHDLoad install but no .slave file could be read.".to_string(),
         );
     };
-    match inspect_whdload_slave_file(first_slave) {
-        Ok(_artifact) => accepted(
-            path.to_path_buf(),
-            ContainerKind::Folder(FolderRole::WhdloadInstall),
-            ContentKind::WhdloadInstall,
-            None,
-            format!("WHDLoad install ({} slave file(s) found).", slaves.len()),
-        ),
-        Err(error) => skipped(
-            path.to_path_buf(),
-            ContainerKind::Folder(FolderRole::WhdloadInstall),
-            Some(ContentKind::WhdloadInstall),
-            SkipReason::InvalidContent(format!("{error:?}")),
-            "This folder has a .slave file, but it could not be read as a valid WHDLoad slave."
-                .to_string(),
-        ),
+    let first_artifact = match inspect_whdload_slave_file(first_slave) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return skipped(
+                path.to_path_buf(),
+                ContainerKind::Folder(FolderRole::WhdloadInstall),
+                Some(ContentKind::WhdloadInstall),
+                SkipReason::InvalidContent(format!("{error:?}")),
+                "This folder has a .slave file, but it could not be read as a valid WHDLoad \
+                 slave."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Parse the remaining slaves best-effort: a malformed extra slave never
+    // erases the identity a valid one already established.
+    let mut artifacts = vec![first_artifact];
+    for extra in slaves.iter().skip(1) {
+        if let Ok(artifact) = inspect_whdload_slave_file(extra) {
+            artifacts.push(artifact);
+        }
     }
+
+    let reconciliation = reconcile_whdload_slaves(&artifacts, whdload_dat);
+
+    // The platform hint comes from the verified slave structure
+    // (`structural_slave_observation` -> `Amiga`), not the folder name.
+    let mut identity = identity_for(path, path.parent().unwrap_or(path));
+    if let Some(summary) = identity.as_mut() {
+        summary.platform = reconciliation
+            .observations
+            .iter()
+            .find_map(|observation| observation.platform_candidate.clone());
+    }
+
+    let mut explanation = format!(
+        "WHDLoad install ({} readable slave file(s); verified Amiga WHDLoad slave structure).",
+        artifacts.len()
+    );
+    if reconciliation.ambiguous {
+        explanation.push_str(
+            " Its slaves resolve to conflicting catalogue releases - identity needs review.",
+        );
+    } else if let Some(release) = reconciliation.agreed_release() {
+        explanation.push_str(&format!(" Exact catalogue match: {release}."));
+    }
+
+    accepted(
+        path.to_path_buf(),
+        ContainerKind::Folder(FolderRole::WhdloadInstall),
+        ContentKind::WhdloadInstall,
+        identity,
+        explanation,
+    )
 }
 
 fn discover_extracted_folder(path: &Path) -> GameDiscovery {

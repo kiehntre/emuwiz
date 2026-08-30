@@ -467,6 +467,16 @@ fn whdload_folder_is_discovered_as_one_install_candidate() {
         ContainerKind::Folder(FolderRole::WhdloadInstall)
     );
     assert_eq!(item.validation_state, ValidationState::Accepted);
+    // The platform hint comes from the verified slave structure, not the
+    // folder name; with no DAT context there is no exact catalogue match.
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(
+        item.explanation
+            .contains("verified Amiga WHDLoad slave structure"),
+        "{}",
+        item.explanation
+    );
+    assert!(!item.explanation.contains("Exact catalogue match"));
     assert_eq!(report.stats.game_folders, 1);
 }
 
