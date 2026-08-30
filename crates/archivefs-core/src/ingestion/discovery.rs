@@ -562,6 +562,9 @@ fn discover_direct_file(path: &Path, source_root: &Path) -> GameDiscovery {
     if extension == "rdb" {
         return discover_amiga_image(path, source_root);
     }
+    if extension == "adf" {
+        return discover_amiga_floppy(path, source_root);
+    }
     if matches!(extension.as_str(), "hdf" | "hdfx") {
         return discover_ambiguous_disk_image(path, source_root);
     }
@@ -685,6 +688,127 @@ fn discover_ambiguous_disk_image(path: &Path, source_root: &Path) -> GameDiscove
 
 fn amiga_explanation(disk: &AmigaDisk) -> String {
     format!("Amiga image ({} partition(s)).", disk.rdb.partitions.len())
+}
+
+/// `.adf` is the dominant Amiga floppy format, and - unlike `.rdb`, which
+/// is Amiga-specific - it is a real cross-platform extension collision:
+/// Acorn ADFS / Archimedes floppy images use `.adf` too (see the `Amiga`
+/// platform's `conflicts_with`). It has therefore always been classified
+/// mainly by extension and weak platform evidence, never by its own
+/// contents. This routes it through [`amiga_disk::inspect_amiga_floppy`],
+/// which reuses the existing bounded RDB / flat-AmigaDOS reader and the
+/// existing OFS/FFS traversal to validate the on-disc boot and root
+/// blocks:
+///
+/// 1. Contents validate as AmigaDOS -> accepted as [`ContentKind::AmigaImage`]
+///    with a structural `Amiga` platform hint that outranks any filename
+///    signal, and an explanation naming the DOS variant, OFS/FFS family,
+///    block size, and flags.
+/// 2. Contents do not validate as Amiga, but the existing identity system
+///    still resolves a *non-Amiga* platform (e.g. an `Acorn Archimedes`
+///    folder) -> accepted as the more general [`ContentKind::ComputerDisk`],
+///    visible with that platform, the Amiga claim withheld.
+/// 3. Neither -> refused with the structural failure explained; no Amiga
+///    identity is produced from the `.adf` extension alone.
+fn discover_amiga_floppy(path: &Path, source_root: &Path) -> GameDiscovery {
+    match amiga_disk::inspect_amiga_floppy(path) {
+        Ok(inspection) => GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::AmigaImage),
+            // Structural OFS/FFS validation is authoritative for the
+            // platform here, ahead of any filename or folder signal.
+            platform_hint: Some("Amiga".to_string()),
+            identity_candidate: identity_for(path, source_root),
+            validation_state: ValidationState::Accepted,
+            explanation: amiga_floppy_explanation(&inspection),
+            skip_reason: None,
+        },
+        Err(error) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary)
+                    if summary
+                        .platform
+                        .as_deref()
+                        .is_some_and(|platform| platform != "Amiga") =>
+                {
+                    accepted(
+                        path.to_path_buf(),
+                        ContainerKind::DirectFile,
+                        ContentKind::ComputerDisk,
+                        identity,
+                        "Disk image (.adf is shared between Amiga and Acorn ADFS; not \
+                         verified as an Amiga floppy, but the platform is otherwise \
+                         identified)."
+                            .to_string(),
+                    )
+                }
+                _ => amiga_floppy_refusal(path, &error),
+            }
+        }
+    }
+}
+
+fn amiga_floppy_explanation(inspection: &amiga_disk::AmigaFloppyInspection) -> String {
+    let filesystem = &inspection.filesystem;
+    let family = match filesystem.family {
+        amiga_disk::AmigaDosFamily::Ofs => "OFS",
+        amiga_disk::AmigaDosFamily::Ffs => "FFS",
+    };
+    let mut detail = format!(
+        "Amiga floppy image (DOS\\{} / {family}, {}-byte blocks",
+        filesystem.dos_type, filesystem.block_size
+    );
+    if filesystem.international {
+        detail.push_str(", international");
+    }
+    if filesystem.directory_cache {
+        detail.push_str(", dir-cache");
+    }
+    detail.push(')');
+    if let Some(label) = filesystem
+        .volume_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        detail.push_str(&format!(" - volume {label:?}"));
+    }
+    detail.push('.');
+    detail
+}
+
+fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> GameDiscovery {
+    use amiga_disk::AmigaFloppyError;
+    let (reason, explanation) = match error {
+        AmigaFloppyError::Container(inner) => (
+            SkipReason::InvalidContent(format!("{inner:?}")),
+            format!(
+                "This file is named .adf but its contents are not a readable Amiga \
+                 floppy image: {inner}."
+            ),
+        ),
+        AmigaFloppyError::NoPartition => (
+            SkipReason::InvalidContent("no Amiga partition present".to_string()),
+            "This .adf parsed as a container but held no traversable AmigaDOS filesystem."
+                .to_string(),
+        ),
+        AmigaFloppyError::Filesystem(inner) => (
+            SkipReason::InvalidContent(format!("{inner:?}")),
+            format!(
+                "This .adf has an AmigaDOS boot signature but its OFS/FFS structures \
+                 did not validate: {inner}."
+            ),
+        ),
+    };
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(ContentKind::AmigaImage),
+        reason,
+        explanation,
+    )
 }
 
 fn identity_for(path: &Path, source_root: &Path) -> Option<IdentitySummary> {

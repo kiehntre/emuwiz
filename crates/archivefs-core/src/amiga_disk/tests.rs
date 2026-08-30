@@ -143,3 +143,167 @@ fn beyond_eof_and_evidence() {
     assert_eq!(e.platform_candidate.as_deref(), Some("Amiga"));
     assert_ne!(e.claim, ClaimType::ExactSlaveMatch)
 }
+
+// --- .adf content-aware inspection -------------------------------------
+//
+// A minimal, structurally valid flat AmigaDOS floppy image (no RDB
+// wrapper): a `DOS\x0N` boot block, a root-block pointer, and a valid
+// `ST_ROOT` root block carrying a volume label - exactly the boot/root
+// structures `inspect_amiga_filesystem` validates via the existing
+// bounded `affs-read` reader. 128 sectors keeps the root block in the
+// middle at block 64, matching that reader's default geometry.
+
+fn fs_checksum(block: &mut [u8; 512]) {
+    let mut sum = 0_u32;
+    for offset in (0..512).step_by(4) {
+        if offset != 20 {
+            sum = sum.wrapping_add(u32::from_be_bytes(
+                block[offset..offset + 4].try_into().unwrap(),
+            ));
+        }
+    }
+    p32(block, 20, (sum as i32).wrapping_neg() as u32);
+}
+
+fn flat_adf(dos: u8, volume: &[u8]) -> Vec<u8> {
+    const SECTORS: usize = 128;
+    const ROOT: usize = SECTORS / 2;
+    let mut img = vec![0_u8; SECTORS * 512];
+    img[..3].copy_from_slice(b"DOS");
+    img[3] = dos;
+    p32(&mut img, 8, ROOT as u32); // affs-read reads the root block index here
+    let mut root = [0_u8; 512];
+    p32(&mut root, 0, 2); // T_HEADER
+    p32(&mut root, 12, 72); // hash-table size
+    let name_len = volume.len().min(30);
+    root[0x1B0] = name_len as u8;
+    root[0x1B1..0x1B1 + name_len].copy_from_slice(&volume[..name_len]);
+    p32(&mut root, 508, 1); // ST_ROOT
+    fs_checksum(&mut root);
+    img[ROOT * 512..(ROOT + 1) * 512].copy_from_slice(&root);
+    img
+}
+
+#[test]
+fn flat_adf_ofs_dos0_is_structurally_confirmed_from_contents() {
+    let (_d, p) = file(&flat_adf(0, b"WorkbenchDisk"));
+    let inspection = inspect_amiga_floppy(&p).unwrap();
+    assert_eq!(inspection.filesystem.dos_type, 0);
+    assert_eq!(inspection.filesystem.family, AmigaDosFamily::Ofs);
+    assert!(!inspection.filesystem.international);
+    assert!(!inspection.filesystem.directory_cache);
+    assert_eq!(inspection.filesystem.block_size, 512);
+    assert_eq!(
+        inspection.filesystem.volume_label.as_deref(),
+        Some("WorkbenchDisk")
+    );
+    assert_eq!(inspection.disk.rdb.partitions.len(), 1);
+}
+
+#[test]
+fn flat_adf_ffs_dos1_is_structurally_confirmed_from_contents() {
+    let (_d, p) = file(&flat_adf(1, b"GameDisk1"));
+    let inspection = inspect_amiga_floppy(&p).unwrap();
+    assert_eq!(inspection.filesystem.dos_type, 1);
+    assert_eq!(inspection.filesystem.family, AmigaDosFamily::Ffs);
+    assert_eq!(
+        inspection.filesystem.volume_label.as_deref(),
+        Some("GameDisk1")
+    );
+}
+
+#[test]
+fn flat_adf_dos2_through_dos7_variants_are_confirmed_at_512_byte_blocks() {
+    for dos in 2..=7_u8 {
+        let (_d, p) = file(&flat_adf(dos, b"Vol"));
+        let inspection = inspect_amiga_floppy(&p)
+            .unwrap_or_else(|error| panic!("DOS\\{dos} should be supported: {error:?}"));
+        assert_eq!(inspection.filesystem.dos_type, dos);
+        assert_eq!(
+            inspection.filesystem.family,
+            if dos & 1 == 0 {
+                AmigaDosFamily::Ofs
+            } else {
+                AmigaDosFamily::Ffs
+            }
+        );
+        assert_eq!(inspection.filesystem.international, dos & 2 != 0);
+        assert_eq!(inspection.filesystem.directory_cache, dos & 4 != 0);
+    }
+}
+
+#[test]
+fn random_bytes_named_adf_are_refused_not_trusted_for_the_extension() {
+    let (_d, p) = file(&vec![0xAB_u8; 4096]);
+    assert!(matches!(
+        inspect_amiga_floppy(&p),
+        Err(AmigaFloppyError::Container(DiskError::NoRdb))
+    ));
+}
+
+#[test]
+fn zip_and_truncated_and_acorn_style_adf_are_all_refused() {
+    // ZIP renamed .adf (local file header magic `PK\x03\x04`).
+    let mut zip = vec![0_u8; 2048];
+    zip[..4].copy_from_slice(b"PK\x03\x04");
+    let (_d, p) = file(&zip);
+    assert!(matches!(
+        inspect_amiga_floppy(&p),
+        Err(AmigaFloppyError::Container(DiskError::NoRdb))
+    ));
+
+    // Truncated below the 512-byte minimum.
+    let (_d, p) = file(&vec![b'D', b'O', b'S', 0]);
+    assert!(matches!(
+        inspect_amiga_floppy(&p),
+        Err(AmigaFloppyError::Container(DiskError::TooSmall))
+    ));
+
+    // Acorn ADFS / other non-Amiga "ADF": no `DOS` boot identifier.
+    let mut acorn = vec![0_u8; 2048];
+    acorn[..8].copy_from_slice(b"Hugo\0\0\0\0");
+    let (_d, p) = file(&acorn);
+    assert!(matches!(
+        inspect_amiga_floppy(&p),
+        Err(AmigaFloppyError::Container(DiskError::NoRdb))
+    ));
+}
+
+#[test]
+fn adf_with_dos_signature_but_malformed_root_block_fails_closed() {
+    let mut img = flat_adf(1, b"Broken");
+    // Corrupt the root block so its checksum/structure no longer validates.
+    let root = 64 * 512;
+    img[root..root + 4].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+    let (_d, p) = file(&img);
+    assert!(matches!(
+        inspect_amiga_floppy(&p),
+        Err(AmigaFloppyError::Filesystem(_))
+    ));
+}
+
+#[test]
+fn structural_amiga_floppy_observation_is_platform_only_never_a_release() {
+    let (_d, p) = file(&flat_adf(3, b"IntlFfsDisk"));
+    let inspection = inspect_amiga_floppy(&p).unwrap();
+    let observation = structural_amiga_floppy_observation(&inspection);
+    assert_eq!(observation.platform_candidate.as_deref(), Some("Amiga"));
+    assert_eq!(observation.release_candidate, None);
+    assert_eq!(observation.hash_or_value, None);
+    assert_eq!(observation.claim, ClaimType::PlatformCandidate);
+    assert_eq!(observation.claim_strength, ClaimStrength::Strong);
+    assert_eq!(
+        observation.provenance.representation,
+        Representation::StructuralMetadata
+    );
+    assert_eq!(
+        observation.provenance.channel,
+        EvidenceChannel::LocalStructural
+    );
+    assert_ne!(observation.claim, ClaimType::ExactSlaveMatch);
+    let notes = observation.notes.unwrap();
+    assert!(notes.contains("DOS\\3"));
+    assert!(notes.contains("FFS"));
+    assert!(notes.contains("international"));
+    assert!(notes.contains("IntlFfsDisk"));
+}

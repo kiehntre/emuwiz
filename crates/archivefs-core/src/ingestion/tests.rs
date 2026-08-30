@@ -412,6 +412,123 @@ fn a_mixed_folder_produces_a_candidate_for_every_kind_with_no_unexplained_disapp
     );
 }
 
+/// A minimal, structurally valid flat AmigaDOS floppy image (no RDB
+/// wrapper) - the same shape `amiga_disk::tests::flat_adf` builds: a
+/// `DOS\x0N` boot block, a root-block pointer, and a valid `ST_ROOT` root
+/// block with a volume label. This is what `.adf` content inspection
+/// validates through the existing bounded OFS/FFS reader.
+fn minimal_flat_adf(dos: u8, volume: &[u8]) -> Vec<u8> {
+    const SECTORS: usize = 128;
+    const ROOT: usize = SECTORS / 2;
+    let mut img = vec![0u8; SECTORS * 512];
+    img[..3].copy_from_slice(b"DOS");
+    img[3] = dos;
+    put32(&mut img, 8, ROOT as u32);
+    let mut root = [0u8; 512];
+    put32(&mut root, 0, 2); // T_HEADER
+    put32(&mut root, 12, 72); // hash-table size
+    let name_len = volume.len().min(30);
+    root[0x1B0] = name_len as u8;
+    root[0x1B1..0x1B1 + name_len].copy_from_slice(&volume[..name_len]);
+    put32(&mut root, 508, 1); // ST_ROOT
+    let mut sum = 0u32;
+    for offset in (0..512).step_by(4) {
+        if offset != 20 {
+            sum = sum.wrapping_add(u32::from_be_bytes(
+                root[offset..offset + 4].try_into().unwrap(),
+            ));
+        }
+    }
+    put32(&mut root, 20, (sum as i32).wrapping_neg() as u32);
+    img[ROOT * 512..(ROOT + 1) * 512].copy_from_slice(&root);
+    img
+}
+
+#[test]
+fn adf_ofs_dos0_is_discovered_as_amiga_from_its_contents() {
+    let dir = source_dir("adf-ofs");
+    std::fs::write(
+        dir.path().join("Some Puzzle Game (1991).adf"),
+        minimal_flat_adf(0, b"PuzzleDisk"),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_eq!(item.skip_reason, None);
+    assert!(item.explanation.contains("OFS"));
+    assert!(item.explanation.contains("DOS\\0"));
+    assert_eq!(report.stats.amiga_images, 1);
+}
+
+#[test]
+fn adf_ffs_dos1_is_discovered_as_amiga_with_the_ffs_family_named() {
+    let dir = source_dir("adf-ffs");
+    std::fs::write(
+        dir.path().join("unrelated title.adf"),
+        minimal_flat_adf(1, b"FastFileDisk"),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(item.explanation.contains("FFS"));
+}
+
+/// Requirement 4: random/unrelated content named like an Amiga game must
+/// not gain a strong Amiga structural identity from the `.adf` extension.
+#[test]
+fn random_content_named_like_an_amiga_game_gets_no_amiga_structural_evidence() {
+    let dir = source_dir("adf-lie");
+    std::fs::write(
+        dir.path().join("Some Amiga Game.adf"),
+        b"this is not an amiga disk image, just some bytes with a lying name",
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    // The item stays visible and explained, but is never accepted, and no
+    // Amiga platform identity is attached from the extension alone.
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert_eq!(item.platform_hint, None);
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
+    assert!(!item.explanation.contains("OFS"));
+    assert!(!item.explanation.contains("FFS"));
+    assert_eq!(report.stats.amiga_images, 1); // still categorised as an Amiga-image attempt
+}
+
+#[test]
+fn zip_and_truncated_files_renamed_adf_fail_closed() {
+    let dir = source_dir("adf-fakes");
+    let mut zip = vec![0u8; 4096];
+    zip[..4].copy_from_slice(b"PK\x03\x04");
+    std::fs::write(dir.path().join("Game A.adf"), &zip).unwrap();
+    std::fs::write(dir.path().join("Game B.adf"), b"DOS\x00 short").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in &report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped, "{item:?}");
+        assert_eq!(item.platform_hint, None);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+    }
+}
+
 /// Every extension the content registry recognises must actually be
 /// picked up end-to-end by discovery when placed as a loose file - keeps
 /// the registry table and the discovery wiring from silently drifting

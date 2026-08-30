@@ -251,6 +251,131 @@ fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
     })
 }
 
+/// The content-derived result of confirming one Amiga floppy / flat disk
+/// image (`.adf`): the validated container plus the OFS/FFS filesystem
+/// metadata the existing bounded reader was able to prove. Produced only
+/// when both [`inspect_amiga_image`] and [`inspect_amiga_filesystem`]
+/// succeed - never from an extension alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmigaFloppyInspection {
+    pub disk: AmigaDisk,
+    pub filesystem: AmigaFilesystem,
+}
+
+/// Why an `.adf` / flat Amiga image could not be structurally confirmed.
+/// Every variant means "not trusted as Amiga content", never "probably
+/// fine".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmigaFloppyError {
+    /// The container itself is not a readable Amiga image (bad/absent boot
+    /// signature, truncation, impossible geometry, a ZIP or random bytes,
+    /// an Acorn ADFS image, ...). Carries the underlying [`DiskError`].
+    Container(DiskError),
+    /// [`inspect_amiga_image`] succeeded but produced no partition to
+    /// traverse - a shape no real AmigaDOS floppy has.
+    NoPartition,
+    /// The boot signature matched a DOS type, but the OFS/FFS boot and
+    /// root structures did not validate through the existing bounded
+    /// reader (malformed root block, unsupported block geometry, a
+    /// non-DOS Amiga filesystem such as PFS/SFS/MuFS that stays
+    /// detection-only). Carries the underlying [`FilesystemError`].
+    Filesystem(FilesystemError),
+}
+
+impl std::fmt::Display for AmigaFloppyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Container(error) => write!(f, "{error}"),
+            Self::NoPartition => f.write_str("Amiga image inspection error: NoPartition"),
+            Self::Filesystem(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for AmigaFloppyError {}
+
+/// Content-aware inspection of an Amiga floppy / flat disk image (`.adf`).
+///
+/// This adds **no** new parser: it reuses [`inspect_amiga_image`] (which
+/// already accepts both an RDB-partitioned image and a flat, unpartitioned
+/// AmigaDOS image) and then [`inspect_amiga_filesystem`] on the first
+/// partition to validate the on-disc OFS/FFS boot and root blocks with the
+/// existing bounded reader and its traversal limits.
+///
+/// `.adf` is a real cross-platform extension collision (Acorn ADFS /
+/// Archimedes floppy images use it too), so identity here is taken only
+/// from disc contents. A file that merely ends in `.adf` but whose bytes
+/// do not present a valid AmigaDOS boot block and a structurally valid
+/// root block is refused, not trusted.
+pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
+    let disk = inspect_amiga_image(path).map_err(AmigaFloppyError::Container)?;
+    let partition = disk
+        .rdb
+        .partitions
+        .first()
+        .cloned()
+        .ok_or(AmigaFloppyError::NoPartition)?;
+    let filesystem =
+        inspect_amiga_filesystem(&disk, &partition).map_err(AmigaFloppyError::Filesystem)?;
+    Ok(AmigaFloppyInspection { disk, filesystem })
+}
+
+/// Strong, local, structural Amiga *platform* evidence for a `.adf` / flat
+/// image whose OFS/FFS structures validated. Mirrors
+/// [`structural_hdf_observation`], but for a floppy-shaped image
+/// ([`Representation::StructuralMetadata`], not
+/// [`Representation::WholeHdf`]). It is a platform candidate only: it never
+/// asserts a game/release identity, so `release_candidate` and
+/// `hash_or_value` are always `None` - a volume label is descriptive
+/// context in `notes`, never an identity.
+pub fn structural_amiga_floppy_observation(
+    inspection: &AmigaFloppyInspection,
+) -> EvidenceObservation {
+    let filesystem = &inspection.filesystem;
+    let family = match filesystem.family {
+        AmigaDosFamily::Ofs => "OFS",
+        AmigaDosFamily::Ffs => "FFS",
+    };
+    let mut notes = format!(
+        "validated Amiga floppy image: DOS\\{} ({family}), {}-byte logical blocks",
+        filesystem.dos_type, filesystem.block_size
+    );
+    if filesystem.international {
+        notes.push_str(", international");
+    }
+    if filesystem.directory_cache {
+        notes.push_str(", directory-cache");
+    }
+    if let Some(label) = filesystem
+        .volume_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        notes.push_str(&format!(", volume {label:?}"));
+    }
+    EvidenceObservation {
+        provenance: Provenance {
+            channel: EvidenceChannel::LocalStructural,
+            upstream_source: SourceFamily::Unknown,
+            upstream_version: None,
+            source_artifact: None,
+            imported_at_unix: None,
+            retrieved_at_unix: None,
+            generator_version: None,
+            lineage: LineageRelation::Independent,
+            representation: Representation::StructuralMetadata,
+        },
+        claim: ClaimType::PlatformCandidate,
+        claim_strength: ClaimStrength::Strong,
+        identity_scope: IdentityScope::PlatformIdentity,
+        hash_or_value: None,
+        platform_candidate: Some("Amiga".into()),
+        release_candidate: None,
+        notes: Some(notes),
+    }
+}
+
 pub fn structural_hdf_observation(_: &AmigaDisk) -> EvidenceObservation {
     EvidenceObservation {
         provenance: Provenance {
