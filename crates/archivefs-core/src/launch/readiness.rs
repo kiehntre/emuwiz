@@ -263,6 +263,34 @@ pub enum LaunchBlockerKind {
     /// see the blocker detail for the underlying
     /// [`crate::patch_manager::XemuLaunchBlockerKind`].
     XemuBindingUnavailable,
+    /// A DOSBox command-plan request was given a non-DOSBox launch target.
+    DosBoxCandidateRequired,
+    /// The canonical identity this DOSBox plan was built for does not target
+    /// `DOS` - the only platform this native launch slice supports. A bare
+    /// Weak MZ signature or an ambiguous/unknown platform never reaches a
+    /// resolved `DOS` identity, so it fails closed here.
+    DosBoxPlatformMismatch,
+    /// The supplied launch input is not a safe absolute DOS game directory.
+    DosBoxContentUnsupported,
+    /// No `dosbox.conf` was found in the game directory where the DOS layout
+    /// rule expects one.
+    DosBoxConfigMissing,
+    /// A `dosbox.conf` is present but its contents did not parse as a DOSBox
+    /// configuration (empty / binary / malformed section / non-UTF-8 / too
+    /// large - see [`crate::dosbox_config_evidence`]).
+    DosBoxConfigMalformed,
+    /// A structurally valid DOSBox config was found, but it carries no
+    /// `[autoexec]` section, so there is no reviewed configuration to launch
+    /// with. A file name alone is never sufficient.
+    DosBoxConfigNoAutoexec,
+    /// A compatible DOSBox executable could not be discovered on this
+    /// machine (nothing on `PATH` or the standard locations, or the only
+    /// match was a symlink / non-regular / non-executable file).
+    DosBoxBindingUnavailable,
+    /// A DOSBox variant was requested that this build does not support
+    /// (only classic DOSBox and DOSBox Staging are modeled; DOSBox-X and
+    /// anything else fail closed).
+    DosBoxVariantUnsupported,
     /// A MAME launch requires a resolved Arcade platform.
     MamePlatformMismatch,
     /// No unique DAT-backed MAME set identity is available.

@@ -162,6 +162,12 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
         ),
         ("RetroArch", &["retroarch"][..], "org.libretro.RetroArch"),
         ("ScummVM", &["scummvm"][..], "org.scummvm.ScummVM"),
+        ("DOSBox", &["dosbox"][..], "com.dosbox.DOSBox"),
+        (
+            "DOSBox Staging",
+            &["dosbox-staging"][..],
+            "io.github.dosbox-staging",
+        ),
         (
             "Xenia",
             &["xenia_canary", "xenia"][..],
