@@ -95,6 +95,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("gg", ContentKind::RomCartridge),
     cf("md", ContentKind::RomCartridge),
     cf("gen", ContentKind::RomCartridge),
+    // WonderSwan cartridge images are distinct extensions. Shared `.bin`
+    // remains intentionally absent and is handled only by cue/bin pairing.
+    cf("ws", ContentKind::RomCartridge),
+    cf("wsc", ContentKind::RomCartridge),
     // --- Disc-based ---
     cf("iso", ContentKind::DiscImage),
     cf("chd", ContentKind::DiscImage),

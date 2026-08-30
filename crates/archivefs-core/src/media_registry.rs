@@ -235,6 +235,17 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "gg",
         kind: ArchiveKind::DirectGameImage,
     },
+    // Bandai WonderSwan cartridge images. `.ws` and `.wsc` are distinct
+    // platform-specific extensions; shared `.bin` remains a corroboration
+    // candidate and is deliberately not registered here.
+    MediaFormat {
+        extension: "ws",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "wsc",
+        kind: ArchiveKind::DirectGameImage,
+    },
 ];
 
 /// Extensions that never resolve to an [`ArchiveKind`] on their own - they
@@ -388,6 +399,16 @@ mod tests {
             Some(ArchiveKind::DirectGameImage)
         );
         assert_eq!(kind_for_extension("gg"), Some(ArchiveKind::DirectGameImage));
+    }
+
+    #[test]
+    fn wonderswan_cartridge_extensions_are_direct_game_images() {
+        assert_eq!(kind_for_extension("ws"), Some(ArchiveKind::DirectGameImage));
+        assert_eq!(
+            kind_for_extension("wsc"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(kind_for_extension("bin"), None);
     }
 
     #[test]

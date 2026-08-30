@@ -110,6 +110,38 @@ fn loose_game_boy_rom_is_discovered_as_a_rom_cartridge_candidate() {
 }
 
 #[test]
+fn loose_wonderswan_rom_is_discovered_with_its_existing_platform_context() {
+    let parent = source_dir("wonderswan");
+    let platform_dir = parent.path().join("WonderSwan");
+    std::fs::create_dir(&platform_dir).unwrap();
+    std::fs::write(platform_dir.join("Game.ws"), b"wonderswan rom bytes").unwrap();
+
+    let report = discover_source(&platform_dir).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::RomCartridge));
+    assert_eq!(item.platform_hint.as_deref(), Some("WonderSwan"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(report.stats.loose_roms, 1);
+}
+
+#[test]
+fn loose_wonderswan_color_rom_is_discovered_with_its_existing_platform_context() {
+    let parent = source_dir("wonderswan-color");
+    let platform_dir = parent.path().join("WonderSwan Color");
+    std::fs::create_dir(&platform_dir).unwrap();
+    std::fs::write(platform_dir.join("Game.wsc"), b"wonderswan color rom bytes").unwrap();
+
+    let report = discover_source(&platform_dir).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::RomCartridge));
+    assert_eq!(item.platform_hint.as_deref(), Some("WonderSwan Color"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(report.stats.loose_roms, 1);
+}
+
+#[test]
 fn zip_containing_a_game_boy_rom_is_discovered_with_the_same_content_kind_as_loose() {
     let dir = source_dir("zip-gb");
     write_zip_containing(dir.path(), "Pokemon.zip", "Pokemon.gb", b"gb rom bytes");
