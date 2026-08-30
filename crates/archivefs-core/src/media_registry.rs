@@ -365,6 +365,18 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "gbc",
         kind: ArchiveKind::DirectGameImage,
     },
+    // --- Nintendo Virtual Boy ---
+    // Virtual Boy has no standardized header detector in this crate. These
+    // extensions identify the media family only; exact identity remains
+    // DAT/hash-driven and `.bin` stays a shared corroboration candidate.
+    MediaFormat {
+        extension: "vb",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "vboy",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // --- Super Nintendo / Super Famicom ---
     MediaFormat {
         extension: "sfc",
@@ -566,6 +578,17 @@ mod tests {
             kind_for_extension("gbc"),
             Some(ArchiveKind::DirectGameImage)
         );
+    }
+
+    #[test]
+    fn virtual_boy_extensions_are_recognized_as_direct_game_images() {
+        for extension in ["vb", "vboy"] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be a direct game image"
+            );
+        }
     }
 
     #[test]
