@@ -1765,6 +1765,23 @@ fn discover_cores(
     cores.into_iter().map(|(_, core)| core).collect()
 }
 
+/// The `.info` filename conventions this resolver understands, tried in
+/// this exact order. `stem` already has `_libretro.so` stripped (e.g.
+/// `gambatte`), so the probed names are `<stem>.info` then
+/// `<stem>_libretro.info`.
+///
+/// `<stem>.info` is RetroArch's own core-pack layout and the historical
+/// EmuWiz expectation; `<stem>_libretro.info` is what distro libretro
+/// packages ship (e.g. `/usr/share/libretro/info/gambatte_libretro.info`).
+/// Legacy first so existing setups stay byte-for-byte unaffected, and when
+/// both files exist the legacy name wins. Only a genuinely absent file
+/// (`FsProbe::Missing`) advances to the next candidate - any other outcome
+/// (symlink, wrong type, unreadable, or a present file) is reported from
+/// the first candidate that produced it. No fuzzy matching: only these two
+/// exact names are ever probed, and a found file is always parsed by the
+/// existing parser before it counts as `Found`.
+const INFO_FILENAME_SUFFIXES: [&str; 2] = [".info", "_libretro.info"];
+
 fn resolve_core_info(
     filesystem: &dyn ReadOnlyHostFilesystem,
     info_dir: &Path,
@@ -1772,44 +1789,48 @@ fn resolve_core_info(
     profile: ProfileRef,
     diagnostics: &mut Vec<RawDiagnostic>,
 ) -> CoreInfoFinding {
-    let info_path = info_dir.join(format!("{stem}.info"));
-    match filesystem.probe(&info_path) {
-        FsProbe::Missing => CoreInfoFinding::Missing,
-        FsProbe::Symlink => CoreInfoFinding::Symlink,
-        FsProbe::WrongType | FsProbe::PresentDirectory => CoreInfoFinding::WrongType,
-        FsProbe::Inaccessible => CoreInfoFinding::Inaccessible,
-        FsProbe::IoError => CoreInfoFinding::IoError,
-        FsProbe::PresentFile => match filesystem.read_bounded(&info_path, MAX_INFO_BYTES) {
-            BoundedReadResult::Ok(bytes) => {
-                let bytes = strip_utf8_bom(&bytes);
-                match std::str::from_utf8(bytes) {
-                    Ok(text) => {
-                        let parsed = parse_config(text, &INFO_KEYS);
-                        let firmware =
-                            parse_firmware_requirements(text, &info_path, profile, diagnostics);
-                        CoreInfoFinding::Found {
-                            display_name: parsed.values.get("display_name").cloned(),
-                            display_version: parsed.values.get("display_version").cloned(),
-                            system_name: parsed.values.get("systemname").cloned(),
-                            supported_extensions: parsed
-                                .values
-                                .get("supported_extensions")
-                                .map(|value| split_supported_extensions(value))
-                                .unwrap_or_default(),
-                            core_name: parsed.values.get("corename").cloned(),
-                            manufacturer: parsed.values.get("manufacturer").cloned(),
-                            categories: parsed.values.get("categories").cloned(),
-                            database: parsed.values.get("database").cloned(),
-                            firmware,
+    for suffix in INFO_FILENAME_SUFFIXES {
+        let info_path = info_dir.join(format!("{stem}{suffix}"));
+        let finding = match filesystem.probe(&info_path) {
+            FsProbe::Missing => continue,
+            FsProbe::Symlink => CoreInfoFinding::Symlink,
+            FsProbe::WrongType | FsProbe::PresentDirectory => CoreInfoFinding::WrongType,
+            FsProbe::Inaccessible => CoreInfoFinding::Inaccessible,
+            FsProbe::IoError => CoreInfoFinding::IoError,
+            FsProbe::PresentFile => match filesystem.read_bounded(&info_path, MAX_INFO_BYTES) {
+                BoundedReadResult::Ok(bytes) => {
+                    let bytes = strip_utf8_bom(&bytes);
+                    match std::str::from_utf8(bytes) {
+                        Ok(text) => {
+                            let parsed = parse_config(text, &INFO_KEYS);
+                            let firmware =
+                                parse_firmware_requirements(text, &info_path, profile, diagnostics);
+                            CoreInfoFinding::Found {
+                                display_name: parsed.values.get("display_name").cloned(),
+                                display_version: parsed.values.get("display_version").cloned(),
+                                system_name: parsed.values.get("systemname").cloned(),
+                                supported_extensions: parsed
+                                    .values
+                                    .get("supported_extensions")
+                                    .map(|value| split_supported_extensions(value))
+                                    .unwrap_or_default(),
+                                core_name: parsed.values.get("corename").cloned(),
+                                manufacturer: parsed.values.get("manufacturer").cloned(),
+                                categories: parsed.values.get("categories").cloned(),
+                                database: parsed.values.get("database").cloned(),
+                                firmware,
+                            }
                         }
+                        Err(_) => CoreInfoFinding::InvalidUtf8,
                     }
-                    Err(_) => CoreInfoFinding::InvalidUtf8,
                 }
-            }
-            BoundedReadResult::TooLarge => CoreInfoFinding::TooLarge,
-            _ => CoreInfoFinding::IoError,
-        },
+                BoundedReadResult::TooLarge => CoreInfoFinding::TooLarge,
+                _ => CoreInfoFinding::IoError,
+            },
+        };
+        return finding;
     }
+    CoreInfoFinding::Missing
 }
 
 fn split_supported_extensions(raw: &str) -> Vec<String> {
@@ -3631,6 +3652,172 @@ mod tests {
                 .all(|d| d.detail_kind != DiagnosticCategory::CoreInventory
                     || !d.code.starts_with("firmware")),
             "a core with no firmware metadata must never raise a firmware diagnostic"
+        );
+    }
+
+    // --- `.info` filename conventions ------------------------------------
+    //
+    // `resolve_core_info` tries `<stem>.info` first (RetroArch's own core
+    // packs / historical EmuWiz expectation) then `<stem>_libretro.info`
+    // (distro libretro packages, e.g. `/usr/share/libretro/info/`).
+
+    /// Body used by the filename-convention tests: a Native profile whose
+    /// `libretro_directory`/`libretro_info_path` point at this fixture.
+    fn write_core_info_profile(fixture: &Fixture) {
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.mkdir("info");
+    }
+
+    const GAME_BOY_INFO_BODY: &str = "display_name = \"Nintendo - Game Boy / Color (Gambatte)\"\n\
+         systemname = \"Game Boy/Game Boy Color\"\n\
+         database = \"Nintendo - Game Boy|Nintendo - Game Boy Color\"\n\
+         supported_extensions = \"gb|gbc|dmg\"\n";
+
+    #[test]
+    fn legacy_stem_dot_info_filename_is_still_resolved() {
+        let fixture = Fixture::new("core-info-legacy");
+        write_core_info_profile(&fixture);
+        fixture.write("cores/gambatte_libretro.so", "stub");
+        fixture.write("info/gambatte.info", GAME_BOY_INFO_BODY);
+
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        let core = &report.profiles[0].cores[0];
+        assert_eq!(core.core_stem, "gambatte");
+        match &core.info {
+            CoreInfoFinding::Found { system_name, .. } => {
+                assert_eq!(system_name.as_deref(), Some("Game Boy/Game Boy Color"));
+            }
+            other => panic!("expected Found from `<stem>.info`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distro_stem_underscore_libretro_dot_info_filename_is_resolved() {
+        let fixture = Fixture::new("core-info-distro");
+        write_core_info_profile(&fixture);
+        fixture.write("cores/gambatte_libretro.so", "stub");
+        // The real on-disk name shipped by distro libretro packages.
+        fixture.write("info/gambatte_libretro.info", GAME_BOY_INFO_BODY);
+
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        let core = &report.profiles[0].cores[0];
+        assert_eq!(core.core_stem, "gambatte");
+        match &core.info {
+            CoreInfoFinding::Found { system_name, .. } => {
+                assert_eq!(system_name.as_deref(), Some("Game Boy/Game Boy Color"));
+            }
+            other => panic!("expected Found from `<stem>_libretro.info`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn when_both_info_filename_conventions_exist_the_legacy_one_wins() {
+        let fixture = Fixture::new("core-info-both");
+        write_core_info_profile(&fixture);
+        fixture.write("cores/gambatte_libretro.so", "stub");
+        fixture.write(
+            "info/gambatte.info",
+            "display_name = \"LEGACY gambatte.info\"\n\
+             systemname = \"Game Boy/Game Boy Color\"\n",
+        );
+        fixture.write(
+            "info/gambatte_libretro.info",
+            "display_name = \"DISTRO gambatte_libretro.info\"\n\
+             systemname = \"Sega - Mega Drive - Genesis\"\n",
+        );
+
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        match &report.profiles[0].cores[0].info {
+            CoreInfoFinding::Found {
+                display_name,
+                system_name,
+                ..
+            } => {
+                assert_eq!(display_name.as_deref(), Some("LEGACY gambatte.info"));
+                assert_eq!(system_name.as_deref(), Some("Game Boy/Game Boy Color"));
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn neither_info_filename_convention_present_is_still_a_plain_missing() {
+        let fixture = Fixture::new("core-info-neither");
+        write_core_info_profile(&fixture);
+        fixture.write("cores/gambatte_libretro.so", "stub");
+
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        assert!(matches!(
+            report.profiles[0].cores[0].info,
+            CoreInfoFinding::Missing
+        ));
+        assert!(report.profiles[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn distro_named_info_still_maps_to_a_canonical_platform() {
+        let fixture = Fixture::new("core-info-distro-map");
+        write_core_info_profile(&fixture);
+        fixture.write("cores/gambatte_libretro.so", "stub");
+        fixture.write("info/gambatte_libretro.info", GAME_BOY_INFO_BODY);
+
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+        assert_eq!(
+            crate::launch::retroarch_platform_candidate(&report.profiles[0].cores[0].info),
+            Some("Game Boy")
+        );
+    }
+
+    #[test]
+    fn distro_named_core_info_yields_a_retroarch_launch_candidate() {
+        use crate::launch::{
+            CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef,
+            LaunchTarget, ResolvedIdentity, build_launch_plan,
+        };
+
+        let fixture = Fixture::new("core-info-distro-launch");
+        write_core_info_profile(&fixture);
+        fixture.write("cores/gambatte_libretro.so", "stub");
+        fixture.write("info/gambatte_libretro.info", GAME_BOY_INFO_BODY);
+
+        let report =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &fixture.env()).unwrap();
+
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Game Boy".to_string(),
+            game_key: "distro-launch-key".to_string(),
+        });
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/roms/aladdin.gb")),
+            requires_mount: false,
+            provenance: "test loose Game Boy ROM".to_string(),
+        };
+        // The launch pipeline is not touched by this fix - it must produce a
+        // RetroArchCore candidate purely because the distro-named `.info`
+        // now resolves and maps to Game Boy.
+        let plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        assert!(
+            plan.candidates.iter().any(|candidate| matches!(
+                &candidate.target,
+                LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "gambatte"
+            )),
+            "expected a RetroArchCore candidate from a distro-named .info: {:?}",
+            plan.candidates
         );
     }
 
