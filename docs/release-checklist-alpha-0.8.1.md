@@ -120,7 +120,10 @@ Run against the exact final commit before tagging:
 - [ ] `scripts/test-release-artifact-verifier.sh` (rejects malformed
       artifacts)
 - [ ] `bash tests/test_install.sh`
-- [ ] `cargo audit`
+- [x] `cargo audit` - passes with only the two explicitly accepted
+      unmaintained transitive dependencies documented in
+      [DEPENDENCY_SECURITY.md](DEPENDENCY_SECURITY.md); no known vulnerability,
+      unsoundness, or yanked-package finding.
 - [ ] Built `emuwiz-cli --version` and `emuwiz --version` both report
       `0.8.1-alpha`.
 
