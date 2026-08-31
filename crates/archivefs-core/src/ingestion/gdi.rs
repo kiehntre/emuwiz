@@ -501,6 +501,11 @@ mod tests {
             .unwrap()
             .join(format!("archivefs-gdi-outside-{}", std::process::id()));
         std::fs::write(&outside, vec![0_u8; 2352 * 2]).unwrap();
+        // `write_temp` intentionally reuses its PID/name directory. Remove
+        // any stale sibling left by an earlier interrupted run before
+        // creating the escape symlink, whose existence is the behavior under
+        // test rather than a setup failure.
+        let _ = std::fs::remove_file(dir.join("escape.bin"));
         std::os::unix::fs::symlink(&outside, dir.join("escape.bin")).unwrap();
         assert_eq!(resolve_gdi_data_track(&gdi), Err(GdiError::UnsafeReference));
         let _ = std::fs::remove_file(&outside);
