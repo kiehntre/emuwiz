@@ -1420,7 +1420,7 @@ fn exact_aliases_do_not_collapse_related_platforms() {
 
 #[test]
 fn bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths() {
-    assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 50);
+    assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 75);
     let mut ids: Vec<_> = BUNDLED_PLATFORM_ARTWORK
         .iter()
         .map(|artwork| artwork.asset_id)
@@ -2558,7 +2558,7 @@ fn custom_platform_artwork_path_falls_back_to_none_when_missing_or_unconfigured(
 }
 
 #[test]
-fn managed_artwork_source_order_is_custom_bundled_custom_category_then_category() {
+fn managed_artwork_source_prefers_custom_over_bundled_artwork() {
     let temp = artwork_test_directory("source-priority");
     assert_eq!(
         current_artwork_source(Some(&temp), "PS2", None),
@@ -2569,18 +2569,12 @@ fn managed_artwork_source_order_is_custom_bundled_custom_category_then_category(
         current_artwork_source(Some(&temp), "PS2", None),
         ("Custom", true)
     );
-    write_test_png(&temp.join("console.png"), 2, 2, [1, 2, 3, 255]);
-    // MasterSystem deliberately: a console-category platform that still has
-    // no bundled artwork of its own, so the category rungs of the ladder are
-    // actually reached. NES used to serve here and now ships its own image.
+    // Every current canonical platform has its own bundled artwork. The
+    // complete set must therefore still prefer the platform-specific bundle
+    // whenever no custom file overrides it.
     assert_eq!(
         current_artwork_source(Some(&temp), "MasterSystem", None),
-        ("Category fallback (custom)", false)
-    );
-    std::fs::remove_file(temp.join("console.png")).unwrap();
-    assert_eq!(
-        current_artwork_source(Some(&temp), "MasterSystem", None),
-        ("Category fallback", false)
+        ("Bundled", false)
     );
     let _ = std::fs::remove_dir_all(temp);
 }

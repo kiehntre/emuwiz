@@ -192,6 +192,10 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../../assets/platforms/amstradcpc.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "atari8bit",
+        png: include_bytes!("../../assets/platforms/atari8bit.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "appleii",
         png: include_bytes!("../../assets/platforms/appleii.png"),
     },
@@ -236,8 +240,24 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../../assets/platforms/commodore64.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "commodore128",
+        png: include_bytes!("../../assets/platforms/commodore128.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "commodorecdtv",
+        png: include_bytes!("../../assets/platforms/commodorecdtv.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "dos",
+        png: include_bytes!("../../assets/platforms/dos.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "dreamcast",
         png: include_bytes!("../../assets/platforms/dreamcast.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "fmtowns",
+        png: include_bytes!("../../assets/platforms/fmtowns.png"),
     },
     BundledPlatformArtwork {
         asset_id: "gameboy",
@@ -260,28 +280,96 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../../assets/platforms/gamegear.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "intellivision",
+        png: include_bytes!("../../assets/platforms/intellivision.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "macintosh",
+        png: include_bytes!("../../assets/platforms/macintosh.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "mastersystem",
+        png: include_bytes!("../../assets/platforms/mastersystem.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "megadrive",
         png: include_bytes!("../../assets/platforms/megadrive.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "msx",
+        png: include_bytes!("../../assets/platforms/msx.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "msx2",
+        png: include_bytes!("../../assets/platforms/msx2.png"),
     },
     BundledPlatformArtwork {
         asset_id: "n64",
         png: include_bytes!("../../assets/platforms/n64.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "necpc8801",
+        png: include_bytes!("../../assets/platforms/necpc8801.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "necpc9801",
+        png: include_bytes!("../../assets/platforms/necpc9801.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "neogeo",
         png: include_bytes!("../../assets/platforms/neogeo.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "neogeo64",
+        png: include_bytes!("../../assets/platforms/neogeo64.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "neogeocd",
+        png: include_bytes!("../../assets/platforms/neogeocd.png"),
     },
     BundledPlatformArtwork {
         asset_id: "neogeopocket",
         png: include_bytes!("../../assets/platforms/neogeopocket.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "neogeopocketcolor",
+        png: include_bytes!("../../assets/platforms/neogeopocketcolor.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "nes",
         png: include_bytes!("../../assets/platforms/nes.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "ngage",
+        png: include_bytes!("../../assets/platforms/ngage.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "nintendo3ds",
         png: include_bytes!("../../assets/platforms/nintendo3ds.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "nintendods",
+        png: include_bytes!("../../assets/platforms/nintendods.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "pc",
+        png: include_bytes!("../../assets/platforms/pc.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "pc98",
+        png: include_bytes!("../../assets/platforms/pc98.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "pcengine",
+        png: include_bytes!("../../assets/platforms/pcengine.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "pcenginecd",
+        png: include_bytes!("../../assets/platforms/pcenginecd.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "pcfx",
+        png: include_bytes!("../../assets/platforms/pcfx.png"),
     },
     BundledPlatformArtwork {
         asset_id: "philipscdi",
@@ -312,6 +400,10 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../../assets/platforms/saturn.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "segacd",
+        png: include_bytes!("../../assets/platforms/segacd.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "scummvm",
         png: include_bytes!("../../assets/platforms/scummvm.png"),
     },
@@ -336,6 +428,10 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../../assets/platforms/turbografx16.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "vectrex",
+        png: include_bytes!("../../assets/platforms/vectrex.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "vic20",
         png: include_bytes!("../../assets/platforms/vic20.png"),
     },
@@ -350,6 +446,10 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
     BundledPlatformArtwork {
         asset_id: "wiiu",
         png: include_bytes!("../../assets/platforms/wiiu.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "wonderswan",
+        png: include_bytes!("../../assets/platforms/wonderswan.png"),
     },
     BundledPlatformArtwork {
         asset_id: "wonderswancolor",

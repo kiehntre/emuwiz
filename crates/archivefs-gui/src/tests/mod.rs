@@ -122,41 +122,7 @@ fn hermetic_gui_config() -> Result<Config, String> {
 /// removed from it, and a new opaque asset cannot be bundled without being
 /// added. It is expected to shrink to nothing.
 #[cfg(test)]
-const OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW: &[&str] = &[
-    "3do",
-    "acornelectron",
-    "amigacd32",
-    "amstradcpc",
-    "appleii",
-    "arcade",
-    "atari2600",
-    "atari5200",
-    "atari7800",
-    "atarijaguar",
-    "atarilynx",
-    "atarist",
-    "bbcmicro",
-    "colecovision",
-    "commodore64",
-    "gameboyadvance",
-    "gameboycolor",
-    "gamegear",
-    "neogeo",
-    "neogeopocket",
-    "nes",
-    "nintendo3ds",
-    "philipscdi",
-    "playstationvita",
-    "psp",
-    "scummvm",
-    "sega32x",
-    "sharpx68000",
-    "turbografx16",
-    "vic20",
-    "virtualboy",
-    "wonderswancolor",
-    "zxspectrum",
-];
+const OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW: &[&str] = &[];
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
