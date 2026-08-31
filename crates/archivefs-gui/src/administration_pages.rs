@@ -4021,7 +4021,7 @@ pub(super) fn missing_removal_disabled_reason<'a>(
     selected_count: usize,
     selection_reason: Option<&'a str>,
 ) -> Option<&'a str> {
-    database_reason.or_else(|| {
+    database_reason.or({
         if selected_count == 0 {
             Some("Select one or more missing catalogue entries to remove.")
         } else {

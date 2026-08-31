@@ -243,7 +243,7 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
             detail: format!("Configuration directory found at {}", path.display()),
         });
     }
-    if fs::symlink_metadata(&home.join("Desktop/xenia-canary.config.toml"))
+    if fs::symlink_metadata(home.join("Desktop/xenia-canary.config.toml"))
         .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         .unwrap_or(false)
     {

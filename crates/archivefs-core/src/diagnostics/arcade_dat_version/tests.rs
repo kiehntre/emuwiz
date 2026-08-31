@@ -178,7 +178,7 @@ fn a_detected_emulator_with_no_parseable_version_is_unknown() {
         Some("MAME build: some unexpected new shape"),
         &mame_dat(Some("0.270")),
     );
-    assert_eq!(readiness.emulator_detected, true);
+    assert!(readiness.emulator_detected);
     assert_eq!(readiness.emulator_version, None);
     assert_eq!(
         readiness.compatibility,

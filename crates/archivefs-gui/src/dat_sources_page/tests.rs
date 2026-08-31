@@ -5583,8 +5583,10 @@ fn dat_acquisition_entry_point_exposes_existing_safe_provider_paths_without_auto
     assert!(view.tosec_packs.is_empty());
     assert!(!view.background_busy);
 
-    let mut ui_state = DatSourcesPageUi::default();
-    ui_state.managed_sources_expanded = Some(true);
+    let mut ui_state = DatSourcesPageUi {
+        managed_sources_expanded: Some(true),
+        ..Default::default()
+    };
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,
@@ -5684,8 +5686,10 @@ fn managed_sources_render_in_a_separate_section_from_local_sources() {
     assert_eq!(view.rows.len(), 1);
     assert_eq!(view.managed_rows.len(), 1);
     assert_eq!(view.managed_rows[0].authoritative_name, "gamecom");
-    let mut ui_state = DatSourcesPageUi::default();
-    ui_state.managed_sources_expanded = Some(true);
+    let mut ui_state = DatSourcesPageUi {
+        managed_sources_expanded: Some(true),
+        ..Default::default()
+    };
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Local DAT Sources"));
     assert!(rendered_text_contains(&output, "Managed DAT Sources"));
@@ -6223,8 +6227,10 @@ fn a_previous_revision_and_its_acquisition_time_are_shown_when_present() {
     assert!(row.previous_retrieved.is_some());
     assert!(row.rollback_available);
 
-    let mut ui_state = DatSourcesPageUi::default();
-    ui_state.managed_sources_expanded = Some(true);
+    let mut ui_state = DatSourcesPageUi {
+        managed_sources_expanded: Some(true),
+        ..Default::default()
+    };
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "previous-revision"));
     assert!(rendered_text_contains(
@@ -6257,8 +6263,10 @@ fn no_previous_revision_is_reported_honestly_when_there_is_only_one_snapshot() {
     assert_eq!(row.previous_revision, None);
     assert!(!row.rollback_available);
 
-    let mut ui_state = DatSourcesPageUi::default();
-    ui_state.managed_sources_expanded = Some(true);
+    let mut ui_state = DatSourcesPageUi {
+        managed_sources_expanded: Some(true),
+        ..Default::default()
+    };
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,

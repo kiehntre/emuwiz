@@ -739,14 +739,12 @@ fn read_manifest(package_root: &Path, plan: &mut LocalModPackagePlan) -> Option<
         );
         return None;
     }
-    let Some(bytes) = read_regular_file(
+    let bytes = read_regular_file(
         &path,
         MAX_LOCAL_MOD_PACKAGE_MANIFEST_BYTES,
         plan,
         ModPlanBlockerKind::ManifestMalformed,
-    ) else {
-        return None;
-    };
+    )?;
     match serde_json::from_slice(&bytes) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
@@ -967,10 +965,7 @@ fn assess_compatibility(
     }
 }
 
-fn verified_identity_value<'a>(
-    identity: &'a GameIdentityReport,
-    kind: IdentityKind,
-) -> Option<&'a str> {
+fn verified_identity_value(identity: &GameIdentityReport, kind: IdentityKind) -> Option<&str> {
     let values: BTreeSet<_> = identity
         .evidence
         .iter()
@@ -1069,14 +1064,14 @@ fn inspect_operation(
             ModPlanBlockerKind::PayloadMissing,
         ) {
             operation.observed_payload_sha256 = Some(digest.clone());
-            if let Some(expected) = operation.expected_result_sha256.as_deref() {
-                if !valid_sha256(expected) || !digest.eq_ignore_ascii_case(expected) {
-                    block(
-                        plan,
-                        ModPlanBlockerKind::ExpectedResultHashMismatch,
-                        "payload hash does not match expected_result_sha256",
-                    );
-                }
+            if let Some(expected) = operation.expected_result_sha256.as_deref()
+                && (!valid_sha256(expected) || !digest.eq_ignore_ascii_case(expected))
+            {
+                block(
+                    plan,
+                    ModPlanBlockerKind::ExpectedResultHashMismatch,
+                    "payload hash does not match expected_result_sha256",
+                );
             }
         }
     }
@@ -1281,14 +1276,12 @@ fn hash_path(
         );
         return None;
     }
-    let Some(bytes) = read_regular_file(
+    let bytes = read_regular_file(
         path,
         maximum,
         plan,
         ModPlanBlockerKind::PayloadNotRegularFile,
-    ) else {
-        return None;
-    };
+    )?;
     Some(sha256_hex(&bytes))
 }
 
@@ -1646,9 +1639,7 @@ mod tests {
     fn mod_package_rejects_duplicate_destinations_and_source_hash_mismatch() {
         let (_temp, request, root) = setup();
         let (operation, payload) = valid_replace();
-        let duplicate = operation
-            .replacen("\"operations\":[", "\"operations\":[", 1)
-            .replace("] ,", "],");
+        let duplicate = operation.replace("] ,", "],");
         let operation_json = duplicate
             .split("\"operations\":[")
             .nth(1)

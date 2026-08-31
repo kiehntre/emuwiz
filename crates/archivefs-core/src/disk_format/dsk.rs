@@ -359,7 +359,7 @@ fn probe_plus3dos_disk_spec(
     let sectors_field = sector[3];
     let sector_size_code = sector[4];
 
-    let type_is_known = matches!(disk_type, 0 | 1 | 2 | 3);
+    let type_is_known = matches!(disk_type, 0..=3);
     let reserved_zero = sector[10..15].iter().all(|byte| *byte == 0);
     let size_is_512 = sector_size_code == 2;
     let tracks_agree =

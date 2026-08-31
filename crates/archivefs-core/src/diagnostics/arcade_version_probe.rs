@@ -148,10 +148,10 @@ fn probeable_executable(path: &Path) -> bool {
 }
 
 /// The first probeable executable path discovered for `emulator`, if any.
-fn probe_target<'a>(
-    installations: &'a [LinuxEmulatorInstallationEvidence],
+fn probe_target(
+    installations: &[LinuxEmulatorInstallationEvidence],
     emulator: ArcadeEmulator,
-) -> Option<&'a Path> {
+) -> Option<&Path> {
     let name = match emulator {
         ArcadeEmulator::Mame => "MAME",
         ArcadeEmulator::Fbneo => "FinalBurn Neo",
@@ -182,10 +182,10 @@ pub fn probe_arcade_emulator_versions(
     installations: &[LinuxEmulatorInstallationEvidence],
 ) -> Vec<(ArcadeEmulator, String)> {
     let mut outputs = Vec::new();
-    if let Some(path) = probe_target(installations, ArcadeEmulator::Mame) {
-        if let Some(output) = probe_command_output(path, OsStr::new("-version"), PROBE_TIMEOUT) {
-            outputs.push((ArcadeEmulator::Mame, output));
-        }
+    if let Some(path) = probe_target(installations, ArcadeEmulator::Mame)
+        && let Some(output) = probe_command_output(path, OsStr::new("-version"), PROBE_TIMEOUT)
+    {
+        outputs.push((ArcadeEmulator::Mame, output));
     }
     outputs
 }

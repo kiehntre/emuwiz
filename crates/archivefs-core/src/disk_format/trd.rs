@@ -101,12 +101,12 @@ pub(super) fn inspect(
                  Scorpion family; no other platform writes it. It encodes no machine subtype."
                     .to_string(),
             ];
-            if let Some(label) = descriptor.label {
-                if let Ok(text) = std::str::from_utf8(&label) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        evidence.push(format!("Disk label: {trimmed:?}"));
-                    }
+            if let Some(label) = descriptor.label
+                && let Ok(text) = std::str::from_utf8(&label)
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    evidence.push(format!("Disk label: {trimmed:?}"));
                 }
             }
             if let Some(folder) = context.folder_platform

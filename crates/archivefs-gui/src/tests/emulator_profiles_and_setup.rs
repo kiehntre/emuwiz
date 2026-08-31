@@ -3371,13 +3371,7 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
     };
     let input = app.build_launch_readiness_input(live);
 
-    let launch_readiness_page::LaunchReadinessInput::Plan {
-        plan,
-        dolphin,
-        pcsx2: _,
-        ..
-    } = input
-    else {
+    let launch_readiness_page::LaunchReadinessInput::Plan { plan, dolphin, .. } = input else {
         panic!("a resolved GameCube identity with RetroArch scanned must produce a Plan");
     };
     assert!(

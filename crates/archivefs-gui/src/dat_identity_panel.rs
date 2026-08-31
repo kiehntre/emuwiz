@@ -91,11 +91,8 @@ fn show_summary(ui: &mut egui::Ui, summary: &LibraryDatIdentitySummary) {
             }
         });
     }
-    match &summary.verification_state {
-        DatVerificationState::Conflicting { detail } => {
-            ui.collapsing("Explanation", |ui| ui.label(detail));
-        }
-        _ => {}
+    if let DatVerificationState::Conflicting { detail } = &summary.verification_state {
+        ui.collapsing("Explanation", |ui| ui.label(detail));
     }
     if let DatSetDependencySummary::Resolved {
         set_name,

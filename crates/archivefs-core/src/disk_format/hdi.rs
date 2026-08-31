@@ -242,6 +242,9 @@ fn validate_nhd(
     ))
 }
 
+// These fields are intentionally kept explicit to make each on-disk
+// validation constraint visible at the call site.
+#[allow(clippy::too_many_arguments)]
 fn validate_common(
     file_bytes: u64,
     header_bytes: u64,

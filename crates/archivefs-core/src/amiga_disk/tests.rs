@@ -253,7 +253,7 @@ fn zip_and_truncated_and_acorn_style_adf_are_all_refused() {
     ));
 
     // Truncated below the 512-byte minimum.
-    let (_d, p) = file(&vec![b'D', b'O', b'S', 0]);
+    let (_d, p) = file(&[b'D', b'O', b'S', 0]);
     assert!(matches!(
         inspect_amiga_floppy(&p),
         Err(AmigaFloppyError::Container(DiskError::TooSmall))

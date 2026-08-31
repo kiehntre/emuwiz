@@ -30,7 +30,6 @@ pub(crate) const SELECTED: &str = "★";
 pub(crate) const ABOUT: &str = "i";
 pub(crate) const ROMM: &str = "○";
 pub(crate) const CLEAN_UP: &str = "▪";
-pub(crate) const SEARCH: &str = "?";
 
 /// The restrained retro cheat-code motif used once (Home or Cheats header) as
 /// decoration only - never the primary label.
@@ -69,7 +68,7 @@ mod tests {
     fn every_icon_is_renderable_by_the_embedded_font_stack() {
         let unsupported: Vec<_> = [
             HOME, GAMES, ORGANISE, CHECK, CHEATS, VERIFY, SETTINGS, SOURCES, MOUNT, ARTWORK,
-            HISTORY, RECENT, SELECTED, ABOUT, ROMM, CLEAN_UP, SEARCH,
+            HISTORY, RECENT, SELECTED, ABOUT, ROMM, CLEAN_UP,
         ]
         .into_iter()
         .filter(|icon| !is_font_stack_safe(icon))

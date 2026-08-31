@@ -245,7 +245,7 @@ fn freshness(
         (Some(a), Some(c)) => Some(a.trim().eq_ignore_ascii_case(c.trim())),
         _ => None,
     };
-    for verdict in [
+    if let Some(verdict) = [
         compare(&audited.sha256, &current.sha256),
         compare(&audited.sha1, &current.sha1),
         compare(&audited.md5, &current.md5),
@@ -253,6 +253,7 @@ fn freshness(
     ]
     .into_iter()
     .flatten()
+    .next()
     {
         return if verdict {
             DatProvenanceFreshness::Current

@@ -170,6 +170,9 @@ enum StandaloneProcess {
 enum StandaloneLaunchStage {
     Starting(Receiver<Result<StandaloneProcess, String>>),
     Running(StandaloneProcess),
+    // Retain the process wrapper until the terminal state is replaced so its
+    // normal drop/reaping behavior remains unchanged.
+    #[allow(dead_code)]
     Exited(StandaloneProcess),
     Failed(String),
 }
@@ -1229,6 +1232,9 @@ pub(crate) fn show_launch_readiness_panel(
     }
 }
 
+// This is the UI boundary for the complete launch plan and its per-adapter
+// state; keeping these inputs explicit makes ownership and dispatch visible.
+#[allow(clippy::too_many_arguments)]
 fn show_plan(
     ui: &mut egui::Ui,
     plan: &LaunchPlan,

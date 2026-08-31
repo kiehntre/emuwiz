@@ -439,8 +439,8 @@ fn decode_z80_hardware_mode(
         SnapshotFormat::Z80V3 => match mode {
             0 | 1 | 3 => known(Spectrum48K),
             2 => known(OtherDocumented("SamRam")),
-            4 | 5 | 6 if modified_hardware => MachineEvidence::Encoded(SpectrumPlus2),
-            4 | 5 | 6 => known(Spectrum128K),
+            4..=6 if modified_hardware => MachineEvidence::Encoded(SpectrumPlus2),
+            4..=6 => known(Spectrum128K),
             7 | 8 if modified_hardware => MachineEvidence::Encoded(SpectrumPlus2A),
             7 | 8 => known(SpectrumPlus3),
             9 => known(Pentagon),
@@ -507,7 +507,7 @@ pub fn parse_sna_snapshot(bytes: &[u8]) -> Result<SpectrumSnapshotFacts, Snapsho
         // PC is popped from the stack, so SP must point into RAM for the
         // snapshot to be resumable at all - a real discriminator against
         // random bytes that happened to have a small mode/border byte.
-        if sp < 0x4000 || sp > 0xFFFE {
+        if !(0x4000..=0xFFFE).contains(&sp) {
             return Err(SnapshotRefusal::Malformed {
                 detail: format!(
                     "a 48K .sna keeps PC on the stack, so SP ({sp:#06x}) must be in RAM (0x4000..=0xFFFE)"
