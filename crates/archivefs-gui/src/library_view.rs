@@ -303,17 +303,15 @@ pub(crate) fn show_loaded_data(
                                 platform_custom_text,
                                 platform_busy,
                                 clipboard,
-                                selected_evidence: match selected_evidence {
-                                    selected_evidence_page::SelectedEvidenceState::Ready {
-                                        report,
-                                        ..
-                                    } if Some(report.path.as_path())
-                                        == selected_archive.as_deref() =>
-                                    {
-                                        Some(report)
-                                    }
-                                    _ => None,
-                                },
+                                // Keyed to the current selection so a worker
+                                // result for a row the user already left is
+                                // never shown, and a completed failure shows
+                                // its reason instead of a permanent "loading"
+                                // line - see `selected_evidence_view`.
+                                selected_evidence: selected_game_panel::selected_evidence_view(
+                                    selected_evidence,
+                                    selected_archive.as_deref(),
+                                ),
                             },
                         )
                     })

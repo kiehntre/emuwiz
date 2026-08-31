@@ -283,7 +283,7 @@ fn context_menu_disabled_mount_reason_matches_the_main_button_reason() {
                     platform_custom_text: &mut platform_custom_text,
                     platform_busy: false,
                     clipboard: &mut clipboard,
-                    selected_evidence: None,
+                    selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
                 },
             );
         });
@@ -3114,7 +3114,7 @@ fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport(
                         platform_custom_text: &mut platform_custom_text,
                         platform_busy: false,
                         clipboard: &mut clipboard,
-                        selected_evidence: None,
+                        selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
                     },
                 );
             });

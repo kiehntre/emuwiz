@@ -2609,7 +2609,7 @@ fn inspect_contents_button_is_absent_when_nothing_is_selected() {
                     platform_custom_text: &mut platform_custom_text,
                     platform_busy: false,
                     clipboard: &mut clipboard,
-                    selected_evidence: None,
+                    selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
                 },
             );
         });
@@ -2662,7 +2662,7 @@ fn selected_archive_tools_include_inspection_and_cheats_mods() {
                     platform_custom_text: &mut platform_custom_text,
                     platform_busy: false,
                     clipboard: &mut clipboard,
-                    selected_evidence: None,
+                    selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
                 },
             );
         });
@@ -2717,7 +2717,7 @@ fn render_selected_archive_with_reason(
                     platform_custom_text: &mut platform_custom_text,
                     platform_busy: false,
                     clipboard: &mut clipboard,
-                    selected_evidence: None,
+                    selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
                 },
             );
         });

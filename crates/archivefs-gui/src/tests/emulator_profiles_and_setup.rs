@@ -160,9 +160,9 @@ fn library_selected_archive_panel_renders_the_selected_evidence_report() {
     }
     let selected_report = match &selected_evidence {
         selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
-            Some(report.as_ref())
+            selected_game_panel::SelectedEvidenceView::Ready(report.as_ref())
         }
-        _ => None,
+        _ => selected_game_panel::SelectedEvidenceView::Loading,
     };
     let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
     game.metadata.platform = Some("Game Boy".to_string());
@@ -209,6 +209,172 @@ fn library_selected_archive_panel_renders_the_selected_evidence_report() {
     });
     assert!(rendered_text_contains(&output, "Structural evidence"));
     assert!(rendered_text_contains(&output, "Game Boy header"));
+}
+
+/// Renders the Library "Selected game details" panel for one `NotMountable`
+/// game with the given identity-evidence view and returns its text output -
+/// the exact path Journey A (`Library -> selected game details`) exercises.
+fn render_selected_game_panel_evidence(
+    path: &std::path::Path,
+    platform: &str,
+    view: selected_game_panel::SelectedEvidenceView<'_>,
+) -> egui::FullOutput {
+    let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
+    game.metadata.platform = Some(platform.to_string());
+    let EmptySelectedArchiveViewStateParts {
+        mut confirm_unmount,
+        mut confirm_lazy_unmount,
+        mut focus_lazy_cancel,
+        lazy_unmount_offers,
+        remount_offers,
+        mut cleanup_after_unmount,
+        mut platform_choice,
+        mut platform_custom_text,
+        mut clipboard,
+    } = empty_selected_archive_view_state_parts();
+    let ctx = egui::Context::default();
+    ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_selected_archive(
+                ui,
+                Some(&game),
+                None,
+                &[],
+                None,
+                None,
+                SelectedArchiveViewState {
+                    operation: None,
+                    busy: false,
+                    block_reason: None,
+                    action_readiness_debug_lines: &[],
+                    confirm_unmount: &mut confirm_unmount,
+                    confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                    focus_lazy_cancel: &mut focus_lazy_cancel,
+                    lazy_unmount_offers: &lazy_unmount_offers,
+                    remount_offers: &remount_offers,
+                    cleanup_after_unmount: &mut cleanup_after_unmount,
+                    platform_choice: &mut platform_choice,
+                    platform_custom_text: &mut platform_custom_text,
+                    platform_busy: false,
+                    clipboard: &mut clipboard,
+                    selected_evidence: view,
+                },
+            );
+        });
+    })
+}
+
+#[test]
+fn library_selected_archive_panel_shows_checking_state_while_evidence_loads() {
+    let path = PathBuf::from("/roms/aladdin.gb");
+    let output = render_selected_game_panel_evidence(
+        &path,
+        "Game Boy",
+        selected_game_panel::SelectedEvidenceView::Loading,
+    );
+    assert!(rendered_text_contains(&output, "Checking game identity"));
+    // The old wording that could persist forever must be gone.
+    assert!(!rendered_text_contains(
+        &output,
+        "Identity evidence is loading for the selected game"
+    ));
+    assert!(!rendered_text_contains(&output, "Structural evidence"));
+}
+
+#[test]
+fn library_selected_archive_panel_shows_failure_reason_not_endless_loading() {
+    let path = PathBuf::from("/roms/aladdin.gb");
+    let reason = "could not read /roms/aladdin.gb: No such file or directory";
+    let output = render_selected_game_panel_evidence(
+        &path,
+        "Game Boy",
+        selected_game_panel::SelectedEvidenceView::Failed(reason),
+    );
+    assert!(rendered_text_contains(
+        &output,
+        "Identity check could not be completed"
+    ));
+    assert!(rendered_text_contains(&output, reason));
+    assert!(!rendered_text_contains(&output, "Checking game identity"));
+    assert!(!rendered_text_contains(
+        &output,
+        "Identity evidence is loading for the selected game"
+    ));
+}
+
+#[test]
+fn selected_evidence_view_keys_result_to_the_current_selection() {
+    use selected_game_panel::{SelectedEvidenceView, selected_evidence_view};
+
+    let gb = PathBuf::from("/roms/gb/aladdin.gb");
+    let ps2 = PathBuf::from("/roms/ps2/some game.iso");
+
+    // A completed report is shown only for its own selection.
+    let ready_gb = ready_selected_evidence_state(&gb);
+    assert!(matches!(
+        selected_evidence_view(&ready_gb, Some(gb.as_path())),
+        SelectedEvidenceView::Ready(_)
+    ));
+    // Switching to another game must not show the previous game's evidence.
+    assert!(matches!(
+        selected_evidence_view(&ready_gb, Some(ps2.as_path())),
+        SelectedEvidenceView::Loading
+    ));
+
+    // A completed failure surfaces its reason for its own selection, and is
+    // ignored (shown as still-checking) for any other selection.
+    let failed_ps2 = selected_evidence_page::SelectedEvidenceState::Error {
+        generation: 7,
+        path: ps2.clone(),
+        message: "could not read the disc image".to_string(),
+    };
+    match selected_evidence_view(&failed_ps2, Some(ps2.as_path())) {
+        SelectedEvidenceView::Failed(reason) => {
+            assert_eq!(reason, "could not read the disc image");
+        }
+        other => panic!("expected Failed, got {:?}", std::mem::discriminant(&other)),
+    }
+    assert!(matches!(
+        selected_evidence_view(&failed_ps2, Some(gb.as_path())),
+        SelectedEvidenceView::Loading
+    ));
+
+    // Nothing loaded yet, or no selection, reads as still-checking - never a
+    // permanent blank.
+    assert!(matches!(
+        selected_evidence_view(
+            &selected_evidence_page::SelectedEvidenceState::Idle,
+            Some(gb.as_path())
+        ),
+        SelectedEvidenceView::Loading
+    ));
+    assert!(matches!(
+        selected_evidence_view(&ready_gb, None),
+        SelectedEvidenceView::Loading
+    ));
+}
+
+#[test]
+fn selected_evidence_view_ready_carries_structural_evidence_without_any_dat() {
+    let gb = PathBuf::from("/roms/gb/aladdin.gb");
+    let mut state = ready_selected_evidence_state(&gb);
+    if let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } = &mut state {
+        report
+            .structural_facts
+            .push(archivefs_core::content_evidence::ContentEvidence::new(
+                archivefs_core::content_evidence::ContentEvidenceKind::BootStructure,
+                "Game Boy header",
+                archivefs_core::content_evidence::ContentEvidenceConfidence::Strong,
+                "Game Boy header was read from the selected file",
+            ));
+    }
+    let view = selected_game_panel::selected_evidence_view(&state, Some(gb.as_path()));
+    let selected_game_panel::SelectedEvidenceView::Ready(report) = view else {
+        panic!("expected Ready");
+    };
+    // Structural evidence is available with no DAT identity summary passed
+    // to the panel at all (the `&[]` slice in the render helper above).
+    assert!(!report.structural_facts.is_empty());
 }
 
 #[test]

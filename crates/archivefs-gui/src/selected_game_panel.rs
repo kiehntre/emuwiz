@@ -64,6 +64,50 @@ pub(crate) fn remount_is_offered(
         && offered_archives.contains(&record.mount_plan.archive.path)
 }
 
+/// The three states the selected-game details panel renders for identity
+/// evidence, keyed by the caller to the *currently selected* file so a stale
+/// worker result for a previous selection is never shown. The panel must
+/// never sit indefinitely on a bare "loading" line: a failed read-only
+/// inspection resolves to [`Self::Failed`] with a concise reason.
+#[derive(Clone, Copy)]
+pub(crate) enum SelectedEvidenceView<'a> {
+    /// The read-only inspection is running (or has not started yet) for the
+    /// current selection.
+    Loading,
+    /// Structural / verified identity evidence for the current selection.
+    Ready(&'a selected_evidence_page::SelectedEvidenceReport),
+    /// The inspection could not be completed; carries the concise reason.
+    Failed(&'a str),
+}
+
+/// Projects the app's generation-guarded [`selected_evidence_page::SelectedEvidenceState`]
+/// into the panel's three visible states, keyed to the *currently selected*
+/// file. Any result whose path is not the current selection - a worker still
+/// finishing for a row the user already left - is treated as [`SelectedEvidenceView::Loading`],
+/// never shown as if it belonged to this game. A completed failure resolves
+/// to [`SelectedEvidenceView::Failed`] so the panel can show the reason
+/// rather than an endless "loading" line. Neither branch consults DAT
+/// status or mountability.
+pub(crate) fn selected_evidence_view<'a>(
+    state: &'a selected_evidence_page::SelectedEvidenceState,
+    selected_archive: Option<&Path>,
+) -> SelectedEvidenceView<'a> {
+    use selected_evidence_page::SelectedEvidenceState;
+    match state {
+        SelectedEvidenceState::Ready { report, .. }
+            if Some(report.path.as_path()) == selected_archive =>
+        {
+            SelectedEvidenceView::Ready(report)
+        }
+        SelectedEvidenceState::Error { path, message, .. }
+            if Some(path.as_path()) == selected_archive =>
+        {
+            SelectedEvidenceView::Failed(message)
+        }
+        _ => SelectedEvidenceView::Loading,
+    }
+}
+
 pub(crate) struct SelectedArchiveViewState<'a> {
     pub(crate) operation: Option<&'a RunningOperation>,
     pub(crate) busy: bool,
@@ -79,7 +123,7 @@ pub(crate) struct SelectedArchiveViewState<'a> {
     pub(crate) platform_custom_text: &'a mut String,
     pub(crate) platform_busy: bool,
     pub(crate) clipboard: &'a mut dyn ClipboardBackend,
-    pub(crate) selected_evidence: Option<&'a selected_evidence_page::SelectedEvidenceReport>,
+    pub(crate) selected_evidence: SelectedEvidenceView<'a>,
 }
 
 #[derive(Default)]
@@ -260,10 +304,29 @@ pub(crate) fn show_selected_archive(
                 }
             });
 
-        if let Some(report) = selected_evidence {
-            selected_evidence_page::show_identity_evidence(ui, report);
-        } else {
-            ui.label("Identity evidence is loading for the selected game...");
+        // Identity evidence has exactly three visible states, keyed to this
+        // selection by the caller. Structural / verified evidence is shown
+        // independently of DAT status (rendered just below) and never waits
+        // on mountability or a trusted catalogue. A failed inspection shows
+        // its reason instead of an endless "loading" line.
+        match selected_evidence {
+            SelectedEvidenceView::Ready(report) => {
+                selected_evidence_page::show_identity_evidence(ui, report);
+            }
+            SelectedEvidenceView::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking game identity…");
+                });
+            }
+            SelectedEvidenceView::Failed(reason) => {
+                widgets::banner(
+                    ui,
+                    "Identity check could not be completed",
+                    reason,
+                    widgets::StatusTone::Blocked,
+                );
+            }
         }
         show_dat_identity_section(ui, dat_identities);
         ui.add_space(6.0);
