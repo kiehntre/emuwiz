@@ -1028,9 +1028,10 @@ fn loose_commodore_disks_are_discovered_as_computer_disks() {
     let root = source_dir("commodore-disks");
     let dir = root.path().join("c128");
     std::fs::create_dir_all(&dir).unwrap();
-    for extension in ["d64", "g64", "d71", "d81"] {
+    for extension in ["g64", "d71", "d81"] {
         std::fs::write(dir.join(format!("fixture.{extension}")), b"fixture bytes").unwrap();
     }
+    std::fs::write(dir.join("fixture.d64"), minimal_d64()).unwrap();
 
     let report = discover_source(&dir).unwrap();
     assert_eq!(
