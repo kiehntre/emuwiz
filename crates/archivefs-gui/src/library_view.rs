@@ -256,12 +256,13 @@ pub(crate) fn show_loaded_data(
         widgets::status_badge(ui, readiness, tone);
     });
 
-    // The focused-archive mount / context actions render here, directly
+    // The selected-game mount / context actions render here, directly
     // under the bulk "Mount all" / "Unmount all" / "Doctor ready" row, so
     // every mount action - bulk and per-archive - sits in one place instead
     // of the focused-archive controls floating alone in the middle of the
     // page between the results banners and the filter card (manual smoke
-    // feedback). Collapsed by default; state persists for the session.
+    // feedback). Open by default: this is the user's selected-game details
+    // surface, not an implementation detail that should have to be guessed.
     let selected_persisted = selected_persisted_archive(cached, selected_archive.as_deref());
     let selected_dat_identities = selected_persisted
         .and_then(|archive| cached.and_then(|snapshot| snapshot.dat_identities.get(&archive.id)))
@@ -270,9 +271,9 @@ pub(crate) fn show_loaded_data(
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
     let selected_actions = if let Some(path) = selected_archive.as_deref() {
-        egui::CollapsingHeader::new(format!("Focused archive · {}", path.display()))
+        egui::CollapsingHeader::new(format!("Selected game details · {}", path.display()))
             .id_salt("library_focused_archive_details")
-            .default_open(false)
+            .default_open(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("library_selected_archive_scroll")
@@ -309,7 +310,7 @@ pub(crate) fn show_loaded_data(
             .body_returned
             .unwrap_or_default()
     } else {
-        ui.weak("No focused archive. Select a Library row to establish workflow context.");
+        ui.weak("No selected game. Select a Library row to establish game details.");
         SelectedArchiveActions::default()
     };
     if let Some(request) = selected_actions.operation {

@@ -121,8 +121,10 @@ pub(crate) fn show_selected_archive(
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
-            "Selected archive",
-            Some("Inspect identity, mount state, health, and metadata for the focused row."),
+            "Selected game details",
+            Some(
+                "Review this game's identity evidence, DAT status, content inspection, and available actions.",
+            ),
         );
         if record.is_none() && persisted.is_none() {
             ui.label("Select an archive row to view details.");
@@ -150,6 +152,13 @@ pub(crate) fn show_selected_archive(
                     "Known to the library database, not confirmed by the latest live snapshot. \
                      Mount/unmount actions are unavailable until it is - platform assignment \
                      below is metadata only and unaffected.",
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Identity evidence is read directly from the selected file; it does not require mounting or a DAT catalogue.",
+                    )
+                    .color(theme::muted(ui))
+                    .small(),
                 );
                 if ui
                     .add_enabled(

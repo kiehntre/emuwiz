@@ -2359,7 +2359,7 @@ fn library_app_with_test_rows(count: usize) -> (ArchiveFsApp, Vec<String>) {
 #[test]
 fn the_focused_archive_mount_actions_sit_with_the_bulk_mount_actions() {
     // Item 7 (manual smoke): the per-archive mount / context actions
-    // ("Focused archive") must render directly under the bulk
+    // ("Selected game details") must render directly under the bulk
     // "Mount all" / "Unmount all" / "Doctor" row - not floating alone lower
     // down the page, above the Find-and-filter card.
     let (mut app, _paths) = library_app_with_test_rows(3);
@@ -2377,14 +2377,8 @@ fn the_focused_archive_mount_actions_sit_with_the_bulk_mount_actions() {
 
     let bulk_mount =
         find_exact_text_center(&output, "Mount all").expect("the bulk 'Mount all' action renders");
-    let focused = find_exact_text_center(&output, "Focused archive · /roms/library-row-00.zip")
-        .or_else(|| {
-            find_exact_text_center(
-                &output,
-                "No focused archive. Select a Library row to establish workflow context.",
-            )
-        })
-        .expect("the focused-archive mount / context section renders");
+    let focused = find_exact_text_center(&output, "Selected game details · /roms/library-row-00.zip")
+        .expect("the selected-game mount / context section renders");
     let filter = find_exact_text_center(&output, "Find and filter")
         .expect("the Find and filter card renders");
 
