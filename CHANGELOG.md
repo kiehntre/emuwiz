@@ -62,6 +62,26 @@ release notes.
   native ScummVM launch execution, plus safe command planning and/or
   readiness reporting for PPSSPP, RPCS3, xemu, and Xenia, wired into the
   Doctor and Game Details readiness views.
+- **Unified launch and identity architecture.** Launch now separates
+  compatibility, verified identity, emulator/profile discovery, readiness,
+  command planning, and execution. RetroArch core matching/preferences, MAME
+  shortname authority, PCSX2 direct-content restrictions, and the launch
+  evidence bridge are family-specific and fail closed when evidence is
+  insufficient.
+- **Additional identity and DAT evidence.** PS2 CHD identity, NGP/NGPC
+  headers, Dreamcast specialist routing, Macintosh DC42 evidence, C64/tape
+  ambiguity hardening, and Virtual Boy media recognition are represented
+  conservatively. DAT identity, disk-only CHD set audits, set verdicts, and
+  verified identity facts persist their provenance and freshness.
+- **Cheats & Mods apply safety.** Selected verified PCSX2, Dolphin,
+  RetroArch, and GameCube/Wii provider records can use the shared confirmed
+  transaction path with journal/history and rollback where supported.
+  Safe local mod-package inspection/planning exists, but unsupported formats,
+  downloads, external installers, exact resume, CheatBase Stage 1, and a
+  universal mod installer are not included.
+- **Current documentation and diagnostics.** Architecture, launch support,
+  front-door workflows, Doctor findings, and historical/superseded guidance
+  now describe the current EmuWiz boundaries.
 - **DAT collection completion reporting.** The DAT Sources page shows how
   complete a catalogued collection is against its managed DATs.
 - **Managed DAT snapshot provenance and local revision rollback.** Managed

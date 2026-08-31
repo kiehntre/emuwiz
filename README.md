@@ -300,7 +300,8 @@ EmuWiz is dedicated to [my dad](DEDICATION.md).
 
 ## Release status
 
-The committed workspace is `0.8.1-alpha` and is in release preparation. It
+The committed workspace is `0.8.1-alpha` (candidate version
+`v0.8.1-alpha`) and is in release preparation. It
 has not been tagged or published in this checkout. The latest published
 release documented here is `v0.8.0-alpha`; use the Releases page to choose an
 actually published download rather than assuming the candidate is available.
