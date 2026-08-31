@@ -1727,7 +1727,7 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // the verified-identity cache adds one more.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        13,
+        14,
         "{:?}",
         scan.coverage
     );
