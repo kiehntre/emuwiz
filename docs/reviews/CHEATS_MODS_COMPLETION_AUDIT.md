@@ -1,5 +1,9 @@
 # Current-main Cheats & Mods completion audit
 
+> **Completed review snapshot**
+>
+> This audit records an earlier implementation review and is retained for provenance. It is not current capability guidance; see the [README](../../README.md) and [cheat/mod safety guidance](../CHEATS_MODS_SAFETY.md).
+
 Date: 2026-08-08. Branch: `feature/cheat-provider-finishing` (== `origin/main` @ `a2e5c56`).
 
 This is a completion audit of the Cheats & Mods implementation as it actually

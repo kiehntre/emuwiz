@@ -1,5 +1,7 @@
 # Sega Family Support Audit — EmuWiz end-to-end
 
+> **Research snapshot** — This audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Repo:** `/home/davedap/archivefs` · **Branch:** `feature/archivefs-unified-platform`
 **Scope:** Master System, Game Gear, Mega Drive/Genesis, 32X, Mega CD/Sega CD, Saturn, Dreamcast. Read-only research; every claim verified against source on this branch (CDI format facts additionally reference the repository's own two-source-verified `dreamcast_cdi` module documentation and the `opticaldiscs` 0.15 dependency, plus common CDI tooling knowledge — flagged inline).
 
@@ -399,4 +401,3 @@ Total: two `IdentityPlatform` variants plus a handful of dispatch arms, three re
 - Reused: everything (identity/Flycast already work).
 - Join fixed: strong extensions invisible to the scanner. Non-goals: cue/bin registration, multi-file set persistence.
 - Tests: `kind_for_extension("gdi"/"cdi")`, watcher relevance, discovery rows; regression: registry uniqueness tests.
-

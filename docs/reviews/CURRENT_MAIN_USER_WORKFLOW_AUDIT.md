@@ -1,5 +1,9 @@
 # Current-main user-workflow audit
 
+> **Completed review snapshot**
+>
+> This audit records an earlier repository review and is retained for provenance. It is not current product guidance; see the [README](../../README.md) and [current launch guidance](../LAUNCH_SUPPORT.md).
+
 Audited: `main` at `ff149e7` (branch `review/current-main-user-workflow-audit`).
 Scope: ArchiveFS as an integrated user-facing product — CLI (`archivefs-cli`)
 and GUI (`archivefs-gui`) over the shared `archivefs-core`. This is an audit

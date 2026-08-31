@@ -1,5 +1,9 @@
 # EmuWiz v0.8.0-alpha ("Alpha 2.0") release checklist
 
+> **Historical release checklist**
+>
+> This checklist applies only to the earlier v0.8.0-alpha release and is retained for release provenance. Use the [current release checklist](release-checklist.md) for present-day release work.
+
 Concise checklist for this release only. Do not tag `v0.8.0-alpha` until
 every box below is checked against the exact final commit. This does not
 replace [`docs/release-checklist.md`](release-checklist.md) or

@@ -1,5 +1,7 @@
 # NEC Family Support Audit — EmuWiz (READ-ONLY)
 
+> **Research snapshot** — This audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Scope:** PC Engine / TurboGrafx-16, SuperGrafx, PC Engine CD / TurboGrafx-CD, TurboDuo, PC-FX
 **Branch:** `feature/archivefs-unified-platform`
 **Method:** static source analysis only — no builds, edits, or tree modifications

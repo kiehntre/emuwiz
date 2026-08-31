@@ -49,7 +49,7 @@ emulator. It does not distribute copyrighted game content.
   managed local snapshot history.
 
 See [platform and media notes](docs/PLATFORM_REGISTRY_AND_DIRECT_IDENTITY.md)
-and [DAT documentation](docs/design/DAT_SOURCES_STAGE2_IMPLEMENTATION.md).
+and the [current adapter support matrix](docs/ADAPTER_SUPPORT_MATRIX.md).
 
 ### Organise Libraries
 
@@ -274,7 +274,6 @@ available for several commands; see the [JSON API](docs/json-api.md).
 - [Architecture overview](ARCHITECTURE.md) and [full architecture reference](docs/architecture.md)
 - [Domain model](docs/domain-model.md)
 - [Database design](docs/DATABASE_DESIGN.md) and [recovery diagnostics](docs/DATABASE_RECOVERY.md)
-- [DAT design and source workflows](docs/design/DAT_SOURCES_STAGE2_IMPLEMENTATION.md)
 - [Library Views](docs/library-views.md)
 - [Adapter support matrix](docs/ADAPTER_SUPPORT_MATRIX.md)
 - [Cheats & Mods documentation](docs/CHEATS_MODS_BEGINNER_WORKFLOW.md)

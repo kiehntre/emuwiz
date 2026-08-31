@@ -1,5 +1,7 @@
 # Tape / Cassette Format Support Audit — EmuWiz (RESEARCH ONLY)
 
+> **Research snapshot** — This audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Scope:** every tape/cassette extension claimed by any canonical EmuWiz platform — Commodore TAP/T64/CAS, ZX Spectrum TAP/TZX, Amstrad CDT/VOC, Acorn UEF, MSX CAS, Atari 8-bit CAS, plus WAV/PZX/CSW assessment
 **Branch:** `feature/archivefs-unified-platform`
 **Method:** static source analysis only — no source modified, no commits. Tape-format specs below are documented for future parser work and marked as needing the crate's two-source verification bar before any implementation.
@@ -327,4 +329,3 @@ Every non-MATURE cell is the same root cause: **no tape parser exists at any lay
 10. **Five highest-value pre-release tape tasks?** #1 `cpc-zxtape-signature-parity` (Tiny — kills the one live misidentification), #3 Commodore TAP, #4 Atari CAS, #6 T64, then #2 ZX TAP — resolve every unsafe claim and light up the family's biggest platforms.
 11. **Which are the real bane, and why?** TZX/CDT (attacker-controlled control flow + embedded expansion) and CSW (expansion bombs) — dangerous on *resource and control-flow* grounds, not reputation; everything else is ordinary bounded parsing.
 12. **What parser-safety architecture should every future tape parser share?** The §15 taxonomy as the fact-vocabulary, the §23 caps as hard constants in the crate's bounded-reader style, linear framing-only passes with zero control-flow following, streaming-with-caps for any expansion, and the crate's two-source verification bar before any magic table is committed.
-

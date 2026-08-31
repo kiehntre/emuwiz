@@ -1,5 +1,7 @@
 # Production registry parity audit
 
+> **Research snapshot** — This audit records an earlier repository state and is not current capability documentation. See the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 Base: `50d4007`  
 Branch: `feature/content-registry-parity`
 
@@ -106,4 +108,3 @@ for a unique valid asset id and a non-unknown fallback category. The literal
 `74` assertion was removed. No platform artwork/category row was missing, so
 changing the number to `75` would have preserved the brittle invariant rather
 than testing the real one.
-

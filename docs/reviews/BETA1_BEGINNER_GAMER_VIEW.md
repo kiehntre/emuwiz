@@ -1,5 +1,9 @@
 # Beta 1 beginner / gamer view review
 
+> **Completed review snapshot**
+>
+> This review records an earlier beta pass and is retained for provenance. It is not current product guidance; see the [README](../../README.md) for the current user-facing view.
+
 This pass follows the Sunshine/XFCE hands-on session after PR #20. It changes presentation and one confirmed Doctor classification boundary; DAT matching, providers, canonical organisation, and apply/rollback semantics are unchanged.
 
 | Observed issue | Before | Now |

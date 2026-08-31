@@ -1,5 +1,9 @@
 # Manual QA plan - ArchiveFS v0.6.0-alpha
 
+> **Historical QA document**
+>
+> This plan records validation for an earlier release and is retained as provenance. It is not current product guidance. See the [README](../README.md) and [release checklist](release-checklist.md) for current guidance.
+
 This is the consolidated manual, check-box acceptance plan for the
 `v0.6.0-alpha` release, covering everything merged since `v0.5.0-alpha`:
 shared verified game identity, shared preview/conflict detection, the

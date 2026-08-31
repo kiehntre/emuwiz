@@ -1,5 +1,9 @@
 # EmuWiz rename audit
 
+> **Completed review snapshot**
+>
+> This audit records the completed branding transition and is retained for provenance. It is not current product guidance; see the [README](../../README.md).
+
 Audit date: 2026-08-10.
 
 This audit covers the documentation and user-facing branding rename. EmuWiz

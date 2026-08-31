@@ -1,5 +1,7 @@
 # N64 CIC real-retail fingerprint corpus
 
+> **Research snapshot** — This manifest records research/reference data and is not current capability documentation. See the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 This manifest records legally distributable fingerprint metadata rather than
 copyrighted ROM or IPL3 bytes. The CRC32 and MD5 values are published by the
 CC0-licensed `n64checksum` research/reference implementation and agree with

@@ -1,5 +1,7 @@
 # Amiga Family Support Audit — EmuWiz (RESEARCH ONLY)
 
+> **Research snapshot** — This audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Scope:** Amiga OCS/ECS/AGA · CD32 · Commodore CDTV · WHDLoad installs · floppy games · HDF installations — Amiberry, FS-UAE, RetroArch/PUAE
 **Branch:** `feature/archivefs-unified-platform`
 **Method:** static source analysis only — no source modified, no commits.

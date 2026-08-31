@@ -1,5 +1,9 @@
 # EmuWiz v0.7.1-alpha ("Alpha 1.1") release checklist
 
+> **Historical release checklist**
+>
+> This checklist applies only to the earlier v0.7.1-alpha release and is retained for release provenance. Use the [current release checklist](release-checklist.md) for present-day release work.
+
 This checklist is specific to the `v0.7.1-alpha` stabilization release. Do
 not reuse [`docs/release-checklist.md`](release-checklist.md) for this
 release - that file records the already-shipped `v0.7.0` promotion.

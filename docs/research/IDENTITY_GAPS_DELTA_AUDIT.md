@@ -1,5 +1,7 @@
 # Platform Identity Gaps — Delta Audit (RESEARCH ONLY)
 
+> **Research snapshot** — This delta audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Repo:** `/home/davedap/archivefs` · **Branch:** `feature/archivefs-unified-platform` · **Tree: clean (all prior work committed)**
 **Method:** delta re-verification of every family audited in this series, against the current tree. This is not a fresh survey — it measures **what still matters after the landing wave**.
 

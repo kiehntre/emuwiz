@@ -1,5 +1,7 @@
 # Xbox Family Support Audit — EmuWiz (RESEARCH ONLY)
 
+> **Research snapshot** — This audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Scope:** Original Xbox · Xbox 360 — xemu · Xenia/Xenia Canary
 **Branch:** `feature/archivefs-unified-platform`
 **Method:** static source analysis only — no source modified, no commits.

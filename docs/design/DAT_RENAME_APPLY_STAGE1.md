@@ -1,5 +1,9 @@
 # DAT Rename Apply — Stage 1 (gated, reversible)
 
+> **Historical / superseded design**
+>
+> This document records an earlier implementation stage and safety design. It is retained for provenance, not as the complete current workflow. See the [README](../../README.md) and [safe apply/rollback guidance](../SHARED_SAFE_APPLY_ROLLBACK.md).
+
 Status: implemented on `feature/dat-rename-apply`. This is the design and
 safety record for the **apply** side of the read-only rename planning (PR #14).
 It may perform filesystem renames **only** for proposals that are from the

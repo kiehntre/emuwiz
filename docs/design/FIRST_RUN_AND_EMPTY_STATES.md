@@ -1,5 +1,9 @@
 # First Run and Empty States
 
+> **Historical / superseded implementation record**
+>
+> This document records an earlier GUI implementation stage and is retained for provenance. It may not describe the current interface. See the [README](../../README.md) and current [launch/support guidance](../LAUNCH_SUPPORT.md).
+
 Status: implemented on `feature/first-run-empty-state-polish`. This document
 describes what shipped, not a proposal.
 

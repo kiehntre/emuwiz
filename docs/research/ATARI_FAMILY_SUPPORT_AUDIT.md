@@ -1,5 +1,7 @@
 # EmuWiz Atari Family — Second-Pass Deep Audit
 
+> **Research snapshot** — This audit records repository findings at the time it was written. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Repository:** `/home/davedap/archivefs`
 **Branch:** `feature/archivefs-unified-platform`
 **Scope:** Atari 2600, 5200, 7800, 8-bit (400/800/XL/XE), Lynx, Jaguar, Jaguar CD, ST/STE/TT/Falcon

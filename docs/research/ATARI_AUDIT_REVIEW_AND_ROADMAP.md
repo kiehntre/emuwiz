@@ -1,5 +1,7 @@
 # Atari Audit Review & Implementation Roadmap (RESEARCH ONLY)
 
+> **Research snapshot** — This review records an earlier repository state and proposed work. It is not current capability documentation; see the [README](../../README.md), [adapter support matrix](../ADAPTER_SUPPORT_MATRIX.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Repo:** `/home/davedap/archivefs` · **Branch:** `feature/archivefs-unified-platform`
 **Subject under review:** `docs/research/ATARI_FAMILY_SUPPORT_AUDIT.md` (800 lines)
 **Method:** every load-bearing claim re-checked against source; the gaps it missed hunted; its task list converted into an implementation-ready roadmap. No source modified, no commits.

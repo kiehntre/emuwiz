@@ -1,5 +1,9 @@
 # ArchiveFS v0.6.0-alpha - Release Notes
 
+> **Historical release document**
+>
+> This file describes EmuWiz as it existed for this release. It is retained for release history, not current capability guidance. See the [README](../README.md) and [CHANGELOG](../CHANGELOG.md) for current behavior.
+
 **Release classification: alpha.** This is pre-1.0, actively developed
 software. Nothing in this document should be read as a promise of
 stability, and the interfaces it describes may still change before a 1.0

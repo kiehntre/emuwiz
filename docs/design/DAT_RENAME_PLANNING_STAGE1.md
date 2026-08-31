@@ -1,5 +1,9 @@
 # DAT Rename Planning — Stage 1 (read-only)
 
+> **Historical / superseded design**
+>
+> This document records an earlier implementation stage and is retained for provenance. It is not a complete current capability reference. See the [README](../../README.md) and [current roadmap](../../ROADMAP.md).
+
 Status: implemented on `feature/dat-rename-planning`. This document is the
 design and safety record for the **read-only rename planning** layer built on
 the DAT audit and the PR #13 matching policy.

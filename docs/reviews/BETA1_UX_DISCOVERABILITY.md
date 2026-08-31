@@ -1,5 +1,9 @@
 # Beta 1 UX & Discoverability review
 
+> **Completed review snapshot**
+>
+> This review records an earlier beta pass and is retained for provenance. It is not current product guidance; see the [README](../../README.md) for the current user-facing view.
+
 Date: 2026-08-08. Branch: `feature/beta1-ux-discoverability` (== origin/main base).
 
 This records the first hands-on beta session's UX problems and what PR #19

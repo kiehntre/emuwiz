@@ -1,5 +1,7 @@
 # Cheats/Mods Expansion Research (EmuWiz / ArchiveFS)
 
+> **Research snapshot** — This document records earlier research and design reasoning. It is not current capability documentation; see the [README](../../README.md), [cheat and mod safety guidance](../CHEATS_MODS_SAFETY.md), and [roadmap](../../ROADMAP.md) for present guidance.
+
 **Scope:** research and architecture only. No code was changed to produce this document.
 **Repo state audited:** `main` @ `50c76ce39131bc0b571172979d01df653edd548f`, clean tree.
 **Claim tags used throughout:** `[FACT]` = documented fact, source cited · `[CODE]` = conclusion from reading this repo's source, file cited · `[INFERENCE]` = reasoned but not directly sourced · `[COMMUNITY]` = community wiki/forum knowledge, not authoritative.
