@@ -1034,7 +1034,7 @@ fn preview_is_disabled_until_every_required_field_is_filled_then_becomes_clickab
 
     // Nothing filled in yet: clicking where the button is must not produce
     // an action, and the disabled hint must be visible.
-    let (output, action) = click_text(&ctx, &mut state, "Preview Playing Library");
+    let (output, action) = click_text(&ctx, &mut state, "Preview 1G1R Library");
     assert!(action.is_none(), "a disabled button must never click");
     assert!(rendered_text_contains(
         &output,
@@ -1045,7 +1045,7 @@ fn preview_is_disabled_until_every_required_field_is_filled_then_becomes_clickab
     type_into_field(&ctx, &mut state, SOURCE_ROOT_FIELD_ID, "/tmp/roms");
     type_into_field(&ctx, &mut state, DESTINATION_ROOT_FIELD_ID, "/tmp/playing");
 
-    let (output, action) = click_text(&ctx, &mut state, "Preview Playing Library");
+    let (output, action) = click_text(&ctx, &mut state, "Preview 1G1R Library");
     assert!(
         !rendered_text_contains(
             &output,

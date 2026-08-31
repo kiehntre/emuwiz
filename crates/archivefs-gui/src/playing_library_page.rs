@@ -1077,7 +1077,7 @@ pub(crate) fn show_playing_library_page(
 ) -> Option<PlayingLibraryPageAction> {
     let mut action = None;
 
-    widgets::section_header(ui, "Build Playing Library", None);
+    widgets::section_header(ui, "Build Playing Library (1G1R)", None);
     ui.label(
         egui::RichText::new(
             "Pick one representative release per game and create a linked library of it. \
@@ -1152,10 +1152,10 @@ pub(crate) fn show_playing_library_page(
     });
 
     ui.add_space(8.0);
-    widgets::section_header(ui, "1G1R election preferences", None);
+    widgets::section_header(ui, "Choose which version to keep", None);
     ui.label(
         egui::RichText::new(
-            "These preferences explain which verified release wins each game family. The preview shows the election reasoning before anything is applied.",
+            "1G1R means 1 Game, 1 ROM: EmuWiz picks one preferred verified release for each game. These are the 1G1R selection rules.",
         )
         .color(theme::muted(ui))
         .small(),
@@ -1199,7 +1199,7 @@ pub(crate) fn show_playing_library_page(
         && !state.destination_root_draft.trim().is_empty();
     if widgets::action_button(
         ui,
-        "Preview Playing Library",
+        "Preview 1G1R Library",
         widgets::ActionStyle::Primary,
         ready,
     )
