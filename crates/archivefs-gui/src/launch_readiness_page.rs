@@ -1172,8 +1172,10 @@ pub(crate) fn show_launch_readiness_panel(
 ) {
     widgets::section_header(
         ui,
-        "Launch readiness",
-        Some("Ways this game can be played."),
+        "Play / Launch readiness",
+        Some(
+            "Ways this game can be played. Check emulator readiness, then launch only a command backed by verified identity and resolved content.",
+        ),
     );
 
     match input {
