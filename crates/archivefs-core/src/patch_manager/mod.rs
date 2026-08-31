@@ -552,7 +552,9 @@ pub use retroarch_cheat_setup::{
     RetroArchCheatSetupPreviewSummary, RetroArchCheatSetupProfile,
     RetroArchCheatSetupProfileBlocker, RetroArchCheatSetupProfileState, RetroArchCheatSetupResult,
     RetroArchCheatSetupStatus, build_retroarch_cheat_setup_plan,
-    discover_retroarch_cheat_setup_profiles, resolve_retroarch_cheat_setup_profile,
+    discover_retroarch_cheat_setup_profiles,
+    discover_retroarch_cheat_setup_profiles_with_core_directory_override,
+    resolve_retroarch_cheat_setup_profile,
 };
 pub use retroarch_inventory::{
     ArtifactAssociation, ArtifactAssociationConfidence, ArtifactCatalogueGame,

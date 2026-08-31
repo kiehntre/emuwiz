@@ -1085,6 +1085,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         shared_history_operation: None,
         shared_rollback: SharedRollbackState::Idle,
         retroarch_profiles: RetroArchProfilesState::NotScanned,
+        retroarch_core_directory_override: None,
         pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
         dolphin_profiles: DolphinProfilesState::NotScanned,
         dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,

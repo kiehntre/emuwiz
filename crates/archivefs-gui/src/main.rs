@@ -108,7 +108,7 @@ use archivefs_core::patch_manager::{
     classify_bsfree_gamecube_cheat, default_bsfree_source_root, default_cheat_source_cache_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
-    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
+    discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles_with_core_directory_override,
     discover_shared_apply_history, discover_xenia_profiles, download_bsfree_database,
     execute_shared_apply, execute_shared_rollback, fetch_dolphin_catalogue_with_transport,
     fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
@@ -4235,6 +4235,14 @@ struct ArchiveFsApp {
     /// scanned automatically - filesystem probing only happens on an
     /// explicit "Scan/Rescan Profiles" click.
     retroarch_profiles: RetroArchProfilesState,
+    /// An explicit EmuWiz override for the RetroArch core directory,
+    /// persisted GUI-only (see `retroarch_core_directory_override_path`).
+    /// `None` = automatic discovery from `retroarch.cfg`. When `Some`, it
+    /// is passed straight to
+    /// `discover_retroarch_cheat_setup_profiles_with_core_directory_override`
+    /// in `start_retroarch_profile_scan`; the GUI does not re-implement any
+    /// core resolution.
+    retroarch_core_directory_override: Option<PathBuf>,
     /// Read-only PCSX2 profile discovery shared by every PS2 archive
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
@@ -4872,6 +4880,7 @@ impl ArchiveFsApp {
             shared_history_operation: None,
             shared_rollback: SharedRollbackState::Idle,
             retroarch_profiles: RetroArchProfilesState::NotScanned,
+            retroarch_core_directory_override: load_retroarch_core_directory_override(),
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
@@ -15660,14 +15669,40 @@ impl ArchiveFsApp {
             "RetroArch profile discovery started.",
         ));
         self.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
+        let core_directory_override = self.retroarch_core_directory_override.clone();
         thread::spawn(move || {
             let filesystem = HostReadOnlyFilesystem;
             let environment = DiscoveryEnvironment::from_process_environment();
-            let result = discover_retroarch_cheat_setup_profiles(&filesystem, &environment, None)
-                .map_err(|error| error.to_string());
+            let result = discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+                &filesystem,
+                &environment,
+                None,
+                core_directory_override.as_deref(),
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send(result);
             context.request_repaint();
         });
+    }
+
+    /// Persist an explicit EmuWiz override for the RetroArch core directory
+    /// and keep the in-memory copy in sync. Storage + plumbing only: this
+    /// does not trigger a rescan (matching the `save_gui_mode` convention);
+    /// the next explicit profile scan picks it up. The UI that calls this
+    /// arrives in increment 3; for now it is covered by tests.
+    #[allow(dead_code)]
+    fn set_retroarch_core_directory_override(&mut self, path: PathBuf) {
+        self.retroarch_core_directory_override = Some(path);
+        save_retroarch_core_directory_override(self.retroarch_core_directory_override.as_deref());
+    }
+
+    /// Drop any persisted RetroArch core-directory override, returning
+    /// discovery to fully automatic `retroarch.cfg` resolution. Called by
+    /// the increment 3 "Reset" control; exercised by tests for now.
+    #[allow(dead_code)]
+    fn clear_retroarch_core_directory_override(&mut self) {
+        self.retroarch_core_directory_override = None;
+        save_retroarch_core_directory_override(None);
     }
 
     fn poll_retroarch_profiles(&mut self) {
@@ -30450,6 +30485,61 @@ fn gui_mode_config_path() -> Option<PathBuf> {
     archivefs_core::app_dirs::config_path("gui_mode.txt").ok()
 }
 
+/// The GUI-only file that persists an explicit RetroArch core-directory
+/// override, as one plain path line. A sibling of `gui_mode.txt` under the
+/// EmuWiz config directory - not part of `config.toml`, so no parser or
+/// schema change, and an install that has never set one simply has no
+/// file. Reading is fully injectable (`_at`) for tests.
+fn retroarch_core_directory_override_path() -> Option<PathBuf> {
+    archivefs_core::app_dirs::config_path("retroarch_core_directory_override.txt").ok()
+}
+
+/// Reads the override from an explicit file path. A missing/unreadable
+/// file, or one that is empty or only whitespace, is `None` (automatic
+/// discovery). The stored path is taken verbatim - it is the user's
+/// explicit choice, never canonicalised here.
+fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Writes (or, for `None`, removes) the override at an explicit file path.
+/// Best-effort: a persistence failure never blocks the in-memory value
+/// from taking effect for the session, exactly like `save_gui_mode`.
+///
+/// The non-test write path has no caller until increment 3 wires the
+/// "Choose core folder" / "Reset" controls; this increment is storage +
+/// plumbing only, so the round-trip is exercised by tests for now.
+#[allow(dead_code)]
+fn save_retroarch_core_directory_override_at(path: &Path, value: Option<&Path>) {
+    match value {
+        Some(dir) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, dir.to_string_lossy().as_ref());
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The default-location counterparts, used by the running app.
+fn load_retroarch_core_directory_override() -> Option<PathBuf> {
+    retroarch_core_directory_override_path()
+        .as_deref()
+        .and_then(load_retroarch_core_directory_override_at)
+}
+
+#[allow(dead_code)]
+fn save_retroarch_core_directory_override(value: Option<&Path>) {
+    if let Some(path) = retroarch_core_directory_override_path() {
+        save_retroarch_core_directory_override_at(&path, value);
+    }
+}
+
 fn parse_gui_mode(contents: &str) -> GuiMode {
     match contents.trim() {
         "advanced" => GuiMode::AdvancedView,
@@ -31635,6 +31725,73 @@ fn file_pick_drain_picked_returns_the_path() {
     assert_eq!(
         drain_file_pick(&receiver),
         FilePickDrain::Picked(PathBuf::from("/tmp/pic.png"))
+    );
+}
+
+// --- RetroArch core-directory override persistence (increment 2) ---------
+//
+// Storage + plumbing only: these cover the on-disk round-trip for the
+// GUI-only `retroarch_core_directory_override.txt` file. The discovery
+// behaviour it feeds is covered in `archivefs-core`
+// (`retroarch_cheat_setup` + `emulator_environment::retroarch`).
+
+#[test]
+fn a_missing_core_directory_override_file_loads_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    assert!(!path.exists());
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+fn an_empty_or_whitespace_core_directory_override_file_loads_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    std::fs::write(&path, "   \n\t").unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+fn a_core_directory_override_round_trips_through_save_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("nested/retroarch_core_directory_override.txt");
+    let chosen = PathBuf::from("/opt/libretro/cores");
+    save_retroarch_core_directory_override_at(&path, Some(chosen.as_path()));
+    assert!(path.exists(), "save must create the file (and any parent)");
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(chosen)
+    );
+}
+
+#[test]
+fn clearing_a_core_directory_override_removes_the_file_and_next_load_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    save_retroarch_core_directory_override_at(
+        &path,
+        Some(PathBuf::from("/opt/libretro/cores").as_path()),
+    );
+    assert!(path.exists());
+    save_retroarch_core_directory_override_at(&path, None);
+    assert!(!path.exists(), "clearing must remove the file");
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+    // Clearing an already-absent file is a harmless no-op.
+    save_retroarch_core_directory_override_at(&path, None);
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_persisted_core_directory_override_survives_a_second_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    save_retroarch_core_directory_override_at(&path, Some(Path::new("/first/cores")));
+    save_retroarch_core_directory_override_at(&path, Some(Path::new("/second/cores")));
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(PathBuf::from("/second/cores"))
     );
 }
 
