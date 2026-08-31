@@ -1,11 +1,49 @@
 use super::*;
 
+/// Writes a tiny shell script that prints `output`, and does not return until
+/// that script is genuinely spawnable.
+///
+/// Unlike the other launch fixtures, ScummVM's preflight actually `execve`s
+/// this file (through the detector). In a multithreaded test binary a
+/// concurrent `fork`+`exec` in another test can briefly leave a writable
+/// descriptor to a just-written file alive, so the first `execve` here can
+/// transiently fail with `ETXTBSY` and surface as a spurious
+/// `ScummVmGameIdUnavailable`. The write is made fully durable and its handle
+/// dropped before `chmod`, then spawnability is confirmed with a bounded,
+/// yield-only retry (no timed sleep) so every caller sees a ready executable.
 #[cfg(unix)]
 fn executable_fixture(root: &std::path::Path, output: &str) -> std::path::PathBuf {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
     let path = root.join("scummvm-fixture");
-    std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n")).unwrap();
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(file, "#!/bin/sh\nprintf '%s\\n' '{output}'\n").unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+    } // handle closed here, before the mode change
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    const ETXTBSY: i32 = 26;
+    for attempt in 0.. {
+        match Command::new(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.wait();
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(ETXTBSY) && attempt < 10_000 => {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("scummvm fixture never became spawnable: {error}"),
+        }
+    }
     path
 }
 
