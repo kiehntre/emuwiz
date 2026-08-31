@@ -101,6 +101,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("z64", ContentKind::RomCartridge),
     cf("n64", ContentKind::RomCartridge),
     cf("v64", ContentKind::RomCartridge),
+    // Virtual Boy images are recognised as generic cartridge media only;
+    // exact identity remains DAT/hash-driven and has no header parser here.
+    cf("vb", ContentKind::RomCartridge),
+    cf("vboy", ContentKind::RomCartridge),
     // --- Sega ---
     cf("sms", ContentKind::RomCartridge),
     cf("gg", ContentKind::RomCartridge),
@@ -327,6 +331,17 @@ mod tests {
     fn neo_geo_pocket_extensions_are_cartridge_content() {
         assert_eq!(content_kind_for_extension("ngp"), Some(ContentKind::RomCartridge));
         assert_eq!(content_kind_for_extension("ngc"), Some(ContentKind::RomCartridge));
+    }
+
+    #[test]
+    fn virtual_boy_extensions_are_generic_cartridge_content() {
+        for extension in ["vb", "vboy"] {
+            assert_eq!(
+                content_kind_for_extension(extension),
+                Some(ContentKind::RomCartridge),
+                ".{extension} must be generic ROM content"
+            );
+        }
     }
 
     #[test]
