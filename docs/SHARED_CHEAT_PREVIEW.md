@@ -1,118 +1,26 @@
-# Shared read-only Cheats & Mods preview
+# Shared Cheats & Mods preview
 
-EmuWiz has a shared source-to-destination preview and conflict model for the
-RetroArch, PCSX2, and Dolphin Cheats & Mods workflows. It is observational:
+## CURRENT BEHAVIOR
 
-> Preview only. No files were changed.
+The shared preview is a bounded, evidence-aware plan. It joins a selected
+verified game identity to a discovered emulator profile, provider record,
+materialized local source, exact destination, and current destination state.
+It is not a generic patch interpreter and never executes cheat directives.
 
-There is no apply path in this milestone. Previewing cannot install, replace,
-enable, disable, delete, back up, journal, or roll back content.
+Read-only stages include provider browsing, source validation, emulator/profile
+discovery, local inventory, and preview. They create no user files and do not
+modify emulator files. A preview can report candidate, blocked, conflict,
+preview-only, already-installed, or apply-eligible entries.
 
-## Preview and destination states
+An apply-eligible entry requires an exact verified identity, an adapter-approved
+materialized source, a safe destination, fresh source/destination checks, and
+explicit confirmation. Supported PCSX2, Dolphin, RetroArch, and GameCube/Wii
+flows use the shared transaction engine; coverage is adapter-specific.
 
-The typed preview state is one of: `Install new`, `Already installed`, `Replace
-different`, `Conflict`, `Ambiguous`, `Not eligible`, `Unsupported`, `Unsafe
-destination`, `Destination unavailable`, `Source unavailable`, `Identity
-unavailable`, or `Resource limit reached`.
+Local mod-package inspection and planning are supported. Unsupported patch or
+mod formats fail closed. Downloads and external installers are not part of
+local mod-package Stage 1.
 
-The separately reported destination state distinguishes missing, regular and
-identical, regular and different, directory, symlink, special file,
-inaccessible, changed during inspection, and unavailable. Proposed actions are
-only `Install`, `Skip`, `Replace`, or `Blocked` metadata. No proposed action is
-executable.
-
-Each entry preserves the adapter, exact selected archive path, verified
-identity when present, match strength, exact source path and SHA-256,
-destination root/relative/final paths, existing destination SHA-256, typed
-blockers and warnings, and the future backup/replacement-permission flags.
-Core destination-safety errors remain typed rather than becoming prose.
-
-## Eligibility
-
-PCSX2 requires a verified executable CRC and one exact PNACH match. Dolphin
-requires a verified Game ID; Game-ID-only and revision-aware matches remain
-distinct. Candidate filename/title evidence is visible but blocked. Multiple
-exact matches are conflicts.
-
-RetroArch preserves its existing exact/strong/candidate/ambiguous/unsupported
-strength vocabulary. The shared engine accepts exact or strong RetroArch input
-only alongside verified selected-archive identity; weak/candidate-only input is
-never eligible. The GUI materializes a selected trusted catalogue's individual
-RetroArch staging records into this shared report through the
-`materialize_retroarch_shared_preview` bridge (see
-[`RETROARCH_GUI_APPLY_HISTORY.md`](RETROARCH_GUI_APPLY_HISTORY.md)); it
-truthfully reports source unavailable only when no eligible catalogue entry
-actually exists for the selected archive, never as a placeholder for
-unfinished wiring.
-
-PCSX2 destinations are accepted only when an inspected matched file maps back
-to exactly `<configuration>/<category>/<filename>`. Deeper recursive PNACH
-paths remain blocked conservatively. Dolphin maps only
-`<configuration>/GameSettings/<filename>`. No Dolphin texture-pack preview is
-implemented.
-
-## Destination safety
-
-The preview reuses EmuWiz's destination-safety validator. It rejects
-relative roots, filesystem roots, traversal or embedded-separator components,
-paths outside the approved root, root/parent/final symlinks, non-directory
-parents, directories or special files at the final path, inaccessible paths,
-and identities that change while being read. Missing roots or parents are
-reported; preview never creates them.
-
-Duplicate final destinations, filename collisions, conservative case-folded
-collisions, one source targeting several destinations, multiple exact sources,
-duplicate source content, adapter/platform mismatches, stale identity, source
-changes, and destination changes are retained as typed conflicts. None is
-silently resolved.
-
-## Source revalidation and hashing
-
-Every source path must be absolute, regular, and free of symlink components.
-It is opened read-only with `O_NOFOLLOW` on Unix. Device/inode, size, and
-modification time are compared before and after reading. The newly calculated
-digest is compared with the digest recorded by the adapter inventory; a
-mismatch is `Source changed`. Destination regular files receive the same
-bounded, race-aware treatment. Duplicate paths are hashed once per report.
-
-## Deterministic limits
-
-| Resource | Limit |
-|---|---:|
-| Preview entries | 512 |
-| Unique source files hashed | 256 |
-| Unique destination files hashed | 256 |
-| Bytes hashed per file | 1 MiB |
-| Total source and destination bytes hashed | 32 MiB |
-| Destination paths inspected | 1,024 |
-| Conflict records retained | 128 |
-| Warnings retained per entry/report | 64 |
-
-Limit exhaustion produces an explicit incomplete/resource-limited report.
-Entries, blockers, conflicts, and summary counts are sorted and calculated
-deterministically.
-
-## GUI and stale-result behavior
-
-The shared Preview section uses summary and entry cards with expandable
-technical details. Work runs on a background thread. A result applies only
-while exact archive, adapter, profile, source mode, selected source, page, and
-platform context still match. Identity or adapter-inventory reinspection also
-invalidates the prior preview. Preview activity records one start and one
-completion, blocked/conflict, or failure event—not one event per file.
-
-## Read-only and future work
-
-Production preview code creates no files or directories, writes no temporary
-data, renames and deletes nothing, executes and mounts nothing, and performs no
-network operation or metadata upload. Synthetic fixture writes exist only in
-unit tests.
-
-The shared transaction foundation provides fresh immediately-before-write
-checks, explicit replacement consent, verified backups, durable journaling,
-atomic installation, post-write verification, and rollback for adapters with a
-safe materialized source seam. The GUI RetroArch per-game materialization
-bridge and Dolphin external Gecko-provider staging bridge are implemented and
-wired into Cheats & Mods. PCSX2 remains preview-only because it has no
-independent, approved source artifact to materialize. See
-[`SHARED_SAFE_APPLY_ROLLBACK.md`](SHARED_SAFE_APPLY_ROLLBACK.md).
+See [SHARED_SAFE_APPLY_ROLLBACK.md](SHARED_SAFE_APPLY_ROLLBACK.md),
+[CHEATS_MODS_SAFETY.md](CHEATS_MODS_SAFETY.md), and
+[ADAPTER_SUPPORT_MATRIX.md](ADAPTER_SUPPORT_MATRIX.md).
