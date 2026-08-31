@@ -2412,6 +2412,127 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
     assert!(rendered_text_contains(&on_diagnostics, "Healthy"));
 }
 
+// --- Increment 3: RetroArch core-folder repair flow in Emulator Setup ---
+
+fn emulator_setup_app_ready() -> ArchiveFsApp {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.doctor_scan = doctor_outcome(doctor_scan_from(&[]));
+    app.view = MainView::EmulatorSetup;
+    // Pre-seed a finished scan so rendering never spawns a real discovery
+    // thread; the empty environment yields zero usable cores.
+    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app
+}
+
+#[test]
+fn retroarch_core_folder_card_shows_automatic_mode_and_the_two_always_on_actions() {
+    let mut app = emulator_setup_app_ready();
+    assert!(app.retroarch_core_directory_override.is_none());
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&output, "Automatic core folder"));
+    assert!(rendered_text_contains(&output, "Rescan cores"));
+    assert!(rendered_text_contains(&output, "Choose core folder"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    // With no override active, "Reset to automatic" is hidden.
+    assert!(!rendered_text_contains(&output, "Reset to automatic"));
+    // The normal summary never leads with a raw diagnostic code.
+    assert!(!rendered_text_contains(
+        &output,
+        "retroarch_core_directory_override"
+    ));
+}
+
+#[test]
+fn retroarch_core_folder_card_shows_custom_mode_and_reset_when_an_override_is_active() {
+    let mut app = emulator_setup_app_ready();
+    app.retroarch_core_directory_override = Some(PathBuf::from("/custom/libretro/cores"));
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&output, "Custom core folder"));
+    assert!(rendered_text_contains(&output, "Reset to automatic"));
+    assert!(rendered_text_contains(&output, "Rescan cores"));
+}
+
+#[test]
+fn choosing_an_unusable_core_folder_is_reported_and_never_persisted() {
+    let mut app = emulator_setup_app_ready();
+    let missing = PathBuf::from("/no/such/core/folder/xyz");
+
+    app.apply_picked_retroarch_core_folder(missing.clone(), egui::Context::default());
+
+    // Nothing was saved: the active folder is still automatic.
+    assert!(app.retroarch_core_directory_override.is_none());
+    assert_eq!(app.retroarch_core_folder_rejected_pick, Some(missing));
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&output, "Folder not usable"));
+    // Still not claiming any custom folder.
+    assert!(rendered_text_contains(&output, "Automatic core folder"));
+}
+
+#[test]
+fn rescan_cores_routes_through_the_one_existing_profile_scan_lane() {
+    let mut app = emulator_setup_app_ready();
+    // The card's "Rescan cores" action calls exactly this - no second
+    // discovery path exists in the GUI.
+    app.start_retroarch_profile_scan(egui::Context::default());
+    assert!(matches!(
+        app.retroarch_profiles,
+        RetroArchProfilesState::Scanning { .. }
+    ));
+}
+
+#[test]
+fn retroarch_core_folder_technical_details_carry_raw_diagnostics_kept_out_of_the_summary() {
+    use archivefs_core::emulator_environment::retroarch::{
+        Diagnostic, DiagnosticCategory, DiagnosticSeverity,
+    };
+    use retroarch_core_setup::{CoreFolderMode, CoreFolderScan, core_folder_readiness};
+
+    let mut discovery = cheat_discovery(Vec::new());
+    discovery.diagnostics.push(Diagnostic {
+        code: "retroarch_core_directory_override_unusable",
+        severity: DiagnosticSeverity::Warning,
+        detail_kind: DiagnosticCategory::PathResolution,
+        profile: None,
+        purpose: None,
+        path: None,
+        entry_index: None,
+    });
+    let mode = CoreFolderMode::from_override(Some(Path::new("/custom/cores")));
+
+    // The one-line normal summary must not contain the raw code.
+    let readiness = core_folder_readiness(CoreFolderScan::Ready(&discovery), &mode);
+    assert!(
+        !readiness
+            .sentence
+            .contains("retroarch_core_directory_override_unusable")
+    );
+
+    // The Technical details body does surface it, plus a plain translation.
+    let profiles = RetroArchProfilesState::Ready(discovery);
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_retroarch_core_folder_technical(ui, &profiles, &mode, None);
+        });
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "retroarch_core_directory_override_unusable"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "The custom core folder could not be read."
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "EmuWizCoreDirectoryOverride"
+    ));
+}
+
 #[test]
 fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
     let profile_report = ProfileAssessmentReport {

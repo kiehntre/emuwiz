@@ -181,6 +181,7 @@ pub(crate) mod playing_library_page;
 pub(crate) mod problems_repair_page;
 pub(crate) mod repair_history_page;
 pub(crate) mod repair_review_page;
+pub(crate) mod retroarch_core_setup;
 pub(crate) mod rom_organisation_page;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
@@ -4243,6 +4244,12 @@ struct ArchiveFsApp {
     /// in `start_retroarch_profile_scan`; the GUI does not re-implement any
     /// core resolution.
     retroarch_core_directory_override: Option<PathBuf>,
+    /// A directory the user picked in Emulator Setup's "Choose core folder"
+    /// that failed the pre-persist check (missing, or not a directory). It
+    /// is *not* persisted and does not change the active core folder; the
+    /// card shows a plain "folder not usable" message until the next pick,
+    /// rescan, or reset clears it. `None` the rest of the time.
+    retroarch_core_folder_rejected_pick: Option<PathBuf>,
     /// Read-only PCSX2 profile discovery shared by every PS2 archive
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
@@ -4881,6 +4888,7 @@ impl ArchiveFsApp {
             shared_rollback: SharedRollbackState::Idle,
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             retroarch_core_directory_override: load_retroarch_core_directory_override(),
+            retroarch_core_folder_rejected_pick: None,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
@@ -6198,26 +6206,7 @@ impl ArchiveFsApp {
         ui.add_space(theme::SECTION_GAP);
         show_emulator_setup_summary(ui, self.doctor_scan.displayed(), &self.retroarch_profiles);
         ui.add_space(theme::SECTION_GAP);
-        ui.horizontal_wrapped(|ui| {
-            let (label, tone) = retroarch_integration_presentation(&self.retroarch_profiles);
-            widgets::status_badge(ui, label, tone);
-            let action = if matches!(
-                self.retroarch_profiles,
-                RetroArchProfilesState::Ready(_) | RetroArchProfilesState::Error(_)
-            ) {
-                "Rescan RetroArch"
-            } else {
-                "Scan RetroArch"
-            };
-            if ui.button(action).clicked()
-                && !matches!(
-                    self.retroarch_profiles,
-                    RetroArchProfilesState::Scanning { .. }
-                )
-            {
-                self.start_retroarch_profile_scan(context.clone());
-            }
-        });
+        self.show_retroarch_core_folder_card(ui, context);
         ui.add_space(theme::SECTION_GAP);
         fn show_emulator_setup_summary(
             ui: &mut egui::Ui,
@@ -6313,6 +6302,120 @@ impl ArchiveFsApp {
             .id_salt("emulator-setup-full-diagnostics")
             .default_open(false)
             .show(ui, |ui| self.show_doctor_page_body(ui, context));
+    }
+
+    /// The normal-user RetroArch layer for Emulator Setup: one badge, one
+    /// sentence, the three repair actions, and a Technical details
+    /// expander. Every readiness word comes from
+    /// [`retroarch_core_setup::core_folder_readiness`], a pure projection
+    /// of the shared discovery state - this method never re-derives core
+    /// availability or launch readiness. "Rescan cores" and the post-pick
+    /// / post-reset refresh all go through the one existing
+    /// [`Self::start_retroarch_profile_scan`] lane.
+    fn show_retroarch_core_folder_card(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        use retroarch_core_setup::{CoreFolderMode, CoreFolderScan, core_folder_readiness};
+
+        let mode = CoreFolderMode::from_override(self.retroarch_core_directory_override.as_deref());
+        let scanning = matches!(
+            self.retroarch_profiles,
+            RetroArchProfilesState::Scanning { .. }
+        );
+        let readiness = {
+            let scan = match &self.retroarch_profiles {
+                RetroArchProfilesState::NotScanned => CoreFolderScan::NotScanned,
+                RetroArchProfilesState::Scanning { .. } => CoreFolderScan::Scanning,
+                RetroArchProfilesState::Error(message) => CoreFolderScan::Failed(message.as_str()),
+                RetroArchProfilesState::Ready(discovery) => CoreFolderScan::Ready(discovery),
+            };
+            core_folder_readiness(scan, &mode)
+        };
+        let rejected_pick = self.retroarch_core_folder_rejected_pick.clone();
+
+        enum CoreFolderAction {
+            Rescan,
+            ChooseFolder(PathBuf),
+            Reset,
+        }
+        let mut pending: Option<CoreFolderAction> = None;
+
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("RetroArch");
+                widgets::status_badge(ui, readiness.badge_label, readiness.badge_tone);
+            });
+            ui.label(egui::RichText::new(mode.label()).strong());
+            if let Some(headline) = readiness.headline {
+                ui.label(egui::RichText::new(headline).strong());
+            }
+            ui.label(readiness.sentence.as_str());
+            if scanning {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Scanning RetroArch cores...");
+                });
+            }
+            ui.add_space(theme::SECTION_GAP);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!scanning, egui::Button::new("Rescan cores"))
+                    .clicked()
+                {
+                    pending = Some(CoreFolderAction::Rescan);
+                }
+                if ui
+                    .add_enabled(!scanning, egui::Button::new("Choose core folder"))
+                    .clicked()
+                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                {
+                    pending = Some(CoreFolderAction::ChooseFolder(folder));
+                }
+                if mode.is_custom()
+                    && ui
+                        .add_enabled(!scanning, egui::Button::new("Reset to automatic"))
+                        .clicked()
+                {
+                    pending = Some(CoreFolderAction::Reset);
+                }
+            });
+            if rejected_pick.is_some() {
+                widgets::banner(
+                    ui,
+                    "Folder not usable",
+                    "This folder could not be used as a RetroArch core folder. Choose another \
+                     folder or reset to automatic detection.",
+                    widgets::StatusTone::Blocked,
+                );
+            }
+            egui::CollapsingHeader::new("Technical details")
+                .id_salt("retroarch-core-folder-technical")
+                .default_open(false)
+                .show(ui, |ui| {
+                    show_retroarch_core_folder_technical(
+                        ui,
+                        &self.retroarch_profiles,
+                        &mode,
+                        rejected_pick.as_deref(),
+                    );
+                });
+        });
+
+        match pending {
+            Some(CoreFolderAction::Rescan) => {
+                self.retroarch_core_folder_rejected_pick = None;
+                if !scanning {
+                    self.start_retroarch_profile_scan(context.clone());
+                }
+            }
+            Some(CoreFolderAction::ChooseFolder(folder)) => {
+                self.apply_picked_retroarch_core_folder(folder, context.clone());
+            }
+            Some(CoreFolderAction::Reset) => {
+                self.retroarch_core_folder_rejected_pick = None;
+                self.clear_retroarch_core_directory_override();
+                self.start_retroarch_profile_scan(context.clone());
+            }
+            None => {}
+        }
     }
 
     /// The consolidated "Problems & Repair" destination - see
@@ -15686,23 +15789,41 @@ impl ArchiveFsApp {
     }
 
     /// Persist an explicit EmuWiz override for the RetroArch core directory
-    /// and keep the in-memory copy in sync. Storage + plumbing only: this
-    /// does not trigger a rescan (matching the `save_gui_mode` convention);
-    /// the next explicit profile scan picks it up. The UI that calls this
-    /// arrives in increment 3; for now it is covered by tests.
-    #[allow(dead_code)]
+    /// and keep the in-memory copy in sync. This does not itself trigger a
+    /// rescan (matching the `save_gui_mode` convention); callers that need
+    /// fresh core state run `start_retroarch_profile_scan` next - the
+    /// Emulator Setup repair flow does exactly that.
     fn set_retroarch_core_directory_override(&mut self, path: PathBuf) {
         self.retroarch_core_directory_override = Some(path);
         save_retroarch_core_directory_override(self.retroarch_core_directory_override.as_deref());
     }
 
     /// Drop any persisted RetroArch core-directory override, returning
-    /// discovery to fully automatic `retroarch.cfg` resolution. Called by
-    /// the increment 3 "Reset" control; exercised by tests for now.
-    #[allow(dead_code)]
+    /// discovery to fully automatic `retroarch.cfg` resolution. Does not
+    /// rescan on its own; the "Reset to automatic" control rescans after.
     fn clear_retroarch_core_directory_override(&mut self) {
         self.retroarch_core_directory_override = None;
         save_retroarch_core_directory_override(None);
+    }
+
+    /// Emulator Setup "Choose core folder" outcome. A picked directory is
+    /// validated (exists + is a directory) *before* it is persisted; on
+    /// success it is saved through the shared helper and a fresh RetroArch
+    /// profile scan is started so `matching_retroarch_cores` ->
+    /// `build_retroarch_candidates` -> `build_launch_plan` -> gamer
+    /// readiness all update naturally. An unusable pick is reported and
+    /// never stored, so the active core folder is unchanged.
+    fn apply_picked_retroarch_core_folder(&mut self, folder: PathBuf, context: egui::Context) {
+        match retroarch_core_setup::classify_picked_core_folder(&folder) {
+            retroarch_core_setup::PickedCoreFolder::Directory => {
+                self.retroarch_core_folder_rejected_pick = None;
+                self.set_retroarch_core_directory_override(folder);
+                self.start_retroarch_profile_scan(context);
+            }
+            retroarch_core_setup::PickedCoreFolder::Unusable => {
+                self.retroarch_core_folder_rejected_pick = Some(folder);
+            }
+        }
     }
 
     fn poll_retroarch_profiles(&mut self) {
@@ -23167,6 +23288,89 @@ fn retroarch_integration_presentation(
     }
 }
 
+/// The "Technical details" body for the RetroArch core-folder card. This is
+/// the only place raw `PathFinding` provenance, the `ResolutionState` name,
+/// diagnostic codes and full filesystem paths appear - the normal summary
+/// above deliberately shows none of them.
+fn show_retroarch_core_folder_technical(
+    ui: &mut egui::Ui,
+    profiles: &RetroArchProfilesState,
+    mode: &retroarch_core_setup::CoreFolderMode,
+    rejected_pick: Option<&Path>,
+) {
+    use archivefs_core::emulator_environment::retroarch::PathPurpose;
+
+    ui.label(format!("Active source: {}", mode.label()));
+    match mode.custom_path() {
+        Some(path) => {
+            ui.label(format!("Override path: {}", path.display()));
+            ui.label("Resolution: EmuWizCoreDirectoryOverride");
+        }
+        None => {
+            ui.label("Override path: (none - automatic detection)");
+        }
+    }
+    if let Some(path) = rejected_pick {
+        ui.label(format!("Last rejected pick: {}", path.display()));
+    }
+
+    match profiles {
+        RetroArchProfilesState::NotScanned => {
+            ui.label("No RetroArch core scan has run yet.");
+        }
+        RetroArchProfilesState::Scanning { .. } => {
+            ui.label("RetroArch core scan in progress.");
+        }
+        RetroArchProfilesState::Error(message) => {
+            ui.label(format!("Scan error: {message}"));
+        }
+        RetroArchProfilesState::Ready(discovery) => {
+            let inventory = retroarch_core_setup::core_inventory(discovery);
+            ui.label(format!(
+                "Usable libretro cores: {} (of {} found) - platforms mapped: {}",
+                inventory.usable_cores, inventory.total_cores, inventory.mapped_platforms
+            ));
+            if let Some(finding) = discovery
+                .environment
+                .profiles
+                .iter()
+                .flat_map(|profile| profile.paths.iter())
+                .find(|finding| finding.purpose == PathPurpose::Cores)
+            {
+                if let Some(resolved) = &finding.resolved_path {
+                    ui.label(format!("Resolved core directory: {}", resolved.display));
+                }
+                if let Some(configured) = &finding.configured_value {
+                    ui.label(format!("retroarch.cfg configured value: {configured}"));
+                }
+            }
+            let mut any_diagnostic = false;
+            for diagnostic in discovery
+                .environment
+                .profiles
+                .iter()
+                .flat_map(|profile| profile.diagnostics.iter())
+            {
+                any_diagnostic = true;
+                match retroarch_core_setup::humanize_retroarch_diagnostic(diagnostic.code) {
+                    Some(plain) => ui.label(format!("{} - {plain}", diagnostic.code)),
+                    None => ui.label(diagnostic.code.to_string()),
+                };
+            }
+            for diagnostic in &discovery.diagnostics {
+                any_diagnostic = true;
+                match retroarch_core_setup::humanize_retroarch_diagnostic(diagnostic.code) {
+                    Some(plain) => ui.label(format!("{} - {plain}", diagnostic.code)),
+                    None => ui.label(diagnostic.code.to_string()),
+                };
+            }
+            if !any_diagnostic {
+                ui.label("No RetroArch diagnostics recorded.");
+            }
+        }
+    }
+}
+
 fn show_cheat_archive_context(
     ui: &mut egui::Ui,
     workflow: &CheatWorkflowState,
@@ -30507,11 +30711,6 @@ fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
 /// Writes (or, for `None`, removes) the override at an explicit file path.
 /// Best-effort: a persistence failure never blocks the in-memory value
 /// from taking effect for the session, exactly like `save_gui_mode`.
-///
-/// The non-test write path has no caller until increment 3 wires the
-/// "Choose core folder" / "Reset" controls; this increment is storage +
-/// plumbing only, so the round-trip is exercised by tests for now.
-#[allow(dead_code)]
 fn save_retroarch_core_directory_override_at(path: &Path, value: Option<&Path>) {
     match value {
         Some(dir) => {
@@ -30533,7 +30732,6 @@ fn load_retroarch_core_directory_override() -> Option<PathBuf> {
         .and_then(load_retroarch_core_directory_override_at)
 }
 
-#[allow(dead_code)]
 fn save_retroarch_core_directory_override(value: Option<&Path>) {
     if let Some(path) = retroarch_core_directory_override_path() {
         save_retroarch_core_directory_override_at(&path, value);
