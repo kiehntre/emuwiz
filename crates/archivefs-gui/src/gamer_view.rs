@@ -82,14 +82,89 @@ pub(crate) fn gamer_primary_action(state: MountState) -> GamerPrimaryAction {
 }
 
 /// The short, list-row-sized counterpart of `gamer_primary_action` - one
-/// or two words, safe to append after a title/platform pair.
+/// or two words, safe to append after a title/platform pair. The list has
+/// no per-row launch plan, so a mount-free game reads only "Ready" (media
+/// is usable); whether a safe core exists is the selected-game card's
+/// verdict ("Ready to play" vs "Needs setup"), never claimed here.
 pub(crate) fn gamer_primary_action_short_label(action: &GamerPrimaryAction) -> &'static str {
     match action {
         GamerPrimaryAction::Mount => "Ready to mount",
         GamerPrimaryAction::Unmount => "Mounted",
-        GamerPrimaryAction::NoMountingNeeded => "Ready to play",
+        GamerPrimaryAction::NoMountingNeeded => "Ready",
         GamerPrimaryAction::Blocked(_) => "Needs attention",
     }
+}
+
+/// The Gamer View card's **single** reconciled readiness state, derived from
+/// media/mount readiness *and* safe-launch readiness together. The card's
+/// status line and its primary action both consume this one value, so a
+/// game can never simultaneously read "Ready to play" and "Can't play yet".
+///
+/// A game that needs no mounting is only `Ready` when the shared launch
+/// planner ([`launch_readiness_page::gamer_play_action`]) actually produced
+/// a safe RetroArch request; a blocked plan is `NeedsSetup`, never
+/// "Ready to play". No launch-planning rule is re-implemented here.
+pub(crate) enum GamerReadiness<'a> {
+    /// Pending mount - the media is usable once mounted.
+    Mount,
+    /// Currently mounted.
+    Unmount,
+    /// Media usable and a safe launch plan exists.
+    Ready {
+        request: &'a archivefs_core::launch::RetroArchLaunchRequest,
+    },
+    /// Media usable, but the launch is blocked (no safe core, identity not
+    /// verified, RetroArch not scanned, ...). Carries the planner's reason.
+    NeedsSetup { reason: &'a str },
+    /// The media / mount itself is blocked. Carries the mount blocker.
+    NeedsAttention { reason: String },
+}
+
+/// Reconciles mount state and the shared launch-plan projection into one
+/// [`GamerReadiness`]. `MountState` alone never yields `Ready`.
+pub(crate) fn gamer_readiness<'a>(
+    mount_state: MountState,
+    play_action: &'a launch_readiness_page::GamerPlayAction,
+) -> GamerReadiness<'a> {
+    match gamer_primary_action(mount_state) {
+        GamerPrimaryAction::Mount => GamerReadiness::Mount,
+        GamerPrimaryAction::Unmount => GamerReadiness::Unmount,
+        GamerPrimaryAction::Blocked(reason) => GamerReadiness::NeedsAttention { reason },
+        GamerPrimaryAction::NoMountingNeeded => match play_action {
+            launch_readiness_page::GamerPlayAction::Ready(request) => {
+                GamerReadiness::Ready { request }
+            }
+            launch_readiness_page::GamerPlayAction::Blocked(reason) => {
+                GamerReadiness::NeedsSetup { reason }
+            }
+        },
+    }
+}
+
+/// The one- or two-word status word for a [`GamerReadiness`] - the text on
+/// the card's status line, kept in lockstep with its primary action.
+pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'static str {
+    match readiness {
+        GamerReadiness::Mount => "Ready to mount",
+        GamerReadiness::Unmount => "Mounted",
+        GamerReadiness::Ready { .. } => "Ready to play",
+        GamerReadiness::NeedsSetup { .. } => "Needs setup",
+        GamerReadiness::NeedsAttention { .. } => "Needs attention",
+    }
+}
+
+/// Turns the shared planner's blocker string into one plain sentence for a
+/// novice: drops the internal "Can't play yet:" lead-in the planner uses
+/// and leaves the specific reason (e.g. "no safe RetroArch launch option is
+/// available."). The lead sentence and any technical detail are the card's
+/// job, not this string's.
+pub(crate) fn humanize_play_blocker(reason: &str) -> &str {
+    reason
+        .trim()
+        .strip_prefix("Can't play yet:")
+        .or_else(|| reason.trim().strip_prefix("Can’t play yet:"))
+        .map(str::trim_start)
+        .unwrap_or(reason.trim())
 }
 
 /// Prefers the real, human title from metadata; falls back to the
@@ -153,6 +228,11 @@ pub(crate) enum GamerViewAction {
     /// select-then-navigate shape (`AppOperationRequest::OpenCheatsMods`'s
     /// handler) rather than inventing new plumbing.
     ReviewIdentity(PathBuf),
+    /// "Open Emulator Setup" from a `NeedsSetup` card: the game whose
+    /// launch is blocked (usually "no safe core for this platform"). The
+    /// caller keeps it selected and switches to Advanced View's Emulator
+    /// Setup page, the same select-then-navigate shape as `ReviewIdentity`.
+    OpenEmulatorSetup(PathBuf),
     /// "Update game information": re-reads the already-cached enrichment
     /// data from disk for the currently focused game. Never itself
     /// contacts a metadata provider's server - see
@@ -1326,12 +1406,16 @@ pub(crate) fn show_gamer_view(
                                         false,
                                     );
                                     show_gamer_metadata_enrichment(ui, &metadata_view);
+                                    // One reconciled readiness state feeds both
+                                    // the status word and the primary action
+                                    // below, so the card can never say
+                                    // "Ready to play" while the action is
+                                    // blocked.
+                                    let readiness =
+                                        gamer_readiness(record.mount_state, play_action);
                                     featured_meta_line(
                                         ui,
-                                        gamer_primary_action_short_label(&gamer_primary_action(
-                                            record.mount_state,
-                                        ))
-                                        .to_string(),
+                                        gamer_readiness_short_label(&readiness).to_string(),
                                         true,
                                     );
                                     if let Some(row) = row
@@ -1393,8 +1477,8 @@ pub(crate) fn show_gamer_view(
                                     // visually prominent button for what this game
                                     // needs right now, and the first control a
                                     // keyboard reaches in this panel.
-                                    match gamer_primary_action(record.mount_state) {
-                                        GamerPrimaryAction::Mount => {
+                                    match &readiness {
+                                        GamerReadiness::Mount => {
                                             if featured_primary_button(ui, "Mount", !busy).clicked()
                                             {
                                                 action = Some(GamerViewAction::Operation(
@@ -1406,7 +1490,7 @@ pub(crate) fn show_gamer_view(
                                                 ));
                                             }
                                         }
-                                        GamerPrimaryAction::Unmount => {
+                                        GamerReadiness::Unmount => {
                                             if featured_primary_button(ui, "Unmount", !busy)
                                                 .clicked()
                                             {
@@ -1420,35 +1504,52 @@ pub(crate) fn show_gamer_view(
                                             }
                                             ui.weak("Currently mounted.");
                                         }
-                                        GamerPrimaryAction::NoMountingNeeded => {
-                                            match play_action {
-                                                launch_readiness_page::GamerPlayAction::Ready(
-                                                    request,
-                                                ) => {
-                                                    if featured_primary_button(
-                                                        ui,
-                                                        "Play — Launch RetroArch",
-                                                        !busy,
-                                                    )
-                                                    .clicked()
-                                                    {
-                                                        action = Some(GamerViewAction::Play(
-                                                            request.clone(),
-                                                        ));
-                                                    }
-                                                }
-                                                launch_readiness_page::GamerPlayAction::Blocked(
-                                                    reason,
-                                                ) => {
-                                                    ui.colored_label(
-                                                        ui.visuals().warn_fg_color,
-                                                        reason,
-                                                    );
-                                                }
+                                        GamerReadiness::Ready { request } => {
+                                            if featured_primary_button(
+                                                ui,
+                                                "Play — Launch RetroArch",
+                                                !busy,
+                                            )
+                                            .clicked()
+                                            {
+                                                action = Some(GamerViewAction::Play(
+                                                    (*request).clone(),
+                                                ));
                                             }
                                         }
-                                        GamerPrimaryAction::Blocked(reason) => {
-                                            ui.colored_label(ui.visuals().warn_fg_color, reason);
+                                        GamerReadiness::NeedsSetup { reason } => {
+                                            // Plain lead first, then the
+                                            // planner's specific reason, then a
+                                            // real next step. No Play button.
+                                            ui.colored_label(
+                                                ui.visuals().warn_fg_color,
+                                                "EmuWiz found the game, but it cannot safely \
+                                                 launch it yet.",
+                                            );
+                                            ui.label(humanize_play_blocker(reason));
+                                            if widgets::action_button(
+                                                ui,
+                                                "Open Emulator Setup",
+                                                widgets::ActionStyle::Secondary,
+                                                !busy,
+                                            )
+                                            .on_hover_text(
+                                                "Check emulator readiness and rescan RetroArch \
+                                                 after installing or configuring a core for \
+                                                 this system.",
+                                            )
+                                            .clicked()
+                                            {
+                                                action = Some(GamerViewAction::OpenEmulatorSetup(
+                                                    archive_path.clone(),
+                                                ));
+                                            }
+                                        }
+                                        GamerReadiness::NeedsAttention { reason } => {
+                                            ui.colored_label(
+                                                ui.visuals().warn_fg_color,
+                                                reason.as_str(),
+                                            );
                                         }
                                     }
                                     if let Some(reason) = block_reason {

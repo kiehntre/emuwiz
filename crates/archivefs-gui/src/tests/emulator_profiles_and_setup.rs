@@ -142,6 +142,190 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
 }
 
+/// Renders the real Gamer View selected-game card for one game with the
+/// given mount state and shared launch-plan projection - the exact path
+/// Journey D (Gamer View readiness label vs Play button) exercises.
+fn render_gamer_card(
+    mount_state: MountState,
+    platform: &str,
+    play_action: &launch_readiness_page::GamerPlayAction,
+) -> egui::FullOutput {
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/roms/journey-d-game.gb");
+    let mut game = record(path.to_str().unwrap(), mount_state);
+    game.metadata.title = Some("Journey D Game".to_string());
+    game.metadata.platform = Some(platform.to_string());
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![game])));
+    app.archive_context.select_only(path.clone());
+
+    let ctx = egui::Context::default();
+    let mut cover_requests = Vec::new();
+    ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let LoadState::Ready(data) = &app.state else {
+                unreachable!()
+            };
+            let _ = show_gamer_view(
+                ui,
+                Some(data),
+                GamerViewViewState {
+                    filter: "",
+                    library_filters: &mut app.library_filters,
+                    archive_context: &mut app.archive_context,
+                    screen: &mut app.gamer_view_screen,
+                    busy: false,
+                    block_reason: None,
+                    cleanup_after_unmount: false,
+                    cheat_workflow: app.cheat_workflow.as_ref(),
+                    feedback: None,
+                    artwork_directory: None,
+                    artwork_cache: &mut app.platform_artwork_cache,
+                    covers: &mut app.gamer_covers,
+                    cover_requests: &mut cover_requests,
+                    game_metadata: None,
+                    play_action,
+                },
+            );
+        });
+    })
+}
+
+#[test]
+fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
+    let play_action = launch_readiness_page::GamerPlayAction::Ready(
+        archivefs_core::launch::RetroArchLaunchRequest {
+            selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
+            expected_platform_id: "Game Boy".to_string(),
+            expected_game_key: "k".to_string(),
+            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            },
+            core_stem: "gambatte".to_string(),
+        },
+    );
+    let output = render_gamer_card(MountState::NotMountable, "Game Boy", &play_action);
+    assert!(rendered_text_contains(&output, "Ready to play"));
+    assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
+    assert!(!rendered_text_contains(&output, "Needs setup"));
+    assert!(!rendered_text_contains(&output, "Can’t play yet"));
+}
+
+#[test]
+fn gamer_card_blocked_launch_shows_needs_setup_never_ready_to_play() {
+    // The exact projection the live Game Boy QA item produces: media is
+    // usable (NotMountable loose ROM), but no safe RetroArch core.
+    let play_action = launch_readiness_page::GamerPlayAction::Blocked(
+        "Can’t play yet: no safe RetroArch launch option is available.".to_string(),
+    );
+    let output = render_gamer_card(MountState::NotMountable, "Game Boy", &play_action);
+
+    assert!(rendered_text_contains(&output, "Needs setup"));
+    assert!(rendered_text_contains(
+        &output,
+        "EmuWiz found the game, but it cannot safely launch it yet."
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "no safe RetroArch launch option is available."
+    ));
+    assert!(rendered_text_contains(&output, "Open Emulator Setup"));
+
+    // The contradiction Journey D is about must be impossible.
+    assert!(!rendered_text_contains(&output, "Ready to play"));
+    assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
+    assert!(
+        !(rendered_text_contains(&output, "Ready to play")
+            && rendered_text_contains(&output, "Can’t play yet"))
+    );
+}
+
+#[test]
+fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
+    // A Ready launch plan must not override a media/mount blocker.
+    let play_action = launch_readiness_page::GamerPlayAction::Ready(
+        archivefs_core::launch::RetroArchLaunchRequest {
+            selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
+            expected_platform_id: "Game Boy".to_string(),
+            expected_game_key: "k".to_string(),
+            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            },
+            core_stem: "gambatte".to_string(),
+        },
+    );
+    let output = render_gamer_card(MountState::MountPathExists, "Game Boy", &play_action);
+    assert!(rendered_text_contains(&output, "Needs attention"));
+    assert!(rendered_text_contains(
+        &output,
+        "A file already exists at this game's mount destination."
+    ));
+    assert!(!rendered_text_contains(&output, "Ready to play"));
+    assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
+}
+
+#[test]
+fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
+    use launch_readiness_page::GamerPlayAction;
+
+    let blocked = GamerPlayAction::Blocked("Can’t play yet: nope.".to_string());
+    assert!(matches!(
+        gamer_readiness(MountState::NotMountable, &blocked),
+        GamerReadiness::NeedsSetup { .. }
+    ));
+    assert_eq!(
+        gamer_readiness_short_label(&gamer_readiness(MountState::NotMountable, &blocked)),
+        "Needs setup"
+    );
+
+    let ready = GamerPlayAction::Ready(archivefs_core::launch::RetroArchLaunchRequest {
+        selected_content_path: PathBuf::from("/x"),
+        expected_platform_id: "Game Boy".to_string(),
+        expected_game_key: "k".to_string(),
+        profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+            profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+            scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+        },
+        core_stem: "gambatte".to_string(),
+    });
+    assert!(matches!(
+        gamer_readiness(MountState::NotMountable, &ready),
+        GamerReadiness::Ready { .. }
+    ));
+
+    // Mount / mounted / media-blocked never consult the play action.
+    assert!(matches!(
+        gamer_readiness(MountState::Pending, &blocked),
+        GamerReadiness::Mount
+    ));
+    assert!(matches!(
+        gamer_readiness(MountState::Mounted, &blocked),
+        GamerReadiness::Unmount
+    ));
+    assert!(matches!(
+        gamer_readiness(MountState::MountPathExists, &ready),
+        GamerReadiness::NeedsAttention { .. }
+    ));
+}
+
+#[test]
+fn humanize_play_blocker_drops_the_internal_lead_in() {
+    assert_eq!(
+        humanize_play_blocker("Can’t play yet: no safe RetroArch launch option is available."),
+        "no safe RetroArch launch option is available."
+    );
+    assert_eq!(
+        humanize_play_blocker("Can't play yet: game identity could not be verified."),
+        "game identity could not be verified."
+    );
+    // A reason without the lead-in is passed through untouched.
+    assert_eq!(
+        humanize_play_blocker("RetroArch has not been checked yet."),
+        "RetroArch has not been checked yet."
+    );
+}
+
 #[test]
 fn library_selected_archive_panel_renders_the_selected_evidence_report() {
     let path = PathBuf::from("/roms/aladdin.gb");

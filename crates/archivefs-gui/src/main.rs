@@ -11869,6 +11869,17 @@ impl ArchiveFsApp {
         self.navigate_to_library_tab(LibraryTab::Archives);
     }
 
+    /// "Open Emulator Setup" from a Gamer View `NeedsSetup` card: keep the
+    /// same game selected and switch to Advanced View's Emulator Setup
+    /// page. Same select-then-navigate shape as `review_identity`; no new
+    /// plumbing and nothing about the game changes.
+    fn open_emulator_setup_for(&mut self, archive_path: PathBuf) {
+        self.archive_context.select_only(archive_path);
+        self.ui_mode = GuiMode::AdvancedView;
+        save_gui_mode(self.ui_mode);
+        self.navigate_to_main_view(MainView::EmulatorSetup);
+    }
+
     /// Render the focused archive's complete Game Details surface.  Library
     /// owns the selection now; this method is shared with the retained
     /// internal Selected compatibility route so there is still only one
@@ -17394,6 +17405,9 @@ impl ArchiveFsApp {
                         }
                         Some(GamerViewAction::ReviewIdentity(archive_path)) => {
                             self.review_identity(archive_path);
+                        }
+                        Some(GamerViewAction::OpenEmulatorSetup(archive_path)) => {
+                            self.open_emulator_setup_for(archive_path);
                         }
                         // A match guard here (clippy's suggestion) would make
                         // this otherwise-exhaustive `GamerViewAction` match

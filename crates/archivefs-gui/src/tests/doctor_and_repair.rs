@@ -3392,7 +3392,9 @@ fn unknown_platform_rows_are_needs_attention_in_the_list_too() {
     );
     assert_eq!(
         gamer_view_row_state_label(false, MountState::NotMountable),
-        "Ready to play"
+        // The list never claims launch-readiness; that is the selected-game
+        // card's job. A mount-free game reads only "Ready" here.
+        "Ready"
     );
 }
 
