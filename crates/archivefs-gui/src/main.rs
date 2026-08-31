@@ -1921,13 +1921,23 @@ impl DoctorScanState {
 ///    enabled, platform-relevant source qualifies, the report's
 ///    `no_intro` field is patched to `NoIntroLookupResult::Ambiguous`
 ///    instead, naming every competing source.
+#[allow(dead_code)]
 fn gather_selected_evidence_with_registry(
     path: &Path,
     no_intro_source_cache: &Mutex<selected_evidence_no_intro::NoIntroSourceCache>,
 ) -> Result<selected_evidence_page::SelectedEvidenceReport, String> {
+    gather_selected_evidence_with_registry_and_platform(path, None, no_intro_source_cache)
+}
+
+fn gather_selected_evidence_with_registry_and_platform(
+    path: &Path,
+    platform_hint: Option<&str>,
+    no_intro_source_cache: &Mutex<selected_evidence_no_intro::NoIntroSourceCache>,
+) -> Result<selected_evidence_page::SelectedEvidenceReport, String> {
     let dat_sources_config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
-    gather_selected_evidence_with_registry_at(
+    gather_selected_evidence_with_registry_at_and_platform(
         path,
+        platform_hint,
         no_intro_source_cache,
         dat_sources_config_path.as_deref().ok(),
     )
@@ -1939,8 +1949,23 @@ fn gather_selected_evidence_with_registry(
 /// unset) behaves exactly like an empty registry - `NotImported` - the same
 /// honest fallback `DatSourcesPageState` itself uses when the path cannot be
 /// resolved.
+#[allow(dead_code)]
 fn gather_selected_evidence_with_registry_at(
     path: &Path,
+    no_intro_source_cache: &Mutex<selected_evidence_no_intro::NoIntroSourceCache>,
+    dat_sources_config_path: Option<&std::path::Path>,
+) -> Result<selected_evidence_page::SelectedEvidenceReport, String> {
+    gather_selected_evidence_with_registry_at_and_platform(
+        path,
+        None,
+        no_intro_source_cache,
+        dat_sources_config_path,
+    )
+}
+
+fn gather_selected_evidence_with_registry_at_and_platform(
+    path: &Path,
+    platform_hint: Option<&str>,
     no_intro_source_cache: &Mutex<selected_evidence_no_intro::NoIntroSourceCache>,
     dat_sources_config_path: Option<&std::path::Path>,
 ) -> Result<selected_evidence_page::SelectedEvidenceReport, String> {
@@ -1950,7 +1975,8 @@ fn gather_selected_evidence_with_registry_at(
         .and_then(|structural_facts| {
             archivefs_core::platform_evidence_fusion::fuse_platform_evidence(structural_facts)
                 .resolved_platform
-        });
+        })
+        .or(platform_hint);
 
     let registry = dat_sources_config_path
         .and_then(|config_path| {
@@ -1979,7 +2005,11 @@ fn gather_selected_evidence_with_registry_at(
         _ => None,
     };
 
-    let mut result = selected_evidence_page::gather_selected_evidence(path, resolved_source);
+    let mut result = selected_evidence_page::gather_selected_evidence_with_platform(
+        path,
+        platform_hint,
+        resolved_source,
+    );
     if let (Ok(report), Some(note)) = (&mut result, ambiguity_note) {
         report.no_intro = selected_evidence_page::NoIntroLookupResult::Ambiguous { note };
     }
@@ -6344,15 +6374,10 @@ impl ArchiveFsApp {
     /// app-level state, and never calls the planner unless both real
     /// prerequisites (evidence loaded, RetroArch scanned) already hold.
     ///
-    /// The `GameIdentityReport` this reads is the one already loaded for
-    /// the Cheats & Mods workflow (`self.cheat_workflow`) - the only place
-    /// this app currently holds one. It is only ever trusted when that
-    /// workflow's own `archive_path` matches the focused Selected archive;
-    /// a `GameIdentityReport` left over from a previously opened, different
-    /// archive is never reused here. When none is available for the
-    /// focused archive, this reads as `CanonicalIdentityStatus::Unknown` -
-    /// the same honest state as identity that was never resolved at all,
-    /// never a fabricated third state.
+    /// The `GameIdentityReport` comes from the selected evidence worker and
+    /// is only trusted when its exact path matches the focused archive. This
+    /// keeps launch planning on the core identity bridge while making it
+    /// available without opening Cheats & Mods first.
     fn build_launch_readiness_input(
         &self,
         live: Option<&LoadedData>,
@@ -6370,13 +6395,35 @@ impl ArchiveFsApp {
         };
 
         let focused = self.archive_context.focused.as_deref();
-        let game_identity_report = focused
-            .and_then(|focused| {
-                self.cheat_workflow
-                    .as_ref()
-                    .filter(|workflow| workflow.archive_path == focused)
+        let selected_game_identity_report =
+            focused.and_then(|focused| match &self.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                    if report.path == focused =>
+                {
+                    Some(&report.game_identity_report)
+                }
+                _ => None,
+            });
+        // Keep older in-process test/compatibility fixtures usable when they
+        // have not yet been given the new selected-evidence report. A real
+        // selected game always takes the evidence-worker report above, so
+        // opening Cheats & Mods is no longer required for launch planning.
+        let game_identity_report = selected_game_identity_report
+            .filter(|report| {
+                !matches!(
+                    archivefs_core::launch::canonical_identity_from_game_report(report).0,
+                    archivefs_core::launch::CanonicalIdentityStatus::Unknown
+                )
             })
-            .and_then(ready_game_identity);
+            .or_else(|| {
+                focused
+                    .and_then(|focused| {
+                        self.cheat_workflow
+                            .as_ref()
+                            .filter(|workflow| workflow.archive_path == focused)
+                    })
+                    .and_then(ready_game_identity)
+            });
 
         let (identity_status, verified_facts) = match game_identity_report {
             Some(report) => archivefs_core::launch::canonical_identity_from_game_report(report),
@@ -10255,8 +10302,10 @@ impl ArchiveFsApp {
     /// GUI Batch A: starts (or restarts, on a new selection) the real,
     /// off-UI-thread evidence gather for the Selected page's identity
     /// panel - see `selected_evidence_page::gather_selected_evidence`.
-    /// Explicit only (a button press); never called automatically on
-    /// selection.
+    /// Started automatically when the selected game changes so identity
+    /// evidence is available in the selected-game details surface and to
+    /// the launch planner. The worker remains generation-guarded and
+    /// read-only.
     fn start_selected_evidence_load(&mut self, context: egui::Context, path: PathBuf) {
         self.selected_evidence_generation += 1;
         let generation = self.selected_evidence_generation;
@@ -10267,8 +10316,27 @@ impl ArchiveFsApp {
             receiver,
         };
         let no_intro_source_cache = Arc::clone(&self.no_intro_source_cache);
+        let platform_hint = match &self.state {
+            LoadState::Ready(data) => data
+                .records
+                .iter()
+                .find(|record| record.mount_plan.archive.path == path)
+                .and_then(|record| {
+                    record
+                        .metadata
+                        .platform
+                        .as_deref()
+                        .or(record.identity.platform.as_deref())
+                })
+                .map(str::to_owned),
+            LoadState::Loading { .. } | LoadState::Error(_) => None,
+        };
         thread::spawn(move || {
-            let result = gather_selected_evidence_with_registry(&path, &no_intro_source_cache);
+            let result = gather_selected_evidence_with_registry_and_platform(
+                &path,
+                platform_hint.as_deref(),
+                &no_intro_source_cache,
+            );
             let _ = sender.send((generation, result));
             context.request_repaint();
         });
@@ -11649,6 +11717,24 @@ impl ArchiveFsApp {
         archive_actions_blocked: bool,
         archive_action_block_reason: Option<&'static str>,
     ) -> Option<MountPageAction> {
+        if let Some(path) = self.archive_context.focused.clone() {
+            let should_load_evidence = match &self.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Loading {
+                    path: loading_path,
+                    ..
+                } => loading_path != &path,
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                    report.path != path
+                }
+                selected_evidence_page::SelectedEvidenceState::Idle => true,
+                selected_evidence_page::SelectedEvidenceState::Error {
+                    path: error_path, ..
+                } => error_path != &path,
+            };
+            if should_load_evidence {
+                self.start_selected_evidence_load(context.clone(), path);
+            }
+        }
         if matches!(
             self.dolphin_local_profiles,
             DolphinLocalProfilesState::NotScanned

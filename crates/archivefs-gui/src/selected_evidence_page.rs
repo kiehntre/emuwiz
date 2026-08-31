@@ -44,6 +44,7 @@ use eframe::egui;
 
 use archivefs_core::content_evidence::ContentEvidence;
 use archivefs_core::dat::model::ChecksumAlgorithm;
+use archivefs_core::game_identity::inspect_catalogued_game_identity;
 use archivefs_core::gb_header_evidence::{observe_gb_evidence, parse_gb_header};
 use archivefs_core::gba_header_evidence::{observe_gba_evidence, parse_gba_header};
 use archivefs_core::identity_source::hasheous::client::{
@@ -187,6 +188,11 @@ pub(crate) struct SelectedEvidenceReport {
     /// existing library planner without recomputing it and risking drift
     /// between what the evidence panel shows and what gets planned.
     pub identity_result: IdentityResult,
+    /// The existing authoritative per-file identity report used by launch
+    /// planning. Kept alongside the presentation so the GUI can show the
+    /// same evidence while the core launch bridge consumes the original
+    /// report, rather than reconstructing identity in the GUI.
+    pub game_identity_report: archivefs_core::game_identity::GameIdentityReport,
     pub hashes: Option<LocalHashes>,
     pub no_intro: NoIntroLookupResult,
     /// Structural + (if matched) direct No-Intro observations, ready to be
@@ -199,8 +205,21 @@ pub(crate) struct SelectedEvidenceReport {
 /// [`hash_file`], looks it up against `no_intro_source` if one is
 /// registered, and composes the real [`inspect_identity`]/[`present_identity`]
 /// result. Intended to run off the UI thread (large files, real hashing).
+#[allow(dead_code)]
 pub(crate) fn gather_selected_evidence(
     path: &Path,
+    no_intro_source: Option<&ImportedNoIntroSource>,
+) -> Result<SelectedEvidenceReport, String> {
+    gather_selected_evidence_with_platform(path, None, no_intro_source)
+}
+
+/// Like [`gather_selected_evidence`], with an exact platform hint from the
+/// library row when structural evidence alone cannot identify the platform
+/// (for example a PS2 ISO). The hint is only passed to the existing core
+/// identity inspector; no platform or identity parsing is duplicated here.
+pub(crate) fn gather_selected_evidence_with_platform(
+    path: &Path,
+    platform_hint: Option<&str>,
     no_intro_source: Option<&ImportedNoIntroSource>,
 ) -> Result<SelectedEvidenceReport, String> {
     let bytes = std::fs::read(path)
@@ -222,6 +241,8 @@ pub(crate) fn gather_selected_evidence(
         ..Default::default()
     });
     let identity = present_identity(&identity_result);
+    let game_identity_report =
+        inspect_catalogued_game_identity(path, platform_hint.or(identity.platform));
 
     let mut base_observations: Vec<EvidenceObservation> = structural_facts
         .iter()
@@ -236,6 +257,7 @@ pub(crate) fn gather_selected_evidence(
         structural_facts,
         identity,
         identity_result,
+        game_identity_report,
         hashes,
         no_intro,
         base_observations,
@@ -560,8 +582,12 @@ fn show_ready_report(
             report.identity.status.label(),
             status_tone_for(report.identity.status),
         );
+        let platform = report
+            .identity
+            .platform
+            .unwrap_or_else(|| report.game_identity_report.platform.label());
         ui.horizontal(|ui| {
-            ui.strong(report.identity.platform.unwrap_or("Unknown platform"));
+            ui.strong(platform);
             widgets::status_badge(ui, label, tone);
         });
         if !report.identity.content_summary.is_empty() {
@@ -603,6 +629,35 @@ fn show_ready_report(
             })
             .collect();
         widgets::status_rows(ui, &rows);
+    }
+
+    // The core identity inspector is authoritative structural evidence for
+    // direct media. Keep it separate from DAT evidence: a file can have
+    // verified on-disc identity facts even when no trusted DAT is loaded.
+    let verified_identity_facts = report
+        .game_identity_report
+        .evidence
+        .iter()
+        .filter(|evidence| {
+            evidence.status == archivefs_core::game_identity::IdentityStatus::Verified
+                && !matches!(
+                    evidence.kind,
+                    archivefs_core::game_identity::IdentityKind::Platform
+                        | archivefs_core::game_identity::IdentityKind::LooseRomFormat
+                        | archivefs_core::game_identity::IdentityKind::LooseRomTitle
+                )
+                && evidence.value.is_some()
+        })
+        .collect::<Vec<_>>();
+    if !verified_identity_facts.is_empty() {
+        widgets::section_header(ui, "Verified identity evidence", None);
+        for evidence in verified_identity_facts {
+            ui.horizontal(|ui| {
+                ui.label(evidence.kind.to_string());
+                widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
+                ui.label(evidence.value.as_deref().unwrap_or_default());
+            });
+        }
     }
 
     // DAT evidence (direct No-Intro).
@@ -926,6 +981,17 @@ mod tests {
         assert_eq!(report.path, path);
         assert!(!report.structural_facts.is_empty());
         assert!(report.hashes.is_some(), "hashing must run for a real file");
+        assert_eq!(
+            report.game_identity_report.platform,
+            archivefs_core::game_identity::IdentityPlatform::GameBoy
+        );
+        assert!(
+            report
+                .game_identity_report
+                .verified_loose_rom_sha256()
+                .is_some(),
+            "core identity evidence must remain available without DAT evidence"
+        );
         assert!(matches!(report.no_intro, NoIntroLookupResult::NotImported));
     }
 
@@ -1061,6 +1127,18 @@ mod tests {
                     &identity_result,
                 ),
             identity_result,
+            game_identity_report: archivefs_core::game_identity::GameIdentityReport {
+                archive_path: PathBuf::from("test.gb"),
+                platform: archivefs_core::game_identity::IdentityPlatform::Other,
+                format: archivefs_core::game_identity::IdentityImageFormat::Unsupported,
+                evidence: Vec::new(),
+                warnings: Vec::new(),
+                bytes_read: 0,
+                archive_members_inspected: 0,
+                metadata_paths_inspected: 0,
+                nested_container_depth: 0,
+                complete: false,
+            },
             hashes: None,
             no_intro: NoIntroLookupResult::NotImported,
             base_observations,
