@@ -265,6 +265,115 @@ fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
     assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
 }
 
+/// The absolute rect of the first painted text galley containing `needle`.
+fn first_text_shape_rect(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+    fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, needle)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| walk(&clipped.shape, needle))
+}
+
+#[test]
+fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
+    // Increment 4: the blocked-launch card's "Open Emulator Setup" button
+    // must produce a structured RetroArch focus target, never a
+    // text-parsed one.
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/roms/journey-4-game.gb");
+    let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
+    game.metadata.title = Some("Journey Four".to_string());
+    game.metadata.platform = Some("Game Boy".to_string());
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![game])));
+    app.archive_context.select_only(path.clone());
+
+    let play_action = launch_readiness_page::GamerPlayAction::Blocked(
+        "Can’t play yet: no safe RetroArch launch option is available.".to_string(),
+    );
+
+    let ctx = egui::Context::default();
+    let screen = egui::vec2(1400.0, 900.0);
+    let base = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+        ..Default::default()
+    };
+    let mut cover_requests = Vec::new();
+
+    let mut frame = |input: egui::RawInput| -> (egui::FullOutput, Option<GamerViewAction>) {
+        let mut captured = None;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let LoadState::Ready(data) = &app.state else {
+                    unreachable!()
+                };
+                captured = show_gamer_view(
+                    ui,
+                    Some(data),
+                    GamerViewViewState {
+                        filter: "",
+                        library_filters: &mut app.library_filters,
+                        archive_context: &mut app.archive_context,
+                        screen: &mut app.gamer_view_screen,
+                        busy: false,
+                        block_reason: None,
+                        cleanup_after_unmount: false,
+                        cheat_workflow: app.cheat_workflow.as_ref(),
+                        feedback: None,
+                        artwork_directory: None,
+                        artwork_cache: &mut app.platform_artwork_cache,
+                        covers: &mut app.gamer_covers,
+                        cover_requests: &mut cover_requests,
+                        game_metadata: None,
+                        play_action: &play_action,
+                    },
+                );
+            });
+        });
+        (out, captured)
+    };
+
+    let (first, _) = frame(base.clone());
+    let button_rect = first_text_shape_rect(&first, "Open Emulator Setup")
+        .expect("the NeedsSetup card must render an Open Emulator Setup button");
+    let pos = button_rect.center();
+
+    let _ = frame(egui::RawInput {
+        events: vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }],
+        ..base.clone()
+    });
+    let (_, action) = frame(egui::RawInput {
+        events: vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+        ..base
+    });
+
+    assert!(
+        matches!(
+            &action,
+            Some(GamerViewAction::OpenEmulatorSetup(picked, EmulatorSetupFocus::RetroArch))
+                if picked == &path
+        ),
+        "expected OpenEmulatorSetup(path, RetroArch) from the NeedsSetup button"
+    );
+}
+
 #[test]
 fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
     use launch_readiness_page::GamerPlayAction;

@@ -1087,6 +1087,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         retroarch_profiles: RetroArchProfilesState::NotScanned,
         retroarch_core_directory_override: None,
         retroarch_core_folder_rejected_pick: None,
+        emulator_setup_focus: None,
         pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
         dolphin_profiles: DolphinProfilesState::NotScanned,
         dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,

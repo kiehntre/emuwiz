@@ -229,10 +229,15 @@ pub(crate) enum GamerViewAction {
     /// handler) rather than inventing new plumbing.
     ReviewIdentity(PathBuf),
     /// "Open Emulator Setup" from a `NeedsSetup` card: the game whose
-    /// launch is blocked (usually "no safe core for this platform"). The
-    /// caller keeps it selected and switches to Advanced View's Emulator
-    /// Setup page, the same select-then-navigate shape as `ReviewIdentity`.
-    OpenEmulatorSetup(PathBuf),
+    /// launch is blocked, plus which repair card to bring into view. The
+    /// caller keeps the game selected and switches to Advanced View's
+    /// Emulator Setup page, the same select-then-navigate shape as
+    /// `ReviewIdentity`. The focus target is always
+    /// [`EmulatorSetupFocus::RetroArch`]: `NeedsSetup` is produced only by
+    /// `gamer_readiness` when the shared launch plan has no safe RetroArch
+    /// core for this platform, so this action is structurally
+    /// RetroArch-specific - it is never derived by parsing blocker text.
+    OpenEmulatorSetup(PathBuf, EmulatorSetupFocus),
     /// "Update game information": re-reads the already-cached enrichment
     /// data from disk for the currently focused game. Never itself
     /// contacts a metadata provider's server - see
@@ -1542,6 +1547,7 @@ pub(crate) fn show_gamer_view(
                                             {
                                                 action = Some(GamerViewAction::OpenEmulatorSetup(
                                                     archive_path.clone(),
+                                                    EmulatorSetupFocus::RetroArch,
                                                 ));
                                             }
                                         }

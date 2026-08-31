@@ -2533,6 +2533,121 @@ fn retroarch_core_folder_technical_details_carry_raw_diagnostics_kept_out_of_the
     ));
 }
 
+// --- Increment 4: focus Emulator Setup on the relevant repair -----------
+
+#[test]
+fn open_emulator_setup_for_navigates_selects_and_records_retroarch_focus() {
+    // `open_emulator_setup_for` persists the GUI mode as a side effect
+    // (unchanged behaviour). Snapshot and restore the real file so the
+    // suite never leaves the user's install in Advanced View.
+    let saved_mode = load_gui_mode();
+
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/roms/journey-4-game.gb");
+    assert!(app.emulator_setup_focus.is_none());
+
+    app.open_emulator_setup_for(path.clone(), EmulatorSetupFocus::RetroArch);
+
+    assert_eq!(app.view, MainView::EmulatorSetup);
+    assert_eq!(app.archive_context.focused.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        app.emulator_setup_focus,
+        Some(EmulatorSetupFocus::RetroArch)
+    );
+    assert_eq!(app.ui_mode, GuiMode::AdvancedView);
+
+    save_gui_mode(saved_mode);
+}
+
+#[test]
+fn emulator_setup_first_render_consumes_the_retroarch_focus() {
+    let mut app = emulator_setup_app_ready();
+    app.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+
+    let output = render_problems_repair_app(&mut app);
+
+    // Exactly one frame acts on the hint.
+    assert!(app.emulator_setup_focus.is_none());
+    // The RetroArch repair card is present on the page the hint targeted.
+    assert!(rendered_text_contains(&output, "RetroArch"));
+    assert!(rendered_text_contains(&output, "Rescan cores"));
+    assert!(rendered_text_contains(&output, "Choose core folder"));
+}
+
+#[test]
+fn emulator_setup_focus_is_one_shot_and_later_frames_do_not_re_target() {
+    let mut app = emulator_setup_app_ready();
+    app.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+
+    let _ = render_problems_repair_app(&mut app);
+    assert!(app.emulator_setup_focus.is_none());
+
+    // Subsequent frames: the hint stays consumed, nothing re-arms it, and
+    // the page keeps rendering normally (no snap-back / no panic).
+    for _ in 0..3 {
+        let output = render_problems_repair_app(&mut app);
+        assert!(app.emulator_setup_focus.is_none());
+        assert!(rendered_text_contains(&output, "RetroArch"));
+        assert!(rendered_text_contains(&output, "Automatic core folder"));
+    }
+}
+
+#[test]
+fn normal_emulator_setup_navigation_leaves_focus_none() {
+    let mut app = emulator_setup_app_ready();
+    // Arrived via sidebar/Home: no repair-action hint was set.
+    assert!(app.emulator_setup_focus.is_none());
+
+    let output = render_problems_repair_app(&mut app);
+
+    assert!(app.emulator_setup_focus.is_none());
+    assert!(rendered_text_contains(&output, "Automatic core folder"));
+    assert!(rendered_text_contains(&output, "Rescan cores"));
+}
+
+#[test]
+fn focused_navigation_keeps_retroarch_technical_details_collapsed() {
+    let mut app = emulator_setup_app_ready();
+    app.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+
+    let output = render_problems_repair_app(&mut app);
+
+    // The expander header is there...
+    assert!(rendered_text_contains(&output, "Technical details"));
+    // ...but its body (technical-details-only lines) is not rendered, so
+    // `default_open(false)` still holds under focused navigation.
+    assert!(!rendered_text_contains(&output, "Usable libretro cores:"));
+    assert!(!rendered_text_contains(&output, "Resolved core directory"));
+}
+
+#[test]
+fn retroarch_readiness_is_identical_with_and_without_focus() {
+    let readiness_sentence = "RetroArch is installed, but EmuWiz cannot find a usable libretro core in the folder it \
+         is currently using.";
+
+    let mut without_focus = emulator_setup_app_ready();
+    let out_without = render_problems_repair_app(&mut without_focus);
+
+    let mut with_focus = emulator_setup_app_ready();
+    with_focus.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+    let out_with = render_problems_repair_app(&mut with_focus);
+
+    // Same readiness wording either way.
+    assert!(rendered_text_contains(&out_without, readiness_sentence));
+    assert!(rendered_text_contains(&out_with, readiness_sentence));
+    // Focus never kicks a rescan or otherwise alters discovery state, and
+    // it never drives launch planning from this page.
+    assert!(!rendered_text_contains(
+        &out_with,
+        "Scanning RetroArch cores"
+    ));
+    assert!(matches!(
+        with_focus.retroarch_profiles,
+        RetroArchProfilesState::Ready(_)
+    ));
+    assert!(with_focus.emulator_setup_focus.is_none());
+}
+
 #[test]
 fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
     let profile_report = ProfileAssessmentReport {

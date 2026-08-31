@@ -141,6 +141,8 @@ mod gamer_platform_shelf;
 use gamer_platform_shelf::*;
 mod gamer_view;
 use gamer_view::*;
+mod emulator_setup_focus;
+use emulator_setup_focus::*;
 mod library_view;
 use library_view::*;
 mod navigation;
@@ -4250,6 +4252,12 @@ struct ArchiveFsApp {
     /// card shows a plain "folder not usable" message until the next pick,
     /// rescan, or reset clears it. `None` the rest of the time.
     retroarch_core_folder_rejected_pick: Option<PathBuf>,
+    /// One-shot: which Emulator Setup repair card to scroll into view on the
+    /// next render of that page. Set by `open_emulator_setup_for` when the
+    /// user arrived via a repair action (Gamer View `NeedsSetup`), consumed
+    /// with `take()` on the first frame so later frames and manual
+    /// scrolling are untouched. `None` for sidebar/Home navigation.
+    emulator_setup_focus: Option<EmulatorSetupFocus>,
     /// Read-only PCSX2 profile discovery shared by every PS2 archive
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
@@ -4889,6 +4897,7 @@ impl ArchiveFsApp {
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             retroarch_core_directory_override: load_retroarch_core_directory_override(),
             retroarch_core_folder_rejected_pick: None,
+            emulator_setup_focus: None,
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
@@ -6189,6 +6198,14 @@ impl ArchiveFsApp {
     /// "Problems & Repair". Per-emulator rows appear in the scan's
     /// "Emulators" / "Emulator profiles" categories once the check has run.
     fn show_emulator_setup_page(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        // One-shot navigation hint: `take()` here means the first frame
+        // after a repair-action navigation may scroll the relevant card
+        // into view, and every later frame (and any manual scroll) is left
+        // alone. Sidebar/Home navigation never sets this, so it is `None`.
+        let focus_retroarch = matches!(
+            self.emulator_setup_focus.take(),
+            Some(EmulatorSetupFocus::RetroArch)
+        );
         // RetroArch has a dedicated, cached discovery lane because its
         // profile/environment scan is also used by Cheats & Mods. Starting
         // it here makes Emulator Setup truthful on first use without moving
@@ -6206,7 +6223,7 @@ impl ArchiveFsApp {
         ui.add_space(theme::SECTION_GAP);
         show_emulator_setup_summary(ui, self.doctor_scan.displayed(), &self.retroarch_profiles);
         ui.add_space(theme::SECTION_GAP);
-        self.show_retroarch_core_folder_card(ui, context);
+        self.show_retroarch_core_folder_card(ui, context, focus_retroarch);
         ui.add_space(theme::SECTION_GAP);
         fn show_emulator_setup_summary(
             ui: &mut egui::Ui,
@@ -6312,7 +6329,17 @@ impl ArchiveFsApp {
     /// availability or launch readiness. "Rescan cores" and the post-pick
     /// / post-reset refresh all go through the one existing
     /// [`Self::start_retroarch_profile_scan`] lane.
-    fn show_retroarch_core_folder_card(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+    ///
+    /// `focus_retroarch` is the one-shot navigation hint from
+    /// `show_emulator_setup_page`: when `true` (a repair-action arrival)
+    /// this card is scrolled into view once, aligned to the top. It never
+    /// expands Technical details and never re-scrolls on later frames.
+    fn show_retroarch_core_folder_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        focus_retroarch: bool,
+    ) {
         use retroarch_core_setup::{CoreFolderMode, CoreFolderScan, core_folder_readiness};
 
         let mode = CoreFolderMode::from_override(self.retroarch_core_directory_override.as_deref());
@@ -6338,6 +6365,10 @@ impl ArchiveFsApp {
         }
         let mut pending: Option<CoreFolderAction> = None;
 
+        // Record the card's vertical span so a one-shot focus arrival can
+        // scroll exactly this card into view without wrapping (and
+        // re-indenting) the card body.
+        let card_top = ui.cursor().top();
         widgets::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("RetroArch");
@@ -6398,6 +6429,19 @@ impl ArchiveFsApp {
                     );
                 });
         });
+
+        // First frame after a repair-action arrival: bring the card into
+        // view, aligned near the top. `focus_retroarch` came from a
+        // one-shot `take()`, so this fires once and never fights a manual
+        // scroll afterward. Technical details is untouched - it stays
+        // collapsed.
+        if focus_retroarch {
+            let card_rect = egui::Rect::from_min_max(
+                egui::pos2(ui.min_rect().left(), card_top),
+                egui::pos2(ui.min_rect().right(), ui.cursor().top()),
+            );
+            ui.scroll_to_rect(card_rect, Some(egui::Align::TOP));
+        }
 
         match pending {
             Some(CoreFolderAction::Rescan) => {
@@ -11984,11 +12028,15 @@ impl ArchiveFsApp {
     /// "Open Emulator Setup" from a Gamer View `NeedsSetup` card: keep the
     /// same game selected and switch to Advanced View's Emulator Setup
     /// page. Same select-then-navigate shape as `review_identity`; no new
-    /// plumbing and nothing about the game changes.
-    fn open_emulator_setup_for(&mut self, archive_path: PathBuf) {
+    /// plumbing and nothing about the game changes. `focus` records which
+    /// repair card the page should scroll into view once (consumed by
+    /// `show_emulator_setup_page` with `take()`); sidebar/Home navigation
+    /// never sets it.
+    fn open_emulator_setup_for(&mut self, archive_path: PathBuf, focus: EmulatorSetupFocus) {
         self.archive_context.select_only(archive_path);
         self.ui_mode = GuiMode::AdvancedView;
         save_gui_mode(self.ui_mode);
+        self.emulator_setup_focus = Some(focus);
         self.navigate_to_main_view(MainView::EmulatorSetup);
     }
 
@@ -17562,8 +17610,8 @@ impl ArchiveFsApp {
                         Some(GamerViewAction::ReviewIdentity(archive_path)) => {
                             self.review_identity(archive_path);
                         }
-                        Some(GamerViewAction::OpenEmulatorSetup(archive_path)) => {
-                            self.open_emulator_setup_for(archive_path);
+                        Some(GamerViewAction::OpenEmulatorSetup(archive_path, focus)) => {
+                            self.open_emulator_setup_for(archive_path, focus);
                         }
                         // A match guard here (clippy's suggestion) would make
                         // this otherwise-exhaustive `GamerViewAction` match
