@@ -478,6 +478,7 @@ fn strict_native_ready_candidate_shows_launch_retroarch_button() {
     let plan = plan_with(vec![ready_candidate()]);
     let output = render(&plan_input(plan));
     assert!(rendered_text_contains(&output, "Launch RetroArch"));
+    assert!(rendered_text_contains(&output, "Play"));
 }
 
 #[test]

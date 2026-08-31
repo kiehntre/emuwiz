@@ -1612,7 +1612,8 @@ fn show_standalone_launch_action(
     }
 }
 
-/// Renders the "Launch RetroArch" action for one eligible candidate,
+/// Renders the user-facing "Play" action for one eligible candidate while
+/// retaining the adapter name for technical clarity,
 /// entirely from an owned snapshot of `launch_state` so the click handler
 /// below never needs to mutate `launch_state` while a borrow of it is still
 /// live from a `match`.
@@ -1677,7 +1678,7 @@ fn show_launch_action(
 
     match display {
         Display::Idle => {
-            if ui.button("Launch RetroArch").clicked() {
+            if ui.button("Play — Launch RetroArch").clicked() {
                 launch_state.start(request);
             }
         }
@@ -1687,7 +1688,7 @@ fn show_launch_action(
         Display::Running { pid } => {
             widgets::status_badge(ui, "RetroArch running", widgets::StatusTone::Success);
             ui.label(egui::RichText::new(format!("PID {pid}")).small());
-            ui.add_enabled(false, egui::Button::new("Launch RetroArch"));
+            ui.add_enabled(false, egui::Button::new("Play — Launch RetroArch"));
         }
         Display::Exited {
             success,
@@ -1716,7 +1717,7 @@ fn show_launch_action(
                     });
                 }
             }
-            if ui.button("Launch RetroArch").clicked() {
+            if ui.button("Play — Launch RetroArch").clicked() {
                 launch_state.start(request);
             }
         }
@@ -1725,7 +1726,7 @@ fn show_launch_action(
             widgets::technical_details(ui, "retroarch-launch-error", |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
             });
-            if ui.button("Launch RetroArch").clicked() {
+            if ui.button("Play — Launch RetroArch").clicked() {
                 launch_state.start(request);
             }
         }
