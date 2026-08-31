@@ -213,6 +213,117 @@ pub(crate) fn gather_selected_evidence(
     gather_selected_evidence_with_platform(path, None, no_intro_source)
 }
 
+/// How far into a selected file the *fast* structural pass reads. Every
+/// header detector this module dispatches to touches only the first few
+/// hundred bytes to at most ~0x8000; 1 MiB is a wide margin that keeps the
+/// fast pass bounded for a multi-gigabyte disc image (whose whole-file read
+/// and hash belong in the deferred enrichment pass, not in the pass whose
+/// only job is to make identity visible quickly).
+pub(crate) const STRUCTURAL_PREFIX_BYTES: u64 = 1 << 20;
+
+fn read_structural_prefix(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let mut prefix = Vec::new();
+    file.take(STRUCTURAL_PREFIX_BYTES)
+        .read_to_end(&mut prefix)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Ok(prefix)
+}
+
+/// The fast identity pass the selected-game panel waits on: a bounded
+/// header read, the real structural detectors, and the existing bounded
+/// per-platform [`inspect_catalogued_game_identity`] (loose-ROM hash for a
+/// small cartridge, `SYSTEM.CNF`/boot record for a disc - never a
+/// whole-file hash). It deliberately does **not** compute the whole-file
+/// checksum or resolve the No-Intro DAT registry; both can cost minutes for
+/// a large ISO or a big DAT set and are handled afterwards by
+/// [`compute_selected_evidence_enrichment`] without blocking what the user
+/// sees. `hashes`/`no_intro` are therefore left unset here and filled in
+/// by the enrichment pass via [`apply_selected_evidence_enrichment`].
+pub(crate) fn gather_selected_evidence_fast(
+    path: &Path,
+    platform_hint: Option<&str>,
+) -> Result<SelectedEvidenceReport, String> {
+    let prefix = read_structural_prefix(path)?;
+    let structural_facts = gather_structural_evidence(path, &prefix);
+    let explanation = fuse_platform_evidence(structural_facts.clone());
+
+    let identity_result = inspect_identity(IdentityInspectionInput {
+        content_evidence: explanation.input_evidence.clone(),
+        ..Default::default()
+    });
+    let identity = present_identity(&identity_result);
+    let game_identity_report =
+        inspect_catalogued_game_identity(path, platform_hint.or(identity.platform));
+
+    let base_observations: Vec<EvidenceObservation> = structural_facts
+        .iter()
+        .map(observation_from_content_evidence)
+        .collect();
+
+    Ok(SelectedEvidenceReport {
+        path: path.to_path_buf(),
+        structural_facts,
+        identity,
+        identity_result,
+        game_identity_report,
+        hashes: None,
+        no_intro: NoIntroLookupResult::NotImported,
+        base_observations,
+    })
+}
+
+/// The result of the deferred enrichment pass: the whole-file checksum and
+/// the No-Intro lookup for it. Merged into an already-visible
+/// [`SelectedEvidenceReport`] once ready, so structural / verified identity
+/// never waits on it.
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedEvidenceEnrichment {
+    pub hashes: LocalHashes,
+    pub no_intro: NoIntroLookupResult,
+    pub extra_observations: Vec<EvidenceObservation>,
+}
+
+/// Computes the whole-file checksum for `path` (the expensive step for a
+/// large disc image) and looks it up against the already-resolved
+/// `no_intro_source`. The caller resolves the No-Intro source off the UI
+/// thread; DAT-registry parsing must not happen on the fast path.
+pub(crate) fn compute_selected_evidence_enrichment(
+    path: &Path,
+    no_intro_source: Option<&ImportedNoIntroSource>,
+) -> Result<SelectedEvidenceEnrichment, String> {
+    let trusted_root = path.parent().unwrap_or(path).to_path_buf();
+    let trusted = TrustedRoots::from_paths([trusted_root.as_path()]);
+    let hashes = hash_file(path, &trusted, None)
+        .map_err(|refusal| format!("could not hash {}: {refusal:?}", path.display()))?;
+    let no_intro = lookup_no_intro_for(no_intro_source, &hashes);
+    let extra_observations = match &no_intro {
+        NoIntroLookupResult::Matched { observations, .. } => observations.clone(),
+        _ => Vec::new(),
+    };
+    Ok(SelectedEvidenceEnrichment {
+        hashes,
+        no_intro,
+        extra_observations,
+    })
+}
+
+/// Merges a completed [`SelectedEvidenceEnrichment`] into a report the panel
+/// is already showing. Only ever called when the report's path still
+/// matches the current selection (generation-guarded by the caller).
+pub(crate) fn apply_selected_evidence_enrichment(
+    report: &mut SelectedEvidenceReport,
+    enrichment: SelectedEvidenceEnrichment,
+) {
+    report.hashes = Some(enrichment.hashes);
+    report.no_intro = enrichment.no_intro;
+    report
+        .base_observations
+        .extend(enrichment.extra_observations);
+}
+
 /// Like [`gather_selected_evidence`], with an exact platform hint from the
 /// library row when structural evidence alone cannot identify the platform
 /// (for example a PS2 ISO). The hint is only passed to the existing core
@@ -994,6 +1105,146 @@ mod tests {
             "core identity evidence must remain available without DAT evidence"
         );
         assert!(matches!(report.no_intro, NoIntroLookupResult::NotImported));
+    }
+
+    // -- staged fast pass + deferred enrichment ----------------------
+
+    #[test]
+    fn fast_pass_resolves_structural_and_verified_identity_without_a_whole_file_hash() {
+        let dir = write_temp_rom("Aladdin (USA) (SGB Enhanced).gb", &gb_rom_bytes());
+        let path = dir.path().join("Aladdin (USA) (SGB Enhanced).gb");
+        let report =
+            gather_selected_evidence_fast(&path, Some("Game Boy")).expect("fast pass succeeds");
+        assert_eq!(report.path, path);
+        assert!(
+            !report.structural_facts.is_empty(),
+            "structural (cartridge header) evidence must be present immediately"
+        );
+        assert_eq!(
+            report.game_identity_report.platform,
+            archivefs_core::game_identity::IdentityPlatform::GameBoy
+        );
+        assert!(
+            report
+                .game_identity_report
+                .verified_loose_rom_sha256()
+                .is_some(),
+            "verified identity evidence is available in the fast pass, no DAT needed"
+        );
+        // The expensive parts are deferred, not done here.
+        assert!(
+            report.hashes.is_none(),
+            "the whole-file checksum is left to the enrichment pass"
+        );
+        assert!(matches!(report.no_intro, NoIntroLookupResult::NotImported));
+    }
+
+    #[test]
+    fn fast_pass_reads_only_a_bounded_prefix_of_a_large_file() {
+        // A header that is real, followed by far more than the fast pass
+        // will ever read - the header must still be found.
+        let mut bytes = gb_rom_bytes();
+        bytes.resize((STRUCTURAL_PREFIX_BYTES as usize) * 4, 0);
+        let dir = write_temp_rom("big.gb", &bytes);
+        let path = dir.path().join("big.gb");
+        let report = gather_selected_evidence_fast(&path, Some("Game Boy")).expect("fast pass ok");
+        assert!(!report.structural_facts.is_empty());
+    }
+
+    #[test]
+    fn fast_pass_on_an_unreadable_path_is_an_honest_error() {
+        let result =
+            gather_selected_evidence_fast(Path::new("/nonexistent/definitely-not-here.gb"), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn enrichment_computes_the_hash_and_merges_into_an_existing_report() {
+        let dir = write_temp_rom("Aladdin.gb", &gb_rom_bytes());
+        let path = dir.path().join("Aladdin.gb");
+        let mut report =
+            gather_selected_evidence_fast(&path, Some("Game Boy")).expect("fast pass ok");
+        assert!(report.hashes.is_none());
+        let base_observation_count = report.base_observations.len();
+
+        let enrichment =
+            compute_selected_evidence_enrichment(&path, None).expect("enrichment succeeds");
+        assert!(matches!(
+            enrichment.no_intro,
+            NoIntroLookupResult::NotImported
+        ));
+
+        apply_selected_evidence_enrichment(&mut report, enrichment);
+        assert!(
+            report.hashes.is_some(),
+            "the whole-file checksum is now filled in"
+        );
+        assert!(matches!(report.no_intro, NoIntroLookupResult::NotImported));
+        assert!(report.base_observations.len() >= base_observation_count);
+    }
+
+    /// Live check against the exact real Game Boy path from manual QA:
+    /// the fast pass must complete essentially instantly with real
+    /// structural + verified identity and no whole-file hash. Skipped (not
+    /// failed) when the file is not present on this machine.
+    #[test]
+    #[ignore = "live path; run explicitly with --ignored on the QA machine"]
+    fn live_fast_pass_real_game_boy_completes_quickly() {
+        let path = Path::new("/mnt/games/roms/gb/Aladdin (USA) (SGB Enhanced).gb");
+        if !path.exists() {
+            eprintln!("skipping: real GB fixture not present");
+            return;
+        }
+        let start = std::time::Instant::now();
+        let report = gather_selected_evidence_fast(path, Some("Game Boy")).expect("fast pass ok");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "fast pass took {elapsed:?}, expected well under 2s"
+        );
+        assert!(!report.structural_facts.is_empty());
+        assert!(
+            report
+                .game_identity_report
+                .verified_loose_rom_sha256()
+                .is_some()
+        );
+        assert!(report.hashes.is_none());
+    }
+
+    /// Live check against the exact real PS2 ISO from manual QA (multi-GB
+    /// on a slow USB disc): the fast pass must surface the serial /
+    /// executable CRC without reading or hashing the whole image. Skipped
+    /// when not present.
+    #[test]
+    #[ignore = "live path; run explicitly with --ignored on the QA machine"]
+    fn live_fast_pass_real_ps2_iso_surfaces_serial_without_full_hash() {
+        let path = Path::new("/mnt/usbdrive/games/ps2/God of War (USA)/God of War (USA).iso");
+        if !path.exists() {
+            eprintln!("skipping: real PS2 ISO fixture not present");
+            return;
+        }
+        let start = std::time::Instant::now();
+        let report =
+            gather_selected_evidence_fast(path, Some("PlayStation 2")).expect("fast pass ok");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "fast pass on the ISO took {elapsed:?}; it must not read/hash the whole 8+ GB image"
+        );
+        assert_eq!(
+            report.game_identity_report.platform,
+            archivefs_core::game_identity::IdentityPlatform::PlayStation2
+        );
+        let has_serial = report.game_identity_report.evidence.iter().any(|e| {
+            e.kind == archivefs_core::game_identity::IdentityKind::Ps2Serial
+                && e.status == archivefs_core::game_identity::IdentityStatus::Verified
+        });
+        assert!(
+            has_serial,
+            "the PS2 serial must be visible in the fast pass"
+        );
+        assert!(report.hashes.is_none());
     }
 
     #[test]

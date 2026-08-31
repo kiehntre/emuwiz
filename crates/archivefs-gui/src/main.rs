@@ -4521,6 +4521,13 @@ struct ArchiveFsApp {
     /// `Idle`; loading is always an explicit action, never automatic.
     selected_evidence: selected_evidence_page::SelectedEvidenceState,
     selected_evidence_generation: u64,
+    /// The deferred enrichment pass for the selected file: the whole-file
+    /// checksum and its No-Intro DAT lookup. Kept separate from
+    /// `selected_evidence` so the structural / verified identity in a
+    /// `Ready` report is shown immediately and this - which can cost
+    /// minutes for a multi-gigabyte ISO or a large DAT set - fills in
+    /// `hashes`/`no_intro` afterwards without ever blocking the panel.
+    selected_evidence_enrichment: SelectedEvidenceEnrichmentState,
     /// Resolves the registered DAT source registry down to the No-Intro
     /// source relevant to a selected file's platform, without ever
     /// reparsing an unchanged registry - see
@@ -4785,6 +4792,29 @@ fn drain_file_pick(receiver: &mpsc::Receiver<Option<PathBuf>>) -> FilePickDrain 
 const FILE_PICKER_DISCONNECTED_MESSAGE: &str =
     "The image picker closed unexpectedly. Please try again.";
 
+/// The deferred whole-file-checksum + No-Intro-lookup pass for the selected
+/// file. Independent of `SelectedEvidenceState` so the structural / verified
+/// identity in a `Ready` report is never held back by it. Guarded by the
+/// same `selected_evidence_generation` the fast pass uses.
+enum SelectedEvidenceEnrichmentState {
+    Idle,
+    Loading {
+        generation: u64,
+        path: PathBuf,
+        receiver: mpsc::Receiver<(
+            u64,
+            Result<selected_evidence_page::SelectedEvidenceEnrichment, String>,
+        )>,
+    },
+    /// Terminal: the enrichment was merged into the `Ready` report, or it
+    /// failed (structural / verified identity stays visible regardless).
+    /// Not retried until the selection changes.
+    Done {
+        generation: u64,
+        path: PathBuf,
+    },
+}
+
 impl ArchiveFsApp {
     fn is_busy(&self) -> bool {
         self.operation.is_some()
@@ -4937,6 +4967,7 @@ impl ArchiveFsApp {
             romm_generation: 0,
             selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
             selected_evidence_generation: 0,
+            selected_evidence_enrichment: SelectedEvidenceEnrichmentState::Idle,
             no_intro_source_cache: Arc::new(Mutex::new(
                 selected_evidence_no_intro::NoIntroSourceCache::new(),
             )),
@@ -10315,7 +10346,9 @@ impl ArchiveFsApp {
             path: path.clone(),
             receiver,
         };
-        let no_intro_source_cache = Arc::clone(&self.no_intro_source_cache);
+        // A new selection invalidates any in-flight or completed enrichment
+        // pass for the previous file.
+        self.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
         let platform_hint = match &self.state {
             LoadState::Ready(data) => data
                 .records
@@ -10332,14 +10365,111 @@ impl ArchiveFsApp {
             LoadState::Loading { .. } | LoadState::Error(_) => None,
         };
         thread::spawn(move || {
-            let result = gather_selected_evidence_with_registry_and_platform(
+            // Fast pass only: bounded header read + the bounded per-platform
+            // identity inspector. The whole-file checksum and No-Intro DAT
+            // resolution are the deferred enrichment pass
+            // (`start_selected_evidence_enrichment`) so a multi-gigabyte ISO
+            // or a large DAT set never blocks the visible identity.
+            let result = selected_evidence_page::gather_selected_evidence_fast(
                 &path,
                 platform_hint.as_deref(),
-                &no_intro_source_cache,
             );
             let _ = sender.send((generation, result));
             context.request_repaint();
         });
+    }
+
+    /// Starts the deferred enrichment pass for an already-visible `Ready`
+    /// report whose `hashes` are not yet filled in: the whole-file checksum
+    /// and the No-Intro DAT lookup, both resolved entirely off the UI
+    /// thread. Generation-guarded like every other background loader; a new
+    /// selection (which bumps `selected_evidence_generation` and resets the
+    /// enrichment state to `Idle`) makes a late result be discarded.
+    fn start_selected_evidence_enrichment(
+        &mut self,
+        context: egui::Context,
+        path: PathBuf,
+        generation: u64,
+        platform: Option<String>,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        self.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Loading {
+            generation,
+            path: path.clone(),
+            receiver,
+        };
+        let no_intro_source_cache = Arc::clone(&self.no_intro_source_cache);
+        thread::spawn(move || {
+            let config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
+            let no_intro_state = config_path
+                .as_deref()
+                .ok()
+                .and_then(|config_path| {
+                    archivefs_core::dat::sources::load_dat_sources_config_from(config_path).ok()
+                })
+                .map(|config| {
+                    archivefs_core::dat::sources::DatSourceRegistry::from_config(&config).0
+                })
+                .map(|registry| {
+                    no_intro_source_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .resolve(&registry, platform.as_deref())
+                        .clone()
+                });
+            let resolved_source = match &no_intro_state {
+                Some(selected_evidence_no_intro::NoIntroSourceState::Selected(imported)) => {
+                    Some(imported.as_ref())
+                }
+                _ => None,
+            };
+            let result = selected_evidence_page::compute_selected_evidence_enrichment(
+                &path,
+                resolved_source,
+            );
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+    }
+
+    /// If the fast pass has produced a `Ready` report for the current
+    /// selection whose whole-file `hashes` are still unset, and no
+    /// enrichment pass has been started or finished for it, start one. Kept
+    /// out of `poll_selected_evidence` so it can read the freshly-settled
+    /// `Ready` state and the live record set in the same frame.
+    fn maybe_start_selected_evidence_enrichment(&mut self, context: &egui::Context) {
+        let selected_evidence_page::SelectedEvidenceState::Ready {
+            generation, report, ..
+        } = &self.selected_evidence
+        else {
+            return;
+        };
+        if report.hashes.is_some() {
+            return;
+        }
+        let generation = *generation;
+        let path = report.path.clone();
+        let already = match &self.selected_evidence_enrichment {
+            SelectedEvidenceEnrichmentState::Idle => false,
+            SelectedEvidenceEnrichmentState::Loading {
+                generation: g,
+                path: p,
+                ..
+            }
+            | SelectedEvidenceEnrichmentState::Done {
+                generation: g,
+                path: p,
+            } => *g == generation && *p == path,
+        };
+        if already {
+            return;
+        }
+        let platform = report
+            .identity
+            .platform
+            .map(str::to_owned)
+            .or_else(|| Some(report.game_identity_report.platform.label().to_string()));
+        self.start_selected_evidence_enrichment(context.clone(), path, generation, platform);
     }
 
     /// GUI Batch A: the explicit "Check Hasheous" action - a real network
@@ -10449,6 +10579,39 @@ impl ArchiveFsApp {
                     outcome,
                 };
             }
+        }
+
+        // Drain a completed deferred enrichment pass (whole-file checksum +
+        // No-Intro lookup) and merge it into the `Ready` report the panel is
+        // already showing, if the selection has not moved on since.
+        if let SelectedEvidenceEnrichmentState::Loading {
+            generation,
+            path,
+            receiver,
+        } = &self.selected_evidence_enrichment
+            && let Ok((message_generation, result)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            let generation = *generation;
+            let path = path.clone();
+            if let (
+                Ok(enrichment),
+                selected_evidence_page::SelectedEvidenceState::Ready {
+                    generation: ready_generation,
+                    report,
+                    ..
+                },
+            ) = (&result, &mut self.selected_evidence)
+                && *ready_generation == generation
+                && report.path == path
+            {
+                selected_evidence_page::apply_selected_evidence_enrichment(
+                    report,
+                    enrichment.clone(),
+                );
+            }
+            self.selected_evidence_enrichment =
+                SelectedEvidenceEnrichmentState::Done { generation, path };
         }
     }
 
@@ -11735,6 +11898,7 @@ impl ArchiveFsApp {
                 self.start_selected_evidence_load(context.clone(), path);
             }
         }
+        self.maybe_start_selected_evidence_enrichment(context);
         if matches!(
             self.dolphin_local_profiles,
             DolphinLocalProfilesState::NotScanned
@@ -17090,6 +17254,7 @@ impl ArchiveFsApp {
                             self.start_selected_evidence_load(context.clone(), path);
                         }
                     }
+                    self.maybe_start_selected_evidence_enrichment(context);
                     if matches!(self.retroarch_profiles, RetroArchProfilesState::NotScanned) {
                         self.start_retroarch_profile_scan(context.clone());
                     }

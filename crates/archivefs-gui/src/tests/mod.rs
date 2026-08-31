@@ -1176,6 +1176,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         romm_generation: 0,
         selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
         selected_evidence_generation: 0,
+        selected_evidence_enrichment: SelectedEvidenceEnrichmentState::Idle,
         no_intro_source_cache: Arc::new(Mutex::new(
             selected_evidence_no_intro::NoIntroSourceCache::new(),
         )),
