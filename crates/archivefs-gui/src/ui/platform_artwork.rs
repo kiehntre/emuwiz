@@ -101,8 +101,8 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
             PlatformAssetCategory::Computer
         }
         "Arcade" => PlatformAssetCategory::Arcade,
-        "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "Philips CD-i"
-        | "Sega CD" => PlatformAssetCategory::OpticalDisc,
+        "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "PC-FX"
+        | "Philips CD-i" | "Sega CD" => PlatformAssetCategory::OpticalDisc,
         "Atari2600" | "Atari5200" | "Atari7800" | "Atari Jaguar" | "PC Engine"
         | "TurboGrafx-16" => PlatformAssetCategory::Cartridge,
         _ => PlatformAssetCategory::Unknown,
