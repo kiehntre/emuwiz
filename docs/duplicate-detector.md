@@ -1,16 +1,35 @@
 # Duplicate Detector Plugin Architecture
 
-This document describes the intended architecture for richer, hash- and metadata-assisted duplicate detection in EmuWiz. Most of it remains a design document, not yet implemented.
+This document separates the current duplicate workflow from the richer
+hash- and metadata-assisted architecture proposed below.
 
-**Current status:** a first, narrower tier already exists today:
-`FilenameDuplicateDetector` groups catalogue entries by normalized filename
-plus effective platform - roughly the "Same Title + Platform" tier described
-below - and is exposed through the `duplicates` CLI command and a GUI
-duplicate-review workflow with bulk selection. It is read-only: it reports
-candidates and never deletes, moves, renames, mounts, or unmounts anything.
-The remaining tiers (exact archive/CRC/ROM-hash duplicates, metadata-assisted
-matching, and a full plugin architecture) are still future work, described
-below as originally designed.
+## CURRENT BEHAVIOR
+
+EmuWiz currently provides duplicate and equivalent-representation review
+through the library and repair workflows:
+
+- filename/platform duplicate candidates are reported by the `duplicates`
+  command and GUI review;
+- exact duplicate-content scans can identify byte-identical files;
+- selected equivalent representations, including supported optical and N64
+  cases, can be reviewed separately from byte equality;
+- supported duplicate quarantine and organisation actions are previewed,
+  explicitly confirmed, journaled, no-clobber, and reversible where the
+  workflow supports rollback;
+- reports do not silently delete, rewrite, mount, or unmount source archives;
+  uncertain groups remain for review rather than being guessed into one
+  survivor.
+
+Current implementation details and boundaries belong in the [README](../README.md),
+[adapter matrix](ADAPTER_SUPPORT_MATRIX.md), and [safe apply and rollback
+documentation](SHARED_SAFE_APPLY_ROLLBACK.md).
+
+## FUTURE / DESIGN IDEAS
+
+The sections below preserve the original design proposal. They describe
+possible richer matching strategies and a future plugin architecture; they
+are not promises that every listed signal or integration is currently
+available.
 
 ## Goals
 

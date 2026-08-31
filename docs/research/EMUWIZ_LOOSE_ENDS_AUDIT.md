@@ -1,5 +1,20 @@
 # EmuWiz loose-ends / project-health audit
 
+> **RESEARCH SNAPSHOT — not current capability documentation**
+>
+> This report records an earlier project-health review. Many implementation
+> gaps and priorities identified here may have since landed. Use the
+> [README](../../README.md), [current adapter matrix](../ADAPTER_SUPPORT_MATRIX.md),
+> [launch support](../LAUNCH_SUPPORT.md), [roadmap](../../ROADMAP.md), and
+> [changelog](../../CHANGELOG.md) for current behavior.
+
+> **Current status note:** only the historical provenance is authoritative
+> here; do not treat its “current” sections or ranked queues as current
+> guidance without re-verifying them against the committed code.
+>
+> Current committed reference for this documentation pass: `46af6e8`
+> (`2026-08-31`). This is not a re-audit of the findings below.
+
 Audit date: 2026-08-11. Original code baseline: `origin/main` at
 `f7c450cad3b89207251dd3b2b4747af1f1e01d42` (merge of PR #29), refreshed
 against `7c8d6ea1891d4bd32bcdb0716ff7d998ec08ed83` (merge of PR #33), and

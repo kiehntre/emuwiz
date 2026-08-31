@@ -1,5 +1,16 @@
 # Broken Joins Audit — capabilities that exist but never reach the user
 
+> **RESEARCH SNAPSHOT — not current capability documentation**
+>
+> Recorded against an earlier repository state. Many gaps identified here may
+> have since landed. Use the [README](../../README.md), [current adapter
+> matrix](../ADAPTER_SUPPORT_MATRIX.md), [launch support](../LAUNCH_SUPPORT.md),
+> [roadmap](../../ROADMAP.md), and [changelog](../../CHANGELOG.md) for current
+> behavior.
+>
+> Current committed reference for this documentation pass: `46af6e8`
+> (`2026-08-31`). This is not a re-audit of the findings below.
+
 **Repo:** `/home/davedap/archivefs` · **Branch:** `feature/archivefs-unified-platform`
 **Scope:** whole-repository, read-only research audit. Every claim below was verified against source on this branch. This audit deliberately hunts **broken joins** — two mature pieces with a missing connection — over new features.
 
@@ -260,4 +271,3 @@ Prioritised; each is verified against the GUI sources:
 ## 11. Conclusion
 
 EmuWiz's pattern across every family audited is consistent, and it is a *good* problem to have: the evidence and adapter layers are consistently ahead of the wiring layer. Of the twenty highest-value joins found, **eighteen are pure connections between existing, tested components** and none requires a new parser. The rare gaps that do require new code (Hatari/Amiga command adapters, Acorn disk adapters, a CSO reader) are small, templated by five existing adapters, and deliberately deferred to P1/P2 — because until joins #1/#2/#3/#8 land, users cannot see the sophistication that already exists.
-

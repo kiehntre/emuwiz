@@ -1,5 +1,20 @@
 # Pre-RC Launch + Projection Gap Audit (RESEARCH ONLY)
 
+> **RESEARCH SNAPSHOT — not current capability documentation**
+>
+> This report records an earlier launch and projection review. Several gaps
+> identified here may have since landed. Use the [README](../../README.md),
+> [current adapter matrix](../ADAPTER_SUPPORT_MATRIX.md), [launch support](../LAUNCH_SUPPORT.md),
+> [roadmap](../../ROADMAP.md), and [changelog](../../CHANGELOG.md) for current
+> behavior.
+>
+> Current committed reference for this documentation pass: `46af6e8`
+> (`2026-08-31`). This is not a re-audit of the findings below.
+
+> **Current status note:** the launch rows, emulator execution paths, and
+> RomM/ES-DE projection tables below are historical snapshots and require
+> re-verification before reuse.
+
 **Repo:** `/home/davedap/archivefs` · **Branch:** `feature/archivefs-unified-platform`
 **Live HEAD at report time:** `cc39b3b feat(launch): add DOSBox execution` (tree clean except research docs)
 **Scope:** (1) RetroArch launch-compatibility rows, (2) NeoGeo↔MAME acceptance, (3) RomM/ES-DE projection parity. No parsers re-audited beyond what launch/export safety requires. **No modifications made.**

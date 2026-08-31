@@ -1,5 +1,20 @@
 # Pre-RC Gap Challenge — EmuWiz (RESEARCH ONLY)
 
+> **RESEARCH SNAPSHOT — not current capability documentation**
+>
+> This report records an earlier pre-release review. Several launch,
+> projection, identity, and integration gaps identified here may have since
+> landed. Use the [README](../../README.md), [current adapter
+> matrix](../ADAPTER_SUPPORT_MATRIX.md), [launch support](../LAUNCH_SUPPORT.md),
+> [roadmap](../../ROADMAP.md), and [changelog](../../CHANGELOG.md) for current
+> behavior.
+>
+> Current committed reference for this documentation pass: `46af6e8`
+> (`2026-08-31`). This is not a re-audit of the findings below.
+
+> **Current status note:** treat the ranked gaps and shortlist below as
+> historical research conclusions, not an active task list.
+
 **Repo:** `/home/davedap/archivefs` · **Branch:** `feature/archivefs-unified-platform` · tree clean except one file
 **Question:** does the current pre-RC shortlist miss any genuinely high-value **user-facing** gap?
 **Method:** re-verified the live state of every projection/launch/Doctor surface this pass (`es_de_export.rs`, `romm_platform_mapping.rs`, `launch/platform_map.rs`, `launch/` module list, `launch_readiness_page.rs`, `diagnostics/profiles.rs`, `game_identity.rs` inspect arms).

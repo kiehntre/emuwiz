@@ -4,6 +4,10 @@ This document is the maintained release procedure for EmuWiz. The scripts
 described here build and inspect artifacts; they do not create tags, push
 branches, or publish releases.
 
+The current product uses the EmuWiz names (`emuwiz-cli`, `emuwiz`) and the
+workspace version. Legacy `archivefs-*` names remain compatibility aliases in
+release/install artifacts; they are not the primary product names.
+
 ## Release contract
 
 The canonical Linux bundle is:
@@ -230,8 +234,8 @@ release uses `vMAJOR.MINOR.PATCH` with no suffix. In both cases:
 4. create one annotated tag on that exact commit; and
 5. push only that tag, which starts the tag-only release workflow.
 
-For v0.7.0, after every gate and explicit release authorization, the
-commands would be:
+Historical example: for v0.7.0, after every gate and explicit release
+authorization, the commands would have been:
 
 ```sh
 git fetch origin
@@ -253,12 +257,13 @@ and managed-state directory. Keep the previous verified application artifact
 and checksum.
 
 Application rollback means stopping EmuWiz and restoring the previous
-binary bundle. **In-place database downgrade is not supported.** EmuWiz
-v0.7 uses schema 6; older binaries reject a schema-6 database. To run an older
-binary, restore the pre-upgrade database copy to a separate compatible path.
-Keep the v0.7 database and managed state untouched for later recovery. Never
-edit SQLite schema/version fields manually, and do not assume an older binary
-can interpret new journals, profile records, or catalogue state.
+binary bundle. **In-place database downgrade is not supported.** The current
+migration chain extends through migration `0010` (schema version 10). Older
+binaries may reject a database created by the current workspace. To run an
+older binary, restore the pre-upgrade database copy to a separate compatible
+path. Keep the newer database and managed state untouched for later recovery.
+Never edit SQLite schema/version fields manually, and do not assume an older
+binary can interpret new journals, profile records, or catalogue state.
 
 If a published artifact itself must be withdrawn, preserve the tag, checksums,
 and incident evidence; mark the release clearly rather than replacing bytes
