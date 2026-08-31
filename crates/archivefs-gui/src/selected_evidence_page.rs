@@ -570,6 +570,59 @@ pub(crate) fn show_selected_evidence_panel(
     action
 }
 
+pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenceReport) {
+    widgets::section_header(ui, "Structural evidence", None);
+    if report.structural_facts.is_empty() {
+        ui.label("No structural evidence was recognized for this file type.");
+    } else {
+        let rows: Vec<(&str, &str, widgets::StatusTone)> = report
+            .structural_facts
+            .iter()
+            .map(|fact| {
+                let tone = match fact.confidence {
+                    archivefs_core::content_evidence::ContentEvidenceConfidence::Strong => {
+                        widgets::StatusTone::Success
+                    }
+                    archivefs_core::content_evidence::ContentEvidenceConfidence::Corroborated => {
+                        widgets::StatusTone::Info
+                    }
+                    archivefs_core::content_evidence::ContentEvidenceConfidence::Weak => {
+                        widgets::StatusTone::Pending
+                    }
+                };
+                (fact.detail.as_str(), fact.value.as_str(), tone)
+            })
+            .collect();
+        widgets::status_rows(ui, &rows);
+    }
+
+    let verified_identity_facts = report
+        .game_identity_report
+        .evidence
+        .iter()
+        .filter(|evidence| {
+            evidence.status == archivefs_core::game_identity::IdentityStatus::Verified
+                && !matches!(
+                    evidence.kind,
+                    archivefs_core::game_identity::IdentityKind::Platform
+                        | archivefs_core::game_identity::IdentityKind::LooseRomFormat
+                        | archivefs_core::game_identity::IdentityKind::LooseRomTitle
+                )
+                && evidence.value.is_some()
+        })
+        .collect::<Vec<_>>();
+    if !verified_identity_facts.is_empty() {
+        widgets::section_header(ui, "Verified identity evidence", None);
+        for evidence in verified_identity_facts {
+            ui.horizontal(|ui| {
+                ui.label(evidence.kind.to_string());
+                widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
+                ui.label(evidence.value.as_deref().unwrap_or_default());
+            });
+        }
+    }
+}
+
 fn show_ready_report(
     ui: &mut egui::Ui,
     advanced_mode: bool,
@@ -605,60 +658,8 @@ fn show_ready_report(
         }
     });
 
-    // Structural evidence.
-    widgets::section_header(ui, "Structural evidence", None);
-    if report.structural_facts.is_empty() {
-        ui.label("No structural evidence was recognized for this file type.");
-    } else {
-        let rows: Vec<(&str, &str, widgets::StatusTone)> = report
-            .structural_facts
-            .iter()
-            .map(|fact| {
-                let tone = match fact.confidence {
-                    archivefs_core::content_evidence::ContentEvidenceConfidence::Strong => {
-                        widgets::StatusTone::Success
-                    }
-                    archivefs_core::content_evidence::ContentEvidenceConfidence::Corroborated => {
-                        widgets::StatusTone::Info
-                    }
-                    archivefs_core::content_evidence::ContentEvidenceConfidence::Weak => {
-                        widgets::StatusTone::Pending
-                    }
-                };
-                (fact.detail.as_str(), fact.value.as_str(), tone)
-            })
-            .collect();
-        widgets::status_rows(ui, &rows);
-    }
-
-    // The core identity inspector is authoritative structural evidence for
-    // direct media. Keep it separate from DAT evidence: a file can have
-    // verified on-disc identity facts even when no trusted DAT is loaded.
-    let verified_identity_facts = report
-        .game_identity_report
-        .evidence
-        .iter()
-        .filter(|evidence| {
-            evidence.status == archivefs_core::game_identity::IdentityStatus::Verified
-                && !matches!(
-                    evidence.kind,
-                    archivefs_core::game_identity::IdentityKind::Platform
-                        | archivefs_core::game_identity::IdentityKind::LooseRomFormat
-                        | archivefs_core::game_identity::IdentityKind::LooseRomTitle
-                )
-                && evidence.value.is_some()
-        })
-        .collect::<Vec<_>>();
-    if !verified_identity_facts.is_empty() {
-        widgets::section_header(ui, "Verified identity evidence", None);
-        for evidence in verified_identity_facts {
-            ui.horizontal(|ui| {
-                ui.label(evidence.kind.to_string());
-                widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
-                ui.label(evidence.value.as_deref().unwrap_or_default());
-            });
-        }
-    }
+    // Core identity evidence is distinct from DAT evidence.
+    show_identity_evidence(ui, report);
 
     // DAT evidence (direct No-Intro).
     widgets::section_header(ui, "DAT evidence", None);

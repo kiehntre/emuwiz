@@ -79,6 +79,7 @@ pub(crate) struct SelectedArchiveViewState<'a> {
     pub(crate) platform_custom_text: &'a mut String,
     pub(crate) platform_busy: bool,
     pub(crate) clipboard: &'a mut dyn ClipboardBackend,
+    pub(crate) selected_evidence: Option<&'a selected_evidence_page::SelectedEvidenceReport>,
 }
 
 #[derive(Default)]
@@ -113,6 +114,7 @@ pub(crate) fn show_selected_archive(
         platform_custom_text,
         platform_busy,
         clipboard,
+        selected_evidence,
     } = view_state;
     let mut request = None;
     let mut platform_request = None;
@@ -258,6 +260,11 @@ pub(crate) fn show_selected_archive(
                 }
             });
 
+        if let Some(report) = selected_evidence {
+            selected_evidence_page::show_identity_evidence(ui, report);
+        } else {
+            ui.label("Identity evidence is loading for the selected game...");
+        }
         show_dat_identity_section(ui, dat_identities);
         ui.add_space(6.0);
         let can_lazy_unmount = lazy_unmount_available(record, lazy_unmount_offers, busy);

@@ -131,6 +131,7 @@ pub(crate) fn gamer_undo_available(
 
 pub(crate) enum GamerViewAction {
     Operation(OperationRequest),
+    Play(archivefs_core::launch::RetroArchLaunchRequest),
     OpenCheatsMods(PathBuf),
     /// The folder to copy to the clipboard - "Open location" (§2.1's
     /// action visibility rules). No file-manager process is launched;
@@ -674,6 +675,7 @@ pub(crate) struct GamerViewViewState<'a> {
     /// which are real (already-answered) results this view still renders
     /// (as "no game information available" wording), never network calls.
     pub(crate) game_metadata: Option<&'a crate::game_metadata::GameMetadataResult>,
+    pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -822,6 +824,7 @@ pub(crate) fn show_gamer_view(
         covers,
         cover_requests,
         game_metadata,
+        play_action,
     } = view_state;
     let mut action = None;
 
@@ -1418,10 +1421,31 @@ pub(crate) fn show_gamer_view(
                                             ui.weak("Currently mounted.");
                                         }
                                         GamerPrimaryAction::NoMountingNeeded => {
-                                            ui.weak(
-                                                "No mounting needed \u{2014} ready for your \
-                                                 emulator.",
-                                            );
+                                            match play_action {
+                                                launch_readiness_page::GamerPlayAction::Ready(
+                                                    request,
+                                                ) => {
+                                                    if featured_primary_button(
+                                                        ui,
+                                                        "Play — Launch RetroArch",
+                                                        !busy,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        action = Some(GamerViewAction::Play(
+                                                            request.clone(),
+                                                        ));
+                                                    }
+                                                }
+                                                launch_readiness_page::GamerPlayAction::Blocked(
+                                                    reason,
+                                                ) => {
+                                                    ui.colored_label(
+                                                        ui.visuals().warn_fg_color,
+                                                        reason,
+                                                    );
+                                                }
+                                            }
                                         }
                                         GamerPrimaryAction::Blocked(reason) => {
                                             ui.colored_label(ui.visuals().warn_fg_color, reason);

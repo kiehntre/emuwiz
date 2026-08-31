@@ -283,6 +283,7 @@ fn context_menu_disabled_mount_reason_matches_the_main_button_reason() {
                     platform_custom_text: &mut platform_custom_text,
                     platform_busy: false,
                     clipboard: &mut clipboard,
+                    selected_evidence: None,
                 },
             );
         });
@@ -1251,6 +1252,7 @@ fn existing_global_unmount_all_confirmation_wording_is_unchanged() {
                     platform_custom_text: &mut platform_custom_text,
                     platform_busy: false,
                     retroarch_profiles: &RetroArchProfilesState::NotScanned,
+                    selected_evidence: &selected_evidence_page::SelectedEvidenceState::Idle,
                     selected_archives: &mut selected_archives,
                     bulk_platform_choice: &mut bulk_platform_choice,
                     bulk_platform_busy: false,
@@ -3112,6 +3114,7 @@ fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport(
                         platform_custom_text: &mut platform_custom_text,
                         platform_busy: false,
                         clipboard: &mut clipboard,
+                        selected_evidence: None,
                     },
                 );
             });

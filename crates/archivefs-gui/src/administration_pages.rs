@@ -3941,6 +3941,7 @@ pub(super) struct LoadedViewState<'a> {
     /// gated only by exact archive identity; the destination page uses
     /// this state to present scan, eligible, and blocked profile states.
     pub(super) retroarch_profiles: &'a RetroArchProfilesState,
+    pub(super) selected_evidence: &'a selected_evidence_page::SelectedEvidenceState,
     pub(super) selected_archives: &'a mut HashSet<PathBuf>,
     pub(super) bulk_platform_choice: &'a mut Option<String>,
     pub(super) bulk_platform_busy: bool,

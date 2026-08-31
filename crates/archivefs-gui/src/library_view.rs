@@ -58,6 +58,7 @@ pub(crate) fn show_loaded_data(
         platform_custom_text,
         platform_busy,
         retroarch_profiles,
+        selected_evidence,
         selected_archives,
         bulk_platform_choice,
         bulk_platform_busy,
@@ -302,6 +303,17 @@ pub(crate) fn show_loaded_data(
                                 platform_custom_text,
                                 platform_busy,
                                 clipboard,
+                                selected_evidence: match selected_evidence {
+                                    selected_evidence_page::SelectedEvidenceState::Ready {
+                                        report,
+                                        ..
+                                    } if Some(report.path.as_path())
+                                        == selected_archive.as_deref() =>
+                                    {
+                                        Some(report)
+                                    }
+                                    _ => None,
+                                },
                             },
                         )
                     })

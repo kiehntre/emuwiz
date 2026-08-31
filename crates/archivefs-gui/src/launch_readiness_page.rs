@@ -131,6 +131,50 @@ pub(crate) enum LaunchReadinessInput {
     },
 }
 
+pub(crate) enum GamerPlayAction {
+    Ready(RetroArchLaunchRequest),
+    Blocked(String),
+}
+
+/// Projects the same shared launch plan used by Advanced View into Gamer
+/// View's single primary action. This is presentation only: a Ready result
+/// carries the exact request that the existing RetroArch executor preflights
+/// again before spawning anything.
+pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction {
+    let LaunchReadinessInput::Plan { plan, .. } = input else {
+        return GamerPlayAction::Blocked(match input {
+            LaunchReadinessInput::EvidenceNotLoaded => {
+                "Identity evidence is still loading.".to_string()
+            }
+            LaunchReadinessInput::RetroArchNotScanned => {
+                "RetroArch has not been checked yet.".to_string()
+            }
+            LaunchReadinessInput::IdentityUnknown => {
+                "Can’t play yet: game identity could not be verified.".to_string()
+            }
+            LaunchReadinessInput::IdentityConflicting => {
+                "Can’t play yet: game identity evidence conflicts.".to_string()
+            }
+            LaunchReadinessInput::Plan { .. } => unreachable!(),
+        });
+    };
+    for candidate in &plan.candidates {
+        if matches!(candidate.target, LaunchTarget::RetroArchCore { .. }) {
+            if let Some(request) = retroarch_launch_request(plan, candidate) {
+                return GamerPlayAction::Ready(request);
+            }
+            if let Some(blocker) = candidate.blockers.first() {
+                return GamerPlayAction::Blocked(format!("Can’t play yet: {}", blocker.detail));
+            }
+            if let Some(warning) = candidate.warnings.first() {
+                return GamerPlayAction::Blocked(format!("Can’t play yet: {}", warning.detail));
+            }
+            return GamerPlayAction::Blocked("Can’t play yet: RetroArch core is not ready.".into());
+        }
+    }
+    GamerPlayAction::Blocked("Can’t play yet: no safe RetroArch launch option is available.".into())
+}
+
 pub(crate) struct DuckStationLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::DuckStationProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -443,7 +487,7 @@ impl RetroArchLaunchState {
         )
     }
 
-    fn start(&mut self, request: RetroArchLaunchRequest) {
+    pub(crate) fn start(&mut self, request: RetroArchLaunchRequest) {
         let key = RetroArchLaunchKey::from_request(&request);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {

@@ -17073,6 +17073,26 @@ impl ArchiveFsApp {
                 // unreachable while `ui_mode` is `GamerView`, since
                 // nothing in this mode's UI ever sets `self.view` to one.
                 if self.ui_mode == GuiMode::GamerView && self.view != MainView::CheatsMods {
+                    if let Some(path) = self.archive_context.focused.clone() {
+                        let evidence_is_stale = match &self.selected_evidence {
+                            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                                report.path != path
+                            }
+                            selected_evidence_page::SelectedEvidenceState::Loading {
+                                path: loading_path, ..
+                            } => loading_path != &path,
+                            selected_evidence_page::SelectedEvidenceState::Idle => true,
+                            selected_evidence_page::SelectedEvidenceState::Error {
+                                path: error_path, ..
+                            } => error_path != &path,
+                        };
+                        if evidence_is_stale {
+                            self.start_selected_evidence_load(context.clone(), path);
+                        }
+                    }
+                    if matches!(self.retroarch_profiles, RetroArchProfilesState::NotScanned) {
+                        self.start_retroarch_profile_scan(context.clone());
+                    }
                     let data = match &self.state {
                         LoadState::Ready(data) => Some(data.as_ref()),
                         LoadState::Loading { previous, .. } => previous.as_deref(),
@@ -17128,6 +17148,9 @@ impl ArchiveFsApp {
                         .as_ref()
                         .filter(|(path, _)| Some(path) == focused_archive.as_ref())
                         .map(|(_, result)| result);
+                    let gamer_launch_input = self.build_launch_readiness_input(data);
+                    let gamer_play_action =
+                        launch_readiness_page::gamer_play_action(&gamer_launch_input);
                     let gamer_action = show_gamer_view(
                         ui,
                         data,
@@ -17146,6 +17169,7 @@ impl ArchiveFsApp {
                             covers: &mut self.gamer_covers,
                             cover_requests: &mut cover_requests,
                             game_metadata,
+                            play_action: &gamer_play_action,
                         },
                     );
                     // Started only once the list has actually asked for something,
@@ -17165,6 +17189,9 @@ impl ArchiveFsApp {
                         }
                     }
                     match gamer_action {
+                        Some(GamerViewAction::Play(request)) => {
+                            self.launch_retroarch.start(request);
+                        }
                         Some(GamerViewAction::Operation(request)) => {
                             requested_action = Some(AppOperationRequest::Archive(request));
                         }
@@ -18271,6 +18298,7 @@ impl ArchiveFsApp {
                                 platform_custom_text: &mut self.platform_custom_text,
                                 platform_busy: self.platform_action.is_some(),
                                 retroarch_profiles: &self.retroarch_profiles,
+                                selected_evidence: &self.selected_evidence,
                                 selected_archives: &mut self.archive_context.selected,
                                 bulk_platform_choice: &mut self.bulk_platform_choice,
                                 bulk_platform_busy: self.bulk_platform_action.is_some(),

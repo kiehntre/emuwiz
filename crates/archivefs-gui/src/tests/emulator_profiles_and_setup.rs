@@ -88,6 +88,130 @@ fn gamer_view_shows_list_and_selected_game_actions_at_1024x600() {
 }
 
 #[test]
+fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/roms/aladdin.gb");
+    let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
+    game.metadata.title = Some("Aladdin".to_string());
+    game.metadata.platform = Some("Game Boy".to_string());
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![game])));
+    app.archive_context.select_only(path.clone());
+
+    let play_action = launch_readiness_page::GamerPlayAction::Ready(
+        archivefs_core::launch::RetroArchLaunchRequest {
+            selected_content_path: path,
+            expected_platform_id: "Game Boy".to_string(),
+            expected_game_key: "test-game".to_string(),
+            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            },
+            core_stem: "gambatte".to_string(),
+        },
+    );
+    let ctx = egui::Context::default();
+    let mut cover_requests = Vec::new();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let LoadState::Ready(data) = &app.state else {
+                unreachable!()
+            };
+            let _ = show_gamer_view(
+                ui,
+                Some(data),
+                GamerViewViewState {
+                    filter: "",
+                    library_filters: &mut app.library_filters,
+                    archive_context: &mut app.archive_context,
+                    screen: &mut app.gamer_view_screen,
+                    busy: false,
+                    block_reason: None,
+                    cleanup_after_unmount: false,
+                    cheat_workflow: app.cheat_workflow.as_ref(),
+                    feedback: None,
+                    artwork_directory: None,
+                    artwork_cache: &mut app.platform_artwork_cache,
+                    covers: &mut app.gamer_covers,
+                    cover_requests: &mut cover_requests,
+                    game_metadata: None,
+                    play_action: &play_action,
+                },
+            );
+        });
+    });
+    assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
+}
+
+#[test]
+fn library_selected_archive_panel_renders_the_selected_evidence_report() {
+    let path = PathBuf::from("/roms/aladdin.gb");
+    let mut selected_evidence = ready_selected_evidence_state(&path);
+    if let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
+        &mut selected_evidence
+    {
+        report
+            .structural_facts
+            .push(archivefs_core::content_evidence::ContentEvidence::new(
+                archivefs_core::content_evidence::ContentEvidenceKind::BootStructure,
+                "Game Boy header",
+                archivefs_core::content_evidence::ContentEvidenceConfidence::Strong,
+                "Game Boy header was read from the selected file",
+            ));
+    }
+    let selected_report = match &selected_evidence {
+        selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+            Some(report.as_ref())
+        }
+        _ => None,
+    };
+    let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
+    game.metadata.platform = Some("Game Boy".to_string());
+    let EmptySelectedArchiveViewStateParts {
+        mut confirm_unmount,
+        mut confirm_lazy_unmount,
+        mut focus_lazy_cancel,
+        lazy_unmount_offers,
+        remount_offers,
+        mut cleanup_after_unmount,
+        mut platform_choice,
+        mut platform_custom_text,
+        mut clipboard,
+    } = empty_selected_archive_view_state_parts();
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_selected_archive(
+                ui,
+                Some(&game),
+                None,
+                &[],
+                None,
+                None,
+                SelectedArchiveViewState {
+                    operation: None,
+                    busy: false,
+                    block_reason: None,
+                    action_readiness_debug_lines: &[],
+                    confirm_unmount: &mut confirm_unmount,
+                    confirm_lazy_unmount: &mut confirm_lazy_unmount,
+                    focus_lazy_cancel: &mut focus_lazy_cancel,
+                    lazy_unmount_offers: &lazy_unmount_offers,
+                    remount_offers: &remount_offers,
+                    cleanup_after_unmount: &mut cleanup_after_unmount,
+                    platform_choice: &mut platform_choice,
+                    platform_custom_text: &mut platform_custom_text,
+                    platform_busy: false,
+                    clipboard: &mut clipboard,
+                    selected_evidence: selected_report,
+                },
+            );
+        });
+    });
+    assert!(rendered_text_contains(&output, "Structural evidence"));
+    assert!(rendered_text_contains(&output, "Game Boy header"));
+}
+
+#[test]
 fn gamer_view_renders_without_a_romm_catalogue_and_contacts_nothing() {
     // The cover column draws on every Gamer View frame. With no RomM
     // catalogue imported - a clean install, or an import that never ran -
