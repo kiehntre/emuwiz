@@ -6237,13 +6237,11 @@ pub(crate) fn show_dat_sources_page(
         action = Some(plan_action);
     }
 
-    // The gated apply/recovery section. The user reviews the built transaction
-    // and confirms; the core executor performs any rename on a worker thread.
-    if action.is_none()
-        && let Some(apply_action) = show_rename_apply_section(ui, &view.rename_apply, ui_state)
-    {
-        action = Some(apply_action);
-    }
+    // Rename planning and journal/recovery history belong to Identify & Rename
+    // and History & Logs. DAT Sources remains a catalogue-management surface;
+    // keeping settled rename transactions out of this page prevents unrelated
+    // old smoke-test records from looking like DAT health warnings. The data is
+    // retained and the task-oriented Identify & Rename page still renders it.
 
     if !view.load_problems.is_empty() || !view.unresolved.is_empty() {
         ui.add_space(10.0);

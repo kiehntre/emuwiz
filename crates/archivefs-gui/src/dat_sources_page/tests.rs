@@ -5305,18 +5305,13 @@ fn an_applied_transaction_is_rediscovered_after_restart_and_rollbackable() {
     assert_eq!(recovery[0].applied_count, 1);
     let id = recovery[0].transaction_id.clone();
 
-    // The page shows it as Applied and offers the roll-back control.
+    // DAT Sources owns catalogue management only. The applied journal remains
+    // available in the view model for Identify & Rename / History & Logs, but
+    // settled rename history is not rendered inline here.
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(&output, "Applied"));
-    assert!(rendered_text_contains(&output, "Roll back transaction"));
-    // Post-v0.8 usability pass: the primary line leads with a human
-    // summary of what was actually renamed, not the raw transaction ID -
-    // the ID is still available, but only behind Technical details.
-    assert!(rendered_text_contains(
-        &output,
-        "Renamed \"game0.bin\" -> \"Game 0 (Europe).bin\""
-    ));
+    assert!(!rendered_text_contains(&output, "Roll back transaction"));
+    assert!(!rendered_text_contains(&output, "Renamed \"game0.bin\""));
     assert!(
         !rendered_text_contains(&output, &id),
         "the raw transaction ID must not appear on the primary line"
@@ -5410,9 +5405,9 @@ fn the_apply_section_renders_at_a_narrow_compact_width() {
     let view = page.view();
     let mut ui_state = DatSourcesPageUi::default();
     let output = render_at_width(&view, &mut ui_state, 700.0);
-    assert!(rendered_text_contains(&output, "Review approved renames"));
-    assert!(rendered_text_contains(&output, "Apply approved renames"));
-    assert!(rendered_text_contains(&output, "game0.bin"));
+    assert!(rendered_text_contains(&output, "Local DAT Sources"));
+    assert!(!rendered_text_contains(&output, "Review approved renames"));
+    assert!(!rendered_text_contains(&output, "Rename transactions"));
 }
 
 #[test]
