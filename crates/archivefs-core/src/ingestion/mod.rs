@@ -50,6 +50,5 @@ pub use content_registry::ContentKind;
 pub use discovery::{
     DiscoveredStructuralEvidence, DiscoveryError, DiscoveryStats, GameDiscovery, IdentitySummary,
     SkipReason, SkipReasonCounts, SourceDiscoveryReport, ValidationState, discover_source,
-    discover_source_with_whdload_dat,
-    is_known_non_game_extension,
+    discover_source_with_whdload_dat, is_known_non_game_extension,
 };

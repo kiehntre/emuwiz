@@ -608,14 +608,26 @@ mod tests {
 
         let mono_evidence = &observation.members[0].evidence;
         let color_evidence = &observation.members[1].evidence;
-        assert!(mono_evidence.iter().any(|item| item.value == "Monochrome (NGP)"));
-        assert!(color_evidence.iter().any(|item| item.value == "Color (NGPC)"));
+        assert!(
+            mono_evidence
+                .iter()
+                .any(|item| item.value == "Monochrome (NGP)")
+        );
+        assert!(
+            color_evidence
+                .iter()
+                .any(|item| item.value == "Color (NGPC)")
+        );
         assert_eq!(
-            crate::ngp_header_evidence::parse_ngp_header(&mono).unwrap().system_flag,
+            crate::ngp_header_evidence::parse_ngp_header(&mono)
+                .unwrap()
+                .system_flag,
             crate::ngp_header_evidence::NgpSystemFlag::Monochrome
         );
         assert_eq!(
-            crate::ngp_header_evidence::parse_ngp_header(&color).unwrap().system_flag,
+            crate::ngp_header_evidence::parse_ngp_header(&color)
+                .unwrap()
+                .system_flag,
             crate::ngp_header_evidence::NgpSystemFlag::Color
         );
     }

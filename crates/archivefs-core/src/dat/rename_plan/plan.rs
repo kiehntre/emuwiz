@@ -2364,7 +2364,12 @@ mod tests {
         // would rename this to "Disk Only Game.zip".
         let archive = write(dir.path(), "unrelated.zip");
         let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
-        out.archives = vec![archive_audit(&archive, complete_pass(), "Disk Only Game", 1)];
+        out.archives = vec![archive_audit(
+            &archive,
+            complete_pass(),
+            "Disk Only Game",
+            1,
+        )];
         out.sets = vec![set_resolution(
             Path::new(""),
             "Disk Only Game",
@@ -2376,7 +2381,10 @@ mod tests {
             build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
 
         assert!(
-            !plan.proposals.iter().any(|proposal| proposal.is_outer_archive),
+            !plan
+                .proposals
+                .iter()
+                .any(|proposal| proposal.is_outer_archive),
             "a disk-only set must never produce an outer-archive rename proposal"
         );
     }

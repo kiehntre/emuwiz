@@ -329,8 +329,14 @@ mod tests {
 
     #[test]
     fn neo_geo_pocket_extensions_are_cartridge_content() {
-        assert_eq!(content_kind_for_extension("ngp"), Some(ContentKind::RomCartridge));
-        assert_eq!(content_kind_for_extension("ngc"), Some(ContentKind::RomCartridge));
+        assert_eq!(
+            content_kind_for_extension("ngp"),
+            Some(ContentKind::RomCartridge)
+        );
+        assert_eq!(
+            content_kind_for_extension("ngc"),
+            Some(ContentKind::RomCartridge)
+        );
     }
 
     #[test]

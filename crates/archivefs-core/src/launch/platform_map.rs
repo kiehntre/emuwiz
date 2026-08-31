@@ -618,7 +618,10 @@ mod tests {
     fn multi_system_core_does_not_match_an_unrelated_platform() {
         assert!(!retroarch_platform_matches(&genesis_plus_gx_real(), "PSX"));
         assert!(!retroarch_platform_matches(&genesis_plus_gx_real(), "N64"));
-        assert!(!retroarch_platform_matches(&gambatte_real(), "Game Boy Advance"));
+        assert!(!retroarch_platform_matches(
+            &gambatte_real(),
+            "Game Boy Advance"
+        ));
         assert!(!retroarch_platform_matches(&mgba_real(), "SNES"));
     }
 
@@ -627,23 +630,40 @@ mod tests {
         // No database at all: only the single resolvable candidate matches.
         let systemname_only = found(Some("Game Boy/Game Boy Color/Game Boy Advance"), None);
         assert!(retroarch_platform_matches(&systemname_only, "Game Boy"));
-        assert!(!retroarch_platform_matches(&systemname_only, "Game Boy Color"));
-        assert!(!retroarch_platform_matches(&systemname_only, "Game Boy Advance"));
+        assert!(!retroarch_platform_matches(
+            &systemname_only,
+            "Game Boy Color"
+        ));
+        assert!(!retroarch_platform_matches(
+            &systemname_only,
+            "Game Boy Advance"
+        ));
 
-        for junk in ["", "|||", "   |   ", "Not - A - Real - System|also nonsense"] {
+        for junk in [
+            "",
+            "|||",
+            "   |   ",
+            "Not - A - Real - System|also nonsense",
+        ] {
             let info = found(None, Some(junk));
             assert!(!retroarch_platform_matches(&info, "MegaDrive"));
             assert!(!retroarch_platform_matches(&info, "Game Boy"));
         }
 
-        assert!(!retroarch_platform_matches(&CoreInfoFinding::Missing, "NES"));
+        assert!(!retroarch_platform_matches(
+            &CoreInfoFinding::Missing,
+            "NES"
+        ));
     }
 
     #[test]
     fn sega_cd_database_alternative_still_matches() {
         // The previous Sega CD-only special case is preserved by the general rule,
         // for both the real and the older fabricated systemname shapes.
-        assert!(retroarch_platform_matches(&genesis_plus_gx_real(), "Sega CD"));
+        assert!(retroarch_platform_matches(
+            &genesis_plus_gx_real(),
+            "Sega CD"
+        ));
         let fabricated = found(
             Some("Sega - MS/GG/MD/CD"),
             Some(

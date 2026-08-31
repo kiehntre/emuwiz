@@ -358,7 +358,12 @@ pub fn discover_source_with_whdload_dat(
         if extension_lowercase(path).as_deref() == Some("cue") {
             continue; // already handled above
         }
-        items.push(discover_file(path, root, whdload_dat, &mut structural_evidence));
+        items.push(discover_file(
+            path,
+            root,
+            whdload_dat,
+            &mut structural_evidence,
+        ));
     }
 
     let mut stats = DiscoveryStats::default();

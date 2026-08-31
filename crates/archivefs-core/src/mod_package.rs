@@ -46,9 +46,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::game_identity::{
-    GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus,
-};
+use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus};
 
 pub const LOCAL_MOD_PACKAGE_MANIFEST: &str = "emuwiz.mod.json";
 pub const LOCAL_MOD_PACKAGE_FORMAT_VERSION: u32 = 1;
@@ -539,7 +537,10 @@ fn validate_root(
         block(
             plan,
             unsafe_kind,
-            format!("root must be an absolute non-root path without traversal: {}", root.display()),
+            format!(
+                "root must be an absolute non-root path without traversal: {}",
+                root.display()
+            ),
         );
         return false;
     }
@@ -569,7 +570,11 @@ fn validate_root(
                 return false;
             }
             Err(error) => {
-                block(plan, unsafe_kind, format!("cannot inspect root {}: {error}", root.display()));
+                block(
+                    plan,
+                    unsafe_kind,
+                    format!("cannot inspect root {}: {error}", root.display()),
+                );
                 return false;
             }
         }
@@ -589,7 +594,11 @@ fn validate_root(
             false
         }
         Err(error) => {
-            block(plan, unsafe_kind, format!("cannot inspect root {}: {error}", root.display()));
+            block(
+                plan,
+                unsafe_kind,
+                format!("cannot inspect root {}: {error}", root.display()),
+            );
             false
         }
     }
@@ -603,7 +612,11 @@ fn scan_package(package_root: &Path, plan: &mut LocalModPackagePlan) -> bool {
         let read_dir = match fs::read_dir(&directory) {
             Ok(read_dir) => read_dir,
             Err(error) => {
-                block(plan, ModPlanBlockerKind::PackagePathUnsafe, format!("cannot read {}: {error}", directory.display()));
+                block(
+                    plan,
+                    ModPlanBlockerKind::PackagePathUnsafe,
+                    format!("cannot read {}: {error}", directory.display()),
+                );
                 return false;
             }
         };
@@ -611,29 +624,49 @@ fn scan_package(package_root: &Path, plan: &mut LocalModPackagePlan) -> bool {
             let item = match item {
                 Ok(item) => item,
                 Err(error) => {
-                    block(plan, ModPlanBlockerKind::PackagePathUnsafe, format!("cannot enumerate package: {error}"));
+                    block(
+                        plan,
+                        ModPlanBlockerKind::PackagePathUnsafe,
+                        format!("cannot enumerate package: {error}"),
+                    );
                     return false;
                 }
             };
             let path = item.path();
             if path.to_string_lossy().len() > MAX_LOCAL_MOD_PACKAGE_PATH_BYTES {
-                block(plan, ModPlanBlockerKind::PackageLimitExceeded, "package entry path exceeds the path-length limit");
+                block(
+                    plan,
+                    ModPlanBlockerKind::PackageLimitExceeded,
+                    "package entry path exceeds the path-length limit",
+                );
                 return false;
             }
             entries = entries.saturating_add(1);
             if entries > MAX_LOCAL_MOD_PACKAGE_ENTRIES {
-                block(plan, ModPlanBlockerKind::PackageLimitExceeded, "package entry count exceeds the limit");
+                block(
+                    plan,
+                    ModPlanBlockerKind::PackageLimitExceeded,
+                    "package entry count exceeds the limit",
+                );
                 return false;
             }
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    block(plan, ModPlanBlockerKind::PackagePathUnsafe, format!("cannot inspect {}: {error}", path.display()));
+                    block(
+                        plan,
+                        ModPlanBlockerKind::PackagePathUnsafe,
+                        format!("cannot inspect {}: {error}", path.display()),
+                    );
                     return false;
                 }
             };
             if metadata.file_type().is_symlink() {
-                block(plan, ModPlanBlockerKind::UnsafeSymlink, format!("package contains symlink {}", path.display()));
+                block(
+                    plan,
+                    ModPlanBlockerKind::UnsafeSymlink,
+                    format!("package contains symlink {}", path.display()),
+                );
                 return false;
             }
             if metadata.is_dir() {
@@ -641,11 +674,19 @@ fn scan_package(package_root: &Path, plan: &mut LocalModPackagePlan) -> bool {
             } else if metadata.is_file() {
                 bytes = bytes.saturating_add(metadata.len());
                 if bytes > MAX_LOCAL_MOD_PACKAGE_BYTES {
-                    block(plan, ModPlanBlockerKind::PackageLimitExceeded, "package byte size exceeds the limit");
+                    block(
+                        plan,
+                        ModPlanBlockerKind::PackageLimitExceeded,
+                        "package byte size exceeds the limit",
+                    );
                     return false;
                 }
             } else {
-                block(plan, ModPlanBlockerKind::UnsafePackageEntry, format!("package contains non-regular entry {}", path.display()));
+                block(
+                    plan,
+                    ModPlanBlockerKind::UnsafePackageEntry,
+                    format!("package contains non-regular entry {}", path.display()),
+                );
                 return false;
             }
         }
@@ -658,56 +699,119 @@ fn read_manifest(package_root: &Path, plan: &mut LocalModPackagePlan) -> Option<
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            block(plan, ModPlanBlockerKind::UnsafeSymlink, "manifest must not be a symlink");
+            block(
+                plan,
+                ModPlanBlockerKind::UnsafeSymlink,
+                "manifest must not be a symlink",
+            );
             return None;
         }
         Ok(_) => {
-            block(plan, ModPlanBlockerKind::ManifestMalformed, "manifest is not a regular file");
+            block(
+                plan,
+                ModPlanBlockerKind::ManifestMalformed,
+                "manifest is not a regular file",
+            );
             return None;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            block(plan, ModPlanBlockerKind::ManifestMissing, "package has no emuwiz.mod.json manifest");
+            block(
+                plan,
+                ModPlanBlockerKind::ManifestMissing,
+                "package has no emuwiz.mod.json manifest",
+            );
             return None;
         }
         Err(error) => {
-            block(plan, ModPlanBlockerKind::ManifestMalformed, format!("cannot inspect manifest: {error}"));
+            block(
+                plan,
+                ModPlanBlockerKind::ManifestMalformed,
+                format!("cannot inspect manifest: {error}"),
+            );
             return None;
         }
     };
     if metadata.len() > MAX_LOCAL_MOD_PACKAGE_MANIFEST_BYTES {
-        block(plan, ModPlanBlockerKind::PackageLimitExceeded, "manifest exceeds the byte limit");
+        block(
+            plan,
+            ModPlanBlockerKind::PackageLimitExceeded,
+            "manifest exceeds the byte limit",
+        );
         return None;
     }
-    let Some(bytes) = read_regular_file(&path, MAX_LOCAL_MOD_PACKAGE_MANIFEST_BYTES, plan, ModPlanBlockerKind::ManifestMalformed) else {
+    let Some(bytes) = read_regular_file(
+        &path,
+        MAX_LOCAL_MOD_PACKAGE_MANIFEST_BYTES,
+        plan,
+        ModPlanBlockerKind::ManifestMalformed,
+    ) else {
         return None;
     };
     match serde_json::from_slice(&bytes) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
-            block(plan, ModPlanBlockerKind::ManifestMalformed, format!("manifest JSON is invalid: {error}"));
+            block(
+                plan,
+                ModPlanBlockerKind::ManifestMalformed,
+                format!("manifest JSON is invalid: {error}"),
+            );
             None
         }
     }
 }
 
-fn validate_metadata(raw: &RawManifest, plan: &mut LocalModPackagePlan) -> Option<LocalModPackageMetadata> {
-    let required = [&raw.package_id, &raw.title, &raw.version, &raw.provenance.source];
+fn validate_metadata(
+    raw: &RawManifest,
+    plan: &mut LocalModPackagePlan,
+) -> Option<LocalModPackageMetadata> {
+    let required = [
+        &raw.package_id,
+        &raw.title,
+        &raw.version,
+        &raw.provenance.source,
+    ];
     if required.iter().any(|value| !valid_text(value))
-        || raw.author.as_deref().is_some_and(|value| !valid_text(value))
-        || raw.description.as_deref().is_some_and(|value| !valid_text(value))
+        || raw
+            .author
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
+        || raw
+            .description
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
         || raw.supported_game.identities.is_empty()
         || raw.supported_game.identities.len() > MAX_LOCAL_MOD_PACKAGE_OPERATIONS
-        || raw.supported_game.identities.iter().any(|identity| !valid_text(&identity.value))
-        || raw.supported_game.region.as_deref().is_some_and(|value| !valid_text(value))
-        || raw.supported_game.revision.as_deref().is_some_and(|value| !valid_text(value))
+        || raw
+            .supported_game
+            .identities
+            .iter()
+            .any(|identity| !valid_text(&identity.value))
+        || raw
+            .supported_game
+            .region
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
+        || raw
+            .supported_game
+            .revision
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
     {
-        block(plan, ModPlanBlockerKind::ManifestMalformed, "manifest metadata is missing, empty, or exceeds text limits");
+        block(
+            plan,
+            ModPlanBlockerKind::ManifestMalformed,
+            "manifest metadata is missing, empty, or exceeds text limits",
+        );
         return None;
     }
     let mut identities = BTreeSet::new();
     for identity in &raw.supported_game.identities {
         if !identities.insert((identity.kind, identity.value.clone())) {
-            block(plan, ModPlanBlockerKind::ManifestMalformed, "manifest repeats a supported identity requirement");
+            block(
+                plan,
+                ModPlanBlockerKind::ManifestMalformed,
+                "manifest repeats a supported identity requirement",
+            );
             return None;
         }
     }
@@ -747,11 +851,19 @@ fn assess_compatibility(
     plan: &mut LocalModPackagePlan,
 ) {
     if identity.platform == IdentityPlatform::Other {
-        block(plan, ModPlanBlockerKind::PlatformUnknown, "selected game has no supported canonical platform");
+        block(
+            plan,
+            ModPlanBlockerKind::PlatformUnknown,
+            "selected game has no supported canonical platform",
+        );
         return;
     }
     if identity.platform != package.supported_platform.identity_platform() {
-        block(plan, ModPlanBlockerKind::PlatformMismatch, "package canonical platform does not match the selected game");
+        block(
+            plan,
+            ModPlanBlockerKind::PlatformMismatch,
+            "package canonical platform does not match the selected game",
+        );
         plan.compatibility.state = ModCompatibilityState::Incompatible;
         return;
     }
@@ -763,8 +875,15 @@ fn assess_compatibility(
             .iter()
             .filter(|item| item.kind == required.kind.identity_kind())
             .collect();
-        if evidence.iter().any(|item| item.status == IdentityStatus::Ambiguous) {
-            block(plan, ModPlanBlockerKind::GameIdentityAmbiguous, "selected game has ambiguous declared identity evidence");
+        if evidence
+            .iter()
+            .any(|item| item.status == IdentityStatus::Ambiguous)
+        {
+            block(
+                plan,
+                ModPlanBlockerKind::GameIdentityAmbiguous,
+                "selected game has ambiguous declared identity evidence",
+            );
             return;
         }
         let verified: BTreeSet<_> = evidence
@@ -773,7 +892,11 @@ fn assess_compatibility(
             .filter_map(|item| item.value.as_deref())
             .collect();
         if verified.len() > 1 {
-            block(plan, ModPlanBlockerKind::GameIdentityConflicting, "selected game has conflicting verified identity evidence");
+            block(
+                plan,
+                ModPlanBlockerKind::GameIdentityConflicting,
+                "selected game has conflicting verified identity evidence",
+            );
             return;
         }
         if let Some(value) = verified.first() {
@@ -799,22 +922,42 @@ fn assess_compatibility(
     plan.compatibility.matching_identity = Some(matched);
     if let Some(required_region) = package.supported_game.region.as_deref() {
         match verified_identity_value(identity, IdentityKind::DolphinRegion) {
-            Some(value) if value.eq_ignore_ascii_case(required_region) => plan.compatibility.region_matches = Some(true),
+            Some(value) if value.eq_ignore_ascii_case(required_region) => {
+                plan.compatibility.region_matches = Some(true)
+            }
             Some(_) => {
                 plan.compatibility.region_matches = Some(false);
-                block(plan, ModPlanBlockerKind::RegionMismatch, "package region does not match selected game evidence");
+                block(
+                    plan,
+                    ModPlanBlockerKind::RegionMismatch,
+                    "package region does not match selected game evidence",
+                );
             }
-            None => block(plan, ModPlanBlockerKind::RegionUnavailable, "package requires a region but selected game has no verified region evidence"),
+            None => block(
+                plan,
+                ModPlanBlockerKind::RegionUnavailable,
+                "package requires a region but selected game has no verified region evidence",
+            ),
         }
     }
     if let Some(required_revision) = package.supported_game.revision.as_deref() {
         match verified_identity_value(identity, IdentityKind::DolphinRevision) {
-            Some(value) if value == required_revision => plan.compatibility.revision_matches = Some(true),
+            Some(value) if value == required_revision => {
+                plan.compatibility.revision_matches = Some(true)
+            }
             Some(_) => {
                 plan.compatibility.revision_matches = Some(false);
-                block(plan, ModPlanBlockerKind::RevisionMismatch, "package revision does not match selected game evidence");
+                block(
+                    plan,
+                    ModPlanBlockerKind::RevisionMismatch,
+                    "package revision does not match selected game evidence",
+                );
             }
-            None => block(plan, ModPlanBlockerKind::RevisionUnavailable, "package requires a revision but selected game has no verified revision evidence"),
+            None => block(
+                plan,
+                ModPlanBlockerKind::RevisionUnavailable,
+                "package requires a revision but selected game has no verified revision evidence",
+            ),
         }
     }
     if plan.blockers.is_empty() {
@@ -824,14 +967,19 @@ fn assess_compatibility(
     }
 }
 
-fn verified_identity_value<'a>(identity: &'a GameIdentityReport, kind: IdentityKind) -> Option<&'a str> {
+fn verified_identity_value<'a>(
+    identity: &'a GameIdentityReport,
+    kind: IdentityKind,
+) -> Option<&'a str> {
     let values: BTreeSet<_> = identity
         .evidence
         .iter()
         .filter(|item| item.kind == kind && item.status == IdentityStatus::Verified)
         .filter_map(|item| item.value.as_deref())
         .collect();
-    (values.len() == 1).then(|| values.into_iter().next()).flatten()
+    (values.len() == 1)
+        .then(|| values.into_iter().next())
+        .flatten()
 }
 
 fn inspect_operation(
@@ -846,28 +994,48 @@ fn inspect_operation(
         RawOperationKind::Delete => ModOperationKind::DeleteFile,
     };
     let Some(destination_relative) = safe_relative_path(&raw.destination) else {
-        block(plan, ModPlanBlockerKind::DestinationPathUnsafe, "operation destination must be a non-empty relative path without traversal");
+        block(
+            plan,
+            ModPlanBlockerKind::DestinationPathUnsafe,
+            "operation destination must be a non-empty relative path without traversal",
+        );
         return;
     };
     let destination_path = request.selected_game.game_root.join(&destination_relative);
     if !destination_path.starts_with(&request.selected_game.game_root) {
-        block(plan, ModPlanBlockerKind::DestinationEscapesGameRoot, "operation destination escapes the selected game root");
+        block(
+            plan,
+            ModPlanBlockerKind::DestinationEscapesGameRoot,
+            "operation destination escapes the selected game root",
+        );
         return;
     }
-    let destination_state = inspect_destination(&destination_path, &request.selected_game.game_root, plan);
+    let destination_state =
+        inspect_destination(&destination_path, &request.selected_game.game_root, plan);
     let needs_payload = !matches!(kind, ModOperationKind::DeleteFile);
     if needs_payload != raw.payload.is_some() {
-        block(plan, ModPlanBlockerKind::ManifestMalformed, "payload is required for create/replace/patch and forbidden for delete");
+        block(
+            plan,
+            ModPlanBlockerKind::ManifestMalformed,
+            "payload is required for create/replace/patch and forbidden for delete",
+        );
         return;
     }
     if matches!(kind, ModOperationKind::PatchFile) {
         block(
             plan,
             ModPlanBlockerKind::UnsupportedPatchFormat,
-            format!("patch operation {:?} is unsupported in the inspection-only foundation", raw.patch_format),
+            format!(
+                "patch operation {:?} is unsupported in the inspection-only foundation",
+                raw.patch_format
+            ),
         );
     } else if raw.patch_format.is_some() {
-        block(plan, ModPlanBlockerKind::ManifestMalformed, "patch_format is valid only for patch operations");
+        block(
+            plan,
+            ModPlanBlockerKind::ManifestMalformed,
+            "patch_format is valid only for patch operations",
+        );
         return;
     }
 
@@ -884,17 +1052,30 @@ fn inspect_operation(
         patch_format: raw.patch_format,
     };
     if raw.payload.is_some() && operation.payload_path.is_none() {
-        block(plan, ModPlanBlockerKind::PayloadPathUnsafe, "operation payload must be a non-empty relative path without traversal");
+        block(
+            plan,
+            ModPlanBlockerKind::PayloadPathUnsafe,
+            "operation payload must be a non-empty relative path without traversal",
+        );
         return;
     }
     if let Some(payload_relative) = operation.payload_path.as_ref() {
         let payload_path = request.package_root.join(payload_relative);
         operation.source_path = Some(payload_path.clone());
-        if let Some(digest) = hash_path(&payload_path, MAX_LOCAL_MOD_PACKAGE_BYTES, plan, ModPlanBlockerKind::PayloadMissing) {
+        if let Some(digest) = hash_path(
+            &payload_path,
+            MAX_LOCAL_MOD_PACKAGE_BYTES,
+            plan,
+            ModPlanBlockerKind::PayloadMissing,
+        ) {
             operation.observed_payload_sha256 = Some(digest.clone());
             if let Some(expected) = operation.expected_result_sha256.as_deref() {
                 if !valid_sha256(expected) || !digest.eq_ignore_ascii_case(expected) {
-                    block(plan, ModPlanBlockerKind::ExpectedResultHashMismatch, "payload hash does not match expected_result_sha256");
+                    block(
+                        plan,
+                        ModPlanBlockerKind::ExpectedResultHashMismatch,
+                        "payload hash does not match expected_result_sha256",
+                    );
                 }
             }
         }
@@ -908,32 +1089,50 @@ fn inspect_operation(
                 detail: "create operation would overwrite an existing destination".to_string(),
             }),
         },
-        ModOperationKind::ReplaceFile | ModOperationKind::PatchFile => match operation.destination_state {
-            ProposedFileState::ExistingRegularFile => {
-                if let Some(expected) = operation.required_source_sha256.as_deref() {
-                    if !valid_sha256(expected) {
-                        block(plan, ModPlanBlockerKind::ManifestMalformed, "required_source_sha256 must be a SHA-256 hex digest");
-                    } else if let Some(observed) = hash_path(&destination_path, MAX_LOCAL_MOD_PACKAGE_BYTES, plan, ModPlanBlockerKind::PayloadMissing) {
-                        operation.observed_source_sha256 = Some(observed.clone());
-                        if !observed.eq_ignore_ascii_case(expected) {
-                            block(plan, ModPlanBlockerKind::SourceHashMismatch, "destination source hash does not match required_source_sha256");
+        ModOperationKind::ReplaceFile | ModOperationKind::PatchFile => {
+            match operation.destination_state {
+                ProposedFileState::ExistingRegularFile => {
+                    if let Some(expected) = operation.required_source_sha256.as_deref() {
+                        if !valid_sha256(expected) {
+                            block(
+                                plan,
+                                ModPlanBlockerKind::ManifestMalformed,
+                                "required_source_sha256 must be a SHA-256 hex digest",
+                            );
+                        } else if let Some(observed) = hash_path(
+                            &destination_path,
+                            MAX_LOCAL_MOD_PACKAGE_BYTES,
+                            plan,
+                            ModPlanBlockerKind::PayloadMissing,
+                        ) {
+                            operation.observed_source_sha256 = Some(observed.clone());
+                            if !observed.eq_ignore_ascii_case(expected) {
+                                block(
+                                    plan,
+                                    ModPlanBlockerKind::SourceHashMismatch,
+                                    "destination source hash does not match required_source_sha256",
+                                );
+                            }
                         }
                     }
                 }
+                ProposedFileState::Missing => plan.conflicts.push(ModPlanConflict {
+                    kind: ModPlanConflictKind::RequiredSourceMissing,
+                    destination_path,
+                    detail: "replace/patch operation requires an existing source file".to_string(),
+                }),
+                _ => plan.conflicts.push(ModPlanConflict {
+                    kind: ModPlanConflictKind::DestinationIsNotRegularFile,
+                    destination_path,
+                    detail: "replace/patch destination is not a regular file".to_string(),
+                }),
             }
-            ProposedFileState::Missing => plan.conflicts.push(ModPlanConflict {
-                kind: ModPlanConflictKind::RequiredSourceMissing,
-                destination_path,
-                detail: "replace/patch operation requires an existing source file".to_string(),
-            }),
-            _ => plan.conflicts.push(ModPlanConflict {
-                kind: ModPlanConflictKind::DestinationIsNotRegularFile,
-                destination_path,
-                detail: "replace/patch destination is not a regular file".to_string(),
-            }),
-        },
+        }
         ModOperationKind::DeleteFile => {
-            if !matches!(operation.destination_state, ProposedFileState::ExistingRegularFile) {
+            if !matches!(
+                operation.destination_state,
+                ProposedFileState::ExistingRegularFile
+            ) {
                 plan.conflicts.push(ModPlanConflict {
                     kind: ModPlanConflictKind::RequiredSourceMissing,
                     destination_path,
@@ -964,7 +1163,10 @@ fn safe_relative_path(raw: &str) -> Option<PathBuf> {
 
 fn has_unsafe_path_components(path: &Path) -> bool {
     path.components().any(|component| {
-        matches!(component, Component::ParentDir | Component::CurDir | Component::RootDir | Component::Prefix(_))
+        matches!(
+            component,
+            Component::ParentDir | Component::CurDir | Component::RootDir | Component::Prefix(_)
+        )
     })
 }
 
@@ -974,15 +1176,26 @@ fn has_unsafe_path_components(path: &Path) -> bool {
 /// `..`/`.` components make the path unsafe.
 fn has_traversal_components(path: &Path) -> bool {
     path.components().any(|component| {
-        matches!(component, Component::ParentDir | Component::CurDir | Component::Prefix(_))
+        matches!(
+            component,
+            Component::ParentDir | Component::CurDir | Component::Prefix(_)
+        )
     })
 }
 
-fn inspect_destination(path: &Path, game_root: &Path, plan: &mut LocalModPackagePlan) -> ProposedFileState {
+fn inspect_destination(
+    path: &Path,
+    game_root: &Path,
+    plan: &mut LocalModPackagePlan,
+) -> ProposedFileState {
     let relative = match path.strip_prefix(game_root) {
         Ok(relative) => relative,
         Err(_) => {
-            block(plan, ModPlanBlockerKind::DestinationEscapesGameRoot, "destination is outside selected game root");
+            block(
+                plan,
+                ModPlanBlockerKind::DestinationEscapesGameRoot,
+                "destination is outside selected game root",
+            );
             return ProposedFileState::Unavailable;
         }
     };
@@ -991,15 +1204,28 @@ fn inspect_destination(path: &Path, game_root: &Path, plan: &mut LocalModPackage
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                block(plan, ModPlanBlockerKind::UnsafeSymlink, format!("destination has unsafe symlink component {}", current.display()));
+                block(
+                    plan,
+                    ModPlanBlockerKind::UnsafeSymlink,
+                    format!(
+                        "destination has unsafe symlink component {}",
+                        current.display()
+                    ),
+                );
                 return ProposedFileState::Unavailable;
             }
-            Ok(metadata) if current == path && metadata.is_file() => return ProposedFileState::ExistingRegularFile,
-            Ok(metadata) if current == path && metadata.is_dir() => return ProposedFileState::ExistingDirectory,
+            Ok(metadata) if current == path && metadata.is_file() => {
+                return ProposedFileState::ExistingRegularFile;
+            }
+            Ok(metadata) if current == path && metadata.is_dir() => {
+                return ProposedFileState::ExistingDirectory;
+            }
             Ok(_) if current == path => return ProposedFileState::ExistingSpecialFile,
             Ok(metadata) if !metadata.is_dir() => return ProposedFileState::Unavailable,
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ProposedFileState::Missing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ProposedFileState::Missing;
+            }
             Err(_) => return ProposedFileState::Unavailable,
         }
     }
@@ -1014,28 +1240,53 @@ fn hash_path(
 ) -> Option<String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            block(plan, ModPlanBlockerKind::UnsafeSymlink, format!("refusing symlink {}", path.display()));
+            block(
+                plan,
+                ModPlanBlockerKind::UnsafeSymlink,
+                format!("refusing symlink {}", path.display()),
+            );
             return None;
         }
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => {
-            block(plan, ModPlanBlockerKind::PayloadNotRegularFile, format!("not a regular file: {}", path.display()));
+            block(
+                plan,
+                ModPlanBlockerKind::PayloadNotRegularFile,
+                format!("not a regular file: {}", path.display()),
+            );
             return None;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            block(plan, missing_kind, format!("missing required file: {}", path.display()));
+            block(
+                plan,
+                missing_kind,
+                format!("missing required file: {}", path.display()),
+            );
             return None;
         }
         Err(error) => {
-            block(plan, ModPlanBlockerKind::PayloadNotRegularFile, format!("cannot inspect {}: {error}", path.display()));
+            block(
+                plan,
+                ModPlanBlockerKind::PayloadNotRegularFile,
+                format!("cannot inspect {}: {error}", path.display()),
+            );
             return None;
         }
     };
     if metadata.len() > maximum {
-        block(plan, ModPlanBlockerKind::PackageLimitExceeded, format!("file exceeds byte limit: {}", path.display()));
+        block(
+            plan,
+            ModPlanBlockerKind::PackageLimitExceeded,
+            format!("file exceeds byte limit: {}", path.display()),
+        );
         return None;
     }
-    let Some(bytes) = read_regular_file(path, maximum, plan, ModPlanBlockerKind::PayloadNotRegularFile) else {
+    let Some(bytes) = read_regular_file(
+        path,
+        maximum,
+        plan,
+        ModPlanBlockerKind::PayloadNotRegularFile,
+    ) else {
         return None;
     };
     Some(sha256_hex(&bytes))
@@ -1050,16 +1301,28 @@ fn read_regular_file(
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
         Ok(_) => {
-            block(plan, error_kind, format!("not a safe regular file: {}", path.display()));
+            block(
+                plan,
+                error_kind,
+                format!("not a safe regular file: {}", path.display()),
+            );
             return None;
         }
         Err(error) => {
-            block(plan, error_kind, format!("cannot inspect {}: {error}", path.display()));
+            block(
+                plan,
+                error_kind,
+                format!("cannot inspect {}: {error}", path.display()),
+            );
             return None;
         }
     };
     if before.len() > maximum {
-        block(plan, ModPlanBlockerKind::PackageLimitExceeded, format!("file exceeds byte limit: {}", path.display()));
+        block(
+            plan,
+            ModPlanBlockerKind::PackageLimitExceeded,
+            format!("file exceeds byte limit: {}", path.display()),
+        );
         return None;
     }
     let mut options = OpenOptions::new();
@@ -1072,25 +1335,41 @@ fn read_regular_file(
     let file = match options.open(path) {
         Ok(file) => file,
         Err(error) => {
-            block(plan, error_kind, format!("cannot read {}: {error}", path.display()));
+            block(
+                plan,
+                error_kind,
+                format!("cannot read {}: {error}", path.display()),
+            );
             return None;
         }
     };
     let mut limited: Take<File> = file.take(maximum.saturating_add(1));
     let mut bytes = Vec::with_capacity(before.len() as usize);
     if limited.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > maximum {
-        block(plan, error_kind, format!("cannot safely read {}", path.display()));
+        block(
+            plan,
+            error_kind,
+            format!("cannot safely read {}", path.display()),
+        );
         return None;
     }
     let after = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => {
-            block(plan, error_kind, format!("file changed during inspection: {}", path.display()));
+            block(
+                plan,
+                error_kind,
+                format!("file changed during inspection: {}", path.display()),
+            );
             return None;
         }
     };
     if after.file_type().is_symlink() || after.len() != before.len() {
-        block(plan, error_kind, format!("file changed during inspection: {}", path.display()));
+        block(
+            plan,
+            error_kind,
+            format!("file changed during inspection: {}", path.display()),
+        );
         return None;
     }
     Some(bytes)
@@ -1121,7 +1400,11 @@ fn detect_duplicate_destinations(plan: &mut LocalModPackagePlan) {
             destination_path: destination_path.clone(),
             detail: format!("{count} package operations declare the same destination"),
         });
-        block(plan, ModPlanBlockerKind::DuplicateDestination, "package contains duplicate operation destinations");
+        block(
+            plan,
+            ModPlanBlockerKind::DuplicateDestination,
+            "package contains duplicate operation destinations",
+        );
     }
 }
 
@@ -1137,7 +1420,11 @@ mod tests {
         IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityProvenance,
     };
 
-    fn report(path: PathBuf, platform: IdentityPlatform, evidence: Vec<(IdentityKind, IdentityStatus, &str)>) -> GameIdentityReport {
+    fn report(
+        path: PathBuf,
+        platform: IdentityPlatform,
+        evidence: Vec<(IdentityKind, IdentityStatus, &str)>,
+    ) -> GameIdentityReport {
         GameIdentityReport {
             archive_path: path,
             platform,
@@ -1180,7 +1467,15 @@ mod tests {
             LocalModPackageRequest {
                 selected_game: SelectedGameForMod {
                     game_root,
-                    identity: report(game, IdentityPlatform::Snes, vec![(IdentityKind::LooseRomSha256, IdentityStatus::Verified, "game-sha")]),
+                    identity: report(
+                        game,
+                        IdentityPlatform::Snes,
+                        vec![(
+                            IdentityKind::LooseRomSha256,
+                            IdentityStatus::Verified,
+                            "game-sha",
+                        )],
+                    ),
                 },
                 package_root: package_root.clone(),
             },
@@ -1208,7 +1503,11 @@ mod tests {
         let hash = sha256_hex(&payload);
         (
             manifest(
-                &format!(r#"{{"kind":"replace","payload":"payload/new.bin","destination":"game.bin","required_source_sha256":"{}","expected_result_sha256":"{}"}}"#, sha256_hex(b"original"), hash),
+                &format!(
+                    r#"{{"kind":"replace","payload":"payload/new.bin","destination":"game.bin","required_source_sha256":"{}","expected_result_sha256":"{}"}}"#,
+                    sha256_hex(b"original"),
+                    hash
+                ),
                 "",
             ),
             payload,
@@ -1254,8 +1553,26 @@ mod tests {
         request.selected_game.identity.platform = IdentityPlatform::GameCube;
         request.selected_game.identity.evidence = vec![
             request.selected_game.identity.evidence[0].clone(),
-            IdentityEvidence { kind: IdentityKind::DolphinRegion, status: IdentityStatus::Verified, value: Some("EUR".to_string()), confidence: IdentityConfidence::ExactBytes, provenance: request.selected_game.identity.evidence[0].provenance.clone(), diagnostic: String::new() },
-            IdentityEvidence { kind: IdentityKind::DolphinRevision, status: IdentityStatus::Verified, value: Some("2".to_string()), confidence: IdentityConfidence::ExactBytes, provenance: request.selected_game.identity.evidence[0].provenance.clone(), diagnostic: String::new() },
+            IdentityEvidence {
+                kind: IdentityKind::DolphinRegion,
+                status: IdentityStatus::Verified,
+                value: Some("EUR".to_string()),
+                confidence: IdentityConfidence::ExactBytes,
+                provenance: request.selected_game.identity.evidence[0]
+                    .provenance
+                    .clone(),
+                diagnostic: String::new(),
+            },
+            IdentityEvidence {
+                kind: IdentityKind::DolphinRevision,
+                status: IdentityStatus::Verified,
+                value: Some("2".to_string()),
+                confidence: IdentityConfidence::ExactBytes,
+                provenance: request.selected_game.identity.evidence[0]
+                    .provenance
+                    .clone(),
+                diagnostic: String::new(),
+            },
         ];
         let (manifest, payload) = valid_replace();
         let manifest = manifest.replace("\"snes\"", "\"game_cube\"").replace("\"identities\":[{\"kind\":\"loose_rom_sha256\",\"value\":\"game-sha\"}]", "\"identities\":[{\"kind\":\"loose_rom_sha256\",\"value\":\"game-sha\"}],\"region\":\"USA\",\"revision\":\"1\"");
@@ -1268,16 +1585,25 @@ mod tests {
         request.selected_game.identity.evidence[0].status = IdentityStatus::Ambiguous;
         let (manifest, payload) = valid_replace();
         write_package(&root, &manifest, Some(("payload/new.bin", &payload)));
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::GameIdentityAmbiguous));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::GameIdentityAmbiguous
+        ));
     }
 
     #[test]
     fn mod_package_rejects_missing_and_malformed_manifest() {
         let (_temp, request, _root) = setup();
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::ManifestMissing));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::ManifestMissing
+        ));
         let (_temp, request, root) = setup();
         write_package(&root, "{not json", None);
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::ManifestMalformed));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::ManifestMalformed
+        ));
     }
 
     #[test]
@@ -1285,14 +1611,20 @@ mod tests {
         let (_temp, request, root) = setup();
         let (manifest, _) = valid_replace();
         write_package(&root, &manifest, None);
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::PayloadMissing));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::PayloadMissing
+        ));
 
         for destination in ["/absolute.bin", "../escape.bin"] {
             let (_temp, request, root) = setup();
             let (manifest, payload) = valid_replace();
             let manifest = manifest.replace("\"game.bin\"", &format!("\"{destination}\""));
             write_package(&root, &manifest, Some(("payload/new.bin", &payload)));
-            assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::DestinationPathUnsafe));
+            assert!(has_blocker(
+                &inspect_local_mod_package(request),
+                ModPlanBlockerKind::DestinationPathUnsafe
+            ));
         }
     }
 
@@ -1304,37 +1636,64 @@ mod tests {
         let (manifest, _) = valid_replace();
         write_package(&root, &manifest, None);
         symlink("/tmp", root.join("payload")).unwrap();
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::UnsafeSymlink));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::UnsafeSymlink
+        ));
     }
 
     #[test]
     fn mod_package_rejects_duplicate_destinations_and_source_hash_mismatch() {
         let (_temp, request, root) = setup();
         let (operation, payload) = valid_replace();
-        let duplicate = operation.replacen("\"operations\":[", "\"operations\":[", 1).replace("] ,", "],");
-        let operation_json = duplicate.split("\"operations\":[").nth(1).unwrap().split("],\"provenance").next().unwrap();
+        let duplicate = operation
+            .replacen("\"operations\":[", "\"operations\":[", 1)
+            .replace("] ,", "],");
+        let operation_json = duplicate
+            .split("\"operations\":[")
+            .nth(1)
+            .unwrap()
+            .split("],\"provenance")
+            .next()
+            .unwrap();
         let manifest = manifest(&format!("{operation_json},{operation_json}"), "");
         write_package(&root, &manifest, Some(("payload/new.bin", &payload)));
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::DuplicateDestination));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::DuplicateDestination
+        ));
 
         let (_temp, request, root) = setup();
         let (manifest, payload) = valid_replace();
         let manifest = manifest.replace(&sha256_hex(b"original"), &"0".repeat(64));
         write_package(&root, &manifest, Some(("payload/new.bin", &payload)));
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::SourceHashMismatch));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::SourceHashMismatch
+        ));
     }
 
     #[test]
     fn mod_package_rejects_unsupported_patch_and_enforces_limits() {
         let (_temp, request, root) = setup();
         let patch = r#"{"kind":"patch","payload":"payload/p.ips","destination":"game.bin","patch_format":"ips"}"#;
-        write_package(&root, &manifest(patch, ""), Some(("payload/p.ips", b"patch")));
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::UnsupportedPatchFormat));
+        write_package(
+            &root,
+            &manifest(patch, ""),
+            Some(("payload/p.ips", b"patch")),
+        );
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::UnsupportedPatchFormat
+        ));
 
         let (_temp, request, root) = setup();
         let roots = vec![root; MAX_LOCAL_MOD_PACKAGE_CANDIDATES + 1];
         let candidates = inspect_local_mod_package_candidates(request.selected_game, &roots);
-        assert_eq!(candidates.blockers[0].kind, ModPlanBlockerKind::CandidateLimitExceeded);
+        assert_eq!(
+            candidates.blockers[0].kind,
+            ModPlanBlockerKind::CandidateLimitExceeded
+        );
 
         let (_temp, request, root) = setup();
         let (manifest, payload) = valid_replace();
@@ -1342,7 +1701,10 @@ mod tests {
         for index in 0..MAX_LOCAL_MOD_PACKAGE_ENTRIES {
             fs::write(root.join(format!("extra-{index}")), b"x").unwrap();
         }
-        assert!(has_blocker(&inspect_local_mod_package(request), ModPlanBlockerKind::PackageLimitExceeded));
+        assert!(has_blocker(
+            &inspect_local_mod_package(request),
+            ModPlanBlockerKind::PackageLimitExceeded
+        ));
     }
 
     #[test]
@@ -1353,7 +1715,11 @@ mod tests {
         let operations = format!(
             r#"{{"kind":"create","payload":"payload/é $().bin","destination":"z $()/é.bin","expected_result_sha256":"{expected}"}},{{"kind":"create","payload":"payload/a.bin","destination":"a space.bin","expected_result_sha256":"{expected}"}}"#
         );
-        write_package(&root, &manifest(&operations, ""), Some(("payload/é $().bin", payload)));
+        write_package(
+            &root,
+            &manifest(&operations, ""),
+            Some(("payload/é $().bin", payload)),
+        );
         fs::write(root.join("payload/a.bin"), payload).unwrap();
         let plan = inspect_local_mod_package(request);
         assert!(plan.eligible_for_later_apply);

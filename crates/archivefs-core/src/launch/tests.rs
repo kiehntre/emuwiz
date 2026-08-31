@@ -452,13 +452,7 @@ fn reviewed_classic_core_hints_prefer_one_of_two_matching_cores() {
             Some("Atari - 2600"),
             None,
         ),
-        (
-            "Atari5200",
-            "a5200",
-            "stella",
-            Some("Atari - 5200"),
-            None,
-        ),
+        ("Atari5200", "a5200", "stella", Some("Atari - 5200"), None),
         (
             "Atari Lynx",
             "handy",
@@ -509,8 +503,16 @@ fn two_matching_cores_without_a_reviewed_hint_remain_ambiguous() {
         &resolved_content(),
         &[],
         &retroarch_environment_with_cores(vec![
-            core_finding("fceumm", Some("Nintendo - Nintendo Entertainment System"), None),
-            core_finding("mesen", Some("Nintendo - Nintendo Entertainment System"), None),
+            core_finding(
+                "fceumm",
+                Some("Nintendo - Nintendo Entertainment System"),
+                None,
+            ),
+            core_finding(
+                "mesen",
+                Some("Nintendo - Nintendo Entertainment System"),
+                None,
+            ),
         ]),
         &[],
     );
@@ -520,10 +522,12 @@ fn two_matching_cores_without_a_reviewed_hint_remain_ambiguous() {
         .filter(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
         .collect();
     assert_eq!(retroarch_candidates.len(), 2);
-    assert!(retroarch_candidates.iter().all(|candidate| candidate
-        .blockers
-        .iter()
-        .any(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore)));
+    assert!(retroarch_candidates.iter().all(|candidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore)
+    }));
 }
 
 #[test]
@@ -552,10 +556,12 @@ fn reviewed_core_hint_never_manufactures_identity_or_cross_selects_platform() {
         )]),
         &[],
     );
-    assert!(wrong_platform.candidates.iter().all(|candidate| !matches!(
-        candidate.target,
-        LaunchTarget::RetroArchCore { .. }
-    )));
+    assert!(
+        wrong_platform
+            .candidates
+            .iter()
+            .all(|candidate| !matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
+    );
 }
 
 #[test]

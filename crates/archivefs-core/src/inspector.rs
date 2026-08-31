@@ -118,11 +118,9 @@ const LIKELY_CONTENT_EXTENSIONS: &[&str] = &[
     "int", "vec", "lnx", "adf", "ipf", "dsk", "d64", "t64", "tap", "crt", "rom", "mx1", "mx2",
     "d88", "hdi", "nhd", "xdf", "dim", // Disc-image extensions.
     "iso", "xiso", "bin", "img", "mdf", "mds", "nrg", "cso", "gcz", "wbfs", "wad", "rvz", "chd",
-    "gdi", "cdi", "pbp", "ecm", "xbe",
-    "xex", "jag", "lyx", "atr", "atx", "xfd", "st", "stx", "msa",
-    // Apple II and Macintosh media/archive extensions.
-    "pkg",
-    "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
+    "gdi", "cdi", "pbp", "ecm", "xbe", "xex", "jag", "lyx", "atr", "atx", "xfd", "st", "stx",
+    "msa", // Apple II and Macintosh media/archive extensions.
+    "pkg", "do", "po", "woz", "2mg", "nib", "hfv", "dc42", "sit",
     // Executable/installer extensions.
     "exe", "msi", "bat", "sh", "app", "com",
 ];

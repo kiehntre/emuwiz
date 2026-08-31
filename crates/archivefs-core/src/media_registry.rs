@@ -544,8 +544,14 @@ mod tests {
 
     #[test]
     fn neo_geo_pocket_extensions_are_direct_game_images() {
-        assert_eq!(kind_for_extension("ngp"), Some(ArchiveKind::DirectGameImage));
-        assert_eq!(kind_for_extension("ngc"), Some(ArchiveKind::DirectGameImage));
+        assert_eq!(
+            kind_for_extension("ngp"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            kind_for_extension("ngc"),
+            Some(ArchiveKind::DirectGameImage)
+        );
     }
 
     #[test]

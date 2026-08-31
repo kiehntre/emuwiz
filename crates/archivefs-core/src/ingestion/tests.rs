@@ -1063,12 +1063,18 @@ fn neo_geo_pocket_loose_extensions_are_reachable_as_direct_content() {
         item.content == Some(ContentKind::RomCartridge)
             && item.validation_state == ValidationState::Accepted
     }));
-    assert!(report.items.iter().any(|item| {
-        item.platform_hint.as_deref() == Some("Neo Geo Pocket")
-    }));
-    assert!(report.items.iter().any(|item| {
-        item.platform_hint.as_deref() == Some("Neo Geo Pocket Color")
-    }));
+    assert!(
+        report
+            .items
+            .iter()
+            .any(|item| { item.platform_hint.as_deref() == Some("Neo Geo Pocket") })
+    );
+    assert!(
+        report
+            .items
+            .iter()
+            .any(|item| { item.platform_hint.as_deref() == Some("Neo Geo Pocket Color") })
+    );
 }
 
 #[test]
@@ -1134,7 +1140,10 @@ fn archive_member_crt_is_discovered_as_computer_disk_content() {
     let report = discover_source(dir.path()).unwrap();
     assert_eq!(report.items.len(), 1);
     assert_eq!(report.items[0].content, Some(ContentKind::ComputerDisk));
-    assert!(matches!(report.items[0].container, ContainerKind::Archive(_)));
+    assert!(matches!(
+        report.items[0].container,
+        ContainerKind::Archive(_)
+    ));
 }
 
 #[test]

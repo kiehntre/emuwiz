@@ -37,8 +37,8 @@ use crate::n64_byte_order::{detect_n64_byte_order, normalize_to_z64};
 use crate::n64_cic_evidence::{cic_lookup, validate_crc1_crc2};
 use crate::n64_header_evidence::parse_n64_header;
 use crate::neogeocd_boot_evidence::{MAX_IPL_TXT_BYTES, parse_ipl_txt};
-use crate::ngp_header_evidence::{NGP_HEADER_BYTES, NgpSystemFlag, parse_ngp_header};
 use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
+use crate::ngp_header_evidence::{NGP_HEADER_BYTES, NgpSystemFlag, parse_ngp_header};
 use crate::param_sfo::parse_param_sfo;
 use crate::pcengine_cd_boot_evidence::{
     PCE_CD_IPL_HEADER_BYTES, PCE_CD_IPL_SECTOR_OFFSET, parse_pce_cd_ipl,
@@ -1182,7 +1182,10 @@ fn inspect_loose_rom(
             lynx_header = parse_lynx_header(&header);
         }
     }
-    if matches!(report.platform, IdentityPlatform::Ngp | IdentityPlatform::Ngpc) {
+    if matches!(
+        report.platform,
+        IdentityPlatform::Ngp | IdentityPlatform::Ngpc
+    ) {
         file.seek(SeekFrom::Start(0)).ok();
         let mut header = [0_u8; NGP_HEADER_BYTES];
         let valid = if file.read_exact(&mut header).is_ok() {
@@ -1225,8 +1228,7 @@ fn inspect_loose_rom(
     }
     let is_n64 = report.platform == IdentityPlatform::N64;
     let is_snes = report.platform == IdentityPlatform::Snes;
-    let needs_whole_file =
-        is_n64 || is_snes || atari7800_header.is_some() || lynx_header.is_some();
+    let needs_whole_file = is_n64 || is_snes || atari7800_header.is_some() || lynx_header.is_some();
     let mut whole_file_bytes: Option<Vec<u8>> = None;
     let digest = if needs_whole_file {
         // N64 needs the raw bytes afterward for byte-order detection and
@@ -9140,11 +9142,7 @@ mod tests {
             Some("T-7101G")
         );
 
-        let dreamcast = write_fixture(
-            &directory,
-            "dc.chd",
-            &ps1_chd(&dreamcast_iso(b"T-8109N")),
-        );
+        let dreamcast = write_fixture(&directory, "dc.chd", &ps1_chd(&dreamcast_iso(b"T-8109N")));
         assert_eq!(
             inspect_game_identity(&dreamcast, Some("Dreamcast")).verified_dreamcast_product_code(),
             Some("T-8109N")

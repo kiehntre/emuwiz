@@ -2500,9 +2500,8 @@ fn zxtape_is_corroborated_not_strong() {
 fn bare_tzx_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
     let tree = TempTree::new("zxtape-tzx-parity");
     let path = tree.file("unsorted/game.tzx", b"ZXTape!\x1a");
-    let report = detect_platform_report(
-        &DetectionRequest::new(&path, tree.path()).inspecting_content(),
-    );
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
 
     assert_eq!(report.platform, None);
     assert_eq!(report.confidence, DetectionConfidence::Ambiguous);
@@ -2520,9 +2519,8 @@ fn bare_tzx_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
 fn bare_cdt_zxtape_content_is_ambiguous_between_spectrum_and_cpc() {
     let tree = TempTree::new("zxtape-cdt-parity");
     let path = tree.file("unsorted/game.cdt", b"ZXTape!\x1a");
-    let report = detect_platform_report(
-        &DetectionRequest::new(&path, tree.path()).inspecting_content(),
-    );
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
 
     assert_eq!(report.platform, None);
     assert_eq!(report.confidence, DetectionConfidence::Ambiguous);
@@ -2541,11 +2539,14 @@ fn unsigned_tape_extensions_do_not_prefer_spectrum_or_cpc() {
     let tree = TempTree::new("unsigned-tape-parity");
     for extension in ["tzx", "cdt"] {
         let path = tree.file(&format!("unsorted/game.{extension}"), b"not a signed tape");
-        let report = detect_platform_report(
-            &DetectionRequest::new(&path, tree.path()).inspecting_content(),
-        );
+        let report =
+            detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
         assert_eq!(report.platform, None, ".{extension} selected a platform");
-        assert_eq!(report.confidence, DetectionConfidence::Ambiguous, ".{extension}");
+        assert_eq!(
+            report.confidence,
+            DetectionConfidence::Ambiguous,
+            ".{extension}"
+        );
         assert_eq!(
             report
                 .candidates
@@ -2562,7 +2563,12 @@ fn unsigned_tape_extensions_do_not_prefer_spectrum_or_cpc() {
 fn generic_voc_does_not_identify_amstrad_cpc() {
     let report = detect(&format!("{ROOT}/unsorted/game.voc"));
     assert_ne!(report.platform, Some("Amstrad CPC"));
-    assert!(!report.candidates.iter().any(|candidate| candidate.platform == "Amstrad CPC"));
+    assert!(
+        !report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.platform == "Amstrad CPC")
+    );
 }
 
 #[test]
@@ -2581,12 +2587,10 @@ fn zxtape_folder_aliases_break_the_spectrum_cpc_tie() {
     let spectrum = tree.file("spectrum/game.tzx", b"ZXTape!\x1a");
     let cpc = tree.file("cpc/game.cdt", b"ZXTape!\x1a");
 
-    let spectrum_report = detect_platform_report(
-        &DetectionRequest::new(&spectrum, tree.path()).inspecting_content(),
-    );
-    let cpc_report = detect_platform_report(
-        &DetectionRequest::new(&cpc, tree.path()).inspecting_content(),
-    );
+    let spectrum_report =
+        detect_platform_report(&DetectionRequest::new(&spectrum, tree.path()).inspecting_content());
+    let cpc_report =
+        detect_platform_report(&DetectionRequest::new(&cpc, tree.path()).inspecting_content());
 
     assert_eq!(spectrum_report.platform, Some("ZX Spectrum"));
     assert_eq!(cpc_report.platform, Some("Amstrad CPC"));
@@ -2613,9 +2617,8 @@ fn trusted_cpc_metadata_breaks_zxtape_tie() {
 fn content_without_zxtape_signature_adds_no_cpc_signature_evidence() {
     let tree = TempTree::new("zxtape-no-signature");
     let path = tree.file("unsorted/random.bin", b"not a tape container");
-    let report = detect_platform_report(
-        &DetectionRequest::new(&path, tree.path()).inspecting_content(),
-    );
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
 
     assert_ne!(report.platform, Some("Amstrad CPC"));
     assert!(!report.evidence.iter().any(|evidence| {
