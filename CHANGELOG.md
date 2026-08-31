@@ -16,11 +16,17 @@ guessing at intent, dates, or scope.
 Identity, launch, optical, and whole-collection library release
 ("Alpha 2.1"). **Not yet tagged or published.** The currently published
 release remains [`v0.8.0-alpha`](docs/releases/v0.8.0-alpha.md); this entry
-describes what has merged to `main` toward the next alpha so far. See
+describes what has merged to the current candidate branch toward the next
+alpha so far. See
 [`docs/releases/v0.8.1-alpha.md`](docs/releases/v0.8.1-alpha.md) for full
 release notes.
 
 ### Added
+
+- **Dolphin texture-mod inspection and apply workflow.** Selected PNG
+  textures and validated manifest-backed texture packs can be previewed and
+  applied through the GUI's verified transaction path, with backups and
+  rollback. General mod formats remain outside this supported slice.
 
 - **Verified disc and folder identity for more platforms.** ScummVM game
   folders, 3DO game discs, and PC-FX game discs are now identified from

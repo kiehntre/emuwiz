@@ -6,7 +6,8 @@
 # be edited here at all (see below).
 
 # Folders EmuWiz scans recursively for supported archives (.zip, .7z,
-# .rar). EmuWiz supports any number of independent source folders, and
+# .rar) and recognised direct game media. EmuWiz supports any number of
+# independent source folders, and
 # a config with zero sources loads and runs fine - this is not a required
 # key.
 #
