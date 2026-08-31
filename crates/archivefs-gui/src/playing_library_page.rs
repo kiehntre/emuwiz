@@ -1152,7 +1152,14 @@ pub(crate) fn show_playing_library_page(
     });
 
     ui.add_space(8.0);
-    widgets::section_header(ui, "Preferences", None);
+    widgets::section_header(ui, "1G1R election preferences", None);
+    ui.label(
+        egui::RichText::new(
+            "These preferences explain which verified release wins each game family. The preview shows the election reasoning before anything is applied.",
+        )
+        .color(theme::muted(ui))
+        .small(),
+    );
     widgets::card(ui, |ui| {
         ui.label("Region order (most preferred first):");
         ui.add(
