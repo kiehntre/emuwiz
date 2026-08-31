@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use crate::emulator_environment::retroarch::{
     AppImageIdentificationConfidence, ConfigAssociation, ConfigReadOutcome, Diagnostic,
     DiscoveryEnvironment, ExecutableState, PathPurpose, ProfileKind, ProfileScope, ResolutionState,
-    RetroArchEnvironmentReport, RetroArchProfile, discover_retroarch_environment,
+    RetroArchEnvironmentReport, RetroArchProfile,
+    discover_retroarch_environment_with_core_directory_override,
 };
 use crate::emulator_environment::{EncodedPath, FsProbe, ReadOnlyHostFilesystem};
 
@@ -259,7 +260,30 @@ pub fn discover_retroarch_cheat_setup_profiles(
     environment: &DiscoveryEnvironment,
     configuration_override: Option<&Path>,
 ) -> Result<RetroArchCheatSetupDiscovery, RetroArchCheatSetupError> {
-    let report = discover_retroarch_environment(filesystem, environment).map_err(|error| {
+    discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+        filesystem,
+        environment,
+        configuration_override,
+        None,
+    )
+}
+
+/// Like [`discover_retroarch_cheat_setup_profiles`], but threading an
+/// explicit EmuWiz core-directory override through to
+/// [`discover_retroarch_environment_with_core_directory_override`]. `None`
+/// is identical to the plain call. `retroarch.cfg` is never written.
+pub fn discover_retroarch_cheat_setup_profiles_with_core_directory_override(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+    configuration_override: Option<&Path>,
+    core_directory_override: Option<&Path>,
+) -> Result<RetroArchCheatSetupDiscovery, RetroArchCheatSetupError> {
+    let report = discover_retroarch_environment_with_core_directory_override(
+        filesystem,
+        environment,
+        core_directory_override,
+    )
+    .map_err(|error| {
         RetroArchCheatSetupError::new("retroarch_discovery_failed", error.to_string())
     })?;
     let profiles = report

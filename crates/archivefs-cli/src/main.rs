@@ -2967,6 +2967,14 @@ fn path_finding_summary(
         ),
         ResolutionState::RuntimeDefaultUnknown => "runtime default unknown".to_string(),
         ResolutionState::NoReadableConfig => "no readable config".to_string(),
+        ResolutionState::EmuWizCoreDirectoryOverride => {
+            let path = finding
+                .resolved_path
+                .as_ref()
+                .map(|path| path.display.as_str())
+                .unwrap_or("(unusable)");
+            format!("EmuWiz core-directory override -> {path}")
+        }
     }
 }
 

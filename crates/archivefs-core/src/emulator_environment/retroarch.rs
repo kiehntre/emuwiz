@@ -331,6 +331,13 @@ pub enum ResolutionState {
     /// The config file itself could not be read (missing, unreadable,
     /// too large, or invalid UTF-8), so no key could be checked.
     NoReadableConfig,
+    /// EmuWiz was handed an explicit core-directory override for this
+    /// purpose (only ever [`PathPurpose::Cores`]), so `retroarch.cfg`'s own
+    /// value was not consulted. `resolved_path` is the override when it is a
+    /// real directory; it is `None` when the override directory is
+    /// missing/unusable, in which case discovery finds no cores for this
+    /// profile and never silently falls back to the configured directory.
+    EmuWizCoreDirectoryOverride,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -825,6 +832,26 @@ pub fn discover_retroarch_environment(
     filesystem: &dyn ReadOnlyHostFilesystem,
     environment: &DiscoveryEnvironment,
 ) -> Result<RetroArchEnvironmentReport, DiscoveryError> {
+    discover_retroarch_environment_with_core_directory_override(filesystem, environment, None)
+}
+
+/// Like [`discover_retroarch_environment`], but with an explicit EmuWiz
+/// core-directory override. `retroarch.cfg` is still parsed normally and
+/// every other path resolved from it unchanged; only after config
+/// resolution, and only for [`PathPurpose::Cores`], is the resolved
+/// directory replaced with `core_directory_override` before `discover_cores`
+/// runs. `retroarch.cfg` is never written. `None` is byte-for-byte the old
+/// behaviour. A missing/unusable override directory yields no cores for the
+/// affected profiles and never falls back to the configured directory - the
+/// `PathFinding` for `Cores` records
+/// [`ResolutionState::EmuWizCoreDirectoryOverride`] and a
+/// `retroarch_core_directory_override_applied` / `_unusable` diagnostic so a
+/// caller can tell an override apart from automatic resolution.
+pub fn discover_retroarch_environment_with_core_directory_override(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+    core_directory_override: Option<&Path>,
+) -> Result<RetroArchEnvironmentReport, DiscoveryError> {
     let home = environment
         .home
         .as_ref()
@@ -852,6 +879,7 @@ pub fn discover_retroarch_environment(
         &home_dir,
         environment.path.as_deref(),
         None,
+        core_directory_override,
     );
 
     // AppImage/desktop-file discovery is profile-independent scanning
@@ -906,6 +934,7 @@ pub fn discover_retroarch_environment(
             &home_dir,
             None,
             None,
+            core_directory_override,
         );
         distinct_profile.app_images = distinct_candidates;
         profiles.push((distinct_profile, distinct_sort_path, distinct_diagnostics));
@@ -922,6 +951,7 @@ pub fn discover_retroarch_environment(
             filesystem,
             &environment.user_flatpak_root,
         )),
+        core_directory_override,
     ));
     profiles.push(discover_profile(
         filesystem,
@@ -934,6 +964,7 @@ pub fn discover_retroarch_environment(
             filesystem,
             &environment.system_flatpak_root,
         )),
+        core_directory_override,
     ));
 
     profiles.sort_by(|left, right| {
@@ -1014,6 +1045,7 @@ fn discover_profile(
     tilde_home: &Path,
     executable_search_path: Option<&OsStr>,
     flatpak_metadata_found: Option<bool>,
+    core_directory_override: Option<&Path>,
 ) -> (RetroArchProfile, PathBuf, Vec<RawDiagnostic>) {
     let mut diagnostics: Vec<RawDiagnostic> = Vec::new();
     let profile_ref = ProfileRef {
@@ -1045,13 +1077,27 @@ fn discover_profile(
     );
     let config_file_found = matches!(config_outcome, ConfigReadOutcome::Parsed { .. });
 
-    let path_results = build_path_findings(
+    let mut path_results = build_path_findings(
         filesystem,
         parsed.as_ref(),
         tilde_home,
         profile_ref,
         &mut diagnostics,
     );
+
+    // After every path is resolved from `retroarch.cfg` normally, an
+    // explicit EmuWiz override replaces the resolved Cores directory only -
+    // `retroarch.cfg` itself is never touched. `discover_cores` below then
+    // runs unchanged over the (possibly overridden) `resolved_dirs`.
+    if let Some(override_dir) = core_directory_override {
+        apply_core_directory_override(
+            &mut path_results,
+            override_dir,
+            filesystem,
+            profile_ref,
+            &mut diagnostics,
+        );
+    }
 
     let cores = discover_cores(
         filesystem,
@@ -1586,6 +1632,62 @@ fn build_path_findings(
         findings,
         resolved_dirs,
     }
+}
+
+/// Replaces the resolved [`PathPurpose::Cores`] directory with an explicit
+/// EmuWiz override. The override wins outright: when it is a real
+/// directory, it becomes the Cores directory; when it is missing or not a
+/// directory, `Cores` is dropped from `resolved_dirs` entirely so
+/// `discover_cores` finds nothing there and never falls back to whatever
+/// `retroarch.cfg` pointed at. Either way the `Cores` `PathFinding` is
+/// rewritten to [`ResolutionState::EmuWizCoreDirectoryOverride`] and a
+/// diagnostic is recorded, so a caller can always tell an override apart
+/// from automatic resolution. `retroarch.cfg` is not read or written here.
+fn apply_core_directory_override(
+    path_results: &mut PathFindingsResult,
+    override_dir: &Path,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    profile: ProfileRef,
+    diagnostics: &mut Vec<RawDiagnostic>,
+) {
+    let probe = filesystem.probe(override_dir);
+    let usable = probe == FsProbe::PresentDirectory;
+
+    if usable {
+        path_results
+            .resolved_dirs
+            .insert(PathPurpose::Cores, override_dir.to_path_buf());
+    } else {
+        path_results.resolved_dirs.remove(&PathPurpose::Cores);
+    }
+
+    if let Some(finding) = path_results
+        .findings
+        .iter_mut()
+        .find(|finding| finding.purpose == PathPurpose::Cores)
+    {
+        finding.resolution = ResolutionState::EmuWizCoreDirectoryOverride;
+        finding.configured_value = None;
+        finding.resolved_path = usable.then(|| EncodedPath::from_path(override_dir));
+        finding.probe = Some(probe);
+    }
+
+    diagnostics.push(RawDiagnostic::new(
+        if usable {
+            "retroarch_core_directory_override_applied"
+        } else {
+            "retroarch_core_directory_override_unusable"
+        },
+        if usable {
+            DiagnosticSeverity::Info
+        } else {
+            DiagnosticSeverity::Warning
+        },
+        DiagnosticCategory::PathResolution,
+        Some(profile),
+        Some(PathPurpose::Cores),
+        Some(override_dir.to_path_buf()),
+    ));
 }
 
 fn discover_cores(
@@ -3529,6 +3631,238 @@ mod tests {
                 .all(|d| d.detail_kind != DiagnosticCategory::CoreInventory
                     || !d.code.starts_with("firmware")),
             "a core with no firmware metadata must never raise a firmware diagnostic"
+        );
+    }
+
+    // --- EmuWiz core-directory override -----------------------------
+
+    /// Builds a fixture whose `retroarch.cfg` points `libretro_directory`
+    /// at a real directory containing only a PUAE core, and whose
+    /// `libretro_info_path` has a real Game Boy `.info` file. Returns the
+    /// fixture plus the path of a separate "override" directory that
+    /// contains a `gambatte` core (the info file matches it by stem).
+    fn override_fixture(name: &str) -> (Fixture, PathBuf) {
+        let fixture = Fixture::new(name);
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+                fixture.path("configured-cores").display(),
+                fixture.path("info").display()
+            ),
+        );
+        fixture.mkdir("configured-cores");
+        fixture.write("configured-cores/puae_libretro.so", "stub");
+        fixture.mkdir("info");
+        fixture.write(
+            "info/gambatte.info",
+            "display_name = \"Nintendo - Game Boy / Color (Gambatte)\"\n\
+             systemname = \"Game Boy/Game Boy Color\"\n\
+             database = \"Nintendo - Game Boy|Nintendo - Game Boy Color\"\n\
+             supported_extensions = \"gb|gbc|dmg\"\n",
+        );
+        fixture.mkdir("override-cores");
+        fixture.write("override-cores/gambatte_libretro.so", "stub");
+        let override_dir = fixture.path("override-cores");
+        (fixture, override_dir)
+    }
+
+    fn cores_finding(profile: &RetroArchProfile) -> &PathFinding {
+        profile
+            .paths
+            .iter()
+            .find(|finding| finding.purpose == PathPurpose::Cores)
+            .expect("every profile records a Cores path finding")
+    }
+
+    #[test]
+    fn no_core_directory_override_is_byte_for_byte_the_plain_discovery() {
+        let (fixture, _override_dir) = override_fixture("override-none");
+        let filesystem = HostReadOnlyFilesystem;
+
+        let plain = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let explicit_none = discover_retroarch_environment_with_core_directory_override(
+            &filesystem,
+            &fixture.env(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            format!("{plain:?}"),
+            format!("{explicit_none:?}"),
+            "passing None must be identical to the plain call"
+        );
+        // The configured PUAE core is what discovery uses with no override.
+        assert_eq!(plain.profiles[0].cores.len(), 1);
+        assert_eq!(plain.profiles[0].cores[0].core_stem, "puae");
+        assert_eq!(
+            cores_finding(&plain.profiles[0]).resolution,
+            ResolutionState::ConfiguredResolved
+        );
+    }
+
+    #[test]
+    fn valid_core_directory_override_enumerates_the_override_and_its_cores_match_game_boy() {
+        let (fixture, override_dir) = override_fixture("override-valid");
+        let filesystem = HostReadOnlyFilesystem;
+
+        let report = discover_retroarch_environment_with_core_directory_override(
+            &filesystem,
+            &fixture.env(),
+            Some(override_dir.as_path()),
+        )
+        .unwrap();
+
+        // The override core replaces the configured one outright.
+        let native = &report.profiles[0];
+        assert!(
+            native.cores.iter().any(|core| core.core_stem == "gambatte"),
+            "the override directory's Game Boy core must be enumerated"
+        );
+        assert!(
+            !native.cores.iter().any(|core| core.core_stem == "puae"),
+            "the configured directory must no longer be used"
+        );
+
+        // Provenance: the Cores finding says it was an EmuWiz override.
+        let finding = cores_finding(native);
+        assert_eq!(
+            finding.resolution,
+            ResolutionState::EmuWizCoreDirectoryOverride
+        );
+        assert_eq!(
+            finding.resolved_path.as_ref().unwrap().display,
+            override_dir.to_string_lossy()
+        );
+        assert!(
+            native
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "retroarch_core_directory_override_applied")
+        );
+
+        // The existing platform-mapping layer accepts the discovered core
+        // for Game Boy - no name is hard-coded into discovery.
+        let gambatte = native
+            .cores
+            .iter()
+            .find(|core| core.core_stem == "gambatte")
+            .unwrap();
+        assert_eq!(
+            crate::launch::retroarch_platform_candidate(&gambatte.info),
+            Some("Game Boy")
+        );
+    }
+
+    #[test]
+    fn overridden_environment_naturally_yields_a_game_boy_retroarch_launch_candidate() {
+        use crate::launch::{
+            CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef,
+            LaunchTarget, ResolvedIdentity, build_launch_plan,
+        };
+
+        let (fixture, override_dir) = override_fixture("override-launch");
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment_with_core_directory_override(
+            &filesystem,
+            &fixture.env(),
+            Some(override_dir.as_path()),
+        )
+        .unwrap();
+
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Game Boy".to_string(),
+            game_key: "test-game-key".to_string(),
+        });
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/roms/aladdin.gb")),
+            requires_mount: false,
+            provenance: "test loose Game Boy ROM".to_string(),
+        };
+
+        // The existing planner is not modified by this increment; it should
+        // produce a RetroArchCore candidate purely because the resolved
+        // Cores directory now contains a matching core.
+        let plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        let has_gambatte_core = plan.candidates.iter().any(|candidate| {
+            matches!(
+                &candidate.target,
+                LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "gambatte"
+            )
+        });
+        assert!(
+            has_gambatte_core,
+            "the unchanged launch pipeline must yield a RetroArchCore candidate: {:?}",
+            plan.candidates
+        );
+    }
+
+    #[test]
+    fn missing_core_directory_override_finds_no_cores_and_never_falls_back() {
+        let (fixture, _valid_override) = override_fixture("override-missing");
+        let filesystem = HostReadOnlyFilesystem;
+        let missing = fixture.path("does-not-exist-cores");
+        assert!(!missing.exists());
+
+        let report = discover_retroarch_environment_with_core_directory_override(
+            &filesystem,
+            &fixture.env(),
+            Some(missing.as_path()),
+        )
+        .unwrap();
+
+        let native = &report.profiles[0];
+        // No panic; no invented core; no fallback to the configured PUAE dir.
+        assert!(
+            native.cores.is_empty(),
+            "a missing override directory must yield no cores, not the configured ones"
+        );
+
+        let finding = cores_finding(native);
+        assert_eq!(
+            finding.resolution,
+            ResolutionState::EmuWizCoreDirectoryOverride
+        );
+        assert!(finding.resolved_path.is_none());
+        assert_eq!(finding.probe, Some(FsProbe::Missing));
+        assert!(
+            native
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "retroarch_core_directory_override_unusable"),
+            "the override problem must be recorded as a diagnostic"
+        );
+    }
+
+    #[test]
+    fn core_directory_override_never_rewrites_retroarch_cfg_on_disk() {
+        let (fixture, override_dir) = override_fixture("override-no-cfg-write");
+        let cfg_path = fixture.path(".config/retroarch/retroarch.cfg");
+        let before = fs::read_to_string(&cfg_path).unwrap();
+
+        let filesystem = HostReadOnlyFilesystem;
+        let _ = discover_retroarch_environment_with_core_directory_override(
+            &filesystem,
+            &fixture.env(),
+            Some(override_dir.as_path()),
+        )
+        .unwrap();
+
+        let after = fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(
+            before, after,
+            "retroarch.cfg must be left exactly as it was"
+        );
+        assert!(
+            after.contains(
+                &fixture
+                    .path("configured-cores")
+                    .to_string_lossy()
+                    .to_string()
+            )
         );
     }
 

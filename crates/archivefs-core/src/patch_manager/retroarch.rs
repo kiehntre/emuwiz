@@ -1446,6 +1446,7 @@ fn resolution_state_tag(state: ResolutionState) -> &'static [u8] {
         ResolutionState::ConfiguredUnresolved => b"configured_unresolved",
         ResolutionState::RuntimeDefaultUnknown => b"runtime_default_unknown",
         ResolutionState::NoReadableConfig => b"no_readable_config",
+        ResolutionState::EmuWizCoreDirectoryOverride => b"emuwiz_core_directory_override",
     }
 }
 
