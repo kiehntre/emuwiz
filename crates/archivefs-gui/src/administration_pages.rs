@@ -2365,6 +2365,7 @@ pub(super) fn format_history_timestamp(timestamp: SystemTime) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DatabasePanelAction {
     ScanLibrary,
+    ScanAndUpgradeLibrary,
     ViewRecentlyFound,
     RefreshStatus,
     RetryLoad,
@@ -2381,9 +2382,8 @@ pub(super) enum DatabasePanelAction {
 pub(super) fn database_state_path(state: &DatabaseState) -> Option<PathBuf> {
     match state {
         DatabaseState::NotCreated { database_path } => Some(database_path.clone()),
-        DatabaseState::Loading { previous, .. }
-        | DatabaseState::Outdated { previous, .. }
-        | DatabaseState::Error { previous, .. } => previous
+        DatabaseState::Outdated { health, .. } => Some(health.resolved_path.clone()),
+        DatabaseState::Loading { previous, .. } | DatabaseState::Error { previous, .. } => previous
             .as_ref()
             .map(|snapshot| snapshot.database_path.clone()),
         DatabaseState::Ready { snapshot, .. } => Some(snapshot.database_path.clone()),
@@ -2491,17 +2491,35 @@ pub(super) fn show_database_panel(
 
             match state {
                 DatabaseState::Outdated { health, .. } => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!(
-                            "Database schema is outdated (found version {}); run a library scan \
-                             to upgrade it.",
-                            health
+                    widgets::banner(
+                        ui,
+                        "Library database needs upgrading",
+                        "Your library was created by an older EmuWiz version. Upgrade it before \
+                         using current catalogue features.",
+                        widgets::StatusTone::Warning,
+                    );
+                    egui::CollapsingHeader::new("Technical details")
+                        .id_salt("library_database_upgrade_details")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let found_version = health
                                 .schema_version
                                 .map(|version| version.to_string())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        ),
-                    );
+                                .unwrap_or_else(|| "unknown".to_string());
+                            ui.label(format!("schema {found_version}"));
+                            ui.label(format!("required schema {}", latest_schema_version()));
+                            if let Some(migrations) = health
+                                .schema_version
+                                .and_then(|version| pending_schema_migration_versions(version).ok())
+                            {
+                                let chain = migrations
+                                    .iter()
+                                    .map(i64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" → ");
+                                ui.label(format!("migration chain {chain}"));
+                            }
+                        });
                 }
                 DatabaseState::Error { message, .. } => {
                     ui.colored_label(ui.visuals().error_fg_color, message.as_str());
@@ -2514,7 +2532,14 @@ pub(super) fn show_database_panel(
 
             ui.horizontal(|ui| {
                 let loading = state.is_loading();
-                if ui
+                if matches!(state, DatabaseState::Outdated { .. }) {
+                    if ui
+                        .add_enabled(!loading, egui::Button::new("Scan and upgrade library"))
+                        .clicked()
+                    {
+                        action = Some(DatabasePanelAction::ScanAndUpgradeLibrary);
+                    }
+                } else if ui
                     .add_enabled(!loading, egui::Button::new("Scan library"))
                     .clicked()
                 {
@@ -2537,9 +2562,7 @@ pub(super) fn show_database_panel(
                             action = Some(DatabasePanelAction::RefreshStatus);
                         }
                     }
-                    DatabaseState::NotCreated { .. }
-                    | DatabaseState::Outdated { .. }
-                    | DatabaseState::Error { .. } => {
+                    DatabaseState::NotCreated { .. } | DatabaseState::Error { .. } => {
                         if ui
                             .add_enabled(!loading, egui::Button::new("Retry database load"))
                             .clicked()
@@ -2547,7 +2570,7 @@ pub(super) fn show_database_panel(
                             action = Some(DatabasePanelAction::RetryLoad);
                         }
                     }
-                    DatabaseState::Loading { .. } => {}
+                    DatabaseState::Loading { .. } | DatabaseState::Outdated { .. } => {}
                 }
                 if loading {
                     ui.spinner();

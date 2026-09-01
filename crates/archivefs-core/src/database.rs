@@ -34,7 +34,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, params};
 
 use crate::emulator_environment::EncodedPath;
 use crate::game_identity::{
@@ -160,6 +160,14 @@ fn latest_known_version(migrations: &[Migration]) -> i64 {
         .unwrap_or(0)
 }
 
+fn pending_migration_versions(migrations: &[Migration], current_version: i64) -> Vec<i64> {
+    migrations
+        .iter()
+        .filter(|migration| migration.version > current_version)
+        .map(|migration| migration.version)
+        .collect()
+}
+
 fn persisted_set_result_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<PersistedSetAuditResult> {
@@ -212,6 +220,18 @@ fn persisted_set_result_from_row(
 pub struct Database {
     connection: Connection,
     path: PathBuf,
+}
+
+/// The durable result of an explicitly requested library-database upgrade.
+/// The backup is retained after success so the user can recover the exact
+/// pre-upgrade catalogue if a later problem is discovered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseUpgradeReport {
+    pub database_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub from_version: i64,
+    pub to_version: i64,
+    pub applied_versions: Vec<i64>,
 }
 
 /// A durable, source-scoped DAT set verdict. `exhaustive` is explicit because
@@ -372,6 +392,180 @@ impl Database {
             .close()
             .map_err(|(_, error)| ArchiveFsError::Database(error.to_string()))
     }
+}
+
+/// Backs up and upgrades an existing, older library database using the
+/// migration chain already compiled into this build. This is deliberately a
+/// separate, write-authorized entry point: read-only health checks and normal
+/// startup never call it.
+///
+/// The backup is a consistent SQLite online-backup snapshot, not a raw file
+/// copy (which could omit committed WAL content). Migration does not start
+/// until that backup has been created, reopened read-only, and verified with
+/// `PRAGMA quick_check`. If migration later fails, the error names the retained
+/// backup that contains the exact pre-upgrade schema and data.
+pub fn upgrade_library_database(path: impl AsRef<Path>) -> Result<DatabaseUpgradeReport> {
+    upgrade_library_database_with_migrations(path.as_ref(), MIGRATIONS)
+}
+
+fn upgrade_library_database_with_migrations(
+    path: &Path,
+    migrations: &[Migration],
+) -> Result<DatabaseUpgradeReport> {
+    if !path.is_file() {
+        return Err(ArchiveFsError::Database(format!(
+            "Library database does not exist at {}. Nothing was changed.",
+            path.display()
+        )));
+    }
+
+    let source = open_read_only_connection(path)?;
+    let from_version = schema_version(&source)?;
+    let to_version = latest_known_version(migrations);
+    if from_version > to_version {
+        return Err(ArchiveFsError::Database(format!(
+            "Library database schema {from_version} is newer than this build supports \
+             (schema {to_version}). Nothing was changed."
+        )));
+    }
+    let applied_versions = pending_migration_versions(migrations, from_version);
+    if applied_versions.is_empty() {
+        return Err(ArchiveFsError::Database(format!(
+            "Library database is already at the required schema {to_version}. Nothing was changed."
+        )));
+    }
+    verify_database_connection(&source, from_version).map_err(|error| {
+        ArchiveFsError::Database(format!(
+            "The pre-upgrade library database did not pass SQLite's safety check. Nothing was \
+             changed: {error}"
+        ))
+    })?;
+
+    let backup_path = reserve_database_backup_path(path, from_version, to_version)?;
+    if let Err(error) = source.backup(MAIN_DB, &backup_path, None) {
+        let _ = fs::remove_file(&backup_path);
+        return Err(ArchiveFsError::Database(format!(
+            "Could not create a safe pre-upgrade database backup. The library database was not \
+             changed: {error}"
+        )));
+    }
+    drop(source);
+
+    if let Err(error) = verify_database_backup(&backup_path, from_version) {
+        let _ = fs::remove_file(&backup_path);
+        return Err(ArchiveFsError::Database(format!(
+            "Could not verify the pre-upgrade database backup. The library database was not \
+             changed: {error}"
+        )));
+    }
+
+    let migration_result = (|| {
+        let mut connection = open_connection(path)?;
+        let observed_version = schema_version(&connection)?;
+        if observed_version != from_version {
+            return Err(ArchiveFsError::Database(format!(
+                "library database changed from schema {from_version} to {observed_version} while \
+                 the backup was being prepared; refusing to migrate it"
+            )));
+        }
+        apply_migrations(&mut connection, migrations)?;
+        let migrated_version = schema_version(&connection)?;
+        if migrated_version != to_version {
+            return Err(ArchiveFsError::Database(format!(
+                "migration finished at schema {migrated_version}, expected schema {to_version}"
+            )));
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = migration_result {
+        return Err(ArchiveFsError::Database(format!(
+            "Library database upgrade failed. The pre-upgrade database is recoverable from {}. \
+             Details: {error}",
+            backup_path.display()
+        )));
+    }
+
+    Ok(DatabaseUpgradeReport {
+        database_path: path.to_path_buf(),
+        backup_path,
+        from_version,
+        to_version,
+        applied_versions,
+    })
+}
+
+fn reserve_database_backup_path(
+    path: &Path,
+    from_version: i64,
+    to_version: i64,
+) -> Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        ArchiveFsError::Database(format!(
+            "could not derive a backup name for {}. Nothing was changed.",
+            path.display()
+        ))
+    })?;
+
+    for sequence in 0..1_000_u16 {
+        let mut backup_name = file_name.to_os_string();
+        backup_name.push(format!(".schema-{from_version}-before-{to_version}.backup"));
+        if sequence > 0 {
+            backup_name.push(format!(".{sequence}"));
+        }
+        let candidate = parent.join(backup_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ArchiveFsError::Database(format!(
+                    "Could not reserve a pre-upgrade database backup beside {}. The library \
+                     database was not changed: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    Err(ArchiveFsError::Database(format!(
+        "Could not choose an unused pre-upgrade backup name beside {}. The library database was \
+         not changed.",
+        path.display()
+    )))
+}
+
+fn verify_database_backup(path: &Path, expected_version: i64) -> Result<()> {
+    let connection = open_read_only_connection(path)?;
+    verify_database_connection(&connection, expected_version)
+}
+
+fn verify_database_connection(connection: &Connection, expected_version: i64) -> Result<()> {
+    let actual_version = schema_version(connection)?;
+    if actual_version != expected_version {
+        return Err(ArchiveFsError::Database(format!(
+            "backup schema is {actual_version}, expected {expected_version}"
+        )));
+    }
+    let result = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            ArchiveFsError::Database(format!("failed to run SQLite quick_check: {error}"))
+        })?;
+    if result != "ok" {
+        return Err(ArchiveFsError::Database(format!(
+            "SQLite quick_check reported: {result}"
+        )));
+    }
+    Ok(())
 }
 
 /// Stable diagnostic categories. Sidecar presence is evidence only: it is
@@ -5039,6 +5233,26 @@ pub fn latest_schema_version() -> i64 {
     latest_known_version(MIGRATIONS)
 }
 
+/// Returns the exact built-in forward migration chain required to bring
+/// `current_version` up to this build's schema. This only examines the
+/// compiled migration list; it performs no filesystem or database I/O.
+pub fn pending_schema_migration_versions(current_version: i64) -> Result<Vec<i64>> {
+    let required_version = latest_schema_version();
+    if current_version < 0 {
+        return Err(ArchiveFsError::Database(format!(
+            "database schema version {current_version} is invalid"
+        )));
+    }
+    if current_version > required_version {
+        return Err(ArchiveFsError::Database(format!(
+            "database schema version {current_version} is newer than the required schema \
+             {required_version}"
+        )));
+    }
+
+    Ok(pending_migration_versions(MIGRATIONS, current_version))
+}
+
 /// Scans every folder in `config.source_folders` with the existing
 /// [`ArchiveScanner`] (unmodified - one scan per folder, so a single
 /// unreachable folder cannot poison the whole run) and persists the
@@ -5655,6 +5869,104 @@ mod tests {
             )
             .unwrap();
         connection.close().unwrap();
+    }
+
+    #[test]
+    fn explicit_schema_seven_upgrade_backs_up_then_uses_migrations_eight_to_ten() {
+        let root = temp_dir("explicit-schema-seven-upgrade");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 7);
+
+        let report = upgrade_library_database(&database_path).unwrap();
+
+        assert_eq!(report.database_path, database_path);
+        assert_eq!(report.from_version, 7);
+        assert_eq!(report.to_version, 10);
+        assert_eq!(report.applied_versions, vec![8, 9, 10]);
+        assert!(report.backup_path.is_file());
+        assert_eq!(
+            pending_schema_migration_versions(7).unwrap(),
+            vec![8, 9, 10]
+        );
+
+        let upgraded = Database::open_read_only(&database_path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 10);
+        assert_eq!(upgraded.load_archives().unwrap()[0].display_name, "ZooCube");
+        upgraded.close().unwrap();
+
+        let backup = open_read_only_connection(&report.backup_path).unwrap();
+        verify_database_connection(&backup, 7).unwrap();
+        let display_name: String = backup
+            .query_row(
+                "SELECT display_name FROM archives WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display_name, "ZooCube");
+        backup.close().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&report.backup_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_upgrade_retains_a_recoverable_pre_upgrade_backup() {
+        let root = temp_dir("failed-upgrade-backup");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 7);
+        let failing_migrations = [
+            Migration {
+                version: 8,
+                description: "test migration that succeeds",
+                sql: "CREATE TABLE test_upgrade_step_eight (id INTEGER PRIMARY KEY);",
+            },
+            Migration {
+                version: 9,
+                description: "test migration that fails",
+                sql: "THIS IS DELIBERATELY INVALID SQL;",
+            },
+        ];
+
+        let error = upgrade_library_database_with_migrations(&database_path, &failing_migrations)
+            .unwrap_err()
+            .to_string();
+        let backup_path = root.join("library.sqlite3.schema-7-before-9.backup");
+
+        assert!(error.contains("upgrade failed"));
+        assert!(error.contains("recoverable from"));
+        assert!(error.contains(&backup_path.display().to_string()));
+        assert_eq!(
+            schema_version(&open_read_only_connection(&database_path).unwrap()).unwrap(),
+            8
+        );
+        let backup = open_read_only_connection(&backup_path).unwrap();
+        verify_database_connection(&backup, 7).unwrap();
+        backup.close().unwrap();
+
+        // Demonstrate recoverability without touching the partially migrated
+        // file: restore the verified snapshot to a separate temporary path,
+        // then let the normal migration runner advance that copy.
+        let restored_path = root.join("restored.sqlite3");
+        fs::copy(&backup_path, &restored_path).unwrap();
+        let restored = Database::open_or_create(&restored_path).unwrap();
+        assert_eq!(restored.schema_version().unwrap(), 10);
+        assert_eq!(restored.load_archives().unwrap()[0].display_name, "ZooCube");
+        restored.close().unwrap();
+
+        let _ = fs::remove_dir_all(root);
     }
 
     // -----------------------------------------------------------------

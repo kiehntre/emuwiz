@@ -215,33 +215,34 @@ use archivefs_core::{
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
     Config, ConfigIdentity, DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseHealth,
-    DatabaseHealthReport, DoctorReport, DoctorStatus, FrontendPlatformMapping, FrontendProfile,
-    FrontendProfileKind, FrontendProfilePolicy, HealthCategory, HealthIssue, InspectorEntry,
-    InspectorEntryClassification, InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult,
-    LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan,
-    LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
-    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE, RecentScanAdditions,
-    RecoveryAction, RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary,
-    SetSourceFolderEnabledOutcome, SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability,
-    SourceFolderConfig, SourceFolderView, SourceHealthIssue, UnmountOneOutcome,
-    VERIFIED_DAT_PLATFORM_SOURCE, add_library_view_default, add_source_folder_default,
-    apply_library_view_default, assign_source_platform_default, build_source_folder_views,
-    canonical_platform_names, catalogue_filename_duplicates, check_archive_index_freshness,
-    check_database_health, classify_archive_health, cleanup_selected_mount_tree,
-    create_configured_mount_root_default, create_starter_config_default, default_config_path,
-    default_database_path, default_index_path, diagnose_database, edit_library_view_default,
-    format_unix_timestamp_utc, inspect_archive, is_inspectable, is_known_disc_companion,
-    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
-    list_source_folder_views_default, load_library_view_configs_default,
-    load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
+    DatabaseHealthReport, DatabaseUpgradeReport, DoctorReport, DoctorStatus,
+    FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,
+    HealthCategory, HealthIssue, InspectorEntry, InspectorEntryClassification, InspectorEntryKind,
+    InspectorReport, LazyUnmountCleanupResult, LibraryViewApplyReport, LibraryViewConfig,
+    LibraryViewLayoutTemplate, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry,
+    MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, MountOneOutcome, MountState,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
+    ROMM_PLATFORM_SOURCE, RecentScanAdditions, RecoveryAction, RecoveryOffer,
+    RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
+    SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability, SourceFolderConfig,
+    SourceFolderView, SourceHealthIssue, UnmountOneOutcome, VERIFIED_DAT_PLATFORM_SOURCE,
+    add_library_view_default, add_source_folder_default, apply_library_view_default,
+    assign_source_platform_default, build_source_folder_views, canonical_platform_names,
+    catalogue_filename_duplicates, check_archive_index_freshness, check_database_health,
+    classify_archive_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
+    create_starter_config_default, default_config_path, default_database_path, default_index_path,
+    diagnose_database, edit_library_view_default, format_unix_timestamp_utc, inspect_archive,
+    is_inspectable, is_known_disc_companion, latest_schema_version,
+    lazy_unmount_one_archive_path_with_progress, list_source_folder_views_default,
+    load_library_view_configs_default, load_read_only_snapshot_default,
+    load_source_folder_configs_from, mount_one_archive_path, pending_schema_migration_versions,
     persisted_archive_has_unknown_platform, plan_stale_mount_directories,
     preview_library_view_default, read_archive_index, remount_one_archive_path,
     remove_library_view_default, remove_source_folder_default, repair_library_view_default,
     run_setup_diagnostics_default, scan_all_enabled_sources_default, scan_and_persist,
     scan_source_folder_default, set_library_view_enabled_default,
     set_source_folder_enabled_default, source_health_issues, unmount_one_archive_path,
-    validate_library_view_destination, validate_new_source_folder,
+    upgrade_library_database, validate_library_view_destination, validate_new_source_folder,
 };
 use eframe::egui;
 use ui::components::{
@@ -2542,6 +2543,7 @@ enum DatabaseOutcome {
     Scanned {
         snapshot: CachedLibrarySnapshot,
         scan_summary: ScanPersistSummary,
+        upgrade: Option<DatabaseUpgradeReport>,
     },
 }
 
@@ -2677,6 +2679,24 @@ fn load_database_snapshot_at(
     scan_config: Option<&Config>,
 ) -> DatabaseLoadResult {
     if let Some(config) = scan_config {
+        // A scan is an explicit write-authorized action. If its read-only
+        // preflight finds an older database, preserve and verify a consistent
+        // SQLite backup before allowing the existing migration chain to run.
+        // The normal no-scan load below never reaches this branch.
+        let upgrade = if database_path.is_file() {
+            let health = check_database_health(database_path);
+            if health.migrations_current {
+                None
+            } else {
+                Some(upgrade_library_database(database_path).map_err(|error| {
+                    DatabaseLoadError::Failed {
+                        message: error.to_string(),
+                    }
+                })?)
+            }
+        } else {
+            None
+        };
         let mut database =
             Database::open_or_create(database_path).map_err(|error| DatabaseLoadError::Failed {
                 message: error.to_string(),
@@ -2691,6 +2711,7 @@ fn load_database_snapshot_at(
         return Ok(DatabaseOutcome::Scanned {
             snapshot,
             scan_summary,
+            upgrade,
         });
     }
 
@@ -5459,13 +5480,27 @@ impl ArchiveFsApp {
             Ok(DatabaseOutcome::Scanned {
                 snapshot,
                 scan_summary,
+                upgrade,
             }) => {
+                let activity = match &upgrade {
+                    Some(report) => format_database_upgrade_success(report, &scan_summary),
+                    None => format_scan_activity(&scan_summary),
+                };
                 self.history.record(HistoryEntry::new(
                     ActivityAction::LibraryDatabase,
                     None,
                     ActivityOutcome::Completed,
-                    format_scan_activity(&scan_summary),
+                    activity.clone(),
                 ));
+                if upgrade.is_some() {
+                    self.feedback = Some(ActionFeedback {
+                        succeeded: true,
+                        message: activity,
+                        cleanup: None,
+                        warning: None,
+                        more_information: None,
+                    });
+                }
                 DatabaseState::Ready {
                     snapshot: Box::new(snapshot),
                     last_scan_summary: Some(scan_summary),
@@ -17384,7 +17419,8 @@ impl ArchiveFsApp {
                             }
                             if let Some(action) = show_database_panel(ui, &self.database_state) {
                                 match action {
-                                    DatabasePanelAction::ScanLibrary => {
+                                    DatabasePanelAction::ScanLibrary
+                                    | DatabasePanelAction::ScanAndUpgradeLibrary => {
                                         self.start_database_action(context.clone(), true);
                                     }
                                     DatabasePanelAction::ViewRecentlyFound => {
@@ -19279,6 +19315,27 @@ fn format_scan_activity(summary: &ScanPersistSummary) -> String {
         summary.counts.archives_unchanged,
         summary.counts.skipped_unsupported_extension + summary.counts.skipped_ambiguous_platform,
         summary.counts.errors_count,
+    )
+}
+
+fn format_database_upgrade_success(
+    report: &DatabaseUpgradeReport,
+    summary: &ScanPersistSummary,
+) -> String {
+    let migration_chain = report
+        .applied_versions
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(" → ");
+    format!(
+        "Library database upgraded safely from schema {} to schema {} using migrations {}. The \
+         original database is recoverable from {}. {}",
+        report.from_version,
+        report.to_version,
+        migration_chain,
+        report.backup_path.display(),
+        format_scan_activity(summary)
     )
 }
 

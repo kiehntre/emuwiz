@@ -15,6 +15,190 @@
 
 use super::*;
 
+fn create_schema_seven_database(path: &Path) {
+    const MIGRATIONS: [&str; 7] = [
+        include_str!("../../../archivefs-core/src/migrations/0001_initial.sql"),
+        include_str!("../../../archivefs-core/src/migrations/0002_platform_aliases.sql"),
+        include_str!("../../../archivefs-core/src/migrations/0003_source_folder_scan_status.sql"),
+        include_str!("../../../archivefs-core/src/migrations/0004_scan_skip_counts.sql"),
+        include_str!("../../../archivefs-core/src/migrations/0005_source_platform_assignment.sql"),
+        include_str!("../../../archivefs-core/src/migrations/0006_game_identity_reports.sql"),
+        include_str!("../../../archivefs-core/src/migrations/0007_discovery_details.sql"),
+    ];
+
+    let mut connection = rusqlite::Connection::open(path).unwrap();
+    for (index, sql) in MIGRATIONS.iter().enumerate() {
+        let version = i64::try_from(index + 1).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute_batch(sql).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations (version, description, applied_at) \
+                 VALUES (?1, ?2, 'fixture')",
+                rusqlite::params![version, format!("schema {version} fixture")],
+            )
+            .unwrap();
+        transaction
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    connection.close().unwrap();
+}
+
+fn database_upgrade_backups(database_path: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}.schema-7-before-10.backup",
+        database_path.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::read_dir(database_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect()
+}
+
+#[test]
+fn schema_seven_diagnostic_stays_read_only_and_offers_the_upgrade_action() {
+    let dir = database_test_dir("schema-seven-diagnostic");
+    let database_path = dir.join("library.sqlite3");
+    create_schema_seven_database(&database_path);
+    let before = std::fs::read(&database_path).unwrap();
+
+    let result = load_database_snapshot_at(&database_path, &dir.join("config.toml"), None);
+
+    match result {
+        Err(DatabaseLoadError::Outdated { health }) => {
+            assert_eq!(health.schema_version, Some(7));
+            assert_eq!(health.resolved_path, database_path);
+
+            let state = DatabaseState::Outdated {
+                health,
+                previous: None,
+            };
+            assert_eq!(database_state_path(&state), Some(database_path.clone()));
+            let context = egui::Context::default();
+            let mut action = None;
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    action = show_database_panel(ui, &state);
+                });
+            });
+            assert!(rendered_text_contains(
+                &output,
+                "Library database needs upgrading"
+            ));
+            assert!(rendered_text_contains(
+                &output,
+                "Your library was created by an older EmuWiz version."
+            ));
+            assert!(rendered_text_contains(&output, "schema 7"));
+            assert!(rendered_text_contains(&output, "required schema 10"));
+            assert!(rendered_text_contains(
+                &output,
+                "migration chain 8 → 9 → 10"
+            ));
+            assert!(rendered_text_contains(&output, "Scan and upgrade library"));
+            assert!(!rendered_text_contains(&output, "Retry database load"));
+
+            let button = find_exact_text_center(&output, "Scan and upgrade library").unwrap();
+            let input = egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(button),
+                    egui::Event::PointerButton {
+                        pos: button,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: button,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    action = show_database_panel(ui, &state);
+                });
+            });
+            assert_eq!(action, Some(DatabasePanelAction::ScanAndUpgradeLibrary));
+        }
+        _ => panic!("expected schema seven to be reported as Outdated"),
+    }
+    assert_eq!(std::fs::read(&database_path).unwrap(), before);
+    assert!(database_upgrade_backups(&database_path).is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn schema_seven_scan_action_backs_up_upgrades_and_refreshes_gui_state() {
+    let dir = database_test_dir("schema-seven-explicit-upgrade");
+    let database_path = dir.join("library.sqlite3");
+    create_schema_seven_database(&database_path);
+    let source = dir.join("source");
+    let mount = dir.join("mount");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = config_for(&source, &mount);
+
+    let result = load_database_snapshot_at(&database_path, &dir.join("config.toml"), Some(&config));
+    match &result {
+        Ok(DatabaseOutcome::Scanned {
+            snapshot,
+            upgrade: Some(report),
+            ..
+        }) => {
+            assert_eq!(snapshot.schema_version, 10);
+            assert_eq!(report.from_version, 7);
+            assert_eq!(report.to_version, 10);
+            assert_eq!(report.applied_versions, vec![8, 9, 10]);
+            assert!(report.backup_path.is_file());
+            assert_eq!(
+                check_database_health(&report.backup_path).schema_version,
+                Some(7)
+            );
+        }
+        _ => panic!("expected a scanned outcome with an upgrade report"),
+    }
+    let health = check_database_health(&database_path);
+    assert_eq!(health.schema_version, Some(10));
+    assert!(health.migrations_current);
+    assert_eq!(database_upgrade_backups(&database_path).len(), 1);
+
+    let mut app = app_for_operation_tests();
+    let generation = DatabaseGeneration::INITIAL.next();
+    app.database_generation = generation;
+    let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+    app.database_state = DatabaseState::Loading {
+        generation,
+        receiver,
+        worker: None,
+        previous: None,
+        scanning: true,
+    };
+    sender.send((generation, result)).unwrap();
+    app.poll_database_load(&egui::Context::default());
+
+    match &app.database_state {
+        DatabaseState::Ready { snapshot, .. } => assert_eq!(snapshot.schema_version, 10),
+        _ => panic!("successful upgrade did not refresh the GUI state to Ready"),
+    }
+    let feedback = app.feedback.as_ref().unwrap();
+    assert!(feedback.succeeded);
+    assert!(feedback.message.contains("upgraded safely"));
+    assert!(feedback.message.contains("8 → 9 → 10"));
+    assert!(feedback.message.contains("recoverable from"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn gui_database_refresh_is_read_only_and_creates_no_sidecars() {
     let dir = database_test_dir("read-only-refresh");
@@ -829,7 +1013,9 @@ fn scan_partial_success_reports_folder_errors_without_failing_the_scan() {
         Ok(DatabaseOutcome::Scanned {
             snapshot,
             scan_summary,
+            upgrade,
         }) => {
+            assert!(upgrade.is_none());
             assert_eq!(scan_summary.folder_errors.len(), 1);
             assert_eq!(scan_summary.folder_errors[0].0, source_a);
             // Archives under the still-reachable folder remain in the
@@ -863,7 +1049,9 @@ fn successful_scan_refreshes_cached_counts() {
         Ok(DatabaseOutcome::Scanned {
             snapshot,
             scan_summary,
+            upgrade,
         }) => {
+            assert!(upgrade.is_none());
             assert_eq!(scan_summary.counts.archives_added, 1);
             assert_eq!(snapshot.stats.total_archives, 1);
             assert_eq!(snapshot.archives.len(), 1);
@@ -1301,6 +1489,7 @@ fn the_database_status_scan_library_path_still_populates_last_scan_summary_direc
             Ok(DatabaseOutcome::Scanned {
                 snapshot,
                 scan_summary: scan_summary.clone(),
+                upgrade: None,
             }),
         ))
         .unwrap();
