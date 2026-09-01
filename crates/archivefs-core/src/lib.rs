@@ -26,6 +26,7 @@ mod database;
 /// over the existing per-subsystem reports. See the module documentation
 /// for the read-only contract.
 pub mod diagnostics;
+pub mod emulator_download;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
