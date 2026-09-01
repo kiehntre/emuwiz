@@ -6335,6 +6335,16 @@ impl ArchiveFsApp {
                                     "RetroArch profile discovery is shared with Cheats & Mods.",
                                 );
                             }
+                            None if name == "shadPS4" => {
+                                widgets::status_badge(
+                                    ui,
+                                    "Needs setup",
+                                    widgets::StatusTone::Pending,
+                                );
+                                ui.weak(
+                                    "No shadPS4 installation was found in the documented local paths.",
+                                );
+                            }
                             None => {
                                 widgets::status_badge(
                                     ui,
