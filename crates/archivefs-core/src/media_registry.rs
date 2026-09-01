@@ -323,6 +323,13 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "chd",
         kind: ArchiveKind::DirectGameImage,
     },
+    // DiscJuggler CDI is a single-file optical image. The extension only
+    // makes it discoverable; Dreamcast identity still requires the bounded
+    // CDI descriptor and IP.BIN checks in `game_identity`.
+    MediaFormat {
+        extension: "cdi",
+        kind: ArchiveKind::DirectGameImage,
+    },
     // --- Loose cartridge ROMs ---
     //
     // Every entry below is a self-evidencing cartridge-ROM extension whose
@@ -748,6 +755,14 @@ mod tests {
     fn d88_is_a_direct_game_image() {
         assert_eq!(
             kind_for_extension("d88"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn cdi_is_a_direct_game_image_but_extension_is_not_platform_identity() {
+        assert_eq!(
+            kind_for_extension("cdi"),
             Some(ArchiveKind::DirectGameImage)
         );
     }

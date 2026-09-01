@@ -8649,9 +8649,10 @@ mod tests {
         desc.push(0);
         desc.push(0);
         desc.extend_from_slice(&[0u8; 13]);
-        let dlen = (desc.len() + 4) as u32;
+        let dlen = (desc.len() + 8) as u32;
         let mut file = vec![0u8; total_bytes as usize];
         file.extend_from_slice(&desc);
+        file.extend_from_slice(&0x8000_0006_u32.to_le_bytes());
         file.extend_from_slice(&dlen.to_le_bytes());
         file
     }

@@ -20,18 +20,21 @@
 //! error rather than panicking or reading out of bounds, so a truncated or
 //! foreign file is refused, never guessed at.
 //!
-//! This module does not reimplement any of that trailer walking. It only:
+//! The dependency's public parser is not used here because its API calls
+//! `std::fs::read` and would allocate the whole image before reaching the
+//! footer. This module performs the same small descriptor walk against a
+//! bounded buffer, retaining the dependency only for its sector reader.
 //!
-//! 1. Bounds the whole-file read [`opticaldiscs::discjuggler::parse_discjuggler`]
-//!    itself performs (see [`MAX_CDI_BYTES`]) and serializes concurrent
-//!    calls to it (see "Upstream limitation" below);
+//! This module:
+//!
+//! 1. Reads only the footer and bounded descriptor (see the resource limits
+//!    below);
 //! 2. Selects the single correct Dreamcast data track from the parsed
 //!    track list, using the same structural rule
 //!    [`crate::ingestion::gdi::resolve_gdi_data_track`] already uses for
 //!    `.gdi` (see [`select_dreamcast_data_track`]);
 //! 3. Cross-checks that track's declared byte range actually fits inside
-//!    the real file, since the trailer's own arithmetic is never checked
-//!    against the file's true length;
+//!    the data region, since descriptor arithmetic must not be trusted;
 //! 4. Wraps the result in a [`crate::logical_media::LogicalMedia`] so the
 //!    existing, unchanged [`crate::game_identity::inspect_dreamcast_source`]
 //!    (via `parse_ip_bin_meta`) can read it exactly like an ISO, CUE, GDI,
@@ -43,8 +46,8 @@
 //! A `.cdi` concatenates every track from every session in one file. Per
 //! [`opticaldiscs::discjuggler`]'s own module documentation, a Dreamcast
 //! GD-ROM rip's high-density session records its absolute starting LBA in
-//! [`opticaldiscs::discjuggler::DiscJugglerTrack::base_lba`] (`0` for a
-//! plain volume-relative disc). This is exactly the same structural
+//! CDI track `base_lba` (`0` for a plain volume-relative disc). This is
+//! exactly the same structural
 //! signal `.gdi` descriptors give directly as `start_lba`, so
 //! [`select_dreamcast_data_track`] reuses the identical
 //! [`crate::chd_identity::GDROM_HIGH_DENSITY_START_FRAME`] boundary and
@@ -58,46 +61,15 @@
 //! browsing that track's ISO 9660 directory extents, which is outside
 //! this module's scope entirely).
 //!
-//! # Upstream limitation: no `Read + Seek`/`mmap` API, and why this
-//! serializes instead
-//!
-//! `opticaldiscs::discjuggler::parse_discjuggler` is the *only* public
-//! entry point this crate has for CDI, and it is hardcoded to
-//! `std::fs::read(path)` - it reads the **entire file** into a `Vec<u8>`
-//! purely to reach the trailer descriptor at the end (typically a few KB).
-//! There is no `Read + Seek`-generic variant, no `mmap`/`memmap2`
-//! dependency anywhere in `opticaldiscs` 0.15.0 (confirmed against its own
-//! `Cargo.toml`), and the trailer-walking functions it calls internally
-//! (`load_session`, `load_track`, `Cursor`, ...) are private, so there is
-//! no way for calling code to supply a different byte source. Handing
-//! `parse_discjuggler` anything other than a plain path (e.g. a path
-//! backed by our own `mmap`) would not change what it does once called -
-//! the read happens inside a function this crate does not control.
-//!
-//! The only way to avoid that whole-file read would be to reimplement the
-//! trailer walk ourselves against different I/O - exactly the "second CDI
-//! parser" this module must not become (see the module-level "What backs
-//! this" section above: DiscJuggler's own reverse-engineered ambiguity is
-//! why a from-scratch parser was rejected in favor of reusing
-//! `opticaldiscs` in the first place).
-//!
-//! Given that, [`MAX_CDI_BYTES`] bounds the worst case for *one* call, but
-//! a library scanner that inspects many `.cdi` files *concurrently* could
-//! still hold several such multi-hundred-MB-to-1.5-GiB buffers at once.
-//! [`CDI_PARSE_LOCK`] serializes calls into `parse_discjuggler` itself
-//! (not the rest of this module's own bounded, allocation-free track
-//! selection and sector reads) so at most one such buffer exists at a
-//! time - a cheap, correct mitigation for the single process-wide
-//! resource this crate's own code can actually control. It does not fix
-//! the underlying inefficiency (a genuinely large legitimate disc still
-//! costs one full read), which can only be fixed upstream in
-//! `opticaldiscs` itself.
+//! The supported versions are the three version markers used by DiscJuggler
+//! (`0x80000004`, `0x80000005`, and `0x80000006`, commonly called 2, 3, and
+//! 3.5). Versions are accepted only when their footer and self-delimiting
+//! descriptor validate; no other CDI-like variant is guessed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Mutex;
 
-use opticaldiscs::discjuggler::{DiscJugglerTrack, parse_discjuggler};
 use opticaldiscs::sector_reader::{BinCueSectorReader, SectorReader};
 
 use crate::chd_identity::GDROM_HIGH_DENSITY_START_FRAME;
@@ -107,30 +79,27 @@ use crate::logical_media::{LogicalMedia, LogicalMediaError};
 /// this crate.
 const SECTOR_SIZE: u64 = 2048;
 
-/// A real Dreamcast GD-ROM `.cdi` tops out around 1.2 GiB. 1.5 GiB leaves
-/// headroom for format overhead (subchannel data, CD-Text, multiple
-/// sessions) while still bounding `parse_discjuggler`'s unavoidable
-/// whole-file read (see the module documentation's "Upstream limitation"
-/// section) well below the 2 GiB this module used before this bound was
-/// tightened - reducing the parser's worst-case heap allocation per call
-/// without risking rejecting a genuine disc. Checked from filesystem
-/// metadata alone, before any read.
+/// Maximum image size considered by this inspector. Checked from filesystem
+/// metadata before opening any descriptor or data range.
 pub const MAX_CDI_BYTES: u64 = 1_536 * 1024 * 1024;
 
-/// Serializes calls into [`opticaldiscs::discjuggler::parse_discjuggler`],
-/// the one place in this module that allocates a buffer up to
-/// [`MAX_CDI_BYTES`] - see the module documentation's "Upstream
-/// limitation" section for why this exists instead of a streaming parse.
-/// A plain [`Mutex`] is the smallest tool for this: the call it guards is
-/// synchronous and brief (parse only, no long-lived I/O), and every
-/// caller in this crate is itself synchronous.
-static CDI_PARSE_LOCK: Mutex<()> = Mutex::new(());
-
-/// `parse_discjuggler` already bounds `num_sessions`/per-session track
-/// count to `u8` each (at most 255 sessions, 255 tracks per session), so
-/// this can never actually be exceeded by a real parse - a second,
-/// independent bound kept only as defense in depth.
-const MAX_CDI_TRACKS: usize = 65_536;
+/// Maximum descriptor/metadata allocation. Real descriptors are normally a
+/// few kilobytes; malformed footer values never request an image-sized Vec.
+pub const MAX_CDI_METADATA_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum bytes transferred by one descriptor or logical-media read.
+pub const MAX_CDI_READ_BYTES: usize = 64 * 1024;
+/// Maximum logical data bytes inspected after the descriptor. The descriptor
+/// and data limits are separate so identity never turns into whole-image I/O.
+pub const MAX_CDI_INSPECTED_BYTES: u64 = 4 * 1024 * 1024;
+/// Conservative bounds for CDI's variable-count fields.
+pub const MAX_CDI_SESSIONS: usize = 32;
+pub const MAX_CDI_TRACKS: usize = 256;
+pub const MAX_CDI_DESCRIPTORS: usize = 512;
+const MAX_CDI_INDICES: usize = 64;
+const MAX_CDI_CDTEXT_BLOCKS: usize = 64;
+const CDI_V2: u32 = 0x8000_0004;
+const CDI_V3: u32 = 0x8000_0005;
+const CDI_V35: u32 = 0x8000_0006;
 
 #[derive(Debug)]
 pub enum CdiIdentityError {
@@ -138,12 +107,9 @@ pub enum CdiIdentityError {
     Io(String),
     /// The file exceeds [`MAX_CDI_BYTES`]; refused before any read.
     TooLarge { bytes: u64, maximum: u64 },
-    /// `opticaldiscs::discjuggler::parse_discjuggler` rejected the file:
-    /// not a CDI at all, or a truncated/malformed/unsupported-read-mode
-    /// trailer. `detail` is its own error, rendered as text.
+    /// The footer or bounded descriptor is not a supported CDI layout.
     Parse(String),
-    /// More tracks than [`MAX_CDI_TRACKS`] were parsed - defense in depth,
-    /// not expected to be reachable via a genuine parse.
+    /// More tracks or descriptors than the conservative bounds allow.
     TooManyTracks,
     /// No Dreamcast-eligible data track was found at all.
     NoDataTrack,
@@ -158,11 +124,8 @@ pub enum CdiIdentityError {
     /// file - a contradictory or overflowing offset/length pair, never
     /// trusted just because the trailer's own arithmetic produced it.
     ImpossibleOffset,
-    /// [`CDI_PARSE_LOCK`] was poisoned by a panic in a previous call.
-    /// Refused rather than recovering the guard and proceeding: this
-    /// crate has no way to know the poisoning panic left no shared state
-    /// corrupted, so the safe answer is to fail closed, not to guess.
-    LockPoisoned,
+    /// The descriptor exceeds [`MAX_CDI_METADATA_BYTES`].
+    MetadataTooLarge { bytes: u64, maximum: usize },
 }
 
 impl std::fmt::Display for CdiIdentityError {
@@ -188,14 +151,305 @@ impl std::fmt::Display for CdiIdentityError {
             }
             Self::ImpossibleOffset => formatter
                 .write_str("CDI data track's declared byte range does not fit inside the file"),
-            Self::LockPoisoned => {
-                formatter.write_str("CDI parse lock was poisoned by a panic in a previous call")
-            }
+            Self::MetadataTooLarge { bytes, maximum } => write!(
+                formatter,
+                "CDI descriptor is {bytes} bytes, exceeding the {maximum}-byte metadata bound"
+            ),
         }
     }
 }
 
 impl std::error::Error for CdiIdentityError {}
+
+#[derive(Debug, Clone)]
+struct CdiTrack {
+    is_data: bool,
+    physical_sector_size: u64,
+    data_offset: u64,
+    file_byte_offset: u64,
+    base_lba: u64,
+    track_frames: u64,
+    data_frames: u64,
+    descriptor_count: usize,
+}
+
+struct DescriptorCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl DescriptorCursor<'_> {
+    fn take(&mut self, length: usize) -> Result<&[u8], CdiIdentityError> {
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or_else(|| CdiIdentityError::Parse("descriptor offset overflow".into()))?;
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or_else(|| CdiIdentityError::Parse("truncated CDI descriptor".into()))?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn skip(&mut self, length: usize) -> Result<(), CdiIdentityError> {
+        self.take(length).map(|_| ())
+    }
+
+    fn u8(&mut self) -> Result<u8, CdiIdentityError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, CdiIdentityError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(
+            |_| CdiIdentityError::Parse("invalid CDI u16".into()),
+        )?))
+    }
+
+    fn u32(&mut self) -> Result<u32, CdiIdentityError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(
+            |_| CdiIdentityError::Parse("invalid CDI u32".into()),
+        )?))
+    }
+}
+
+fn checked_track_bytes(offset: u64, physical_sector_size: u64, frames: u64) -> Option<u64> {
+    offset.checked_add(physical_sector_size.checked_mul(frames)?)
+}
+
+fn read_descriptor(path: &Path, file_len: u64) -> Result<(Vec<u8>, u64), CdiIdentityError> {
+    if file_len < 8 {
+        return Err(CdiIdentityError::Parse(
+            "file too small for CDI footer".into(),
+        ));
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+    file.seek(SeekFrom::Start(file_len - 8))
+        .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+    let mut footer = [0_u8; 8];
+    file.read_exact(&mut footer)
+        .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+    let version = u32::from_le_bytes(
+        footer[..4]
+            .try_into()
+            .map_err(|_| CdiIdentityError::Parse("invalid CDI footer version".into()))?,
+    );
+    let location =
+        u64::from(u32::from_le_bytes(footer[4..].try_into().map_err(
+            |_| CdiIdentityError::Parse("invalid CDI footer location".into()),
+        )?));
+    if !matches!(version, CDI_V2 | CDI_V3 | CDI_V35) {
+        return Err(CdiIdentityError::Parse(format!(
+            "unsupported CDI version 0x{version:08x}"
+        )));
+    }
+
+    // Versions 2/3 store the descriptor start; 3.5 stores the distance from
+    // EOF, including the eight-byte footer. This matches real v3 Shenmue and
+    // v3.5 Simpsons images in the configured corpus.
+    let descriptor_start = match version {
+        CDI_V2 | CDI_V3 => location,
+        CDI_V35 => file_len
+            .checked_sub(location)
+            .ok_or_else(|| CdiIdentityError::Parse("CDI descriptor offset underflow".into()))?,
+        _ => unreachable!(),
+    };
+    let descriptor_end = file_len - 8;
+    if descriptor_start >= descriptor_end {
+        return Err(CdiIdentityError::Parse(
+            "CDI descriptor does not fit before footer".into(),
+        ));
+    }
+    let descriptor_len = descriptor_end - descriptor_start;
+    if descriptor_len > MAX_CDI_METADATA_BYTES as u64 {
+        return Err(CdiIdentityError::MetadataTooLarge {
+            bytes: descriptor_len,
+            maximum: MAX_CDI_METADATA_BYTES,
+        });
+    }
+    let descriptor_len_usize =
+        usize::try_from(descriptor_len).map_err(|_| CdiIdentityError::MetadataTooLarge {
+            bytes: descriptor_len,
+            maximum: MAX_CDI_METADATA_BYTES,
+        })?;
+    let mut descriptor = vec![0_u8; descriptor_len_usize];
+    let mut read = 0usize;
+    while read < descriptor.len() {
+        let amount = (descriptor.len() - read).min(MAX_CDI_READ_BYTES);
+        let offset = descriptor_start
+            .checked_add(u64::try_from(read).map_err(|_| {
+                CdiIdentityError::Parse("CDI descriptor read offset overflow".into())
+            })?)
+            .ok_or_else(|| CdiIdentityError::Parse("CDI descriptor read offset overflow".into()))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+        file.read_exact(&mut descriptor[read..read + amount])
+            .map_err(|error| CdiIdentityError::Io(error.to_string()))?;
+        read += amount;
+    }
+    Ok((descriptor, descriptor_start))
+}
+
+fn parse_descriptor(bytes: &[u8], data_end: u64) -> Result<Vec<CdiTrack>, CdiIdentityError> {
+    let mut cursor = DescriptorCursor { bytes, position: 0 };
+    let sessions = usize::from(cursor.u8()?);
+    if sessions == 0 || sessions > MAX_CDI_SESSIONS {
+        return Err(CdiIdentityError::TooManyTracks);
+    }
+    let mut tracks: Vec<CdiTrack> = Vec::new();
+    let mut current_offset = 0_u64;
+    let mut descriptor_count = 0usize;
+    let mut saw_terminator = false;
+    for _ in 0..=sessions {
+        let session = cursor.take(15)?;
+        let track_count = usize::from(session[1]);
+        if track_count > 99 {
+            return Err(CdiIdentityError::TooManyTracks);
+        }
+        if track_count == 0 {
+            saw_terminator = true;
+            break;
+        }
+        for _ in 0..track_count {
+            if tracks.len() >= MAX_CDI_TRACKS {
+                return Err(CdiIdentityError::TooManyTracks);
+            }
+            let track = parse_track(&mut cursor, current_offset, data_end)?;
+            descriptor_count = descriptor_count
+                .checked_add(track.descriptor_count)
+                .ok_or(CdiIdentityError::TooManyTracks)?;
+            if descriptor_count > MAX_CDI_DESCRIPTORS {
+                return Err(CdiIdentityError::TooManyTracks);
+            }
+            let track_end_lba = track
+                .base_lba
+                .checked_add(track.track_frames)
+                .ok_or(CdiIdentityError::ImpossibleOffset)?;
+            for previous in &tracks {
+                let previous_end = previous
+                    .base_lba
+                    .checked_add(previous.track_frames)
+                    .ok_or(CdiIdentityError::ImpossibleOffset)?;
+                if track.base_lba < previous_end && previous.base_lba < track_end_lba {
+                    return Err(CdiIdentityError::ImpossibleOffset);
+                }
+            }
+            tracks.push(track);
+            let track = tracks.last().ok_or(CdiIdentityError::TooManyTracks)?;
+            current_offset = checked_track_bytes(
+                current_offset,
+                track.physical_sector_size,
+                track.track_frames,
+            )
+            .ok_or(CdiIdentityError::ImpossibleOffset)?;
+        }
+    }
+    if !saw_terminator || tracks.is_empty() {
+        return Err(CdiIdentityError::Parse(
+            "CDI descriptor has no terminating session or tracks".into(),
+        ));
+    }
+    if current_offset > data_end {
+        return Err(CdiIdentityError::ImpossibleOffset);
+    }
+    Ok(tracks)
+}
+
+fn parse_track(
+    cursor: &mut DescriptorCursor<'_>,
+    track_start: u64,
+    data_end: u64,
+) -> Result<CdiTrack, CdiIdentityError> {
+    cursor.skip(16)?;
+    let filename_len = usize::from(cursor.u8()?);
+    cursor.skip(filename_len)?;
+    cursor.skip(29)?;
+    let _medium_type = cursor.u16()?;
+    let index_count = usize::from(cursor.u16()?);
+    if index_count > MAX_CDI_INDICES {
+        return Err(CdiIdentityError::TooManyTracks);
+    }
+    let mut pregap = 0_u64;
+    for index in 0..index_count {
+        let value = u64::from(cursor.u32()?);
+        if index == 0 {
+            pregap = value;
+        }
+    }
+    let cdtext_blocks =
+        usize::try_from(cursor.u32()?).map_err(|_| CdiIdentityError::TooManyTracks)?;
+    if cdtext_blocks > MAX_CDI_CDTEXT_BLOCKS {
+        return Err(CdiIdentityError::TooManyTracks);
+    }
+    let descriptor_count = cdtext_blocks
+        .checked_add(index_count)
+        .ok_or(CdiIdentityError::TooManyTracks)?;
+    if descriptor_count > MAX_CDI_DESCRIPTORS {
+        return Err(CdiIdentityError::TooManyTracks);
+    }
+    for _ in 0..cdtext_blocks {
+        for _ in 0..18 {
+            let field_len = usize::from(cursor.u8()?);
+            cursor.skip(field_len)?;
+        }
+    }
+    cursor.skip(2)?;
+    let track_mode = cursor.u32()?;
+    cursor.skip(4)?;
+    let _session_index = cursor.u32()?;
+    let _track_index = cursor.u32()?;
+    let base_lba = u64::from(cursor.u32()?);
+    let track_frames = u64::from(cursor.u32()?);
+    cursor.skip(16)?;
+    let read_mode = cursor.u32()?;
+    cursor.skip(4 + 9 + 12)?;
+    let _isrc_valid = cursor.u32()?;
+    cursor.skip(99)?;
+
+    let (physical_sector_size, data_offset, is_data) = match (track_mode, read_mode) {
+        (0, 2) => (2352, 0, false),
+        (0, 3) => (2368, 0, false),
+        (0, 4) => (2448, 0, false),
+        (1, 0) => (2048, 0, true),
+        (1, 2) => (2352, 16, true),
+        (1, 3) => (2368, 16, true),
+        (1, 4) => (2448, 16, true),
+        (2, 1) => (2336, 8, true),
+        (2, 2) => (2352, 24, true),
+        (2, 3) => (2368, 24, true),
+        (2, 4) => (2448, 24, true),
+        _ => {
+            return Err(CdiIdentityError::UnsupportedSectorLayout);
+        }
+    };
+    if pregap > track_frames {
+        return Err(CdiIdentityError::ImpossibleOffset);
+    }
+    let track_end = checked_track_bytes(track_start, physical_sector_size, track_frames)
+        .ok_or(CdiIdentityError::ImpossibleOffset)?;
+    if track_end > data_end {
+        return Err(CdiIdentityError::ImpossibleOffset);
+    }
+    let data_start = checked_track_bytes(track_start, physical_sector_size, pregap)
+        .ok_or(CdiIdentityError::ImpossibleOffset)?;
+    let data_frames = track_frames - pregap;
+    if checked_track_bytes(data_start, physical_sector_size, data_frames)
+        .is_none_or(|end| end > track_end)
+    {
+        return Err(CdiIdentityError::ImpossibleOffset);
+    }
+    Ok(CdiTrack {
+        is_data,
+        physical_sector_size,
+        data_offset,
+        file_byte_offset: data_start,
+        base_lba,
+        track_frames,
+        data_frames,
+        descriptor_count,
+    })
+}
 
 /// A [`LogicalMedia`] over one `.cdi` file's selected Dreamcast data
 /// track, decoded on demand.
@@ -208,6 +462,7 @@ impl std::error::Error for CdiIdentityError {}
 pub struct CdiLogicalMedia {
     reader: RefCell<BinCueSectorReader>,
     len: u64,
+    bytes_inspected: Cell<u64>,
 }
 
 /// Opens `path` as a DiscJuggler `.cdi` and resolves the single Dreamcast
@@ -225,43 +480,38 @@ pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, 
         });
     }
 
-    let tracks = {
-        let _guard = CDI_PARSE_LOCK
-            .lock()
-            .map_err(|_poisoned| CdiIdentityError::LockPoisoned)?;
-        parse_discjuggler(path).map_err(|error| CdiIdentityError::Parse(format!("{error:?}")))?
-    };
-    if tracks.len() > MAX_CDI_TRACKS {
-        return Err(CdiIdentityError::TooManyTracks);
-    }
+    let (descriptor, data_end) = read_descriptor(path, file_len)?;
+    let tracks = parse_descriptor(&descriptor, data_end)?;
 
     let track = select_dreamcast_data_track(&tracks)?;
 
-    if track.data_offset >= track.physical_sector_size {
+    let data_sector_end = track
+        .data_offset
+        .checked_add(SECTOR_SIZE)
+        .ok_or(CdiIdentityError::UnsupportedSectorLayout)?;
+    if data_sector_end > track.physical_sector_size {
         return Err(CdiIdentityError::UnsupportedSectorLayout);
     }
-    if track.frame_count == 0 {
+    if track.data_frames == 0 {
         return Err(CdiIdentityError::NoDataTrack);
     }
-    let track_bytes = track
-        .physical_sector_size
-        .checked_mul(track.frame_count)
-        .ok_or(CdiIdentityError::ImpossibleOffset)?;
-    let track_end = track
-        .file_byte_offset
-        .checked_add(track_bytes)
-        .ok_or(CdiIdentityError::ImpossibleOffset)?;
-    if track_end > file_len {
+    let data_end = checked_track_bytes(
+        track.file_byte_offset,
+        track.physical_sector_size,
+        track.data_frames,
+    )
+    .ok_or(CdiIdentityError::ImpossibleOffset)?;
+    if data_end > file_len {
         return Err(CdiIdentityError::ImpossibleOffset);
     }
 
     let logical_len = track
-        .frame_count
+        .data_frames
         .checked_mul(SECTOR_SIZE)
         .ok_or(CdiIdentityError::ImpossibleOffset)?;
 
     let reader = BinCueSectorReader::with_layout(
-        &track.data_path,
+        path,
         track.file_byte_offset,
         track.physical_sector_size,
         track.data_offset,
@@ -271,16 +521,15 @@ pub fn open_dreamcast_cdi_logical_media(path: &Path) -> Result<CdiLogicalMedia, 
     Ok(CdiLogicalMedia {
         reader: RefCell::new(reader),
         len: logical_len,
+        bytes_inspected: Cell::new(0),
     })
 }
 
 /// Selects the single correct Dreamcast data track from a parsed `.cdi`
 /// track list - see the module documentation for the exact rule. Never
 /// track order, never a filename.
-fn select_dreamcast_data_track(
-    tracks: &[DiscJugglerTrack],
-) -> Result<&DiscJugglerTrack, CdiIdentityError> {
-    let high_density: Vec<&DiscJugglerTrack> = tracks
+fn select_dreamcast_data_track(tracks: &[CdiTrack]) -> Result<&CdiTrack, CdiIdentityError> {
+    let high_density: Vec<&CdiTrack> = tracks
         .iter()
         .filter(|track| {
             track.is_data && track.base_lba >= u64::from(GDROM_HIGH_DENSITY_START_FRAME)
@@ -295,7 +544,7 @@ fn select_dreamcast_data_track(
     // Single-session shape: no track reaches the GD-ROM high-density
     // boundary, so this can only be trusted if exactly one data track
     // exists in the whole file.
-    let plain: Vec<&DiscJugglerTrack> = tracks.iter().filter(|track| track.is_data).collect();
+    let plain: Vec<&CdiTrack> = tracks.iter().filter(|track| track.is_data).collect();
     match plain.len() {
         1 => Ok(plain[0]),
         0 => Err(CdiIdentityError::NoDataTrack),
@@ -309,6 +558,27 @@ impl LogicalMedia for CdiLogicalMedia {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LogicalMediaError> {
+        if buf.len() > MAX_CDI_READ_BYTES {
+            return Err(LogicalMediaError::DecodeFailed {
+                detail: format!("CDI logical read exceeds {MAX_CDI_READ_BYTES}-byte bound"),
+            });
+        }
+        let requested = u64::try_from(buf.len()).map_err(|_| LogicalMediaError::DecodeFailed {
+            detail: "CDI logical read length does not fit in u64".to_string(),
+        })?;
+        let inspected = self
+            .bytes_inspected
+            .get()
+            .checked_add(requested)
+            .ok_or_else(|| LogicalMediaError::DecodeFailed {
+                detail: "CDI cumulative logical-read counter overflowed".to_string(),
+            })?;
+        if inspected > MAX_CDI_INSPECTED_BYTES {
+            return Err(LogicalMediaError::DecodeFailed {
+                detail: "CDI cumulative logical-read bound exceeded".to_string(),
+            });
+        }
+        self.bytes_inspected.set(inspected);
         let end = offset
             .checked_add(buf.len() as u64)
             .ok_or(LogicalMediaError::OutOfBounds {
@@ -327,7 +597,14 @@ impl LogicalMedia for CdiLogicalMedia {
         let mut filled = 0usize;
         let mut reader = self.reader.borrow_mut();
         while filled < buf.len() {
-            let absolute = offset + filled as u64;
+            let absolute =
+                offset
+                    .checked_add(filled as u64)
+                    .ok_or(LogicalMediaError::OutOfBounds {
+                        offset,
+                        requested_len: buf.len(),
+                        media_len: self.len,
+                    })?;
             let lba = absolute / SECTOR_SIZE;
             let within_sector = (absolute % SECTOR_SIZE) as usize;
             let sector =
@@ -424,6 +701,14 @@ mod tests {
     /// actually written (e.g. to simulate truncation) - `None` writes the
     /// full, correctly-sized region.
     fn build_cdi(sessions: &[Vec<TrackSpec>], data_len_override: Option<u64>) -> Vec<u8> {
+        build_cdi_version(sessions, data_len_override, CDI_V35)
+    }
+
+    fn build_cdi_version(
+        sessions: &[Vec<TrackSpec>],
+        data_len_override: Option<u64>,
+        version: u32,
+    ) -> Vec<u8> {
         let mut total_bytes = 0u64;
         for session in sessions {
             for &(_, read_mode, _, length, _) in session {
@@ -454,12 +739,18 @@ mod tests {
         desc.push(0);
         desc.extend_from_slice(&[0u8; 13]);
 
-        let dlen = (desc.len() + 4) as u32;
+        let dlen = (desc.len() + 8) as u32;
 
         let data_len = data_len_override.unwrap_or(total_bytes);
         let mut file = vec![0u8; data_len as usize];
         file.extend_from_slice(&desc);
-        file.extend_from_slice(&dlen.to_le_bytes());
+        file.extend_from_slice(&version.to_le_bytes());
+        let location = match version {
+            CDI_V2 | CDI_V3 => data_len,
+            CDI_V35 => u64::from(dlen),
+            _ => 0,
+        };
+        file.extend_from_slice(&(location as u32).to_le_bytes());
         file
     }
 
@@ -567,7 +858,7 @@ mod tests {
 
     #[test]
     fn two_plain_data_tracks_with_no_high_density_candidate_are_ambiguous() {
-        let bytes = build_cdi(&[vec![(1, 2, 0, 4, 0), (1, 2, 0, 4, 0)]], None);
+        let bytes = build_cdi(&[vec![(1, 2, 0, 4, 0), (1, 2, 4, 4, 0)]], None);
         let file = write_cdi(&bytes);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
@@ -588,11 +879,120 @@ mod tests {
 
     #[test]
     fn extension_alone_is_insufficient_without_a_real_descriptor() {
-        let file = write_cdi(b"this is not a disc juggler image at all");
+        let file = write_cdi(&[0x13, 0x37, 0x00, 0xff, 0x4a, 0x91]);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
             Err(CdiIdentityError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn empty_file_refuses_without_panicking() {
+        let file = write_cdi(&[]);
+        assert!(matches!(
+            open_dreamcast_cdi_logical_media(file.path()),
+            Err(CdiIdentityError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn supported_footer_versions_use_their_documented_location_form() {
+        for version in [CDI_V2, CDI_V3, CDI_V35] {
+            let bytes = build_cdi_version(&[vec![(1, 0, 0, 1, 0)]], None, version);
+            let file = write_cdi(&bytes);
+            assert!(open_dreamcast_cdi_logical_media(file.path()).is_ok(),
+                "version {version:#x} should parse");
+        }
+    }
+
+    #[test]
+    fn unsupported_footer_version_refuses() {
+        let bytes = build_cdi_version(&[vec![(1, 0, 0, 1, 0)]], None, 0x8000_0007);
+        let file = write_cdi(&bytes);
+        assert!(matches!(
+            open_dreamcast_cdi_logical_media(file.path()),
+            Err(CdiIdentityError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn impossible_session_count_refuses_before_track_walk() {
+        let sessions = (0..MAX_CDI_SESSIONS + 1)
+            .map(|_| vec![(1, 0, 0, 1, 0)])
+            .collect::<Vec<_>>();
+        let bytes = build_cdi(&sessions, None);
+        let file = write_cdi(&bytes);
+        assert!(matches!(
+            open_dreamcast_cdi_logical_media(file.path()),
+            Err(CdiIdentityError::TooManyTracks)
+        ));
+    }
+
+    #[test]
+    fn impossible_track_count_refuses_before_track_walk() {
+        let tracks = vec![(1, 0, 0, 1, 0); 100];
+        let bytes = build_cdi(&[tracks], None);
+        let file = write_cdi(&bytes);
+        assert!(matches!(
+            open_dreamcast_cdi_logical_media(file.path()),
+            Err(CdiIdentityError::TooManyTracks)
+        ));
+    }
+
+    #[test]
+    fn footer_offset_beyond_eof_refuses() {
+        let mut bytes = build_cdi_version(&[vec![(1, 0, 0, 1, 0)]], None, CDI_V3);
+        let footer_offset = bytes.len() - 4;
+        bytes[footer_offset..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let file = write_cdi(&bytes);
+        assert!(matches!(
+            open_dreamcast_cdi_logical_media(file.path()),
+            Err(CdiIdentityError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn checked_track_arithmetic_overflow_refuses() {
+        assert_eq!(checked_track_bytes(u64::MAX, 2048, 1), None);
+        assert_eq!(checked_track_bytes(0, u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn overlapping_logical_track_ranges_refuse() {
+        let bytes = build_cdi(&[vec![(1, 0, 0, 4, 0), (1, 0, 0, 4, 0)]], None);
+        let file = write_cdi(&bytes);
+        assert!(matches!(
+            open_dreamcast_cdi_logical_media(file.path()),
+            Err(CdiIdentityError::ImpossibleOffset)
+        ));
+    }
+
+    #[test]
+    fn valid_container_without_usable_ip_bin_has_no_product_code() {
+        let bytes = build_cdi(&[vec![(1, 0, 0, 1, 0)]], None);
+        let file = write_cdi(&bytes);
+        let media = open_dreamcast_cdi_logical_media(file.path()).unwrap();
+        let header = read_ip_bin(&media);
+        let fact = crate::dreamcast_boot_evidence::parse_ip_bin_meta(&header).unwrap();
+        assert!(!fact.hardware_id_recognized);
+        assert!(
+            crate::dreamcast_boot_evidence::observe_ip_bin_evidence(&fact).is_empty()
+        );
+    }
+
+    #[test]
+    fn one_logical_read_is_bounded_and_repeated_reads_are_capped() {
+        let bytes = build_cdi(&[vec![(1, 0, 0, 1, 0)]], None);
+        let file = write_cdi(&bytes);
+        let media = open_dreamcast_cdi_logical_media(file.path()).unwrap();
+        let mut too_large = vec![0; MAX_CDI_READ_BYTES + 1];
+        assert!(media.read_at(0, &mut too_large).is_err());
+
+        let mut sector = [0; 2048];
+        for _ in 0..(MAX_CDI_INSPECTED_BYTES as usize / sector.len()) {
+            media.read_at(0, &mut sector).unwrap();
+        }
+        assert!(media.read_at(0, &mut sector).is_err());
     }
 
     #[test]
@@ -616,7 +1016,7 @@ mod tests {
         let file = write_cdi(&bytes);
         assert!(matches!(
             open_dreamcast_cdi_logical_media(file.path()),
-            Err(CdiIdentityError::Parse(_))
+            Err(CdiIdentityError::UnsupportedSectorLayout)
         ));
     }
 
