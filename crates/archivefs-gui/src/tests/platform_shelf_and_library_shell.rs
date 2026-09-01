@@ -1420,7 +1420,7 @@ fn exact_aliases_do_not_collapse_related_platforms() {
 
 #[test]
 fn bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths() {
-    assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 75);
+    assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 76);
     let mut ids: Vec<_> = BUNDLED_PLATFORM_ARTWORK
         .iter()
         .map(|artwork| artwork.asset_id)

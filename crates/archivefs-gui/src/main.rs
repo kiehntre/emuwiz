@@ -6278,6 +6278,7 @@ impl ArchiveFsApp {
                     "DuckStation",
                     "RetroArch",
                     "ScummVM",
+                    "shadPS4",
                 ];
                 for name in emulators {
                     ui.horizontal_wrapped(|ui| {
@@ -6293,6 +6294,19 @@ impl ArchiveFsApp {
                             })
                         });
                         match matching {
+                            Some(finding)
+                                if name == "shadPS4"
+                                    && finding.title.contains("installation found") =>
+                            {
+                                widgets::status_badge(
+                                    ui,
+                                    "Needs setup",
+                                    widgets::StatusTone::Pending,
+                                );
+                                ui.weak(
+                                    "shadPS4 was found, but PS4 identity and launch support are not enabled yet.",
+                                );
+                            }
                             Some(finding)
                                 if finding.title.contains("ready to launch")
                                     && finding.severity == DoctorSeverity::Info =>

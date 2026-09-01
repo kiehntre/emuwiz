@@ -11,6 +11,24 @@ use std::path::{Path, PathBuf};
 
 const ROOT: &str = "/roms";
 
+#[test]
+fn ps4_is_a_conservative_canonical_platform_distinct_from_ps3() {
+    let ps4 = platform_by_id("PS4").expect("PS4 registry entry");
+    assert_eq!(ps4.display_name, "Sony PlayStation 4");
+    assert_ne!(ps4.id, "PS3");
+    assert_eq!(
+        platform_for_folder_name("PlayStation 4").map(|p| p.id),
+        Some("PS4")
+    );
+
+    let package = detect_platform_report(&DetectionRequest::new(
+        Path::new("/roms/ps4/CUSA00000.pkg"),
+        Path::new(ROOT),
+    ));
+    assert_eq!(package.platform, Some("PS4"));
+    assert!(!ps4.can_be_confirmed_by_signature());
+}
+
 /// A throwaway directory. Real trees are needed to prove the bounded reads and
 /// the read-only guarantee; nothing outside one is ever written.
 struct TempTree {

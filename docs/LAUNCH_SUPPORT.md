@@ -23,6 +23,13 @@ ScummVM, xemu, and Xenia workflows. The exact platform and media coverage
 varies by emulator. A listed emulator is not a promise that every game or
 format for that emulator can launch.
 
+PlayStation 4 is recognised conservatively from explicit PS4 folder names
+and shared package candidates. shadPS4 installation evidence can be shown in
+Emulator Setup, but PS4 PARAM.SFO identity validation, extracted-layout
+verification, and shadPS4 launch planning are not yet implemented. EmuWiz
+therefore must not present a PS4 item as verified or launchable solely because
+it has a `.pkg`, `eboot.bin`, or `sce_sys` path.
+
 The GUI exposes launch readiness and supported launch actions from the game
 details workflow. The CLI and GUI use the shared launch planning and
 identity evidence, but launch execution is currently primarily surfaced by

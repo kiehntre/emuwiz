@@ -87,6 +87,7 @@ const BUNDLED_PLATFORM_IDS: &[&str] = &[
     "PC-FX",
     "PS2",
     "PS3",
+    "PS4",
     "PSP",
     "PSX",
     "Philips CD-i",

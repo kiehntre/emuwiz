@@ -76,7 +76,7 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
     };
     match platform.id {
         "3DO" | "ColecoVision" | "Dreamcast" | "GameCube" | "Intellivision" | "MasterSystem"
-        | "MegaDrive" | "N64" | "NeoGeo" | "NeoGeo64" | "NES" | "PSX" | "PS2" | "PS3"
+        | "MegaDrive" | "N64" | "NeoGeo" | "NeoGeo64" | "NES" | "PSX" | "PS2" | "PS3" | "PS4"
         | "Saturn" | "Sega 32X" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU" | "Xbox"
         | "Xbox360" => PlatformAssetCategory::Console,
         "Atari Lynx"
@@ -126,7 +126,7 @@ pub(crate) fn canonical_platform_for_artwork(
 
 /// The stable filename stem for a persisted canonical platform identifier:
 /// lowercase ASCII alphanumerics only. Display-name changes therefore cannot
-/// rename artwork. Registry tests prove that all 74 current IDs remain unique
+/// rename artwork. Registry tests prove that all current IDs remain unique
 /// under this convention.
 pub(crate) fn canonical_platform_asset_id(platform_id: &str) -> String {
     platform_id
@@ -386,6 +386,10 @@ pub(crate) const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
     BundledPlatformArtwork {
         asset_id: "ps3",
         png: include_bytes!("../../assets/platforms/ps3.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "ps4",
+        png: include_bytes!("../../assets/platforms/ps4.png"),
     },
     BundledPlatformArtwork {
         asset_id: "psp",

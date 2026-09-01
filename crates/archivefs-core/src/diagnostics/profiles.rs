@@ -111,6 +111,36 @@ fn first_executable(home: &Path, names: &[&str]) -> Option<PathBuf> {
     candidates.into_iter().find(|path| safe_executable(path))
 }
 
+fn discover_shadps4_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
+    let mut evidence = Vec::new();
+    // shadPS4 is commonly installed with a stable native binary beside a
+    // Qt launcher. Keep these paths explicit and bounded: the launcher’s
+    // version directory is user-managed and is not recursively searched.
+    for (installation_form, path, detail) in [
+        (
+            "Native",
+            home.join("Applications/shadPS4/shadps4"),
+            "shadPS4 native executable found",
+        ),
+        (
+            "Qt launcher",
+            home.join("Applications/shadPS4/QtLauncher/shadPS4QtLauncher-qt.AppImage"),
+            "shadPS4 Qt launcher found; selected emulator version remains launcher-managed",
+        ),
+    ] {
+        if safe_executable(&path) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: "shadPS4".to_string(),
+                installation_form: installation_form.to_string(),
+                executable: Some(EncodedPath::from_path(&path)),
+                profile: None,
+                detail: detail.to_string(),
+            });
+        }
+    }
+    evidence
+}
+
 fn flatpak_metadata(home: &Path, app_id: &str) -> Option<&'static str> {
     let user = home.join(".local/share/flatpak/app").join(app_id);
     if fs::symlink_metadata(&user)
@@ -227,6 +257,7 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
             });
         }
     }
+    evidence.extend(discover_shadps4_installations(&home));
     if let Some(path) = [home.join(".config/scummvm"), home.join(".config/ScummVM")]
         .into_iter()
         .find(|path| {
@@ -3840,5 +3871,36 @@ mod tests {
         assert_eq!(findings[0].id, "emulator_profile.duckstation_inspected");
         assert_eq!(findings[0].category, DoctorCategory::EmulatorProfiles);
         assert_eq!(findings[0].subsystem, DoctorSubsystem::EmulatorProfiles);
+    }
+
+    #[test]
+    fn shadps4_discovery_is_bounded_and_reports_missing_installations() {
+        let missing = TempTree::new("shadps4-missing");
+        assert!(discover_shadps4_installations(missing.path()).is_empty());
+
+        let installed = TempTree::new("shadps4-installed");
+        let native = installed.path().join("Applications/shadPS4/shadps4");
+        let launcher = installed
+            .path()
+            .join("Applications/shadPS4/QtLauncher/shadPS4QtLauncher-qt.AppImage");
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        fs::write(&native, b"ELF fixture").unwrap();
+        fs::write(&launcher, b"AppImage fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&native, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let found = discover_shadps4_installations(installed.path());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|item| item.emulator == "shadPS4"));
+        assert!(found.iter().any(|item| item.installation_form == "Native"));
+        assert!(
+            found
+                .iter()
+                .any(|item| item.installation_form == "Qt launcher")
+        );
     }
 }

@@ -1677,6 +1677,23 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "`.pkg` is a PS3 package format.",
     },
     Platform {
+        id: "PS4",
+        display_name: "Sony PlayStation 4",
+        folder_aliases: &["ps4", "playstation4", "sonyplaystation4"],
+        filename_aliases: &[],
+        // PS4 packages and extracted game directories are not identity
+        // evidence on their own. Keep `.pkg` as a shared candidate only;
+        // PS4-specific identity and layout validation are intentionally
+        // deferred until a bounded PARAM.SFO/EBOOT contract is established.
+        strong_extensions: &[],
+        weak_extensions: &["pkg"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["PS3"],
+        preferred_emulator: None,
+        explanation: "PS4 is recognised conservatively from explicit PS4 folder names or as a shared package candidate. PARAM.SFO identity, extracted-layout validation, and launch support are not yet claimed.",
+    },
+    Platform {
         id: "PSP",
         display_name: "Sony PlayStation Portable",
         folder_aliases: &[

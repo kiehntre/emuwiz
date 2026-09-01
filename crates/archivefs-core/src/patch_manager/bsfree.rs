@@ -2170,7 +2170,7 @@ mod tests {
 
     #[test]
     fn all_verified_bsfree_targets_resolve_through_the_one_canonical_registry() {
-        assert_eq!(crate::platform::canonical_ids().len(), 75);
+        assert_eq!(crate::platform::canonical_ids().len(), 76);
         for upstream_id in 1..=44 {
             let upstream_name = verified_system_name(upstream_id).unwrap();
             let mapping = bsfree_platform_mapping(upstream_id, upstream_name);
