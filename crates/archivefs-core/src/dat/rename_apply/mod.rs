@@ -33,6 +33,7 @@
 //! no-clobber primitive (everything but Linux in this build) the executor
 //! refuses to mutate rather than risk a TOCTOU-prone exists+rename sequence.
 
+pub mod exact_resume;
 pub mod executor;
 pub mod identity;
 pub mod journal;
@@ -42,6 +43,11 @@ pub mod preflight;
 pub mod reconcile;
 pub mod rollback;
 
+pub use exact_resume::{
+    ExactResumeError, ExactResumeExecution, ExactResumeInspection, ExactResumeOutcome,
+    ExactResumeRefusal, ExactResumeResult, build_envelope, compute_plan_digest,
+    inspect_exact_resume, resume_exact_transaction,
+};
 pub use executor::{
     ApplyError, ApplyExecution, ApplyOutcome, HardConflictMode, apply_transaction,
     build_transaction, build_transaction_entries, is_approved,
@@ -54,8 +60,9 @@ pub use journal::{
     resolve_leave_untouched, write_journal,
 };
 pub use model::{
-    EntryState, ObjectIdentity, ObjectKind, RecoveryResolution, RenameTransaction, RollbackResult,
-    RollbackStatus, TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
+    EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectIdentity,
+    ObjectKind, RecoveryResolution, RenameTransaction, RollbackResult, RollbackStatus,
+    TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{

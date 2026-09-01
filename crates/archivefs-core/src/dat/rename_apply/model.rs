@@ -94,6 +94,58 @@ pub enum RecoveryResolution {
     LeaveUntouched,
 }
 
+/// The durable lifecycle of an approval-bound exact-resume record.
+///
+/// This is intentionally separate from [`TransactionState`]. The latter is
+/// the existing apply/rollback history; this state says whether an immutable
+/// approval envelope is available for an exact retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactResumeState {
+    /// The approved operation set is still pending, including after a crash
+    /// left the transaction in an in-flight state.
+    Pending,
+    /// Every approved operation is filesystem-confirmed complete.
+    Completed,
+    /// An exact attempt stopped on an execution failure and remains eligible
+    /// for a later exact reconciliation if the filesystem still proves it.
+    Failed,
+    /// An exact attempt was interrupted before all approved operations ran.
+    Interrupted,
+    /// The envelope or filesystem no longer proves a safe exact retry.
+    NotResumable,
+}
+
+/// Immutable approval evidence for one DAT-backed rename transaction.
+///
+/// The envelope is captured from the reviewed plan and explicit approvals;
+/// resume never rebuilds it from a fresh plan. The mutable entry/checkpoint
+/// state remains in the journal payload alongside [`RenameTransaction`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactResumeEnvelope {
+    pub format_version: u32,
+    pub transaction_id: String,
+    pub approved_generation: u64,
+    pub classifier_version: String,
+    pub plan_digest: String,
+    pub source_scan_root: String,
+    pub approved_source_paths: Vec<String>,
+    pub operations: Vec<ExactResumeOperation>,
+    pub created_at_unix: u64,
+}
+
+/// One exact, approval-bound operation in an [`ExactResumeEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactResumeOperation {
+    pub index: usize,
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub operation: TransactionOperation,
+    pub identity: ObjectIdentity,
+    pub original_basename: String,
+    pub proposed_basename: String,
+}
+
 impl RecoveryResolution {
     pub fn label(self) -> &'static str {
         match self {

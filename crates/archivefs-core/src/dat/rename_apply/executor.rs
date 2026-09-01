@@ -142,11 +142,13 @@ pub fn build_transaction(
     if entries.is_empty() {
         return Err(ApplyError::NothingApproved);
     }
-    Ok(RenameTransaction {
-        transaction_id: new_transaction_id(crate::dat::sources::now_unix()),
+    let transaction_id = new_transaction_id(crate::dat::sources::now_unix());
+    let created_at_unix = crate::dat::sources::now_unix();
+    let mut transaction = RenameTransaction {
+        transaction_id,
         plan_generation: plan.generation,
         classifier_version: Some(plan.classifier_version.clone()),
-        created_at_unix: crate::dat::sources::now_unix(),
+        created_at_unix,
         source_scan_root: plan.scan_root.clone(),
         state: TransactionState::Planned,
         entries,
@@ -154,7 +156,12 @@ pub fn build_transaction(
         recovery_resolution: None,
         recovery_resolved_at_unix: None,
         unknown: Default::default(),
-    })
+    };
+    let envelope =
+        super::exact_resume::build_envelope(plan, approved_paths, &transaction, created_at_unix);
+    super::exact_resume::store_envelope(&mut transaction, envelope);
+    super::exact_resume::set_state(&mut transaction, super::model::ExactResumeState::Pending);
+    Ok(transaction)
 }
 
 /// Builds the transaction entries for the approved, actionable proposals of a
@@ -312,6 +319,9 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         .all(|e| e.state == EntryState::Skipped)
     {
         transaction.state = TransactionState::ApplyFailed;
+        if super::exact_resume::has_envelope(transaction) {
+            super::exact_resume::set_state(transaction, super::model::ExactResumeState::Failed);
+        }
         write_journal(&execution.journal_dir, transaction)
             .map_err(|error| ApplyError::Journal(error.to_string()))?;
         let summary = TransactionSummary::from_transaction(transaction);
@@ -333,6 +343,12 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
     for index in 0..transaction.entries.len() {
         if cancelled(execution.cancel) {
             transaction.state = TransactionState::ApplyFailed;
+            if super::exact_resume::has_envelope(transaction) {
+                super::exact_resume::set_state(
+                    transaction,
+                    super::model::ExactResumeState::Interrupted,
+                );
+            }
             write_journal(&execution.journal_dir, transaction)
                 .map_err(|error| ApplyError::Journal(error.to_string()))?;
             let summary = TransactionSummary::from_transaction(transaction);
@@ -359,6 +375,9 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
                     .join("; "),
             );
             transaction.state = TransactionState::ApplyFailed;
+            if super::exact_resume::has_envelope(transaction) {
+                super::exact_resume::set_state(transaction, super::model::ExactResumeState::Failed);
+            }
             write_journal(&execution.journal_dir, transaction)
                 .map_err(|error| ApplyError::Journal(error.to_string()))?;
             break;
@@ -382,6 +401,12 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
                 transaction.entries[index].state = state;
                 transaction.entries[index].failure_reason = Some(reason);
                 transaction.state = TransactionState::ApplyFailed;
+                if super::exact_resume::has_envelope(transaction) {
+                    super::exact_resume::set_state(
+                        transaction,
+                        super::model::ExactResumeState::Failed,
+                    );
+                }
                 write_journal(&execution.journal_dir, transaction)
                     .map_err(|error| ApplyError::Journal(error.to_string()))?;
                 break;
@@ -393,6 +418,9 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
 
     if transaction.state == TransactionState::Applying {
         transaction.state = TransactionState::Applied;
+        if super::exact_resume::has_envelope(transaction) {
+            super::exact_resume::set_state(transaction, super::model::ExactResumeState::Completed);
+        }
     }
     write_journal(&execution.journal_dir, transaction)
         .map_err(|error| ApplyError::Journal(error.to_string()))?;

@@ -179,11 +179,12 @@ fn one_approved_safe_rename_applies() {
         ProposalState::Suggested,
     )];
     let plan = plan(proposals, 1, &roms);
+    let approved = approved_of(&[&source]);
 
     let cancel = no_cancel();
     let outcome = apply(
         &plan,
-        approved_of(&[&source]),
+        approved.clone(),
         TrustedRoots::from_paths([&roms]),
         &journal,
         HardConflictMode::AbortAll,
@@ -198,6 +199,14 @@ fn one_approved_safe_rename_applies() {
     );
     assert_eq!(outcome.summary.applied, 1);
     assert_eq!(outcome.summary.failed, 0);
+    assert_eq!(
+        inspect_exact_resume(
+            &outcome.transaction,
+            plan.generation,
+            &compute_plan_digest(&plan, &approved),
+        ),
+        ExactResumeInspection::AlreadyComplete
+    );
     assert!(!source.exists());
     assert!(roms.join("Golden Axe (Europe).hdf").exists());
     // Content is identical through the rename.
