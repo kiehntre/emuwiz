@@ -340,6 +340,7 @@ pub enum IdentityPlatform {
     GameBoy,
     GameBoyColor,
     GameBoyAdvance,
+    VirtualBoy,
     N64,
     Commodore64,
     Vic20,
@@ -391,6 +392,7 @@ impl IdentityPlatform {
             "game boy" | "gb" | "nintendo game boy" => Self::GameBoy,
             "game boy color" | "gbc" | "nintendo game boy color" => Self::GameBoyColor,
             "game boy advance" | "gba" | "nintendo game boy advance" => Self::GameBoyAdvance,
+            "virtual boy" | "virtualboy" | "vb" | "nintendo virtual boy" => Self::VirtualBoy,
             "n64" | "nintendo 64" | "nintendo64" => Self::N64,
             "commodore 64" | "commodore64" | "c64" => Self::Commodore64,
             "vic-20" | "vic20" | "commodore vic-20" | "commodore vic20" => Self::Vic20,
@@ -460,6 +462,7 @@ impl IdentityPlatform {
             Self::GameBoy => "Game Boy",
             Self::GameBoyColor => "Game Boy Color",
             Self::GameBoyAdvance => "Game Boy Advance",
+            Self::VirtualBoy => "Nintendo Virtual Boy",
             Self::N64 => "Nintendo 64",
             Self::Commodore64 => "Commodore 64",
             Self::Vic20 => "VIC-20",
@@ -878,6 +881,7 @@ fn inspect_game_identity_with_platform_trust(
             | IdentityPlatform::GameBoy
             | IdentityPlatform::GameBoyColor
             | IdentityPlatform::GameBoyAdvance
+            | IdentityPlatform::VirtualBoy
             | IdentityPlatform::N64
             | IdentityPlatform::Atari2600
             | IdentityPlatform::Atari5200
@@ -1167,6 +1171,8 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
         (IdentityPlatform::GameBoyAdvance, "gba") => Some("gba"),
+        (IdentityPlatform::VirtualBoy, "vb") => Some("vb"),
+        (IdentityPlatform::VirtualBoy, "vboy") => Some("vboy"),
         (IdentityPlatform::N64, "z64") => Some("z64"),
         (IdentityPlatform::N64, "v64") => Some("v64"),
         (IdentityPlatform::N64, "n64") => Some("n64"),
@@ -3235,6 +3241,7 @@ fn inspect_iso_source(
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::VirtualBoy
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
@@ -6160,6 +6167,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::VirtualBoy
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
@@ -6350,6 +6358,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::VirtualBoy
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
@@ -10061,6 +10070,33 @@ mod tests {
                 "{hint} must resolve to {expected:?}"
             );
         }
+        for hint in ["Virtual Boy", "virtualboy", "VB", "Nintendo Virtual Boy"] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(hint)),
+                IdentityPlatform::VirtualBoy,
+                "{hint} must resolve to Virtual Boy"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_boy_direct_rom_uses_bounded_hash_identity_without_inventing_metadata() {
+        let directory = FixtureDir::new("loose-virtual-boy");
+        let bytes = b"synthetic Virtual Boy cartridge bytes";
+        let path = write_fixture(&directory, "Example.vb", bytes);
+        let report = inspect_catalogued_game_identity(&path, Some("Virtual Boy"));
+
+        assert_eq!(report.platform, IdentityPlatform::VirtualBoy);
+        assert_eq!(report.format, IdentityImageFormat::LooseCartridgeRom);
+        let expected = sha256_hex(bytes);
+        assert_eq!(report.verified_loose_rom_sha256(), Some(expected.as_str()));
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|item| item.kind != IdentityKind::SnesHeader)
+        );
+        assert!(report.complete);
     }
 
     // ------------------------------------------------------------------

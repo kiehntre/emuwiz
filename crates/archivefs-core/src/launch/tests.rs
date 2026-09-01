@@ -401,6 +401,32 @@ fn alias_resolvable_systemname_becomes_a_candidate() {
 }
 
 #[test]
+fn virtual_boy_retroarch_core_can_be_planned_from_verified_identity() {
+    let plan = build_launch_plan(
+        &resolved("Virtual Boy"),
+        &LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some("/games/example.vb".into()),
+            requires_mount: false,
+            provenance: "direct Virtual Boy cartridge".to_string(),
+        },
+        &[],
+        &retroarch_environment_with_cores(vec![core_finding(
+            "beetle_vb",
+            Some("Nintendo - Virtual Boy"),
+            None,
+        )]),
+        &[],
+    );
+    assert_eq!(plan.summary.ready, 1);
+    assert!(matches!(
+        plan.candidates[0].target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "beetle_vb"
+    ));
+}
+
+#[test]
 fn reviewed_classic_core_hints_prefer_one_of_two_matching_cores() {
     for (platform_id, preferred, alternative, system_name, database) in [
         (

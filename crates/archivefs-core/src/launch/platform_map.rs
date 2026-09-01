@@ -183,6 +183,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
+        platform_id: "Virtual Boy",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["beetle_vb", "mednafen_vb"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
         platform_id: "N64",
         standalone_adapters: &[],
         retroarch_core_hints: &["mupen64plus_next"],
@@ -404,6 +410,16 @@ mod tests {
                 entry.platform_id
             );
         }
+    }
+
+    #[test]
+    fn virtual_boy_uses_reviewed_retroarch_core_hints() {
+        let info = found(Some("Nintendo - Virtual Boy"), None);
+        assert_eq!(retroarch_platform_candidate(&info), Some("Virtual Boy"));
+        assert!(retroarch_platform_matches(&info, "Virtual Boy"));
+        let entry = launch_compatibility_for_platform("Virtual Boy").expect("reviewed row");
+        assert_eq!(entry.retroarch_core_hints, &["beetle_vb", "mednafen_vb"]);
+        assert!(entry.standalone_adapters.is_empty());
     }
 
     #[test]

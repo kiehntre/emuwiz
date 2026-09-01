@@ -151,6 +151,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::GameBoy => Some("Game Boy"),
         IdentityPlatform::GameBoyColor => Some("Game Boy Color"),
         IdentityPlatform::GameBoyAdvance => Some("Game Boy Advance"),
+        IdentityPlatform::VirtualBoy => Some("Virtual Boy"),
         IdentityPlatform::N64 => Some("N64"),
         IdentityPlatform::Commodore64 | IdentityPlatform::Vic20 => None,
         IdentityPlatform::Xbox => Some("Xbox"),
@@ -282,6 +283,7 @@ fn resolved_identity_for_platform(
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::VirtualBoy
         | IdentityPlatform::Ngp
         | IdentityPlatform::Ngpc => {
             // A verified full-file SHA-256 is a genuine opaque game key, but
@@ -467,6 +469,18 @@ pub fn launch_content_ref_from_archive_record(
     if !archive.kind.is_mount_input() {
         let kind = match archive.kind {
             ArchiveKind::MegaDriveRom => Some(LaunchContentKind::Cartridge),
+            ArchiveKind::DirectGameImage
+                if archive
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("vb")
+                            || extension.eq_ignore_ascii_case("vboy")
+                    }) =>
+            {
+                Some(LaunchContentKind::Cartridge)
+            }
             // `DirectGameImage` covers more than one real platform/format;
             // this bridge does not know which without guessing.
             _ => None,

@@ -165,6 +165,7 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::GameBoy
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
+        | IdentityPlatform::VirtualBoy
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
