@@ -92,7 +92,9 @@ fn cheats_mods_page_routes_retroarch_to_shared_preview_without_stale_wording() {
 
     for expected in [
         "Choose a RetroArch profile",
-        "native-user",
+        // Forward-port (3580b2d): the profile picker now labels profiles in
+        // plain words instead of the raw internal id.
+        "RetroArch — Native (User)",
         "Cheat source",
         "Available cheats",
         source_name.as_str(),
@@ -443,7 +445,11 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         });
     });
     assert!(rendered_text_contains(&output, "Blocked"));
-    assert!(rendered_text_contains(
+    // Forward-port (3580b2d): the raw blocker code moved behind the shared
+    // "Technical details" disclosure; the visible line is plain.
+    assert!(rendered_text_contains(&output, "cannot be used"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(
         &output,
         "cheats_destination_unresolved"
     ));

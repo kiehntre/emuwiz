@@ -23969,9 +23969,32 @@ fn show_pcsx2_workflow(
         .selected_pcsx2_profile_id
         .as_deref()
         .and_then(|profile_id| resolved_pcsx2_cheats_directory(profiles, profile_id));
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("PCSX2 cheat setup");
+            let (label, tone) = match profiles {
+                Pcsx2ProfilesState::NotScanned => ("Not checked", widgets::StatusTone::Pending),
+                Pcsx2ProfilesState::Scanning { .. } => ("Checking…", widgets::StatusTone::Active),
+                Pcsx2ProfilesState::Error(_) => ("Setup incomplete", widgets::StatusTone::Blocked),
+                Pcsx2ProfilesState::Ready(discovery) if discovery.profiles.is_empty() => {
+                    ("Not found", widgets::StatusTone::Pending)
+                }
+                Pcsx2ProfilesState::Ready(_) if cheats_directory.is_some() => {
+                    ("Setup selected", widgets::StatusTone::Success)
+                }
+                Pcsx2ProfilesState::Ready(_) => ("Choose a setup", widgets::StatusTone::Pending),
+            };
+            widgets::status_badge(ui, label, tone);
+        });
+        ui.label(if cheats_directory.is_some() {
+            "PCSX2 is selected. EmuWiz can now check compatible cheats for this game."
+        } else {
+            "Choose a usable PCSX2 setup below before installing cheats."
+        });
+    });
     widgets::section_header(
         ui,
-        "Stage 1 · PCSX2 profile",
+        "PCSX2 setup details",
         Some("EmuWiz selects automatically only when exactly one discovered profile is eligible."),
     );
     match profiles {
@@ -24036,13 +24059,16 @@ fn show_pcsx2_workflow(
                     Some(cheats_directory) => {
                         widgets::banner(
                             ui,
-                            "PCSX2 cheats directory identified",
-                            &format!(
-                                "Cheats will be installed to: {}",
-                                cheats_directory.display()
-                            ),
+                            "PCSX2 setup selected",
+                            "EmuWiz found the folder PCSX2 uses for cheats.",
                             widgets::StatusTone::Success,
                         );
+                        widgets::technical_details(ui, "pcsx2_cheats_directory", |ui| {
+                            ui.label(format!(
+                                "Cheats will be installed to: {}",
+                                cheats_directory.display()
+                            ));
+                        });
                     }
                     None => {
                         widgets::banner(
@@ -24070,23 +24096,26 @@ fn show_pcsx2_workflow(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        "Stage 2 · Existing PCSX2-managed files",
+        "Existing PCSX2 files",
         Some(
             "Cheats, widescreen patches, and other PNACH categories are inferred only from documented directory locations.",
         ),
     );
     widgets::card(ui, |ui| {
-        widgets::status_strip(
-            ui,
-            &[
-                ("Unverified local content", widgets::StatusTone::Warning),
-                ("Read-only", widgets::StatusTone::Success),
-                ("Uploaded · No", widgets::StatusTone::Info),
-                ("Executed · No", widgets::StatusTone::Info),
-                ("Changed · No", widgets::StatusTone::Info),
-            ],
-        );
-        ui.label("EmuWiz inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
+        ui.label("This check stays on your computer and does not run or change cheat files.");
+        widgets::technical_details(ui, "pcsx2_local_inspection_safety", |ui| {
+            widgets::status_strip(
+                ui,
+                &[
+                    ("Unverified local content", widgets::StatusTone::Warning),
+                    ("Read-only", widgets::StatusTone::Success),
+                    ("Uploaded · No", widgets::StatusTone::Info),
+                    ("Executed · No", widgets::StatusTone::Info),
+                    ("Changed · No", widgets::StatusTone::Info),
+                ],
+            );
+            ui.label("EmuWiz inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
+        });
     });
     let Some(selected_profile_id) = workflow.selected_pcsx2_profile_id.as_deref() else {
         widgets::banner(
@@ -26604,51 +26633,50 @@ fn show_pcsx2_profile_card(
 ) {
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
+            let profile_label = format!(
+                "PCSX2 — {} ({})",
+                pcsx2_installation_label(profile.installation_type),
+                pcsx2_scope_label(profile.scope)
+            );
             if profile.eligible {
                 let selected = workflow.selected_pcsx2_profile_id.as_deref()
                     == Some(profile.profile_id.as_str());
-                if ui.radio(selected, &profile.profile_id).clicked() {
+                if ui.radio(selected, &profile_label).clicked() {
                     workflow.selected_pcsx2_profile_id = Some(profile.profile_id.clone());
                     workflow.pcsx2_inventory_profile_id = None;
                     workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
                 }
-                widgets::status_badge(ui, "Eligible", widgets::StatusTone::Success);
+                widgets::status_badge(ui, "Ready for cheat setup", widgets::StatusTone::Success);
             } else {
-                ui.add_enabled(false, egui::Button::selectable(false, &profile.profile_id));
-                widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                ui.add_enabled(false, egui::Button::selectable(false, profile_label));
+                widgets::status_badge(ui, "Setup incomplete", widgets::StatusTone::Blocked);
             }
-            ui.label(format!(
-                "{} · {}",
-                pcsx2_installation_label(profile.installation_type),
-                pcsx2_scope_label(profile.scope)
-            ));
         });
-        if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
-            let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+        if !profile.blockers.is_empty() {
+            ui.label("This PCSX2 setup cannot be used. Open Technical details to see what needs attention.");
         }
-        for directory in &profile.patch_directories {
-            ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(
-                    ui,
-                    pcsx2_directory_state_label(directory.state),
-                    pcsx2_directory_state_tone(directory.state),
-                );
-                ui.label(pcsx2_category_label(directory.category));
-                if widgets::path_value(ui, "Path", &directory.path) {
-                    let _ = clipboard.set_text(directory.path.display().to_string());
-                }
-            });
-        }
-        if let Some(blocker) = profile.blockers.first() {
-            ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
-        }
-        if profile.blockers.len() > 1 {
-            widgets::technical_details(ui, ("pcsx2_profile_blockers", &profile.profile_id), |ui| {
-                for blocker in &profile.blockers {
-                    ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
-                }
-            });
-        }
+        widgets::technical_details(ui, ("pcsx2_profile_details", &profile.profile_id), |ui| {
+            ui.label(format!("Profile ID: {}", profile.profile_id));
+            if widgets::path_value(ui, "Configuration", &profile.configuration_path) {
+                let _ = clipboard.set_text(profile.configuration_path.display().to_string());
+            }
+            for directory in &profile.patch_directories {
+                ui.horizontal_wrapped(|ui| {
+                    widgets::status_badge(
+                        ui,
+                        pcsx2_directory_state_label(directory.state),
+                        pcsx2_directory_state_tone(directory.state),
+                    );
+                    ui.label(pcsx2_category_label(directory.category));
+                    if widgets::path_value(ui, "Path", &directory.path) {
+                        let _ = clipboard.set_text(directory.path.display().to_string());
+                    }
+                });
+            }
+            for blocker in &profile.blockers {
+                ui.label(format!("{:?} — {}", blocker.kind, blocker.detail));
+            }
+        });
     });
 }
 
@@ -29840,7 +29868,12 @@ fn show_cheat_workflow_step1(
                         if profile.eligible {
                             let selected = workflow.selected_profile_id.as_deref()
                                 == Some(&profile.profile_id);
-                            if ui.radio(selected, &profile.profile_id).clicked() {
+                            let label = format!(
+                                "RetroArch — {} ({})",
+                                profile_kind_label(&profile.installation_type),
+                                profile_scope_label(&profile.scope)
+                            );
+                            if ui.radio(selected, label).clicked() {
                                 workflow.selected_profile_id = Some(profile.profile_id.clone());
                                 workflow.existing_library_profile_id = None;
                                 workflow.existing_library = CheatStepResource::NotLoaded;
@@ -29853,30 +29886,31 @@ fn show_cheat_workflow_step1(
                         } else {
                             ui.add_enabled(
                                 false,
-                                egui::Button::selectable(false, &profile.profile_id),
+                                egui::Button::selectable(
+                                    false,
+                                    format!(
+                                        "RetroArch — {} ({})",
+                                        profile_kind_label(&profile.installation_type),
+                                        profile_scope_label(&profile.scope)
+                                    ),
+                                ),
                             );
                             widgets::status_badge(ui, "Blocked", profile_presentation_tone(false));
                         }
-                        ui.label(format!(
-                            "{} / {}",
-                            profile_kind_label(&profile.installation_type),
-                            profile_scope_label(&profile.scope)
-                        ));
                     });
-                    if let Some(blocker) = profile.blockers.first() {
-                        ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                    if !profile.blockers.is_empty() {
+                        ui.label("This RetroArch setup cannot be used until its configuration is corrected.");
                     }
-                    if profile.blockers.len() > 1 {
-                        widgets::technical_details(
-                            ui,
-                            ("retroarch_profile_blockers", &profile.profile_id),
-                            |ui| {
-                                for blocker in &profile.blockers {
-                                    ui.label(format!("{} — {}", blocker.code, blocker.detail));
-                                }
-                            },
-                        );
-                    }
+                    widgets::technical_details(
+                        ui,
+                        ("retroarch_profile_blockers", &profile.profile_id),
+                        |ui| {
+                            ui.label(format!("Profile ID: {}", profile.profile_id));
+                            for blocker in &profile.blockers {
+                                ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                            }
+                        },
+                    );
                 });
                 ui.add_space(6.0);
             }

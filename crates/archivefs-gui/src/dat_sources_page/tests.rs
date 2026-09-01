@@ -438,7 +438,7 @@ fn disabling_says_the_source_is_kept() {
     assert!(
         consequences
             .iter()
-            .any(|line| line.contains("stays registered")),
+            .any(|line| line.contains("kept in your catalogue list")),
         "{consequences:?}"
     );
 }

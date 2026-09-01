@@ -1495,7 +1495,7 @@ fn history_logs_page_has_a_recovery_heading_above_its_rollback_card() {
 }
 
 #[test]
-fn pcsx2_profile_card_shows_the_first_blocker_directly_and_the_rest_behind_technical_details() {
+fn pcsx2_profile_card_hides_all_raw_blockers_behind_technical_details() {
     let ctx = egui::Context::default();
     let mut workflow = CheatWorkflowState {
         archive_path: PathBuf::from("/roms/a.zip"),
@@ -1604,13 +1604,15 @@ fn pcsx2_profile_card_shows_the_first_blocker_directly_and_the_rest_behind_techn
             );
         });
     });
-    assert!(
-        rendered_text_contains(&output, "first blocker detail"),
-        "the first blocker must stay directly visible, not hidden behind a disclosure"
-    );
+    // Forward-port (3580b2d): every raw blocker detail is now behind the
+    // shared "Technical details" disclosure; the card leads with a plain
+    // status line.
+    assert!(rendered_text_contains(&output, "Setup incomplete"));
+    assert!(!rendered_text_contains(&output, "first blocker detail"));
+    assert!(!rendered_text_contains(&output, "second blocker detail"));
     assert!(
         rendered_text_contains(&output, "Technical details"),
-        "the remaining blockers must be reachable behind the shared technical_details label"
+        "the blockers must be reachable behind the shared technical_details label"
     );
     assert!(
         !rendered_text_contains(&output, "All technical blockers"),

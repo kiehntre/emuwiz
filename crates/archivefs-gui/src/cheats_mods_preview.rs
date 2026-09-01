@@ -288,8 +288,20 @@ pub(crate) fn show_cheat_candidate_stages(
                 }
                 ui.label(format!("{} cheats", candidate.cheat_count));
             });
-            ui.label(&candidate.catalogue_relative_path);
-            show_candidate_evidence(ui, candidate);
+            widgets::technical_details(
+                ui,
+                (
+                    "cheat_candidate_source",
+                    candidate.catalogue_relative_path.as_str(),
+                ),
+                |ui| {
+                    ui.label(format!(
+                        "Catalogue item: {}",
+                        candidate.catalogue_relative_path
+                    ));
+                    show_candidate_evidence(ui, candidate);
+                },
+            );
             if candidate.manually_selectable {
                 if widgets::action_button(
                     ui,
@@ -657,12 +669,8 @@ pub(crate) fn show_shared_cheat_preview(
                     show_xenia_generated_install_preview(ui, generated, clipboard);
                 }
                 if let Some(materialized) = &response.materialized {
-                    widgets::card(ui, |ui| {
-                        widgets::status_badge(
-                            ui,
-                            "Trusted source materialized",
-                            widgets::StatusTone::Success,
-                        );
+                    widgets::technical_details(ui, "cheat_materialized_source", |ui| {
+                        ui.label("Trusted source prepared for this exact preview.");
                         widgets::copyable_value(ui, "Snapshot ID", &materialized.snapshot_id);
                         if let CheatStepResource::Ready(fetch) = &workflow.source_fetch {
                             widgets::copyable_value(
@@ -698,13 +706,9 @@ pub(crate) fn show_shared_cheat_preview(
                 }
                 widgets::card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        widgets::status_badge(
-                            ui,
-                            format!("Adapter · {:?}", report.adapter),
-                            widgets::StatusTone::Info,
-                        );
-                        ui.strong(format!("{} entries", report.summary.entries));
-                        ui.label(format!("{} install new", report.summary.install_new));
+                        widgets::status_badge(ui, "Preview ready", widgets::StatusTone::Success);
+                        ui.strong(format!("{} cheat file(s) checked", report.summary.entries));
+                        ui.label(format!("{} ready to install", report.summary.install_new));
                         ui.label(format!(
                             "{} already installed",
                             report.summary.already_installed
@@ -716,13 +720,16 @@ pub(crate) fn show_shared_cheat_preview(
                         ui.label(format!("{} conflicts", report.summary.conflicts));
                         ui.label(format!("{} blocked", report.summary.blocked));
                     });
-                    ui.label(format!(
-                        "Hashed {} source and {} destination files · {} total bytes · {} paths inspected",
-                        report.summary.source_files_hashed,
-                        report.summary.destination_files_hashed,
-                        report.summary.bytes_hashed,
-                        report.summary.destination_paths_inspected
-                    ));
+                    widgets::technical_details(ui, "cheat_preview_summary", |ui| {
+                        ui.label(format!("Adapter: {:?}", report.adapter));
+                        ui.label(format!(
+                            "Hashed {} source and {} destination files · {} total bytes · {} paths inspected",
+                            report.summary.source_files_hashed,
+                            report.summary.destination_files_hashed,
+                            report.summary.bytes_hashed,
+                            report.summary.destination_paths_inspected
+                        ));
+                    });
                 });
                 for (index, entry) in report.entries.iter().enumerate() {
                     widgets::card(ui, |ui| {
@@ -883,39 +890,23 @@ pub(crate) fn show_shared_transaction_readiness(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        "Review and controlled apply",
-        Some("Preview → Review → Confirm → Apply → Verify → Result"),
+        "Install selected cheats",
+        Some("Review the changes before anything is written."),
     );
     let support = adapter_write_support(report.adapter);
     widgets::card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            for stage in [
-                "1 Preview",
-                "2 Review",
-                "3 Confirm",
-                "4 Apply",
-                "5 Verify",
-                "6 Result",
-            ] {
-                widgets::status_badge(ui, stage, widgets::StatusTone::Info);
-            }
-        });
         match support {
             SharedAdapterWriteSupport::ApplyAndRollback => {
-                widgets::status_badge(
-                    ui,
-                    "Transaction engine available",
-                    widgets::StatusTone::Success,
+                widgets::status_badge(ui, "Ready to install", widgets::StatusTone::Success);
+                ui.label(
+                    "EmuWiz will back up changed files, check the result, and keep the information needed to undo this install.",
                 );
-                ui.label(match report.adapter {
-                    PreviewAdapter::Dolphin => "This Dolphin GameSettings file has a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected codes are staged in this exact preview.",
-                    PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected patches are staged in this exact preview.",
-                    _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. This page will not offer confirmation until the selected per-game catalogue source is materialized in this exact preview.",
-                });
             }
             SharedAdapterWriteSupport::PreviewOnlySourceNotMaterialized => {
                 widgets::status_badge(ui, "Preview only", widgets::StatusTone::Pending);
-                ui.label("This adapter currently inventories emulator-managed files but does not provide an independent approved materialized source. Apply and rollback are unavailable; no shortcut is offered.");
+                ui.label(
+                    "EmuWiz can show these files, but it cannot safely install them for this emulator yet.",
+                );
             }
         }
         let actionable = report
@@ -930,27 +921,41 @@ pub(crate) fn show_shared_transaction_readiness(
                     )
             })
             .count();
-        ui.label(format!(
-            "Actionable materialized entries in this page state: {actionable}"
-        ));
-        ui.label("General confirmation is operation-scoped. Replacement permission is separate and never preselected. Cancellation before the write phase changes nothing.");
+        widgets::technical_details(ui, "shared_transaction_contract", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for stage in [
+                    "1 Preview",
+                    "2 Review",
+                    "3 Confirm",
+                    "4 Apply",
+                    "5 Verify",
+                    "6 Result",
+                ] {
+                    widgets::status_badge(ui, stage, widgets::StatusTone::Info);
+                }
+            });
+            ui.label(match report.adapter {
+                PreviewAdapter::Dolphin => "This Dolphin GameSettings file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged in this exact preview.",
+                PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected patches are staged in this exact preview.",
+                _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected per-game catalogue source is materialized in this exact preview.",
+            });
+            ui.label(format!(
+                "Actionable materialized entries in this page state: {actionable}"
+            ));
+            ui.label("Confirmation is bound to this exact operation. Replacement permission is separate and never preselected. Cancellation before the write phase changes nothing.");
+        });
         if actionable == 0 {
             widgets::banner(
                 ui,
-                "No write is available",
-                "There is no eligible materialized source bound to this exact preview, so EmuWiz shows no Apply control.",
+                "Nothing ready to install",
+                "No selected item can be installed safely from this preview.",
                 widgets::StatusTone::Pending,
             );
         }
         match transaction {
             CheatTransactionState::Idle if actionable > 0 && source_materialized => {
-                if widgets::action_button(
-                    ui,
-                    "Review exact apply plan",
-                    widgets::ActionStyle::Primary,
-                    true,
-                )
-                .clicked()
+                if widgets::action_button(ui, "Review changes", widgets::ActionStyle::Primary, true)
+                    .clicked()
                 {
                     action = Some(CheatWorkflowAction::ReviewApply);
                 }
@@ -960,22 +965,33 @@ pub(crate) fn show_shared_transaction_readiness(
                 replacement_approved,
                 ..
             } => {
-                widgets::status_badge(ui, "Review required", widgets::StatusTone::Warning);
-                widgets::copyable_value(ui, "Plan ID", &plan.plan_id);
+                widgets::status_badge(ui, "Review changes", widgets::StatusTone::Warning);
                 let replacement_required = plan.entries.iter().any(|entry| {
                     entry.proposed_action
                         == archivefs_core::patch_manager::PreviewProposedAction::Replace
                 });
-                for entry in &plan.entries {
-                    ui.separator();
-                    ui.label(format!("Action: {:?}", entry.proposed_action));
-                    ui.label(format!("Source: {}", entry.source_path.display));
-                    ui.label(format!(
-                        "Destination: {}/{}",
-                        entry.destination_root.display, entry.destination_relative_path.display
-                    ));
-                    widgets::copyable_value(ui, "Approved source SHA-256", &entry.source_digest);
-                }
+                ui.label(format!(
+                    "{} selected file{} will be installed.",
+                    plan.entries.len(),
+                    if plan.entries.len() == 1 { "" } else { "s" }
+                ));
+                widgets::technical_details(ui, "shared_transaction_exact_plan", |ui| {
+                    widgets::copyable_value(ui, "Plan ID", &plan.plan_id);
+                    for entry in &plan.entries {
+                        ui.separator();
+                        ui.label(format!("Action: {:?}", entry.proposed_action));
+                        ui.label(format!("Source: {}", entry.source_path.display));
+                        ui.label(format!(
+                            "Destination: {}/{}",
+                            entry.destination_root.display, entry.destination_relative_path.display
+                        ));
+                        widgets::copyable_value(
+                            ui,
+                            "Approved source SHA-256",
+                            &entry.source_digest,
+                        );
+                    }
+                });
                 if replacement_required {
                     ui.checkbox(
                         replacement_approved,
@@ -985,7 +1001,7 @@ pub(crate) fn show_shared_transaction_readiness(
                 ui.horizontal_wrapped(|ui| {
                     if widgets::action_button(
                         ui,
-                        "Confirm and apply exact plan",
+                        "Confirm and install",
                         widgets::ActionStyle::Primary,
                         !replacement_required || *replacement_approved,
                     )
@@ -1003,52 +1019,71 @@ pub(crate) fn show_shared_transaction_readiness(
             CheatTransactionState::Applying { .. } => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Applying and verifying the exact approved plan off the UI thread…");
+                    ui.label("Installing and checking the result…");
                 });
             }
             CheatTransactionState::Result { result, .. } => {
                 let (label, tone) = match result.journal.status {
-                    SharedApplyStatus::Success => ("Apply succeeded", widgets::StatusTone::Success),
-                    SharedApplyStatus::PartialFailure => {
-                        ("Apply partially succeeded", widgets::StatusTone::Warning)
+                    SharedApplyStatus::Success => {
+                        ("Installed and verified", widgets::StatusTone::Success)
                     }
-                    SharedApplyStatus::Failed => ("Apply failed", widgets::StatusTone::Blocked),
+                    SharedApplyStatus::PartialFailure => {
+                        ("Some changes failed", widgets::StatusTone::Warning)
+                    }
+                    SharedApplyStatus::Failed => ("Install failed", widgets::StatusTone::Blocked),
                     SharedApplyStatus::DryRun => ("Dry run", widgets::StatusTone::Info),
                 };
                 widgets::status_badge(ui, label, tone);
-                widgets::copyable_value(ui, "Operation ID", &result.journal.operation_id);
-                for entry in &result.journal.entries {
-                    ui.label(format!(
-                        "{:?} · verification {} · backup {}",
-                        entry.outcome,
-                        if entry.verification_succeeded {
-                            "passed"
-                        } else {
-                            "not complete"
-                        },
-                        if entry.backup_path.is_some() {
-                            "retained"
-                        } else {
-                            "not required"
-                        }
-                    ));
-                    for failure in &entry.failures {
-                        ui.label(format!("Failure: {:?} · {}", failure.kind, failure.detail));
+                ui.label(format!(
+                    "{} file result{} recorded.",
+                    result.journal.entries.len(),
+                    if result.journal.entries.len() == 1 {
+                        ""
+                    } else {
+                        "s"
                     }
-                }
-                if let Some(failure) = &result.journal_failure {
+                ));
+                if result.journal_failure.is_some() {
                     widgets::banner(
                         ui,
-                        "Journal failed after transaction work",
-                        &failure.detail,
+                        "Undo information could not be saved",
+                        "The file operation finished, but EmuWiz could not save all of its recovery information. Check Technical details before making more changes.",
                         widgets::StatusTone::Warning,
                     );
                 }
-                if let Some(path) = &result.journal_path
-                    && widgets::path_value(ui, "Journal", path)
-                {
-                    let _ = clipboard.set_text(path.display().to_string());
-                }
+                widgets::technical_details(ui, "shared_transaction_result", |ui| {
+                    widgets::copyable_value(ui, "Operation ID", &result.journal.operation_id);
+                    for entry in &result.journal.entries {
+                        ui.label(format!(
+                            "{:?} · verification {} · backup {}",
+                            entry.outcome,
+                            if entry.verification_succeeded {
+                                "passed"
+                            } else {
+                                "not complete"
+                            },
+                            if entry.backup_path.is_some() {
+                                "retained"
+                            } else {
+                                "not required"
+                            }
+                        ));
+                        for failure in &entry.failures {
+                            ui.label(format!("Failure: {:?} · {}", failure.kind, failure.detail));
+                        }
+                    }
+                    if let Some(failure) = &result.journal_failure {
+                        ui.label(format!(
+                            "Recovery journal failure: {:?} · {}",
+                            failure.kind, failure.detail
+                        ));
+                    }
+                    if let Some(path) = &result.journal_path
+                        && widgets::path_value(ui, "Journal", path)
+                    {
+                        let _ = clipboard.set_text(path.display().to_string());
+                    }
+                });
                 ui.horizontal_wrapped(|ui| {
                     if widgets::action_button(
                         ui,

@@ -1199,12 +1199,11 @@ fn pcsx2_workflow_presents_gamehacking_with_identity_gated_download() {
         });
     });
     for expected in [
-        "Stage 1 · PCSX2 profile",
-        "Eligible",
-        "Existing PCSX2-managed files",
-        "Uploaded · No",
-        "Executed · No",
-        "Changed · No",
+        "PCSX2 cheat setup",
+        "PCSX2 setup details",
+        "Ready for cheat setup",
+        "Existing PCSX2 files",
+        "does not run or change cheat files",
         "Verified game CRC unavailable",
         "GameHacking.org",
         "Game identity incomplete",
@@ -1221,7 +1220,7 @@ fn pcsx2_workflow_presents_gamehacking_with_identity_gated_download() {
 }
 
 #[test]
-fn pcsx2_workflow_shows_the_exact_resolved_cheats_directory_before_install() {
+fn pcsx2_workflow_keeps_the_exact_resolved_cheats_directory_in_technical_details() {
     let mut app = app_with_cheats_mods_context();
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.platform = Some("PS2".to_string());
@@ -1239,11 +1238,9 @@ fn pcsx2_workflow_shows_the_exact_resolved_cheats_directory_before_install() {
             let _ = show_pcsx2_workflow(ui, workflow, &profiles, &mut clipboard);
         });
     });
-    assert!(rendered_text_contains(
-        &output,
-        "PCSX2 cheats directory identified"
-    ));
-    assert!(rendered_text_contains(&output, "/isolated/PCSX2/cheats"));
+    assert!(rendered_text_contains(&output, "PCSX2 setup selected"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "/isolated/PCSX2/cheats"));
 }
 
 #[test]

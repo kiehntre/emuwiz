@@ -852,6 +852,14 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             state.showing_playing_library = true;
         }
     });
+    if !state.showing_playing_library {
+        ui.label(
+            egui::RichText::new(
+                "Playing Library chooses one preferred verified release per game and creates a separate linked library while leaving originals untouched.",
+            )
+            .color(theme::muted(ui)),
+        );
+    }
     ui.add_space(8.0);
 
     if state.showing_playing_library {
@@ -878,10 +886,12 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             );
             match &state.saved_library_root {
                 Some(root) => {
-                    ui.label(
-                        egui::RichText::new(format!("Folder: {}", root.display()))
-                            .color(theme::muted(ui)),
-                    );
+                    ui.label(format!(
+                        "Organised library: {}",
+                        root.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("chosen folder")
+                    ));
                     if widgets::action_button(
                         ui,
                         "Change folder…",
@@ -925,6 +935,9 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
                 );
             }
             widgets::technical_details(ui, "linked_library_manual_path", |ui| {
+                if let Some(root) = &state.saved_library_root {
+                    ui.label(format!("Exact folder: {}", root.display()));
+                }
                 ui.label(
                     egui::RichText::new(
                         "Type or paste a path directly instead of using the folder picker.",
@@ -946,10 +959,12 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             ui.label(egui::RichText::new("Game library folder").strong());
             match &state.saved_master_root {
                 Some(root) => {
-                    ui.label(
-                        egui::RichText::new(format!("Folder: {}", root.display()))
-                            .color(theme::muted(ui)),
-                    );
+                    ui.label(format!(
+                        "Original games: {}",
+                        root.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("chosen folder")
+                    ));
                     if widgets::action_button(
                         ui,
                         "Change folder…",
@@ -993,6 +1008,9 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
                 );
             }
             widgets::technical_details(ui, "rom_organisation_manual_path", |ui| {
+                if let Some(root) = &state.saved_master_root {
+                    ui.label(format!("Exact folder: {}", root.display()));
+                }
                 ui.label(
                     egui::RichText::new(
                         "Type or paste a path directly instead of using the folder picker.",
@@ -1008,14 +1026,6 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
                     }
                 });
             });
-            ui.add_space(4.0);
-            ui.label(
-            egui::RichText::new(
-                "Choosing a folder never moves anything by itself: organising always requires a \
-                 preview and your explicit approval.",
-            )
-            .color(theme::muted(ui)),
-        );
         });
     }
 
@@ -1070,7 +1080,9 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         if state.pending_preview {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Preparing preview… scanning games and resolving platform identity.");
+                ui.label(
+                    "Preparing your preview… checking each game and deciding where it belongs.",
+                );
             });
         }
         ui.label(
@@ -1084,13 +1096,6 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
 
     if let Some(plan) = state.plan.clone() {
         ui.add_space(8.0);
-        widgets::banner(
-            ui,
-            "Preview only",
-            "Nothing changes until you review this preview and explicitly approve it.",
-            widgets::StatusTone::Info,
-        );
-        ui.add_space(6.0);
         show_plan(ui, &plan, state);
     }
 

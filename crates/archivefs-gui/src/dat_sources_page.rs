@@ -4027,7 +4027,7 @@ impl DatSourcesPageState {
         self.tosec_last_apply = None;
         if self.is_busy() || self.tosec_load_error.is_some() || self.load_error.is_some() {
             self.tosec_action_error = Some(
-                "Cannot apply TOSEC selections while a DAT operation is running or the local DAT registry could not be read."
+                "Cannot apply TOSEC selections while a catalogue operation is running or the local catalogue list could not be read."
                     .to_string(),
             );
             return;
@@ -4064,7 +4064,7 @@ impl DatSourcesPageState {
                     });
                     if !outcome.failed.is_empty() {
                         self.tosec_action_error = Some(format!(
-                            "{} selected TOSEC DAT(s) were not registered. They remain unregistered; existing known-good entries were kept.",
+                            "{} selected TOSEC catalogue(s) could not be added. Existing known-good entries were kept.",
                             outcome.failed.len()
                         ));
                     } else if !outcome.conflicts.is_empty() {
@@ -4076,7 +4076,7 @@ impl DatSourcesPageState {
                 }
                 Err(error) => {
                     self.tosec_action_error = Some(format!(
-                        "TOSEC selection was applied, but the local DAT registry could not be reloaded: {error}"
+                        "TOSEC selection was applied, but the local catalogue list could not be reloaded: {error}"
                     ));
                 }
             },
@@ -4239,7 +4239,7 @@ impl DatSourcesPageState {
     fn save(&mut self) {
         if self.load_error.is_some() {
             self.save_state = DatSaveState::Failed(
-                "Not saving: the existing registry file could not be read, and overwriting it \
+                "Not saving: the existing catalogue list could not be read, and overwriting it \
                  would discard it."
                     .to_string(),
             );
@@ -5383,7 +5383,7 @@ impl DatSourcesPageState {
         for row in rows.iter().filter(|row| row.changed) {
             match self.saved.get(&row.id) {
                 None => out.push(format!(
-                    "'{}' will be registered, pointing at {}.",
+                    "'{}' will be added to EmuWiz, using {}.",
                     row.display_name, row.path
                 )),
                 Some(saved) => {
@@ -5392,7 +5392,7 @@ impl DatSourcesPageState {
                             format!("'{}' will be used again.", row.display_name)
                         } else {
                             format!(
-                                "'{}' will no longer be used. It stays registered.",
+                                "'{}' will be disabled but kept in your catalogue list.",
                                 row.display_name
                             )
                         });
@@ -5428,14 +5428,14 @@ impl DatSourcesPageState {
         for saved in self.saved.sorted_all() {
             if self.draft.get(&saved.id).is_none() {
                 out.push(format!(
-                    "'{}' will be removed from the registry. The file at {} is not deleted.",
+                    "'{}' will be removed from EmuWiz. The file at {} is not deleted.",
                     saved.display_name,
                     saved.path.display()
                 ));
             }
         }
         if out.is_empty() {
-            out.push("The registry will be rewritten with your changes.".to_string());
+            out.push("The catalogue list will be saved with your changes.".to_string());
         }
         out
     }
@@ -6023,13 +6023,13 @@ pub(crate) fn show_dat_sources_page(
         ui,
         crate::ui::icons::VERIFY,
         "Verify Games",
-        "Use DAT catalogues to identify and check your games.",
+        "Use trusted game catalogues to identify and check your games.",
     );
 
     if let Some(error) = &view.load_error {
         widgets::banner(
             ui,
-            "Registry not read",
+            "Catalogue list could not be loaded",
             &format!(
                 "{error}\nShowing an empty list. Saving is disabled so the existing file is not \
                  overwritten."
@@ -6039,22 +6039,12 @@ pub(crate) fn show_dat_sources_page(
         ui.add_space(8.0);
     }
 
-    widgets::banner(
-        ui,
-        "Your files are safe",
-        SAFE_PROMISE,
-        widgets::StatusTone::Info,
-    );
-    ui.label(
-        egui::RichText::new(READ_ONLY_PROMISE)
-            .color(theme::muted(ui))
-            .small(),
-    );
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(format!("Supported formats: {SUPPORTED_FORMATS}"))
-            .color(theme::muted(ui)),
-    );
+    ui.label("Checking a catalogue only reads your games. Changes always require a separate preview and approval.");
+    widgets::technical_details(ui, "dat_source_safety_and_formats", |ui| {
+        ui.label(SAFE_PROMISE);
+        ui.label(READ_ONLY_PROMISE);
+        ui.label(format!("Supported catalogue formats: {SUPPORTED_FORMATS}"));
+    });
     ui.add_space(10.0);
 
     if let Some(acquisition_action) = show_evidence_acquisition_section(ui, view) {
@@ -7972,7 +7962,7 @@ fn show_toolbar(ui: &mut egui::Ui, view: &DatSourcesPageView) -> Option<DatSourc
             DatSaveState::Idle => {}
             DatSaveState::Saved => {
                 ui.add_space(6.0);
-                widgets::status_badge(ui, "Registry saved", widgets::StatusTone::Success);
+                widgets::status_badge(ui, "Catalogue sources saved", widgets::StatusTone::Success);
             }
             DatSaveState::Failed(message) => {
                 ui.add_space(6.0);
@@ -7980,12 +7970,12 @@ fn show_toolbar(ui: &mut egui::Ui, view: &DatSourcesPageView) -> Option<DatSourc
             }
         }
 
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!("File: {}", view.config_path.display()))
-                .color(theme::muted(ui))
-                .small(),
-        );
+        widgets::technical_details(ui, "dat_sources_config_path", |ui| {
+            ui.label(format!(
+                "Catalogue settings file: {}",
+                view.config_path.display()
+            ));
+        });
     });
     action
 }
@@ -8105,24 +8095,17 @@ fn show_source_row(
             }
         });
 
-        ui.label(
-            egui::RichText::new(format!("ID: {}", row.id))
-                .color(theme::muted(ui))
-                .monospace(),
-        );
-        ui.label(
-            egui::RichText::new(format!("{} · {}", row.kind_label, row.path))
-                .color(theme::muted(ui)),
-        );
-
-        // Format is only ever what a check observed. An unvalidated source says
-        // so rather than guessing from the file extension.
-        let format_line = if row.formats.is_empty() {
-            "Format: not checked yet".to_string()
-        } else {
-            format!("Format: {}", row.formats.join(", "))
-        };
-        ui.label(egui::RichText::new(format_line).color(theme::muted(ui)));
+        widgets::technical_details(ui, ("local_dat_source", row.id.as_str()), |ui| {
+            ui.label(egui::RichText::new(format!("Source ID: {}", row.id)).monospace());
+            ui.label(format!("Type: {}", row.kind_label));
+            ui.label(format!("Path: {}", row.path));
+            let format_line = if row.formats.is_empty() {
+                "Parser format: not checked yet".to_string()
+            } else {
+                format!("Parser format: {}", row.formats.join(", "))
+            };
+            ui.label(format_line);
+        });
 
         if let Some(detail) = &row.health_detail {
             ui.label(detail);
@@ -8225,7 +8208,7 @@ fn show_source_row(
                 ui,
                 "Remove this source?",
                 &format!(
-                    "'{}' will no longer be registered. The file at {} is not deleted, and no ROM \
+                    "EmuWiz will stop using '{}'. The file at {} is not deleted, and no ROM \
                      is touched.",
                     row.display_name, row.path
                 ),
@@ -8234,7 +8217,7 @@ fn show_source_row(
             ui.horizontal(|ui| {
                 if widgets::action_button(
                     ui,
-                    "Remove from registry",
+                    "Remove from EmuWiz",
                     widgets::ActionStyle::Primary,
                     true,
                 )
@@ -9042,7 +9025,7 @@ fn show_dat_policy_section(
         if !view.editable {
             ui.label(
                 egui::RichText::new(
-                    "The registry could not be read, so the policy cannot be edited until that \
+                    "The catalogue list could not be read, so these preferences cannot be edited until that \
                      is fixed.",
                 )
                 .color(theme::muted(ui)),
@@ -10943,7 +10926,7 @@ fn show_kept_but_not_understood(ui: &mut egui::Ui, view: &DatSourcesPageView) {
         ui,
         "Kept but not recognised",
         Some(
-            "These parts of your registry file name something this build does not know about. \
+            "These saved catalogue settings name something this build does not know about. \
              They are preserved exactly as written, and saving from this page does not remove \
              them.",
         ),
