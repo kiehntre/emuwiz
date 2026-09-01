@@ -196,6 +196,7 @@ pub mod value {
     pub const TZX: &str = "TZX";
     pub const CDT: &str = "CDT";
     pub const COMMODORE_TAP: &str = "Commodore TAP";
+    pub const ZX_SPECTRUM_TAP: &str = "ZX Spectrum TAP";
 
     // DiskEncoding
     pub const MFM: &str = "MFM";

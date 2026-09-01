@@ -364,6 +364,9 @@ pub mod zx_spectrum_snapshot;
 /// never decodes pulses or extracts member bytes.
 pub mod commodore_tape;
 
+/// Bounded, read-only ZX Spectrum TAP/TZX and Amstrad CDT inspection.
+pub mod tape_identity;
+
 /// Evidence *scope*: whether an observed content fact could ever
 /// discriminate between platforms (Generic/Family/PlatformSpecific) -
 /// deliberately a separate axis from
