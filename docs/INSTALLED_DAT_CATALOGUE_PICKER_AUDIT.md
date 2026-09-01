@@ -5,6 +5,35 @@ This audit describes the code at release base
 and usability audit only. No GUI, DAT parsing, migration, verification,
 rename, repair, or 1G1R election code was changed.
 
+> **Implementation status (updated 2026-09-01).** The shared backend this
+> audit recommends now exists, landed by `e8f30bf`
+> *feat(dat): unify installed catalogue selection* in the core module
+> `crates/archivefs-core/src/dat/catalogue_selection.rs`:
+>
+> - `CatalogueRef` — the typed, path-free logical reference this audit
+>   argues for (`Local { source_id, member }` and
+>   `ManagedCurrent { source_id, snapshot_sha256 }`).
+> - `InstalledCatalogueSummary` + `list_installed_catalogues` — the
+>   deterministic, de-duplicated, per-row fault-tolerant inventory across
+>   the local registry and the managed MAME / Redump stores, with
+>   `EvidenceValue` fields so unknowns stay honest.
+> - `resolve_catalogue` / `resolve_catalogue_for_platform` — fail-closed
+>   binding that **re-hashes** managed snapshot bytes (the gap called out
+>   in §4 / §8), and returns typed ambiguity (`MultipleCandidates`) rather
+>   than auto-choosing.
+> - Thin adapters (`playing_library_request`, `to_dat_audit_request`,
+>   `to_combined_dat_audit_source`, `to_library_scan_request`) so Build
+>   Playing Library, Verify, and Repair can consume one reference.
+>
+> Still open exactly as this audit's step list anticipates: the **GUI
+> picker wiring** for those three pages, first-class enumeration of the
+> No-Intro / TOSEC pack stores (only their registered local projections
+> appear today), stable folder-member references, and a persisted
+> per-workflow "active catalogue" choice. The design rationale below is
+> retained unchanged as the record of why the backend is shaped the way
+> it is; where it says a shared selector "does not exist", read that as
+> "did not exist at base `4fbaebc`".
+
 ## Executive finding
 
 EmuWiz does not currently have one definition, registry, or selector for an
