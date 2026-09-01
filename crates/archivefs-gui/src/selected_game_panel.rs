@@ -169,10 +169,8 @@ pub(crate) fn show_selected_archive(
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
-            "Selected game details",
-            Some(
-                "Review this game's identity evidence, DAT status, content inspection, and available actions.",
-            ),
+            "Selected game",
+            Some("Review this game and its available actions."),
         );
         if record.is_none() && persisted.is_none() {
             ui.label("Select an archive row to view details.");
@@ -181,26 +179,22 @@ pub(crate) fn show_selected_archive(
 
         let Some(record) = record else {
             if let Some(persisted) = persisted {
-                let archive_path_text = persisted.absolute_path.display().to_string();
-                if widgets::copyable_value(ui, "Archive path", &archive_path_text) {
-                    let _ = clipboard.set_text(archive_path_text.clone());
-                }
-                let source_text = source_path
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "Unassigned / Legacy".to_string());
-                ui.label(format!("Source: {source_text}"));
+                ui.strong(
+                    persisted
+                        .absolute_path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Saved game"),
+                );
                 if persisted.last_verified_missing_at.is_some() {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
-                        "Status: Missing from the latest successful source-folder scan",
+                        "This game was not found in the latest scan.",
                     );
-                    ui.label(format!("Last seen: {}", persisted.last_seen_at));
+                    ui.label("Check that its game folder is available, then scan again.");
+                } else {
+                    widgets::status_badge(ui, "Saved in library", widgets::StatusTone::Info);
                 }
-                ui.label(
-                    "Known to the library database, not confirmed by the latest live snapshot. \
-                     Mount/unmount actions are unavailable until it is - platform assignment \
-                     below is metadata only and unaffected.",
-                );
                 ui.label(
                     egui::RichText::new(
                         "Identity evidence is read directly from the selected file; it does not require mounting or a DAT catalogue.",
@@ -208,6 +202,20 @@ pub(crate) fn show_selected_archive(
                     .color(theme::muted(ui))
                     .small(),
                 );
+                widgets::technical_details(ui, "persisted-game-details", |ui| {
+                    let archive_path_text = persisted.absolute_path.display().to_string();
+                    if widgets::copyable_value(ui, "Archive path", &archive_path_text) {
+                        let _ = clipboard.set_text(archive_path_text.clone());
+                    }
+                    let source_text = source_path
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "No current source folder".to_string());
+                    ui.label(format!("Source: {source_text}"));
+                    ui.label(format!("Last seen: {}", persisted.last_seen_at));
+                    ui.label(
+                        "This entry is saved in the library database but is not present in the latest live scan. Mount and unmount actions remain unavailable until it returns.",
+                    );
+                });
                 if ui
                     .add_enabled(
                         is_inspectable(&persisted.absolute_path),
@@ -237,59 +245,27 @@ pub(crate) fn show_selected_archive(
             return;
         };
 
-        egui::Grid::new("selected_archive_details")
+        ui.strong(gamer_view::gamer_display_title(record));
+        let system = record
+            .metadata
+            .platform
+            .as_deref()
+            .or(record.identity.platform.as_deref())
+            .unwrap_or("System not identified");
+        ui.label(system);
+        widgets::status_badge(ui, "Game found", widgets::StatusTone::Success);
+
+        egui::Grid::new("selected_game_summary")
             .num_columns(2)
             .striped(true)
-            // Bounded (2026-08-22, live-QA Phase 8): an `egui::Grid` sizes
-            // each column to its widest cell's natural content width unless
-            // capped, so a genuinely long absolute path - most often the
-            // Mount path, since a mount root plus platform plus a long game
-            // name adds up fast - could push this whole card, and the page
-            // around it, wider than the viewport with no way to reach the
-            // clipped content. `detail_row_with_copy`'s `.truncate()` only
-            // has anything to truncate against once the cell it is drawn
-            // into actually has a bounded width to truncate to.
             .max_col_width(theme::CONTENT_MAX_WIDTH * 0.6)
             .show(ui, |ui| {
-                detail_row_with_copy(
-                    ui,
-                    "Archive path",
-                    &record.mount_plan.archive.path.display().to_string(),
-                    clipboard,
-                );
-                detail_row_with_copy(
-                    ui,
-                    "Mount path",
-                    &record.mount_plan.mount_path.display().to_string(),
-                    clipboard,
-                );
-                detail_row_with_copy(
-                    ui,
-                    "Source",
-                    &source_path
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "Unassigned / Legacy".to_string()),
-                    clipboard,
-                );
-                detail_row(
-                    ui,
-                    "Platform",
-                    record
-                        .metadata
-                        .platform
-                        .as_deref()
-                        .or(record.identity.platform.as_deref())
-                        .unwrap_or("Unknown"),
-                );
                 detail_row(
                     ui,
                     "Archive format",
                     archive_kind_name(record.mount_plan.archive.kind),
                 );
                 detail_row(ui, "Size", &format_size(record.identity.size_bytes));
-                detail_row(ui, "Mount state", &record.mount_state.to_string());
-                detail_row(ui, "Health", &record.health.to_string());
-                optional_detail_row(ui, "Title", record.metadata.title.as_deref());
                 optional_detail_row(ui, "Region", record.metadata.region.as_deref());
                 optional_detail_row(ui, "Version", record.metadata.version.as_deref());
                 optional_detail_row(ui, "Disc", record.metadata.disc.as_deref());
@@ -297,7 +273,6 @@ pub(crate) fn show_selected_archive(
                 optional_detail_row(ui, "Developer", record.metadata.developer.as_deref());
                 optional_detail_row(ui, "Genre", record.metadata.genre.as_deref());
                 optional_detail_row(ui, "Notes", record.metadata.notes.as_deref());
-                optional_detail_row(ui, "Metadata source", record.metadata.source.as_deref());
                 if let Some(year) = record.metadata.release_year {
                     detail_row(ui, "Release year", &year.to_string());
                 }
@@ -306,6 +281,38 @@ pub(crate) fn show_selected_archive(
                 }
             });
 
+        widgets::technical_details(ui, "selected-game-storage-details", |ui| {
+            egui::Grid::new("selected_game_storage_details")
+                .num_columns(2)
+                .striped(true)
+                .max_col_width(theme::CONTENT_MAX_WIDTH * 0.6)
+                .show(ui, |ui| {
+                    detail_row_with_copy(
+                        ui,
+                        "Archive path",
+                        &record.mount_plan.archive.path.display().to_string(),
+                        clipboard,
+                    );
+                    detail_row_with_copy(
+                        ui,
+                        "Mount path",
+                        &record.mount_plan.mount_path.display().to_string(),
+                        clipboard,
+                    );
+                    detail_row_with_copy(
+                        ui,
+                        "Source",
+                        &source_path
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "No current source folder".to_string()),
+                        clipboard,
+                    );
+                    detail_row(ui, "Mount state", &record.mount_state.to_string());
+                    detail_row(ui, "Health", &record.health.to_string());
+                    optional_detail_row(ui, "Metadata source", record.metadata.source.as_deref());
+                });
+        });
+
         // Identity evidence has exactly three visible states, keyed to this
         // selection by the caller. Structural / verified evidence is shown
         // independently of DAT status (rendered just below) and never waits
@@ -313,7 +320,10 @@ pub(crate) fn show_selected_archive(
         // its reason instead of an endless "loading" line.
         match selected_evidence {
             SelectedEvidenceView::Ready(report) => {
-                selected_evidence_page::show_identity_evidence(ui, report);
+                ui.strong("Game identified");
+                widgets::technical_details(ui, "selected-game-identity", |ui| {
+                    selected_evidence_page::show_identity_evidence(ui, report);
+                });
             }
             SelectedEvidenceView::Loading => {
                 ui.horizontal(|ui| {
@@ -325,9 +335,12 @@ pub(crate) fn show_selected_archive(
                 widgets::banner(
                     ui,
                     "Identity check could not be completed",
-                    reason,
+                    "The game is still available. Open Technical details for the exact reason.",
                     widgets::StatusTone::Blocked,
                 );
+                widgets::technical_details(ui, "selected-game-identity-error", |ui| {
+                    ui.label(reason);
+                });
             }
         }
         show_dat_identity_section(ui, dat_identities);
@@ -360,12 +373,7 @@ pub(crate) fn show_selected_archive(
             }
         });
         if !record.is_mount_input() {
-            widgets::banner(
-                ui,
-                "No mount required",
-                "Loose ROM · no EmuWiz mount required. Inspect, Cheats & Mods, copy-path, and library metadata actions remain available.",
-                widgets::StatusTone::Info,
-            );
+            ui.weak("Ready to use directly.");
             return;
         }
         ui.add_enabled_ui(!busy, |ui| {

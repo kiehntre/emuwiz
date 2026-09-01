@@ -1769,98 +1769,21 @@ fn painted_doctor_texts(output: &egui::FullOutput) -> Vec<String> {
     found
 }
 
-/// Clicking the disclosure expands it, clicking again collapses it, and
-/// the state survives the frames in between.
 #[test]
-fn the_measured_values_disclosure_expands_collapses_and_persists() {
+fn finding_technical_details_are_collapsed_by_default() {
     let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
     let ordinals = DoctorFindingOrdinals::of(&scan);
     let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
     let state = doctor_outcome(scan);
     let mut selected = Some(key);
-    let mut clipboard = InMemoryClipboard::default();
-    let context = egui::Context::default();
-    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
-    let idle = egui::RawInput {
-        screen_rect: Some(screen),
-        ..Default::default()
-    };
-    let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
-        context.run(input, |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                let _ = show_doctor_page(
-                    ui,
-                    &state,
-                    selected,
-                    None,
-                    None,
-                    None,
-                    &mut clipboard,
-                    false,
-                );
-            });
-        })
-    };
-
-    let output = frame(idle.clone(), &mut selected);
+    let output = render_doctor_page(&state, &mut selected);
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "Measured values"));
     assert!(!rendered_text_contains(&output, "available_bytes"));
-    let header = find_exact_text_center(&output, "Measured values")
-        .expect("the disclosure must be rendered");
-
-    let click = |position: egui::Pos2| egui::RawInput {
-        screen_rect: Some(screen),
-        events: vec![
-            egui::Event::PointerMoved(position),
-            egui::Event::PointerButton {
-                pos: position,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: Default::default(),
-            },
-            egui::Event::PointerButton {
-                pos: position,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: Default::default(),
-            },
-        ],
-        ..Default::default()
-    };
-
-    let _ = frame(click(header), &mut selected);
-    let output = frame(idle.clone(), &mut selected);
-    assert!(
-        rendered_text_contains(&output, "available_bytes"),
-        "clicking must expand the measured values"
-    );
-    // Still open several frames later - the state is not rebuilt per frame.
-    let _ = frame(idle.clone(), &mut selected);
-    let output = frame(idle.clone(), &mut selected);
-    assert!(rendered_text_contains(&output, "available_bytes"));
-
-    // Re-found rather than reused: the header may have shifted as the
-    // content above it settled.
-    let output = frame(idle.clone(), &mut selected);
-    let header = find_exact_text_center(&output, "Measured values")
-        .expect("the disclosure is still rendered while expanded");
-    let _ = frame(click(header), &mut selected);
-    // `CollapsingHeader` animates closed, so the content is still painted
-    // for a few frames after the click; the assertion is that it goes.
-    let mut collapsed = false;
-    for _ in 0..30 {
-        let output = frame(idle.clone(), &mut selected);
-        if !rendered_text_contains(&output, "available_bytes") {
-            collapsed = true;
-            break;
-        }
-    }
-    assert!(collapsed, "clicking again must collapse them");
 }
 
-/// A finding that measured nothing must say so in plain text, not offer a
-/// triangle that opens onto nothing.
 #[test]
-fn a_finding_with_no_measurements_renders_words_not_a_disclosure() {
+fn a_finding_with_no_measurements_keeps_that_fact_in_technical_details() {
     let mut scan = repeated_doctor_findings();
     scan.findings[0].measurements.clear();
     let ordinals = DoctorFindingOrdinals::of(&scan);
@@ -1868,82 +1791,18 @@ fn a_finding_with_no_measurements_renders_words_not_a_disclosure() {
     let state = doctor_outcome(scan);
 
     let output = render_doctor_page(&state, &mut Some(key));
-    assert!(rendered_text_contains(&output, DOCTOR_NO_MEASURED_VALUES));
+    assert!(!rendered_text_contains(&output, DOCTOR_NO_MEASURED_VALUES));
     assert_eq!(DOCTOR_NO_MEASURED_VALUES, "No measured values recorded");
-    assert!(
-        !rendered_text_contains(&output, "Measured values"),
-        "no disclosure may be offered for a finding that measured nothing"
-    );
+    assert!(rendered_text_contains(&output, "Technical details"));
 }
 
-/// The disclosure is a real `CollapsingHeader`, so it carries egui's own
-/// focus and Enter/Space activation rather than a hand-painted triangle.
 #[test]
-fn the_measured_values_disclosure_activates_from_the_keyboard() {
-    for key_pressed in [egui::Key::Enter, egui::Key::Space] {
-        let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
-        let ordinals = DoctorFindingOrdinals::of(&scan);
-        let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
-        let state = doctor_outcome(scan);
-        let mut selected = Some(key);
-        let mut clipboard = InMemoryClipboard::default();
-        let context = egui::Context::default();
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
-        let idle = egui::RawInput {
-            screen_rect: Some(screen),
-            ..Default::default()
-        };
-        let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
-            context.run(input, |context| {
-                egui::CentralPanel::default().show(context, |ui| {
-                    let _ = show_doctor_page(
-                        ui,
-                        &state,
-                        selected,
-                        None,
-                        None,
-                        None,
-                        &mut clipboard,
-                        false,
-                    );
-                });
-            })
-        };
-        let output = frame(idle.clone(), &mut selected);
-        assert!(!rendered_text_contains(&output, "available_bytes"));
-
-        // Focus it the way a keyboard user reaches it, then activate.
-        let mut tabbed = idle.clone();
-        tabbed.events = vec![egui::Event::Key {
-            key: egui::Key::Tab,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: Default::default(),
-        }];
-        let mut expanded = false;
-        for _ in 0..12 {
-            let _ = frame(tabbed.clone(), &mut selected);
-            let mut activate = idle.clone();
-            activate.events = vec![egui::Event::Key {
-                key: key_pressed,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Default::default(),
-            }];
-            let _ = frame(activate, &mut selected);
-            let output = frame(idle.clone(), &mut selected);
-            if rendered_text_contains(&output, "available_bytes") {
-                expanded = true;
-                break;
-            }
-        }
-        assert!(
-            expanded,
-            "{key_pressed:?} must reach and activate the disclosure by keyboard"
-        );
-    }
+fn finding_technical_details_use_the_shared_accessible_disclosure() {
+    let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+    let key = doctor_finding_key(&scan.findings[0], 0);
+    let output = render_doctor_page(&doctor_outcome(scan), &mut Some(key));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "available_bytes"));
 }
 
 /// The expansion key of the first finding of a given kind.
@@ -1971,7 +1830,8 @@ fn doctor_page_shows_measured_values_only_for_the_selected_finding() {
 
     let mut selected = Some(key);
     let expanded = render_doctor_page(&state, &mut selected);
-    assert!(rendered_text_contains(&expanded, "Measured values"));
+    assert!(rendered_text_contains(&expanded, "Technical details"));
+    assert!(!rendered_text_contains(&expanded, "Measured values"));
 }
 
 /// Test 87
@@ -2014,25 +1874,25 @@ fn the_copied_report_carries_the_measured_values_too() {
 #[test]
 fn the_read_only_notice_states_that_no_probe_file_is_written() {
     let output = render_doctor_page(&DoctorScanState::NotRun, &mut None);
-    assert!(rendered_text_contains(
+    assert!(!rendered_text_contains(
         &output,
         "no test file is ever written"
     ));
-    assert!(rendered_text_contains(
+    assert!(!rendered_text_contains(
         &output,
         "emulator profiles, cheats and patches are never modified"
     ));
+    assert!(rendered_text_contains(
+        &output,
+        "Checking is read-only and will not change your files"
+    ));
 }
 
-/// Post-v0.8 usability pass: before this fix, "what does Run Doctor
-/// actually check" only appeared in the empty "no scan has run yet"
-/// state's message - once a scan completed, that explanation vanished
-/// for the rest of the session. It must now appear both before and
-/// after a scan has run.
 #[test]
-fn doctor_page_explains_what_it_checks_before_and_after_a_scan() {
+fn doctor_page_keeps_full_scan_scope_collapsed_before_and_after_a_check() {
     let before = render_doctor_page(&DoctorScanState::NotRun, &mut None);
-    assert!(rendered_text_contains(
+    assert!(rendered_text_contains(&before, "Technical details"));
+    assert!(!rendered_text_contains(
         &before,
         "Checks configuration, source folder availability, the mount destination, library \
              and database health, and emulator or profile prerequisites where applicable."
@@ -2040,7 +1900,8 @@ fn doctor_page_explains_what_it_checks_before_and_after_a_scan() {
 
     let after = doctor_outcome(doctor_scan_from(&[]));
     let output = render_doctor_page(&after, &mut None);
-    assert!(rendered_text_contains(
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(
         &output,
         "Checks configuration, source folder availability, the mount destination, library \
              and database health, and emulator or profile prerequisites where applicable."
@@ -2051,13 +1912,14 @@ fn doctor_page_explains_what_it_checks_before_and_after_a_scan() {
 fn doctor_page_states_the_scan_is_read_only() {
     let output = render_doctor_page(&DoctorScanState::NotRun, &mut None);
     assert!(rendered_text_contains(&output, "read-only"));
-    assert!(rendered_text_contains(
+    assert!(!rendered_text_contains(
         &output,
         "never creates, mounts, unmounts, repairs, rebuilds or removes anything"
     ));
-    assert!(rendered_text_contains(&output, "Run Doctor"));
+    assert!(rendered_text_contains(&output, "Check for problems"));
+    assert!(!rendered_text_contains(&output, "Run Doctor"));
     assert!(rendered_text_contains(&output, "Last run: never"));
-    assert!(rendered_text_contains(&output, "No scan has run yet"));
+    assert!(rendered_text_contains(&output, "No check has run yet"));
 }
 
 #[test]
@@ -2225,17 +2087,17 @@ fn doctor_page_shows_evidence_only_for_the_selected_finding() {
 
     let mut selected = Some(key);
     let expanded = render_doctor_page(&state, &mut selected);
-    for expected in [
+    assert!(rendered_text_contains(&expanded, "Technical details"));
+    assert!(rendered_text_contains(&expanded, "Hide details"));
+    for hidden in [
         "Evidence",
         "Classification: Missing",
         "Last seen: 2026-07-31T00:00:00Z",
-        "Reported by archive health",
-        "library.archive_missing",
-        "Hide details",
+        "Diagnostic ID: library.archive_missing",
     ] {
         assert!(
-            rendered_text_contains(&expanded, expected),
-            "missing {expected}"
+            !rendered_text_contains(&expanded, hidden),
+            "technical detail leaked into the normal layer: {hidden}"
         );
     }
 }
@@ -2335,11 +2197,9 @@ fn doctor_page_names_an_existing_repair_without_offering_it() {
 fn doctor_page_shows_a_healthy_result_rather_than_an_empty_screen() {
     let state = doctor_outcome(doctor_scan_from(&[]));
     let output = render_doctor_page(&state, &mut None);
-    assert!(rendered_text_contains(&output, "Healthy"));
-    assert!(rendered_text_contains(
-        &output,
-        "No problems detected by the available read-only checks."
-    ));
+    assert!(rendered_text_contains(&output, "No problems found"));
+    assert!(!rendered_text_contains(&output, "Healthy"));
+    assert!(!rendered_text_contains(&output, "Critical: 0"));
 }
 
 #[test]
@@ -2391,8 +2251,34 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
         rendered_text_contains(&output, "PPSSPP"),
         "a supported emulator's own row must be visible"
     );
+    assert!(
+        rendered_text_contains(&output, "Setup incomplete")
+            || rendered_text_contains(&output, "Ready")
+    );
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "/profiles/ppsspp"));
     // No Problems & Repair tab chrome when arriving at the dedicated route.
     assert!(!rendered_text_contains(&output, "Repair / Recovery"));
+}
+
+#[test]
+fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.doctor_scan = DoctorScanState::NotRun;
+    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.view = MainView::EmulatorSetup;
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(
+        &output,
+        "Emulators have not been checked"
+    ));
+    assert!(!rendered_text_contains(
+        &output,
+        "No emulator-specific evidence was returned"
+    ));
+    assert!(!rendered_text_contains(&output, "PPSSPP"));
 }
 
 #[test]
@@ -2409,7 +2295,7 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
 
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&on_diagnostics, "Healthy"));
+    assert!(rendered_text_contains(&on_diagnostics, "No problems found"));
 }
 
 // --- Increment 3: RetroArch core-folder repair flow in Emulator Setup ---
@@ -2426,14 +2312,17 @@ fn emulator_setup_app_ready() -> ArchiveFsApp {
 }
 
 #[test]
-fn retroarch_core_folder_card_shows_automatic_mode_and_the_two_always_on_actions() {
+fn retroarch_card_keeps_folder_mode_technical_and_shows_recovery_actions() {
     let mut app = emulator_setup_app_ready();
     assert!(app.retroarch_core_directory_override.is_none());
 
     let output = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&output, "Automatic core folder"));
-    assert!(rendered_text_contains(&output, "Rescan cores"));
-    assert!(rendered_text_contains(&output, "Choose core folder"));
+    assert!(!rendered_text_contains(&output, "Automatic core folder"));
+    assert!(rendered_text_contains(&output, "Check again"));
+    assert!(rendered_text_contains(
+        &output,
+        "Choose game-support folder"
+    ));
     assert!(rendered_text_contains(&output, "Technical details"));
     // With no override active, "Reset to automatic" is hidden.
     assert!(!rendered_text_contains(&output, "Reset to automatic"));
@@ -2445,14 +2334,32 @@ fn retroarch_core_folder_card_shows_automatic_mode_and_the_two_always_on_actions
 }
 
 #[test]
+fn retroarch_failure_leads_with_try_again_then_choose_folder() {
+    let mut app = emulator_setup_app_ready();
+    app.retroarch_profiles =
+        RetroArchProfilesState::Error("permission denied for /usr/lib/libretro".to_string());
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(
+        &output,
+        "RetroArch could not be checked"
+    ));
+    assert!(rendered_text_contains(&output, "Try again"));
+    assert!(rendered_text_contains(&output, "Choose folder"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "permission denied"));
+    assert!(!rendered_text_contains(&output, "/usr/lib/libretro"));
+}
+
+#[test]
 fn retroarch_core_folder_card_shows_custom_mode_and_reset_when_an_override_is_active() {
     let mut app = emulator_setup_app_ready();
     app.retroarch_core_directory_override = Some(PathBuf::from("/custom/libretro/cores"));
 
     let output = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&output, "Custom core folder"));
+    assert!(!rendered_text_contains(&output, "Custom core folder"));
     assert!(rendered_text_contains(&output, "Reset to automatic"));
-    assert!(rendered_text_contains(&output, "Rescan cores"));
+    assert!(rendered_text_contains(&output, "Check again"));
 }
 
 #[test]
@@ -2469,13 +2376,13 @@ fn choosing_an_unusable_core_folder_is_reported_and_never_persisted() {
     let output = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(&output, "Folder not usable"));
     // Still not claiming any custom folder.
-    assert!(rendered_text_contains(&output, "Automatic core folder"));
+    assert!(!rendered_text_contains(&output, "Automatic core folder"));
 }
 
 #[test]
-fn rescan_cores_routes_through_the_one_existing_profile_scan_lane() {
+fn check_again_routes_through_the_one_existing_profile_scan_lane() {
     let mut app = emulator_setup_app_ready();
-    // The card's "Rescan cores" action calls exactly this - no second
+    // The card's "Check again" action calls exactly this - no second
     // discovery path exists in the GUI.
     app.start_retroarch_profile_scan(egui::Context::default());
     assert!(matches!(
@@ -2570,8 +2477,11 @@ fn emulator_setup_first_render_consumes_the_retroarch_focus() {
     assert!(app.emulator_setup_focus.is_none());
     // The RetroArch repair card is present on the page the hint targeted.
     assert!(rendered_text_contains(&output, "RetroArch"));
-    assert!(rendered_text_contains(&output, "Rescan cores"));
-    assert!(rendered_text_contains(&output, "Choose core folder"));
+    assert!(rendered_text_contains(&output, "Check again"));
+    assert!(rendered_text_contains(
+        &output,
+        "Choose game-support folder"
+    ));
 }
 
 #[test]
@@ -2588,7 +2498,7 @@ fn emulator_setup_focus_is_one_shot_and_later_frames_do_not_re_target() {
         let output = render_problems_repair_app(&mut app);
         assert!(app.emulator_setup_focus.is_none());
         assert!(rendered_text_contains(&output, "RetroArch"));
-        assert!(rendered_text_contains(&output, "Automatic core folder"));
+        assert!(!rendered_text_contains(&output, "Automatic core folder"));
     }
 }
 
@@ -2601,8 +2511,8 @@ fn normal_emulator_setup_navigation_leaves_focus_none() {
     let output = render_problems_repair_app(&mut app);
 
     assert!(app.emulator_setup_focus.is_none());
-    assert!(rendered_text_contains(&output, "Automatic core folder"));
-    assert!(rendered_text_contains(&output, "Rescan cores"));
+    assert!(!rendered_text_contains(&output, "Automatic core folder"));
+    assert!(rendered_text_contains(&output, "Check again"));
 }
 
 #[test]
@@ -2622,7 +2532,7 @@ fn focused_navigation_keeps_retroarch_technical_details_collapsed() {
 
 #[test]
 fn retroarch_readiness_is_identical_with_and_without_focus() {
-    let readiness_sentence = "RetroArch is installed, but EmuWiz cannot find a usable libretro core in the folder it \
+    let readiness_sentence = "RetroArch is installed, but EmuWiz cannot find usable game-support files in the folder it \
          is currently using.";
 
     let mut without_focus = emulator_setup_app_ready();
@@ -2696,7 +2606,7 @@ fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
     inputs.emulator_profiles = Gathered::Ready(&profile_report);
     let scan = run_doctor_scan(&inputs);
 
-    for (id, emulator, profile, configuration_path, cheat_destination, eligibility, blocker) in [
+    for (id, emulator, _profile, configuration_path, cheat_destination, eligibility, blocker) in [
         (
             "emulator_profile.ppsspp_inspected",
             "PPSSPP",
@@ -2718,10 +2628,13 @@ fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
     ] {
         let key = doctor_key_of_kind(&scan, id);
         let output = render_doctor_page(&doctor_outcome(scan.clone()), &mut Some(key));
-        for expected in [
-            "Emulator profiles (2)",
-            emulator,
-            profile,
+        for expected in ["Emulator profiles (2)", emulator, "Technical details"] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "Doctor did not render {expected:?} for {emulator}"
+            );
+        }
+        for hidden in [
             "Configuration path:",
             configuration_path,
             "Cheat destination:",
@@ -2729,15 +2642,12 @@ fn doctor_page_shows_ppsspp_and_duckstation_profile_inspections() {
             eligibility,
         ] {
             assert!(
-                rendered_text_contains(&output, expected),
-                "Doctor did not render {expected:?} for {emulator}"
+                !rendered_text_contains(&output, hidden),
+                "Doctor leaked technical detail {hidden:?} for {emulator}"
             );
         }
         if let Some(blocker) = blocker {
-            assert!(
-                rendered_text_contains(&output, blocker),
-                "Doctor did not render {blocker:?} for {emulator}"
-            );
+            assert!(!rendered_text_contains(&output, blocker));
         }
     }
 }
@@ -2836,7 +2746,8 @@ fn doctor_page_leaves_an_existing_dolphin_profile_row_unchanged_alongside_ppsspp
     );
     let output = render_doctor_page(&doctor_outcome(scan.clone()), &mut Some(dolphin_key));
     assert!(rendered_text_contains(&output, "Dolphin"));
-    assert!(rendered_text_contains(
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(
         &output,
         "/profiles/dolphin/GameSettings"
     ));
@@ -2939,9 +2850,12 @@ fn doctor_page_lists_unchecked_and_deferred_checks_alongside_a_healthy_result() 
     let output = render_doctor_page(&state, &mut None);
 
     assert!(rendered_text_contains(&output, "What was checked"));
-    assert!(rendered_text_contains(&output, "Not checked in this run"));
-    assert!(rendered_text_contains(&output, "Not checked by EmuWiz yet"));
-    assert!(rendered_text_contains(
+    assert!(!rendered_text_contains(&output, "Not checked in this run"));
+    assert!(!rendered_text_contains(
+        &output,
+        "Not checked by EmuWiz yet"
+    ));
+    assert!(!rendered_text_contains(
         &output,
         "a healthy result does not mean they are fine"
     ));
@@ -2950,10 +2864,7 @@ fn doctor_page_lists_unchecked_and_deferred_checks_alongside_a_healthy_result() 
         "Write access inside a sandbox",
         "Managed entries with no install record",
     ] {
-        assert!(
-            rendered_text_contains(&output, deferred),
-            "the deferred check `{deferred}` must be visible"
-        );
+        assert!(!rendered_text_contains(&output, deferred));
     }
     // And nothing claims a pass for a check that never ran.
     assert_eq!(
@@ -2971,8 +2882,8 @@ fn doctor_page_renders_long_unicode_paths_without_panicking() {
     let key = doctor_key_of_kind(&scan, "library.archive_missing");
     let state = doctor_outcome(scan);
     let output = render_doctor_page(&state, &mut Some(key));
-    assert!(rendered_text_contains(&output, "ゲーム 💾 [!].zip"));
-    assert!(rendered_text_contains(&output, "Evidence"));
+    assert!(!rendered_text_contains(&output, "ゲーム 💾 [!].zip"));
+    assert!(rendered_text_contains(&output, "Technical details"));
 }
 
 #[test]
@@ -3629,8 +3540,8 @@ fn unknown_platform_rows_are_needs_attention_in_the_list_too() {
     assert_eq!(
         gamer_view_row_state_label(false, MountState::NotMountable),
         // The list never claims launch-readiness; that is the selected-game
-        // card's job. A mount-free game reads only "Ready" here.
-        "Ready"
+        // card's job. This row only confirms that the game was found.
+        "Game found"
     );
 }
 
@@ -3741,11 +3652,9 @@ fn problems_repair_diagnostics_tab_still_renders_doctor_content() {
     app.view = MainView::Doctor;
     let output = render_problems_repair_app(&mut app);
 
-    assert!(
-        rendered_text_contains(&output, DOCTOR_READ_ONLY_NOTICE),
-        "Diagnostics must still render Doctor's own safety notice"
-    );
-    assert!(rendered_text_contains(&output, "Run Doctor"));
+    assert!(!rendered_text_contains(&output, DOCTOR_READ_ONLY_NOTICE));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(rendered_text_contains(&output, "Check for problems"));
 }
 
 #[test]

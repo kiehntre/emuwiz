@@ -135,6 +135,9 @@ fn fresh_install_shows_the_welcome_banner_and_not_configured_cards() {
     let (output, _) = render(&view, 1100.0);
     assert!(rendered_text_contains(&output, "Welcome to EmuWiz"));
     assert!(rendered_text_contains(&output, "No source folders yet"));
+    assert_eq!(view.cards[0].card, HomeCard::BuildLibrary);
+    assert_eq!(view.cards[0].title, "Add your games");
+    assert_eq!(view.cards[0].action_label, "Add game folder");
 }
 
 // --- Established configuration rendering ---
@@ -169,8 +172,9 @@ fn config_disappeared_after_being_confirmed_shows_the_warning_banner_not_the_wel
     let (output, _) = render(&view, 1100.0);
     assert!(rendered_text_contains(
         &output,
-        "Configuration file is no longer found"
+        "EmuWiz settings could not be found"
     ));
+    assert!(!rendered_text_contains(&output, "Doctor"));
     assert!(!rendered_text_contains(&output, "Welcome to EmuWiz"));
 }
 
@@ -196,7 +200,7 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::CanonicalOrganisation, "Open Organise"),
         (HomeCard::CheckSetup, "Open Emulator Setup"),
         (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
-        (HomeCard::DatSources, "Open DAT Sources"),
+        (HomeCard::DatSources, "Verify games"),
         (HomeCard::DuplicateReview, "Open duplicate finder"),
         (HomeCard::ConvertDiscs, "Open disc conversion"),
         (HomeCard::Settings, "Open Settings"),
@@ -266,7 +270,7 @@ fn setup_checks_with_errors_are_reported_as_unavailable() {
 }
 
 #[test]
-fn lazily_loaded_pages_not_yet_visited_are_reported_as_unknown_not_not_configured() {
+fn lazily_loaded_pages_not_yet_visited_omit_their_status_badge() {
     let view = build_home_view(&fresh_install_inputs());
     for card_kind in [
         HomeCard::CheatsAndMods,
@@ -274,11 +278,7 @@ fn lazily_loaded_pages_not_yet_visited_are_reported_as_unknown_not_not_configure
         HomeCard::RomM,
     ] {
         let card = view.cards.iter().find(|c| c.card == card_kind).unwrap();
-        assert!(
-            matches!(card.readiness, Some(CardReadiness::Unknown(_))),
-            "{card_kind:?} should be Unknown before its page has been visited, got {:?}",
-            card.readiness
-        );
+        assert_eq!(card.readiness, None);
     }
 }
 
@@ -443,7 +443,8 @@ fn primary_home_cards_carry_their_visual_identity() {
     assert_eq!(cheats.icon, crate::ui::icons::CHEATS);
     let verify = find(HomeCard::DatSources);
     assert_eq!(verify.icon, crate::ui::icons::VERIFY);
-    assert_eq!(verify.title, "Verify collection");
+    assert_eq!(verify.title, "Verify your games");
+    assert_eq!(verify.action_label, "Verify games");
     let settings = find(HomeCard::Settings);
     assert_eq!(settings.icon, crate::ui::icons::SETTINGS);
     assert_eq!(settings.title, "Settings");
@@ -534,7 +535,7 @@ fn the_primary_home_cards_render_at_compact_width() {
         "Organise",
         "Set up emulators",
         "Cheats & Mods",
-        "Verify collection",
+        "Verify your games",
         "Settings",
     ] {
         assert!(
@@ -542,6 +543,23 @@ fn the_primary_home_cards_render_at_compact_width() {
             "expected {expected:?} to render at compact width"
         );
     }
+}
+
+#[test]
+fn dat_terminology_is_retained_but_collapsed_by_default() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    let (output, _) = render(&view, 1200.0);
+    assert!(rendered_text_contains(&output, "Verify your games"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(
+        &output,
+        "commonly called DAT files"
+    ));
+    assert!(!rendered_text_contains(
+        &output,
+        "Check your games with DATs"
+    ));
 }
 
 // --- "Set up emulators" badge tracks the Doctor scan it opens ------------

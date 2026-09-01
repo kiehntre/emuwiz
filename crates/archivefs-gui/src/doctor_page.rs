@@ -80,17 +80,22 @@ pub(crate) fn show_doctor_page(
         ui.horizontal_wrapped(|ui| {
             match displayed {
                 Some(outcome) if outcome.scan.is_healthy() => {
-                    widgets::status_badge(ui, "Healthy", widgets::StatusTone::Success)
+                    widgets::status_badge(ui, "No problems found", widgets::StatusTone::Success)
                 }
                 Some(outcome) => widgets::status_badge(
                     ui,
                     outcome.scan.overall_severity().label(),
                     doctor_severity_tone(outcome.scan.overall_severity()),
                 ),
-                None => widgets::status_badge(ui, "Not run yet", widgets::StatusTone::Pending),
+                None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
             }
-            if widgets::action_button(ui, "Run Doctor", widgets::ActionStyle::Primary, !running)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                "Check for problems",
+                widgets::ActionStyle::Primary,
+                !running,
+            )
+            .clicked()
             {
                 action = Some(DoctorPageAction::RunScan);
             }
@@ -101,12 +106,15 @@ pub(crate) fn show_doctor_page(
                 let _ = clipboard.set_text(doctor_scan_report_text(outcome));
             }
         });
-        ui.label(DOCTOR_WHAT_IT_CHECKS_NOTICE);
         ui.label(
-            egui::RichText::new(DOCTOR_READ_ONLY_NOTICE)
+            egui::RichText::new("Checking is read-only and will not change your files.")
                 .color(theme::muted(ui))
                 .small(),
         );
+        widgets::technical_details(ui, "doctor-scan-safety", |ui| {
+            ui.label(DOCTOR_WHAT_IT_CHECKS_NOTICE);
+            ui.label(DOCTOR_READ_ONLY_NOTICE);
+        });
         match displayed {
             Some(outcome) => ui.weak(format!(
                 "Last run: {}",
@@ -137,8 +145,8 @@ pub(crate) fn show_doctor_page(
         ui.add_space(theme::SECTION_GAP);
         widgets::empty_state(
             ui,
-            "No scan has run yet",
-            "Run Doctor to check configuration, the mount root, source folders, the library, the catalogue database and recent installs. Nothing is changed.",
+            "No check has run yet",
+            "Check for problems to review your game folders, library, storage, and emulator setup. Nothing will be changed.",
             None,
         );
         return action;
@@ -146,19 +154,21 @@ pub(crate) fn show_doctor_page(
 
     let scan = &outcome.scan;
     ui.add_space(theme::SECTION_GAP);
-    ui.horizontal_wrapped(|ui| {
-        for (severity, count) in scan.counts() {
-            widgets::status_badge(
-                ui,
-                format!("{}: {count}", severity.label()),
-                if count == 0 {
-                    widgets::StatusTone::Pending
-                } else {
-                    doctor_severity_tone(severity)
-                },
-            );
-        }
-    });
+    if !scan.is_healthy() {
+        ui.horizontal_wrapped(|ui| {
+            for (severity, count) in scan.counts() {
+                widgets::status_badge(
+                    ui,
+                    format!("{}: {count}", severity.label()),
+                    if count == 0 {
+                        widgets::StatusTone::Pending
+                    } else {
+                        doctor_severity_tone(severity)
+                    },
+                );
+            }
+        });
+    }
     if scan.merged_duplicate_count > 0 {
         ui.weak(format!(
             "{} duplicate finding(s) reported by more than one check were merged.",
@@ -169,16 +179,6 @@ pub(crate) fn show_doctor_page(
     if let Some(outcome) = repair_result {
         ui.add_space(theme::SECTION_GAP);
         show_doctor_repair_result(ui, outcome);
-    }
-
-    if scan.is_healthy() {
-        ui.add_space(theme::SECTION_GAP);
-        widgets::banner(
-            ui,
-            "Healthy",
-            "No problems detected by the available read-only checks.",
-            widgets::StatusTone::Success,
-        );
     }
 
     // Deliberately *not* a running draw-order counter: a compact group's
@@ -512,14 +512,11 @@ fn show_doctor_finding_card(
             );
             ui.label(egui::RichText::new(&finding.title).strong());
         });
-        ui.add(egui::Label::new(&finding.explanation).wrap());
-        if let Some(affected) = &finding.affected {
-            ui.add(egui::Label::new(format!("Resource: {}", affected.display)).wrap());
-            if affected.lossy {
-                ui.weak(
-                    "This path contains bytes that are not valid text, so it is shown approximately.",
-                );
-            }
+        let explanation_is_technical = finding_explanation_is_technical(&finding.explanation);
+        if explanation_is_technical {
+            ui.weak("Open Details for guidance and technical information.");
+        } else {
+            ui.add(egui::Label::new(&finding.explanation).wrap());
         }
         if widgets::action_button(
             ui,
@@ -716,42 +713,15 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) 
     if let Some(next) = &finding.next_step {
         ui.label(egui::RichText::new("Recommended next step").strong());
         ui.add(egui::Label::new(next).wrap());
-    }
-    if !finding.evidence.is_empty() {
-        // Evidence (paths, hashes, raw reasons) is already gated behind the
-        // finding's own "Details"/"Hide details" selection, so it stays
-        // visible exactly when the user asked to see it.
-        ui.label(egui::RichText::new("Evidence").strong());
-        for item in &finding.evidence {
-            ui.add(egui::Label::new(format!("• {item}")).wrap());
-        }
-    }
-    if finding.measurements.is_empty() {
-        // Plain text, not a header: a disclosure triangle that opens onto
-        // nothing is a control that lies about having something behind it.
-        ui.weak(DOCTOR_NO_MEASURED_VALUES);
-    } else {
-        // The same facts as the evidence above, as values. Shown collapsed so
-        // the prose stays the primary account for a person reading this.
-        //
-        // Salted with this card's unique key, never with `finding.id` alone:
-        // a scan repeats an id across hundreds of findings, and salting on it
-        // gave every one of their headers the same egui widget id. egui
-        // flagged that clash on screen ("First use of widget ID …") and the
-        // colliding widgets overwrote each other's open/closed state within
-        // the frame, so the triangle never appeared to respond.
-        //
-        // `CollapsingHeader` is a real button: it carries egui's own keyboard
-        // focus, Enter/Space activation and accessibility node. Nothing here
-        // paints a triangle by hand.
-        egui::CollapsingHeader::new("Measured values")
-            .id_salt(format!("doctor-measurements-{key}"))
-            .default_open(false)
-            .show(ui, |ui| {
-                for (name, value) in &finding.measurements {
-                    ui.label(format!("{name}: {value}"));
-                }
-            });
+    } else if finding.offered_repair().is_none()
+        && finding.recovery.is_none()
+        && !matches!(
+            finding.severity,
+            DoctorSeverity::Info | DoctorSeverity::Healthy
+        )
+    {
+        ui.label(egui::RichText::new("What to do next").strong());
+        ui.label("EmuWiz cannot repair this automatically.");
     }
     if let Some(recovery) = &finding.recovery {
         // Informational only. Stage 1A deliberately renders no button here:
@@ -760,12 +730,48 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) 
         ui.add_space(4.0);
         ui.add(egui::Label::new(recovery.notice()).wrap());
     }
-    ui.add_space(4.0);
-    ui.weak(format!(
-        "Reported by {} · finding ID {}",
-        finding.subsystem.label(),
-        finding.id
-    ));
+    widgets::technical_details(ui, format!("doctor-finding-{key}"), |ui| {
+        if finding_explanation_is_technical(&finding.explanation) {
+            ui.label(egui::RichText::new("Original finding").strong());
+            ui.add(egui::Label::new(&finding.explanation).wrap());
+        }
+        if let Some(affected) = &finding.affected {
+            ui.add(egui::Label::new(format!("Resource: {}", affected.display)).wrap());
+            if affected.lossy {
+                ui.weak(
+                    "This path contains bytes that are not valid text, so it is shown approximately.",
+                );
+            }
+        }
+        if !finding.evidence.is_empty() {
+            ui.label(egui::RichText::new("Evidence").strong());
+            for item in &finding.evidence {
+                ui.add(egui::Label::new(format!("• {item}")).wrap());
+            }
+        }
+        if finding.measurements.is_empty() {
+            ui.weak(DOCTOR_NO_MEASURED_VALUES);
+        } else {
+            ui.label(egui::RichText::new("Measured values").strong());
+            for (name, value) in &finding.measurements {
+                ui.label(format!("{name}: {value}"));
+            }
+        }
+        ui.label(egui::RichText::new("Technical reference").strong());
+        ui.label(format!("Check: {}", finding.subsystem.label()));
+        ui.label(format!("Diagnostic ID: {}", finding.id));
+    });
+}
+
+fn finding_explanation_is_technical(explanation: &str) -> bool {
+    explanation.split_whitespace().any(|word| {
+        word.trim_matches(|character: char| {
+            matches!(character, '`' | '(' | ')' | '[' | ']' | ',' | ';')
+        })
+        .starts_with('/')
+            || word.contains(":\\")
+            || word.contains("file://")
+    })
 }
 
 /// What this scan actually covered, what it could not, and what EmuWiz
@@ -774,7 +780,7 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) 
 fn show_doctor_coverage(ui: &mut egui::Ui, scan: &DoctorScan) {
     egui::CollapsingHeader::new("What was checked")
         .id_salt("doctor-coverage")
-        .default_open(scan.is_healthy())
+        .default_open(false)
         .show(ui, |ui| {
             let checked = scan.checked_subsystems();
             if checked.is_empty() {

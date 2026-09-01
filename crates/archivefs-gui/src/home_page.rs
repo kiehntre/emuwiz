@@ -8,21 +8,16 @@
 //! up, or currently unavailable. Nothing on this page is a new capability -
 //! it is a front door onto capabilities that already exist.
 //!
-//! # The view model, and why some cards say "not checked yet"
+//! # The view model
 //!
 //! Following `romm_source`/`cheat_sources_page`, authoritative state is
 //! turned into a [`HomeView`] by the pure [`build_home_view`], and the
 //! drawing code only draws. `main.rs` builds [`HomeInputs`] from whatever
 //! is already loaded on `ArchiveFsApp` - never from a fresh read.
 //!
-//! Three of the seven cards (Cheats & Mods' source count, DAT Sources'
-//! registry count, RomM's provider state) read state that EmuWiz
-//! deliberately does not load until the user visits that page - loading it
-//! eagerly here would mean opening Home always triggers three background
-//! reads nobody asked for, network-shaped or not. So when the real page
-//! has not been visited yet this session, [`CardReadiness::Unknown`] is
-//! shown - "open it to check" - rather than guessing, or lying that
-//! nothing is configured.
+//! Some cards read state that EmuWiz deliberately does not load until the
+//! user visits that page. Home omits those badges until their real state is
+//! known rather than presenting an ordinary lazy load as a problem.
 
 use crate::ui::{components as widgets, theme};
 use eframe::egui;
@@ -57,9 +52,9 @@ pub(crate) enum HomeCard {
 ///   is not ready). Never conflated with "not configured".
 /// - [`Self::Ready`]: configured and, as far as already-loaded state shows,
 ///   usable.
-/// - [`Self::Unknown`]: Home has not loaded enough to say. Only used for
-///   the three lazily-loaded destinations described in the module docs,
-///   and only before their real page has been visited this session.
+/// - [`Self::Unknown`]: Home has loaded an active task state but not enough
+///   evidence to claim ready or unavailable. Lazily loaded destinations
+///   omit the badge entirely until their page has established a state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CardReadiness {
     NotConfigured(String),
@@ -133,6 +128,9 @@ pub(crate) struct HomeCardView {
     pub(crate) icon: &'static str,
     pub(crate) title: &'static str,
     pub(crate) explanation: &'static str,
+    /// Optional supporting terminology, always rendered in a collapsed
+    /// disclosure rather than in the task-first summary.
+    pub(crate) technical_detail: Option<&'static str>,
     pub(crate) tier: HomeCardTier,
     pub(crate) accent: Option<HomeAccent>,
     /// `None` for the one card (Settings) with no single configured/not
@@ -258,37 +256,77 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
     };
 
     let cheats_readiness = match inputs.cheat_sources_enabled_count {
-        None => CardReadiness::Unknown("Open Cheat Sources to check status".to_string()),
-        Some(0) => CardReadiness::NotConfigured("No cheat sources enabled".to_string()),
-        Some(n) => CardReadiness::Ready(format!("{n} cheat source{} enabled", plural(n))),
+        None => None,
+        Some(0) => Some(CardReadiness::NotConfigured(
+            "No cheat sources enabled".to_string(),
+        )),
+        Some(n) => Some(CardReadiness::Ready(format!(
+            "{n} cheat source{} enabled",
+            plural(n)
+        ))),
     };
 
     let dat_readiness = match inputs.dat_sources_registered_count {
-        None => CardReadiness::Unknown("Open DAT Sources to check status".to_string()),
-        Some(0) => CardReadiness::NotConfigured("No DAT sources registered yet".to_string()),
-        Some(n) => CardReadiness::Ready(format!("{n} DAT source{} registered", plural(n))),
+        None => None,
+        Some(0) => Some(CardReadiness::NotConfigured(
+            "No trusted catalogues added yet".to_string(),
+        )),
+        Some(n) => Some(CardReadiness::Ready(format!(
+            "{n} trusted catalogue{} added",
+            plural(n)
+        ))),
     };
 
     let romm_readiness = match &inputs.romm_state_label {
-        None => CardReadiness::Unknown("Open RomM to check status".to_string()),
+        None => None,
         Some(RommReadinessLabel::NotConfigured(label)) => {
-            CardReadiness::NotConfigured((*label).to_string())
+            Some(CardReadiness::NotConfigured((*label).to_string()))
         }
         Some(RommReadinessLabel::Unavailable(label)) => {
-            CardReadiness::Unavailable((*label).to_string())
+            Some(CardReadiness::Unavailable((*label).to_string()))
         }
-        Some(RommReadinessLabel::Ready(label)) => CardReadiness::Ready((*label).to_string()),
+        Some(RommReadinessLabel::Ready(label)) => Some(CardReadiness::Ready((*label).to_string())),
     };
 
     let setup_readiness = summarize_setup_checks(inputs.setup_check);
 
-    let cards = vec![
+    let build_library = HomeCardView {
+        card: HomeCard::BuildLibrary,
+        icon: crate::ui::icons::SOURCES,
+        title: if inputs.source_folder_count == 0 {
+            "Add your games"
+        } else {
+            "Build my library"
+        },
+        explanation: if inputs.source_folder_count == 0 {
+            "Choose the folder where your games are stored. EmuWiz will scan it without changing the files."
+        } else {
+            "Choose and review the folders EmuWiz scans for games."
+        },
+        technical_detail: None,
+        tier: if inputs.source_folder_count == 0 {
+            HomeCardTier::Primary
+        } else {
+            HomeCardTier::Secondary
+        },
+        accent: (inputs.source_folder_count == 0).then_some(HomeAccent::Games),
+        readiness: Some(library_readiness),
+        action_label: if inputs.source_folder_count == 0 {
+            "Add game folder"
+        } else {
+            "Open Sources"
+        },
+        secondary: None,
+    };
+
+    let mut cards = vec![
         // --- Primary destinations: the major jobs -------------------------
         HomeCardView {
             card: HomeCard::BrowseGames,
             icon: crate::ui::icons::GAMES,
             title: "My Games",
             explanation: "Browse your games. See the library EmuWiz has found, organised and searchable.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Games),
             readiness: Some(browse_readiness),
@@ -300,6 +338,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::ORGANISE,
             title: "Organise",
             explanation: "Rename and tidy your library. Preview how your games can be renamed or moved into platform folders; nothing moves until you approve it.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Organise),
             readiness: None,
@@ -311,6 +350,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::CHECK,
             title: "Set up emulators",
             explanation: "Check which emulators EmuWiz can find and whether each is ready to launch games.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Check),
             readiness: Some(setup_readiness),
@@ -322,21 +362,25 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::CHEATS,
             title: "Cheats & Mods",
             explanation: "Find cheats and game enhancements for a selected game.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Cheats),
-            readiness: Some(cheats_readiness),
+            readiness: cheats_readiness,
             action_label: "Open Cheats & Mods",
             secondary: Some((HomeCard::CheatSources, "Manage Cheat Sources")),
         },
         HomeCardView {
             card: HomeCard::DatSources,
             icon: crate::ui::icons::VERIFY,
-            title: "Verify collection",
-            explanation: "Check your games with DATs. Auditing is read-only: nothing is renamed, moved, or rewritten.",
+            title: "Verify your games",
+            explanation: "Check game names, versions, and known-good file matches using trusted game catalogues.",
+            technical_detail: Some(
+                "These trusted game catalogues are commonly called DAT files. Verification is read-only: nothing is renamed, moved, or rewritten.",
+            ),
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Verify),
-            readiness: Some(dat_readiness),
-            action_label: "Open DAT Sources",
+            readiness: dat_readiness,
+            action_label: "Verify games",
             secondary: None,
         },
         HomeCardView {
@@ -344,6 +388,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::CHECK,
             title: "Find duplicate games",
             explanation: "Find identical or equivalent copies in your library, keep one, and move the rest into a recoverable quarantine. Nothing is permanently deleted.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Check),
             readiness: None,
@@ -355,6 +400,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::GAMES,
             title: "Convert discs",
             explanation: "Convert supported disc images into verified CHD files.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Games),
             readiness: None,
@@ -365,23 +411,12 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             card: HomeCard::Settings,
             icon: crate::ui::icons::SETTINGS,
             title: "Settings",
-            explanation: "Set up EmuWiz: sources, mounts, and preferences.",
+            explanation: "Choose game folders and preferences. Advanced storage options are available when needed.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Settings),
             readiness: None,
             action_label: "Open Settings",
-            secondary: None,
-        },
-        // --- Secondary/admin destinations: quieter, still present ---------
-        HomeCardView {
-            card: HomeCard::BuildLibrary,
-            icon: crate::ui::icons::SOURCES,
-            title: "Build my library",
-            explanation: "EmuWiz needs one or more source folders before it can scan for archives.",
-            tier: HomeCardTier::Secondary,
-            accent: None,
-            readiness: Some(library_readiness),
-            action_label: "Open Sources",
             secondary: None,
         },
         HomeCardView {
@@ -389,6 +424,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::CLEAN_UP,
             title: "Quick Rename",
             explanation: "Safely identify and rename games using verified catalogue evidence.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Organise),
             readiness: None,
@@ -400,13 +436,23 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             icon: crate::ui::icons::ROMM,
             title: "Connect RomM",
             explanation: "Connect EmuWiz to your RomM server and browse its records. RomM is treated as a read-only source: nothing in your RomM library is ever changed.",
+            technical_detail: None,
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Organise),
-            readiness: Some(romm_readiness),
+            readiness: romm_readiness,
             action_label: "Open RomM",
             secondary: None,
         },
     ];
+
+    cards.insert(
+        if inputs.source_folder_count == 0 {
+            0
+        } else {
+            8
+        },
+        build_library,
+    );
 
     HomeView { banner, cards }
 }
@@ -463,9 +509,9 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
         HomeBanner::ConfigDisappeared => {
             widgets::banner(
                 ui,
-                "Configuration file is no longer found",
-                "EmuWiz found your configuration earlier in this session, and it is no \
-                 longer present. Check Doctor before starting a new task.",
+                "EmuWiz settings could not be found",
+                "EmuWiz found your settings earlier, but they are no longer available. Check \
+                 the problem before starting another task.",
                 widgets::StatusTone::Warning,
             );
             ui.add_space(theme::SECTION_GAP);
@@ -500,6 +546,11 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
                             13.0
                         }),
                 );
+                if let Some(detail) = card.technical_detail {
+                    widgets::technical_details(ui, ("home-card", card.card), |ui| {
+                        ui.label(detail);
+                    });
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if widgets::action_button(

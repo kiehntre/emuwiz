@@ -151,8 +151,11 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     };
 
     let (first, _) = frame(base.clone());
-    assert!(rendered_text_contains(&first, "Play — Launch RetroArch"));
-    let button = first_text_shape_rect(&first, "Play — Launch RetroArch").unwrap();
+    // Integration: the beginner label is "Play" (1c825e7); the jargon
+    // label must be gone.
+    assert!(rendered_text_contains(&first, "Play"));
+    assert!(!rendered_text_contains(&first, "Play — Launch RetroArch"));
+    let button = first_text_shape_rect(&first, "Play").unwrap();
     let pointer = button.center();
     let _ = frame(egui::RawInput {
         events: vec![egui::Event::PointerButton {
@@ -163,6 +166,10 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
         }],
         ..base.clone()
     });
+    // Integration: the real launch-action wiring (934c9ec) still fires -
+    // clicking the button returns `GamerViewAction::Play` with the exact
+    // planned request, routed through `featured_retroarch_launch_action`
+    // and the shared executor.
     let (_, action) = frame(egui::RawInput {
         events: vec![egui::Event::PointerButton {
             pos: pointer,
@@ -173,7 +180,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
         ..base
     });
     let Some(GamerViewAction::Play(clicked_request)) = action else {
-        panic!("Play must return GamerViewAction::Play");
+        panic!("clicking Play must return GamerViewAction::Play (real launch wiring)");
     };
     assert_eq!(clicked_request, request);
 }
@@ -253,7 +260,8 @@ fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
     );
     let output = render_gamer_card(MountState::NotMountable, "Game Boy", &play_action);
     assert!(rendered_text_contains(&output, "Ready to play"));
-    assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
+    assert!(rendered_text_contains(&output, "Play"));
+    assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
     assert!(!rendered_text_contains(&output, "Needs setup"));
     assert!(!rendered_text_contains(&output, "Can’t play yet"));
 }
@@ -295,7 +303,11 @@ fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
         "This game's file is no longer available where it was last seen."
     ));
     assert!(rendered_text_contains(&output, "Technical details"));
-    assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
+    // Integration: the executor still offers a retry button after a failure
+    // (934c9ec); its label is the beginner "Play" (1c825e7), not the jargon
+    // form.
+    assert!(rendered_text_contains(&output, "Play"));
+    assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
 }
 
 #[test]
@@ -310,17 +322,18 @@ fn gamer_card_blocked_launch_shows_needs_setup_never_ready_to_play() {
     assert!(rendered_text_contains(&output, "Needs setup"));
     assert!(rendered_text_contains(
         &output,
-        "EmuWiz found the game, but it cannot safely launch it yet."
+        "RetroArch needs setup for this game."
     ));
-    assert!(rendered_text_contains(
+    assert!(!rendered_text_contains(
         &output,
         "no safe RetroArch launch option is available."
     ));
+    assert!(rendered_text_contains(&output, "Technical details"));
     assert!(rendered_text_contains(&output, "Open Emulator Setup"));
 
     // The contradiction Journey D is about must be impossible.
     assert!(!rendered_text_contains(&output, "Ready to play"));
-    assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
+    assert!(!rendered_text_contains(&output, "Play"));
     assert!(
         !(rendered_text_contains(&output, "Ready to play")
             && rendered_text_contains(&output, "Can’t play yet"))
@@ -508,23 +521,6 @@ fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
 }
 
 #[test]
-fn humanize_play_blocker_drops_the_internal_lead_in() {
-    assert_eq!(
-        humanize_play_blocker("Can’t play yet: no safe RetroArch launch option is available."),
-        "no safe RetroArch launch option is available."
-    );
-    assert_eq!(
-        humanize_play_blocker("Can't play yet: game identity could not be verified."),
-        "game identity could not be verified."
-    );
-    // A reason without the lead-in is passed through untouched.
-    assert_eq!(
-        humanize_play_blocker("RetroArch has not been checked yet."),
-        "RetroArch has not been checked yet."
-    );
-}
-
-#[test]
 fn library_selected_archive_panel_renders_the_selected_evidence_report() {
     let path = PathBuf::from("/roms/aladdin.gb");
     let mut selected_evidence = ready_selected_evidence_state(&path);
@@ -589,8 +585,11 @@ fn library_selected_archive_panel_renders_the_selected_evidence_report() {
             );
         });
     });
-    assert!(rendered_text_contains(&output, "Structural evidence"));
-    assert!(rendered_text_contains(&output, "Game Boy header"));
+    assert!(rendered_text_contains(&output, "Game identified"));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "Structural evidence"));
+    assert!(!rendered_text_contains(&output, "Game Boy header"));
+    assert!(!rendered_text_contains(&output, "/roms/aladdin.gb"));
 }
 
 /// Renders the Library "Selected game details" panel for one `NotMountable`
@@ -655,6 +654,9 @@ fn library_selected_archive_panel_shows_checking_state_while_evidence_loads() {
         selected_game_panel::SelectedEvidenceView::Loading,
     );
     assert!(rendered_text_contains(&output, "Checking game identity"));
+    assert!(rendered_text_contains(&output, "Ready to use directly"));
+    assert!(!rendered_text_contains(&output, "No mount required"));
+    assert!(!rendered_text_contains(&output, "Archive path"));
     // The old wording that could persist forever must be gone.
     assert!(!rendered_text_contains(
         &output,
@@ -676,7 +678,8 @@ fn library_selected_archive_panel_shows_failure_reason_not_endless_loading() {
         &output,
         "Identity check could not be completed"
     ));
-    assert!(rendered_text_contains(&output, reason));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, reason));
     assert!(!rendered_text_contains(&output, "Checking game identity"));
     assert!(!rendered_text_contains(
         &output,

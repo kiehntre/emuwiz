@@ -83,14 +83,14 @@ pub(crate) fn gamer_primary_action(state: MountState) -> GamerPrimaryAction {
 
 /// The short, list-row-sized counterpart of `gamer_primary_action` - one
 /// or two words, safe to append after a title/platform pair. The list has
-/// no per-row launch plan, so a mount-free game reads only "Ready" (media
-/// is usable); whether a safe core exists is the selected-game card's
+/// no per-row launch plan, so a mount-free game reads only "Game found"
+/// (media is usable); whether a safe core exists is the selected-game card's
 /// verdict ("Ready to play" vs "Needs setup"), never claimed here.
 pub(crate) fn gamer_primary_action_short_label(action: &GamerPrimaryAction) -> &'static str {
     match action {
         GamerPrimaryAction::Mount => "Ready to mount",
         GamerPrimaryAction::Unmount => "Mounted",
-        GamerPrimaryAction::NoMountingNeeded => "Ready",
+        GamerPrimaryAction::NoMountingNeeded => "Game found",
         GamerPrimaryAction::Blocked(_) => "Needs attention",
     }
 }
@@ -153,18 +153,24 @@ pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'s
     }
 }
 
-/// Turns the shared planner's blocker string into one plain sentence for a
-/// novice: drops the internal "Can't play yet:" lead-in the planner uses
-/// and leaves the specific reason (e.g. "no safe RetroArch launch option is
-/// available."). The lead sentence and any technical detail are the card's
-/// job, not this string's.
-pub(crate) fn humanize_play_blocker(reason: &str) -> &str {
-    reason
-        .trim()
-        .strip_prefix("Can't play yet:")
-        .or_else(|| reason.trim().strip_prefix("Can’t play yet:"))
-        .map(str::trim_start)
-        .unwrap_or(reason.trim())
+/// Keeps the safe planner's exact refusal available without making planner,
+/// executable, core, or preflight terminology part of the beginner layer.
+fn show_gamer_launch_blocker(ui: &mut egui::Ui, reason: &str) {
+    ui.colored_label(
+        ui.visuals().warn_fg_color,
+        "RetroArch needs setup for this game.",
+    );
+    ui.label("Check Emulator Setup, then return here to play.");
+    widgets::technical_details(ui, "gamer-launch-refusal", |ui| {
+        ui.label(reason);
+    });
+}
+
+const GAMER_PLAY_LABEL: &str = "Play";
+const COPY_FOLDER_LOCATION_LABEL: &str = "Copy folder location";
+
+fn gamer_copy_location_label() -> &'static str {
+    COPY_FOLDER_LOCATION_LABEL
 }
 
 /// Prefers the real, human title from metadata; falls back to the
@@ -208,7 +214,7 @@ pub(crate) enum GamerViewAction {
     Operation(OperationRequest),
     Play(archivefs_core::launch::RetroArchLaunchRequest),
     OpenCheatsMods(PathBuf),
-    /// The folder to copy to the clipboard - "Open location" (§2.1's
+    /// The folder to copy to the clipboard - "Copy folder location" (§2.1's
     /// action visibility rules). No file-manager process is launched;
     /// see the implementation summary for why (no such capability, and
     /// no new external-process dependency, exists in this codebase today).
@@ -529,18 +535,21 @@ fn featured_retroarch_launch_action(
 
     let display = launch_state.display_for(request);
     launch_readiness_page::show_retroarch_launch_feedback(ui, &display);
+    // Integration: the executor state machine, polling and running/closed/
+    // error presentation are 934c9ec's; the plain beginner label is
+    // 1c825e7's (`GAMER_PLAY_LABEL`).
     match display {
         RetroArchLaunchDisplay::Idle
         | RetroArchLaunchDisplay::Exited { .. }
         | RetroArchLaunchDisplay::Failed { .. } => {
-            featured_primary_button(ui, "Play — Launch RetroArch", enabled).clicked()
+            featured_primary_button(ui, GAMER_PLAY_LABEL, enabled).clicked()
         }
         RetroArchLaunchDisplay::Starting => {
-            featured_primary_button(ui, "Starting RetroArch…", false);
+            featured_primary_button(ui, "Starting…", false);
             false
         }
         RetroArchLaunchDisplay::Running { .. } => {
-            featured_primary_button(ui, "Play — Launch RetroArch", false);
+            featured_primary_button(ui, GAMER_PLAY_LABEL, false);
             false
         }
     }
@@ -1544,9 +1553,14 @@ pub(crate) fn show_gamer_view(
                                                     },
                                                 ));
                                             }
-                                            ui.weak("Currently mounted.");
                                         }
                                         GamerReadiness::Ready { request } => {
+                                            // Integration: keep the live-launch
+                                            // executor helper (934c9ec) - it renders
+                                            // running/closed/error state and drives
+                                            // real spawning - and take the beginner
+                                            // "Play" label from 1c825e7 (applied
+                                            // inside `featured_retroarch_launch_action`).
                                             if featured_retroarch_launch_action(
                                                 ui,
                                                 retroarch_launch_state,
@@ -1558,17 +1572,16 @@ pub(crate) fn show_gamer_view(
                                                     (*request).clone(),
                                                 ));
                                             }
+                                            widgets::technical_details(
+                                                ui,
+                                                "gamer-play-executor",
+                                                |ui| {
+                                                    ui.label("Opens with RetroArch.");
+                                                },
+                                            );
                                         }
                                         GamerReadiness::NeedsSetup { reason } => {
-                                            // Plain lead first, then the
-                                            // planner's specific reason, then a
-                                            // real next step. No Play button.
-                                            ui.colored_label(
-                                                ui.visuals().warn_fg_color,
-                                                "EmuWiz found the game, but it cannot safely \
-                                                 launch it yet.",
-                                            );
-                                            ui.label(humanize_play_blocker(reason));
+                                            show_gamer_launch_blocker(ui, reason);
                                             if widgets::action_button(
                                                 ui,
                                                 "Open Emulator Setup",
@@ -1596,7 +1609,13 @@ pub(crate) fn show_gamer_view(
                                         }
                                     }
                                     if let Some(reason) = block_reason {
-                                        ui.weak(reason);
+                                        widgets::technical_details(
+                                            ui,
+                                            "gamer-operation-block",
+                                            |ui| {
+                                                ui.label(reason);
+                                            },
+                                        );
                                     }
 
                                     ui.add_space(theme::SECTION_GAP);
@@ -1636,7 +1655,7 @@ pub(crate) fn show_gamer_view(
                                         let folder =
                                             archive_path.parent().filter(|folder| folder.is_dir());
                                         if let Some(folder) = folder
-                                            && secondary(ui, "Open location").clicked()
+                                            && secondary(ui, gamer_copy_location_label()).clicked()
                                         {
                                             action = Some(GamerViewAction::CopyLocation(
                                                 folder.display().to_string(),
@@ -1709,6 +1728,46 @@ mod game_metadata_enrichment_tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn clipboard_action_is_named_copy_folder_location() {
+        assert_eq!(gamer_copy_location_label(), "Copy folder location");
+        assert_ne!(gamer_copy_location_label(), "Open location");
+
+        let action = GamerViewAction::CopyLocation("/games".to_string());
+        assert!(matches!(action, GamerViewAction::CopyLocation(path) if path == "/games"));
+    }
+
+    #[test]
+    fn mount_free_row_does_not_claim_launch_readiness() {
+        let mount_only = gamer_primary_action(MountState::NotMountable);
+        assert_eq!(gamer_primary_action_short_label(&mount_only), "Game found");
+
+        let refusal = "Can't play yet: executable preflight rejected the selected core";
+        let play_action = launch_readiness_page::GamerPlayAction::Blocked(refusal.to_string());
+        let readiness = gamer_readiness(MountState::NotMountable, &play_action);
+        assert!(matches!(
+            readiness,
+            GamerReadiness::NeedsSetup { reason } if reason == refusal
+        ));
+    }
+
+    #[test]
+    fn raw_launch_refusal_is_collapsed_by_default() {
+        let refusal = "executable preflight rejected /cores/gambatte_libretro.so";
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_gamer_launch_blocker(ui, refusal);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "RetroArch needs setup for this game"
+        ));
+        assert!(rendered_text_contains(&output, "Technical details"));
+        assert!(!rendered_text_contains(&output, refusal));
     }
 
     fn empty_archive_metadata() -> archivefs_core::ArchiveMetadata {

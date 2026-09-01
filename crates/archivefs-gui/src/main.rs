@@ -6274,7 +6274,15 @@ impl ArchiveFsApp {
         ) {
             widgets::card(ui, |ui| {
                 ui.heading("Emulator readiness");
-                ui.label("Only the emulator/profile evidence gathered by Doctor is shown here. A missing row is never treated as installed.");
+                let Some(outcome) = outcome else {
+                    widgets::empty_state(
+                        ui,
+                        "Emulators have not been checked",
+                        "Open Full diagnostics to check the supported emulators on this computer.",
+                        None,
+                    );
+                    return;
+                };
                 let emulators = [
                     "Dolphin",
                     "PCSX2",
@@ -6287,97 +6295,147 @@ impl ArchiveFsApp {
                     "ScummVM",
                     "shadPS4",
                 ];
+                let mut not_found = Vec::new();
                 for name in emulators {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(name).strong());
-                        let matching = outcome.and_then(|result| {
-                            result.scan.findings.iter().find(|finding| {
-                                matches!(
-                                    finding.category,
-                                    DoctorCategory::Emulators | DoctorCategory::EmulatorProfiles
-                                ) && (finding.title.contains(name)
-                                    || finding.explanation.contains(name)
-                                    || finding.evidence.iter().any(|line| line.contains(name)))
-                            })
+                    let matching = outcome.scan.findings.iter().find(|finding| {
+                        matches!(
+                            finding.category,
+                            DoctorCategory::Emulators | DoctorCategory::EmulatorProfiles
+                        ) && (finding.title.contains(name)
+                            || finding.explanation.contains(name)
+                            || finding.evidence.iter().any(|line| line.contains(name)))
+                    });
+                    let installation = outcome.scan.findings.iter().find(|finding| {
+                        finding.category == DoctorCategory::EmulatorProfiles
+                            && finding.title == format!("{name} installation found")
+                    });
+                    if matching.is_none() && name != "RetroArch" {
+                        not_found.push(name);
+                        continue;
+                    }
+                    ui.group(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(name).strong());
+                            match matching {
+                                // Integration (Merge Rule 3): a discovered shadPS4
+                                // is explicitly "Needs setup" - PS4 launch support
+                                // is not claimed, so it never reads "Ready" or the
+                                // generic "Setup incomplete".
+                                Some(finding)
+                                    if name == "shadPS4"
+                                        && finding.title.contains("installation found") =>
+                                {
+                                    widgets::status_badge(
+                                        ui,
+                                        "Needs setup",
+                                        widgets::StatusTone::Pending,
+                                    );
+                                }
+                                Some(finding)
+                                    if finding.title.contains("ready to launch")
+                                        && finding.severity == DoctorSeverity::Info =>
+                                {
+                                    widgets::status_badge(
+                                        ui,
+                                        "Ready",
+                                        widgets::StatusTone::Success,
+                                    );
+                                }
+                                Some(_) => {
+                                    widgets::status_badge(
+                                        ui,
+                                        "Setup incomplete",
+                                        widgets::StatusTone::Warning,
+                                    );
+                                }
+                                None => {
+                                    let (label, tone) =
+                                        retroarch_integration_presentation(retroarch_profiles);
+                                    widgets::status_badge(ui, label, tone);
+                                }
+                            }
                         });
                         match matching {
                             Some(finding)
                                 if name == "shadPS4"
                                     && finding.title.contains("installation found") =>
                             {
-                                widgets::status_badge(
-                                    ui,
-                                    "Needs setup",
-                                    widgets::StatusTone::Pending,
-                                );
-                                ui.weak(
-                                    "shadPS4 was found, but PS4 identity and launch support are not enabled yet.",
+                                // Plain explanation inline; the raw discovery
+                                // path stays under Technical details below.
+                                ui.label(
+                                    "shadPS4 is installed, but PS4 game identity and launch \
+                                     support are not enabled yet.",
                                 );
                             }
                             Some(finding)
                                 if finding.title.contains("ready to launch")
                                     && finding.severity == DoctorSeverity::Info =>
                             {
-                                widgets::status_badge(ui, "Ready", widgets::StatusTone::Success);
-                                ui.weak(finding.explanation.clone());
+                                ui.label("Ready to launch games.");
                             }
                             Some(finding) => {
-                                let label = if finding.severity == DoctorSeverity::Info {
-                                    if finding.category == DoctorCategory::EmulatorProfiles {
-                                        "Profile found"
-                                    } else {
-                                        "Evidence found"
-                                    }
+                                let next_step = if finding.severity == DoctorSeverity::Info {
+                                    "EmuWiz found this emulator, but setup is not complete."
                                 } else {
-                                    "Needs attention"
+                                    "Open Full diagnostics for the recommended next step."
                                 };
-                                widgets::status_badge(ui, label, widgets::StatusTone::Pending);
-                                ui.weak(finding.explanation.clone());
+                                // Integration: 1c825e7's flattened body wins here.
+                                // The PS4 branch's discovered-but-unconfigured
+                                // shadPS4 state is preserved by the dedicated
+                                // `Some(finding) if name == "shadPS4"` arm above
+                                // (rewoven into this structure); a shadPS4 that is
+                                // *not* discovered falls to the beginner-consistent
+                                // "Other supported emulators" list like every other
+                                // undetected emulator (Merge Rule 3).
+                                ui.label(next_step);
                             }
-                            None if name == "RetroArch" => {
-                                let (label, tone) =
-                                    retroarch_integration_presentation(retroarch_profiles);
-                                widgets::status_badge(ui, label, tone);
-                                ui.weak(
-                                    "RetroArch profile discovery is shared with Cheats & Mods.",
-                                );
-                            }
-                            None if name == "shadPS4" => {
-                                widgets::status_badge(
-                                    ui,
-                                    "Needs setup",
-                                    widgets::StatusTone::Pending,
-                                );
-                                ui.weak(
-                                    "No shadPS4 installation was found in the documented local paths.",
-                                );
-                            }
-                            None => {
-                                widgets::status_badge(
-                                    ui,
-                                    "Not checked",
-                                    widgets::StatusTone::Pending,
-                                );
-                                ui.weak(
-                                    "No emulator-specific evidence was returned by the last scan.",
-                                );
-                            }
+                            None => match retroarch_profiles {
+                                RetroArchProfilesState::Scanning { .. } => {
+                                    ui.label("Checking RetroArch setup…");
+                                }
+                                RetroArchProfilesState::Ready(_) => {
+                                    ui.label("See the RetroArch card below for current setup.");
+                                }
+                                _ => {
+                                    ui.label("Try the RetroArch check below.");
+                                }
+                            },
                         }
-                        if let Some(evidence) = outcome.and_then(|result| {
-                            result.scan.findings.iter().find(|finding| {
-                                finding.category == DoctorCategory::EmulatorProfiles
-                                    && finding.title == format!("{name} installation found")
-                            })
-                        }) {
-                            ui.weak("Installation evidence:");
-                            for line in &evidence.evidence {
-                                ui.weak(line.clone());
-                            }
+                        if let Some(finding) = matching {
+                            widgets::technical_details(ui, ("emulator-finding", name), |ui| {
+                                ui.label(&finding.explanation);
+                                if let Some(evidence) = installation {
+                                    ui.label(egui::RichText::new("Installation evidence").strong());
+                                    for line in &evidence.evidence {
+                                        ui.label(line);
+                                    }
+                                }
+                            });
+                        } else if let Some(evidence) = installation {
+                            widgets::technical_details(ui, ("emulator-installation", name), |ui| {
+                                for line in &evidence.evidence {
+                                    ui.label(line);
+                                }
+                            });
                         }
                     });
                 }
-                if outcome.is_none() {
-                    ui.weak("Run Doctor below to collect the current emulator evidence.");
+                if !not_found.is_empty() {
+                    egui::CollapsingHeader::new("Other supported emulators")
+                        .id_salt("emulator-setup-not-found")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for name in not_found {
+                                ui.horizontal(|ui| {
+                                    ui.label(name);
+                                    widgets::status_badge(
+                                        ui,
+                                        "Not found",
+                                        widgets::StatusTone::Pending,
+                                    );
+                                });
+                            }
+                        });
                 }
             });
         }
@@ -6392,7 +6450,7 @@ impl ArchiveFsApp {
     /// expander. Every readiness word comes from
     /// [`retroarch_core_setup::core_folder_readiness`], a pure projection
     /// of the shared discovery state - this method never re-derives core
-    /// availability or launch readiness. "Rescan cores" and the post-pick
+    /// availability or launch readiness. "Check again" and the post-pick
     /// / post-reset refresh all go through the one existing
     /// [`Self::start_retroarch_profile_scan`] lane.
     ///
@@ -6406,7 +6464,9 @@ impl ArchiveFsApp {
         context: &egui::Context,
         focus_retroarch: bool,
     ) {
-        use retroarch_core_setup::{CoreFolderMode, CoreFolderScan, core_folder_readiness};
+        use retroarch_core_setup::{
+            CoreFolderMode, CoreFolderReadinessKind, CoreFolderScan, core_folder_readiness,
+        };
 
         let mode = CoreFolderMode::from_override(self.retroarch_core_directory_override.as_deref());
         let scanning = matches!(
@@ -6440,7 +6500,6 @@ impl ArchiveFsApp {
                 ui.heading("RetroArch");
                 widgets::status_badge(ui, readiness.badge_label, readiness.badge_tone);
             });
-            ui.label(egui::RichText::new(mode.label()).strong());
             if let Some(headline) = readiness.headline {
                 ui.label(egui::RichText::new(headline).strong());
             }
@@ -6448,19 +6507,33 @@ impl ArchiveFsApp {
             if scanning {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Scanning RetroArch cores...");
+                    ui.label("Checking RetroArch support files…");
                 });
             }
             ui.add_space(theme::SECTION_GAP);
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(!scanning, egui::Button::new("Rescan cores"))
+                    .add_enabled(
+                        !scanning,
+                        egui::Button::new(if readiness.kind == CoreFolderReadinessKind::Error {
+                            "Try again"
+                        } else {
+                            "Check again"
+                        }),
+                    )
                     .clicked()
                 {
                     pending = Some(CoreFolderAction::Rescan);
                 }
                 if ui
-                    .add_enabled(!scanning, egui::Button::new("Choose core folder"))
+                    .add_enabled(
+                        !scanning,
+                        egui::Button::new(if readiness.kind == CoreFolderReadinessKind::Error {
+                            "Choose folder"
+                        } else {
+                            "Choose game-support folder"
+                        }),
+                    )
                     .clicked()
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
@@ -6478,7 +6551,7 @@ impl ArchiveFsApp {
                 widgets::banner(
                     ui,
                     "Folder not usable",
-                    "This folder could not be used as a RetroArch core folder. Choose another \
+                    "This folder could not be used for RetroArch game support. Choose another \
                      folder or reset to automatic detection.",
                     widgets::StatusTone::Blocked,
                 );

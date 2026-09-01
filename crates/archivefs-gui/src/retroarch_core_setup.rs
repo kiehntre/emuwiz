@@ -177,10 +177,6 @@ pub(crate) struct CoreFolderReadiness {
     pub(crate) sentence: String,
 }
 
-fn plural(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
-}
-
 /// Pure projection of scan state + active mode into normal-user wording.
 pub(crate) fn core_folder_readiness(
     scan: CoreFolderScan<'_>,
@@ -192,39 +188,31 @@ pub(crate) fn core_folder_readiness(
             badge_label: "Not checked",
             badge_tone: StatusTone::Pending,
             headline: None,
-            sentence: "EmuWiz has not checked which RetroArch cores are available yet.".to_string(),
+            sentence: "EmuWiz has not checked RetroArch's game support yet.".to_string(),
         },
         CoreFolderScan::Scanning => CoreFolderReadiness {
             kind: CoreFolderReadinessKind::Scanning,
             badge_label: "Scanning",
             badge_tone: StatusTone::Active,
             headline: None,
-            sentence: "Scanning RetroArch cores...".to_string(),
+            sentence: "Checking RetroArch support files…".to_string(),
         },
         CoreFolderScan::Failed(_) => CoreFolderReadiness {
             kind: CoreFolderReadinessKind::Error,
             badge_label: "Needs attention",
             badge_tone: StatusTone::Blocked,
-            headline: Some("RetroArch core check could not finish"),
-            sentence: "EmuWiz could not check RetroArch's cores. Open Technical details for the \
-                       exact error."
+            headline: Some("RetroArch could not be checked"),
+            sentence: "Try again. If the check still fails, choose RetroArch's game-support \
+                       folder."
                 .to_string(),
         },
         CoreFolderScan::Ready(discovery) => {
             let inventory = core_inventory(discovery);
             if inventory.usable_cores > 0 {
                 let sentence = if mode.is_custom() {
-                    format!(
-                        "Core folder accepted. EmuWiz found {} usable libretro core{}.",
-                        inventory.usable_cores,
-                        plural(inventory.usable_cores)
-                    )
+                    "The selected game-support folder is ready to use.".to_string()
                 } else {
-                    format!(
-                        "EmuWiz found {} usable libretro core{} in RetroArch's configured folder.",
-                        inventory.usable_cores,
-                        plural(inventory.usable_cores)
-                    )
+                    "RetroArch's game-support files are ready to use.".to_string()
                 };
                 CoreFolderReadiness {
                     kind: CoreFolderReadinessKind::Ready,
@@ -240,10 +228,11 @@ pub(crate) fn core_folder_readiness(
                     kind: CoreFolderReadinessKind::CustomFolderUnavailable,
                     badge_label: "Needs setup",
                     badge_tone: StatusTone::Blocked,
-                    headline: Some("Custom core folder is unavailable"),
-                    sentence: "EmuWiz cannot read the core folder you selected. Choose another \
+                    headline: Some("The selected folder is unavailable"),
+                    sentence:
+                        "EmuWiz cannot read the game-support folder you selected. Choose another \
                                folder or reset to automatic detection."
-                        .to_string(),
+                            .to_string(),
                 }
             } else if mode.is_custom() {
                 CoreFolderReadiness {
@@ -251,7 +240,8 @@ pub(crate) fn core_folder_readiness(
                     badge_label: "Needs setup",
                     badge_tone: StatusTone::Warning,
                     headline: None,
-                    sentence: "No usable libretro cores were found in this folder.".to_string(),
+                    sentence: "No usable RetroArch game-support files were found in this folder."
+                        .to_string(),
                 }
             } else {
                 CoreFolderReadiness {
@@ -259,8 +249,8 @@ pub(crate) fn core_folder_readiness(
                     badge_label: "Needs setup",
                     badge_tone: StatusTone::Warning,
                     headline: None,
-                    sentence: "RetroArch is installed, but EmuWiz cannot find a usable libretro \
-                               core in the folder it is currently using."
+                    sentence: "RetroArch is installed, but EmuWiz cannot find usable game-support \
+                               files in the folder it is currently using."
                         .to_string(),
                 }
             }
@@ -438,7 +428,10 @@ mod tests {
         let mode = CoreFolderMode::Custom(override_dir);
         let readiness = core_folder_readiness(CoreFolderScan::Ready(&discovery), &mode);
         assert_eq!(readiness.kind, CoreFolderReadinessKind::Ready);
-        assert!(readiness.sentence.starts_with("Core folder accepted."));
+        assert_eq!(
+            readiness.sentence,
+            "The selected game-support folder is ready to use."
+        );
     }
 
     #[test]
@@ -456,7 +449,7 @@ mod tests {
         assert!(
             readiness
                 .sentence
-                .contains("No usable libretro cores were found")
+                .contains("No usable RetroArch game-support files were found")
         );
     }
 
@@ -479,7 +472,7 @@ mod tests {
         );
         assert_eq!(
             readiness.headline,
-            Some("Custom core folder is unavailable")
+            Some("The selected folder is unavailable")
         );
     }
 
@@ -487,7 +480,7 @@ mod tests {
     fn scanning_and_not_scanned_and_error_states_have_plain_sentences() {
         let scanning = core_folder_readiness(CoreFolderScan::Scanning, &CoreFolderMode::Automatic);
         assert_eq!(scanning.kind, CoreFolderReadinessKind::Scanning);
-        assert_eq!(scanning.sentence, "Scanning RetroArch cores...");
+        assert_eq!(scanning.sentence, "Checking RetroArch support files…");
 
         let not_scanned =
             core_folder_readiness(CoreFolderScan::NotScanned, &CoreFolderMode::Automatic);
@@ -498,6 +491,13 @@ mod tests {
             &CoreFolderMode::Automatic,
         );
         assert_eq!(failed.kind, CoreFolderReadinessKind::Error);
+        assert_eq!(failed.headline, Some("RetroArch could not be checked"));
+        assert!(failed.sentence.starts_with("Try again."));
+        assert!(
+            failed
+                .sentence
+                .contains("choose RetroArch's game-support folder")
+        );
         // The raw error string is never surfaced in the one-line sentence.
         assert!(!failed.sentence.contains("permission denied"));
     }

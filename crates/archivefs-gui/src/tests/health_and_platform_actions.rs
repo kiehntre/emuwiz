@@ -2377,9 +2377,8 @@ fn the_focused_archive_mount_actions_sit_with_the_bulk_mount_actions() {
 
     let bulk_mount =
         find_exact_text_center(&output, "Mount all").expect("the bulk 'Mount all' action renders");
-    let focused =
-        find_exact_text_center(&output, "Selected game details · /roms/library-row-00.zip")
-            .expect("the selected-game mount / context section renders");
+    let focused = find_exact_text_center(&output, "Selected game")
+        .expect("the selected-game mount / context section renders");
     let filter = find_exact_text_center(&output, "Find and filter")
         .expect("the Find and filter card renders");
 

@@ -93,16 +93,36 @@ pub(crate) fn show_loaded_data(
     }
     if let Some(recent) = recent_scan {
         widgets::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Scan {}", recent.scan.scan_run_id));
-                ui.label(format!("Added {}", recent.scan.archives_added));
-                ui.label(format!("Updated {}", recent.scan.archives_updated));
+            ui.strong("Latest scan");
+            ui.label(format!(
+                "Found {} new game{} and updated {} existing entr{}.",
+                recent.scan.archives_added,
+                if recent.scan.archives_added == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                recent.scan.archives_updated,
+                if recent.scan.archives_updated == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+            ));
+            if recent.scan.errors_count > 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "Some files could not be added. Open Technical details for the count.",
+                );
+            }
+            widgets::technical_details(ui, "recent-scan-details", |ui| {
+                ui.label(format!("Scan ID: {}", recent.scan.scan_run_id));
                 ui.label(format!(
-                    "Skipped {}",
+                    "Skipped: {}",
                     recent.scan.skipped_unsupported_extension
                         + recent.scan.skipped_ambiguous_platform
                 ));
-                ui.label(format!("Errors {}", recent.scan.errors_count));
+                ui.label(format!("Errors: {}", recent.scan.errors_count));
             });
             if recent.truncated {
                 ui.colored_label(
@@ -271,8 +291,8 @@ pub(crate) fn show_loaded_data(
         .unwrap_or(&[]);
     let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
-    let selected_actions = if let Some(path) = selected_archive.as_deref() {
-        egui::CollapsingHeader::new(format!("Selected game details · {}", path.display()))
+    let selected_actions = if selected_archive.is_some() {
+        egui::CollapsingHeader::new("Selected game")
             .id_salt("library_focused_archive_details")
             .default_open(true)
             .show(ui, |ui| {
@@ -1215,7 +1235,7 @@ pub(crate) fn show_loaded_data(
         Some(LibraryTableMessage::EmptyLibrary) => {
             widgets::empty_state(
                 ui,
-                &crate::ui::icons::with_icon(crate::ui::icons::GAMES, "No games yet"),
+                &crate::ui::icons::with_icon(crate::ui::icons::GAMES, "No games found yet"),
                 EMPTY_LIBRARY_MESSAGE,
                 None,
             );
@@ -2269,7 +2289,8 @@ pub(crate) fn show_selection_controls_row(
     });
 }
 
-pub(crate) const EMPTY_LIBRARY_MESSAGE: &str = "Add a source or scan your library to find games.";
+pub(crate) const EMPTY_LIBRARY_MESSAGE: &str =
+    "Choose the folder where your games are stored, then scan to find them.";
 pub(crate) const ZERO_FILTER_RESULTS_MESSAGE: &str =
     "No archives match the current search and filters.";
 

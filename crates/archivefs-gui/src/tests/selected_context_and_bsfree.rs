@@ -2971,9 +2971,9 @@ fn featured_panel_frame(
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::GamerView;
     app.view = MainView::Library;
-    // Real parent directory, because "Open location" is only offered when there
-    // is somewhere to open - testing that it is present needs a path whose
-    // folder exists. No file is created: only the folder is looked at.
+    // Real parent directory, because "Copy folder location" is only offered
+    // when there is a folder to copy. No file is created: only the folder is
+    // looked at.
     let folder = std::env::temp_dir();
     let mut records = Vec::new();
     for index in 0..8 {
@@ -3197,7 +3197,7 @@ fn row_thumbnails_survive_the_featured_panel() {
 #[test]
 fn every_secondary_action_is_still_present() {
     let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
-    for label in ["Mount", "Cheats & Mods", "Details", "Open location"] {
+    for label in ["Mount", "Cheats & Mods", "Details", "Copy folder location"] {
         assert!(
             rendered_text_contains(&output, label),
             "{label} is missing from the featured panel"
@@ -3212,7 +3212,7 @@ fn mount_is_the_first_actionable_widget_in_the_panel() {
     // the reading order.
     let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let mut order = Vec::new();
-    for label in ["Mount", "Cheats & Mods", "Details", "Open location"] {
+    for label in ["Mount", "Cheats & Mods", "Details", "Copy folder location"] {
         let rect =
             text_rect(&output, label).unwrap_or_else(|| panic!("{label} should be rendered"));
         order.push((label, rect.top(), rect.left()));
