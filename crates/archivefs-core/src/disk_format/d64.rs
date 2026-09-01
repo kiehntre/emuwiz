@@ -20,6 +20,8 @@ use super::{
 
 const SECTOR_BYTES: u64 = 256;
 const MAX_D64_OFFSET: u64 = 256 * 1024;
+const D64_35_TRACK_BYTES: u64 = 174_848;
+const D64_35_TRACK_ERROR_BYTES: u64 = 175_531;
 const BAM_TRACK: u8 = 18;
 const BAM_SECTOR: u8 = 0;
 const DIRECTORY_TRACK: u8 = 18;
@@ -37,13 +39,21 @@ fn sectors_on_track(track: u8) -> u8 {
     }
 }
 
-fn sector_count(tracks: u8) -> u16 {
-    (1..=tracks).map(sectors_on_track).map(u16::from).sum()
+fn sector_count(tracks: u8) -> Option<u16> {
+    (1..=tracks)
+        .map(sectors_on_track)
+        .map(u16::from)
+        .try_fold(0_u16, |total, count| total.checked_add(count))
 }
 
-fn offset(track: u8, sector: u8) -> u64 {
-    let before: u16 = (1..track).map(sectors_on_track).map(u16::from).sum();
-    (u64::from(before) + u64::from(sector)) * SECTOR_BYTES
+fn offset(track: u8, sector: u8) -> Option<u64> {
+    let before = (1..track)
+        .map(sectors_on_track)
+        .map(u64::from)
+        .try_fold(0_u64, |total, count| total.checked_add(count))?;
+    before
+        .checked_add(u64::from(sector))?
+        .checked_mul(SECTOR_BYTES)
 }
 
 fn valid_ts(track: u8, sector: u8, tracks: u8) -> bool {
@@ -112,22 +122,28 @@ fn validate(
 ) -> Result<D64Layout, DiskFormatRefusal> {
     let length = reader.len();
     let (tracks, has_error_info_tail) = match length {
-        174_848 => (35, false),
-        175_531 => (35, true),
+        D64_35_TRACK_BYTES => (35, false),
+        D64_35_TRACK_ERROR_BYTES => (35, true),
         _ => {
             return Err(malformed(format!(
                 "unsupported D64 length {length}; supported lengths are 174848 (35-track) or 175531 (35-track with error info)"
             )));
         }
     };
-    let sectors = sector_count(tracks);
-    let sector_data_bytes = u64::from(sectors) * SECTOR_BYTES;
+    let sectors = sector_count(tracks).ok_or_else(|| malformed("D64 sector count overflowed"))?;
+    let sector_data_bytes = u64::from(sectors)
+        .checked_mul(SECTOR_BYTES)
+        .ok_or_else(|| malformed("D64 sector data size overflowed"))?;
     let tail_bytes = if has_error_info_tail {
         u64::from(sectors)
     } else {
         0
     };
-    if sector_data_bytes + tail_bytes != length {
+    if sector_data_bytes
+        .checked_add(tail_bytes)
+        .ok_or_else(|| malformed("D64 total size overflowed"))?
+        != length
+    {
         return Err(malformed(
             "D64 geometry and error-info tail length disagree",
         ));
@@ -283,7 +299,9 @@ fn read_sector(
             "impossible track/sector {track}/{sector}"
         )));
     }
-    reader.read_exact_at(offset(track, sector), SECTOR_BYTES as usize)
+    let offset = offset(track, sector)
+        .ok_or_else(|| malformed("D64 track/sector offset arithmetic overflowed"))?;
+    reader.read_exact_at(offset, SECTOR_BYTES as usize)
 }
 
 fn validate_file_chain(

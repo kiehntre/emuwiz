@@ -546,6 +546,18 @@ fn d64_random_wrong_size_and_other_commodore_extensions_are_not_claimed() {
     assert!(fixture.inspect(&random).refusal.is_some());
     let wrong = fixture.write("library/wrong.d64", &[0; 123]);
     assert!(fixture.inspect(&wrong).refusal.is_some());
+    for (name, length) in [("40-track.d64", 196_608), ("40-track-errors.d64", 197_376)] {
+        let path = fixture.write(name, &vec![0; length]);
+        let evidence = fixture.inspect(&path);
+        assert_eq!(
+            evidence.format, None,
+            "{name} must remain outside the supported scope"
+        );
+        assert!(
+            evidence.refusal.is_some(),
+            "{name} must be refused explicitly"
+        );
+    }
     for extension in ["g64", "d71", "d81"] {
         let path = fixture.write(&format!("library/untouched.{extension}"), &[0; 16]);
         assert_eq!(
