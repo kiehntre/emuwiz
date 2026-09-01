@@ -201,6 +201,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("cdt", ContentKind::TapeImage),
     cf("tap", ContentKind::TapeImage),
     cf("tzx", ContentKind::TapeImage),
+    cf("t64", ContentKind::TapeImage),
     // --- Sinclair-family machine snapshots ---
     // The category is knowable from the extension; the machine family is not,
     // and is confirmed by `crate::zx_spectrum_snapshot` parsing the bytes in
@@ -288,6 +289,14 @@ mod tests {
         assert_eq!(
             content_kind_for_extension("d88"),
             Some(ContentKind::ComputerDisk)
+        );
+    }
+
+    #[test]
+    fn commodore_t64_is_tape_content() {
+        assert_eq!(
+            content_kind_for_extension("t64"),
+            Some(ContentKind::TapeImage)
         );
     }
 

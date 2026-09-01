@@ -355,6 +355,11 @@ pub mod ws_header_evidence;
 /// identity.
 pub mod zx_spectrum_snapshot;
 
+/// Bounded, read-only structural inspection for Commodore TAP and T64
+/// containers. This observes headers and T64 directory metadata only; it
+/// never decodes pulses or extracts member bytes.
+pub mod commodore_tape;
+
 /// Evidence *scope*: whether an observed content fact could ever
 /// discriminate between platforms (Generic/Family/PlatformSpecific) -
 /// deliberately a separate axis from

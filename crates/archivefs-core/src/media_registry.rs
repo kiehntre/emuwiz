@@ -202,6 +202,10 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         kind: ArchiveKind::DirectGameImage,
     },
     MediaFormat {
+        extension: "t64",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
         extension: "tzx",
         kind: ArchiveKind::DirectGameImage,
     },

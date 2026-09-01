@@ -805,6 +805,29 @@ fn structural_format_evidence(
     trusted: &TrustedRoots,
     folder_platform: Option<&str>,
 ) -> Vec<DetectionEvidence> {
+    // Commodore TAP is the one `.tap` format in this phase with a
+    // self-identifying header. Use its machine byte to distinguish C64/VIC-20
+    // from the otherwise shared `.tap` extension; a bare extension remains
+    // weak evidence and ZX TAP is not parsed here.
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("tap"))
+        && let Ok(observation) = crate::commodore_tape::inspect_commodore_tap_file(path, trusted)
+        && let Some(platform) = observation.machine.platform_id()
+    {
+        return vec![DetectionEvidence {
+            source: DetectionSource::Signature,
+            conclusive: true,
+            platform,
+            detail: format!(
+                "valid C64-TAPE-RAW header version {} identifies {} tape media; pulse data was not decoded",
+                observation.version,
+                observation.machine.label()
+            ),
+        }];
+    }
+
     use crate::disk_format::{DiskFormatContext, inspect_disk_format};
 
     if path

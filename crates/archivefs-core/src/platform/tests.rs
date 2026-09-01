@@ -654,6 +654,27 @@ fn a_tap_file_stays_ambiguous_between_the_tape_systems() {
     assert!(names.contains(&"Commodore 64"));
 }
 
+#[test]
+fn valid_commodore_tap_header_disambiguates_the_shared_tap_extension() {
+    let tree = TempTree::new("commodore-tap-structure");
+    let mut tap = Vec::from(&b"C64-TAPE-RAW"[..]);
+    tap.extend([2, 0, 0, 0]);
+    tap.extend(1_u32.to_le_bytes());
+    tap.push(0xaa);
+    let c64 = tree.file("unsorted/c64.tap", &tap);
+    let c64_report =
+        detect_platform_report(&DetectionRequest::new(&c64, tree.path()).inspecting_content());
+    assert_eq!(c64_report.platform, Some("Commodore 64"));
+    assert_eq!(c64_report.confidence, DetectionConfidence::Confirmed);
+
+    tap[13] = 1;
+    let vic20 = tree.file("unsorted/vic20.tap", &tap);
+    let vic20_report =
+        detect_platform_report(&DetectionRequest::new(&vic20, tree.path()).inspecting_content());
+    assert_eq!(vic20_report.platform, Some("VIC-20"));
+    assert_eq!(vic20_report.confidence, DetectionConfidence::Confirmed);
+}
+
 /// Test 21
 #[test]
 fn a_zip_file_never_identifies_a_platform_by_itself() {

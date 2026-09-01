@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::atari7800_header_evidence::{A78_HEADER_BYTES, parse_a78_header};
+use crate::commodore_tape::{
+    COMMODORE_TAP_HEADER_BYTES, CommodoreTapeError, T64_READ_BYTES, inspect_commodore_tap_file,
+    inspect_t64_file, observe_commodore_tap_evidence, observe_t64_evidence,
+};
 use crate::disc_evidence_collector::{
     DiscCollectionRefusal, chd_needs_specialist_optical_backend, open_chd_iso9660,
     open_chd_raw_track, read_bounded_chd_bytes,
@@ -255,6 +259,12 @@ pub enum IdentityKind {
     /// Parsed, checksum/complement-validated SNES internal-header metadata;
     /// exact release identity remains authoritative only via DAT/hash.
     SnesHeader,
+    /// A structurally valid Commodore TAP/T64 container. This is format
+    /// evidence only; it is never a title or release identity.
+    TapeFormat,
+    /// A bounded T64 directory was read. Member names and address ranges are
+    /// descriptive metadata only; member bytes are not extracted or hashed.
+    T64Directory,
     /// The established PC-FX custom disc-identification hash. It is derived
     /// from PC-FX sector/header/boot content, never from a filename.
     PcfxDiscHash,
@@ -291,6 +301,8 @@ impl fmt::Display for IdentityKind {
             Self::NeoGeoCdBootStructure => "Neo Geo CD boot structure",
             Self::NesHeader => "NES header",
             Self::SnesHeader => "SNES header",
+            Self::TapeFormat => "Commodore tape format",
+            Self::T64Directory => "T64 directory",
             Self::PcfxDiscHash => "PC-FX disc hash",
         };
         f.write_str(value)
@@ -329,6 +341,8 @@ pub enum IdentityPlatform {
     GameBoyColor,
     GameBoyAdvance,
     N64,
+    Commodore64,
+    Vic20,
     Xbox,
     Xbox360,
     ScummVM,
@@ -378,6 +392,8 @@ impl IdentityPlatform {
             "game boy color" | "gbc" | "nintendo game boy color" => Self::GameBoyColor,
             "game boy advance" | "gba" | "nintendo game boy advance" => Self::GameBoyAdvance,
             "n64" | "nintendo 64" | "nintendo64" => Self::N64,
+            "commodore 64" | "commodore64" | "c64" => Self::Commodore64,
+            "vic-20" | "vic20" | "commodore vic-20" | "commodore vic20" => Self::Vic20,
             "xbox" | "original xbox" | "microsoft xbox" => Self::Xbox,
             "xbox360" | "xbox 360" | "microsoft xbox 360" => Self::Xbox360,
             "scummvm" | "scumm vm" => Self::ScummVM,
@@ -445,6 +461,8 @@ impl IdentityPlatform {
             Self::GameBoyColor => "Game Boy Color",
             Self::GameBoyAdvance => "Game Boy Advance",
             Self::N64 => "Nintendo 64",
+            Self::Commodore64 => "Commodore 64",
+            Self::Vic20 => "VIC-20",
             Self::Xbox => "Xbox",
             Self::Xbox360 => "Xbox 360",
             Self::ScummVM => "ScummVM",
@@ -826,6 +844,32 @@ fn inspect_game_identity_with_platform_trust(
     ));
     add_filename_candidate(&mut report);
 
+    // Commodore tape formats are handled by their bounded structural
+    // observer. The shared `.tap` extension is not enough to enter this
+    // path: a valid C64-TAPE-RAW header is required, while T64's directory
+    // is inspected without reading or extracting member bytes.
+    if matches!(
+        platform,
+        IdentityPlatform::Commodore64 | IdentityPlatform::Vic20
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "tap" => {
+                inspect_commodore_tap_identity(&mut report, trusted);
+                return report;
+            }
+            "t64" => {
+                inspect_t64_identity(&mut report, trusted);
+                return report;
+            }
+            _ => {}
+        }
+    }
+
     if matches!(
         platform,
         IdentityPlatform::MegaDrive
@@ -988,6 +1032,124 @@ fn inspect_game_identity_with_platform_trust(
         ),
     }
     report
+}
+
+fn inspect_commodore_tap_identity(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    match inspect_commodore_tap_file(&report.archive_path, trusted) {
+        Ok(observation) => {
+            report.bytes_read = COMMODORE_TAP_HEADER_BYTES as u64;
+            report.complete = true;
+            for fact in observe_commodore_tap_evidence(&observation) {
+                if fact.kind != crate::content_evidence::ContentEvidenceKind::TapeFormat {
+                    continue;
+                }
+                report.evidence.push(evidence(
+                    report,
+                    IdentityKind::TapeFormat,
+                    IdentityStatus::Verified,
+                    Some(fact.value),
+                    IdentityConfidence::StructuredMetadata,
+                    &fact.detail,
+                    "commodore_tape::parse_commodore_tap",
+                ));
+            }
+            let platform = observation.machine.platform_id();
+            if platform == Some(report.platform.label()) {
+                report.evidence.push(evidence(
+                    report,
+                    IdentityKind::Platform,
+                    IdentityStatus::Verified,
+                    platform.map(str::to_owned),
+                    IdentityConfidence::StructuredMetadata,
+                    &format!(
+                        "C64-TAPE-RAW machine byte identifies {}; this does not identify a game or release",
+                        observation.machine.label()
+                    ),
+                    "commodore_tape::parse_commodore_tap machine field",
+                ));
+            } else if let Some(platform) = platform {
+                report.evidence.push(evidence(
+                    report,
+                    IdentityKind::Platform,
+                    IdentityStatus::Invalid,
+                    Some(platform.to_string()),
+                    IdentityConfidence::StructuredMetadata,
+                    "the TAP machine field conflicts with the supplied platform context",
+                    "commodore_tape::parse_commodore_tap machine field",
+                ));
+            }
+            if observation.machine.platform_id().is_none() {
+                retain_warning(
+                    report,
+                    "the TAP header identifies C16/Plus4 media, which has no canonical EmuWiz platform entry yet",
+                );
+            }
+        }
+        Err(error) => add_tape_unavailable(report, tape_error_status(&error), &error.to_string()),
+    }
+}
+
+fn inspect_t64_identity(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    match inspect_t64_file(&report.archive_path, trusted) {
+        Ok(observation) => {
+            report.bytes_read = (T64_READ_BYTES as u64).min(
+                std::fs::metadata(&report.archive_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(T64_READ_BYTES as u64),
+            );
+            report.complete = true;
+            for fact in observe_t64_evidence(&observation) {
+                if fact.kind != crate::content_evidence::ContentEvidenceKind::TapeFormat {
+                    continue;
+                }
+                report.evidence.push(evidence(
+                    report,
+                    IdentityKind::TapeFormat,
+                    IdentityStatus::Verified,
+                    Some(fact.value),
+                    IdentityConfidence::StructuredMetadata,
+                    &fact.detail,
+                    "commodore_tape::parse_t64",
+                ));
+            }
+            report.evidence.push(evidence(
+                report,
+                IdentityKind::T64Directory,
+                IdentityStatus::Verified,
+                Some(observation.entries.len().to_string()),
+                IdentityConfidence::StructuredMetadata,
+                "bounded T64 directory metadata is valid; member names and address ranges are descriptive only, and member bytes were not read",
+                "commodore_tape::parse_t64 directory",
+            ));
+        }
+        Err(error) => add_tape_unavailable(report, tape_error_status(&error), &error.to_string()),
+    }
+}
+
+fn tape_error_status(error: &CommodoreTapeError) -> IdentityStatus {
+    match error {
+        CommodoreTapeError::NotRecognized => IdentityStatus::Ambiguous,
+        CommodoreTapeError::ResourceLimit(_) => IdentityStatus::ResourceLimitReached,
+        CommodoreTapeError::Malformed(_)
+        | CommodoreTapeError::Truncated(_)
+        | CommodoreTapeError::ArithmeticOverflow(_)
+        | CommodoreTapeError::Read(_) => IdentityStatus::Invalid,
+    }
+}
+
+fn add_tape_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diagnostic: &str) {
+    let kinds = [IdentityKind::TapeFormat, IdentityKind::T64Directory];
+    for kind in kinds {
+        report.evidence.push(evidence(
+            report,
+            kind,
+            status,
+            None,
+            IdentityConfidence::Unavailable,
+            diagnostic,
+            "commodore tape structural inspection",
+        ));
+    }
 }
 
 pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Option<&'static str> {
@@ -3074,6 +3236,8 @@ fn inspect_iso_source(
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Commodore64
+        | IdentityPlatform::Vic20
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -5997,6 +6161,8 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Commodore64
+        | IdentityPlatform::Vic20
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
@@ -6185,6 +6351,8 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::N64
+        | IdentityPlatform::Commodore64
+        | IdentityPlatform::Vic20
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
@@ -6388,6 +6556,67 @@ mod tests {
         let content_id = content_id.as_bytes();
         pkg[48..48 + content_id.len()].copy_from_slice(content_id);
         pkg
+    }
+
+    fn commodore_tap(machine: u8) -> Vec<u8> {
+        let mut tap = Vec::from(&b"C64-TAPE-RAW"[..]);
+        tap.extend([2, machine, 0, 0]);
+        tap.extend(1_u32.to_le_bytes());
+        tap.push(0xaa);
+        tap
+    }
+
+    fn t64_with_one_entry() -> Vec<u8> {
+        let mut t64 = vec![
+            0_u8;
+            crate::commodore_tape::T64_HEADER_BYTES
+                + crate::commodore_tape::T64_ENTRY_BYTES
+        ];
+        t64[..20].copy_from_slice(b"C64S tape image file");
+        t64[32..34].copy_from_slice(&0x0100_u16.to_le_bytes());
+        t64[34..36].copy_from_slice(&1_u16.to_le_bytes());
+        t64[36..38].copy_from_slice(&1_u16.to_le_bytes());
+        let entry = crate::commodore_tape::T64_HEADER_BYTES;
+        let data_offset = t64.len() as u32;
+        t64[entry] = 1;
+        t64[entry + 2..entry + 4].copy_from_slice(&0x0801_u16.to_le_bytes());
+        t64[entry + 4..entry + 6].copy_from_slice(&0x0802_u16.to_le_bytes());
+        t64[entry + 8..entry + 12].copy_from_slice(&data_offset.to_le_bytes());
+        t64[entry + 16..entry + 20].copy_from_slice(b"GAME");
+        t64.push(0xaa);
+        t64
+    }
+
+    #[test]
+    fn commodore_tape_identity_reports_structure_without_game_identity() {
+        let directory = FixtureDir::new("commodore-tape");
+        let tap = directory.0.join("unhelpful-name.tap");
+        fs::write(&tap, commodore_tap(0)).unwrap();
+        let report = inspect_game_identity(&tap, Some("Commodore 64"));
+        assert_eq!(report.platform, IdentityPlatform::Commodore64);
+        assert_eq!(
+            report.verified_value(IdentityKind::TapeFormat),
+            Some("Commodore TAP")
+        );
+        assert_eq!(report.verified_value(IdentityKind::LooseRomTitle), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|item| item.kind != IdentityKind::LooseRomSha256)
+        );
+    }
+
+    #[test]
+    fn t64_identity_reports_bounded_directory_not_member_title() {
+        let directory = FixtureDir::new("t64");
+        let t64 = directory.0.join("arbitrary-name.t64");
+        fs::write(&t64, t64_with_one_entry()).unwrap();
+        let report = inspect_game_identity(&t64, Some("Commodore 64"));
+        assert_eq!(report.verified_value(IdentityKind::TapeFormat), Some("T64"));
+        assert_eq!(report.verified_value(IdentityKind::T64Directory), Some("1"));
+        assert_eq!(report.verified_value(IdentityKind::LooseRomTitle), None);
+        assert!(report.complete);
     }
 
     #[test]

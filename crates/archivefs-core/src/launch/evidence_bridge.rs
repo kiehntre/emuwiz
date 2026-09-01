@@ -152,6 +152,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::GameBoyColor => Some("Game Boy Color"),
         IdentityPlatform::GameBoyAdvance => Some("Game Boy Advance"),
         IdentityPlatform::N64 => Some("N64"),
+        IdentityPlatform::Commodore64 | IdentityPlatform::Vic20 => None,
         IdentityPlatform::Xbox => Some("Xbox"),
         IdentityPlatform::Xbox360 => Some("Xbox360"),
         IdentityPlatform::ScummVM => Some("ScummVM"),
@@ -377,7 +378,11 @@ fn resolved_identity_for_platform(
         IdentityPlatform::NeoGeoCd => None,
         // These catalogue platforms have no structural identity parser or
         // launch identity kind yet, so they remain deliberately unresolved.
-        IdentityPlatform::WiiU | IdentityPlatform::ThreeDS | IdentityPlatform::Switch => None,
+        IdentityPlatform::WiiU
+        | IdentityPlatform::ThreeDS
+        | IdentityPlatform::Switch
+        | IdentityPlatform::Commodore64
+        | IdentityPlatform::Vic20 => None,
         IdentityPlatform::Other => None,
     }
 }
