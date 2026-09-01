@@ -156,8 +156,11 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         },
         // Every other platform either resolves its identity a different
         // way (hash/DAT-driven) or does not gate launch on a per-game
-        // fact. Reporting a "missing" fact there would be noise.
-        IdentityPlatform::Saturn
+        // fact. Reporting a "missing" fact there would be noise. PS4
+        // identity (bounded PARAM.SFO) exists, but PS4 launch is a later
+        // phase, so there is no launch-gating fact to report against yet.
+        IdentityPlatform::PlayStation4
+        | IdentityPlatform::Saturn
         | IdentityPlatform::SegaCd
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes

@@ -1681,17 +1681,19 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Sony PlayStation 4",
         folder_aliases: &["ps4", "playstation4", "sonyplaystation4"],
         filename_aliases: &[],
-        // PS4 packages and extracted game directories are not identity
-        // evidence on their own. Keep `.pkg` as a shared candidate only;
-        // PS4-specific identity and layout validation are intentionally
-        // deferred until a bounded PARAM.SFO/EBOOT contract is established.
+        // A `.pkg` file alone is still only a shared candidate: a retail
+        // PS4 package is encrypted, so no trustworthy identity is read from
+        // it. Bounded PS4 identity now comes from an *extracted* game
+        // directory's `sce_sys/param.sfo` with a CUSA-family TITLE_ID (see
+        // `crate::ps4_layout_evidence` / `crate::game_identity`). Launch
+        // support is still deferred.
         strong_extensions: &[],
         weak_extensions: &["pkg"],
         magic: &[],
         layout: &[],
         conflicts_with: &["PS3"],
         preferred_emulator: None,
-        explanation: "PS4 is recognised conservatively from explicit PS4 folder names or as a shared package candidate. PARAM.SFO identity, extracted-layout validation, and launch support are not yet claimed.",
+        explanation: "PS4 is recognised from explicit PS4 folder names, a shared `.pkg` candidate, or a bounded `sce_sys/param.sfo` (CUSA-family TITLE_ID) in an extracted game directory. Encrypted `.pkg` identity and launch support are not yet claimed.",
     },
     Platform {
         id: "PSP",

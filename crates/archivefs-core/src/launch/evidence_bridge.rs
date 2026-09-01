@@ -75,6 +75,10 @@ pub(crate) fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::Ps2Serial
             | IdentityKind::PspDiscId
             | IdentityKind::Ps3TitleId
+            // PS4 title/content IDs are verified identity in the report, but
+            // are intentionally not wired into the launch identity bridge
+            // yet - that is PS4 Launch Phase 2. Adding them here now would
+            // imply a launch path that does not exist.
             | IdentityKind::SaturnProductNumber
             | IdentityKind::DreamcastProductCode
             | IdentityKind::SegaCdProductCode
@@ -173,8 +177,10 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
         // Modern Nintendo platforms are catalogue foundations only; no
-        // launch identity kind exists for them yet.
-        IdentityPlatform::WiiU
+        // launch identity kind exists for them yet. PS4 has bounded
+        // PARAM.SFO identity but no launch support in this phase.
+        IdentityPlatform::PlayStation4
+        | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
         | IdentityPlatform::Other => None,
@@ -380,7 +386,12 @@ fn resolved_identity_for_platform(
         IdentityPlatform::NeoGeoCd => None,
         // These catalogue platforms have no structural identity parser or
         // launch identity kind yet, so they remain deliberately unresolved.
-        IdentityPlatform::WiiU
+        // PS4 does have a structural identity parser (bounded PARAM.SFO),
+        // but no launch bridge in this phase - `launch_platform_id`
+        // already returned `None` above, so this arm is only for
+        // exhaustiveness.
+        IdentityPlatform::PlayStation4
+        | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
         | IdentityPlatform::Commodore64

@@ -206,6 +206,18 @@ pub enum IdentityKind {
     Ps2Serial,
     PspDiscId,
     Ps3TitleId,
+    /// A verified PlayStation 4 title ID in the `CUSA` application-ID
+    /// family, read from a bounded `sce_sys/param.sfo` in an extracted PS4
+    /// game directory. Never derived from a `.pkg` extension, a filename,
+    /// or a PS3/Vita SFO. Distinct from [`Self::Ps3TitleId`] - the two
+    /// platforms are never conflated.
+    Ps4TitleId,
+    /// A verified PlayStation 4 Content ID
+    /// (`<label><dist>-<title-id>_<type>-<label>`), kept separate from
+    /// [`Self::Ps4TitleId`]: it embeds a title-ID component but is its own
+    /// distinct fact, and disagreement between the two is surfaced rather
+    /// than silently resolved.
+    Ps4ContentId,
     SaturnProductNumber,
     DreamcastProductCode,
     SegaCdProductCode,
@@ -278,6 +290,8 @@ impl fmt::Display for IdentityKind {
             Self::Ps2Serial => "PS2 serial",
             Self::PspDiscId => "PSP disc ID",
             Self::Ps3TitleId => "PS3 title ID",
+            Self::Ps4TitleId => "PS4 title ID",
+            Self::Ps4ContentId => "PS4 Content ID",
             Self::SaturnProductNumber => "Saturn product number",
             Self::DreamcastProductCode => "Dreamcast product code",
             Self::SegaCdProductCode => "Sega CD product code",
@@ -326,6 +340,7 @@ pub enum IdentityPlatform {
     PlayStation2,
     Psp,
     PlayStation3,
+    PlayStation4,
     Saturn,
     Dreamcast,
     SegaCd,
@@ -372,6 +387,7 @@ impl IdentityPlatform {
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
             "psp" | "playstation portable" | "sony playstation portable" => Self::Psp,
             "playstation 3" | "playstation3" | "ps3" | "sony playstation 3" => Self::PlayStation3,
+            "playstation 4" | "playstation4" | "ps4" | "sony playstation 4" => Self::PlayStation4,
             "saturn" | "sega saturn" | "sega saturn console" => Self::Saturn,
             "dreamcast" | "sega dreamcast" => Self::Dreamcast,
             "sega cd" | "sega-cd" | "segacd" | "mega cd" | "mega-cd" | "megacd" => Self::SegaCd,
@@ -448,6 +464,7 @@ impl IdentityPlatform {
             Self::PlayStation2 => "PlayStation 2",
             Self::Psp => "PlayStation Portable",
             Self::PlayStation3 => "PlayStation 3",
+            Self::PlayStation4 => "PlayStation 4",
             Self::Saturn => "Sega Saturn",
             Self::Dreamcast => "Sega Dreamcast",
             Self::SegaCd => "Sega Mega-CD / Sega CD",
@@ -664,6 +681,17 @@ impl GameIdentityReport {
 
     pub fn verified_ps3_title_id(&self) -> Option<&str> {
         self.verified_value(IdentityKind::Ps3TitleId)
+    }
+
+    /// The verified PS4 `CUSA`-family title ID, from a bounded
+    /// `sce_sys/param.sfo` in an extracted PS4 game directory.
+    pub fn verified_ps4_title_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::Ps4TitleId)
+    }
+
+    /// The verified PS4 Content ID, kept separate from the title ID.
+    pub fn verified_ps4_content_id(&self) -> Option<&str> {
+        self.verified_value(IdentityKind::Ps4ContentId)
     }
 
     pub fn verified_pcfx_disc_hash(&self) -> Option<&str> {
@@ -937,6 +965,31 @@ fn inspect_game_identity_with_platform_trust(
             .is_some_and(|value| value.eq_ignore_ascii_case("pkg"))
     {
         inspect_direct_pkg(&mut report, trusted);
+        return report;
+    }
+
+    if platform == IdentityPlatform::PlayStation4
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    {
+        inspect_ps4_directory_identity(&mut report);
+        return report;
+    }
+
+    if platform == IdentityPlatform::PlayStation4
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("pkg"))
+    {
+        // A PS4 retail `.pkg` is encrypted; a trustworthy TITLE_ID cannot be
+        // read without decryption support this build deliberately does not
+        // have. The `.pkg` extension alone never becomes PS4 identity.
+        add_unavailable(
+            &mut report,
+            IdentityStatus::Unsupported,
+            "PS4 .pkg identity needs package decryption this build does not perform; \
+             extract the game so sce_sys/param.sfo is readable",
+        );
         return report;
     }
 
@@ -3108,6 +3161,195 @@ fn ps3_directory_paths_are_regular(root: &Path) -> bool {
         })
 }
 
+/// Bounded, symlink-safe check that a candidate PS4 game directory exposes
+/// exactly `sce_sys/` (a directory) and `sce_sys/param.sfo` (a file) with
+/// no symlink anywhere on the path from `root` down. Mirrors
+/// [`ps3_directory_paths_are_regular`]; it never crawls the rest of the
+/// directory.
+fn ps4_directory_paths_are_regular(root: &Path) -> bool {
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return false;
+    }
+    let sce_sys = root.join(crate::ps4_layout_evidence::PS4_SCE_SYS_DIR);
+    let param_sfo = root.join(crate::ps4_layout_evidence::PS4_PARAM_SFO_RELATIVE_PATH);
+    let mut component_path = PathBuf::new();
+    let components_safe = root.components().all(|component| {
+        component_path.push(component.as_os_str());
+        std::fs::symlink_metadata(&component_path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+    });
+    if !components_safe {
+        return false;
+    }
+    let root_ok = std::fs::symlink_metadata(root)
+        .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
+    let sce_sys_ok = std::fs::symlink_metadata(&sce_sys)
+        .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
+    let param_sfo_ok = std::fs::symlink_metadata(&param_sfo)
+        .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file());
+    root_ok && sce_sys_ok && param_sfo_ok
+}
+
+/// Authoritative PS4 identity from an *extracted* PS4 game directory.
+///
+/// The contract is deliberately strict and mirrors the PS3 folder path:
+/// the `sce_sys/param.sfo` layout must be present, the bounded PARAM.SFO
+/// must parse, and its `TITLE_ID` must be a valid `CUSA`-family id. When a
+/// `CONTENT_ID` is also present its embedded title ID must agree with
+/// `TITLE_ID`, or the result is `Ambiguous` (never silently resolved).
+///
+/// No decryption, no PKG parsing, no executable inspection, no recursive
+/// crawl. Descriptive `TITLE` / `APP_VER` / `VERSION` / `CATEGORY` metadata
+/// is retained as report warnings, never as verified identity.
+fn inspect_ps4_directory_identity(report: &mut GameIdentityReport) {
+    use crate::ps4_layout_evidence::{
+        Ps4LayoutObservation, Ps4TitleIdAgreement, normalize_ps4_title_id, parse_ps4_content_id,
+        title_id_agreement,
+    };
+
+    // `report.format` is left at its default (`Unsupported`): an extracted
+    // game directory is not one of the recognised image container formats,
+    // exactly as the PS3 folder path leaves it. Adding an enum variant
+    // here would force an unrelated GUI match update.
+    let root = report.archive_path.clone();
+    if !ps4_directory_paths_are_regular(&root) {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "PS4 directory is missing sce_sys/param.sfo, or a path component is a symlink",
+        );
+        return;
+    }
+
+    let param_sfo_path = root.join(crate::ps4_layout_evidence::PS4_PARAM_SFO_RELATIVE_PATH);
+    let sfo_len = match std::fs::symlink_metadata(&param_sfo_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    if sfo_len > crate::param_sfo::MAX_SFO_BYTES as u64 {
+        add_unavailable(
+            report,
+            IdentityStatus::ResourceLimitReached,
+            "sce_sys/param.sfo exceeds the bounded PARAM.SFO size",
+        );
+        return;
+    }
+    report.metadata_paths_inspected += 1;
+    let bytes = match std::fs::read(&param_sfo_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    report.bytes_read = bytes.len() as u64;
+    let Some(parsed) = crate::param_sfo::parse_param_sfo(&bytes) else {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "sce_sys/param.sfo is malformed or exceeds a PARAM.SFO structural bound",
+        );
+        return;
+    };
+
+    let observation = Ps4LayoutObservation {
+        sce_sys_dir_present: true,
+        param_sfo_present: true,
+        param_sfo: Some(parsed),
+    };
+
+    let Some(raw_title_id) = observation.raw_title_id() else {
+        add_unavailable(
+            report,
+            IdentityStatus::Missing,
+            "sce_sys/param.sfo has no TITLE_ID",
+        );
+        return;
+    };
+    let Some(title_id) = normalize_ps4_title_id(raw_title_id) else {
+        add_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "TITLE_ID is not a PS4 CUSA-family identifier (a PS3 or PS Vita SFO is not PS4)",
+        );
+        return;
+    };
+
+    let parsed_content_id = observation.raw_content_id().and_then(parse_ps4_content_id);
+    if let Ps4TitleIdAgreement::Disagrees {
+        param_sfo_title_id,
+        content_id_title_id,
+    } = title_id_agreement(&title_id, parsed_content_id.as_ref())
+    {
+        push_with_source(
+            report,
+            IdentityKind::Ps4TitleId,
+            IdentityStatus::Ambiguous,
+            None,
+            IdentityConfidence::Unavailable,
+            None,
+            None,
+            "sce_sys/param.sfo TITLE_ID vs CONTENT_ID",
+            &format!(
+                "PARAM.SFO TITLE_ID {param_sfo_title_id} disagrees with the CONTENT_ID title \
+                 component {content_id_title_id}; identity is not resolved"
+            ),
+        );
+        return;
+    }
+
+    // Descriptive metadata: retained as warnings, never as verified identity.
+    for (label, value) in [
+        ("TITLE", observation.title()),
+        ("APP_VER", observation.app_version()),
+        ("VERSION", observation.version()),
+        ("CATEGORY", observation.category()),
+    ] {
+        if let Some(value) = value {
+            report
+                .warnings
+                .push(format!("PS4 PARAM.SFO {label}: {value}"));
+        }
+    }
+
+    push_with_source(
+        report,
+        IdentityKind::Ps4TitleId,
+        IdentityStatus::Verified,
+        Some(title_id),
+        IdentityConfidence::StructuredMetadata,
+        None,
+        None,
+        "sce_sys/param.sfo TITLE_ID (CUSA family) in an extracted PS4 game directory",
+        "verified from bounded PS4 folder PARAM.SFO; package decryption, installation, and exact \
+         release identity remain uninspected",
+    );
+    if let Some(content_id) = parsed_content_id {
+        push_with_source(
+            report,
+            IdentityKind::Ps4ContentId,
+            IdentityStatus::Verified,
+            Some(content_id.raw),
+            IdentityConfidence::StructuredMetadata,
+            None,
+            None,
+            "sce_sys/param.sfo CONTENT_ID",
+            "verified from bounded PS4 folder PARAM.SFO; a separate fact from TITLE_ID",
+        );
+    }
+    report.complete = true;
+}
+
 /// Inspects a direct `.pbp` using the existing bounded PBP container parser.
 /// The complete file is never required: the fixed header and the beginning of
 /// the declared sections are read through the normal 64 MiB identity bound.
@@ -3235,7 +3477,11 @@ fn inspect_iso_source(
         IdentityPlatform::PlayStation2 => {
             inspect_ps2_iso(report, source, member_path, member_index)
         }
-        IdentityPlatform::MegaDrive
+        // PS4 identity is folder-only (sce_sys/param.sfo); PS4 has no ISO
+        // disc path, so an ISO byte source for a PS4-assigned file yields
+        // nothing here.
+        IdentityPlatform::PlayStation4
+        | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
         | IdentityPlatform::GameBoy
@@ -6140,6 +6386,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         }
         IdentityPlatform::Psp => &[IdentityKind::PspDiscId],
         IdentityPlatform::PlayStation3 => &[IdentityKind::Ps3TitleId],
+        IdentityPlatform::PlayStation4 => &[IdentityKind::Ps4TitleId, IdentityKind::Ps4ContentId],
         IdentityPlatform::Saturn => &[IdentityKind::SaturnProductNumber],
         IdentityPlatform::Dreamcast => &[IdentityKind::DreamcastProductCode],
         IdentityPlatform::SegaCd => &[IdentityKind::SegaCdProductCode],
@@ -6352,6 +6599,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::Dreamcast
         | IdentityPlatform::SegaCd
         | IdentityPlatform::PlayStation3
+        | IdentityPlatform::PlayStation4
         | IdentityPlatform::MegaDrive
         | IdentityPlatform::Snes
         | IdentityPlatform::Nes
@@ -6753,6 +7001,302 @@ mod tests {
             inspect_game_identity(&directory.0, Some("PS3")).verified_ps3_title_id(),
             None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // PS4 identity (bounded sce_sys/param.sfo, CUSA-family TITLE_ID)
+    // ------------------------------------------------------------------
+
+    /// Builds a structurally valid PARAM.SFO from `(key, value)` text pairs,
+    /// mirroring the layout `crate::param_sfo` documents and parses.
+    fn ps4_sfo(pairs: &[(&str, &str)]) -> Vec<u8> {
+        const HEADER: usize = 20;
+        const ENTRY: usize = 16;
+        let index_len = pairs.len() * ENTRY;
+        let key_table_start = HEADER + index_len;
+
+        let mut key_table: Vec<u8> = Vec::new();
+        let mut key_offsets: Vec<u16> = Vec::new();
+        for (key, _) in pairs {
+            key_offsets.push(key_table.len() as u16);
+            key_table.extend_from_slice(key.as_bytes());
+            key_table.push(0);
+        }
+        while !key_table.len().is_multiple_of(4) {
+            key_table.push(0);
+        }
+        let data_table_start = key_table_start + key_table.len();
+
+        let mut data_table: Vec<u8> = Vec::new();
+        let mut data_offsets: Vec<u32> = Vec::new();
+        let mut data_lens: Vec<u32> = Vec::new();
+        for (_, value) in pairs {
+            data_offsets.push(data_table.len() as u32);
+            let mut raw = value.as_bytes().to_vec();
+            raw.push(0); // FORMAT_UTF8 (0x0204) is null-terminated
+            data_lens.push(raw.len() as u32);
+            data_table.extend_from_slice(&raw);
+        }
+
+        let mut out = vec![0u8; HEADER];
+        out[0..4].copy_from_slice(&[0x00, b'P', b'S', b'F']);
+        out[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&(key_table_start as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&(data_table_start as u32).to_le_bytes());
+        out[16..20].copy_from_slice(&(pairs.len() as u32).to_le_bytes());
+        for index in 0..pairs.len() {
+            let mut entry = [0u8; ENTRY];
+            entry[0..2].copy_from_slice(&key_offsets[index].to_le_bytes());
+            entry[2..4].copy_from_slice(&0x0204_u16.to_le_bytes());
+            entry[4..8].copy_from_slice(&data_lens[index].to_le_bytes());
+            entry[8..12].copy_from_slice(&data_lens[index].to_le_bytes());
+            entry[12..16].copy_from_slice(&data_offsets[index].to_le_bytes());
+            out.extend_from_slice(&entry);
+        }
+        out.extend_from_slice(&key_table);
+        out.extend_from_slice(&data_table);
+        out
+    }
+
+    /// Writes `sce_sys/param.sfo` (only) under `root`.
+    fn ps4_folder(root: &Path, sfo_bytes: &[u8]) {
+        let sce_sys = root.join("sce_sys");
+        fs::create_dir_all(&sce_sys).unwrap();
+        fs::write(sce_sys.join("param.sfo"), sfo_bytes).unwrap();
+    }
+
+    #[test]
+    fn ps4_folder_resolves_cusa_title_and_content_id() {
+        let directory = FixtureDir::new("ps4-ok");
+        ps4_folder(
+            &directory.0,
+            &ps4_sfo(&[
+                ("TITLE_ID", "CUSA00001"),
+                ("CONTENT_ID", "UP0001-CUSA00001_00-LABEL00000000000"),
+                ("TITLE", "Example PS4 Game"),
+                ("APP_VER", "01.02"),
+                ("VERSION", "01.00"),
+                ("CATEGORY", "gd"),
+            ]),
+        );
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.platform, IdentityPlatform::PlayStation4);
+        assert_eq!(report.verified_ps4_title_id(), Some("CUSA00001"));
+        assert_eq!(
+            report.verified_ps4_content_id(),
+            Some("UP0001-CUSA00001_00-LABEL00000000000")
+        );
+        assert!(report.complete);
+        // Descriptive metadata retained, but only as warnings.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == "PS4 PARAM.SFO TITLE: Example PS4 Game")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == "PS4 PARAM.SFO APP_VER: 01.02")
+        );
+        // Phase 1 is identity only: the report carries verified PS4
+        // identity, but the launch bridge deliberately does not resolve a
+        // launchable canonical identity or emit any VerifiedIdentityFact
+        // for PS4 yet (there is no PS4 launch platform id or fact variant -
+        // that is Phase 2). It must not conflict, either.
+        let (status, facts) =
+            crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+        assert!(matches!(
+            status,
+            crate::launch::planning::CanonicalIdentityStatus::Unknown
+        ));
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn ps4_folder_without_content_id_still_resolves_title_id() {
+        let directory = FixtureDir::new("ps4-no-content-id");
+        ps4_folder(&directory.0, &ps4_sfo(&[("TITLE_ID", "CUSA12345")]));
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), Some("CUSA12345"));
+        assert_eq!(report.verified_ps4_content_id(), None);
+    }
+
+    #[test]
+    fn ps4_folder_missing_param_sfo_is_refused() {
+        let directory = FixtureDir::new("ps4-missing-sfo");
+        fs::create_dir_all(directory.0.join("sce_sys")).unwrap();
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.kind == IdentityKind::Ps4TitleId
+                    && item.status == IdentityStatus::Invalid)
+        );
+    }
+
+    #[test]
+    fn ps4_folder_rejects_ps3_style_title_id() {
+        let directory = FixtureDir::new("ps4-ps3-titleid");
+        ps4_folder(&directory.0, &ps4_sfo(&[("TITLE_ID", "BLUS30000")]));
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::Ps4TitleId && item.status == IdentityStatus::Invalid
+        }));
+    }
+
+    #[test]
+    fn ps4_folder_surfaces_content_id_title_disagreement_as_ambiguous() {
+        let directory = FixtureDir::new("ps4-disagree");
+        ps4_folder(
+            &directory.0,
+            &ps4_sfo(&[
+                ("TITLE_ID", "CUSA00001"),
+                ("CONTENT_ID", "UP0001-CUSA99999_00-LABEL00000000000"),
+            ]),
+        );
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+        let fact = report
+            .evidence
+            .iter()
+            .find(|item| item.kind == IdentityKind::Ps4TitleId)
+            .unwrap();
+        assert_eq!(fact.status, IdentityStatus::Ambiguous);
+        assert!(fact.diagnostic.contains("CUSA00001"));
+        assert!(fact.diagnostic.contains("CUSA99999"));
+    }
+
+    #[test]
+    fn ps4_folder_rejects_malformed_and_truncated_sfo() {
+        let directory = FixtureDir::new("ps4-malformed");
+        ps4_folder(&directory.0, b"\0PSFnot a real sfo body at all");
+        assert_eq!(
+            inspect_game_identity(&directory.0, Some("PS4")).verified_ps4_title_id(),
+            None
+        );
+
+        let truncated = FixtureDir::new("ps4-truncated");
+        let mut bytes = ps4_sfo(&[("TITLE_ID", "CUSA00001")]);
+        bytes.truncate(12);
+        ps4_folder(&truncated.0, &bytes);
+        assert_eq!(
+            inspect_game_identity(&truncated.0, Some("PS4")).verified_ps4_title_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn ps4_folder_rejects_excessive_entry_count() {
+        let directory = FixtureDir::new("ps4-entry-count");
+        let mut bytes = ps4_sfo(&[("TITLE_ID", "CUSA00001")]);
+        // Overwrite tables_entries with a value beyond MAX_SFO_ENTRIES.
+        bytes[16..20].copy_from_slice(&(crate::param_sfo::MAX_SFO_ENTRIES + 1).to_le_bytes());
+        ps4_folder(&directory.0, &bytes);
+        assert_eq!(
+            inspect_game_identity(&directory.0, Some("PS4")).verified_ps4_title_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn ps4_folder_rejects_invalid_offsets_and_oversized_value() {
+        // data_table_start pointed past the end of the file.
+        let bad_offset = FixtureDir::new("ps4-bad-offset");
+        let mut bytes = ps4_sfo(&[("TITLE_ID", "CUSA00001")]);
+        bytes[12..16].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+        ps4_folder(&bad_offset.0, &bytes);
+        assert_eq!(
+            inspect_game_identity(&bad_offset.0, Some("PS4")).verified_ps4_title_id(),
+            None
+        );
+
+        // A single value length beyond MAX_SFO_VALUE_BYTES.
+        let oversized = FixtureDir::new("ps4-oversized-value");
+        let mut bytes = ps4_sfo(&[("TITLE_ID", "CUSA00001")]);
+        bytes[24..28].copy_from_slice(&(crate::param_sfo::MAX_SFO_VALUE_BYTES + 1).to_le_bytes());
+        ps4_folder(&oversized.0, &bytes);
+        assert_eq!(
+            inspect_game_identity(&oversized.0, Some("PS4")).verified_ps4_title_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn ps4_folder_rejects_oversized_param_sfo_file() {
+        let directory = FixtureDir::new("ps4-oversized-file");
+        let mut bytes = ps4_sfo(&[("TITLE_ID", "CUSA00001")]);
+        bytes.resize(crate::param_sfo::MAX_SFO_BYTES + 1, 0);
+        ps4_folder(&directory.0, &bytes);
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::Ps4TitleId
+                && item.status == IdentityStatus::ResourceLimitReached
+        }));
+    }
+
+    #[test]
+    fn ps4_folder_rejects_symlinked_param_sfo() {
+        use std::os::unix::fs::symlink;
+        let directory = FixtureDir::new("ps4-symlink");
+        let outside = FixtureDir::new("ps4-outside");
+        ps4_folder(&outside.0, &ps4_sfo(&[("TITLE_ID", "CUSA00001")]));
+        fs::create_dir(directory.0.join("sce_sys")).unwrap();
+        symlink(
+            outside.0.join("sce_sys").join("param.sfo"),
+            directory.0.join("sce_sys").join("param.sfo"),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_game_identity(&directory.0, Some("PS4")).verified_ps4_title_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn ps4_pkg_extension_alone_does_not_produce_ps4_identity() {
+        let directory = FixtureDir::new("ps4-pkg");
+        let pkg_path = directory.0.join("Some PS4 Game.pkg");
+        fs::write(&pkg_path, ps3_pkg("UP0001-CUSA00001_00-0000000000000000")).unwrap();
+        let report = inspect_game_identity(&pkg_path, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+        assert_eq!(report.verified_ps4_content_id(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::Ps4TitleId && item.status == IdentityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn ps3_folder_is_never_seen_as_ps4() {
+        let directory = FixtureDir::new("ps3-not-ps4");
+        ps3_folder(&directory.0, "BLUS30000", true);
+        // Even asked as PS4, a PS3_GAME layout has no sce_sys/param.sfo.
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+        assert!(report.evidence.iter().any(|item| {
+            item.kind == IdentityKind::Ps4TitleId && item.status == IdentityStatus::Invalid
+        }));
+    }
+
+    #[test]
+    fn ps4_inspection_reads_only_sce_sys_param_sfo_no_recursive_scan() {
+        let directory = FixtureDir::new("ps4-no-crawl");
+        ps4_folder(&directory.0, &ps4_sfo(&[("TITLE_ID", "CUSA00001")]));
+        // A large sibling tree that a recursive crawl would wander into.
+        let deep = directory.0.join("app0").join("nested").join("more");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("huge.bin"), vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let report = inspect_game_identity(&directory.0, Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), Some("CUSA00001"));
+        // Exactly one metadata path (sce_sys/param.sfo) was inspected, and
+        // only its bytes were read.
+        assert_eq!(report.metadata_paths_inspected, 1);
+        assert!(report.bytes_read < crate::param_sfo::MAX_SFO_BYTES as u64);
     }
 
     fn dolphin_fixture(platform: IdentityPlatform, id: &[u8; 6], revision: u8) -> Vec<u8> {

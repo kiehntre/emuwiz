@@ -236,6 +236,10 @@ pub mod psp_pbp_evidence;
 /// SELF magic).
 pub mod ps3_boot_evidence;
 
+/// Pure, read-only PS4 extracted-game layout evidence (`sce_sys/param.sfo`
+/// + a `CUSA`-family `TITLE_ID`). No PKG, no decryption, no launch.
+pub mod ps4_layout_evidence;
+
 /// Pure, read-only Sega Saturn boot-header ("System ID") evidence,
 /// verified against Sega's own official SDK specification.
 pub mod saturn_boot_evidence;
