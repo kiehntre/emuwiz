@@ -34,6 +34,7 @@
 
 pub mod archive;
 pub mod audit;
+pub mod catalogue_selection;
 pub mod classification;
 pub mod dependency;
 pub mod disk_audit;
