@@ -55,8 +55,8 @@ fn every_registered_source_is_listed() {
     let view = fresh("lists-all").view();
     assert_eq!(
         view.rows.len(),
-        9,
-        "all nine registered sources must appear, got {:?}",
+        10,
+        "all ten registered sources must appear, got {:?}",
         view.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
     );
 }
@@ -141,7 +141,7 @@ fn consulted_position_counts_only_enabled_sources_lowest_first() {
         .collect();
     assert_eq!(
         positions,
-        (1..=8).collect::<Vec<_>>(),
+        (1..=9).collect::<Vec<_>>(),
         "positions must stay contiguous over enabled sources"
     );
 }

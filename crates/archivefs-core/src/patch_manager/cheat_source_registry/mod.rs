@@ -6,7 +6,7 @@
 //!
 //! ## Provider counting
 //!
-//! Nine registry entries covering six distinct upstream projects and eight
+//! Ten registry entries covering seven distinct upstream projects and nine
 //! logical data sources:
 //!
 //! - libretro-buildbot-cheats (libretro/libretro-database)
@@ -18,12 +18,13 @@
 //!   (two distinct Dolphin sources sharing the same upstream repository)
 //! - xenia_canary_game_patches (xenia-canary/game-patches)
 //! - bsfree-archive (Andrew Mackrodt's BSFree Archive)
+//! - cheatbase (CheatBase's pinned, browse-only SQLite catalogue)
 //!
 //! The three figures differ for different reasons. `upstream_project` names a
 //! repository, and gamehacking.org accounts for three entries while
-//! dolphin-emu/dolphin accounts for two, so nine entries name only six
+//! dolphin-emu/dolphin accounts for two, so ten entries name seven
 //! repositories between them - that is the number
-//! `the_registry_covers_six_distinct_upstream_projects` derives from the entries
+//! `the_registry_covers_seven_distinct_upstream_projects` derives from the entries
 //! and pins. "Logical data sources" counts the distinct bodies of data rather
 //! than the repositories or the entries; it is an editorial figure with no field
 //! behind it, so nothing asserts it.
@@ -63,6 +64,9 @@ pub struct PlatformParticipation {
 
 use super::bsfree::{BSFREE_PROVIDER_ID, BSFREE_UPSTREAM_PROJECT};
 use super::cheat_sources::trusted_retroarch_cheat_sources;
+use super::cheatbase::{
+    CHEATBASE_CHEAT_COVERAGE_PLATFORM, CHEATBASE_PROVIDER_ID, CHEATBASE_UPSTREAM_PROJECT,
+};
 use super::dolphin_cheat_catalogue::{DOLPHIN_CATALOGUE_PROVIDER_ID, DOLPHIN_CATALOGUE_REPOSITORY};
 use super::dolphin_gecko_provider::{
     DOLPHIN_UPSTREAM_PROVIDER_ID, DOLPHIN_UPSTREAM_PROVIDER_NAME, DOLPHIN_UPSTREAM_REPOSITORY,
@@ -747,6 +751,18 @@ pub fn build_default_registry() -> CheatSourceRegistry {
                 .to_string(),
     }));
 
+    // 10. CheatBase
+    entries.push(CheatSourceEntry::from_spec(CheatSourceSpec {
+        id: CHEATBASE_PROVIDER_ID.to_string(),
+        display_name: "CheatBase".to_string(),
+        emulator: "Nintendo DS / identity reference".to_string(),
+        platforms: vec![CHEATBASE_CHEAT_COVERAGE_PLATFORM.to_string()],
+        capabilities: CheatSourceCapabilities::remote_download_read_only(),
+        upstream_project: CHEATBASE_UPSTREAM_PROJECT.to_string(),
+        default_priority: 110,
+        description: "Pinned, immutable CheatBase SQLite catalogue. Nintendo DS Action Replay records are browse-only; other systems provide identity metadata only. No records are installed or executed".to_string(),
+    }));
+
     CheatSourceRegistry::new(entries)
         .expect("the built-in registry is a fixed list with unique IDs; a duplicate here is a bug")
 }
@@ -814,10 +830,9 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_covers_six_distinct_upstream_projects() {
-        // The module doc gave two different numbers for this - "six" in one
-        // sentence and "Eight" in another. Six is what the registry produces:
-        // three entries share gamehacking.org and two share dolphin-emu/dolphin.
+    fn the_registry_covers_seven_distinct_upstream_projects() {
+        // Three entries share gamehacking.org and two share dolphin-emu/dolphin;
+        // CheatBase adds one independent upstream project.
         // Deriving it from the entries is what stops the prose drifting again.
         let registry = build_default_registry();
         let upstreams: std::collections::BTreeSet<&str> = registry
@@ -827,17 +842,17 @@ mod tests {
             .collect();
         assert_eq!(
             upstreams.len(),
-            6,
-            "expected six distinct upstream projects, got {upstreams:?}"
+            7,
+            "expected seven distinct upstream projects, got {upstreams:?}"
         );
-        // Nine entries over those six repositories.
-        assert_eq!(registry.entries.len(), 9);
+        // Ten entries over those seven repositories.
+        assert_eq!(registry.entries.len(), 10);
     }
 
     #[test]
-    fn default_registry_contains_nine_entries() {
+    fn default_registry_contains_ten_entries() {
         let registry = build_default_registry();
-        assert_eq!(registry.entries.len(), 9);
+        assert_eq!(registry.entries.len(), 10);
     }
 
     #[test]
@@ -850,7 +865,7 @@ mod tests {
             .collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 9);
+        assert_eq!(ids.len(), 10);
     }
 
     #[test]
@@ -865,6 +880,7 @@ mod tests {
         assert!(registry.get("dolphin_upstream_catalogue").is_some());
         assert!(registry.get("xenia_canary_game_patches").is_some());
         assert!(registry.get("bsfree-archive").is_some());
+        assert!(registry.get("cheatbase").is_some());
     }
 
     #[test]
@@ -942,7 +958,7 @@ mod tests {
             ..CheatSourcesConfig::default()
         };
         registry.apply_config(&cfg);
-        assert_eq!(registry.entries.len(), 9);
+        assert_eq!(registry.entries.len(), 10);
     }
 
     #[test]

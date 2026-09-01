@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::CheatProviderSourceState;
 use super::super::bsfree::{BSFREE_PROVIDER_ID, BsFreePaths, inspect_bsfree_source};
+use super::super::cheatbase::{CHEATBASE_PROVIDER_ID, CheatBasePaths, inspect_cheatbase_source};
 use super::super::dolphin_cheat_catalogue::DOLPHIN_CATALOGUE_PROVIDER_ID;
 use super::super::dolphin_gecko_provider::DOLPHIN_UPSTREAM_PROVIDER_ID;
 use super::super::gamehacking_provider::GAMEHACKING_PROVIDER_ID;
@@ -99,6 +100,7 @@ pub fn probe_cheat_source_health(source_id: &str, data_root: &Path) -> Option<Ch
     match source_id {
         id if id == retroarch_id => probe_retroarch_metadata(id, data_root),
         id if id == BSFREE_PROVIDER_ID => probe_bsfree(data_root),
+        id if id == CHEATBASE_PROVIDER_ID => probe_cheatbase(data_root),
         id if id == super::GAMEHACKING_PS2_REGISTRY_ID => {
             probe_gamehacking(data_root, PS2_CATALOGUE_FILE)
         }
@@ -298,6 +300,44 @@ fn probe_bsfree(data_root: &Path) -> Option<CheatSourceHealth> {
         last_error,
         entry_count,
         freshness_seconds,
+    })
+}
+
+/// CheatBase uses the same owned-source lifecycle as the other immutable
+/// SQLite catalogues. Inspection reads only its metadata and validated counts.
+fn probe_cheatbase(data_root: &Path) -> Option<CheatSourceHealth> {
+    let root = data_root.join("cheat-sources").join("cheatbase");
+    let paths = CheatBasePaths::at(root);
+    let status = match inspect_cheatbase_source(&paths) {
+        Ok(status) => status,
+        Err(_) => {
+            return Some(CheatSourceHealth {
+                state: CheatProviderSourceState::Invalid,
+                last_checked_unix_seconds: None,
+                last_error: Some("CheatBase source state is unreadable".to_string()),
+                entry_count: None,
+                freshness_seconds: None,
+            });
+        }
+    };
+    let entry_count = status
+        .validation
+        .as_ref()
+        .map(|validation| validation.counts.cheats);
+    let last_checked = status
+        .validation
+        .as_ref()
+        .map(|validation| validation.result.validated_at_unix_seconds);
+    Some(CheatSourceHealth {
+        state: if status.usable {
+            CheatProviderSourceState::Ready
+        } else {
+            status.state
+        },
+        last_checked_unix_seconds: last_checked,
+        last_error: status.last_error.as_ref().map(ToString::to_string),
+        entry_count,
+        freshness_seconds: last_checked.map(|checked| now_unix().saturating_sub(checked)),
     })
 }
 

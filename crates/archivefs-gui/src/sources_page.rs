@@ -1838,6 +1838,14 @@ pub(super) fn show_bsfree_source_card(
 
 pub(super) fn bsfree_match_label(confidence: ProviderGameMatchConfidence) -> &'static str {
     match confidence {
+        ProviderGameMatchConfidence::ExactHashPlatform => "Exact hash + platform",
+        ProviderGameMatchConfidence::ExactSerialPlatformRegion => {
+            "Exact serial + platform + region"
+        }
+        ProviderGameMatchConfidence::ExactUpstreamRelease => "Exact upstream release",
+        ProviderGameMatchConfidence::ExactTitlePlatformRegionRevision => {
+            "Exact title + platform + region + revision"
+        }
         ProviderGameMatchConfidence::ExactTitlePlatform => "Exact title + platform",
         ProviderGameMatchConfidence::ProbableTitlePlatform => "Probable title + platform",
         ProviderGameMatchConfidence::Ambiguous => "Ambiguous candidates",
