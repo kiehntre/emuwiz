@@ -81,6 +81,7 @@ mod retroarch_materialization;
 mod rpcs3_local;
 mod shared_preview;
 mod shared_transaction;
+mod user_cheat_import;
 mod xemu_local;
 mod xenia_install_plan;
 mod xenia_local;
@@ -621,6 +622,15 @@ pub use shared_transaction::{
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
     require_dolphin_managed_gamehacking_verification,
+};
+pub use user_cheat_import::{
+    USER_CHEAT_MAX_CHEATS_PER_FILE, USER_CHEAT_MAX_DEPTH, USER_CHEAT_MAX_FILE_BYTES,
+    USER_CHEAT_MAX_FILES_VISITED, USER_CHEAT_MAX_PATH_BYTES, USER_CHEAT_MAX_TOTAL_BYTES,
+    USER_CHEAT_MAX_WARNINGS, UserCheatCandidate, UserCheatDiagnostic, UserCheatDiagnosticKind,
+    UserCheatDuplicate, UserCheatEvidence, UserCheatFormat, UserCheatImportError,
+    UserCheatImportLimits, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatch,
+    UserCheatMatchState, UserCheatProvenance, UserCheatSourceOrigin, scan_user_cheat_directory,
+    scan_user_cheat_directory_with_limits, scan_user_cheat_file, scan_user_cheat_file_with_limits,
 };
 pub use xemu_local::{
     XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,
