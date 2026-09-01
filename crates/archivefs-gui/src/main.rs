@@ -137,6 +137,7 @@ use collection_discovery_page::*;
 mod administration_pages;
 mod cheats_mods_preview;
 use cheats_mods_preview::*;
+mod cheatbase_page;
 mod gamer_platform_shelf;
 use gamer_platform_shelf::*;
 mod gamer_view;
@@ -4403,6 +4404,10 @@ struct ArchiveFsApp {
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
     cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
+    /// The browse-only CheatBase panel embedded in Cheats & Mods. Its setup,
+    /// search, and inspection work is explicit and independent of emulator
+    /// cheat installation workflows.
+    cheatbase_page: cheatbase_page::CheatBasePageState,
     rom_organisation_page: Option<rom_organisation_page::RomOrganisationPageState>,
     /// The Repair Review page, loaded lazily on first visit. Preview-only;
     /// it never applies anything.
@@ -4892,6 +4897,7 @@ impl ArchiveFsApp {
             pending_source_scan_summary: None,
             sources_last_scan: None,
             cheat_sources_page: None,
+            cheatbase_page: cheatbase_page::CheatBasePageState::default(),
             rom_organisation_page: None,
             repair_review_page: None,
             repair_history_page: None,
@@ -17178,6 +17184,7 @@ impl ArchiveFsApp {
         self.poll_flycast_profiles();
         self.poll_pcsx2_firmware_evidence();
         self.poll_cheat_workflow(context);
+        self.cheatbase_page.poll(context);
         if matches!(
             self.view,
             MainView::Sources | MainView::CheatsMods | MainView::CheatSources
@@ -18016,10 +18023,23 @@ impl ArchiveFsApp {
                             workflow.platform.clone().unwrap_or_default(),
                         )
                     });
-                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action) = egui::ScrollArea::vertical()
+                    let cheatbase_seed = self.cheat_workflow.as_ref().map(|workflow| {
+                        cheatbase_page::CheatBaseGameSeed {
+                            title: workflow.display_name.clone(),
+                            platform: workflow.platform.clone(),
+                            region: workflow.region.clone(),
+                        }
+                    });
+                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            let cheatbase_action = cheatbase_page::show_cheatbase_page(
+                                ui,
+                                &mut self.cheatbase_page,
+                                cheatbase_seed,
+                            );
+                            ui.add_space(theme::SECTION_GAP);
                             let dolphin_catalogue_action = dolphin_route.then(|| {
                                 let action = show_dolphin_catalogue_manager(
                                     ui,
@@ -18084,7 +18104,7 @@ impl ArchiveFsApp {
                                     &mut self.clipboard,
                                 )
                             }).flatten();
-                            (action, catalogue_action, dolphin_catalogue_action, bsfree_action)
+                            (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action)
                         })
                         .inner;
                     let picker_rows = live
@@ -18104,6 +18124,9 @@ impl ArchiveFsApp {
                     }
                     if let Some(bsfree_action) = bsfree_action {
                         self.start_bsfree_operation(context.clone(), bsfree_action);
+                    }
+                    if let Some(cheatbase_action) = cheatbase_action {
+                        self.cheatbase_page.handle(cheatbase_action, context.clone());
                     }
                     match action {
                         Some(CheatWorkflowAction::ChooseArchive) => {

@@ -900,8 +900,10 @@ mod tests {
         for version in [CDI_V2, CDI_V3, CDI_V35] {
             let bytes = build_cdi_version(&[vec![(1, 0, 0, 1, 0)]], None, version);
             let file = write_cdi(&bytes);
-            assert!(open_dreamcast_cdi_logical_media(file.path()).is_ok(),
-                "version {version:#x} should parse");
+            assert!(
+                open_dreamcast_cdi_logical_media(file.path()).is_ok(),
+                "version {version:#x} should parse"
+            );
         }
     }
 
@@ -975,9 +977,7 @@ mod tests {
         let header = read_ip_bin(&media);
         let fact = crate::dreamcast_boot_evidence::parse_ip_bin_meta(&header).unwrap();
         assert!(!fact.hardware_id_recognized);
-        assert!(
-            crate::dreamcast_boot_evidence::observe_ip_bin_evidence(&fact).is_empty()
-        );
+        assert!(crate::dreamcast_boot_evidence::observe_ip_bin_evidence(&fact).is_empty());
     }
 
     #[test]
