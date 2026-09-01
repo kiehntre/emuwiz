@@ -1916,68 +1916,32 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         );
         return;
     }
-    let mut entry = match archive.by_index(index) {
+    let entry = match archive.by_index(index) {
         Ok(entry) => entry,
         Err(error) => {
             add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
             return;
         }
     };
-    let read_cap = match report.platform {
-        IdentityPlatform::GameCube | IdentityPlatform::Wii => {
-            member_size.min(DOLPHIN_HEADER_BYTES as u64)
-        }
-        IdentityPlatform::PlayStation
-        | IdentityPlatform::PlayStation2
-        | IdentityPlatform::Psp
-        | IdentityPlatform::PlayStation3
-        | IdentityPlatform::Saturn
-        | IdentityPlatform::Dreamcast
-        | IdentityPlatform::SegaCd
-        | IdentityPlatform::MegaDrive
-        | IdentityPlatform::Snes
-        | IdentityPlatform::Nes
-        | IdentityPlatform::GameBoy
-        | IdentityPlatform::GameBoyColor
-        | IdentityPlatform::GameBoyAdvance
-        | IdentityPlatform::N64
-        | IdentityPlatform::Atari2600
-        | IdentityPlatform::Atari5200
-        | IdentityPlatform::Atari7800
-        | IdentityPlatform::Atari8Bit
-        | IdentityPlatform::AtariLynx
-        | IdentityPlatform::AtariJaguar
-        | IdentityPlatform::AtariST
-        | IdentityPlatform::WiiU
-        | IdentityPlatform::ThreeDS
-        | IdentityPlatform::Switch
-        | IdentityPlatform::Xbox
-        | IdentityPlatform::Xbox360
-        | IdentityPlatform::ScummVM
-        | IdentityPlatform::ThreeDo
-        | IdentityPlatform::Pcfx
-        | IdentityPlatform::PcEngineCd
-        | IdentityPlatform::NeoGeoCd
-        | IdentityPlatform::Ngp
-        | IdentityPlatform::Ngpc
-        | IdentityPlatform::Other => member_size.min(MAX_BYTES_READ),
-    };
-    let mut data = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
-    if let Err(error) = entry.by_ref().take(read_cap).read_to_end(&mut data) {
-        add_unavailable(
-            report,
-            IdentityStatus::Invalid,
-            &format!("could not read ISO member: {error}"),
-        );
-        return;
-    }
-    report.bytes_read = data.len() as u64;
-    let mut source = SliceSource {
-        data: &data,
-        declared_len: member_size,
-        truncated: member_size > data.len() as u64,
+    drop(entry);
+    // ZIP entries are forward-only streams. The old implementation inflated
+    // and retained the first 64 MiB unconditionally before asking the ISO
+    // reader which sectors it actually needed. A selected-game card could
+    // therefore allocate 64 MiB per stale worker even when PS2 identity lived
+    // in a few small metadata sectors near the start of the member.
+    //
+    // Reopen the one preflighted member for each random-access request and
+    // stream only as far as that request. `ZipMemberSource` counts skipped
+    // decompressed bytes against the existing 64 MiB identity budget, so this
+    // removes the large allocation without weakening any archive limit.
+    let mut source = ZipMemberSource {
+        archive,
+        member_index: index,
+        len: member_size,
+        bytes_read: 0,
     };
     inspect_iso_source(report, &mut source, Some(member_path), Some(index));
+    report.bytes_read = source.bytes_read();
 }
 
 fn inspect_direct_xex(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
@@ -5810,6 +5774,60 @@ struct FileSource {
     bytes_read: u64,
 }
 
+/// Random-access facade over one preflighted ZIP member.
+///
+/// A compressed member cannot seek, so each read reopens it and discards the
+/// decompressed prefix up to `offset`. Both discarded and returned bytes count
+/// against [`MAX_BYTES_READ`]. Memory is constant-sized and no call can inflate
+/// an unbounded member merely to answer a bounded identity question.
+struct ZipMemberSource {
+    archive: ZipArchive<File>,
+    member_index: usize,
+    len: u64,
+    bytes_read: u64,
+}
+
+impl ByteSource for ZipMemberSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        let work = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
+        if work > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read exceeds ZIP member",
+            ));
+        }
+        if self.bytes_read.saturating_add(work) > MAX_BYTES_READ {
+            return Err(io::Error::other("64 MiB ZIP member read limit reached"));
+        }
+
+        let mut entry = self
+            .archive
+            .by_index(self.member_index)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let skipped = io::copy(&mut entry.by_ref().take(offset), &mut io::sink())?;
+        self.bytes_read = self.bytes_read.saturating_add(skipped);
+        if skipped != offset {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "ZIP member ended before requested ISO offset",
+            ));
+        }
+        entry.read_exact(buffer)?;
+        self.bytes_read = self.bytes_read.saturating_add(buffer.len() as u64);
+        Ok(())
+    }
+}
+
 impl ByteSource for FileSource {
     fn len(&self) -> u64 {
         self.len
@@ -7013,6 +7031,46 @@ mod tests {
         let report = inspect_game_identity(&path, Some("GameCube"));
         assert_eq!(report.verified_dolphin_game_id(), Some("GALE01"));
         assert_eq!(report.bytes_read, DOLPHIN_HEADER_BYTES as u64);
+        assert_eq!(report.archive_members_inspected, 1);
+        assert_eq!(report.nested_container_depth, 1);
+    }
+
+    #[test]
+    fn ps2_zip_streams_only_requested_iso_ranges_instead_of_inflating_the_member() {
+        let directory = FixtureDir::new("ps2-zip-bounded");
+        let path = directory.0.join("container.zip");
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file(
+                "disc.iso",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )
+            .unwrap();
+        let image = ps2_iso(b"BOOT2 = cdrom0:\\SLUS_123.45;1\r\n", true, None);
+        writer.write_all(&image).unwrap();
+        let padding = vec![0_u8; 1024 * 1024];
+        // Cross the production 64 MiB inspection ceiling without committing
+        // a giant binary fixture. The old implementation decompressed and
+        // allocated that entire ceiling before parsing any ISO metadata.
+        for _ in 0..65 {
+            writer.write_all(&padding).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let report = inspect_catalogued_game_identity(&path, Some("PlayStation 2"));
+
+        assert_eq!(
+            report.verified_value(IdentityKind::Ps2Serial),
+            Some("SLUS-12345")
+        );
+        assert!(report.verified_pcsx2_crc().is_some());
+        assert!(
+            report.bytes_read < 1024 * 1024,
+            "bounded ISO metadata needed under 1 MiB of decompression, not the whole synthetic \
+             member: {} bytes",
+            report.bytes_read
+        );
         assert_eq!(report.archive_members_inspected, 1);
         assert_eq!(report.nested_container_depth, 1);
     }

@@ -195,9 +195,33 @@ pub(crate) struct SelectedEvidenceReport {
     pub game_identity_report: archivefs_core::game_identity::GameIdentityReport,
     pub hashes: Option<LocalHashes>,
     pub no_intro: NoIntroLookupResult,
+    /// State of the deferred whole-file checksum / DAT lookup. Compressed
+    /// archives are deliberately terminally skipped: hashing the outer ZIP,
+    /// 7z, or RAR does not identify its game member and made ordinary
+    /// selection stream multi-gigabyte files for no useful card evidence.
+    pub enrichment: SelectedEvidenceEnrichmentStatus,
     /// Structural + (if matched) direct No-Intro observations, ready to be
     /// merged with a Hasheous result once/if one arrives.
     pub base_observations: Vec<EvidenceObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SelectedEvidenceEnrichmentStatus {
+    Pending,
+    Complete,
+    SkippedArchive,
+    Failed(String),
+}
+
+fn is_compressed_archive(path: &Path) -> bool {
+    matches!(
+        archivefs_core::archive_kind(path),
+        Some(
+            archivefs_core::ArchiveKind::Zip
+                | archivefs_core::ArchiveKind::SevenZip
+                | archivefs_core::ArchiveKind::Rar
+        )
+    )
 }
 
 /// Gathers real evidence for `path`: reads it once, runs the real
@@ -235,19 +259,31 @@ fn read_structural_prefix(path: &Path) -> Result<Vec<u8>, String> {
 /// The fast identity pass the selected-game panel waits on: a bounded
 /// header read, the real structural detectors, and the existing bounded
 /// per-platform [`inspect_catalogued_game_identity`] (loose-ROM hash for a
-/// small cartridge, `SYSTEM.CNF`/boot record for a disc - never a
-/// whole-file hash). It deliberately does **not** compute the whole-file
-/// checksum or resolve the No-Intro DAT registry; both can cost minutes for
-/// a large ISO or a big DAT set and are handled afterwards by
-/// [`compute_selected_evidence_enrichment`] without blocking what the user
-/// sees. `hashes`/`no_intro` are therefore left unset here and filled in
-/// by the enrichment pass via [`apply_selected_evidence_enrichment`].
+/// small cartridge, bounded `SYSTEM.CNF`/boot reads for a disc or ZIP member
+/// without a whole-file hash). It deliberately does **not** compute the
+/// whole-file checksum or resolve the No-Intro DAT registry; both can cost
+/// minutes for a large ISO or a big DAT set. Loose files are enriched later
+/// by [`compute_selected_evidence_enrichment`] without blocking what the user
+/// sees. Compressed archives stay terminally bounded and are not enriched by
+/// hashing the outer container.
 pub(crate) fn gather_selected_evidence_fast(
     path: &Path,
     platform_hint: Option<&str>,
 ) -> Result<SelectedEvidenceReport, String> {
-    let prefix = read_structural_prefix(path)?;
-    let structural_facts = gather_structural_evidence(path, &prefix);
+    let archive = is_compressed_archive(path);
+    let structural_facts = if archive {
+        // Archive extensions do not feed any of this module's loose-ROM
+        // structural detectors. Opening is enough to surface a missing or
+        // unreadable RAR/7z (ZIP is additionally validated by the bounded
+        // core identity inspector below); reading a meaningless 1 MiB outer
+        // prefix would only add selection I/O.
+        std::fs::File::open(path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        Vec::new()
+    } else {
+        let prefix = read_structural_prefix(path)?;
+        gather_structural_evidence(path, &prefix)
+    };
     let explanation = fuse_platform_evidence(structural_facts.clone());
 
     let identity_result = inspect_identity(IdentityInspectionInput {
@@ -271,6 +307,11 @@ pub(crate) fn gather_selected_evidence_fast(
         game_identity_report,
         hashes: None,
         no_intro: NoIntroLookupResult::NotImported,
+        enrichment: if archive {
+            SelectedEvidenceEnrichmentStatus::SkippedArchive
+        } else {
+            SelectedEvidenceEnrichmentStatus::Pending
+        },
         base_observations,
     })
 }
@@ -290,14 +331,23 @@ pub(crate) struct SelectedEvidenceEnrichment {
 /// large disc image) and looks it up against the already-resolved
 /// `no_intro_source`. The caller resolves the No-Intro source off the UI
 /// thread; DAT-registry parsing must not happen on the fast path.
+#[cfg(test)]
 pub(crate) fn compute_selected_evidence_enrichment(
     path: &Path,
     no_intro_source: Option<&ImportedNoIntroSource>,
 ) -> Result<SelectedEvidenceEnrichment, String> {
+    compute_selected_evidence_enrichment_cancellable(path, no_intro_source, None)
+}
+
+pub(crate) fn compute_selected_evidence_enrichment_cancellable(
+    path: &Path,
+    no_intro_source: Option<&ImportedNoIntroSource>,
+    cancel: Option<&AtomicBool>,
+) -> Result<SelectedEvidenceEnrichment, String> {
     let trusted_root = path.parent().unwrap_or(path).to_path_buf();
     let trusted = TrustedRoots::from_paths([trusted_root.as_path()]);
-    let hashes = hash_file(path, &trusted, None)
-        .map_err(|refusal| format!("could not hash {}: {refusal:?}", path.display()))?;
+    let hashes = hash_file(path, &trusted, cancel)
+        .map_err(|refusal| format!("could not hash {}: {}", path.display(), refusal.detail()))?;
     let no_intro = lookup_no_intro_for(no_intro_source, &hashes);
     let extra_observations = match &no_intro {
         NoIntroLookupResult::Matched { observations, .. } => observations.clone(),
@@ -319,9 +369,17 @@ pub(crate) fn apply_selected_evidence_enrichment(
 ) {
     report.hashes = Some(enrichment.hashes);
     report.no_intro = enrichment.no_intro;
+    report.enrichment = SelectedEvidenceEnrichmentStatus::Complete;
     report
         .base_observations
         .extend(enrichment.extra_observations);
+}
+
+pub(crate) fn apply_selected_evidence_enrichment_error(
+    report: &mut SelectedEvidenceReport,
+    message: String,
+) {
+    report.enrichment = SelectedEvidenceEnrichmentStatus::Failed(message);
 }
 
 /// Like [`gather_selected_evidence`], with an exact platform hint from the
@@ -340,7 +398,17 @@ pub(crate) fn gather_selected_evidence_with_platform(
 
     let trusted_root = path.parent().unwrap_or(path).to_path_buf();
     let trusted = TrustedRoots::from_paths([trusted_root.as_path()]);
-    let hashes = hash_file(path, &trusted, None).ok();
+    let (hashes, enrichment) = match hash_file(path, &trusted, None) {
+        Ok(hashes) => (Some(hashes), SelectedEvidenceEnrichmentStatus::Complete),
+        Err(refusal) => (
+            None,
+            SelectedEvidenceEnrichmentStatus::Failed(format!(
+                "could not hash {}: {}",
+                path.display(),
+                refusal.detail()
+            )),
+        ),
+    };
 
     let no_intro = match &hashes {
         Some(hashes) => lookup_no_intro_for(no_intro_source, hashes),
@@ -371,6 +439,7 @@ pub(crate) fn gather_selected_evidence_with_platform(
         game_identity_report,
         hashes,
         no_intro,
+        enrichment,
         base_observations,
     })
 }
@@ -732,6 +801,32 @@ pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenc
             });
         }
     }
+
+    match &report.enrichment {
+        SelectedEvidenceEnrichmentStatus::Pending => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking additional local checksum evidence in the background…");
+            });
+        }
+        SelectedEvidenceEnrichmentStatus::SkippedArchive => {
+            widgets::banner(
+                ui,
+                "Bounded archive inspection",
+                "EmuWiz inspected only the archive metadata and bounded game-member evidence. It did not hash the entire ZIP, 7z, or RAR just to populate this card.",
+                widgets::StatusTone::Info,
+            );
+        }
+        SelectedEvidenceEnrichmentStatus::Failed(message) => {
+            widgets::banner(
+                ui,
+                "Additional evidence could not be loaded",
+                message,
+                widgets::StatusTone::Warning,
+            );
+        }
+        SelectedEvidenceEnrichmentStatus::Complete => {}
+    }
 }
 
 fn show_ready_report(
@@ -774,32 +869,43 @@ fn show_ready_report(
 
     // DAT evidence (direct No-Intro).
     widgets::section_header(ui, "DAT evidence", None);
-    match &report.no_intro {
-        NoIntroLookupResult::NotImported => {
-            ui.label("No DAT evidence available (no local No-Intro DAT is imported).");
+    match &report.enrichment {
+        SelectedEvidenceEnrichmentStatus::Pending => {
+            ui.label("DAT lookup will follow the background checksum.");
         }
-        NoIntroLookupResult::Ambiguous { note } => {
-            widgets::banner(
-                ui,
-                "Multiple No-Intro DAT sources match this platform",
-                note,
-                widgets::StatusTone::Pending,
-            );
+        SelectedEvidenceEnrichmentStatus::SkippedArchive => {
+            ui.label("DAT lookup was not started because it would require hashing the whole outer archive.");
         }
-        NoIntroLookupResult::NoMatch { system_name } => {
-            ui.label(format!(
-                "No DAT evidence available ({system_name}: no matching entry)."
-            ));
+        SelectedEvidenceEnrichmentStatus::Failed(_) => {
+            ui.label("DAT lookup could not run because the local checksum was unavailable.");
         }
-        NoIntroLookupResult::Matched {
-            system_name,
-            observations,
-        } => {
-            ui.label(format!(
-                "{system_name}: {} matching entry/entries.",
-                observations.len() / 2
-            ));
-        }
+        SelectedEvidenceEnrichmentStatus::Complete => match &report.no_intro {
+            NoIntroLookupResult::NotImported => {
+                ui.label("No DAT evidence available (no local No-Intro DAT is imported).");
+            }
+            NoIntroLookupResult::Ambiguous { note } => {
+                widgets::banner(
+                    ui,
+                    "Multiple No-Intro DAT sources match this platform",
+                    note,
+                    widgets::StatusTone::Pending,
+                );
+            }
+            NoIntroLookupResult::NoMatch { system_name } => {
+                ui.label(format!(
+                    "No DAT evidence available ({system_name}: no matching entry)."
+                ));
+            }
+            NoIntroLookupResult::Matched {
+                system_name,
+                observations,
+            } => {
+                ui.label(format!(
+                    "{system_name}: {} matching entry/entries.",
+                    observations.len() / 2
+                ));
+            }
+        },
     }
 
     // Hasheous - explicit button only.
@@ -818,7 +924,13 @@ fn show_ready_report(
                 *action = Some(SelectedEvidenceAction::CheckHasheous);
             }
             if !has_sha1 {
-                ui.label("A SHA1 hash is required before Hasheous can be checked.");
+                let reason = match &report.enrichment {
+                    SelectedEvidenceEnrichmentStatus::SkippedArchive => {
+                        "Hasheous is unavailable because whole-archive hashing is not started automatically."
+                    }
+                    _ => "A SHA1 hash is required before Hasheous can be checked.",
+                };
+                ui.label(reason);
             }
         }
         HasheousState::Loading { .. } => {
@@ -1136,7 +1248,29 @@ mod tests {
             report.hashes.is_none(),
             "the whole-file checksum is left to the enrichment pass"
         );
+        assert_eq!(report.enrichment, SelectedEvidenceEnrichmentStatus::Pending);
         assert!(matches!(report.no_intro, NoIntroLookupResult::NotImported));
+    }
+
+    #[test]
+    fn compressed_archive_fast_pass_never_schedules_a_whole_outer_file_hash() {
+        let dir = write_temp_rom("God of War II (Test).rar", b"Rar!\x1a\x07\x01\0");
+        let path = dir.path().join("God of War II (Test).rar");
+
+        let report = gather_selected_evidence_fast(&path, Some("PlayStation 2"))
+            .expect("a readable RAR reaches the bounded deferred identity state");
+
+        assert!(report.hashes.is_none());
+        assert_eq!(
+            report.enrichment,
+            SelectedEvidenceEnrichmentStatus::SkippedArchive,
+            "ordinary selection must not launch a full checksum over the outer archive"
+        );
+        assert_eq!(
+            report.game_identity_report.format,
+            archivefs_core::game_identity::IdentityImageFormat::Deferred
+        );
+        assert_eq!(report.game_identity_report.bytes_read, 0);
     }
 
     #[test]
@@ -1180,6 +1314,10 @@ mod tests {
             "the whole-file checksum is now filled in"
         );
         assert!(matches!(report.no_intro, NoIntroLookupResult::NotImported));
+        assert_eq!(
+            report.enrichment,
+            SelectedEvidenceEnrichmentStatus::Complete
+        );
         assert!(report.base_observations.len() >= base_observation_count);
     }
 
@@ -1393,6 +1531,7 @@ mod tests {
             },
             hashes: None,
             no_intro: NoIntroLookupResult::NotImported,
+            enrichment: SelectedEvidenceEnrichmentStatus::Complete,
             base_observations,
         }
     }
@@ -1665,6 +1804,23 @@ mod tests {
 
     // -- real render smoke tests ------------------------------------------
 
+    fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => {
+                    nested.iter().any(|shape| shape_contains(shape, needle))
+                }
+                _ => false,
+            }
+        }
+
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
     #[test]
     fn idle_panel_renders_without_panicking_when_a_file_is_selected() {
         let ctx = egui::Context::default();
@@ -1722,6 +1878,34 @@ mod tests {
                 let _ = show_selected_evidence_panel(ui, false, Some(Path::new("game.gb")), &state);
             });
         });
+    }
+
+    #[test]
+    fn enrichment_failure_is_visible_on_the_ready_selection_card() {
+        let mut report = make_report(Vec::new());
+        report.enrichment = SelectedEvidenceEnrichmentStatus::Failed(
+            "checksum worker disconnected during inspection".to_string(),
+        );
+        let state = SelectedEvidenceState::Ready {
+            generation: 1,
+            report: Box::new(report),
+            hasheous: HasheousState::Idle,
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_selected_evidence_panel(ui, false, Some(Path::new("test.gb")), &state);
+            });
+        });
+
+        assert!(rendered_text_contains(
+            &output,
+            "Additional evidence could not be loaded"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "checksum worker disconnected during inspection"
+        ));
     }
 
     #[test]

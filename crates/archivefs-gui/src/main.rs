@@ -4565,8 +4565,13 @@ struct ArchiveFsApp {
     /// `Idle`; loading is always an explicit action, never automatic.
     selected_evidence: selected_evidence_page::SelectedEvidenceState,
     selected_evidence_generation: u64,
-    /// The deferred enrichment pass for the selected file: the whole-file
-    /// checksum and its No-Intro DAT lookup. Kept separate from
+    /// Cancellation shared by the current selection's fast and deferred
+    /// workers. Replaced (and set) as soon as focus moves, so a stale
+    /// multi-gigabyte hash stops instead of merely losing its receiver.
+    selected_evidence_cancel: Option<Arc<AtomicBool>>,
+    /// The deferred enrichment pass for a selected loose file: the whole-file
+    /// checksum and its No-Intro DAT lookup. Compressed archives terminate
+    /// after bounded identity inspection instead. Kept separate from
     /// `selected_evidence` so the structural / verified identity in a
     /// `Ready` report is shown immediately and this - which can cost
     /// minutes for a multi-gigabyte ISO or a large DAT set - fills in
@@ -4836,10 +4841,11 @@ fn drain_file_pick(receiver: &mpsc::Receiver<Option<PathBuf>>) -> FilePickDrain 
 const FILE_PICKER_DISCONNECTED_MESSAGE: &str =
     "The image picker closed unexpectedly. Please try again.";
 
-/// The deferred whole-file-checksum + No-Intro-lookup pass for the selected
-/// file. Independent of `SelectedEvidenceState` so the structural / verified
-/// identity in a `Ready` report is never held back by it. Guarded by the
-/// same `selected_evidence_generation` the fast pass uses.
+/// The deferred whole-file-checksum + No-Intro-lookup pass for a selected
+/// loose file. Independent of `SelectedEvidenceState` so the structural /
+/// verified identity in a `Ready` report is never held back by it. Guarded by
+/// the same `selected_evidence_generation` the fast pass uses. Compressed
+/// archives do not enter this state machine.
 enum SelectedEvidenceEnrichmentState {
     Idle,
     Loading {
@@ -5014,6 +5020,7 @@ impl ArchiveFsApp {
             romm_generation: 0,
             selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
             selected_evidence_generation: 0,
+            selected_evidence_cancel: None,
             selected_evidence_enrichment: SelectedEvidenceEnrichmentState::Idle,
             no_intro_source_cache: Arc::new(Mutex::new(
                 selected_evidence_no_intro::NoIntroSourceCache::new(),
@@ -10553,8 +10560,11 @@ impl ArchiveFsApp {
     /// the launch planner. The worker remains generation-guarded and
     /// read-only.
     fn start_selected_evidence_load(&mut self, context: egui::Context, path: PathBuf) {
+        self.cancel_selected_evidence_work();
         self.selected_evidence_generation += 1;
         let generation = self.selected_evidence_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.selected_evidence_cancel = Some(Arc::clone(&cancel));
         let (sender, receiver) = mpsc::channel();
         self.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
             generation,
@@ -10581,25 +10591,68 @@ impl ArchiveFsApp {
         };
         thread::spawn(move || {
             // Fast pass only: bounded header read + the bounded per-platform
-            // identity inspector. The whole-file checksum and No-Intro DAT
-            // resolution are the deferred enrichment pass
-            // (`start_selected_evidence_enrichment`) so a multi-gigabyte ISO
-            // or a large DAT set never blocks the visible identity.
-            let result = selected_evidence_page::gather_selected_evidence_fast(
-                &path,
-                platform_hint.as_deref(),
-            );
+            // identity inspector. For loose files, the whole-file checksum
+            // and No-Intro DAT resolution are the deferred enrichment pass
+            // (`start_selected_evidence_enrichment`). Compressed archives
+            // terminate after bounded member evidence, so neither path can
+            // hold back the visible identity.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                selected_evidence_page::gather_selected_evidence_fast(
+                    &path,
+                    platform_hint.as_deref(),
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(
+                    "the identity worker stopped unexpectedly while inspecting this file"
+                        .to_string(),
+                )
+            });
+            let result = if cancel.load(Ordering::Relaxed) {
+                Err("identity inspection was cancelled after the selection changed".to_string())
+            } else {
+                result
+            };
             let _ = sender.send((generation, result));
             context.request_repaint();
         });
     }
 
+    fn cancel_selected_evidence_work(&mut self) {
+        if let Some(cancel) = self.selected_evidence_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Cancels and detaches evidence work as soon as Library focus no longer
+    /// names the path represented by the state machine. Generation checks
+    /// still guard every reply; cancellation additionally stops the costly
+    /// hash instead of allowing stale I/O to continue in the background.
+    fn reconcile_selected_evidence_selection(&mut self) {
+        let state_path = match &self.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Loading { path, .. }
+            | selected_evidence_page::SelectedEvidenceState::Error { path, .. } => Some(path),
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                Some(&report.path)
+            }
+            selected_evidence_page::SelectedEvidenceState::Idle => None,
+        };
+        if state_path.map(PathBuf::as_path) != self.archive_context.focused.as_deref()
+            && state_path.is_some()
+        {
+            self.cancel_selected_evidence_work();
+            self.selected_evidence = selected_evidence_page::SelectedEvidenceState::Idle;
+            self.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
+        }
+    }
+
     /// Starts the deferred enrichment pass for an already-visible `Ready`
-    /// report whose `hashes` are not yet filled in: the whole-file checksum
-    /// and the No-Intro DAT lookup, both resolved entirely off the UI
+    /// loose-file report whose `hashes` are not yet filled in: the whole-file
+    /// checksum and the No-Intro DAT lookup, both resolved entirely off the UI
     /// thread. Generation-guarded like every other background loader; a new
     /// selection (which bumps `selected_evidence_generation` and resets the
-    /// enrichment state to `Idle`) makes a late result be discarded.
+    /// enrichment state to `Idle`) makes a late result be discarded. Archive
+    /// reports never call this method.
     fn start_selected_evidence_enrichment(
         &mut self,
         context: egui::Context,
@@ -10613,35 +10666,55 @@ impl ArchiveFsApp {
             path: path.clone(),
             receiver,
         };
+        let cancel = Arc::clone(
+            self.selected_evidence_cancel
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        );
         let no_intro_source_cache = Arc::clone(&self.no_intro_source_cache);
         thread::spawn(move || {
-            let config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
-            let no_intro_state = config_path
-                .as_deref()
-                .ok()
-                .and_then(|config_path| {
-                    archivefs_core::dat::sources::load_dat_sources_config_from(config_path).ok()
-                })
-                .map(|config| {
-                    archivefs_core::dat::sources::DatSourceRegistry::from_config(&config).0
-                })
-                .map(|registry| {
-                    no_intro_source_cache
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .resolve(&registry, platform.as_deref())
-                        .clone()
-                });
-            let resolved_source = match &no_intro_state {
-                Some(selected_evidence_no_intro::NoIntroSourceState::Selected(imported)) => {
-                    Some(imported.as_ref())
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(
+                        "additional evidence was cancelled after the selection changed".to_string(),
+                    );
                 }
-                _ => None,
-            };
-            let result = selected_evidence_page::compute_selected_evidence_enrichment(
-                &path,
-                resolved_source,
-            );
+                let config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
+                let no_intro_state = config_path
+                    .as_deref()
+                    .ok()
+                    .and_then(|config_path| {
+                        archivefs_core::dat::sources::load_dat_sources_config_from(config_path).ok()
+                    })
+                    .map(|config| {
+                        archivefs_core::dat::sources::DatSourceRegistry::from_config(&config).0
+                    })
+                    .map(|registry| {
+                        no_intro_source_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .resolve(&registry, platform.as_deref())
+                            .clone()
+                    });
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(
+                        "additional evidence was cancelled after the selection changed".to_string(),
+                    );
+                }
+                let resolved_source = match &no_intro_state {
+                    Some(selected_evidence_no_intro::NoIntroSourceState::Selected(imported)) => {
+                        Some(imported.as_ref())
+                    }
+                    _ => None,
+                };
+                selected_evidence_page::compute_selected_evidence_enrichment_cancellable(
+                    &path,
+                    resolved_source,
+                    Some(&cancel),
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err("the additional-evidence worker stopped unexpectedly".to_string())
+            });
             let _ = sender.send((generation, result));
             context.request_repaint();
         });
@@ -10659,7 +10732,10 @@ impl ArchiveFsApp {
         else {
             return;
         };
-        if report.hashes.is_some() {
+        if !matches!(
+            report.enrichment,
+            selected_evidence_page::SelectedEvidenceEnrichmentStatus::Pending
+        ) {
             return;
         }
         let generation = *generation;
@@ -10750,15 +10826,30 @@ impl ArchiveFsApp {
     /// (the same stale-result guard every other background loader in this
     /// app uses).
     fn poll_selected_evidence(&mut self) {
-        if let selected_evidence_page::SelectedEvidenceState::Loading {
-            generation,
-            path,
-            receiver,
-        } = &self.selected_evidence
-            && let Ok((message_generation, result)) = receiver.try_recv()
-            && message_generation == *generation
+        let base_result = match &self.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Loading {
+                generation,
+                receiver,
+                ..
+            } => match receiver.try_recv() {
+                Ok((message_generation, result)) => Some((*generation, message_generation, result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((
+                    *generation,
+                    *generation,
+                    Err("the identity worker stopped without returning a result".to_string()),
+                )),
+            },
+            _ => None,
+        };
+        if let Some((state_generation, message_generation, result)) = base_result
+            && state_generation == self.selected_evidence_generation
+            && message_generation == state_generation
         {
-            let path = path.clone();
+            let path = match &self.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Loading { path, .. } => path.clone(),
+                _ => return,
+            };
             self.selected_evidence = match result {
                 Ok(report) => selected_evidence_page::SelectedEvidenceState::Ready {
                     generation: message_generation,
@@ -10799,31 +10890,57 @@ impl ArchiveFsApp {
         // Drain a completed deferred enrichment pass (whole-file checksum +
         // No-Intro lookup) and merge it into the `Ready` report the panel is
         // already showing, if the selection has not moved on since.
-        if let SelectedEvidenceEnrichmentState::Loading {
-            generation,
-            path,
-            receiver,
-        } = &self.selected_evidence_enrichment
-            && let Ok((message_generation, result)) = receiver.try_recv()
-            && message_generation == *generation
+        let enrichment_result = match &self.selected_evidence_enrichment {
+            SelectedEvidenceEnrichmentState::Loading {
+                generation,
+                receiver,
+                ..
+            } => match receiver.try_recv() {
+                Ok((message_generation, result)) => Some((*generation, message_generation, result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((
+                    *generation,
+                    *generation,
+                    Err(
+                        "the additional-evidence worker stopped without returning a result"
+                            .to_string(),
+                    ),
+                )),
+            },
+            SelectedEvidenceEnrichmentState::Idle
+            | SelectedEvidenceEnrichmentState::Done { .. } => None,
+        };
+        if let Some((state_generation, message_generation, result)) = enrichment_result
+            && state_generation == self.selected_evidence_generation
+            && message_generation == state_generation
         {
-            let generation = *generation;
-            let path = path.clone();
-            if let (
-                Ok(enrichment),
-                selected_evidence_page::SelectedEvidenceState::Ready {
-                    generation: ready_generation,
-                    report,
-                    ..
-                },
-            ) = (&result, &mut self.selected_evidence)
+            let (generation, path) = match &self.selected_evidence_enrichment {
+                SelectedEvidenceEnrichmentState::Loading {
+                    generation, path, ..
+                } => (*generation, path.clone()),
+                SelectedEvidenceEnrichmentState::Idle
+                | SelectedEvidenceEnrichmentState::Done { .. } => return,
+            };
+            if let selected_evidence_page::SelectedEvidenceState::Ready {
+                generation: ready_generation,
+                report,
+                ..
+            } = &mut self.selected_evidence
                 && *ready_generation == generation
                 && report.path == path
             {
-                selected_evidence_page::apply_selected_evidence_enrichment(
-                    report,
-                    enrichment.clone(),
-                );
+                match result {
+                    Ok(enrichment) => {
+                        selected_evidence_page::apply_selected_evidence_enrichment(
+                            report, enrichment,
+                        );
+                    }
+                    Err(message) => {
+                        selected_evidence_page::apply_selected_evidence_enrichment_error(
+                            report, message,
+                        );
+                    }
+                }
             }
             self.selected_evidence_enrichment =
                 SelectedEvidenceEnrichmentState::Done { generation, path };
@@ -16930,6 +17047,7 @@ impl ArchiveFsApp {
         self.reconcile_library_tab();
         self.reconcile_problems_repair_tab();
         self.reconcile_sources_tab();
+        self.reconcile_selected_evidence_selection();
         self.poll_platform_artwork_task(context);
         self.poll_shared_history();
         // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md

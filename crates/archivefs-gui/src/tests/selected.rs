@@ -1,21 +1,14 @@
-//! GUI Maintenance Batch 2: relocated from main.rs's inline test module.
-//! Exercises `crate::gather_selected_evidence_with_registry`/
-//! `gather_selected_evidence_with_registry_at` - the GUI Batch A main.rs-side
-//! wiring for the Selected-ROM evidence panel's registry-backed No-Intro
-//! lookup. Copied byte-for-byte from its original nested-module location;
-//! only its file location changed.
+//! Selected-game identity/evidence state-machine tests, plus the legacy
+//! registry-backed No-Intro gatherer's focused wiring coverage.
 
 use super::*;
 
 // -- GUI Batch A closeout: registry-backed No-Intro wiring -----------
 //
-// `gather_selected_evidence_with_registry_at` is exactly what
-// `start_selected_evidence_load` calls in the real, running GUI (via
-// `gather_selected_evidence_with_registry`, which only adds the real
-// default config path). These tests exercise that same function
-// end-to-end against real files - a temp DAT source, a real registry
-// config on disk, and a real ROM file - never against the developer's
-// own home directory.
+// These tests exercise the registry resolver end-to-end against real files -
+// a temp DAT source, a real registry config on disk, and a real ROM file -
+// never against the developer's own home directory. The live staged worker
+// path is exercised by the state-machine regressions below.
 mod selected_evidence_registry_wiring {
     use super::*;
     use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind, DatSourceRegistry};
@@ -332,5 +325,137 @@ mod selected_evidence_registry_wiring {
             report.no_intro,
             selected_evidence_page::NoIntroLookupResult::NotImported
         ));
+    }
+}
+
+fn bounded_rar_report(path: &Path) -> selected_evidence_page::SelectedEvidenceReport {
+    std::fs::write(path, b"Rar!\x1a\x07\x01\0").expect("write bounded RAR marker fixture");
+    selected_evidence_page::gather_selected_evidence_fast(path, Some("PlayStation 2"))
+        .expect("bounded archive gather succeeds")
+}
+
+#[test]
+fn live_selection_state_does_not_start_automatic_enrichment_for_an_archive() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("God of War II (Test).rar");
+    let report = bounded_rar_report(&path);
+    let mut app = app_for_operation_tests();
+    app.archive_context.select_only(path);
+    app.selected_evidence_generation = 7;
+    app.selected_evidence = selected_evidence_page::SelectedEvidenceState::Ready {
+        generation: 7,
+        report: Box::new(report),
+        hasheous: selected_evidence_page::HasheousState::Idle,
+    };
+
+    app.maybe_start_selected_evidence_enrichment(&egui::Context::default());
+
+    assert!(matches!(
+        app.selected_evidence_enrichment,
+        SelectedEvidenceEnrichmentState::Idle
+    ));
+    let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
+        &app.selected_evidence
+    else {
+        panic!("the bounded archive report must remain ready");
+    };
+    assert_eq!(
+        report.enrichment,
+        selected_evidence_page::SelectedEvidenceEnrichmentStatus::SkippedArchive
+    );
+}
+
+#[test]
+fn changing_selection_cancels_and_detaches_the_old_evidence_generation() {
+    let mut app = app_for_operation_tests();
+    let old_path = PathBuf::from("/library/old.zip");
+    let new_path = PathBuf::from("/library/new.zip");
+    let (_sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.archive_context.select_only(new_path);
+    app.selected_evidence_generation = 3;
+    app.selected_evidence_cancel = Some(Arc::clone(&cancel));
+    app.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
+        generation: 3,
+        path: old_path,
+        receiver,
+    };
+
+    app.reconcile_selected_evidence_selection();
+
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(matches!(
+        app.selected_evidence,
+        selected_evidence_page::SelectedEvidenceState::Idle
+    ));
+    assert!(matches!(
+        app.selected_evidence_enrichment,
+        SelectedEvidenceEnrichmentState::Idle
+    ));
+}
+
+#[test]
+fn disconnected_identity_worker_becomes_a_visible_error_instead_of_loading_forever() {
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/library/game.zip");
+    let (sender, receiver) = mpsc::channel();
+    drop(sender);
+    app.archive_context.select_only(path.clone());
+    app.selected_evidence_generation = 11;
+    app.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
+        generation: 11,
+        path: path.clone(),
+        receiver,
+    };
+
+    app.poll_selected_evidence();
+
+    match &app.selected_evidence {
+        selected_evidence_page::SelectedEvidenceState::Error {
+            path: error_path,
+            message,
+            ..
+        } => {
+            assert_eq!(error_path, &path);
+            assert!(message.contains("stopped without returning a result"));
+        }
+        _ => panic!("a disconnected worker must settle to the panel's visible Error state"),
+    }
+}
+
+#[test]
+fn disconnected_enrichment_worker_is_visible_on_the_ready_selection_card() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected.rar");
+    let mut report = bounded_rar_report(&path);
+    report.enrichment = selected_evidence_page::SelectedEvidenceEnrichmentStatus::Pending;
+    let (sender, receiver) = mpsc::channel();
+    drop(sender);
+    let mut app = app_for_operation_tests();
+    app.archive_context.select_only(path.clone());
+    app.selected_evidence_generation = 13;
+    app.selected_evidence = selected_evidence_page::SelectedEvidenceState::Ready {
+        generation: 13,
+        report: Box::new(report),
+        hasheous: selected_evidence_page::HasheousState::Idle,
+    };
+    app.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Loading {
+        generation: 13,
+        path,
+        receiver,
+    };
+
+    app.poll_selected_evidence();
+
+    let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
+        &app.selected_evidence
+    else {
+        panic!("base identity remains ready when optional enrichment fails");
+    };
+    match &report.enrichment {
+        selected_evidence_page::SelectedEvidenceEnrichmentStatus::Failed(message) => {
+            assert!(message.contains("stopped without returning a result"));
+        }
+        other => panic!("expected visible enrichment failure, got {other:?}"),
     }
 }
