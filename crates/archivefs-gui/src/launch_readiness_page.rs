@@ -415,6 +415,27 @@ enum RetroArchLaunchStage {
     },
 }
 
+/// Owned presentation snapshot for the launch currently associated with one
+/// exact request. Both Advanced View and Gamer View render this same state,
+/// so a preflight/spawn failure cannot disappear merely because the launch
+/// was initiated from the simpler front door.
+pub(crate) enum RetroArchLaunchDisplay {
+    Idle,
+    Starting,
+    Running {
+        pid: u32,
+    },
+    Exited {
+        success: bool,
+        status_detail: String,
+        stderr_tail: Option<String>,
+    },
+    Failed {
+        message: &'static str,
+        detail: String,
+    },
+}
+
 /// Phase 1 tracks at most one launch at a time, regardless of which
 /// candidate/selection is currently rendered - see the module doc comment.
 /// [`Self::poll`] always advances whatever is tracked so a running process
@@ -497,6 +518,43 @@ impl RetroArchLaunchState {
             let _ = sender.send(result);
         });
         self.tracked = Some((key, RetroArchLaunchStage::Starting { receiver }));
+    }
+
+    pub(crate) fn display_for(
+        &mut self,
+        request: &RetroArchLaunchRequest,
+    ) -> RetroArchLaunchDisplay {
+        let this_key = RetroArchLaunchKey::from_request(request);
+        match self.tracked.as_mut() {
+            Some((key, stage)) if *key == this_key => match stage {
+                RetroArchLaunchStage::Starting { .. } => RetroArchLaunchDisplay::Starting,
+                RetroArchLaunchStage::Running { process } => {
+                    RetroArchLaunchDisplay::Running { pid: process.pid }
+                }
+                RetroArchLaunchStage::Exited { process } => {
+                    let report: &LaunchExitReport = process
+                        .poll()
+                        .expect("Exited stage always has a cached exit report");
+                    let success = matches!(&report.status, Ok(status) if status.success());
+                    let status_detail = match &report.status {
+                        Ok(status) => format!("{status}"),
+                        Err(error) => format!("wait() failed: {error}"),
+                    };
+                    let stderr_tail = (!success && !report.stderr.is_empty())
+                        .then(|| String::from_utf8_lossy(&report.stderr).into_owned());
+                    RetroArchLaunchDisplay::Exited {
+                        success,
+                        status_detail,
+                        stderr_tail,
+                    }
+                }
+                RetroArchLaunchStage::Failed { error } => {
+                    let (message, detail) = launch_error_message(error);
+                    RetroArchLaunchDisplay::Failed { message, detail }
+                }
+            },
+            _ => RetroArchLaunchDisplay::Idle,
+        }
     }
 }
 
@@ -1666,80 +1724,50 @@ fn show_launch_action(
     launch_state: &mut RetroArchLaunchState,
     request: RetroArchLaunchRequest,
 ) {
-    enum Display {
-        Idle,
-        Starting,
-        Running {
-            pid: u32,
-        },
-        Exited {
-            success: bool,
-            status_detail: String,
-            stderr_tail: Option<String>,
-        },
-        Failed {
-            message: &'static str,
-            detail: String,
-        },
-    }
-
-    let this_key = RetroArchLaunchKey::from_request(&request);
-    // Matched via `as_mut()` (not a shared borrow) because reading the
-    // cached exit report of an already-`Exited` process goes through
-    // `LaunchedRetroArchProcess::poll`, which - though idempotent once a
-    // report is cached - is only ever exposed as `&mut self`. This match's
-    // borrow of `launch_state.tracked` ends with it since `display` only
-    // ever holds owned data, so the later `launch_state.start(..)` calls
-    // below borrow it fresh.
-    let display = match launch_state.tracked.as_mut() {
-        Some((key, stage)) if *key == this_key => match stage {
-            RetroArchLaunchStage::Starting { .. } => Display::Starting,
-            RetroArchLaunchStage::Running { process } => Display::Running { pid: process.pid },
-            RetroArchLaunchStage::Exited { process } => {
-                let report: &LaunchExitReport = process
-                    .poll()
-                    .expect("Exited stage always has a cached exit report");
-                let success = matches!(&report.status, Ok(status) if status.success());
-                let status_detail = match &report.status {
-                    Ok(status) => format!("{status}"),
-                    Err(error) => format!("wait() failed: {error}"),
-                };
-                let stderr_tail = (!success && !report.stderr.is_empty())
-                    .then(|| String::from_utf8_lossy(&report.stderr).into_owned());
-                Display::Exited {
-                    success,
-                    status_detail,
-                    stderr_tail,
-                }
-            }
-            RetroArchLaunchStage::Failed { error } => {
-                let (message, detail) = launch_error_message(error);
-                Display::Failed { message, detail }
-            }
-        },
-        _ => Display::Idle,
-    };
+    let display = launch_state.display_for(&request);
+    show_retroarch_launch_feedback(ui, &display);
 
     match display {
-        Display::Idle => {
+        RetroArchLaunchDisplay::Idle => {
             if ui.button("Play — Launch RetroArch").clicked() {
                 launch_state.start(request);
             }
         }
-        Display::Starting => {
+        RetroArchLaunchDisplay::Starting => {
             ui.add_enabled(false, egui::Button::new("Starting RetroArch…"));
         }
-        Display::Running { pid } => {
-            widgets::status_badge(ui, "RetroArch running", widgets::StatusTone::Success);
-            ui.label(egui::RichText::new(format!("PID {pid}")).small());
+        RetroArchLaunchDisplay::Running { .. } => {
             ui.add_enabled(false, egui::Button::new("Play — Launch RetroArch"));
         }
-        Display::Exited {
+        RetroArchLaunchDisplay::Exited { .. } => {
+            if ui.button("Play — Launch RetroArch").clicked() {
+                launch_state.start(request);
+            }
+        }
+        RetroArchLaunchDisplay::Failed { .. } => {
+            if ui.button("Play — Launch RetroArch").clicked() {
+                launch_state.start(request);
+            }
+        }
+    }
+}
+
+/// Shared launch outcome/status renderer. It deliberately owns no button and
+/// cannot start a process; each view keeps its own control styling while both
+/// expose the exact same executor result and actionable failure detail.
+pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroArchLaunchDisplay) {
+    match display {
+        RetroArchLaunchDisplay::Idle | RetroArchLaunchDisplay::Starting => {}
+        RetroArchLaunchDisplay::Running { pid } => {
+            widgets::status_badge(ui, "RetroArch running", widgets::StatusTone::Success);
+            ui.label(egui::RichText::new(format!("PID {pid}")).small());
+        }
+        RetroArchLaunchDisplay::Exited {
             success,
             status_detail,
             stderr_tail,
         } => {
-            if success {
+            if *success {
                 widgets::banner(
                     ui,
                     "RetroArch exited",
@@ -1761,18 +1789,12 @@ fn show_launch_action(
                     });
                 }
             }
-            if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request);
-            }
         }
-        Display::Failed { message, detail } => {
+        RetroArchLaunchDisplay::Failed { message, detail } => {
             widgets::banner(ui, "Launch failed", message, widgets::StatusTone::Blocked);
             widgets::technical_details(ui, "retroarch-launch-error", |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
             });
-            if ui.button("Play — Launch RetroArch").clicked() {
-                launch_state.start(request);
-            }
         }
     }
 }

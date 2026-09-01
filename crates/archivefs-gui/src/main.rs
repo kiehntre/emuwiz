@@ -17728,6 +17728,7 @@ impl ArchiveFsApp {
                             cover_requests: &mut cover_requests,
                             game_metadata,
                             play_action: &gamer_play_action,
+                            retroarch_launch_state: &mut self.launch_retroarch,
                         },
                     );
                     // Started only once the list has actually asked for something,

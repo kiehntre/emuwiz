@@ -183,6 +183,20 @@ pub trait ReadOnlyHostFilesystem {
     /// for native executable discovery via `PATH`. See
     /// [`ExecutableProbe`].
     fn probe_executable(&self, path: &Path) -> ExecutableProbe;
+    /// Resolves one PATH executable candidate to the exact regular file
+    /// that would be executed. The default keeps injected/test filesystems
+    /// source-compatible and returns the candidate itself after the same
+    /// executable probe; the host implementation canonicalizes symlinks and
+    /// then re-checks the resolved target as a regular executable file.
+    ///
+    /// RetroArch discovery records this resolved path, not a PATH symlink.
+    /// That keeps readiness and launch preflight in agreement without
+    /// weakening preflight's rule that the final executable path itself
+    /// must not be a symlink.
+    fn resolve_executable(&self, path: &Path) -> Option<std::path::PathBuf> {
+        (self.probe_executable(path) == ExecutableProbe::RegularExecutable)
+            .then(|| path.to_path_buf())
+    }
     /// Reads at most `max_bytes` bytes. `BoundedReadResult::TooLarge` if
     /// the file is larger; the oversized content is never partially
     /// trusted as a truncated prefix.
@@ -263,6 +277,18 @@ impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
                 io::ErrorKind::PermissionDenied => ExecutableProbe::Inaccessible,
                 _ => ExecutableProbe::IoError,
             },
+        }
+    }
+
+    fn resolve_executable(&self, path: &Path) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let resolved = fs::canonicalize(path).ok()?;
+        let metadata = fs::symlink_metadata(&resolved).ok()?;
+        if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            Some(resolved)
+        } else {
+            None
         }
     }
 

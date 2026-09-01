@@ -97,49 +97,85 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![game])));
     app.archive_context.select_only(path.clone());
 
-    let play_action = launch_readiness_page::GamerPlayAction::Ready(
-        archivefs_core::launch::RetroArchLaunchRequest {
-            selected_content_path: path,
-            expected_platform_id: "Game Boy".to_string(),
-            expected_game_key: "test-game".to_string(),
-            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
-                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
-                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
-            },
-            core_stem: "gambatte".to_string(),
+    let request = archivefs_core::launch::RetroArchLaunchRequest {
+        selected_content_path: path.clone(),
+        expected_platform_id: "Game Boy".to_string(),
+        expected_game_key: "test-game".to_string(),
+        profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+            profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+            scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
         },
-    );
+        core_stem: "gambatte".to_string(),
+    };
+    let play_action = launch_readiness_page::GamerPlayAction::Ready(request.clone());
     let ctx = egui::Context::default();
     let mut cover_requests = Vec::new();
-    let output = ctx.run(egui::RawInput::default(), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let LoadState::Ready(data) = &app.state else {
-                unreachable!()
-            };
-            let _ = show_gamer_view(
-                ui,
-                Some(data),
-                GamerViewViewState {
-                    filter: "",
-                    library_filters: &mut app.library_filters,
-                    archive_context: &mut app.archive_context,
-                    screen: &mut app.gamer_view_screen,
-                    busy: false,
-                    block_reason: None,
-                    cleanup_after_unmount: false,
-                    cheat_workflow: app.cheat_workflow.as_ref(),
-                    feedback: None,
-                    artwork_directory: None,
-                    artwork_cache: &mut app.platform_artwork_cache,
-                    covers: &mut app.gamer_covers,
-                    cover_requests: &mut cover_requests,
-                    game_metadata: None,
-                    play_action: &play_action,
-                },
-            );
+    let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
+    let screen = egui::vec2(1400.0, 900.0);
+    let base = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+        ..Default::default()
+    };
+    let mut frame = |input: egui::RawInput| -> (egui::FullOutput, Option<GamerViewAction>) {
+        let mut captured = None;
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let LoadState::Ready(data) = &app.state else {
+                    unreachable!()
+                };
+                captured = show_gamer_view(
+                    ui,
+                    Some(data),
+                    GamerViewViewState {
+                        filter: "",
+                        library_filters: &mut app.library_filters,
+                        archive_context: &mut app.archive_context,
+                        screen: &mut app.gamer_view_screen,
+                        busy: false,
+                        block_reason: None,
+                        cleanup_after_unmount: false,
+                        cheat_workflow: app.cheat_workflow.as_ref(),
+                        feedback: None,
+                        artwork_directory: None,
+                        artwork_cache: &mut app.platform_artwork_cache,
+                        covers: &mut app.gamer_covers,
+                        cover_requests: &mut cover_requests,
+                        game_metadata: None,
+                        play_action: &play_action,
+                        retroarch_launch_state: &mut launch_state,
+                    },
+                );
+            });
         });
+        (output, captured)
+    };
+
+    let (first, _) = frame(base.clone());
+    assert!(rendered_text_contains(&first, "Play — Launch RetroArch"));
+    let button = first_text_shape_rect(&first, "Play — Launch RetroArch").unwrap();
+    let pointer = button.center();
+    let _ = frame(egui::RawInput {
+        events: vec![egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }],
+        ..base.clone()
     });
-    assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
+    let (_, action) = frame(egui::RawInput {
+        events: vec![egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+        ..base
+    });
+    let Some(GamerViewAction::Play(clicked_request)) = action else {
+        panic!("Play must return GamerViewAction::Play");
+    };
+    assert_eq!(clicked_request, request);
 }
 
 /// Renders the real Gamer View selected-game card for one game with the
@@ -149,6 +185,16 @@ fn render_gamer_card(
     mount_state: MountState,
     platform: &str,
     play_action: &launch_readiness_page::GamerPlayAction,
+) -> egui::FullOutput {
+    let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
+    render_gamer_card_with_launch_state(mount_state, platform, play_action, &mut launch_state)
+}
+
+fn render_gamer_card_with_launch_state(
+    mount_state: MountState,
+    platform: &str,
+    play_action: &launch_readiness_page::GamerPlayAction,
+    launch_state: &mut launch_readiness_page::RetroArchLaunchState,
 ) -> egui::FullOutput {
     let mut app = app_for_operation_tests();
     let path = PathBuf::from("/roms/journey-d-game.gb");
@@ -184,6 +230,7 @@ fn render_gamer_card(
                     cover_requests: &mut cover_requests,
                     game_metadata: None,
                     play_action,
+                    retroarch_launch_state: launch_state,
                 },
             );
         });
@@ -209,6 +256,46 @@ fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
     assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
     assert!(!rendered_text_contains(&output, "Needs setup"));
     assert!(!rendered_text_contains(&output, "Can’t play yet"));
+}
+
+#[test]
+fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
+    let request = archivefs_core::launch::RetroArchLaunchRequest {
+        selected_content_path: PathBuf::from("/nonexistent/gamer-launch-action.gb"),
+        expected_platform_id: "Game Boy".to_string(),
+        expected_game_key: "missing-game".to_string(),
+        profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+            profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+            scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+        },
+        core_stem: "gambatte".to_string(),
+    };
+    let play_action = launch_readiness_page::GamerPlayAction::Ready(request.clone());
+    let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
+    launch_state.start(request);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while launch_state.is_active() {
+        launch_state.poll();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "launch worker never reported the preflight failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let output = render_gamer_card_with_launch_state(
+        MountState::NotMountable,
+        "Game Boy",
+        &play_action,
+        &mut launch_state,
+    );
+    assert!(rendered_text_contains(&output, "Launch failed"));
+    assert!(rendered_text_contains(
+        &output,
+        "This game's file is no longer available where it was last seen."
+    ));
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(rendered_text_contains(&output, "Play — Launch RetroArch"));
 }
 
 #[test]
@@ -306,6 +393,7 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
         ..Default::default()
     };
     let mut cover_requests = Vec::new();
+    let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
 
     let mut frame = |input: egui::RawInput| -> (egui::FullOutput, Option<GamerViewAction>) {
         let mut captured = None;
@@ -333,6 +421,7 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
                         cover_requests: &mut cover_requests,
                         game_metadata: None,
                         play_action: &play_action,
+                        retroarch_launch_state: &mut launch_state,
                     },
                 );
             });

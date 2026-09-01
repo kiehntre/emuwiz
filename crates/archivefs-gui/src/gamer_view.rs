@@ -515,6 +515,37 @@ pub(crate) fn featured_primary_button(
     )
 }
 
+/// Gamer View styling for the same tracked executor state Advanced View
+/// renders. Returns `true` only for an explicit enabled Play/retry click;
+/// process creation remains exclusively in the caller's
+/// `GamerViewAction::Play` handler and the shared launch executor.
+fn featured_retroarch_launch_action(
+    ui: &mut egui::Ui,
+    launch_state: &mut launch_readiness_page::RetroArchLaunchState,
+    request: &archivefs_core::launch::RetroArchLaunchRequest,
+    enabled: bool,
+) -> bool {
+    use launch_readiness_page::RetroArchLaunchDisplay;
+
+    let display = launch_state.display_for(request);
+    launch_readiness_page::show_retroarch_launch_feedback(ui, &display);
+    match display {
+        RetroArchLaunchDisplay::Idle
+        | RetroArchLaunchDisplay::Exited { .. }
+        | RetroArchLaunchDisplay::Failed { .. } => {
+            featured_primary_button(ui, "Play — Launch RetroArch", enabled).clicked()
+        }
+        RetroArchLaunchDisplay::Starting => {
+            featured_primary_button(ui, "Starting RetroArch…", false);
+            false
+        }
+        RetroArchLaunchDisplay::Running { .. } => {
+            featured_primary_button(ui, "Play — Launch RetroArch", false);
+            false
+        }
+    }
+}
+
 /// One line of the featured panel's metadata block.
 pub(crate) fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) {
     let text = egui::RichText::new(text).size(if strong { 16.0 } else { 14.0 });
@@ -761,6 +792,7 @@ pub(crate) struct GamerViewViewState<'a> {
     /// (as "no game information available" wording), never network calls.
     pub(crate) game_metadata: Option<&'a crate::game_metadata::GameMetadataResult>,
     pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
+    pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -910,8 +942,13 @@ pub(crate) fn show_gamer_view(
         cover_requests,
         game_metadata,
         play_action,
+        retroarch_launch_state,
     } = view_state;
     let mut action = None;
+
+    if retroarch_launch_state.poll() || retroarch_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
 
     if let Some(feedback) = feedback {
         let color = if feedback.succeeded {
@@ -1510,12 +1547,12 @@ pub(crate) fn show_gamer_view(
                                             ui.weak("Currently mounted.");
                                         }
                                         GamerReadiness::Ready { request } => {
-                                            if featured_primary_button(
+                                            if featured_retroarch_launch_action(
                                                 ui,
-                                                "Play — Launch RetroArch",
+                                                retroarch_launch_state,
+                                                request,
                                                 !busy,
                                             )
-                                            .clicked()
                                             {
                                                 action = Some(GamerViewAction::Play(
                                                     (*request).clone(),

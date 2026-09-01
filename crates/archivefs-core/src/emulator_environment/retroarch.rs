@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BoundedListResult, BoundedReadResult, EncodedPath, ExecutableProbe, FsProbe,
-    ReadOnlyHostFilesystem, os_str_bytes,
+    BoundedListResult, BoundedReadResult, EncodedPath, FsProbe, ReadOnlyHostFilesystem,
+    os_str_bytes,
 };
 
 /// Official Flatpak application ID for RetroArch, confirmed against the
@@ -262,7 +262,9 @@ fn finalize_diagnostics(mut raw: Vec<RawDiagnostic>) -> Vec<Diagnostic> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Evidence {
     /// Native-only: deterministic (`PATH` order), first-occurrence-deduped
-    /// list of regular, executable files literally named `retroarch`.
+    /// list of verified regular executable targets resolved from PATH
+    /// candidates literally named `retroarch`. A PATH symlink is resolved
+    /// and its target re-checked before this exact target path is recorded.
     /// Always empty for Flatpak profiles.
     pub executables: Vec<EncodedPath>,
     /// Flatpak-only: whether this scope's Flatpak app directory for
@@ -1235,11 +1237,10 @@ fn discover_native_executables(
         }
         let directory = PathBuf::from(OsStr::from_bytes(directory_bytes));
         let candidate = directory.join("retroarch");
-        if seen.contains(&candidate) {
-            continue;
-        }
-        if filesystem.probe_executable(&candidate) == ExecutableProbe::RegularExecutable {
-            seen.push(candidate);
+        if let Some(resolved) = filesystem.resolve_executable(&candidate)
+            && !seen.contains(&resolved)
+        {
+            seen.push(resolved);
         }
     }
     seen.iter()
@@ -4582,6 +4583,31 @@ mod tests {
             executables[1]
                 .display
                 .starts_with(&fixture.path("bin2").to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn path_symlink_records_the_verified_resolved_executable() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("path-symlink-resolved");
+        fixture.mkdir("bin");
+        fixture.mkdir("games");
+        fixture.write("games/retroarch", "#!/bin/sh\n");
+        make_executable(&fixture.path("games/retroarch"));
+        symlink(
+            fixture.path("games/retroarch"),
+            fixture.path("bin/retroarch"),
+        )
+        .unwrap();
+        let mut env = fixture.env();
+        env.path = Some(fixture.path("bin").into_os_string());
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &env).unwrap();
+        assert_eq!(
+            report.profiles[0].evidence.executables,
+            vec![EncodedPath::from_path(&fixture.path("games/retroarch"))]
         );
     }
 

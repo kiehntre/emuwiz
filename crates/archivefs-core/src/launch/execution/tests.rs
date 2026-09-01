@@ -436,14 +436,27 @@ fn executable_missing_is_rejected() {
 }
 
 #[test]
-fn executable_replaced_with_a_symlink_is_rejected() {
+fn path_symlink_is_resolved_to_the_verified_regular_executable_before_final_preflight() {
     let ready = build_ready_fixture("executable-symlink");
     let executable = ready.fixture.path("bin/retroarch");
     let target = ready.fixture.path("bin/real-retroarch");
     fs::rename(&executable, &target).unwrap();
     symlink(&target, &executable).unwrap();
+    let command = preflight(&ready).unwrap();
+    assert_eq!(command.executable, target);
+    assert!(fs::symlink_metadata(&command.executable).unwrap().is_file());
+}
+
+#[test]
+fn path_symlink_to_a_non_file_is_still_rejected_before_spawn() {
+    let ready = build_ready_fixture("executable-symlink-directory");
+    let executable = ready.fixture.path("bin/retroarch");
+    fs::remove_file(&executable).unwrap();
+    let target = ready.fixture.path("not-an-executable");
+    fs::create_dir(&target).unwrap();
+    symlink(&target, &executable).unwrap();
     let error = preflight(&ready).unwrap_err();
-    assert_eq!(error.kind, LaunchPreflightErrorKind::ExecutableUnsafe);
+    assert_eq!(error.kind, LaunchPreflightErrorKind::CommandBlocked);
 }
 
 #[test]
