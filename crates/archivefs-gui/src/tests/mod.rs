@@ -1016,6 +1016,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         // and loading it here would read the real per-user preferences.
         cheat_sources_page: None,
         cheatbase_page: Default::default(),
+        user_cheat_import_page: Default::default(),
         rom_organisation_page: None,
         repair_review_page: None,
         repair_history_page: None,

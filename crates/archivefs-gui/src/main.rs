@@ -139,6 +139,7 @@ mod cheats_mods_preview;
 use cheats_mods_preview::*;
 mod cheatbase_page;
 mod gamer_platform_shelf;
+mod user_cheat_import_page;
 use gamer_platform_shelf::*;
 mod gamer_view;
 use gamer_view::*;
@@ -4324,6 +4325,8 @@ struct ArchiveFsApp {
     /// returning to the same exact archive does not discard a completed
     /// cache inspection or retrieval.
     cheat_workflow: Option<CheatWorkflowState>,
+    /// Independent read-only review state for user-supplied .cht/.pnach files.
+    user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState,
     /// The Dolphin texture-mod panel's own state - deliberately separate
     /// from `cheat_workflow` (a texture mod is not a cheat) and keyed by
     /// `{ archive_path, profile_id, verified_game_id }` internally, so it
@@ -4941,6 +4944,7 @@ impl ArchiveFsApp {
             remembered_emulator_profiles: load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
             cheat_workflow: None,
+            user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState::default(),
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
             launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
@@ -18030,10 +18034,54 @@ impl ArchiveFsApp {
                             region: workflow.region.clone(),
                         }
                     });
+                    let user_cheat_library = live
+                        .map(|data| {
+                            data.records
+                                .iter()
+                                .map(|record| archivefs_core::patch_manager::UserCheatLibraryGame {
+                                    game_id: record.mount_plan.archive.path.display().to_string(),
+                                    title: record
+                                        .metadata
+                                        .title
+                                        .clone()
+                                        .unwrap_or_else(|| record.identity.display_name.clone()),
+                                    platform: record
+                                        .metadata
+                                        .platform
+                                        .clone()
+                                        .or_else(|| record.identity.platform.clone()),
+                                    region: record
+                                        .metadata
+                                        .region
+                                        .clone()
+                                        .or_else(|| record.identity.region.clone()),
+                                    serial: None,
+                                    title_id: None,
+                                    crc: None,
+                                    content_hash: record.identity.content_hash.clone(),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let user_cheat_selected = self.cheat_workflow.as_ref().map(|workflow| {
+                        (
+                            workflow.archive_path.display().to_string(),
+                            workflow.display_name.clone(),
+                        )
+                    });
                     let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            self.user_cheat_import_page.show(
+                                ui,
+                                &ui.ctx().clone(),
+                                &user_cheat_library,
+                                user_cheat_selected
+                                    .as_ref()
+                                    .map(|(id, title)| (id.as_str(), title.as_str())),
+                            );
+                            ui.add_space(theme::SECTION_GAP);
                             let cheatbase_action = cheatbase_page::show_cheatbase_page(
                                 ui,
                                 &mut self.cheatbase_page,
