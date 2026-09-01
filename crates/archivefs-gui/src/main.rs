@@ -18978,8 +18978,8 @@ fn apply_platform_action(
 /// Resolves `archive_path` to a stable persisted archive id by exact
 /// path bytes first (never a lossy display string - see
 /// `Database::find_archive_id_by_absolute_path`), then applies `action`.
-/// Errors clearly if the archive is not yet in the library database
-/// (nothing to assign a platform to) rather than silently doing nothing.
+/// Errors clearly if the archive has no persisted catalogue row (nothing to
+/// assign a platform to) rather than silently doing nothing.
 fn apply_platform_action_at(
     database_path: &Path,
     archive_path: &Path,
@@ -18990,7 +18990,7 @@ fn apply_platform_action_at(
         .find_archive_id_by_absolute_path(archive_path)?
         .ok_or_else(|| {
             ArchiveFsError::Database(format!(
-                "{} is not yet in the library database - run a library scan first",
+                "{} is not yet in the saved library catalogue - run a library scan before assigning a platform",
                 archive_path.display()
             ))
         })?;

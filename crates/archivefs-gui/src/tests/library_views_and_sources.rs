@@ -2725,6 +2725,40 @@ fn render_selected_archive_with_reason(
 }
 
 #[test]
+fn live_only_library_selection_explains_the_catalogue_scan_step() {
+    let path = PathBuf::from("/roms/bbc-micro-game.zip");
+    let record = record_at(path.clone(), MountState::Pending);
+    let live_row = row_for(&record);
+    let snapshot = cached_snapshot(vec![]);
+    let merged = build_display_rows(std::slice::from_ref(&record), &[live_row], Some(&snapshot));
+
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].origin, RowOrigin::Live);
+    assert_eq!(
+        selected_record(std::slice::from_ref(&record), Some(&path)),
+        Some(&record)
+    );
+    assert_eq!(
+        selected_persisted_archive(Some(&snapshot), Some(&path)),
+        None
+    );
+
+    let output = render_selected_archive_with_reason(&record, false, None);
+    assert!(rendered_text_contains(
+        &output,
+        "This item was found in a source folder, but it has not been saved to the library catalogue yet."
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Run a library scan to add it; platform assignment will be available after the scan."
+    ));
+    assert!(!rendered_text_contains(
+        &output,
+        "Not yet in the library database"
+    ));
+}
+
+#[test]
 fn present_live_selected_archive_enables_mount() {
     let record = record_at(PathBuf::from("/roms/a.zip"), MountState::Pending);
     let output = render_selected_archive_with_reason(&record, false, None);

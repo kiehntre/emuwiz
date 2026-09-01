@@ -64,6 +64,8 @@ pub(crate) fn remount_is_offered(
         && offered_archives.contains(&record.mount_plan.archive.path)
 }
 
+pub(crate) const UNCATALOGUED_PLATFORM_GUIDANCE: &str = "This item was found in a source folder, but it has not been saved to the library catalogue yet. Run a library scan to add it; platform assignment will be available after the scan.";
+
 /// The three states the selected-game details panel renders for identity
 /// evidence, keyed by the caller to the *currently selected* file so a stale
 /// worker result for a previous selection is never shown. The panel must
@@ -495,9 +497,7 @@ pub(crate) fn show_platform_section(
     ui.separator();
     ui.strong("Platform");
     let Some(persisted) = persisted else {
-        ui.label(
-            "Not yet in the library database. Run a library scan to enable platform assignment.",
-        );
+        ui.label(UNCATALOGUED_PLATFORM_GUIDANCE);
         return None;
     };
 

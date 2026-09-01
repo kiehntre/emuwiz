@@ -1743,7 +1743,7 @@ fn poll_platform_action_failure_preserves_the_cached_row_and_shows_the_error() {
     });
     sender
         .send(Err(
-            "mystery.zip is not yet in the library database".to_string()
+            "mystery.zip is not yet in the saved library catalogue".to_string()
         ))
         .unwrap();
 
@@ -1752,7 +1752,11 @@ fn poll_platform_action_failure_preserves_the_cached_row_and_shows_the_error() {
     assert!(app.platform_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(!feedback.succeeded);
-    assert!(feedback.message.contains("not yet in the library database"));
+    assert!(
+        feedback
+            .message
+            .contains("not yet in the saved library catalogue")
+    );
     assert!(
         app.history
             .entries()
@@ -2006,7 +2010,7 @@ fn apply_platform_action_errors_clearly_when_not_yet_scanned() {
     assert!(
         error
             .to_string()
-            .contains("not yet in the library database")
+            .contains("not yet in the saved library catalogue")
     );
 
     std::fs::remove_dir_all(&dir).unwrap();

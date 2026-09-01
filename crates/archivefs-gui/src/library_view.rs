@@ -1901,7 +1901,7 @@ pub(crate) fn show_single_row_context_menu(
         }
     } else {
         ui.add_enabled(false, egui::Button::new("Set platform"))
-            .on_disabled_hover_text("Not yet in the library database.");
+            .on_disabled_hover_text(UNCATALOGUED_PLATFORM_GUIDANCE);
     }
 
     ui.separator();
