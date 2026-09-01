@@ -200,8 +200,8 @@ fn dfs_side(total_sectors: u16, title: &str, filename: &[u8; 7], start: u16) -> 
     }
     image[260] = 0x12; // valid BCD catalogue cycle number
     image[261] = 8; // one eight-byte entry
-    image[262] = 1; // 400 sectors: high two sector bits = 1, boot option 0
-    image[263] = 0x90;
+    image[262] = ((total_sectors >> 8) & 3) as u8; // disk-size high bits; boot option 0
+    image[263] = total_sectors as u8;
     image[8..15].copy_from_slice(filename);
     image[15] = b'$' | 0x80; // root directory, locked
     let details = 256 + 8;
@@ -268,6 +268,24 @@ fn standard_dfs_dsd_catalogues_validate_on_both_interleaved_sides() {
 }
 
 #[test]
+fn standard_dfs_80_track_ssd_and_dsd_geometries_are_supported() {
+    let fixture = Fixture::new("dfs-80-track");
+    let ssd = fixture.write(
+        "library/example-80.ssd",
+        &dfs_side(800, "EIGHTY", b"ONE    ", 2),
+    );
+    let mut dsd_bytes = vec![0_u8; 2 * 800 * 256];
+    let side0 = dfs_side(800, "SIDE ZERO", b"ONE    ", 2);
+    let side1 = dfs_side(800, "SIDE ONE", b"TWO    ", 2);
+    dsd_bytes[..512].copy_from_slice(&side0[..512]);
+    dsd_bytes[0x0a00..0x0a00 + 512].copy_from_slice(&side1[..512]);
+    let dsd = fixture.write("library/example-80.dsd", &dsd_bytes);
+
+    assert_eq!(fixture.inspect(&ssd).format, Some(DiskFormat::AcornDfsDisk));
+    assert_eq!(fixture.inspect(&dsd).format, Some(DiskFormat::AcornDfsDisk));
+}
+
+#[test]
 fn dfs_random_truncated_and_impossible_entries_fail_closed() {
     let fixture = Fixture::new("dfs-negative");
     for (extension, size) in [("ssd", 100 * 1024), ("dsd", 200 * 1024)] {
@@ -287,6 +305,30 @@ fn dfs_random_truncated_and_impossible_entries_fail_closed() {
     malformed[8] = 0x01; // control byte in a declared filename
     let malformed = fixture.write("library/malformed.ssd", &malformed);
     assert!(!fixture.inspect(&malformed).is_recognised());
+}
+
+#[test]
+fn dfs_overlapping_and_overlong_file_extents_fail_closed_without_overflow() {
+    let fixture = Fixture::new("dfs-arithmetic");
+
+    let mut overlapping = valid_dfs_ssd();
+    overlapping[261] = 16; // two eight-byte catalogue entries
+    overlapping[16..23].copy_from_slice(b"SECOND ");
+    overlapping[23] = b'$';
+    overlapping[256 + 8 + 8..256 + 8 + 10].copy_from_slice(&0x1900_u16.to_le_bytes());
+    overlapping[256 + 8 + 10..256 + 8 + 12].copy_from_slice(&0x1900_u16.to_le_bytes());
+    overlapping[256 + 8 + 12..256 + 8 + 14].copy_from_slice(&3_u16.to_le_bytes());
+    overlapping[256 + 8 + 14] = 0;
+    overlapping[256 + 8 + 15] = 2;
+    let overlapping = fixture.write("library/overlapping.ssd", &overlapping);
+    assert!(!fixture.inspect(&overlapping).is_recognised());
+
+    let mut overlong = valid_dfs_ssd();
+    overlong[256 + 8 + 6] = 0x30; // maximum 24-bit file length high bits
+    overlong[256 + 8 + 4] = 0xff;
+    overlong[256 + 8 + 5] = 0xff;
+    let overlong = fixture.write("library/overlong.ssd", &overlong);
+    assert!(!fixture.inspect(&overlong).is_recognised());
 }
 
 #[test]

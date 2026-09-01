@@ -107,7 +107,10 @@ fn validate(
         return Err(DiskFormatRefusal::Cancelled);
     }
 
-    let side_sectors = u16::try_from(side_bytes / SECTOR_BYTES).unwrap();
+    let side_sectors =
+        u16::try_from(side_bytes / SECTOR_BYTES).map_err(|_| DiskFormatRefusal::Malformed {
+            detail: format!("{side_bytes} bytes does not fit a DFS sector count"),
+        })?;
     if !matches!(side_sectors, SIDE40_SECTORS | SIDE80_SECTORS) {
         return Err(DiskFormatRefusal::Malformed {
             detail: format!("{side_sectors} sectors is not a standard 40- or 80-track DFS side"),
@@ -140,7 +143,12 @@ fn validate(
         sides.push(parse_side(&catalogue, side_sectors)?);
     }
 
-    let expected_bytes = u64::from(side_sectors) * SECTOR_BYTES * side_count as u64;
+    let expected_bytes = u64::from(side_sectors)
+        .checked_mul(SECTOR_BYTES)
+        .and_then(|bytes| bytes.checked_mul(side_count as u64))
+        .ok_or_else(|| DiskFormatRefusal::Malformed {
+            detail: "DFS geometry byte count overflowed".to_string(),
+        })?;
     if expected_bytes != length {
         return Err(DiskFormatRefusal::GeometryMismatch {
             declared_bytes: expected_bytes,
@@ -194,7 +202,7 @@ fn parse_side(catalogue: &[u8], total_sectors: u16) -> Result<DfsSideLayout, Dis
 
     let boot_option = (geometry >> 4) & 3;
     let mut files = Vec::with_capacity(usize::from(file_count));
-    let mut extents: Vec<(u16, u16)> = Vec::with_capacity(usize::from(file_count));
+    let mut extents: Vec<(u32, u32)> = Vec::with_capacity(usize::from(file_count));
     for index in 0..usize::from(file_count) {
         let name_offset = 8 + index * 8;
         let detail_offset = 256 + 8 + index * 8;
@@ -223,25 +231,27 @@ fn parse_side(catalogue: &[u8], total_sectors: u16) -> Result<DfsSideLayout, Dis
         let load_address = load_low | (u32::from((high >> 2) & 3) << 16);
         let length = length_low | (u32::from((high >> 4) & 3) << 16);
         let execution_address = execution_low | (u32::from(high >> 6) << 16);
-        let data_sectors = u16::try_from(u64::from(length).div_ceil(SECTOR_BYTES))
+        let rounded_length = u64::from(length)
+            .checked_add(SECTOR_BYTES - 1)
+            .ok_or_else(|| malformed(format!("file entry {index} length rounding overflows")))?;
+        let data_sectors = u16::try_from(rounded_length / SECTOR_BYTES)
             .map_err(|_| malformed(format!("file entry {index} length overflows sector count")))?;
-        if start_sector < 2
-            || u32::from(start_sector) + u32::from(data_sectors) > u32::from(total_sectors)
-        {
+        let end_sector = u32::from(start_sector)
+            .checked_add(u32::from(data_sectors))
+            .ok_or_else(|| malformed(format!("file entry {index} sector range overflows")))?;
+        if start_sector < 2 || end_sector > u32::from(total_sectors) {
             return Err(malformed(format!(
                 "file entry {index} starts at sector {start_sector} and extends past the {total_sectors}-sector side"
             )));
         }
-        let end_sector = start_sector.saturating_add(data_sectors);
-        if extents
-            .iter()
-            .any(|(other_start, other_end)| start_sector < *other_end && *other_start < end_sector)
-        {
+        if extents.iter().any(|(other_start, other_end)| {
+            u32::from(start_sector) < *other_end && *other_start < end_sector
+        }) {
             return Err(malformed(format!(
                 "file entry {index} overlaps another file extent"
             )));
         }
-        extents.push((start_sector, end_sector));
+        extents.push((u32::from(start_sector), end_sector));
         files.push(DfsFileEntry {
             directory: char::from(directory_byte).to_string(),
             filename: filename.trim_end().to_string(),
