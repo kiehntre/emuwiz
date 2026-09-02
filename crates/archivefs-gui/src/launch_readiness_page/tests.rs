@@ -42,6 +42,8 @@ static NEXT_PCSX2_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
+        retroarch_scanned: true,
+        standalone_scans_complete: true,
         dolphin: None,
         pcsx2: None,
         duckstation: None,
@@ -55,6 +57,8 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
 fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
+        retroarch_scanned: true,
+        standalone_scans_complete: true,
         dolphin: Some(context),
         pcsx2: None,
         duckstation: None,
@@ -68,6 +72,8 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
 fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
+        retroarch_scanned: true,
+        standalone_scans_complete: true,
         dolphin: None,
         pcsx2: Some(context),
         duckstation: None,
@@ -360,6 +366,211 @@ fn ready_retroarch_candidate_shows_ready_badge() {
     let output = render(&plan_input(plan));
     assert!(rendered_text_contains(&output, "Ready"));
     assert!(rendered_text_contains(&output, "mednafen_psx_hw"));
+}
+
+#[test]
+fn gamer_action_launches_the_exact_ready_retroarch_request() {
+    let action = gamer_play_action(&plan_input(plan_with(vec![ready_candidate()])));
+    assert!(matches!(
+        action,
+        GamerPlayAction::Launch(request)
+            if matches!(
+                request.as_ref(),
+                TypedLaunchRequest::RetroArch(request)
+                    if request.expected_platform_id == "PSX"
+                        && request.selected_content_path == Path::new("/library/Game.bin")
+            )
+    ));
+}
+
+#[test]
+fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
+    let ready = build_ready_pcsx2_fixture("gamer-pcsx2");
+    let plan = pcsx2_plan_with(vec![pcsx2_candidate(
+        &ready.profile_id,
+        &ready.content_path,
+    )]);
+    let input = LaunchReadinessInput::Plan {
+        plan,
+        retroarch_scanned: false,
+        standalone_scans_complete: true,
+        dolphin: None,
+        pcsx2: Some(ready.context),
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
+    };
+    assert!(matches!(
+        gamer_play_action(&input),
+        GamerPlayAction::Launch(request)
+            if matches!(request.as_ref(), TypedLaunchRequest::Pcsx2(_, _))
+    ));
+}
+
+#[test]
+fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
+    let ready = build_ready_dolphin_fixture("gamer-dolphin");
+    let plan = dolphin_plan_with(
+        vec![dolphin_candidate(&ready.profile_id, &ready.content_path)],
+        "GALE01",
+    );
+    let input = LaunchReadinessInput::Plan {
+        plan,
+        retroarch_scanned: false,
+        standalone_scans_complete: true,
+        dolphin: Some(ready.context),
+        pcsx2: None,
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
+    };
+    assert!(matches!(
+        gamer_play_action(&input),
+        GamerPlayAction::Launch(request)
+            if matches!(request.as_ref(), TypedLaunchRequest::Dolphin(_))
+    ));
+}
+
+#[test]
+fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
+    let mut candidate = pcsx2_candidate("missing", Path::new("/library/game.iso"));
+    candidate.readiness = LaunchReadiness::Blocked;
+    candidate.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::NoInstallationCandidate,
+        "no PCSX2 installation was discovered",
+    ));
+    let plan = pcsx2_plan_with(vec![candidate]);
+    let action = gamer_play_action(&LaunchReadinessInput::Plan {
+        plan,
+        retroarch_scanned: false,
+        standalone_scans_complete: true,
+        dolphin: None,
+        pcsx2: None,
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
+    });
+    assert!(matches!(
+        action,
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::EmulatorNotInstalled,
+            emulator: Some(emulator),
+            ..
+        }) if emulator == "PCSX2"
+    ));
+
+    let mut candidate = pcsx2_candidate("broken", Path::new("/library/game.iso"));
+    candidate.readiness = LaunchReadiness::Blocked;
+    candidate.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::Pcsx2BindingUnavailable,
+        "PCSX2 executable binding is incomplete",
+    ));
+    let action = gamer_play_action(&LaunchReadinessInput::Plan {
+        plan: pcsx2_plan_with(vec![candidate]),
+        retroarch_scanned: false,
+        standalone_scans_complete: true,
+        dolphin: None,
+        pcsx2: None,
+        duckstation: None,
+        ppsspp: None,
+        rpcs3: None,
+        xemu: None,
+        xenia: None,
+    });
+    assert!(matches!(
+        action,
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::EmulatorSetupIncomplete,
+            emulator: Some(emulator),
+            ..
+        }) if emulator == "PCSX2"
+    ));
+}
+
+#[test]
+fn gamer_blockers_route_identity_content_choice_and_no_safe_states() {
+    assert!(matches!(
+        gamer_play_action(&LaunchReadinessInput::IdentityUnknown),
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::UnknownSystem,
+            ..
+        })
+    ));
+    assert!(matches!(
+        gamer_play_action(&LaunchReadinessInput::IdentityConflicting),
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::ConflictingIdentity,
+            ..
+        })
+    ));
+    assert!(matches!(
+        gamer_play_action(&LaunchReadinessInput::EvidenceNotLoaded),
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::CheckingGame,
+            ..
+        })
+    ));
+
+    let mut content_candidate = ready_candidate();
+    content_candidate.readiness = LaunchReadiness::Blocked;
+    content_candidate.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::ContentNotResolved,
+        "content needs preparation",
+    ));
+    assert!(matches!(
+        gamer_play_action(&plan_input(plan_with(vec![content_candidate]))),
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::ContentNeedsPreparation,
+            ..
+        })
+    ));
+
+    let mut second = ready_candidate();
+    second.target = LaunchTarget::RetroArchCore {
+        profile: retroarch_profile(),
+        core_stem: "another_core".to_string(),
+        platform_id: "PSX",
+    };
+    second.preference = CandidatePreference::Undetermined;
+    let mut first = ready_candidate();
+    first.preference = CandidatePreference::Undetermined;
+    assert!(matches!(
+        gamer_play_action(&plan_input(plan_with(vec![first, second]))),
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::MultipleChoices,
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        gamer_play_action(&plan_input(plan_with(Vec::new()))),
+        GamerPlayAction::BlockedTyped(GamerBlocker {
+            kind: GamerBlockerKind::NoSafeEmulator,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn typed_launch_request_keeps_adapter_dispatch_typed_without_shell_text() {
+    let action = gamer_play_action(&plan_input(plan_with(vec![ready_candidate()])));
+    let GamerPlayAction::Launch(request) = action else {
+        panic!("ready candidate must produce a typed launch request");
+    };
+    assert_eq!(request.adapter_name(), "RetroArch");
+    let TypedLaunchRequest::RetroArch(request) = *request else {
+        panic!("the request must remain a RetroArch typed request");
+    };
+    assert_eq!(
+        request.selected_content_path,
+        PathBuf::from("/library/Game.bin")
+    );
 }
 
 // --- firmware-blocked candidate ----------------------------------------------

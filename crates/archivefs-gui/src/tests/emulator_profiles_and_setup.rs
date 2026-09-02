@@ -107,7 +107,9 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
         },
         core_stem: "gambatte".to_string(),
     };
-    let play_action = launch_readiness_page::GamerPlayAction::Ready(request.clone());
+    let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone()),
+    ));
     let ctx = egui::Context::default();
     let mut cover_requests = Vec::new();
     let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
@@ -148,6 +150,9 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                         preparation_message: None,
                         play_action: &play_action,
                         retroarch_launch_state: &mut launch_state,
+                        dolphin_launch_state: &mut app.launch_dolphin,
+                        pcsx2_launch_state: &mut app.launch_pcsx2,
+                        standalone_launch_state: &mut app.launch_standalone,
                     },
                 );
             });
@@ -186,6 +191,10 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     });
     let Some(GamerViewAction::Play(clicked_request)) = action else {
         panic!("clicking Play must return GamerViewAction::Play (real launch wiring)");
+    };
+    let launch_readiness_page::TypedLaunchRequest::RetroArch(clicked_request) = *clicked_request
+    else {
+        panic!("RetroArch Gamer View card must return a RetroArch typed request");
     };
     assert_eq!(clicked_request, request);
 }
@@ -248,6 +257,9 @@ fn render_gamer_card_with_launch_state(
                     preparation_message: None,
                     play_action,
                     retroarch_launch_state: launch_state,
+                    dolphin_launch_state: &mut app.launch_dolphin,
+                    pcsx2_launch_state: &mut app.launch_pcsx2,
+                    standalone_launch_state: &mut app.launch_standalone,
                 },
             );
         });
@@ -256,18 +268,21 @@ fn render_gamer_card_with_launch_state(
 
 #[test]
 fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
-    let play_action = launch_readiness_page::GamerPlayAction::Ready(
-        archivefs_core::launch::RetroArchLaunchRequest {
-            selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
-            expected_platform_id: "Game Boy".to_string(),
-            expected_game_key: "k".to_string(),
-            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
-                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
-                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+    let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
+        launch_readiness_page::TypedLaunchRequest::RetroArch(
+            archivefs_core::launch::RetroArchLaunchRequest {
+                selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
+                expected_platform_id: "Game Boy".to_string(),
+                expected_game_key: "k".to_string(),
+                profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                    profile_kind:
+                        archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                    scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+                },
+                core_stem: "gambatte".to_string(),
             },
-            core_stem: "gambatte".to_string(),
-        },
-    );
+        ),
+    ));
     let output = render_gamer_card(MountState::NotMountable, "Game Boy", &play_action);
     assert!(rendered_text_contains(&output, "Ready to play"));
     assert!(rendered_text_contains(&output, "Play"));
@@ -288,7 +303,9 @@ fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
         },
         core_stem: "gambatte".to_string(),
     };
-    let play_action = launch_readiness_page::GamerPlayAction::Ready(request.clone());
+    let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone()),
+    ));
     let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
     launch_state.start(request);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -324,22 +341,25 @@ fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
 fn gamer_card_blocked_launch_shows_needs_setup_never_ready_to_play() {
     // The exact projection the live Game Boy QA item produces: media is
     // usable (NotMountable loose ROM), but no safe RetroArch core.
-    let play_action = launch_readiness_page::GamerPlayAction::Blocked(
-        "Can’t play yet: no safe RetroArch launch option is available.".to_string(),
-    );
+    let play_action =
+        launch_readiness_page::GamerPlayAction::BlockedTyped(launch_readiness_page::GamerBlocker {
+            kind: launch_readiness_page::GamerBlockerKind::NoSafeEmulator,
+            emulator: None,
+            detail: "no safe emulator launch candidate is available".to_string(),
+        });
     let output = render_gamer_card(MountState::NotMountable, "Game Boy", &play_action);
 
     assert!(rendered_text_contains(&output, "Needs setup"));
     assert!(rendered_text_contains(
         &output,
-        "RetroArch needs setup for this game."
+        "No safe emulator available"
     ));
     assert!(!rendered_text_contains(
         &output,
-        "no safe RetroArch launch option is available."
+        "no safe emulator launch candidate is available"
     ));
     assert!(rendered_text_contains(&output, "Technical details"));
-    assert!(rendered_text_contains(&output, "Open Emulator Setup"));
+    assert!(rendered_text_contains(&output, "Check Emulators"));
 
     // The contradiction Journey D is about must be impossible.
     assert!(!rendered_text_contains(&output, "Ready to play"));
@@ -353,18 +373,21 @@ fn gamer_card_blocked_launch_shows_needs_setup_never_ready_to_play() {
 #[test]
 fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
     // A Ready launch plan must not override a media/mount blocker.
-    let play_action = launch_readiness_page::GamerPlayAction::Ready(
-        archivefs_core::launch::RetroArchLaunchRequest {
-            selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
-            expected_platform_id: "Game Boy".to_string(),
-            expected_game_key: "k".to_string(),
-            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
-                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
-                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+    let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
+        launch_readiness_page::TypedLaunchRequest::RetroArch(
+            archivefs_core::launch::RetroArchLaunchRequest {
+                selected_content_path: PathBuf::from("/roms/journey-d-game.gb"),
+                expected_platform_id: "Game Boy".to_string(),
+                expected_game_key: "k".to_string(),
+                profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                    profile_kind:
+                        archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                    scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+                },
+                core_stem: "gambatte".to_string(),
             },
-            core_stem: "gambatte".to_string(),
-        },
-    );
+        ),
+    ));
     let output = render_gamer_card(MountState::MountPathExists, "Game Boy", &play_action);
     assert!(rendered_text_contains(&output, "Needs attention"));
     assert!(rendered_text_contains(
@@ -393,10 +416,9 @@ fn first_text_shape_rect(output: &egui::FullOutput, needle: &str) -> Option<egui
 }
 
 #[test]
-fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
-    // Increment 4: the blocked-launch card's "Open Emulator Setup" button
-    // must produce a structured RetroArch focus target, never a
-    // text-parsed one.
+fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
+    // A generic no-safe-candidate blocker routes to the existing emulator
+    // check, rather than pretending that RetroArch is the cause.
     let mut app = app_for_operation_tests();
     let path = PathBuf::from("/roms/journey-4-game.gb");
     let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
@@ -405,9 +427,12 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
     app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![game])));
     app.archive_context.select_only(path.clone());
 
-    let play_action = launch_readiness_page::GamerPlayAction::Blocked(
-        "Can’t play yet: no safe RetroArch launch option is available.".to_string(),
-    );
+    let play_action =
+        launch_readiness_page::GamerPlayAction::BlockedTyped(launch_readiness_page::GamerBlocker {
+            kind: launch_readiness_page::GamerBlockerKind::NoSafeEmulator,
+            emulator: None,
+            detail: "no safe emulator launch candidate is available".to_string(),
+        });
 
     let ctx = egui::Context::default();
     let screen = egui::vec2(1400.0, 900.0);
@@ -450,6 +475,9 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
                         preparation_message: None,
                         play_action: &play_action,
                         retroarch_launch_state: &mut launch_state,
+                        dolphin_launch_state: &mut app.launch_dolphin,
+                        pcsx2_launch_state: &mut app.launch_pcsx2,
+                        standalone_launch_state: &mut app.launch_standalone,
                     },
                 );
             });
@@ -458,8 +486,8 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
     };
 
     let (first, _) = frame(base.clone());
-    let button_rect = first_text_shape_rect(&first, "Open Emulator Setup")
-        .expect("the NeedsSetup card must render an Open Emulator Setup button");
+    let button_rect = first_text_shape_rect(&first, "Check Emulators")
+        .expect("the NeedsSetup card must render a Check Emulators button");
     let pos = button_rect.center();
 
     let _ = frame(egui::RawInput {
@@ -484,10 +512,10 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
     assert!(
         matches!(
             &action,
-            Some(GamerViewAction::OpenEmulatorSetup(picked, EmulatorSetupFocus::RetroArch))
+            Some(GamerViewAction::CheckEmulators(picked))
                 if picked == &path
         ),
-        "expected OpenEmulatorSetup(path, RetroArch) from the NeedsSetup button"
+        "expected CheckEmulators(path) from the NeedsSetup button"
     );
 }
 
@@ -495,7 +523,11 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
 fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
     use launch_readiness_page::GamerPlayAction;
 
-    let blocked = GamerPlayAction::Blocked("Can’t play yet: nope.".to_string());
+    let blocked = GamerPlayAction::BlockedTyped(launch_readiness_page::GamerBlocker {
+        kind: launch_readiness_page::GamerBlockerKind::NoSafeEmulator,
+        emulator: None,
+        detail: "nope".to_string(),
+    });
     assert!(matches!(
         gamer_readiness(MountState::NotMountable, &blocked),
         GamerReadiness::NeedsSetup { .. }
@@ -505,16 +537,21 @@ fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
         "Needs setup"
     );
 
-    let ready = GamerPlayAction::Ready(archivefs_core::launch::RetroArchLaunchRequest {
-        selected_content_path: PathBuf::from("/x"),
-        expected_platform_id: "Game Boy".to_string(),
-        expected_game_key: "k".to_string(),
-        profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
-            profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
-            scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
-        },
-        core_stem: "gambatte".to_string(),
-    });
+    let ready = GamerPlayAction::Launch(Box::new(
+        launch_readiness_page::TypedLaunchRequest::RetroArch(
+            archivefs_core::launch::RetroArchLaunchRequest {
+                selected_content_path: PathBuf::from("/x"),
+                expected_platform_id: "Game Boy".to_string(),
+                expected_game_key: "k".to_string(),
+                profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                    profile_kind:
+                        archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                    scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+                },
+                core_stem: "gambatte".to_string(),
+            },
+        ),
+    ));
     assert!(matches!(
         gamer_readiness(MountState::NotMountable, &ready),
         GamerReadiness::Ready { .. }

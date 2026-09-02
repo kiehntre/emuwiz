@@ -6649,10 +6649,11 @@ impl ArchiveFsApp {
         // after a repair-action navigation may scroll the relevant card
         // into view, and every later frame (and any manual scroll) is left
         // alone. Sidebar/Home navigation never sets this, so it is `None`.
-        let focus_retroarch = matches!(
-            self.emulator_setup_focus.take(),
-            Some(EmulatorSetupFocus::RetroArch)
-        );
+        let (focus_retroarch, focus_emulator) = match self.emulator_setup_focus.take() {
+            Some(EmulatorSetupFocus::RetroArch) => (true, None),
+            Some(EmulatorSetupFocus::Emulator(name)) => (false, Some(name)),
+            None => (false, None),
+        };
         // RetroArch has a dedicated, cached discovery lane because its
         // profile/environment scan is also used by Cheats & Mods. Starting
         // it here makes Emulator Setup truthful on first use without moving
@@ -6668,7 +6669,12 @@ impl ArchiveFsApp {
              for each one. This page keeps library diagnostics out of the way.",
         );
         ui.add_space(theme::SECTION_GAP);
-        show_emulator_setup_summary(ui, self.doctor_scan.displayed(), &self.retroarch_profiles);
+        show_emulator_setup_summary(
+            ui,
+            self.doctor_scan.displayed(),
+            &self.retroarch_profiles,
+            focus_emulator.as_deref(),
+        );
         ui.add_space(theme::SECTION_GAP);
         // The managed-emulator download section is progressive disclosure:
         // it appears only after the readiness check has run, so the
@@ -6686,6 +6692,7 @@ impl ArchiveFsApp {
             ui: &mut egui::Ui,
             outcome: Option<&DoctorScanOutcome>,
             retroarch_profiles: &RetroArchProfilesState,
+            focused_emulator: Option<&str>,
         ) {
             widgets::card(ui, |ui| {
                 ui.heading("Emulator readiness");
@@ -6727,6 +6734,10 @@ impl ArchiveFsApp {
                     if matching.is_none() && name != "RetroArch" {
                         not_found.push(name);
                         continue;
+                    }
+                    let focused = focused_emulator == Some(name);
+                    if focused {
+                        ui.scroll_to_cursor(Some(egui::Align::Center));
                     }
                     ui.group(|ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -6835,12 +6846,17 @@ impl ArchiveFsApp {
                         }
                     });
                 }
+                let focus_is_not_found =
+                    focused_emulator.is_some_and(|focused| not_found.contains(&focused));
                 if !not_found.is_empty() {
                     egui::CollapsingHeader::new("Other supported emulators")
                         .id_salt("emulator-setup-not-found")
-                        .default_open(false)
+                        .default_open(focus_is_not_found)
                         .show(ui, |ui| {
                             for name in not_found {
+                                if focused_emulator == Some(name) {
+                                    ui.scroll_to_cursor(Some(egui::Align::Center));
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label(name);
                                     widgets::status_badge(
@@ -7112,8 +7128,9 @@ impl ArchiveFsApp {
 
     /// Gathers exactly what [`launch_readiness_page::show_launch_readiness_panel`]
     /// needs from state this app already has - never adds any new
-    /// app-level state, and never calls the planner unless both real
-    /// prerequisites (evidence loaded, RetroArch scanned) already hold.
+    /// app-level state. RetroArch discovery is optional here: a standalone
+    /// adapter can make a complete plan while the independent RetroArch lane
+    /// is still pending.
     ///
     /// The `GameIdentityReport` comes from the selected evidence worker and
     /// is only trusted when its exact path matches the focused archive. This
@@ -7131,8 +7148,18 @@ impl ArchiveFsApp {
         ) {
             return LaunchReadinessInput::EvidenceNotLoaded;
         }
-        let RetroArchProfilesState::Ready(discovery) = &self.retroarch_profiles else {
-            return LaunchReadinessInput::RetroArchNotScanned;
+        let retroarch_scanned = matches!(self.retroarch_profiles, RetroArchProfilesState::Ready(_));
+        let empty_retroarch =
+            archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport {
+                format_version: 2,
+                profiles: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+        let retroarch_environment = match &self.retroarch_profiles {
+            RetroArchProfilesState::Ready(discovery) => &discovery.environment,
+            RetroArchProfilesState::NotScanned
+            | RetroArchProfilesState::Scanning { .. }
+            | RetroArchProfilesState::Error(_) => &empty_retroarch,
         };
 
         let focused = self.archive_context.focused.as_deref();
@@ -7572,15 +7599,50 @@ impl ArchiveFsApp {
             None
         };
 
+        let standalone_scans_complete = match &identity_status {
+            archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) => {
+                match identity.platform_id.as_str() {
+                    "GameCube" | "Wii" => {
+                        matches!(
+                            self.dolphin_local_profiles,
+                            DolphinLocalProfilesState::Ready(_)
+                        )
+                    }
+                    "PS2" => matches!(
+                        self.pcsx2_launch_profiles,
+                        Pcsx2LaunchProfilesState::Ready(_)
+                    ),
+                    "Xbox360" => matches!(self.xenia_profiles, XeniaProfilesState::Ready(_)),
+                    // These lanes are already discovered synchronously by
+                    // this read-only input builder using their existing
+                    // adapter roots.
+                    "PSX" | "PSP" | "PS3" | "Xbox" => true,
+                    _ => true,
+                }
+            }
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+            | archivefs_core::launch::CanonicalIdentityStatus::Conflicting => false,
+        };
+
+        let remembered: Vec<archivefs_core::launch::RememberedPreference> = self
+            .remembered_emulator_profiles
+            .iter()
+            .map(|profile| archivefs_core::launch::RememberedPreference {
+                adapter_id: profile.adapter.clone(),
+                profile_id: profile.profile_id.clone(),
+            })
+            .collect();
         let plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
             &standalone_profiles,
-            &discovery.environment,
-            &[],
+            retroarch_environment,
+            &remembered,
         );
         LaunchReadinessInput::Plan {
             plan,
+            retroarch_scanned,
+            standalone_scans_complete,
             dolphin: dolphin_context,
             pcsx2: pcsx2_context,
             duckstation: duckstation_context,
@@ -18308,6 +18370,9 @@ impl ArchiveFsApp {
                             preparation_message,
                             play_action: &gamer_play_action,
                             retroarch_launch_state: &mut self.launch_retroarch,
+                            dolphin_launch_state: &mut self.launch_dolphin,
+                            pcsx2_launch_state: &mut self.launch_pcsx2,
+                            standalone_launch_state: &mut self.launch_standalone,
                         },
                     );
                     // Started only once the list has actually asked for something,
@@ -18338,7 +18403,12 @@ impl ArchiveFsApp {
                             );
                         }
                         Some(GamerViewAction::Play(request)) => {
-                            self.launch_retroarch.start(request);
+                            request.start(
+                                &mut self.launch_retroarch,
+                                &mut self.launch_dolphin,
+                                &mut self.launch_pcsx2,
+                                &mut self.launch_standalone,
+                            );
                         }
                         Some(GamerViewAction::Operation(request)) => {
                             if matches!(
@@ -18391,6 +18461,16 @@ impl ArchiveFsApp {
                         }
                         Some(GamerViewAction::ReviewIdentity(archive_path)) => {
                             self.review_identity(archive_path);
+                        }
+                        Some(GamerViewAction::OpenLaunchChoices(archive_path)) => {
+                            self.review_identity(archive_path);
+                        }
+                        Some(GamerViewAction::CheckEmulators(archive_path)) => {
+                            self.archive_context.select_only(archive_path);
+                            self.ui_mode = GuiMode::AdvancedView;
+                            save_gui_mode(self.ui_mode);
+                            self.start_doctor_scan(context.clone());
+                            self.navigate_to_main_view(MainView::EmulatorSetup);
                         }
                         Some(GamerViewAction::OpenEmulatorSetup(archive_path, focus)) => {
                             self.open_emulator_setup_for(archive_path, focus);

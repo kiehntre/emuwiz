@@ -8,20 +8,16 @@
 //! any of those itself - see `main.rs`'s `MainView::Selected` branch for
 //! where the plan is assembled and handed in as [`LaunchReadinessInput`].
 //!
-//! # Launch RetroArch (Phase 1)
+//! # Typed launches
 //!
-//! Exactly one explicit action exists here: a "Launch RetroArch" button,
-//! shown only for a candidate within the narrow slice
-//! [`archivefs_core::launch::execution`] already supports (see
-//! [`retroarch_launch_request`] for the exact eligibility rule, which is
-//! also what builds the [`RetroArchLaunchRequest`] sent to core - the same
-//! function decides both, so the button can never show for a request core
-//! would refuse). The click itself is the user's authorization; no second
-//! confirmation dialog is shown. Preflight and spawn happen on a
-//! background thread via [`preflight_and_launch_retroarch`] and are polled
-//! non-blockingly through [`RetroArchLaunchState::poll`] - this module
-//! never builds a command line or trusts the plan's cached readiness as
-//! execution authority; core re-validates everything fresh.
+//! Gamer View and the Selected page expose only typed launch requests for
+//! candidates whose existing adapter and preflight path can execute them.
+//! RetroArch, Dolphin, PCSX2, and the supported standalone adapters each
+//! retain their own typed request/state/executor path. The click itself is
+//! the user's authorization; preflight and spawn happen on background
+//! threads and are polled non-blockingly. This module never builds a shell
+//! command or trusts cached readiness as execution authority; each adapter
+//! re-validates everything fresh.
 //!
 //! # What this module is not
 //!
@@ -33,9 +29,9 @@
 //!   [`archivefs_core::launch::evidence_bridge`] for where those honest
 //!   fail-closed rules actually live; this module only renders whatever
 //!   that bridge already decided.
-//! - It never launches a Flatpak/AppImage/standalone-emulator candidate,
-//!   archive/mounted content, or a `ReadyWithWarnings`/`Blocked` candidate
-//!   - see [`retroarch_launch_request`].
+//! - It never launches a Flatpak/AppImage candidate, archive/mounted
+//!   content, or a `ReadyWithWarnings`/`Blocked` candidate. Standalone
+//!   candidates are limited to adapters with an existing typed GUI executor.
 //! - It never exposes a Stop/Kill action and never automatically relaunches
 //!   a process that has exited.
 
@@ -51,10 +47,10 @@ use archivefs_core::emulator_environment::retroarch::{
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
     DolphinLaunchExitReport, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
-    DolphinLaunchSpawnError, FirmwareReadiness, LaunchBlocker, LaunchCandidate,
+    DolphinLaunchSpawnError, FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchCandidate,
     LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
     LaunchPreflightErrorKind, LaunchReadiness, LaunchSpawnError, LaunchTarget, LaunchWarning,
-    LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
+    LaunchWarningKind, LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError, Pcsx2LaunchExitReport,
     Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest, Pcsx2LaunchSpawnError,
     RetroArchLaunchRequest, preflight_and_launch_dolphin, preflight_and_launch_pcsx2,
@@ -93,6 +89,7 @@ pub(crate) enum LaunchReadinessInput {
     /// `RetroArchProfilesState` is not `Ready` - RetroArch profiles/cores
     /// have never been scanned. The planner is never called in this state,
     /// and this panel never triggers a scan itself.
+    #[allow(dead_code)]
     RetroArchNotScanned,
     /// `CanonicalIdentityStatus::Unknown` - identity could not be resolved
     /// at all.
@@ -102,6 +99,12 @@ pub(crate) enum LaunchReadinessInput {
     /// Identity was resolved and a real [`LaunchPlan`] was built.
     Plan {
         plan: LaunchPlan,
+        /// Whether the RetroArch environment was actually discovered. An
+        /// unscanned RetroArch lane must not hide a ready standalone lane.
+        retroarch_scanned: bool,
+        /// Whether the standalone lane relevant to this platform has
+        /// completed its existing discovery check.
+        standalone_scans_complete: bool,
         /// The already-discovered Dolphin profile data (and the roots that
         /// discovery ran against) `plan`'s Dolphin standalone candidate, if
         /// any, was built from - `None` while that discovery has not
@@ -131,48 +134,198 @@ pub(crate) enum LaunchReadinessInput {
     },
 }
 
+/// One exact adapter request selected by the shared launch plan. Gamer View
+/// carries this typed value to the existing executor; it never constructs a
+/// shell command or re-selects an emulator at click time.
+#[derive(Clone)]
+pub(crate) enum TypedLaunchRequest {
+    RetroArch(RetroArchLaunchRequest),
+    Dolphin(DolphinLaunchRequest),
+    Pcsx2(Pcsx2LaunchRequest, Vec<FirmwareIdentityRecord>),
+    Standalone(StandaloneLaunchRequest),
+}
+
+impl TypedLaunchRequest {
+    pub(crate) fn adapter_name(&self) -> &'static str {
+        match self {
+            Self::RetroArch(_) => "RetroArch",
+            Self::Dolphin(_) => "Dolphin",
+            Self::Pcsx2(_, _) => "PCSX2",
+            Self::Standalone(request) => request.adapter_name(),
+        }
+    }
+
+    pub(crate) fn start(
+        self,
+        retroarch: &mut RetroArchLaunchState,
+        dolphin: &mut DolphinLaunchState,
+        pcsx2: &mut Pcsx2LaunchState,
+        standalone: &mut StandaloneLaunchState,
+    ) {
+        match self {
+            Self::RetroArch(request) => retroarch.start(request),
+            Self::Dolphin(request) => dolphin.start(request),
+            Self::Pcsx2(request, evidence) => pcsx2.start(request, evidence),
+            Self::Standalone(request) => standalone.start(request),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GamerBlockerKind {
+    CheckingGame,
+    UnknownSystem,
+    ConflictingIdentity,
+    ContentNeedsPreparation,
+    EmulatorNotInstalled,
+    EmulatorSetupIncomplete,
+    EmulatorNotChecked,
+    NoSafeEmulator,
+    MultipleChoices,
+    LaunchPlanInvalid,
+}
+
+/// Structured Gamer View blocker presentation. `detail` is the planner's
+/// technical reason; `kind` and `emulator` determine the novice heading and
+/// next action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GamerBlocker {
+    pub(crate) kind: GamerBlockerKind,
+    pub(crate) emulator: Option<String>,
+    pub(crate) detail: String,
+}
+
+impl GamerBlocker {
+    fn new(kind: GamerBlockerKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            emulator: None,
+            detail: detail.into(),
+        }
+    }
+
+    fn for_emulator(kind: GamerBlockerKind, emulator: &str, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            emulator: Some(emulator.to_string()),
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn heading(&self) -> String {
+        match (&self.kind, self.emulator.as_deref()) {
+            (GamerBlockerKind::CheckingGame, _) => "Checking this game".into(),
+            (GamerBlockerKind::UnknownSystem, _) => "Identify game system".into(),
+            (GamerBlockerKind::ConflictingIdentity, _) => "Resolve conflicting identity".into(),
+            (GamerBlockerKind::ContentNeedsPreparation, _) => "Prepare game".into(),
+            (GamerBlockerKind::EmulatorNotInstalled, Some(name)) => {
+                format!("{name} is not installed")
+            }
+            (GamerBlockerKind::EmulatorSetupIncomplete, Some(name)) => {
+                format!("{name} needs setup")
+            }
+            (GamerBlockerKind::EmulatorNotChecked, _) => "Check emulators".into(),
+            (GamerBlockerKind::NoSafeEmulator, _) => "No safe emulator available".into(),
+            (GamerBlockerKind::MultipleChoices, _) => "Choose how to play".into(),
+            (GamerBlockerKind::LaunchPlanInvalid, _) => "Launch plan invalid".into(),
+            (_, None) => "Can’t play yet".into(),
+        }
+    }
+}
+
 pub(crate) enum GamerPlayAction {
-    Ready(RetroArchLaunchRequest),
-    Blocked(String),
+    Launch(Box<TypedLaunchRequest>),
+    BlockedTyped(GamerBlocker),
 }
 
 /// Projects the same shared launch plan used by Advanced View into Gamer
 /// View's single primary action. This is presentation only: a Ready result
-/// carries the exact request that the existing RetroArch executor preflights
-/// again before spawning anything.
+/// carries the exact typed request that the selected adapter preflights again
+/// before spawning anything.
 pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction {
-    let LaunchReadinessInput::Plan { plan, .. } = input else {
-        return GamerPlayAction::Blocked(match input {
-            LaunchReadinessInput::EvidenceNotLoaded => {
-                "Identity evidence is still loading.".to_string()
-            }
-            LaunchReadinessInput::RetroArchNotScanned => {
-                "RetroArch has not been checked yet.".to_string()
-            }
-            LaunchReadinessInput::IdentityUnknown => {
-                "Can’t play yet: game identity could not be verified.".to_string()
-            }
-            LaunchReadinessInput::IdentityConflicting => {
-                "Can’t play yet: game identity evidence conflicts.".to_string()
-            }
+    let LaunchReadinessInput::Plan {
+        plan,
+        retroarch_scanned,
+        standalone_scans_complete,
+        dolphin,
+        pcsx2,
+        duckstation,
+        ppsspp,
+        rpcs3,
+        xemu,
+        xenia,
+        ..
+    } = input
+    else {
+        return GamerPlayAction::BlockedTyped(match input {
+            LaunchReadinessInput::EvidenceNotLoaded => GamerBlocker::new(
+                GamerBlockerKind::CheckingGame,
+                "Identity evidence is still loading.",
+            ),
+            LaunchReadinessInput::RetroArchNotScanned => GamerBlocker::new(
+                GamerBlockerKind::EmulatorNotChecked,
+                "RetroArch has not been checked yet.",
+            ),
+            LaunchReadinessInput::IdentityUnknown => GamerBlocker::new(
+                GamerBlockerKind::UnknownSystem,
+                "Game identity could not be resolved.",
+            ),
+            LaunchReadinessInput::IdentityConflicting => GamerBlocker::new(
+                GamerBlockerKind::ConflictingIdentity,
+                "Game identity evidence conflicts.",
+            ),
             LaunchReadinessInput::Plan { .. } => unreachable!(),
         });
     };
-    for candidate in &plan.candidates {
-        if matches!(candidate.target, LaunchTarget::RetroArchCore { .. }) {
-            if let Some(request) = retroarch_launch_request(plan, candidate) {
-                return GamerPlayAction::Ready(request);
-            }
-            if let Some(blocker) = candidate.blockers.first() {
-                return GamerPlayAction::Blocked(format!("Can’t play yet: {}", blocker.detail));
-            }
-            if let Some(warning) = candidate.warnings.first() {
-                return GamerPlayAction::Blocked(format!("Can’t play yet: {}", warning.detail));
-            }
-            return GamerPlayAction::Blocked("Can’t play yet: RetroArch core is not ready.".into());
-        }
+
+    let has_remembered = plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.preference == CandidatePreference::Remembered);
+    let has_sole_eligible = plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.preference == CandidatePreference::SoleEligible);
+    let requests: Vec<TypedLaunchRequest> = plan
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            (!has_remembered && !has_sole_eligible)
+                || (has_remembered && candidate.preference == CandidatePreference::Remembered)
+                || (!has_remembered
+                    && has_sole_eligible
+                    && candidate.preference == CandidatePreference::SoleEligible)
+        })
+        .filter_map(|candidate| {
+            typed_launch_request(
+                plan,
+                candidate,
+                dolphin.as_ref(),
+                pcsx2.as_ref(),
+                duckstation.as_ref(),
+                ppsspp.as_ref(),
+                rpcs3.as_ref(),
+                xemu.as_ref(),
+                xenia.as_ref(),
+            )
+        })
+        .collect();
+    if requests.len() == 1 {
+        return GamerPlayAction::Launch(Box::new(
+            requests.into_iter().next().expect("one request"),
+        ));
     }
-    GamerPlayAction::Blocked("Can’t play yet: no safe RetroArch launch option is available.".into())
+    if requests.len() > 1 {
+        return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+            GamerBlockerKind::MultipleChoices,
+            "More than one safe emulator choice is available; choose one explicitly.",
+        ));
+    }
+    GamerPlayAction::BlockedTyped(gamer_blocker_for_plan(
+        plan,
+        *retroarch_scanned,
+        *standalone_scans_complete,
+    ))
 }
 
 pub(crate) struct DuckStationLaunchContext {
@@ -288,7 +441,8 @@ impl StandaloneLaunchState {
     }
 }
 
-enum StandaloneLaunchRequest {
+#[derive(Clone)]
+pub(crate) enum StandaloneLaunchRequest {
     DuckStation(
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -313,6 +467,16 @@ enum StandaloneLaunchRequest {
 }
 
 impl StandaloneLaunchRequest {
+    fn adapter_name(&self) -> &'static str {
+        match self {
+            Self::DuckStation(_, _, _) => "DuckStation",
+            Self::Ppsspp(_, _) => "PPSSPP",
+            Self::Rpcs3(_, _) => "RPCS3",
+            Self::Xemu(_, _) => "xemu",
+            Self::Xenia(_, _) => "Xenia",
+        }
+    }
+
     fn key(&self) -> (PathBuf, String) {
         match self {
             Self::DuckStation(r, _, _) => (r.selected_content_path.clone(), "duckstation".into()),
@@ -1318,6 +1482,7 @@ pub(crate) fn show_launch_readiness_panel(
             rpcs3,
             xemu,
             xenia,
+            ..
         } => show_plan(
             ui,
             plan,
@@ -1583,6 +1748,215 @@ fn standalone_launch_request(
         }
         _ => None,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_launch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    dolphin: Option<&DolphinLaunchContext>,
+    pcsx2: Option<&Pcsx2LaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
+    ppsspp: Option<&PpssppLaunchContext>,
+    rpcs3: Option<&Rpcs3LaunchContext>,
+    xemu: Option<&XemuLaunchContext>,
+    xenia: Option<&XeniaLaunchContext>,
+) -> Option<TypedLaunchRequest> {
+    if let Some(request) = retroarch_launch_request(plan, candidate) {
+        return Some(TypedLaunchRequest::RetroArch(request));
+    }
+    if let Some(context) = dolphin
+        && let Some(request) = dolphin_launch_request(plan, candidate, context)
+    {
+        return Some(TypedLaunchRequest::Dolphin(request));
+    }
+    if let Some(context) = pcsx2
+        && let Some(request) = pcsx2_launch_request(plan, candidate, context)
+    {
+        return Some(TypedLaunchRequest::Pcsx2(
+            request,
+            context.firmware_evidence.clone(),
+        ));
+    }
+    standalone_launch_request(plan, candidate, duckstation, ppsspp, rpcs3, xemu, xenia)
+        .map(TypedLaunchRequest::Standalone)
+}
+
+fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> {
+    match &candidate.target {
+        LaunchTarget::Standalone { adapter_id, .. } => match *adapter_id {
+            "duckstation" => Some("DuckStation"),
+            "pcsx2" => Some("PCSX2"),
+            "ppsspp" => Some("PPSSPP"),
+            "rpcs3" => Some("RPCS3"),
+            "xemu" => Some("xemu"),
+            "xenia" => Some("Xenia"),
+            "dolphin" => Some("Dolphin"),
+            _ => None,
+        },
+        LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),
+    }
+}
+
+fn gamer_blocker_for_plan(
+    plan: &LaunchPlan,
+    retroarch_scanned: bool,
+    standalone_scans_complete: bool,
+) -> GamerBlocker {
+    let platform_has_standalone = plan
+        .platform_id
+        .as_deref()
+        .and_then(archivefs_core::launch::launch_compatibility_for_platform)
+        .is_some_and(|compatibility| !compatibility.standalone_adapters.is_empty());
+
+    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
+        candidate.blockers.iter().any(|blocker| {
+            matches!(
+                blocker.kind,
+                LaunchBlockerKind::ContentNotResolved
+                    | LaunchBlockerKind::DolphinContentFormatUnsupported
+                    | LaunchBlockerKind::Pcsx2ContentFormatUnsupported
+                    | LaunchBlockerKind::DuckStationContentFormatUnsupported
+                    | LaunchBlockerKind::PpssppContentFormatUnsupported
+                    | LaunchBlockerKind::Rpcs3ContentFormatUnsupported
+                    | LaunchBlockerKind::XemuContentFormatUnsupported
+                    | LaunchBlockerKind::XeniaContentFormatUnsupported
+            )
+        })
+    }) {
+        let detail = candidate
+            .blockers
+            .iter()
+            .find(|blocker| {
+                matches!(
+                    blocker.kind,
+                    LaunchBlockerKind::ContentNotResolved
+                        | LaunchBlockerKind::DolphinContentFormatUnsupported
+                        | LaunchBlockerKind::Pcsx2ContentFormatUnsupported
+                        | LaunchBlockerKind::DuckStationContentFormatUnsupported
+                        | LaunchBlockerKind::PpssppContentFormatUnsupported
+                        | LaunchBlockerKind::Rpcs3ContentFormatUnsupported
+                        | LaunchBlockerKind::XemuContentFormatUnsupported
+                        | LaunchBlockerKind::XeniaContentFormatUnsupported
+                )
+            })
+            .map(|blocker| blocker.detail.clone())
+            .unwrap_or_else(|| "game content needs preparation".into());
+        return GamerBlocker::new(GamerBlockerKind::ContentNeedsPreparation, detail);
+    }
+
+    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
+        candidate.preference == CandidatePreference::Undetermined
+            && (candidate
+                .blockers
+                .iter()
+                .any(|blocker| matches!(blocker.kind, LaunchBlockerKind::AmbiguousCore))
+                || candidate
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.kind == LaunchWarningKind::MultipleEligibleProfiles))
+    }) {
+        let detail = candidate
+            .blockers
+            .first()
+            .map(|blocker| blocker.detail.clone())
+            .or_else(|| {
+                candidate
+                    .warnings
+                    .first()
+                    .map(|warning| warning.detail.clone())
+            })
+            .unwrap_or_else(|| "more than one safe launch choice is available".into());
+        return GamerBlocker::new(GamerBlockerKind::MultipleChoices, detail);
+    }
+
+    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+    }) {
+        if !standalone_scans_complete || (!retroarch_scanned && !platform_has_standalone) {
+            return GamerBlocker::new(
+                GamerBlockerKind::EmulatorNotChecked,
+                "Emulator readiness has not been checked yet.",
+            );
+        }
+        if let Some(platform) = plan.platform_id.as_deref()
+            && let Some(compatibility) =
+                archivefs_core::launch::launch_compatibility_for_platform(platform)
+            && compatibility.standalone_adapters.len() == 1
+        {
+            let emulator = match compatibility.standalone_adapters[0] {
+                "pcsx2" => "PCSX2",
+                "duckstation" => "DuckStation",
+                "ppsspp" => "PPSSPP",
+                "rpcs3" => "RPCS3",
+                "xemu" => "xemu",
+                "xenia" => "Xenia",
+                "dolphin" => "Dolphin",
+                adapter => adapter,
+            };
+            return GamerBlocker::for_emulator(
+                GamerBlockerKind::EmulatorNotInstalled,
+                emulator,
+                candidate
+                    .blockers
+                    .first()
+                    .map(|blocker| blocker.detail.clone())
+                    .unwrap_or_else(|| "no installed profile was found".into()),
+            );
+        }
+    }
+
+    if let Some(candidate) = plan
+        .candidates
+        .iter()
+        .find(|candidate| !candidate.blockers.is_empty())
+    {
+        let blocker = candidate.blockers.first().expect("non-empty blockers");
+        let emulator = candidate_emulator_name(candidate);
+        if matches!(
+            blocker.kind,
+            LaunchBlockerKind::ProfileIneligible
+                | LaunchBlockerKind::RequiredFirmwareMissing
+                | LaunchBlockerKind::CoreMissing
+                | LaunchBlockerKind::RetroArchProfileMissing
+                | LaunchBlockerKind::AmbiguousRetroArchProfile
+                | LaunchBlockerKind::RetroArchCoreMismatch
+                | LaunchBlockerKind::RetroArchExecutableMissing
+                | LaunchBlockerKind::AmbiguousRetroArchExecutable
+                | LaunchBlockerKind::RetroArchPathNotExact
+                | LaunchBlockerKind::DolphinBindingUnavailable
+                | LaunchBlockerKind::Pcsx2BindingUnavailable
+                | LaunchBlockerKind::DuckStationBindingUnavailable
+                | LaunchBlockerKind::PpssppBindingUnavailable
+                | LaunchBlockerKind::Rpcs3BindingUnavailable
+                | LaunchBlockerKind::XemuBindingUnavailable
+                | LaunchBlockerKind::XeniaBindingUnavailable
+        ) {
+            return match emulator {
+                Some(emulator) => GamerBlocker::for_emulator(
+                    GamerBlockerKind::EmulatorSetupIncomplete,
+                    emulator,
+                    blocker.detail.clone(),
+                ),
+                None => GamerBlocker::new(GamerBlockerKind::NoSafeEmulator, blocker.detail.clone()),
+            };
+        }
+        return GamerBlocker::new(GamerBlockerKind::LaunchPlanInvalid, blocker.detail.clone());
+    }
+
+    if !standalone_scans_complete || (!retroarch_scanned && !platform_has_standalone) {
+        return GamerBlocker::new(
+            GamerBlockerKind::EmulatorNotChecked,
+            "RetroArch has not been checked yet, and no standalone launch is ready.",
+        );
+    }
+    GamerBlocker::new(
+        GamerBlockerKind::NoSafeEmulator,
+        "No safe emulator launch candidate is available.",
+    )
 }
 
 // One immediate-mode render call: the draw target, the plan/candidate being

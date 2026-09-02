@@ -183,11 +183,13 @@ pub(crate) enum GamerReadiness<'a> {
     Unmount,
     /// Media usable and a safe launch plan exists.
     Ready {
-        request: &'a archivefs_core::launch::RetroArchLaunchRequest,
+        request: &'a launch_readiness_page::TypedLaunchRequest,
     },
-    /// Media usable, but the launch is blocked (no safe core, identity not
-    /// verified, RetroArch not scanned, ...). Carries the planner's reason.
-    NeedsSetup { reason: &'a str },
+    /// Media usable, but the launch is blocked. The typed blocker supplies
+    /// both the novice heading and the correct next action.
+    NeedsSetup {
+        blocker: &'a launch_readiness_page::GamerBlocker,
+    },
     /// The media / mount itself is blocked. Carries the mount blocker.
     NeedsAttention { reason: String },
 }
@@ -203,11 +205,11 @@ pub(crate) fn gamer_readiness<'a>(
         GamerPrimaryAction::Unmount => GamerReadiness::Unmount,
         GamerPrimaryAction::Blocked(reason) => GamerReadiness::NeedsAttention { reason },
         GamerPrimaryAction::NoMountingNeeded => match play_action {
-            launch_readiness_page::GamerPlayAction::Ready(request) => {
+            launch_readiness_page::GamerPlayAction::Launch(request) => {
                 GamerReadiness::Ready { request }
             }
-            launch_readiness_page::GamerPlayAction::Blocked(reason) => {
-                GamerReadiness::NeedsSetup { reason }
+            launch_readiness_page::GamerPlayAction::BlockedTyped(blocker) => {
+                GamerReadiness::NeedsSetup { blocker }
             }
         },
     }
@@ -237,11 +239,11 @@ pub(crate) fn gamer_archive_readiness<'a>(
             GamerReadiness::Prepare
         }
         GamerPrimaryAction::NoMountingNeeded => match play_action {
-            launch_readiness_page::GamerPlayAction::Ready(request) => {
+            launch_readiness_page::GamerPlayAction::Launch(request) => {
                 GamerReadiness::Ready { request }
             }
-            launch_readiness_page::GamerPlayAction::Blocked(reason) => {
-                GamerReadiness::NeedsSetup { reason }
+            launch_readiness_page::GamerPlayAction::BlockedTyped(blocker) => {
+                GamerReadiness::NeedsSetup { blocker }
             }
         },
     }
@@ -261,16 +263,46 @@ pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'s
     }
 }
 
-/// Keeps the safe planner's exact refusal available without making planner,
-/// executable, core, or preflight terminology part of the beginner layer.
-fn show_gamer_launch_blocker(ui: &mut egui::Ui, reason: &str) {
-    ui.colored_label(
-        ui.visuals().warn_fg_color,
-        "RetroArch needs setup for this game.",
-    );
-    ui.label("Check Emulator Setup, then return here to play.");
-    widgets::technical_details(ui, "gamer-launch-refusal", |ui| {
-        ui.label(reason);
+/// Keeps the planner's exact refusal available without exposing backend
+/// terminology in the main sentence, and exposes the blocker-specific next
+/// action to the caller through the returned `GamerViewAction`.
+fn show_gamer_launch_blocker(ui: &mut egui::Ui, blocker: &launch_readiness_page::GamerBlocker) {
+    ui.colored_label(ui.visuals().warn_fg_color, blocker.heading());
+    let next = match blocker.kind {
+        launch_readiness_page::GamerBlockerKind::CheckingGame => {
+            "EmuWiz is still checking this game."
+        }
+        launch_readiness_page::GamerBlockerKind::UnknownSystem => {
+            "Review the game identity and assign its system if you know it."
+        }
+        launch_readiness_page::GamerBlockerKind::ConflictingIdentity => {
+            "Review the conflicting identity evidence before choosing a system."
+        }
+        launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation => {
+            "Prepare the game's content, then return here to play."
+        }
+        launch_readiness_page::GamerBlockerKind::EmulatorNotInstalled => {
+            "Open Emulator Setup to install or register this emulator."
+        }
+        launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete => {
+            "Open Emulator Setup to finish this emulator's setup."
+        }
+        launch_readiness_page::GamerBlockerKind::EmulatorNotChecked => {
+            "Run the emulator check to see what is ready on this computer."
+        }
+        launch_readiness_page::GamerBlockerKind::NoSafeEmulator => {
+            "Run the emulator check or review launch readiness for details."
+        }
+        launch_readiness_page::GamerBlockerKind::MultipleChoices => {
+            "Choose one emulator explicitly before playing."
+        }
+        launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid => {
+            "Review launch readiness for the exact reason this plan was refused."
+        }
+    };
+    ui.label(next);
+    widgets::technical_details(ui, "gamer-launch-blocker", |ui| {
+        ui.label(&blocker.detail);
     });
 }
 
@@ -322,7 +354,7 @@ pub(crate) enum GamerViewAction {
     Operation(OperationRequest),
     Prepare(PathBuf),
     SelectArchiveMember(PathBuf, String),
-    Play(archivefs_core::launch::RetroArchLaunchRequest),
+    Play(Box<launch_readiness_page::TypedLaunchRequest>),
     OpenCheatsMods(PathBuf),
     /// The folder to copy to the clipboard - "Copy folder location" (§2.1's
     /// action visibility rules). No file-manager process is launched;
@@ -347,15 +379,17 @@ pub(crate) enum GamerViewAction {
     /// select-then-navigate shape (`AppOperationRequest::OpenCheatsMods`'s
     /// handler) rather than inventing new plumbing.
     ReviewIdentity(PathBuf),
+    /// Open the selected game's launch/readiness surface where the user can
+    /// choose one of several equally valid emulator candidates.
+    OpenLaunchChoices(PathBuf),
+    /// Run the existing Doctor emulator check before returning to setup.
+    CheckEmulators(PathBuf),
     /// "Open Emulator Setup" from a `NeedsSetup` card: the game whose
-    /// launch is blocked, plus which repair card to bring into view. The
-    /// caller keeps the game selected and switches to Advanced View's
-    /// Emulator Setup page, the same select-then-navigate shape as
-    /// `ReviewIdentity`. The focus target is always
-    /// [`EmulatorSetupFocus::RetroArch`]: `NeedsSetup` is produced only by
-    /// `gamer_readiness` when the shared launch plan has no safe RetroArch
-    /// core for this platform, so this action is structurally
-    /// RetroArch-specific - it is never derived by parsing blocker text.
+    /// launch is blocked, plus the exact emulator repair card to bring into
+    /// view. The caller keeps the game selected and switches to Advanced
+    /// View's Emulator Setup page, the same select-then-navigate shape as
+    /// `ReviewIdentity`. The focus is carried as typed navigation state,
+    /// never derived by parsing blocker text.
     OpenEmulatorSetup(PathBuf, EmulatorSetupFocus),
     /// "Update game information": re-reads the already-cached enrichment
     /// data from disk for the currently focused game. Never itself
@@ -364,6 +398,14 @@ pub(crate) enum GamerViewAction {
     /// enrichment display only, never identity, mount state, or anything
     /// else about the game.
     RefreshGameInformation,
+}
+
+fn emulator_setup_focus(emulator: &str) -> EmulatorSetupFocus {
+    if emulator.eq_ignore_ascii_case("RetroArch") {
+        EmulatorSetupFocus::RetroArch
+    } else {
+        EmulatorSetupFocus::Emulator(emulator.to_string())
+    }
 }
 
 /// The single authoritative row snapshot one Gamer View frame is built
@@ -668,6 +710,23 @@ fn featured_retroarch_launch_action(
     }
 }
 
+fn featured_typed_launch_action(
+    ui: &mut egui::Ui,
+    request: &launch_readiness_page::TypedLaunchRequest,
+    retroarch_launch_state: &mut launch_readiness_page::RetroArchLaunchState,
+    enabled: bool,
+) -> bool {
+    match request {
+        launch_readiness_page::TypedLaunchRequest::RetroArch(request) => {
+            featured_retroarch_launch_action(ui, retroarch_launch_state, request, enabled)
+        }
+        _ => {
+            let label = format!("{GAMER_PLAY_LABEL} with {}", request.adapter_name());
+            featured_primary_button(ui, &label, enabled).clicked()
+        }
+    }
+}
+
 /// One line of the featured panel's metadata block.
 pub(crate) fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) {
     let text = egui::RichText::new(text).size(if strong { 16.0 } else { 14.0 });
@@ -920,6 +979,9 @@ pub(crate) struct GamerViewViewState<'a> {
     pub(crate) preparation_message: Option<&'a str>,
     pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
     pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
+    pub(crate) dolphin_launch_state: &'a mut launch_readiness_page::DolphinLaunchState,
+    pub(crate) pcsx2_launch_state: &'a mut launch_readiness_page::Pcsx2LaunchState,
+    pub(crate) standalone_launch_state: &'a mut launch_readiness_page::StandaloneLaunchState,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -1079,10 +1141,22 @@ pub(crate) fn show_gamer_view(
         preparation_message,
         play_action,
         retroarch_launch_state,
+        dolphin_launch_state,
+        pcsx2_launch_state,
+        standalone_launch_state,
     } = view_state;
     let mut action = None;
 
     if retroarch_launch_state.poll() || retroarch_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+    if dolphin_launch_state.poll() || dolphin_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+    if pcsx2_launch_state.poll() || pcsx2_launch_state.is_active() {
+        ui.ctx().request_repaint();
+    }
+    if standalone_launch_state.poll() || standalone_launch_state.is_active() {
         ui.ctx().request_repaint();
     }
 
@@ -1733,50 +1807,93 @@ pub(crate) fn show_gamer_view(
                                             }
                                         }
                                         GamerReadiness::Ready { request } => {
-                                            // Integration: keep the live-launch
-                                            // executor helper (934c9ec) - it renders
-                                            // running/closed/error state and drives
-                                            // real spawning - and take the beginner
-                                            // "Play" label from 1c825e7 (applied
-                                            // inside `featured_retroarch_launch_action`).
-                                            if featured_retroarch_launch_action(
+                                            if featured_typed_launch_action(
                                                 ui,
-                                                retroarch_launch_state,
                                                 request,
+                                                retroarch_launch_state,
                                                 !busy,
                                             )
                                             {
-                                                action = Some(GamerViewAction::Play(
-                                                    (*request).clone(),
-                                                ));
+                                                action = Some(GamerViewAction::Play(Box::new(
+                                                    (**request).clone(),
+                                                )));
                                             }
                                             widgets::technical_details(
                                                 ui,
-                                                "gamer-play-executor",
+                                                "gamer-play-adapter",
                                                 |ui| {
-                                                    ui.label("Opens with RetroArch.");
+                                                    ui.label(format!(
+                                                        "Uses the {} launch adapter.",
+                                                        request.adapter_name()
+                                                    ));
                                                 },
                                             );
                                         }
-                                        GamerReadiness::NeedsSetup { reason } => {
-                                            show_gamer_launch_blocker(ui, reason);
-                                            if widgets::action_button(
-                                                ui,
-                                                "Open Emulator Setup",
-                                                widgets::ActionStyle::Secondary,
-                                                !busy,
-                                            )
-                                            .on_hover_text(
-                                                "Check emulator readiness and rescan RetroArch \
-                                                 after installing or configuring a core for \
-                                                 this system.",
-                                            )
-                                            .clicked()
+                                        GamerReadiness::NeedsSetup { blocker } => {
+                                            show_gamer_launch_blocker(ui, blocker);
+                                            let (label, next_action) = match &blocker.kind {
+                                                launch_readiness_page::GamerBlockerKind::UnknownSystem
+                                                | launch_readiness_page::GamerBlockerKind::ConflictingIdentity => (
+                                                    "Review game identity",
+                                                    Some(GamerViewAction::ReviewIdentity(
+                                                        archive_path.clone(),
+                                                    )),
+                                                ),
+                                                launch_readiness_page::GamerBlockerKind::EmulatorNotInstalled
+                                                | launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete => (
+                                                    "Open Emulator Setup",
+                                                    blocker.emulator.as_deref().map_or_else(
+                                                        || Some(GamerViewAction::CheckEmulators(
+                                                            archive_path.clone(),
+                                                        )),
+                                                        |emulator| {
+                                                            Some(GamerViewAction::OpenEmulatorSetup(
+                                                                archive_path.clone(),
+                                                                emulator_setup_focus(emulator),
+                                                            ))
+                                                        },
+                                                    ),
+                                                ),
+                                                launch_readiness_page::GamerBlockerKind::EmulatorNotChecked => (
+                                                    "Check Emulators",
+                                                    Some(GamerViewAction::CheckEmulators(
+                                                        archive_path.clone(),
+                                                    )),
+                                                ),
+                                                launch_readiness_page::GamerBlockerKind::MultipleChoices => (
+                                                    "Choose an emulator",
+                                                    Some(GamerViewAction::OpenLaunchChoices(
+                                                        archive_path.clone(),
+                                                    )),
+                                                ),
+                                                launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation
+                                                | launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid => (
+                                                    "Open launch readiness",
+                                                    Some(GamerViewAction::OpenLaunchChoices(
+                                                        archive_path.clone(),
+                                                    )),
+                                                ),
+                                                launch_readiness_page::GamerBlockerKind::NoSafeEmulator => (
+                                                    "Check Emulators",
+                                                    Some(GamerViewAction::CheckEmulators(
+                                                        archive_path.clone(),
+                                                    )),
+                                                ),
+                                                launch_readiness_page::GamerBlockerKind::CheckingGame => (
+                                                    "Checking…",
+                                                    None,
+                                                ),
+                                            };
+                                            if let Some(next_action) = next_action
+                                                && widgets::action_button(
+                                                    ui,
+                                                    label,
+                                                    widgets::ActionStyle::Secondary,
+                                                    !busy,
+                                                )
+                                                .clicked()
                                             {
-                                                action = Some(GamerViewAction::OpenEmulatorSetup(
-                                                    archive_path.clone(),
-                                                    EmulatorSetupFocus::RetroArch,
-                                                ));
+                                                action = Some(next_action);
                                             }
                                         }
                                         GamerReadiness::NeedsAttention { reason } => {
@@ -1935,11 +2052,17 @@ mod game_metadata_enrichment_tests {
         assert_eq!(gamer_primary_action_short_label(&mount_only), "Game found");
 
         let refusal = "Can't play yet: executable preflight rejected the selected core";
-        let play_action = launch_readiness_page::GamerPlayAction::Blocked(refusal.to_string());
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid,
+                emulator: None,
+                detail: refusal.to_string(),
+            },
+        );
         let readiness = gamer_readiness(MountState::NotMountable, &play_action);
         assert!(matches!(
             readiness,
-            GamerReadiness::NeedsSetup { reason } if reason == refusal
+            GamerReadiness::NeedsSetup { blocker } if blocker.detail == refusal
         ));
     }
 
@@ -1956,8 +2079,12 @@ mod game_metadata_enrichment_tests {
 
     #[test]
     fn mounted_archive_shows_prepare_until_a_member_is_retained() {
-        let play_action = launch_readiness_page::GamerPlayAction::Blocked(
-            "archive member has not been resolved".to_string(),
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation,
+                emulator: None,
+                detail: "archive member has not been resolved".to_string(),
+            },
         );
         let readiness = gamer_archive_readiness(MountState::Mounted, false, &play_action, None);
         assert!(matches!(readiness, GamerReadiness::Prepare));
@@ -1971,8 +2098,12 @@ mod game_metadata_enrichment_tests {
             size_bytes: 10,
             reason: "ISO media accepted for PlayStation 2".to_string(),
         }];
-        let play_action = launch_readiness_page::GamerPlayAction::Blocked(
-            "archive member has not been resolved".to_string(),
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation,
+                emulator: None,
+                detail: "archive member has not been resolved".to_string(),
+            },
         );
         let readiness =
             gamer_archive_readiness(MountState::Mounted, false, &play_action, Some(&candidates));
@@ -1987,13 +2118,17 @@ mod game_metadata_enrichment_tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_gamer_launch_blocker(ui, refusal);
+                show_gamer_launch_blocker(
+                    ui,
+                    &launch_readiness_page::GamerBlocker {
+                        kind: launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid,
+                        emulator: None,
+                        detail: refusal.to_string(),
+                    },
+                );
             });
         });
-        assert!(rendered_text_contains(
-            &output,
-            "RetroArch needs setup for this game"
-        ));
+        assert!(rendered_text_contains(&output, "Launch plan invalid"));
         assert!(rendered_text_contains(&output, "Technical details"));
         assert!(!rendered_text_contains(&output, refusal));
     }
