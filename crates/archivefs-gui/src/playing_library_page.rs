@@ -18,9 +18,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use archivefs_core::dat::identity::{DatPlatformIdentity, identify_dat_source};
-use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::parsers::parse_dat_file;
+use archivefs_core::dat::catalogue_selection::{CatalogueRef, resolve_catalogue};
+use archivefs_core::dat::identity::DatPlatformIdentity;
 use archivefs_core::dat::rename_apply::executor::{
     ApplyExecution, HardConflictMode, apply_transaction,
 };
@@ -36,7 +35,7 @@ use archivefs_core::launch::es_de_publish::{
     recover_es_de_gamelist_publication,
 };
 use archivefs_core::playing_library::{
-    CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryRequest,
+    CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy,
     ReleaseClass, RetroDeckProjectionPlan, RetroDeckVisibility, RommLibraryProjectionPlan,
     RommVisibility, build_playing_library_plan, build_playing_library_transaction,
     build_retrodeck_projection, build_retrodeck_projection_transaction,
@@ -47,6 +46,7 @@ use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 use crate::rom_organisation_page::collect_source_files;
+use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 use crate::ui::{components as widgets, theme};
 
 /// The confirmation phrase a user must type before a Create Playing Library
@@ -62,6 +62,9 @@ pub(crate) const TYPED_CONFIRMATION_THRESHOLD: usize = 8;
 
 /// The page's authoritative state.
 pub(crate) struct PlayingLibraryPageState {
+    pub(crate) selected_catalogue: Option<CatalogueRef>,
+    pub(crate) catalogue_picker: DatCataloguePickerState,
+    #[cfg(test)]
     pub(crate) dat_path_draft: String,
     pub(crate) source_root_draft: String,
     pub(crate) destination_root_draft: String,
@@ -146,6 +149,9 @@ pub(crate) struct PlayingLibraryPageState {
 impl Default for PlayingLibraryPageState {
     fn default() -> Self {
         Self {
+            selected_catalogue: None,
+            catalogue_picker: DatCataloguePickerState::default(),
+            #[cfg(test)]
             dat_path_draft: String::new(),
             source_root_draft: String::new(),
             destination_root_draft: String::new(),
@@ -225,6 +231,19 @@ fn split_preference_list(draft: &str) -> Vec<String> {
 }
 
 impl PlayingLibraryPageState {
+    fn has_catalogue_selection(&self) -> bool {
+        let selected = self.selected_catalogue.as_ref().is_some_and(|reference| {
+            self.catalogue_picker
+                .is_usable(DatCatalogueWorkflow::PlayingLibrary, reference)
+        });
+        #[cfg(test)]
+        {
+            return selected || !self.dat_path_draft.trim().is_empty();
+        }
+        #[cfg(not(test))]
+        selected
+    }
+
     pub(crate) fn load() -> Self {
         Self::default()
     }
@@ -306,13 +325,16 @@ impl PlayingLibraryPageState {
         self.selected_family = None;
         self.plan_generation += 1;
 
-        let dat_path = PathBuf::from(self.dat_path_draft.trim());
         let source_root = PathBuf::from(self.source_root_draft.trim());
         let destination_root = PathBuf::from(self.destination_root_draft.trim());
-        if self.dat_path_draft.trim().is_empty() {
+        let Some(reference) = self.selected_catalogue.clone() else {
+            #[cfg(test)]
+            if !self.dat_path_draft.trim().is_empty() {
+                return self.preview_test_dat_path(&source_root, &destination_root);
+            }
             self.error = Some("choose a DAT catalogue file first".to_string());
             return;
-        }
+        };
         if self.source_root_draft.trim().is_empty() {
             self.error = Some("choose a source library folder first".to_string());
             return;
@@ -322,28 +344,67 @@ impl PlayingLibraryPageState {
             return;
         }
 
-        let outcome = match parse_dat_file(&dat_path, DatLimits::default()) {
+        let Some(snapshot) = self.catalogue_picker.snapshot() else {
+            self.error = Some("the catalogue list is still loading; try again shortly".into());
+            return;
+        };
+        let resolved = match resolve_catalogue(&reference, snapshot.inputs()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.error = Some(format!("could not resolve the selected catalogue: {error}"));
+                return;
+            }
+        };
+        self.dat_platform_identity = Some(resolved.dat_platform_identity());
+
+        let candidates = collect_source_files(std::slice::from_ref(&source_root));
+        let trusted = TrustedRoots::from_paths([&source_root]);
+        let outcome_matches = match_loose_files_against_dat(
+            &resolved.parsed,
+            &candidates,
+            &trusted,
+            &AtomicBool::new(false),
+        );
+
+        let request = resolved.playing_library_request(
+            outcome_matches.matches,
+            destination_root,
+            self.build_policy(),
+        );
+    match build_playing_library_plan(&request) {
+            Ok(mut plan) => {
+                plan.rejected_launchers = outcome_matches.rejected_launchers;
+                self.plan = Some(plan);
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn preview_test_dat_path(&mut self, source_root: &Path, destination_root: &Path) {
+        let outcome = match archivefs_core::dat::parsers::parse_dat_file(
+            Path::new(self.dat_path_draft.trim()),
+            archivefs_core::dat::limits::DatLimits::default(),
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.error = Some(format!("could not read the DAT catalogue: {error}"));
                 return;
             }
         };
-        self.dat_platform_identity = Some(identify_dat_source(&outcome.dat));
-
-        let candidates = collect_source_files(std::slice::from_ref(&source_root));
-        let trusted = TrustedRoots::from_paths([&source_root]);
+        self.dat_platform_identity = Some(archivefs_core::dat::identity::identify_dat_source(&outcome.dat));
+        let candidates = collect_source_files(std::slice::from_ref(source_root));
+        let trusted = TrustedRoots::from_paths([source_root]);
         let outcome_matches = match_loose_files_against_dat(
             &outcome.dat,
             &candidates,
             &trusted,
             &AtomicBool::new(false),
         );
-
-        let request = PlayingLibraryRequest {
+        let request = archivefs_core::playing_library::PlayingLibraryRequest {
             dat: &outcome.dat,
             matches: outcome_matches.matches,
-            destination_root,
+            destination_root: destination_root.to_path_buf(),
             policy: self.build_policy(),
         };
         match build_playing_library_plan(&request) {
@@ -1057,6 +1118,7 @@ pub(crate) enum PlayingLibraryPageAction {
 /// `ctx.memory_mut(|memory| memory.request_focus(id))` pattern this crate's
 /// own `set_text_edit_caret`/`apply_select_all` already use) rather than by
 /// mutating page state directly.
+#[cfg(test)]
 pub(crate) const DAT_PATH_FIELD_ID: &str = "playing_library_dat_path_field";
 pub(crate) const SOURCE_ROOT_FIELD_ID: &str = "playing_library_source_root_field";
 pub(crate) const DESTINATION_ROOT_FIELD_ID: &str = "playing_library_destination_root_field";
@@ -1088,25 +1150,22 @@ pub(crate) fn show_playing_library_page(
     ui.add_space(8.0);
 
     widgets::card(ui, |ui| {
-        ui.label("Catalogue (DAT) file:");
-        ui.horizontal(|ui| {
-            ui.add(
+        if state.catalogue_picker.poll() || state.catalogue_picker.loading {
+            ui.ctx().request_repaint();
+        }
+        let _ = state.catalogue_picker.show(
+            ui,
+            DatCatalogueWorkflow::PlayingLibrary,
+            &mut state.selected_catalogue,
+        );
+        // Keep the historical render harness able to exercise its stable
+        // widget ID while production uses the typed picker exclusively.
+        #[cfg(test)]
+        ui.add(
                 egui::TextEdit::singleline(&mut state.dat_path_draft)
                     .id(egui::Id::new(DAT_PATH_FIELD_ID))
-                    .desired_width(ui.available_width() - 90.0),
-            );
-            if ui.button("Browse…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose Playing Library DAT Catalogue")
-                    .add_filter("DAT catalogues", &["dat", "xml"])
-                    .pick_file()
-            {
-                state.dat_path_draft = path.display().to_string();
-            }
-        });
-        if path_looks_missing(&state.dat_path_draft, false) {
-            ui.label(egui::RichText::new("This file was not found.").color(theme::WARNING));
-        }
+                .desired_width(280.0),
+        );
         ui.add_space(6.0);
 
         ui.label("Source:");
@@ -1194,7 +1253,7 @@ pub(crate) fn show_playing_library_page(
     });
 
     ui.add_space(8.0);
-    let ready = !state.dat_path_draft.trim().is_empty()
+    let ready = state.has_catalogue_selection()
         && !state.source_root_draft.trim().is_empty()
         && !state.destination_root_draft.trim().is_empty();
     if widgets::action_button(

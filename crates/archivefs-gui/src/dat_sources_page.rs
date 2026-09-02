@@ -49,6 +49,7 @@ use archivefs_core::dat::classification::{
     ContentSelectionPolicy, DatContentClassification, DatContentSummary,
 };
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::catalogue_selection::{CatalogueAvailability, CatalogueRef};
 use archivefs_core::dat::managed_sources::{
     ManagedDatSources, default_managed_dat_sources_config_path, load_managed_dat_sources_from,
     resolve_managed_dat_sources, resolve_redump_bios_sources, resolve_redump_games_sources,
@@ -98,6 +99,7 @@ use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
+use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 
 /// Said once on the page, because a DAT audit is the one place a user might
 /// reasonably expect a "fix it" button and there is deliberately not one.
@@ -1486,6 +1488,12 @@ pub(crate) enum DatSourcesPageAction {
     ValidateAll,
     Audit {
         id: String,
+        scan_root: PathBuf,
+    },
+    /// Explicit single-catalogue Verify flow. The existing combined audit
+    /// remains a separate action and keeps its all-enabled semantics.
+    VerifyCatalogue {
+        reference: CatalogueRef,
         scan_root: PathBuf,
     },
     /// Read-only all-evidence audit for the normal Identify & Rename flow.
@@ -3127,6 +3135,10 @@ impl DatSourcesPageState {
             DatSourcesPageAction::Validate { id } => self.start_validate(id),
             DatSourcesPageAction::ValidateAll => self.start_validate_all(),
             DatSourcesPageAction::Audit { id, scan_root } => self.start_audit(id, scan_root),
+            DatSourcesPageAction::VerifyCatalogue {
+                reference,
+                scan_root,
+            } => self.start_selected_catalogue_audit(reference, scan_root),
             DatSourcesPageAction::AuditAllEnabled { scan_root } => {
                 self.start_combined_audit(scan_root)
             }
@@ -4372,23 +4384,6 @@ impl DatSourcesPageState {
         let Some(entry) = self.draft.get(&id).cloned() else {
             return;
         };
-        self.audit = None;
-        self.identity_enrichment_completed = false;
-        self.identity_enrichment = None;
-        self.audit_error = None;
-        self.audit_elapsed_seconds = None;
-        self.rename_plan = None;
-        self.rename_plan_error = None;
-        self.review_decisions.clear();
-        self.abandon_apply_work();
-        // Each audit is a generation. A result from an older generation is a
-        // stale plan and is dropped, so an old plan can never replace a new one.
-        self.audit_generation = self.audit_generation.wrapping_add(1);
-        let generation = self.audit_generation;
-        let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
-        let trusted = self.trusted.clone();
         let platform_display = authoritative_platform(&entry);
         let canonical_platform = entry
             .platform
@@ -4413,8 +4408,65 @@ impl DatSourcesPageState {
             policy: Some(policy),
             platform: canonical_platform.map(str::to_string),
         };
-        let database_path = self.database_path.clone();
+        self.start_audit_request(request, id, platform_display);
+    }
 
+    fn start_selected_catalogue_audit(&mut self, reference: CatalogueRef, scan_root: PathBuf) {
+        if self.is_busy() {
+            return;
+        }
+        let inputs = archivefs_core::dat::catalogue_selection::CatalogueInventoryInputs {
+            local_registry: &self.draft,
+            managed_sources: &self.managed_sources,
+            managed_root: &self.managed_root,
+            limits: self.limits,
+        };
+        let resolved = match archivefs_core::dat::catalogue_selection::resolve_catalogue(
+            &reference, inputs,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.audit_error = Some(format!(
+                    "could not resolve the selected catalogue: {error}"
+                ));
+                return;
+            }
+        };
+        let canonical_platform = resolved
+            .assigned_platform
+            .as_deref()
+            .and_then(archivefs_core::canonical_platform_for_alias);
+        let policy = resolve(
+            self.draft.policy(),
+            canonical_platform,
+            participating_sources(&self.draft, canonical_platform),
+        );
+        let request = resolved.to_dat_audit_request(scan_root, self.limits, Some(policy));
+        self.start_audit_request(request, reference.token(), resolved.assigned_platform.clone());
+    }
+
+    fn start_audit_request(
+        &mut self,
+        request: DatAuditRequest,
+        source_id: String,
+        platform_display: Option<String>,
+    ) {
+        self.audit = None;
+        self.identity_enrichment_completed = false;
+        self.identity_enrichment = None;
+        self.audit_error = None;
+        self.audit_elapsed_seconds = None;
+        self.rename_plan = None;
+        self.rename_plan_error = None;
+        self.review_decisions.clear();
+        self.abandon_apply_work();
+        self.audit_generation = self.audit_generation.wrapping_add(1);
+        let generation = self.audit_generation;
+        let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let trusted = self.trusted.clone();
+        let database_path = self.database_path.clone();
         std::thread::spawn(move || {
             let report_sender = sender.clone();
             let outcome = run_dat_audit(&request, &trusted, &worker_cancel, &|progress| {
@@ -4492,7 +4544,7 @@ impl DatSourcesPageState {
 
         self.job = Some(RunningJob {
             kind: JobKind::Audit,
-            source_id: id,
+            source_id,
             cancel,
             cancel_requested: false,
             messages,
@@ -5931,6 +5983,9 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// something whose difference from disk defines the unsaved-change state.
 #[derive(Default)]
 pub(crate) struct DatSourcesPageUi {
+    pub(crate) catalogue_picker: DatCataloguePickerState,
+    pub(crate) selected_catalogue: Option<CatalogueRef>,
+    pub(crate) open_catalogue_picker: bool,
     /// Session-only bulk disclosure choices for the two large DAT lists.
     /// `None` leaves individual card state alone; explicit actions set the
     /// whole list to compact or expanded browsing.
@@ -5985,6 +6040,8 @@ impl DatSourcesPageUi {
     /// Forgets every unsubmitted choice.
     pub(crate) fn clear(&mut self) {
         self.local_sources_expanded = None;
+        self.selected_catalogue = None;
+        self.open_catalogue_picker = false;
         self.managed_sources_expanded = None;
         self.open_inspect = None;
         self.open_platform_picker = None;
@@ -6049,6 +6106,13 @@ pub(crate) fn show_dat_sources_page(
 
     if let Some(acquisition_action) = show_evidence_acquisition_section(ui, view) {
         action = Some(acquisition_action);
+    }
+    ui.add_space(10.0);
+
+    if action.is_none()
+        && let Some(single_action) = show_single_catalogue_verify_section(ui, view, ui_state)
+    {
+        action = Some(single_action);
     }
     ui.add_space(10.0);
 
@@ -6239,6 +6303,119 @@ pub(crate) fn show_dat_sources_page(
     }
 
     action
+}
+
+/// Explicit one-catalogue Verify entry point. The existing all-enabled
+/// combined audit below is deliberately untouched. Aggregate folders take
+/// the legacy folder-audit action because the shared resolver refuses to
+/// pretend that a folder is one DAT.
+fn show_single_catalogue_verify_section(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Verify one catalogue",
+            Some("Choose one installed catalogue explicitly. The combined Identify & Rename audit remains unchanged."),
+        );
+        if widgets::action_button(
+            ui,
+            if ui_state.open_catalogue_picker {
+                "Close catalogue picker"
+            } else {
+                "Choose a catalogue…"
+            },
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            ui_state.open_catalogue_picker = !ui_state.open_catalogue_picker;
+            if ui_state.open_catalogue_picker {
+                ui_state.catalogue_picker.ensure_loaded();
+            }
+        }
+        if !ui_state.open_catalogue_picker {
+            return;
+        }
+        if ui_state.catalogue_picker.poll() || ui_state.catalogue_picker.loading {
+            ui.ctx().request_repaint();
+        }
+        let _ = ui_state.catalogue_picker.show(
+            ui,
+            DatCatalogueWorkflow::Verify,
+            &mut ui_state.selected_catalogue,
+        );
+        let Some(reference) = ui_state.selected_catalogue.as_ref() else {
+            return;
+        };
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("2. Choose what to check").strong());
+        for folder in &view.library_folders {
+            if widgets::action_button(
+                ui,
+                format!("Verify against {}", friendly_folder_label(folder)),
+                widgets::ActionStyle::Quiet,
+                true,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                if let Some(source_id) = aggregate_source_id(ui_state, reference) {
+                    action = Some(DatSourcesPageAction::Audit {
+                        id: source_id,
+                        scan_root: folder.clone(),
+                    });
+                } else {
+                    action = Some(DatSourcesPageAction::VerifyCatalogue {
+                        reference: reference.clone(),
+                        scan_root: folder.clone(),
+                    });
+                }
+            }
+        }
+        if widgets::action_button(ui, "Choose another folder…", widgets::ActionStyle::Quiet, true)
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            if let Some(source_id) = aggregate_source_id(ui_state, reference) {
+                action = Some(DatSourcesPageAction::Audit {
+                    id: source_id,
+                    scan_root: path,
+                });
+            } else {
+                action = Some(DatSourcesPageAction::VerifyCatalogue {
+                    reference: reference.clone(),
+                    scan_root: path,
+                });
+            }
+        }
+    });
+    action
+}
+
+fn aggregate_source_id(
+    ui_state: &DatSourcesPageUi,
+    reference: &CatalogueRef,
+) -> Option<String> {
+    let CatalogueRef::Local { source_id, member } = reference else {
+        return None;
+    };
+    if member.is_some() {
+        return None;
+    }
+    ui_state
+        .catalogue_picker
+        .summaries()
+        .iter()
+        .find(|summary| {
+            &summary.reference == reference
+                && matches!(summary.availability, CatalogueAvailability::AggregateFolder { .. })
+        })
+        .map(|_| source_id.clone())
 }
 
 /// A small, task-oriented entry point into the existing DAT-source flows.

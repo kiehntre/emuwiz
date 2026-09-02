@@ -47,10 +47,8 @@ use archivefs_core::Config;
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::rename_apply::model::EntryState;
 use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
-use archivefs_core::dat::sources::{
-    DatSourceEntry, DatSourceRegistry, default_dat_sources_config_path,
-    load_dat_sources_config_from,
-};
+#[cfg(test)]
+use archivefs_core::dat::sources::DatSourceEntry;
 use archivefs_core::repair::execute::{
     RepairExecutionOptions, RepairReverifyOutcome, RepairTransactionResult,
 };
@@ -63,6 +61,7 @@ use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
+use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 
 /// The preview filter. `None` is "All" and is not a variant so "All" is the
 /// default and the filter's absence is not confused with one of its values.
@@ -393,12 +392,15 @@ struct RepairApplyJob {
 /// buttons plus "Choose another folder…").
 #[derive(Debug, Default)]
 pub(crate) struct ScanSetupState {
+    #[cfg(test)]
     pub(crate) dat_sources: Vec<DatSourceEntry>,
     /// Surfaced, never swallowed: an unreadable/unparseable DAT sources
     /// config means the picker has nothing to offer, and that must be
     /// visible rather than presented as an empty registry.
+    #[cfg(test)]
     pub(crate) dat_load_error: Option<String>,
     pub(crate) library_folders: Vec<PathBuf>,
+    #[cfg(test)]
     pub(crate) selected_dat_id: Option<String>,
     pub(crate) chosen_scan_root: Option<PathBuf>,
 }
@@ -501,6 +503,8 @@ pub(crate) struct RepairReviewPageState {
     /// dialog is closed; opening it loads the DAT registry and configured
     /// library folders once, up front (see [`ScanSetupState`]).
     pub(crate) scan_setup: Option<ScanSetupState>,
+    pub(crate) selected_catalogue: Option<archivefs_core::dat::catalogue_selection::CatalogueRef>,
+    pub(crate) catalogue_picker: DatCataloguePickerState,
     scan_job: Option<RepairScanJob>,
     /// The whole-library scan's own status, entirely separate from
     /// [`Self::error`] (which is only ever set by [`Self::load_plan`]'s
@@ -510,6 +514,21 @@ pub(crate) struct RepairReviewPageState {
 }
 
 impl RepairReviewPageState {
+    fn has_catalogue_selection(&self, setup: &ScanSetupState) -> bool {
+        #[cfg(not(test))]
+        let _ = setup;
+        let selected = self.selected_catalogue.as_ref().is_some_and(|reference| {
+            self.catalogue_picker
+                .is_usable(DatCatalogueWorkflow::Repair, reference)
+        });
+        #[cfg(test)]
+        {
+            return selected || setup.selected_dat_id.is_some();
+        }
+        #[cfg(not(test))]
+        selected
+    }
+
     /// Loads a saved [`LibraryRepairPlan`] from a plan file. Read-only: reads
     /// the file, never writes, and never runs a scan, preflight, or re-proof.
     pub(crate) fn load_plan(&mut self, path: PathBuf) {
@@ -568,33 +587,19 @@ impl RepairReviewPageState {
         if self.scan_job.is_some() {
             return;
         }
-        let (dat_sources, dat_load_error) = match default_dat_sources_config_path() {
-            Ok(path) => match load_dat_sources_config_from(&path) {
-                Ok(config) => {
-                    let (registry, _problems) = DatSourceRegistry::from_config(&config);
-                    (
-                        registry
-                            .entries()
-                            .iter()
-                            .filter(|entry| entry.enabled)
-                            .cloned()
-                            .collect(),
-                        None,
-                    )
-                }
-                Err(error) => (Vec::new(), Some(error.to_string())),
-            },
-            Err(error) => (Vec::new(), Some(error.to_string())),
-        };
+        self.catalogue_picker.ensure_loaded();
         let library_folders = Config::load_default()
             .map(|config| config.source_folders)
             .unwrap_or_default();
         self.scan_setup = Some(ScanSetupState {
-            dat_sources,
-            dat_load_error,
             library_folders,
-            selected_dat_id: None,
             chosen_scan_root: None,
+            #[cfg(test)]
+            dat_sources: Vec::new(),
+            #[cfg(test)]
+            dat_load_error: None,
+            #[cfg(test)]
+            selected_dat_id: None,
         });
         self.scan_status = None;
     }
@@ -614,7 +619,7 @@ impl RepairReviewPageState {
     pub(crate) fn can_start_scan(&self) -> bool {
         self.scan_job.is_none()
             && self.scan_setup.as_ref().is_some_and(|setup| {
-                setup.selected_dat_id.is_some() && setup.chosen_scan_root.is_some()
+                self.has_catalogue_selection(setup) && setup.chosen_scan_root.is_some()
             })
     }
 
@@ -631,27 +636,81 @@ impl RepairReviewPageState {
             return;
         }
         let ready = self.scan_setup.as_ref().is_some_and(|setup| {
-            setup.selected_dat_id.is_some() && setup.chosen_scan_root.is_some()
+            self.has_catalogue_selection(setup) && setup.chosen_scan_root.is_some()
         });
         if !ready {
+            return;
+        }
+        #[cfg(test)]
+        if self.selected_catalogue.is_none() {
+            if let Some(setup) = self.scan_setup.take() {
+                self.start_scan_legacy_test(setup);
+            }
             return;
         }
         let Some(setup) = self.scan_setup.take() else {
             return;
         };
+        let Some(scan_root) = setup.chosen_scan_root else {
+            return;
+        };
+        let Some(reference) = self.selected_catalogue.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.catalogue_picker.snapshot() else {
+            self.scan_status = Some(LibraryScanStatus::Failed(
+                "the catalogue list is still loading; try again shortly".to_string(),
+            ));
+            return;
+        };
+        let audit_cache = self
+            .audit_cache_override
+            .clone()
+            .unwrap_or(AuditCacheConfig::Default);
+        let cancel = AtomicBool::new(false);
+        let (sender, messages) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let message = match archivefs_core::dat::catalogue_selection::resolve_catalogue(
+                &reference,
+                snapshot.inputs(),
+            ) {
+                Ok(resolved) => {
+                    let request = resolved.to_library_scan_request(
+                        scan_root.clone(),
+                        DatLimits::default(),
+                        RepairProfile::CanonicalInPlace,
+                        audit_cache,
+                    );
+                    let trusted = TrustedRoots::from_paths([&request.scan_root]);
+                    match run_library_scan(&request, &trusted, &cancel, &|_| {}) {
+                        Ok(outcome) => {
+                            RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome)))
+                        }
+                        Err(error) => RepairScanMessage::Failed(error.to_string()),
+                    }
+                }
+                Err(error) => RepairScanMessage::Failed(format!(
+                    "could not resolve the selected catalogue: {error}"
+                )),
+            };
+            let _ = sender.send(message);
+        });
+
+        self.scan_job = Some(RepairScanJob { messages });
+        self.scan_status = Some(LibraryScanStatus::Scanning);
+    }
+
+    #[cfg(test)]
+    fn start_scan_legacy_test(&mut self, setup: ScanSetupState) {
         let (Some(dat_id), Some(scan_root)) = (setup.selected_dat_id, setup.chosen_scan_root)
         else {
             return;
         };
-        let Some(entry) = setup
-            .dat_sources
-            .iter()
-            .find(|entry| entry.id == dat_id)
-            .cloned()
+        let Some(entry) = setup.dat_sources.iter().find(|entry| entry.id == dat_id).cloned()
         else {
             return;
         };
-
         let request = LibraryScanRequest {
             source_id: entry.id,
             source_display_name: entry.display_name,
@@ -660,9 +719,6 @@ impl RepairReviewPageState {
             scan_root,
             limits: DatLimits::default(),
             profile: RepairProfile::CanonicalInPlace,
-            // `None` in production: resolves `AuditCacheConfig::Default`,
-            // same as every other audit path - see
-            // `audit_cache_override`'s doc.
             audit_cache: self
                 .audit_cache_override
                 .clone()
@@ -671,17 +727,13 @@ impl RepairReviewPageState {
         let trusted = TrustedRoots::from_paths([&request.scan_root]);
         let cancel = AtomicBool::new(false);
         let (sender, messages) = std::sync::mpsc::channel();
-
         std::thread::spawn(move || {
             let message = match run_library_scan(&request, &trusted, &cancel, &|_| {}) {
-                Ok(outcome) => {
-                    RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome)))
-                }
+                Ok(outcome) => RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome))),
                 Err(error) => RepairScanMessage::Failed(error.to_string()),
             };
             let _ = sender.send(message);
         });
-
         self.scan_job = Some(RepairScanJob { messages });
         self.scan_status = Some(LibraryScanStatus::Scanning);
     }
@@ -1629,6 +1681,15 @@ fn show_scan_setup_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) 
         .max_height(max_window_height)
         .open(&mut open)
         .show(ui.ctx(), |ui| {
+            ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
+            if state.catalogue_picker.poll() || state.catalogue_picker.loading {
+                ui.ctx().request_repaint();
+            }
+            let _ = state.catalogue_picker.show(
+                ui,
+                DatCatalogueWorkflow::Repair,
+                &mut state.selected_catalogue,
+            );
             let Some(setup) = state.scan_setup.as_mut() else {
                 return;
             };
@@ -1644,53 +1705,6 @@ fn show_scan_setup_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) 
                 .max_height((max_window_height - 160.0).max(120.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
-                    if let Some(error) = &setup.dat_load_error {
-                        widgets::banner(
-                            ui,
-                            "Could not read the DAT sources registry",
-                            error,
-                            widgets::StatusTone::Blocked,
-                        );
-                    } else if setup.dat_sources.is_empty() {
-                        ui.label(
-                            egui::RichText::new(
-                                "No enabled DAT sources are registered. Add one on the DAT \
-                                 Sources page first.",
-                            )
-                            .color(theme::muted(ui)),
-                        );
-                    } else {
-                        for entry in &setup.dat_sources {
-                            let selected =
-                                setup.selected_dat_id.as_deref() == Some(entry.id.as_str());
-                            let clicked = egui::Frame::new()
-                                .fill(if selected {
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.35)
-                                } else {
-                                    theme::card_fill(ui)
-                                })
-                                .stroke(theme::border(ui))
-                                .corner_radius(6)
-                                .inner_margin(egui::Margin::symmetric(12, 8))
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new(&entry.display_name).strong());
-                                        ui.label(
-                                            egui::RichText::new(entry.path.display().to_string())
-                                                .color(theme::muted(ui))
-                                                .small(),
-                                        );
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-                            if clicked.clicked() {
-                                setup.selected_dat_id = Some(entry.id.clone());
-                            }
-                        }
-                    }
-
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("2. Choose a library folder to scan").strong());
                     for folder in &setup.library_folders {
