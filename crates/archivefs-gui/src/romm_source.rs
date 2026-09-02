@@ -96,6 +96,10 @@ pub(crate) enum RommOperation {
         local_path: std::path::PathBuf,
         romm_game_id: String,
     },
+    OpenManual {
+        local_path: std::path::PathBuf,
+        romm_game_id: String,
+    },
 }
 
 impl RommOperation {
@@ -120,6 +124,7 @@ impl RommOperation {
                 | Self::ResolveGame { .. }
                 | Self::LoadCover { .. }
                 | Self::LoadScreenshot { .. }
+                | Self::OpenManual { .. }
         )
     }
 
@@ -177,6 +182,7 @@ impl RommOperation {
             Self::VerifyLocalFile { .. } => "Verifying the local file",
             Self::LoadCover { .. } => "Loading a cover",
             Self::LoadScreenshot { .. } => "Loading a screenshot",
+            Self::OpenManual { .. } => "Opening a manual",
         }
     }
 }
@@ -220,6 +226,9 @@ pub(crate) enum RommOperationOutcome {
     Verified(Box<crate::romm_game::VerificationOutcomeView>),
     Cover(Box<crate::romm_game::CoverOutcome>),
     Screenshot(Box<crate::romm_game::CoverOutcome>),
+    ManualOpened {
+        path: std::path::PathBuf,
+    },
 }
 
 /// The connection test, reduced to what the card shows. Built in the worker so no
@@ -1020,6 +1029,16 @@ pub(crate) fn build_result_view(
             headline: "Screenshot loaded".to_string(),
             rows: Vec::new(),
             notes: vec![outcome.state.line()],
+            informational: false,
+        },
+        Ok(RommOperationOutcome::ManualOpened { path }) => RommResultView {
+            succeeded: true,
+            headline: "Manual opened".to_string(),
+            rows: vec![row("File", path.display().to_string())],
+            notes: vec![
+                "Opened using the desktop's default document handler. No file was changed."
+                    .to_string(),
+            ],
             informational: false,
         },
         Ok(RommOperationOutcome::Connection(summary)) => build_connection_result(summary),

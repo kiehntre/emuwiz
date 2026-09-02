@@ -949,6 +949,9 @@ pub(crate) enum GamePanelRequest {
     LoadScreenshot {
         romm_game_id: String,
     },
+    OpenManual {
+        romm_game_id: String,
+    },
     /// Choose which claimant to show.
     Choose {
         romm_game_id: String,
@@ -1508,12 +1511,17 @@ fn show_screenshot_and_manual(
     ui.add_space(theme::SECTION_GAP / 2.0);
     ui.label(egui::RichText::new("Manual").strong());
     if candidate.manual_available {
+        if widgets::action_button(ui, "Open Manual", widgets::ActionStyle::Quiet, !inputs.busy)
+            .clicked()
+        {
+            *request = Some(GamePanelRequest::OpenManual {
+                romm_game_id: candidate.romm_game_id.clone(),
+            });
+        }
         ui.label("Manual available");
         ui.label(
-            egui::RichText::new(
-                "The manual is recorded by RomM. Secure viewing is not available in this build.",
-            )
-            .weak(),
+            egui::RichText::new("Uses the explicitly mapped local RomM manual, when available.")
+                .weak(),
         );
     } else {
         ui.label("No manual is available.");

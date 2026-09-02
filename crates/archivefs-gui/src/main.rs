@@ -9849,6 +9849,15 @@ impl ArchiveFsApp {
                     self.romm_game.screenshot = crate::romm_game::CoverState::Loading;
                 }
             }
+            GamePanelRequest::OpenManual { romm_game_id } => {
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::OpenManual {
+                        local_path,
+                        romm_game_id,
+                    },
+                );
+            }
             GamePanelRequest::Cancel => self.cancel_romm_operation(),
             GamePanelRequest::Close => {
                 // Closed for this selection only. Choosing a different archive brings
@@ -33253,6 +33262,13 @@ fn run_romm_operation(
                 return Ok(RommOperationOutcome::Screenshot(Box::new(outcome)));
             }
         }
+        RommOperation::OpenManual {
+            local_path,
+            romm_game_id,
+        } => {
+            let path = open_romm_manual(&api, &settings, local_path, romm_game_id)?;
+            return Ok(RommOperationOutcome::ManualOpened { path });
+        }
         _ => {}
     }
 
@@ -33523,6 +33539,7 @@ fn run_romm_operation(
         | RommOperation::VerifyLocalFile { .. }
         | RommOperation::LoadCover { .. } => unreachable!("handled before this match"),
         RommOperation::LoadScreenshot { .. } => unreachable!("handled before this match"),
+        RommOperation::OpenManual { .. } => unreachable!("handled before this match"),
     }
 }
 
@@ -33762,6 +33779,33 @@ fn cover_record(
         .ok_or_else(|| {
             "That RomM record no longer maps to this file. Look the game up again.".to_string()
         })
+}
+
+fn open_romm_manual(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    settings: &archivefs_core::identity_source::settings::ProviderSettings,
+    local_path: &Path,
+    romm_game_id: &str,
+) -> Result<PathBuf, String> {
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let manual = record
+        .artwork
+        .as_ref()
+        .and_then(|artwork| artwork.manual.as_ref())
+        .ok_or_else(|| "No manual is available for this RomM record.".to_string())?;
+    let mapping = settings
+        .source
+        .media_mapping
+        .as_ref()
+        .map(archivefs_core::identity_source::romm::media_mapping::validate_romm_media_mapping)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    archivefs_core::identity_source::romm::manual::open_local_romm_manual(
+        mapping.as_ref(),
+        manual,
+        &archivefs_core::identity_source::romm::manual::DesktopManualOpener,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Answers a cover request without contacting anything, when it can.
