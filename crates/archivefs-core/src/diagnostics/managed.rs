@@ -94,6 +94,9 @@ pub enum ManagedFormat {
     XeniaPatch,
     /// RetroArch `.cht`. Journal-anchored only.
     RetroArchCheat,
+    /// A local generic (non-cheat) mod package write. Journal-anchored only;
+    /// no in-file marker and no profile-directory marker scan.
+    LocalModPackage,
 }
 
 impl ManagedFormat {
@@ -103,6 +106,7 @@ impl ManagedFormat {
             Self::Pcsx2Pnach => "PCSX2 PNACH",
             Self::XeniaPatch => "Xenia patch",
             Self::RetroArchCheat => "RetroArch cheat file",
+            Self::LocalModPackage => "Local mod package",
         }
     }
 
@@ -118,6 +122,7 @@ impl ManagedFormat {
             PreviewAdapter::Pcsx2 => Self::Pcsx2Pnach,
             PreviewAdapter::Xenia => Self::XeniaPatch,
             PreviewAdapter::RetroArch => Self::RetroArchCheat,
+            PreviewAdapter::LocalModPackage => Self::LocalModPackage,
         }
     }
 }
@@ -450,7 +455,9 @@ fn scan_marked_files(
         let expected_extension = match target.format {
             ManagedFormat::DolphinGameSettings => "ini",
             ManagedFormat::Pcsx2Pnach => "pnach",
-            ManagedFormat::XeniaPatch | ManagedFormat::RetroArchCheat => continue,
+            ManagedFormat::XeniaPatch
+            | ManagedFormat::RetroArchCheat
+            | ManagedFormat::LocalModPackage => continue,
         };
         if path
             .extension()
@@ -526,7 +533,9 @@ fn managed_ids(format: ManagedFormat, bytes: &[u8]) -> Result<Vec<String>, Strin
         ManagedFormat::Pcsx2Pnach => parse_pnach_document(bytes)
             .map(|document| document.managed_block_ids().iter().cloned().collect())
             .map_err(|error| error.detail.clone()),
-        ManagedFormat::XeniaPatch | ManagedFormat::RetroArchCheat => Ok(Vec::new()),
+        ManagedFormat::XeniaPatch
+        | ManagedFormat::RetroArchCheat
+        | ManagedFormat::LocalModPackage => Ok(Vec::new()),
     }
 }
 

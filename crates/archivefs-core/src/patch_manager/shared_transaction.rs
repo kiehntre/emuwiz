@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::destination_safety::{
     DestinationRootState, DestinationState, assess_destination, validate_destination_root,
+    validate_single_component,
 };
 use super::shared_preview::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewProposedAction,
@@ -109,7 +110,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
-        | PreviewAdapter::Xenia => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Xenia
+        | PreviewAdapter::LocalModPackage => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -251,6 +253,10 @@ pub struct SharedPlanEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SharedContentVerification {
+    /// Marks a plan produced by the local generic-mod adapter.  Unlike the
+    /// emulator-specific adapters, its destination may contain any number of
+    /// safe normal path components beneath the approved game root.
+    LocalModPackage,
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,
         require_managed_section: bool,
@@ -669,6 +675,26 @@ pub fn require_dolphin_managed_gamehacking_verification(
     Ok(())
 }
 
+/// Marks a validated local generic-mod plan as using the generic safe-path
+/// destination contract and reseals its plan digest.
+pub fn require_local_mod_package_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.source_mode != "local_mod_package" || plan.entries.is_empty() {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "local-mod verification requires a local package transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::LocalModPackage);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
 pub fn execute_shared_apply(
     plan: &SharedTransactionPlan,
     options: &SharedApplyOptions,
@@ -1046,16 +1072,38 @@ fn apply_one(
             "transaction write-byte limit reached",
         );
     }
-    let Some((category, filename)) = exactly_two_components(&relative) else {
-        return fail_result(
-            result,
-            SharedApplyOutcome::SkippedConflict,
-            SharedApplyFailureKind::DestinationUnsafe,
-            None,
-            "destination must contain exactly two normal components",
-        );
+    let local_mod_package = matches!(
+        plan.content_verification.as_ref(),
+        Some(SharedContentVerification::LocalModPackage)
+    );
+    let assessment = if local_mod_package {
+        assess_local_mod_destination(destination_root, &relative)
+    } else {
+        let Some((category, filename)) = exactly_two_components(&relative) else {
+            return fail_result(
+                result,
+                SharedApplyOutcome::SkippedConflict,
+                SharedApplyFailureKind::DestinationUnsafe,
+                None,
+                "destination must contain exactly two normal components",
+            );
+        };
+        assess_destination(destination_root, &category, &filename)
+            .map(|assessment| {
+                (
+                    assessment.destination_state,
+                    assessment.proposed_destination.path().to_path_buf(),
+                )
+            })
+            .map_err(|error| {
+                failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&error.path),
+                    &error.to_string(),
+                )
+            })
     };
-    let assessment = match assess_destination(destination_root, &category, &filename) {
+    let (destination_state, destination) = match assessment {
         Ok(value) => value,
         Err(error) => {
             return fail_result(
@@ -1063,13 +1111,12 @@ fn apply_one(
                 SharedApplyOutcome::DestinationChanged,
                 SharedApplyFailureKind::DestinationUnsafe,
                 Some(destination_root),
-                &error.to_string(),
+                &error.detail,
             );
         }
     };
-    let destination = assessment.proposed_destination.path().to_path_buf();
     let parent = destination.parent().unwrap_or(destination_root);
-    let current = if assessment.destination_state == DestinationState::RegularFile {
+    let current = if destination_state == DestinationState::RegularFile {
         match stable_hash(&destination, SHARED_MAX_SOURCE_BYTES) {
             Ok(value) => Some(value),
             Err(kind) => {
@@ -1098,9 +1145,9 @@ fn apply_one(
         );
     }
     let expected_state_matches = match plan.proposed_action {
-        PreviewProposedAction::Install => assessment.destination_state == DestinationState::Absent,
+        PreviewProposedAction::Install => destination_state == DestinationState::Absent,
         PreviewProposedAction::Replace | PreviewProposedAction::Skip => {
-            assessment.destination_state == DestinationState::RegularFile
+            destination_state == DestinationState::RegularFile
         }
         PreviewProposedAction::Blocked => false,
     };
@@ -1146,15 +1193,15 @@ fn apply_one(
         return result;
     }
     if !parent.exists() {
-        if !plan.parent_creation_approved
-            || !matches!(
-                plan.adapter,
-                PreviewAdapter::RetroArch
-                    | PreviewAdapter::Pcsx2
-                    | PreviewAdapter::Dolphin
-                    | PreviewAdapter::Xenia
-            )
-        {
+        let adapter_allows_parent_creation = matches!(
+            plan.adapter,
+            PreviewAdapter::RetroArch
+                | PreviewAdapter::Pcsx2
+                | PreviewAdapter::Dolphin
+                | PreviewAdapter::Xenia
+                | PreviewAdapter::LocalModPackage
+        );
+        if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(
                 result,
                 SharedApplyOutcome::WriteFailed,
@@ -1163,18 +1210,31 @@ fn apply_one(
                 "parent creation was not approved by preview and adapter contract",
             );
         }
-        if let Err(kind) = create_one_parent(destination_root, parent) {
-            return fail_result(
-                result,
-                SharedApplyOutcome::WriteFailed,
-                kind,
-                Some(parent),
-                "approved destination parent could not be created safely",
-            );
+        let create = if local_mod_package {
+            create_local_mod_parents(destination_root, parent)
+        } else {
+            create_one_parent(destination_root, parent).map(|()| vec![parent.to_path_buf()])
+        };
+        let created_dirs = match create {
+            Ok(dirs) => dirs,
+            Err(kind) => {
+                return fail_result(
+                    result,
+                    SharedApplyOutcome::WriteFailed,
+                    kind,
+                    Some(parent),
+                    "approved destination parent could not be created safely",
+                );
+            }
+        };
+        // Every directory level this transaction actually created, so rollback
+        // removes each one (innermost first) and leaves no empty scaffold
+        // behind - not just the immediate parent.
+        for dir in &created_dirs {
+            result
+                .created_directories
+                .push(SharedTransactionPath::from_path(dir));
         }
-        result
-            .created_directories
-            .push(SharedTransactionPath::from_path(parent));
     }
     if plan.proposed_action == PreviewProposedAction::Replace {
         let Some(existing) = current.as_ref() else {
@@ -1322,6 +1382,100 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
             }
             Ok(())
         }
+        SharedContentVerification::LocalModPackage => Ok(()),
+    }
+}
+
+/// Revalidate an arbitrary, safe relative path for a local mod package. The
+/// existing adapter contracts intentionally restrict their destinations to
+/// two components; the genuinely-new part here is walking N parents. Root
+/// validation and per-component traversal/absolute-path checks are delegated
+/// to `destination_safety` rather than reimplemented.
+fn assess_local_mod_destination(
+    root: &Path,
+    relative: &Path,
+) -> Result<(DestinationState, PathBuf), SharedApplyFailure> {
+    validate_destination_root(root).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(root),
+            &error.to_string(),
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(relative),
+            "local mod destination is empty",
+        ));
+    }
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(failure(
+                SharedApplyFailureKind::DestinationUnsafe,
+                Some(relative),
+                "local mod destination must contain only normal relative components",
+            ));
+        };
+        validate_single_component(name, root).map_err(|error| {
+            failure(
+                SharedApplyFailureKind::DestinationUnsafe,
+                Some(&error.path),
+                &error.to_string(),
+            )
+        })?;
+    }
+    let destination = root.join(relative);
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = relative.components().collect();
+    for component in &components[..components.len().saturating_sub(1)] {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&current),
+                    "local mod destination parent is a symlink",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&current),
+                    "local mod destination parent is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(failure(
+                    SharedApplyFailureKind::DestinationUnsafe,
+                    Some(&current),
+                    &format!("cannot inspect local mod destination parent: {error}"),
+                ));
+            }
+        }
+    }
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(&destination),
+            "local mod destination is a symlink",
+        )),
+        Ok(metadata) if metadata.is_file() => Ok((DestinationState::RegularFile, destination)),
+        Ok(_) => Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(&destination),
+            "local mod destination is not a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((DestinationState::Absent, destination))
+        }
+        Err(error) => Err(failure(
+            SharedApplyFailureKind::DestinationUnsafe,
+            Some(&destination),
+            &format!("cannot inspect local mod destination: {error}"),
+        )),
     }
 }
 
@@ -2059,6 +2213,49 @@ fn create_one_parent(root: &Path, parent: &Path) -> Result<(), SharedApplyFailur
         return Err(SharedApplyFailureKind::ParentCreationFailed);
     }
     Ok(())
+}
+
+/// Creates every missing directory level between `root` and `parent`,
+/// returning the levels it actually created (creation order, outermost
+/// first) so rollback can remove exactly those. Per-component
+/// traversal/absolute-path checks are delegated to `destination_safety`; an
+/// existing symlink or non-directory anywhere in the chain fails closed.
+fn create_local_mod_parents(
+    root: &Path,
+    parent: &Path,
+) -> Result<Vec<PathBuf>, SharedApplyFailureKind> {
+    if should_inject(FaultPoint::ParentCreationRace) {
+        return Err(SharedApplyFailureKind::ParentCreationFailed);
+    }
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| SharedApplyFailureKind::ParentCreationFailed)?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(SharedApplyFailureKind::ParentCreationFailed);
+        };
+        validate_single_component(name, root)
+            .map_err(|_| SharedApplyFailureKind::ParentCreationFailed)?;
+    }
+    validate_destination_root(root).map_err(|_| SharedApplyFailureKind::RootChanged)?;
+    let mut current = root.to_path_buf();
+    let mut created = Vec::new();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(SharedApplyFailureKind::ParentCreationFailed);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .map_err(|_| SharedApplyFailureKind::ParentCreationFailed)?;
+                created.push(current.clone());
+            }
+            Err(_) => return Err(SharedApplyFailureKind::ParentCreationFailed),
+        }
+    }
+    Ok(created)
 }
 
 /// One directory level [`bootstrap_missing_destination_root`] itself

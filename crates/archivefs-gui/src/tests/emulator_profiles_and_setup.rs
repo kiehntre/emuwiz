@@ -1315,6 +1315,7 @@ fn the_blocked_state_renders_as_visibly_different_from_a_worker_failure() {
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });
@@ -1685,6 +1686,7 @@ fn workflow_diagnostics_are_collapsed_so_the_primary_action_is_not_buried() {
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });
@@ -3016,6 +3018,7 @@ fn gamecube_page_renders_dolphin_without_retroarch_content() {
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });
@@ -3048,6 +3051,7 @@ fn cheats_mods_page_renders_the_new_hierarchy_headings() {
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });
@@ -3094,6 +3098,7 @@ fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selec
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });
@@ -3132,6 +3137,7 @@ fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selec
                     false,
                     &mut clipboard,
                     &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                    &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
                 );
             });
         });
@@ -3951,6 +3957,7 @@ fn beginner_primary_control_is_visible_without_scrolling_on_a_small_viewport() {
                         false,
                         &mut clipboard,
                         &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                        &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
                     );
                 });
             });

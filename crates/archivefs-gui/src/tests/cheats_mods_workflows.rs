@@ -641,6 +641,7 @@ fn dolphin_candidate_match_opens_a_real_matched_file_with_its_own_gecko_codes() 
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });

@@ -374,7 +374,7 @@ pub fn assess_destination(
     inspect_safe_destination(&destination)
 }
 
-fn validate_single_component(
+pub(crate) fn validate_single_component(
     value: &OsStr,
     error_path: &Path,
 ) -> Result<(), DestinationSafetyError> {

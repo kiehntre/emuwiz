@@ -31,6 +31,9 @@ pub enum PreviewAdapter {
     Pcsx2,
     Dolphin,
     Xenia,
+    /// The local generic (non-cheat) mod package workflow. Distinct provenance
+    /// so a journal / history row is never mislabelled as an emulator adapter.
+    LocalModPackage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -721,7 +724,7 @@ fn apply_eligibility_blockers(
             source.match_strength,
             PreviewMatchStrength::VerifiedExact | PreviewMatchStrength::Strong
         ),
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin => {
+        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin | PreviewAdapter::LocalModPackage => {
             source.match_strength == PreviewMatchStrength::VerifiedExact
         }
     };
@@ -1137,7 +1140,10 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" | "wii" | "nintendo wii"
         ),
         PreviewAdapter::Xenia => matches!(normalized.as_str(), "xbox360" | "xbox 360"),
-        PreviewAdapter::RetroArch => !normalized.is_empty(),
+        // Platform agreement for a local mod package is already established by
+        // `mod_package`'s own compatibility check before a plan is built; this
+        // adapter never goes through `build_shared_preview`.
+        PreviewAdapter::RetroArch | PreviewAdapter::LocalModPackage => !normalized.is_empty(),
     }
 }
 

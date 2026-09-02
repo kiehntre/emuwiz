@@ -185,6 +185,7 @@ pub(crate) mod home_page;
 pub(crate) mod identity_sources_page;
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
+pub(crate) mod local_mod_package_page;
 pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
@@ -4386,6 +4387,7 @@ struct ArchiveFsApp {
     /// never reuses state describing a different game or profile. See
     /// `dolphin_texture_mod_page`'s own module doc comment.
     dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState,
+    local_mod_package: local_mod_package_page::LocalModPackagePageState,
     /// The Launch Readiness panel's "Launch RetroArch" tracker - see
     /// `launch_readiness_page`'s own module doc comment. Deliberately not
     /// reset on archive/page navigation: a running or just-exited process
@@ -5023,6 +5025,7 @@ impl ArchiveFsApp {
             cheat_workflow: None,
             user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState::default(),
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+            local_mod_package: local_mod_package_page::LocalModPackagePageState::default(),
             launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
             launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
             launch_pcsx2: launch_readiness_page::Pcsx2LaunchState::default(),
@@ -19256,6 +19259,9 @@ impl ArchiveFsApp {
                             {
                                 ui.ctx().request_repaint();
                             }
+                            if self.local_mod_package.poll() || self.local_mod_package.is_busy() {
+                                ui.ctx().request_repaint();
+                            }
                             let action = show_cheats_mods_page(
                                 ui,
                                 self.cheat_workflow.as_mut(),
@@ -19269,6 +19275,7 @@ impl ArchiveFsApp {
                                 busy || self.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
                                 &mut self.dolphin_texture_mod,
+                                &mut self.local_mod_package,
                             );
                             ui.add_space(theme::SECTION_GAP);
                             let bsfree_action = show_bsfree_game_browser(

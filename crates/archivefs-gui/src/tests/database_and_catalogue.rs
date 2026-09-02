@@ -501,6 +501,7 @@ fn unsupported_platform_banner_names_the_recognised_platform_not_generic_text() 
                 false,
                 &mut clipboard,
                 &mut dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+                &mut crate::local_mod_package_page::LocalModPackagePageState::default(),
             );
         });
     });

@@ -1478,6 +1478,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::Pcsx2 => "PCSX2",
         PreviewAdapter::Dolphin => "Dolphin",
         PreviewAdapter::Xenia => "Xenia",
+        PreviewAdapter::LocalModPackage => "Local mod package",
     }
 }
 

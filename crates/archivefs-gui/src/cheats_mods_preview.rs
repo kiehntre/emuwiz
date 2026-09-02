@@ -1140,6 +1140,7 @@ pub(crate) fn show_cheats_mods_page(
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
     dolphin_texture_mod: &mut crate::dolphin_texture_mod_page::DolphinTextureModPageState,
+    local_mod_package: &mut crate::local_mod_package_page::LocalModPackagePageState,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
     let activity_archive = workflow
@@ -1187,6 +1188,13 @@ pub(crate) fn show_cheats_mods_page(
                 action = Some(CheatWorkflowAction::ChooseArchive);
             }
         });
+        ui.add_space(theme::SECTION_GAP);
+        crate::local_mod_package_page::show_local_mod_package_panel(
+            ui,
+            local_mod_package,
+            &workflow.archive_path,
+            crate::ready_game_identity(workflow),
+        );
         ui.add_space(theme::SECTION_GAP);
     }
 

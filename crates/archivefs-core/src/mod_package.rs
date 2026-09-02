@@ -47,6 +47,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus};
+use crate::patch_manager::{
+    PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewMatchStrength,
+    PreviewProposedAction, PreviewState, PreviewWarning, PreviewWarningKind, SharedPreviewEntry,
+    SharedPreviewReport, SharedTransactionPlan, build_shared_transaction_plan,
+    require_local_mod_package_verification,
+};
 
 pub const LOCAL_MOD_PACKAGE_MANIFEST: &str = "emuwiz.mod.json";
 pub const LOCAL_MOD_PACKAGE_FORMAT_VERSION: u32 = 1;
@@ -270,6 +276,7 @@ pub enum ModPlanBlockerKind {
     SourceHashMismatch,
     ExpectedResultHashMismatch,
     UnsupportedPatchFormat,
+    UnsupportedOperation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -289,8 +296,8 @@ pub struct LocalModPackagePlan {
     pub conflicts: Vec<ModPlanConflict>,
     pub warnings: Vec<String>,
     pub blockers: Vec<ModPlanIssue>,
-    /// True only when a future, separate transactional apply phase could
-    /// consider this immutable inspection plan. It does not authorise writes.
+    /// True only when the separate transactional apply phase can consider
+    /// this immutable inspection plan. It does not authorise writes.
     pub eligible_for_later_apply: bool,
 }
 
@@ -496,6 +503,168 @@ pub fn inspect_local_mod_package_candidates(
             .collect(),
         blockers: Vec::new(),
     }
+}
+
+/// Convert a completed local-package inspection into the existing shared
+/// transaction plan. Only create/replace operations with exact verified
+/// package compatibility are admitted; delete and patch operations remain
+/// explicitly unsupported so applying a package can never guess semantics.
+pub fn build_local_mod_package_transaction_plan(
+    inspected: &LocalModPackagePlan,
+) -> Result<SharedTransactionPlan, crate::patch_manager::SharedApplyFailure> {
+    if !inspected.eligible_for_later_apply
+        || !matches!(
+            inspected.compatibility.state,
+            ModCompatibilityState::Compatible
+        )
+        || !inspected.blockers.is_empty()
+        || !inspected.conflicts.is_empty()
+    {
+        return Err(crate::patch_manager::SharedApplyFailure {
+            kind: crate::patch_manager::SharedApplyFailureKind::InvalidPlan,
+            path: None,
+            detail: "local mod package inspection is not unambiguously eligible".to_string(),
+        });
+    }
+    let identity = inspected
+        .compatibility
+        .matching_identity
+        .as_ref()
+        .map(|value| value.value.clone())
+        .ok_or_else(|| crate::patch_manager::SharedApplyFailure {
+            kind: crate::patch_manager::SharedApplyFailureKind::InvalidPlan,
+            path: None,
+            detail: "local mod package has no exact verified identity".to_string(),
+        })?;
+    let mut entries = Vec::new();
+    for operation in &inspected.operations {
+        let (source, source_digest) = match (
+            operation.source_path.as_ref(),
+            operation.observed_payload_sha256.as_ref(),
+        ) {
+            (Some(source), Some(digest)) => (source.clone(), digest.clone()),
+            _ => {
+                return Err(crate::patch_manager::SharedApplyFailure {
+                    kind: crate::patch_manager::SharedApplyFailureKind::InvalidPlan,
+                    path: Some(crate::patch_manager::SharedTransactionPath::from_path(
+                        &operation.destination_path,
+                    )),
+                    detail: "local mod operation has no verified payload".to_string(),
+                });
+            }
+        };
+        let relative = operation
+            .destination_path
+            .strip_prefix(&inspected.selected_game.game_root)
+            .map_err(|_| crate::patch_manager::SharedApplyFailure {
+                kind: crate::patch_manager::SharedApplyFailureKind::InvalidPlan,
+                path: Some(crate::patch_manager::SharedTransactionPath::from_path(
+                    &operation.destination_path,
+                )),
+                detail: "local mod destination is outside the game root".to_string(),
+            })?
+            .to_path_buf();
+        let (destination_state, action) = match operation.destination_state {
+            ProposedFileState::Missing => (
+                PreviewDestinationState::Missing,
+                PreviewProposedAction::Install,
+            ),
+            ProposedFileState::ExistingRegularFile => {
+                let digest = operation.observed_source_sha256.as_deref();
+                if digest == Some(source_digest.as_str()) {
+                    (
+                        PreviewDestinationState::RegularFileIdentical,
+                        PreviewProposedAction::Skip,
+                    )
+                } else {
+                    (
+                        PreviewDestinationState::RegularFileDifferent,
+                        PreviewProposedAction::Replace,
+                    )
+                }
+            }
+            ProposedFileState::ExistingDirectory => (
+                PreviewDestinationState::Directory,
+                PreviewProposedAction::Blocked,
+            ),
+            ProposedFileState::ExistingSpecialFile => (
+                PreviewDestinationState::SpecialFile,
+                PreviewProposedAction::Blocked,
+            ),
+            ProposedFileState::Unavailable => (
+                PreviewDestinationState::Unavailable,
+                PreviewProposedAction::Blocked,
+            ),
+        };
+        if action == PreviewProposedAction::Blocked {
+            return Err(crate::patch_manager::SharedApplyFailure {
+                kind: crate::patch_manager::SharedApplyFailureKind::InvalidPlan,
+                path: Some(crate::patch_manager::SharedTransactionPath::from_path(
+                    &operation.destination_path,
+                )),
+                detail: "local mod destination is not safely actionable".to_string(),
+            });
+        }
+        let parent = operation
+            .destination_path
+            .parent()
+            .unwrap_or(inspected.selected_game.game_root.as_path());
+        let mut warnings = Vec::new();
+        if !parent.exists() {
+            warnings.push(PreviewWarning {
+                kind: PreviewWarningKind::DestinationParentsMissing,
+                path: Some(parent.to_path_buf()),
+            });
+        }
+        if action == PreviewProposedAction::Replace {
+            warnings.push(PreviewWarning {
+                kind: PreviewWarningKind::BackupWouldBeRequired,
+                path: Some(operation.destination_path.clone()),
+            });
+        }
+        entries.push(SharedPreviewEntry {
+            adapter: PreviewAdapter::LocalModPackage,
+            selected_archive: inspected.selected_game.archive_path.clone(),
+            verified_identity: Some(identity.clone()),
+            match_strength: PreviewMatchStrength::VerifiedExact,
+            source_path: Some(source),
+            source_digest: Some(source_digest),
+            destination_root: inspected.selected_game.game_root.clone(),
+            destination_relative_path: Some(relative),
+            destination_path: Some(operation.destination_path.clone()),
+            destination_state,
+            existing_destination_digest: operation.observed_source_sha256.clone(),
+            state: match action {
+                PreviewProposedAction::Install => PreviewState::InstallNew,
+                PreviewProposedAction::Skip => PreviewState::AlreadyInstalled,
+                PreviewProposedAction::Replace => PreviewState::ReplaceDifferent,
+                PreviewProposedAction::Blocked => PreviewState::Unsupported,
+            },
+            proposed_action: action,
+            eligibility: PreviewEligibility::Eligible,
+            blockers: Vec::new(),
+            warnings,
+            backup_required: action == PreviewProposedAction::Replace,
+            explicit_replacement_permission_required: action == PreviewProposedAction::Replace,
+        });
+    }
+    let report = SharedPreviewReport {
+        request_archive: inspected.selected_game.archive_path.clone(),
+        adapter: PreviewAdapter::LocalModPackage,
+        entries,
+        conflicts: Vec::new(),
+        warnings: Vec::new(),
+        summary: Default::default(),
+        complete: true,
+    };
+    let mut transaction = build_shared_transaction_plan(
+        &report,
+        "local-game",
+        "local_mod_package",
+        &inspected.package_root,
+    )?;
+    require_local_mod_package_verification(&mut transaction)?;
+    Ok(transaction)
 }
 
 fn finish(mut plan: LocalModPackagePlan) -> LocalModPackagePlan {
@@ -1124,6 +1293,11 @@ fn inspect_operation(
             }
         }
         ModOperationKind::DeleteFile => {
+            block(
+                plan,
+                ModPlanBlockerKind::UnsupportedOperation,
+                "delete operations are not supported by the reversible local-mod apply path",
+            );
             if !matches!(
                 operation.destination_state,
                 ProposedFileState::ExistingRegularFile
@@ -1523,6 +1697,28 @@ mod tests {
     }
 
     #[test]
+    fn local_mod_package_builds_shared_reversible_transaction_plan() {
+        let (_temp, request, root) = setup();
+        let (manifest, payload) = valid_replace();
+        write_package(&root, &manifest, Some(("payload/new.bin", &payload)));
+        let plan = inspect_local_mod_package(request);
+        let transaction = build_local_mod_package_transaction_plan(&plan).unwrap();
+        assert_eq!(transaction.entries.len(), 1);
+        assert_eq!(transaction.context.source_mode, "local_mod_package");
+        assert!(matches!(
+            transaction.entries[0].content_verification,
+            Some(crate::patch_manager::SharedContentVerification::LocalModPackage)
+        ));
+        assert_eq!(
+            transaction.entries[0]
+                .destination_relative_path
+                .to_path_buf()
+                .unwrap(),
+            PathBuf::from("game.bin")
+        );
+    }
+
+    #[test]
     fn mod_package_rejects_wrong_platform_and_identity() {
         let (_temp, mut request, root) = setup();
         let (manifest, payload) = valid_replace();
@@ -1729,5 +1925,380 @@ mod tests {
         assert!(plan.eligible_for_later_apply);
         assert_eq!(fs::read(game).unwrap(), before);
         assert!(!root.join("applied").exists());
+    }
+
+    // -----------------------------------------------------------------
+    // Execution-level coverage for the generic local-mod seam: the whole
+    // LocalModPackagePlan -> SharedTransactionPlan -> execute_shared_apply
+    // -> shared rollback round trip, against genuinely nested targets,
+    // using only the existing shared backup/journal/rollback machinery.
+    // -----------------------------------------------------------------
+
+    use crate::patch_manager::{
+        SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation,
+        SharedRollbackOptions, discover_shared_apply_history, execute_shared_apply,
+        execute_shared_rollback, preview_shared_rollback,
+    };
+
+    /// history_root + backup_root under a fresh temp dir, plus an apply
+    /// options value that reuses the plan's own context - the same shape
+    /// every other adapter's tests use.
+    fn shared_roots(temp: &TempDir) -> (PathBuf, PathBuf) {
+        (temp.path().join("history"), temp.path().join("backups"))
+    }
+
+    fn apply_options(
+        plan: &SharedTransactionPlan,
+        history_root: &Path,
+        backup_root: &Path,
+        replacement_approved: bool,
+    ) -> SharedApplyOptions {
+        SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved,
+            }),
+            operation_id: "local-mod-apply".into(),
+            timestamp_unix_seconds: 1_700_000_000,
+            current_context: plan.context.clone(),
+            history_root: history_root.to_path_buf(),
+            backup_root: backup_root.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn local_mod_nested_install_applies_and_rollback_restores_the_tree_exactly() {
+        let (temp, request, package_root) = setup();
+        let game_root = request.selected_game.game_root.clone();
+        let (history_root, backup_root) = shared_roots(&temp);
+
+        // A three-deep target whose parents do not exist yet.
+        let payload = b"new-texture-bytes".to_vec();
+        let manifest = manifest(
+            &format!(
+                r#"{{"kind":"create","payload":"payload/tex.bin","destination":"assets/textures/hi/tex.bin","expected_result_sha256":"{}"}}"#,
+                sha256_hex(&payload)
+            ),
+            "",
+        );
+        write_package(
+            &package_root,
+            &manifest,
+            Some(("payload/tex.bin", &payload)),
+        );
+
+        let inspected = inspect_local_mod_package(request);
+        assert!(inspected.eligible_for_later_apply);
+        assert_eq!(inspected.operations.len(), 1);
+        assert_eq!(
+            inspected.operations[0].destination_state,
+            ProposedFileState::Missing
+        );
+
+        let plan = build_local_mod_package_transaction_plan(&inspected).unwrap();
+        assert_eq!(plan.context.source_mode, "local_mod_package");
+        assert_eq!(
+            plan.context.adapter,
+            crate::patch_manager::PreviewAdapter::LocalModPackage,
+            "provenance must be the local mod package adapter, never a fabricated emulator adapter"
+        );
+
+        let target = game_root.join("assets/textures/hi/tex.bin");
+        let applied = execute_shared_apply(
+            &plan,
+            &apply_options(&plan, &history_root, &backup_root, false),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&target).unwrap(), payload, "target bytes written");
+        assert!(game_root.join("assets").is_dir());
+        assert!(game_root.join("assets/textures").is_dir());
+        assert!(game_root.join("assets/textures/hi").is_dir());
+
+        let entry = &applied.journal.entries[0];
+        assert_eq!(entry.destination_existed_before_apply, Some(false));
+        assert_eq!(
+            entry.created_directories.len(),
+            3,
+            "every created directory level is recorded for rollback, not just the immediate parent"
+        );
+        assert!(entry.backup_path.is_none(), "an install backs nothing up");
+
+        // The journal is written into the *shared* history root, discoverable
+        // by the normal shared-history reader.
+        let journal_path = applied.journal_path.clone().unwrap();
+        assert!(journal_path.starts_with(&history_root));
+        assert_eq!(
+            discover_shared_apply_history(&history_root).journals.len(),
+            1
+        );
+
+        // Rollback through the existing shared API.
+        let preview = preview_shared_rollback(&journal_path, &game_root, &backup_root);
+        assert!(preview.available);
+        let rolled_back = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "local-mod-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: history_root.clone(),
+                backup_root: backup_root.clone(),
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+
+        // Exact restoration: the file and every directory level this
+        // transaction created are gone; the pre-existing game file remains.
+        assert!(!target.exists());
+        assert!(!game_root.join("assets/textures/hi").exists());
+        assert!(!game_root.join("assets/textures").exists());
+        assert!(!game_root.join("assets").exists());
+        assert!(game_root.join("game.bin").is_file());
+        assert!(game_root.is_dir());
+    }
+
+    #[test]
+    fn local_mod_nested_replace_round_trip_restores_original_bytes_from_the_shared_backup() {
+        let (temp, request, package_root) = setup();
+        let game_root = request.selected_game.game_root.clone();
+        let (history_root, backup_root) = shared_roots(&temp);
+
+        // A nested existing file; its parent directories pre-exist.
+        fs::create_dir_all(game_root.join("save/slots")).unwrap();
+        let target = game_root.join("save/slots/data.bin");
+        let original = b"ORIGINAL-SAVE-BYTES".to_vec();
+        fs::write(&target, &original).unwrap();
+
+        let modded = b"MODDED-SAVE-BYTES".to_vec();
+        let manifest = manifest(
+            &format!(
+                r#"{{"kind":"replace","payload":"payload/data.bin","destination":"save/slots/data.bin","required_source_sha256":"{}","expected_result_sha256":"{}"}}"#,
+                sha256_hex(&original),
+                sha256_hex(&modded)
+            ),
+            "",
+        );
+        write_package(
+            &package_root,
+            &manifest,
+            Some(("payload/data.bin", &modded)),
+        );
+
+        let inspected = inspect_local_mod_package(request);
+        assert!(inspected.eligible_for_later_apply);
+        assert_eq!(
+            inspected.operations[0].destination_state,
+            ProposedFileState::ExistingRegularFile
+        );
+
+        let plan = build_local_mod_package_transaction_plan(&inspected).unwrap();
+        let applied = execute_shared_apply(
+            &plan,
+            &apply_options(&plan, &history_root, &backup_root, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&target).unwrap(), modded);
+
+        // The original bytes are preserved in the normal shared backup store.
+        let entry = &applied.journal.entries[0];
+        let backup = entry
+            .backup_path
+            .as_ref()
+            .expect("replace makes a shared backup")
+            .to_path_buf()
+            .unwrap();
+        assert!(backup.starts_with(&backup_root));
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(entry.created_directories.len(), 0);
+
+        let journal_path = applied.journal_path.clone().unwrap();
+        let preview = preview_shared_rollback(&journal_path, &game_root, &backup_root);
+        assert!(preview.available);
+        let rolled_back = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "local-mod-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root,
+                backup_root,
+            },
+        );
+        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            original,
+            "rollback restores the exact original bytes, not merely removes a new file"
+        );
+        assert!(game_root.join("save/slots").is_dir());
+        assert!(game_root.join("save").is_dir());
+    }
+
+    #[test]
+    fn local_mod_symlinked_mid_path_component_is_refused_and_writes_nothing() {
+        #[cfg(unix)]
+        {
+            let (temp, request, package_root) = setup();
+            let game_root = request.selected_game.game_root.clone();
+            let (history_root, backup_root) = shared_roots(&temp);
+
+            // `a/` is a real dir; `a/b` is a symlink pointing outside the game
+            // root; the manifest targets `a/b/c/file.bin`.
+            let outside = temp.path().join("outside");
+            fs::create_dir_all(outside.join("c")).unwrap();
+            fs::create_dir(game_root.join("a")).unwrap();
+            std::os::unix::fs::symlink(&outside, game_root.join("a/b")).unwrap();
+            let sentinel = outside.join("c/file.bin");
+            fs::write(&sentinel, b"UNTOUCHED").unwrap();
+
+            let payload = b"payload".to_vec();
+            let manifest = manifest(
+                &format!(
+                    r#"{{"kind":"create","payload":"payload/f.bin","destination":"a/b/c/file.bin","expected_result_sha256":"{}"}}"#,
+                    sha256_hex(&payload)
+                ),
+                "",
+            );
+            write_package(&package_root, &manifest, Some(("payload/f.bin", &payload)));
+
+            // Inspection already refuses an unsafe symlink component.
+            let inspected = inspect_local_mod_package(request);
+            assert!(
+                has_blocker(&inspected, ModPlanBlockerKind::UnsafeSymlink),
+                "a symlinked mid-path component is an unsafe destination"
+            );
+            assert!(!inspected.eligible_for_later_apply);
+            assert!(build_local_mod_package_transaction_plan(&inspected).is_err());
+
+            // Even a hand-built plan that tries to smuggle the same nested
+            // destination past inspection is refused by the shared apply
+            // assessment, and nothing is written on either side of the link.
+            let mut smuggled = build_shared_plan_for_symlink_case(&game_root, &package_root);
+            crate::patch_manager::require_local_mod_package_verification(&mut smuggled).unwrap();
+            let applied = execute_shared_apply(
+                &smuggled,
+                &apply_options(&smuggled, &history_root, &backup_root, false),
+            );
+            assert_ne!(
+                applied.journal.status,
+                SharedApplyStatus::Success,
+                "the shared apply must refuse a symlinked mid-path component"
+            );
+            assert!(
+                applied.journal.entries[0]
+                    .failures
+                    .iter()
+                    .any(|failure| matches!(
+                        failure.kind,
+                        crate::patch_manager::SharedApplyFailureKind::DestinationUnsafe
+                    )),
+                "refused specifically as an unsafe destination"
+            );
+            // The symlink itself is untouched and its target directory is
+            // exactly as it was - nothing was written through the link.
+            assert!(
+                fs::symlink_metadata(game_root.join("a/b"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!outside.join("c/file.bin.tmp").exists());
+            let target_dir: Vec<_> = fs::read_dir(outside.join("c"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(target_dir, vec![std::ffi::OsString::from("file.bin")]);
+            assert_eq!(
+                fs::read(&sentinel).unwrap(),
+                b"UNTOUCHED",
+                "the symlink target is never touched"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn build_shared_plan_for_symlink_case(
+        game_root: &Path,
+        package_root: &Path,
+    ) -> SharedTransactionPlan {
+        use crate::patch_manager::{
+            PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewMatchStrength,
+            PreviewProposedAction, PreviewState, SharedPreviewEntry, SharedPreviewReport,
+        };
+        let payload = package_root.join("payload/f.bin");
+        let report = SharedPreviewReport {
+            request_archive: game_root.join("game.bin"),
+            adapter: PreviewAdapter::LocalModPackage,
+            entries: vec![SharedPreviewEntry {
+                adapter: PreviewAdapter::LocalModPackage,
+                selected_archive: game_root.join("game.bin"),
+                verified_identity: Some("game-sha".into()),
+                match_strength: PreviewMatchStrength::VerifiedExact,
+                source_path: Some(payload.clone()),
+                source_digest: Some(sha256_hex(b"payload")),
+                destination_root: game_root.to_path_buf(),
+                destination_relative_path: Some(PathBuf::from("a/b/c/file.bin")),
+                destination_path: Some(game_root.join("a/b/c/file.bin")),
+                destination_state: PreviewDestinationState::Missing,
+                existing_destination_digest: None,
+                state: PreviewState::InstallNew,
+                proposed_action: PreviewProposedAction::Install,
+                eligibility: PreviewEligibility::Eligible,
+                blockers: Vec::new(),
+                warnings: Vec::new(),
+                backup_required: false,
+                explicit_replacement_permission_required: false,
+            }],
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+            summary: Default::default(),
+            complete: true,
+        };
+        build_shared_transaction_plan(&report, "local-game", "local_mod_package", package_root)
+            .unwrap()
+    }
+
+    #[test]
+    fn local_mod_delete_and_patch_operations_are_fail_closed_and_produce_no_apply_plan() {
+        // Delete.
+        let (_t1, request, root) = setup();
+        write_package(
+            &root,
+            &manifest(r#"{"kind":"delete","destination":"game.bin"}"#, ""),
+            None,
+        );
+        let deleted = inspect_local_mod_package(request);
+        assert!(has_blocker(
+            &deleted,
+            ModPlanBlockerKind::UnsupportedOperation
+        ));
+        assert!(!deleted.eligible_for_later_apply);
+        assert!(build_local_mod_package_transaction_plan(&deleted).is_err());
+
+        // Patch.
+        let (_t2, request, root) = setup();
+        write_package(
+            &root,
+            &manifest(
+                r#"{"kind":"patch","payload":"payload/p.ips","destination":"game.bin","patch_format":"ips"}"#,
+                "",
+            ),
+            Some(("payload/p.ips", b"PATCH00")),
+        );
+        let patched = inspect_local_mod_package(request);
+        assert!(has_blocker(
+            &patched,
+            ModPlanBlockerKind::UnsupportedPatchFormat
+        ));
+        assert!(!patched.eligible_for_later_apply);
+        assert!(build_local_mod_package_transaction_plan(&patched).is_err());
     }
 }
