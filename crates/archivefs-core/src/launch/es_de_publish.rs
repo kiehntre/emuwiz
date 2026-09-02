@@ -108,22 +108,23 @@
 //! evidence, never silently ignored.
 //!
 //! Writing the record itself goes through the same [`crate::atomic_write_text`]
-//! every other write in this module uses, which is symlink-safe for its
-//! *destination* by construction: it writes a brand-new, uniquely-named
-//! temporary file in the same directory, then finishes with a single
-//! `rename(2)`. POSIX `rename` replaces whatever directory entry
-//! currently exists at the destination name - if that entry is a
-//! symlink, the symlink itself is replaced, and the file it pointed to is
-//! never opened, followed, or written through. An attacker who plants a
-//! symlink at a recovery (or gamelist) path before a write therefore
-//! cannot redirect that write anywhere else; the symlink is simply
-//! discarded and replaced with a real file at the same name. This
-//! guarantee is exercised directly by
+//! every other write in this module uses, which fails closed on an unsafe
+//! *destination* by construction: before it creates its temporary file or
+//! renames anything, it reads the destination's final path component with
+//! [`std::fs::symlink_metadata`] (never followed). If that entry is a
+//! symlink - or exists but is not a regular file - the write is *refused*
+//! outright with an error, and nothing on disk is touched: no temporary
+//! file, no `rename(2)`, and the planted symlink and whatever it points at
+//! are left exactly as found. An attacker who plants a symlink at a
+//! recovery (or gamelist) path before a write therefore cannot redirect
+//! that write anywhere, and cannot even get the link replaced - EmuWiz
+//! stops before any mutation. [`apply_es_de_gamelist_publication`]
+//! propagates that refusal and never goes on to touch `gamelist.xml`.
+//! This guarantee is exercised directly by
 //! `tests::writing_the_recovery_record_through_a_symlinked_path_never_touches_its_target`.
-//! The one place `atomic_write_text` does follow a symlink is its
-//! permission-copy step (`fs::metadata` on the *existing* destination, to
-//! preserve its mode bits before the rename) - a metadata-only read that
-//! never returns file content and never itself writes anywhere.
+//! (The refusal covers the final path component only; the recovery path is
+//! always a sibling of a profile-resolved `gamelist.xml`, so the parent
+//! chain is EmuWiz's own resolved ES-DE layout, never attacker input.)
 
 use std::fs;
 use std::path::{Path, PathBuf};

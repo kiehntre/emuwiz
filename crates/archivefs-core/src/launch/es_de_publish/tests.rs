@@ -717,7 +717,8 @@ fn oversized_existing_gamelist_is_refused_before_reading() {
 fn writing_the_recovery_record_through_a_symlinked_path_never_touches_its_target() {
     let home = tempdir().unwrap();
     let gamelist_path = home.path().join("gamelists/psx/gamelist.xml");
-    std::fs::create_dir_all(gamelist_path.parent().unwrap()).unwrap();
+    let recovery_dir = gamelist_path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&recovery_dir).unwrap();
     let recovery_path = es_de_gamelist_recovery_path(&gamelist_path);
 
     // An attacker-planted symlink sitting exactly at the recovery path,
@@ -727,27 +728,138 @@ fn writing_the_recovery_record_through_a_symlinked_path_never_touches_its_target
     std::os::unix::fs::symlink(&victim, &recovery_path).unwrap();
     assert!(recovery_path.is_symlink());
 
-    write_recovery_record(
+    // The invariant: a symlink at the recovery-record path is *refused*,
+    // fail-closed, before any mutation. `crate::atomic_write_text` reads the
+    // final path component with `fs::symlink_metadata` (never followed) and
+    // returns an error before it creates a temporary file or renames
+    // anything - see the `es_de_publish` module doc comment's
+    // "Recovery-record safety" section.
+    let error = write_recovery_record(
         &recovery_path,
         &gamelist_path,
         &Some("captured".to_string()),
     )
-    .unwrap();
+    .expect_err("a symlinked recovery path must be refused, never written through");
+    assert!(matches!(error, EsDePublicationError::Io { .. }));
 
-    // The victim file must be completely untouched - a write-through
-    // would have overwritten it with the recovery JSON instead.
+    // The victim's bytes are byte-for-byte unchanged - nothing was written
+    // through, or renamed over, the link.
     assert_eq!(
         std::fs::read_to_string(&victim).unwrap(),
         "original victim content"
     );
-    // The symlink itself was replaced by a real regular file: the write
-    // landed on the directory entry, never followed through to the
-    // target, per POSIX `rename(2)` semantics.
+    // The planted symlink is left exactly as found: not removed, not
+    // replaced, not overwritten. EmuWiz never disturbs an unsafe path it
+    // refuses.
     let metadata = std::fs::symlink_metadata(&recovery_path).unwrap();
-    assert!(!metadata.file_type().is_symlink());
-    assert!(metadata.is_file());
+    assert!(metadata.file_type().is_symlink());
+    assert_eq!(std::fs::read_link(&recovery_path).unwrap(), victim);
+
+    // No orphan temporary or sidecar file is left in the parent directory by
+    // the refused write - the only entry is the planted symlink itself.
+    let leftovers: Vec<_> = std::fs::read_dir(&recovery_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers,
+        vec![recovery_path.file_name().unwrap().to_os_string()]
+    );
+
+    // The symlink is never read *through* either: the read path also refuses
+    // it (`RecoveryCorrupt`, via `symlink_metadata`), so a planted link can
+    // neither redirect a write nor smuggle content into a restore.
+    let read_error = read_recovery_record(&recovery_path, &gamelist_path)
+        .expect_err("a symlinked recovery path must never be read through");
+    assert!(matches!(
+        read_error,
+        EsDePublicationError::RecoveryCorrupt { .. }
+    ));
+}
+
+/// The `atomic_write_text` symlink refusal covers the *final* path
+/// component. It does not walk intermediate directories, so a recovery
+/// path whose parent directory is itself a symlink is followed. This is
+/// tolerated here only because `write_recovery_record` is always given a
+/// sibling of a profile-resolved `gamelists/<system>/gamelist.xml` path
+/// (see `es_de_gamelist_recovery_path`), never an attacker-supplied
+/// directory - the parent chain is EmuWiz's own resolved ES-DE layout.
+/// Recorded as a test so the boundary is explicit, not silently assumed;
+/// hardening intermediate components belongs in the shared write helper,
+/// not this module.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_parent_directory_of_the_recovery_path_is_out_of_this_helper_s_scope() {
+    let home = tempdir().unwrap();
+    let real_dir = home.path().join("real/gamelists/psx");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let linked_parent = home.path().join("gamelists/psx");
+    std::fs::create_dir_all(linked_parent.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real_dir, &linked_parent).unwrap();
+
+    let gamelist_path = linked_parent.join("gamelist.xml");
+    let recovery_path = es_de_gamelist_recovery_path(&gamelist_path);
+    // Only the final component matters to the guard; the record lands in the
+    // resolved directory. The test's job is to pin this behaviour, not bless
+    // an attacker-controlled parent - which cannot occur for a
+    // profile-resolved gamelist path.
+    write_recovery_record(&recovery_path, &gamelist_path, &Some("x".to_string())).unwrap();
+    assert!(real_dir.join(recovery_path.file_name().unwrap()).is_file());
+}
+
+#[test]
+fn an_ordinary_recovery_record_write_round_trips_and_atomically_replaces_a_prior_one() {
+    let home = tempdir().unwrap();
+    let gamelist_path = home.path().join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(gamelist_path.parent().unwrap()).unwrap();
+    let recovery_path = es_de_gamelist_recovery_path(&gamelist_path);
+
+    write_recovery_record(&recovery_path, &gamelist_path, &Some("first".to_string())).unwrap();
+    assert!(!recovery_path.is_symlink());
     let record = read_recovery_record(&recovery_path, &gamelist_path).unwrap();
-    assert_eq!(record.previous_content.as_deref(), Some("captured"));
+    assert_eq!(record.previous_content.as_deref(), Some("first"));
+
+    // A second write over the existing regular file is an ordinary atomic
+    // replace - a non-symlinked regular file is a permitted destination.
+    write_recovery_record(&recovery_path, &gamelist_path, &None).unwrap();
+    let record = read_recovery_record(&recovery_path, &gamelist_path).unwrap();
+    assert_eq!(record.previous_content, None);
+
+    // No temp file left behind by either write.
+    let leftovers: Vec<_> = std::fs::read_dir(gamelist_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        leftovers,
+        vec![recovery_path.file_name().unwrap().to_os_string()]
+    );
+}
+
+#[test]
+fn a_directory_planted_at_the_recovery_path_is_refused_without_mutation() {
+    let home = tempdir().unwrap();
+    let gamelist_path = home.path().join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(gamelist_path.parent().unwrap()).unwrap();
+    let recovery_path = es_de_gamelist_recovery_path(&gamelist_path);
+    std::fs::create_dir(&recovery_path).unwrap();
+    std::fs::write(recovery_path.join("planted"), b"attacker file").unwrap();
+
+    let error = write_recovery_record(&recovery_path, &gamelist_path, &Some("x".to_string()))
+        .expect_err("a non-regular-file destination must be refused");
+    assert!(matches!(error, EsDePublicationError::Io { .. }));
+
+    // The directory and its contents are untouched.
+    assert!(recovery_path.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(recovery_path.join("planted")).unwrap(),
+        "attacker file"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&recovery_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("planted")]);
 }
 
 #[test]
