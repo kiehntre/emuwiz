@@ -117,6 +117,9 @@ pub struct ArtworkReference {
     pub reference: String,
     /// The smaller of the provider's variants, when it publishes more than one.
     pub small_reference: Option<String>,
+    /// RomM's larger hosted cover variant, when published.
+    #[serde(default)]
+    pub large_reference: Option<String>,
     /// RomM-hosted screenshot references, kept in provider order.
     #[serde(default)]
     pub screenshots: Vec<MediaReference>,

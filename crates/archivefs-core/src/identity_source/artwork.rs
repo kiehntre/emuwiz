@@ -100,6 +100,8 @@ pub const LAST_USED_WRITE_INTERVAL_SECONDS: i64 = 3600;
 pub struct ArtworkRequest<'a> {
     pub provider_game_id: &'a str,
     pub kind: ArtworkKind,
+    /// RomM's larger hosted cover path, preferred when it is usable.
+    pub large_reference: Option<&'a str>,
     /// RomM's own small-cover path. The only fetchable reference.
     pub small_reference: Option<&'a str>,
     /// Whatever scraper URL RomM recorded. Kept for provenance, never fetched.
@@ -113,8 +115,12 @@ impl<'a> ArtworkRequest<'a> {
         Self {
             provider_game_id: &record.provider_game_id,
             kind: ArtworkKind::Cover,
+            large_reference: artwork.and_then(|art| art.large_reference.as_deref()),
             small_reference: artwork.and_then(|art| art.small_reference.as_deref()),
-            public_reference: artwork.map(|art| art.reference.as_str()),
+            public_reference: artwork.and_then(|art| {
+                (art.large_reference.as_deref() != Some(art.reference.as_str()))
+                    .then_some(art.reference.as_str())
+            }),
         }
     }
 
@@ -122,8 +128,19 @@ impl<'a> ArtworkRequest<'a> {
         Self {
             provider_game_id,
             kind: ArtworkKind::Screenshot,
+            large_reference: None,
             small_reference: media.hosted_reference.as_deref(),
             public_reference: media.public_reference.as_deref(),
+        }
+    }
+
+    fn without_large(&self) -> ArtworkRequest<'a> {
+        ArtworkRequest {
+            provider_game_id: self.provider_game_id,
+            kind: self.kind,
+            large_reference: None,
+            small_reference: self.small_reference,
+            public_reference: self.public_reference,
         }
     }
 }
@@ -624,6 +641,17 @@ impl ArtworkCache {
     /// corrupted entry is refetched rather than drawn as a broken image.
     pub fn lookup(&self, server_id: &str, request: &ArtworkRequest<'_>) -> Option<CachedThumbnail> {
         let key = Self::key_for(server_id, request);
+        if let Some(thumbnail) = self.lookup_key(server_id, &key) {
+            return Some(thumbnail);
+        }
+        let fallback = request.without_large();
+        if fallback.large_reference.is_none() {
+            return None;
+        }
+        self.lookup_key(server_id, &Self::key_for(server_id, &fallback))
+    }
+
+    fn lookup_key(&self, server_id: &str, key: &str) -> Option<CachedThumbnail> {
         let index = self.load_index(server_id);
         let entry = index.entries.iter().find(|entry| entry.key == key)?;
         let path = self.thumbnail_path(&key);
@@ -644,7 +672,7 @@ impl ArtworkCache {
             return None;
         }
         let thumbnail = CachedThumbnail {
-            key: key.clone(),
+            key: key.to_string(),
             path,
             width: entry.width,
             height: entry.height,
@@ -691,6 +719,34 @@ impl ArtworkCache {
     /// Returns a cached thumbnail on success. Makes exactly one request, or none at
     /// all when the reference is not fetchable.
     pub fn fetch<T: RommTransport>(
+        &self,
+        source: &ValidatedRommSource,
+        transport: &T,
+        request: &ArtworkRequest<'_>,
+        now_unix_seconds: i64,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<CachedThumbnail, ArtworkRefusal> {
+        let fallback = request.without_large();
+        let candidates = if request.large_reference.is_some() {
+            [*request, fallback]
+        } else {
+            [*request, *request]
+        };
+        let mut last_error = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index == 1 && request.large_reference.is_none() {
+                break;
+            }
+            match self.fetch_one(source, transport, candidate, now_unix_seconds, cancel) {
+                Ok(thumbnail) => return Ok(thumbnail),
+                Err(ArtworkRefusal::Cancelled) => return Err(ArtworkRefusal::Cancelled),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or(ArtworkRefusal::NoArtwork))
+    }
+
+    fn fetch_one<T: RommTransport>(
         &self,
         source: &ValidatedRommSource,
         transport: &T,
@@ -764,7 +820,8 @@ impl ArtworkCache {
         request: &ArtworkRequest<'_>,
     ) -> Result<String, ArtworkRefusal> {
         let Some(reference) = request
-            .small_reference
+            .large_reference
+            .or(request.small_reference)
             .map(str::trim)
             .filter(|r| !r.is_empty())
         else {
@@ -1028,7 +1085,8 @@ impl ArtworkCache {
 /// path itself is used.
 fn artwork_identity(request: &ArtworkRequest<'_>) -> String {
     match request
-        .small_reference
+        .large_reference
+        .or(request.small_reference)
         .map(str::trim)
         .filter(|r| !r.is_empty())
     {

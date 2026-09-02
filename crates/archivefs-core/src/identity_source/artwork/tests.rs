@@ -127,8 +127,23 @@ fn request<'a>(id: &'a str, small: Option<&'a str>, public: Option<&'a str>) -> 
     ArtworkRequest {
         provider_game_id: id,
         kind: ArtworkKind::Cover,
+        large_reference: None,
         small_reference: small,
         public_reference: public,
+    }
+}
+
+fn request_with_large<'a>(
+    id: &'a str,
+    large: Option<&'a str>,
+    small: Option<&'a str>,
+) -> ArtworkRequest<'a> {
+    ArtworkRequest {
+        provider_game_id: id,
+        kind: ArtworkKind::Cover,
+        large_reference: large,
+        small_reference: small,
+        public_reference: None,
     }
 }
 
@@ -231,6 +246,76 @@ fn a_public_screenshot_reference_is_refused_without_a_request() {
         .expect_err("a public screenshot host must not be fetched");
     assert_eq!(refusal.code(), "remote_host_not_allowed");
     assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn a_valid_large_cover_is_preferred_over_the_small_cover() {
+    let tree = Tree::new("large-preferred");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    cache
+        .fetch(
+            &source(),
+            &server,
+            &request_with_large("1", Some("/assets/large.png"), Some("/assets/small.png")),
+            1_000,
+            None,
+        )
+        .expect("large cover should be fetched");
+    assert_eq!(server.requests()[0].0, format!("{SERVER}/assets/large.png"));
+}
+
+#[test]
+fn an_unusable_large_cover_falls_back_to_the_small_cover() {
+    let tree = Tree::new("large-fallback");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    cache
+        .fetch(
+            &source(),
+            &server,
+            &request_with_large(
+                "1",
+                Some("https://unsafe.example/large.png"),
+                Some("/assets/small.png"),
+            ),
+            1_000,
+            None,
+        )
+        .expect("unsafe large reference should fall back");
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.requests()[0].0, format!("{SERVER}/assets/small.png"));
+}
+
+#[test]
+fn a_missing_large_cover_response_falls_back_to_the_small_cover() {
+    let tree = Tree::new("large-stale");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::scripted(vec![
+        Ok(RommHttpResponse {
+            status: 404,
+            body: Vec::new(),
+            location: None,
+        }),
+        Ok(RommHttpResponse {
+            status: 200,
+            body: synthetic_png(10, 10),
+            location: None,
+        }),
+    ]);
+    cache
+        .fetch(
+            &source(),
+            &server,
+            &request_with_large("1", Some("/assets/large.png"), Some("/assets/small.png")),
+            1_000,
+            None,
+        )
+        .expect("stale large cover should fall back");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].0.ends_with("/assets/large.png"));
+    assert!(requests[1].0.ends_with("/assets/small.png"));
 }
 
 /// Relative-URL forms that change the host are refusals, not requests.
@@ -643,6 +728,18 @@ fn a_cache_key_is_deterministic_and_carries_no_secret() {
         one,
         ArtworkCache::key_for(SERVER, &request("42", Some(replaced), None)),
         "RomM's own timestamp changing must invalidate the thumbnail"
+    );
+    assert_ne!(
+        one,
+        ArtworkCache::key_for(
+            SERVER,
+            &request_with_large(
+                "42",
+                Some("/assets/cover/large.png"),
+                Some(REAL_SMALL_REFERENCE)
+            )
+        ),
+        "large and small variants must not share a cache identity"
     );
 }
 

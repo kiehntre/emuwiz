@@ -164,13 +164,14 @@ pub fn normalise_rom(
     // Artwork references only - never bytes, and never fetched here.
     let screenshots = media_references(value, "path_screenshots", "url_screenshots");
     let manual = media_reference(value, "path_manual", "url_manual");
-    let cover_reference =
-        string_field(value, "url_cover").or_else(|| string_field(value, "path_cover_large"));
+    let large_reference = string_field(value, "path_cover_large");
+    let cover_reference = string_field(value, "url_cover").or_else(|| large_reference.clone());
     let artwork =
         (cover_reference.is_some() || !screenshots.is_empty() || manual.is_some()).then(|| {
             ArtworkReference {
                 reference: cover_reference.unwrap_or_default(),
                 small_reference: string_field(value, "path_cover_small"),
+                large_reference,
                 screenshots: screenshots.clone(),
                 manual: manual.clone(),
             }
@@ -642,6 +643,30 @@ mod tests {
                 .as_ref()
                 .and_then(|m| m.hosted_reference.as_deref()),
             Some("assets/manuals/game.pdf")
+        );
+    }
+
+    #[test]
+    fn path_cover_large_is_normalised_separately_from_the_public_cover_reference() {
+        let value = json!({
+            "id": 7,
+            "platform_slug": "gb",
+            "url_cover": "https://images.example/cover.jpg",
+            "path_cover_large": "assets/romm/resources/large.jpg",
+            "path_cover_small": "assets/romm/resources/small.png"
+        });
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        let artwork = record.artwork.expect("cover is present");
+        assert_eq!(artwork.reference, "https://images.example/cover.jpg");
+        assert_eq!(
+            artwork.large_reference.as_deref(),
+            Some("assets/romm/resources/large.jpg")
+        );
+        assert_eq!(
+            artwork.small_reference.as_deref(),
+            Some("assets/romm/resources/small.png")
         );
     }
 
