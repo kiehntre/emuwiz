@@ -156,8 +156,8 @@ use dat_identity_panel::*;
 pub mod bulk_confirmation;
 pub(crate) mod cheat_sources_page;
 mod collection_discovery_page;
-pub(crate) mod dat_sources_page;
 pub(crate) mod dat_catalogue_picker;
+pub(crate) mod dat_sources_page;
 pub(crate) mod doctor_page;
 // Existing tests (`tests/doctor_and_repair.rs`, and this file's own unit
 // tests) call `doctor_page`'s items unqualified via their own `use

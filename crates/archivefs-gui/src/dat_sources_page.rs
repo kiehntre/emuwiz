@@ -45,11 +45,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Instant;
 
+use archivefs_core::dat::catalogue_selection::{CatalogueAvailability, CatalogueRef};
 use archivefs_core::dat::classification::{
     ContentSelectionPolicy, DatContentClassification, DatContentSummary,
 };
 use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::catalogue_selection::{CatalogueAvailability, CatalogueRef};
 use archivefs_core::dat::managed_sources::{
     ManagedDatSources, default_managed_dat_sources_config_path, load_managed_dat_sources_from,
     resolve_managed_dat_sources, resolve_redump_bios_sources, resolve_redump_games_sources,
@@ -98,8 +98,8 @@ use archivefs_core::identity_source::no_intro::{
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
-use crate::ui::{components as widgets, theme};
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
+use crate::ui::{components as widgets, theme};
 
 /// Said once on the page, because a DAT audit is the one place a user might
 /// reasonably expect a "fix it" button and there is deliberately not one.
@@ -4421,17 +4421,15 @@ impl DatSourcesPageState {
             managed_root: &self.managed_root,
             limits: self.limits,
         };
-        let resolved = match archivefs_core::dat::catalogue_selection::resolve_catalogue(
-            &reference, inputs,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                self.audit_error = Some(format!(
-                    "could not resolve the selected catalogue: {error}"
-                ));
-                return;
-            }
-        };
+        let resolved =
+            match archivefs_core::dat::catalogue_selection::resolve_catalogue(&reference, inputs) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.audit_error =
+                        Some(format!("could not resolve the selected catalogue: {error}"));
+                    return;
+                }
+            };
         let canonical_platform = resolved
             .assigned_platform
             .as_deref()
@@ -4442,7 +4440,11 @@ impl DatSourcesPageState {
             participating_sources(&self.draft, canonical_platform),
         );
         let request = resolved.to_dat_audit_request(scan_root, self.limits, Some(policy));
-        self.start_audit_request(request, reference.token(), resolved.assigned_platform.clone());
+        self.start_audit_request(
+            request,
+            reference.token(),
+            resolved.assigned_platform.clone(),
+        );
     }
 
     fn start_audit_request(
@@ -6319,7 +6321,9 @@ fn show_single_catalogue_verify_section(
         widgets::section_header(
             ui,
             "Verify one catalogue",
-            Some("Choose one installed catalogue explicitly. The combined Identify & Rename audit remains unchanged."),
+            Some(
+                "Choose one installed catalogue explicitly. The combined Identify & Rename audit remains unchanged.",
+            ),
         );
         if widgets::action_button(
             ui,
@@ -6377,8 +6381,13 @@ fn show_single_catalogue_verify_section(
                 }
             }
         }
-        if widgets::action_button(ui, "Choose another folder…", widgets::ActionStyle::Quiet, true)
-            .clicked()
+        if widgets::action_button(
+            ui,
+            "Choose another folder…",
+            widgets::ActionStyle::Quiet,
+            true,
+        )
+        .clicked()
             && let Some(path) = rfd::FileDialog::new().pick_folder()
         {
             if let Some(source_id) = aggregate_source_id(ui_state, reference) {
@@ -6397,10 +6406,7 @@ fn show_single_catalogue_verify_section(
     action
 }
 
-fn aggregate_source_id(
-    ui_state: &DatSourcesPageUi,
-    reference: &CatalogueRef,
-) -> Option<String> {
+fn aggregate_source_id(ui_state: &DatSourcesPageUi, reference: &CatalogueRef) -> Option<String> {
     let CatalogueRef::Local { source_id, member } = reference else {
         return None;
     };
@@ -6413,7 +6419,10 @@ fn aggregate_source_id(
         .iter()
         .find(|summary| {
             &summary.reference == reference
-                && matches!(summary.availability, CatalogueAvailability::AggregateFolder { .. })
+                && matches!(
+                    summary.availability,
+                    CatalogueAvailability::AggregateFolder { .. }
+                )
         })
         .map(|_| source_id.clone())
 }

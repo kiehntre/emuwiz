@@ -1060,19 +1060,23 @@ fn preview_is_disabled_until_every_required_field_is_filled_then_becomes_clickab
 }
 
 #[test]
-fn an_invalid_dat_path_shows_a_plain_inline_error() {
-    let ctx = egui::Context::default();
-    let mut state = PlayingLibraryPageState::default();
+fn an_invalid_legacy_dat_path_is_reported_by_the_test_fallback() {
+    let fixture = Fixture::new("invalid-dat");
+    let source = fixture.path("roms");
+    std::fs::create_dir_all(&source).unwrap();
+    let mut state = base_state(&fixture);
+    state.dat_path_draft = fixture.path("missing.dat").display().to_string();
+    state.source_root_draft = source.display().to_string();
+    state.destination_root_draft = fixture.path("playing").display().to_string();
 
-    type_into_field(
-        &ctx,
-        &mut state,
-        DAT_PATH_FIELD_ID,
-        "/definitely/does/not/exist.dat",
+    state.preview();
+
+    assert!(
+        state
+            .error()
+            .unwrap()
+            .contains("could not read the DAT catalogue")
     );
-    let (output, _) = render(&ctx, &mut state, base_input());
-
-    assert!(rendered_text_contains(&output, "This file was not found."));
 }
 
 #[test]

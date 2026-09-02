@@ -35,18 +35,17 @@ use archivefs_core::launch::es_de_publish::{
     recover_es_de_gamelist_publication,
 };
 use archivefs_core::playing_library::{
-    CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy,
-    ReleaseClass, RetroDeckProjectionPlan, RetroDeckVisibility, RommLibraryProjectionPlan,
-    RommVisibility, build_playing_library_plan, build_playing_library_transaction,
-    build_retrodeck_projection, build_retrodeck_projection_transaction,
-    build_romm_projection_transaction, build_romm_projection_with_visibility,
-    match_loose_files_against_dat,
+    CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy, ReleaseClass,
+    RetroDeckProjectionPlan, RetroDeckVisibility, RommLibraryProjectionPlan, RommVisibility,
+    build_playing_library_plan, build_playing_library_transaction, build_retrodeck_projection,
+    build_retrodeck_projection_transaction, build_romm_projection_transaction,
+    build_romm_projection_with_visibility, match_loose_files_against_dat,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
-use crate::rom_organisation_page::collect_source_files;
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
+use crate::rom_organisation_page::collect_source_files;
 use crate::ui::{components as widgets, theme};
 
 /// The confirmation phrase a user must type before a Create Playing Library
@@ -327,14 +326,6 @@ impl PlayingLibraryPageState {
 
         let source_root = PathBuf::from(self.source_root_draft.trim());
         let destination_root = PathBuf::from(self.destination_root_draft.trim());
-        let Some(reference) = self.selected_catalogue.clone() else {
-            #[cfg(test)]
-            if !self.dat_path_draft.trim().is_empty() {
-                return self.preview_test_dat_path(&source_root, &destination_root);
-            }
-            self.error = Some("choose a DAT catalogue file first".to_string());
-            return;
-        };
         if self.source_root_draft.trim().is_empty() {
             self.error = Some("choose a source library folder first".to_string());
             return;
@@ -343,6 +334,15 @@ impl PlayingLibraryPageState {
             self.error = Some("the destination folder must be an absolute path".to_string());
             return;
         }
+
+        let Some(reference) = self.selected_catalogue.clone() else {
+            #[cfg(test)]
+            if !self.dat_path_draft.trim().is_empty() {
+                return self.preview_test_dat_path(&source_root, &destination_root);
+            }
+            self.error = Some("choose a DAT catalogue file first".to_string());
+            return;
+        };
 
         let Some(snapshot) = self.catalogue_picker.snapshot() else {
             self.error = Some("the catalogue list is still loading; try again shortly".into());
@@ -371,7 +371,7 @@ impl PlayingLibraryPageState {
             destination_root,
             self.build_policy(),
         );
-    match build_playing_library_plan(&request) {
+        match build_playing_library_plan(&request) {
             Ok(mut plan) => {
                 plan.rejected_launchers = outcome_matches.rejected_launchers;
                 self.plan = Some(plan);
@@ -392,8 +392,11 @@ impl PlayingLibraryPageState {
                 return;
             }
         };
-        self.dat_platform_identity = Some(archivefs_core::dat::identity::identify_dat_source(&outcome.dat));
-        let candidates = collect_source_files(std::slice::from_ref(source_root));
+        self.dat_platform_identity = Some(archivefs_core::dat::identity::identify_dat_source(
+            &outcome.dat,
+        ));
+        let source_roots = [source_root.to_path_buf()];
+        let candidates = collect_source_files(&source_roots);
         let trusted = TrustedRoots::from_paths([source_root]);
         let outcome_matches = match_loose_files_against_dat(
             &outcome.dat,
@@ -1162,8 +1165,8 @@ pub(crate) fn show_playing_library_page(
         // widget ID while production uses the typed picker exclusively.
         #[cfg(test)]
         ui.add(
-                egui::TextEdit::singleline(&mut state.dat_path_draft)
-                    .id(egui::Id::new(DAT_PATH_FIELD_ID))
+            egui::TextEdit::singleline(&mut state.dat_path_draft)
+                .id(egui::Id::new(DAT_PATH_FIELD_ID))
                 .desired_width(280.0),
         );
         ui.add_space(6.0);

@@ -46,22 +46,24 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use archivefs_core::Config;
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::rename_apply::model::EntryState;
-use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 #[cfg(test)]
 use archivefs_core::dat::sources::DatSourceEntry;
+use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 use archivefs_core::repair::execute::{
     RepairExecutionOptions, RepairReverifyOutcome, RepairTransactionResult,
 };
+#[cfg(test)]
+use archivefs_core::repair::library::LibraryScanRequest;
 use archivefs_core::repair::library::{
-    ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan, LibraryScanRequest,
-    RepairProfile, ReportCounts, apply_saved_plan_selected, plan_file_from_scan, run_library_scan,
+    ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan, RepairProfile,
+    ReportCounts, apply_saved_plan_selected, plan_file_from_scan, run_library_scan,
 };
 use archivefs_core::repair::proposal::{RepairEvidenceKind, RepairProposal, RepairProposalId};
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
-use crate::ui::{components as widgets, theme};
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
+use crate::ui::{components as widgets, theme};
 
 /// The preview filter. `None` is "All" and is not a variant so "All" is the
 /// default and the filter's absence is not confused with one of its values.
@@ -707,7 +709,11 @@ impl RepairReviewPageState {
         else {
             return;
         };
-        let Some(entry) = setup.dat_sources.iter().find(|entry| entry.id == dat_id).cloned()
+        let Some(entry) = setup
+            .dat_sources
+            .iter()
+            .find(|entry| entry.id == dat_id)
+            .cloned()
         else {
             return;
         };
@@ -729,7 +735,9 @@ impl RepairReviewPageState {
         let (sender, messages) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let message = match run_library_scan(&request, &trusted, &cancel, &|_| {}) {
-                Ok(outcome) => RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome))),
+                Ok(outcome) => {
+                    RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome)))
+                }
                 Err(error) => RepairScanMessage::Failed(error.to_string()),
             };
             let _ = sender.send(message);

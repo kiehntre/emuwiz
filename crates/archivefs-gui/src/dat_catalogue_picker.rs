@@ -162,7 +162,11 @@ impl DatCataloguePickerState {
         workflow: DatCatalogueWorkflow,
         reference: &CatalogueRef,
     ) -> bool {
-        let Some(summary) = self.summaries.iter().find(|row| &row.reference == reference) else {
+        let Some(summary) = self
+            .summaries
+            .iter()
+            .find(|row| &row.reference == reference)
+        else {
             return false;
         };
         workflow.capability(summary)
@@ -210,8 +214,10 @@ impl DatCataloguePickerState {
             }
         });
         ui.label(
-            egui::RichText::new("Select a row explicitly. EmuWiz will not guess between catalogues.")
-                .color(theme::muted(ui)),
+            egui::RichText::new(
+                "Select a row explicitly. EmuWiz will not guess between catalogues.",
+            )
+            .color(theme::muted(ui)),
         );
 
         let query = self.query.trim().to_ascii_lowercase();
@@ -263,13 +269,13 @@ impl DatCataloguePickerState {
                                 ui,
                                 ("catalogue-technical-details", summary.reference.token()),
                                 |ui| {
-                                if let Some(path) = &summary.technical_path {
-                                    ui.label(format!("Path: {}", path.display()));
-                                }
-                                ui.label(format!("Source: {}", summary.reference.token()));
-                                if let Some(hash) = &summary.content_sha256 {
-                                    ui.label(format!("Snapshot SHA-256: {hash}"));
-                                }
+                                    if let Some(path) = &summary.technical_path {
+                                        ui.label(format!("Path: {}", path.display()));
+                                    }
+                                    ui.label(format!("Source: {}", summary.reference.token()));
+                                    if let Some(hash) = &summary.content_sha256 {
+                                        ui.label(format!("Snapshot SHA-256: {hash}"));
+                                    }
                                 },
                             );
                         })
@@ -281,14 +287,19 @@ impl DatCataloguePickerState {
                 }
             });
         if visible == 0 {
-            ui.label(egui::RichText::new("No catalogues match this filter.").color(theme::muted(ui)));
+            ui.label(
+                egui::RichText::new("No catalogues match this filter.").color(theme::muted(ui)),
+            );
         }
         if let Some(reference) = selected.as_ref() {
             ui.label(
                 egui::RichText::new(format!("Selected: {}", reference.token()))
                     .color(theme::muted(ui)),
             );
-            let matching = self.summaries.iter().find(|row| &row.reference == reference);
+            let matching = self
+                .summaries
+                .iter()
+                .find(|row| &row.reference == reference);
             if let Some(row) = matching
                 && !workflow.capability(row)
             {
@@ -320,13 +331,18 @@ fn load_inventory() -> archivefs_core::Result<LoadedInventory> {
         managed_root,
     };
     let summaries = list_installed_catalogues(snapshot.inputs());
-    Ok(LoadedInventory { summaries, snapshot })
+    Ok(LoadedInventory {
+        summaries,
+        snapshot,
+    })
 }
 
 fn summary_matches(summary: &InstalledCatalogueSummary, query: &str) -> bool {
     summary.display_name.to_ascii_lowercase().contains(query)
         || summary.store.label().to_ascii_lowercase().contains(query)
-        || evidence_label(&summary.platform).to_ascii_lowercase().contains(query)
+        || evidence_label(&summary.platform)
+            .to_ascii_lowercase()
+            .contains(query)
 }
 
 fn evidence_label(value: &EvidenceValue<String>) -> String {
@@ -342,7 +358,9 @@ fn evidence_ecosystem_label(
     value: &EvidenceValue<archivefs_core::dat::model::DatEcosystem>,
 ) -> String {
     match value {
-        EvidenceValue::Assigned(value) | EvidenceValue::Confirmed(value) => value.label().to_string(),
+        EvidenceValue::Assigned(value) | EvidenceValue::Confirmed(value) => {
+            value.label().to_string()
+        }
         EvidenceValue::Ambiguous(_) => "Ecosystem ambiguous".to_string(),
         EvidenceValue::Unknown => "Ecosystem unknown".to_string(),
         EvidenceValue::Unavailable => "Ecosystem unavailable".to_string(),
@@ -390,8 +408,7 @@ mod tests {
     #[test]
     fn selection_is_a_typed_reference_not_a_row_index() {
         let reference = CatalogueRef::local("source");
-        let mut selected = None;
-        selected = Some(reference.clone());
+        let selected = Some(reference.clone());
         assert_eq!(selected, Some(reference));
     }
 
