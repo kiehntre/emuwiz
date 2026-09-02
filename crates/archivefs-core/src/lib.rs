@@ -2334,6 +2334,25 @@ fn validate_mount_root_selection(path: &Path) -> Result<()> {
             path.display()
         )));
     }
+    // Additionally reuse the existing read-only destination-root validator so
+    // an unsafe selection the direct checks above cannot see - a `..`
+    // component, a symlinked parent directory, a symlink loop, or any other
+    // unsafe path component - is rejected with the same rules the rest of
+    // core applies to destination roots. It never creates anything, and a
+    // path that does not resolve to a real directory is `Absent`, refused
+    // here too.
+    let validated = patch_manager::validate_destination_root(path).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not a safe location at {}: {source}",
+            path.display()
+        ))
+    })?;
+    if validated.state() != patch_manager::DestinationRootState::ExistingDirectory {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder must already exist; choose an existing writable folder: {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -13094,6 +13113,98 @@ mod tests {
             load_read_only_snapshot(&config_path).unwrap().mount_root,
             selected
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mount_root_rejects_a_symlinked_target_folder() {
+        let root = test_root("mount_root_update_symlink_target");
+        let config_path = root.join("config.toml");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let real = root.join("real-target");
+        fs::create_dir_all(&real).unwrap();
+        let link = root.join("linked-target");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = set_mount_root_to(&config_path, &link).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mount_root_rejects_an_unwritable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_root("mount_root_update_unwritable_target");
+        let config_path = root.join("config.toml");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let readonly = root.join("readonly-target");
+        fs::create_dir_all(&readonly).unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = set_mount_root_to(&config_path, &readonly);
+        // Restore before asserting so temp-dir cleanup always succeeds.
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("not writable"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mount_root_rejects_a_parent_symlinked_or_dotdot_target() {
+        let root = test_root("mount_root_update_unsafe_target");
+        let config_path = root.join("config.toml");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        // A `..` component is rejected even though the OS-resolved directory
+        // is a real, writable directory that the direct checks accept.
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(root.join("mounts")).unwrap();
+        let dotdot_target = root.join("sub").join("..").join("mounts");
+        let error = set_mount_root_to(&config_path, &dotdot_target).unwrap_err();
+        assert!(error.to_string().contains("not a safe location"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+        // A real directory reached through a symlinked parent is rejected.
+        let real_parent = root.join("real-parent");
+        fs::create_dir_all(real_parent.join("target")).unwrap();
+        let linked_parent = root.join("linked-parent");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let via_parent_symlink = linked_parent.join("target");
+        let error = set_mount_root_to(&config_path, &via_parent_symlink).unwrap_err();
+        assert!(error.to_string().contains("not a safe location"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn first_run_add_games_bootstrap_semantics_are_unaffected_by_mount_root_support() {
+        let root = test_root("mount_root_update_first_run_untouched");
+        let config_path = root.join("config.toml");
+        assert!(!config_path.exists(), "precondition: no config file yet");
+
+        // The mount-root setter never bootstraps a missing config.
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        assert!(set_mount_root_to(&config_path, &selected).is_err());
+        assert!(
+            !config_path.exists(),
+            "set_mount_root must not create a starter config"
+        );
+
+        // First-run Add Games still bootstraps + registers exactly as before.
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+        let database_path = root.join("library.sqlite3");
+        let added = add_source_folder_at(&config_path, &database_path, &games).unwrap();
+        assert_eq!(added.path, games);
+        assert!(config_path.exists());
     }
 
     #[test]

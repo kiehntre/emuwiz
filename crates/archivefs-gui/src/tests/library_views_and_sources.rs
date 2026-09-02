@@ -275,6 +275,136 @@ fn mount_root_picker_stages_only_explicit_selections_and_cancel_keeps_the_draft(
     assert_eq!(draft, Some(replacement));
 }
 
+/// Renders the Sources page once with a mount-root draft already staged (a
+/// plain render), and returns the on-screen centre of `label` so a
+/// separate click frame can target it.
+fn staged_mount_root_button_pos(ctx: &egui::Context, staged: &Path, label: &str) -> egui::Pos2 {
+    let sources = three_source_views();
+    let mut add_dialog = None;
+    let mut remove_dialog = None;
+    let mut clipboard = InMemoryClipboard::default();
+    let mut draft = Some(staged.to_path_buf());
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_sources_page_with_mount_root(
+                ui,
+                &sources,
+                &[],
+                Some(Path::new("/mnt/archivefs")),
+                false,
+                &mut draft,
+                false,
+                &mut add_dialog,
+                &mut remove_dialog,
+                &mut clipboard,
+            );
+        });
+    });
+    find_exact_text_center(&output, label)
+        .unwrap_or_else(|| panic!("a staged mount-root draft must render {label:?}"))
+}
+
+#[test]
+fn clicking_apply_folder_emits_apply_mount_root_for_exactly_the_staged_folder() {
+    let ctx = egui::Context::default();
+    let sources = three_source_views();
+    let staged = PathBuf::from("/tmp/staged-mount-root");
+
+    let apply_pos = staged_mount_root_button_pos(&ctx, &staged, "Apply folder");
+
+    let draft = std::cell::RefCell::new(Some(staged.clone()));
+    let add_dialog = std::cell::RefCell::new(None);
+    let remove_dialog = std::cell::RefCell::new(None);
+    let clipboard = std::cell::RefCell::new(InMemoryClipboard::default());
+    let captured: std::rc::Rc<std::cell::RefCell<Option<SourcesPageAction>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let sink = std::rc::Rc::clone(&captured);
+    let sources_for_render = sources.clone();
+
+    let render = move |ui: &mut egui::Ui| -> egui::Response {
+        let inner = ui.scope(|ui| {
+            show_sources_page_with_mount_root(
+                ui,
+                &sources_for_render,
+                &[],
+                Some(Path::new("/mnt/archivefs")),
+                false,
+                &mut draft.borrow_mut(),
+                false,
+                &mut add_dialog.borrow_mut(),
+                &mut remove_dialog.borrow_mut(),
+                &mut *clipboard.borrow_mut(),
+            )
+        });
+        if let Some(action) = inner.inner {
+            *sink.borrow_mut() = Some(action);
+        }
+        inner.response
+    };
+
+    simulate_row_click(&ctx, apply_pos, egui::Modifiers::default(), render);
+
+    assert!(
+        matches!(
+            &*captured.borrow(),
+            Some(SourcesPageAction::ApplyMountRoot(path)) if path == &staged
+        ),
+        "clicking Apply folder must emit ApplyMountRoot for exactly the staged folder"
+    );
+}
+
+#[test]
+fn clicking_cancel_clears_the_staged_draft_and_emits_no_action() {
+    let ctx = egui::Context::default();
+    let sources = three_source_views();
+    let staged = PathBuf::from("/tmp/staged-mount-root");
+
+    let cancel_pos = staged_mount_root_button_pos(&ctx, &staged, "Cancel");
+
+    let draft: std::rc::Rc<std::cell::RefCell<Option<PathBuf>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Some(staged)));
+    let draft_in_render = std::rc::Rc::clone(&draft);
+    let add_dialog = std::cell::RefCell::new(None);
+    let remove_dialog = std::cell::RefCell::new(None);
+    let clipboard = std::cell::RefCell::new(InMemoryClipboard::default());
+    let captured: std::rc::Rc<std::cell::RefCell<Option<SourcesPageAction>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let sink = std::rc::Rc::clone(&captured);
+    let sources_for_render = sources.clone();
+
+    let render = move |ui: &mut egui::Ui| -> egui::Response {
+        let inner = ui.scope(|ui| {
+            show_sources_page_with_mount_root(
+                ui,
+                &sources_for_render,
+                &[],
+                Some(Path::new("/mnt/archivefs")),
+                false,
+                &mut draft_in_render.borrow_mut(),
+                false,
+                &mut add_dialog.borrow_mut(),
+                &mut remove_dialog.borrow_mut(),
+                &mut *clipboard.borrow_mut(),
+            )
+        });
+        if let Some(action) = inner.inner {
+            *sink.borrow_mut() = Some(action);
+        }
+        inner.response
+    };
+
+    simulate_row_click(&ctx, cancel_pos, egui::Modifiers::default(), render);
+
+    assert!(
+        draft.borrow().is_none(),
+        "clicking Cancel must discard the staged folder"
+    );
+    assert!(
+        captured.borrow().is_none(),
+        "clicking Cancel must not emit any SourcesPageAction"
+    );
+}
+
 #[test]
 fn sources_overview_reports_configured_counts_and_catalogue_readiness() {
     let ctx = egui::Context::default();
