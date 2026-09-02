@@ -75,7 +75,7 @@ fn gamer_view_shows_list_and_selected_game_actions_at_1024x600() {
         "GameCube",
         "Cheats & Mods",
         "Details",
-        "Mount",
+        "Prepare game",
     ] {
         assert!(
             rendered_text_contains(&output, expected),
@@ -136,11 +136,13 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                         cleanup_after_unmount: false,
                         cheat_workflow: app.cheat_workflow.as_ref(),
                         feedback: None,
+                        scan_review_available: false,
                         artwork_directory: None,
                         artwork_cache: &mut app.platform_artwork_cache,
                         covers: &mut app.gamer_covers,
                         cover_requests: &mut cover_requests,
                         game_metadata: None,
+                        identity_status: None,
                         play_action: &play_action,
                         retroarch_launch_state: &mut launch_state,
                     },
@@ -231,11 +233,13 @@ fn render_gamer_card_with_launch_state(
                     cleanup_after_unmount: false,
                     cheat_workflow: app.cheat_workflow.as_ref(),
                     feedback: None,
+                    scan_review_available: false,
                     artwork_directory: None,
                     artwork_cache: &mut app.platform_artwork_cache,
                     covers: &mut app.gamer_covers,
                     cover_requests: &mut cover_requests,
                     game_metadata: None,
+                    identity_status: None,
                     play_action,
                     retroarch_launch_state: launch_state,
                 },
@@ -359,7 +363,7 @@ fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
     assert!(rendered_text_contains(&output, "Needs attention"));
     assert!(rendered_text_contains(
         &output,
-        "A file already exists at this game's mount destination."
+        "A file already exists where EmuWiz would prepare this game."
     ));
     assert!(!rendered_text_contains(&output, "Ready to play"));
     assert!(!rendered_text_contains(&output, "Play — Launch RetroArch"));
@@ -428,11 +432,13 @@ fn gamer_view_open_emulator_setup_action_carries_retroarch_focus() {
                         cleanup_after_unmount: false,
                         cheat_workflow: app.cheat_workflow.as_ref(),
                         feedback: None,
+                        scan_review_available: false,
                         artwork_directory: None,
                         artwork_cache: &mut app.platform_artwork_cache,
                         covers: &mut app.gamer_covers,
                         cover_requests: &mut cover_requests,
                         game_metadata: None,
+                        identity_status: None,
                         play_action: &play_action,
                         retroarch_launch_state: &mut launch_state,
                     },

@@ -3159,7 +3159,7 @@ fn the_featured_panel_shows_artwork_above_the_title_and_the_actions() {
     );
 
     let title = text_rect(&output, "Featured Game").expect("the title");
-    let mount = text_rect(&output, "Mount").expect("Mount");
+    let mount = text_rect(&output, "Prepare game").expect("Prepare game");
     let cheats = text_rect(&output, "Cheats & Mods").expect("Cheats & Mods");
     assert!(
         featured.bottom() <= title.top(),
@@ -3167,11 +3167,11 @@ fn the_featured_panel_shows_artwork_above_the_title_and_the_actions() {
     );
     assert!(
         title.bottom() <= mount.top(),
-        "the title is not above Mount"
+        "the title is not above Prepare game"
     );
     assert!(
         mount.bottom() <= cheats.top(),
-        "Mount is not above the secondary actions"
+        "Prepare game is not above the secondary actions"
     );
 }
 
@@ -3199,7 +3199,12 @@ fn row_thumbnails_survive_the_featured_panel() {
 #[test]
 fn every_secondary_action_is_still_present() {
     let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
-    for label in ["Mount", "Cheats & Mods", "Details", "Copy folder location"] {
+    for label in [
+        "Prepare game",
+        "Cheats & Mods",
+        "Details",
+        "Copy folder location",
+    ] {
         assert!(
             rendered_text_contains(&output, label),
             "{label} is missing from the featured panel"
@@ -3214,15 +3219,20 @@ fn mount_is_the_first_actionable_widget_in_the_panel() {
     // the reading order.
     let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let mut order = Vec::new();
-    for label in ["Mount", "Cheats & Mods", "Details", "Copy folder location"] {
+    for label in [
+        "Prepare game",
+        "Cheats & Mods",
+        "Details",
+        "Copy folder location",
+    ] {
         let rect =
             text_rect(&output, label).unwrap_or_else(|| panic!("{label} should be rendered"));
         order.push((label, rect.top(), rect.left()));
     }
-    assert_eq!(order[0].0, "Mount");
+    assert_eq!(order[0].0, "Prepare game");
     assert!(
         order[0].1 <= order[1].1,
-        "Mount is not above the secondary actions"
+        "Prepare game is not above the secondary actions"
     );
     for pair in order[1..].windows(2) {
         assert!(
@@ -3308,7 +3318,7 @@ fn missing_artwork_keeps_the_panel_geometry_exactly() {
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let loading = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
     let title_loading = text_rect(&loading, "Featured Game").expect("the title");
-    let mount_loading = text_rect(&loading, "Mount").expect("Mount");
+    let mount_loading = text_rect(&loading, "Prepare game").expect("Prepare game");
 
     let generation = app.gamer_covers.generation();
     app.gamer_covers.absorb(
@@ -3330,8 +3340,8 @@ fn missing_artwork_keeps_the_panel_geometry_exactly() {
     );
     assert_eq!(
         mount_loading,
-        text_rect(&absent, "Mount").expect("Mount"),
-        "Mount moved when the cover turned out not to exist"
+        text_rect(&absent, "Prepare game").expect("Prepare game"),
+        "Prepare game moved when the cover turned out not to exist"
     );
     assert!(
         rendered_text_contains(&absent, "No cover available"),
@@ -3344,7 +3354,7 @@ fn a_failed_cover_keeps_the_panel_geometry_exactly() {
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
     let title = text_rect(&before, "Featured Game").expect("the title");
-    let mount = text_rect(&before, "Mount").expect("Mount");
+    let mount = text_rect(&before, "Prepare game").expect("Prepare game");
 
     let generation = app.gamer_covers.generation();
     app.gamer_covers.absorb(
@@ -3361,7 +3371,10 @@ fn a_failed_cover_keeps_the_panel_geometry_exactly() {
         title,
         text_rect(&after, "Featured Game").expect("the title")
     );
-    assert_eq!(mount, text_rect(&after, "Mount").expect("Mount"));
+    assert_eq!(
+        mount,
+        text_rect(&after, "Prepare game").expect("Prepare game")
+    );
 }
 
 #[test]
@@ -3369,7 +3382,7 @@ fn a_cover_arriving_does_not_move_the_title_or_the_actions() {
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
     let title = text_rect(&before, "Featured Game").expect("the title");
-    let mount = text_rect(&before, "Mount").expect("Mount");
+    let mount = text_rect(&before, "Prepare game").expect("Prepare game");
 
     let generation = app.gamer_covers.generation();
     app.gamer_covers
@@ -3379,7 +3392,10 @@ fn a_cover_arriving_does_not_move_the_title_or_the_actions() {
         title,
         text_rect(&after, "Featured Game").expect("the title")
     );
-    assert_eq!(mount, text_rect(&after, "Mount").expect("Mount"));
+    assert_eq!(
+        mount,
+        text_rect(&after, "Prepare game").expect("Prepare game")
+    );
 }
 
 #[test]
@@ -3399,7 +3415,7 @@ fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
         .map(|(_, rect)| rect)
         .max_by(|left, right| left.height().total_cmp(&right.height()))
         .expect("the featured cover");
-    let mount = text_rect(&output, "Mount").expect("Mount");
+    let mount = text_rect(&output, "Prepare game").expect("Prepare game");
     let title = text_rect(&output, long).expect("the title");
 
     assert!(
@@ -3408,7 +3424,7 @@ fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
     );
     assert!(
         title.bottom() <= mount.top() + 0.5,
-        "a long title ran into Mount"
+        "a long title ran into Prepare game"
     );
 }
 
@@ -3422,7 +3438,7 @@ fn the_panel_keeps_mount_and_the_actions_on_screen_at_every_supported_size() {
     ] {
         let (_app, _ctx, output) = featured_panel_frame(width, height, "Featured Game");
         let _ = &output;
-        for label in ["Mount", "Cheats & Mods", "Details"] {
+        for label in ["Prepare game", "Cheats & Mods", "Details"] {
             let rect = text_rect(&output, label)
                 .unwrap_or_else(|| panic!("{label} is not rendered at {width}x{height}"));
             assert!(
@@ -3477,7 +3493,7 @@ fn the_actions_survive_a_feedback_banner_and_a_wrapped_title_at_720p() {
     // exact value that used to overflow is not a number worth guessing at.
     for height in [600.0_f32, 640.0, 660.0, 680.0, 696.0, 720.0] {
         let output = run_frames(&mut app, &ctx, 1280.0, height, 4);
-        for label in ["Mount", "Cheats & Mods", "Details"] {
+        for label in ["Prepare game", "Cheats & Mods", "Details"] {
             let rect = text_rect(&output, label).unwrap_or_else(|| {
                 panic!("{label} is not rendered at 1280x{height} with a banner")
             });

@@ -969,7 +969,7 @@ fn skipped_files_window_redirects_to_collection_discovery_instead_of_duplicating
     let mut filter = None;
     let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
 
-    assert!(rendered_text_contains(&output, "Collection Discovery"));
+    assert!(rendered_text_contains(&output, "Sources -> Discovery"));
     // The old per-item row (badge + filename + suggested action) must
     // not be duplicated here now that Collection Discovery owns it.
     assert!(!rendered_text_contains(&output, "Unknown.bin"));

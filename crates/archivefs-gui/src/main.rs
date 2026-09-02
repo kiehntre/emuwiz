@@ -3617,6 +3617,12 @@ const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 3] = [
     ),
 ];
 
+const GAMER_MENU_LABEL: &str = "Menu";
+const GAMER_MENU_ADD_FOLDER_LABEL: &str = "Add another game folder";
+const GAMER_MENU_SCAN_LABEL: &str = "Scan for new games";
+const GAMER_MENU_SETUP_LABEL: &str = "Emulator Setup";
+const GAMER_MENU_ADVANCED_LABEL: &str = "Advanced View";
+
 /// Compresses `DoctorScanState` into the `home_page::SetupCheckSummary` the
 /// Home "Set up emulators" card shows. The card's action opens Problems &
 /// Repair -> Diagnostics, which renders this exact `doctor_scan` state, so
@@ -4657,6 +4663,15 @@ struct ArchiveFsApp {
     /// once the chained scan is started, so a normal Advanced View Sources
     /// page "Add" never chains an unwanted scan.
     gamer_view_pending_first_scan: Option<PathBuf>,
+    /// Set when a scan requested from Gamer View finishes with existing
+    /// skipped/ambiguous/failed detail that the user can review in Sources ->
+    /// Discovery. This is presentation state only; the scan itself is still
+    /// the shared SourceAction::ScanAll/ScanOne path.
+    gamer_view_scan_review_available: bool,
+    /// Distinguishes a Gamer View scan from a scan started elsewhere while
+    /// the shared source worker is running, so its completion can use the
+    /// beginner-facing summary without changing scan semantics.
+    gamer_view_scan_pending_review: bool,
     /// The Remove-source confirmation dialog's open/closed state - see
     /// `SourcesRemoveDialogState`.
     sources_remove_dialog: Option<SourcesRemoveDialogState>,
@@ -5061,6 +5076,8 @@ impl ArchiveFsApp {
             dolphin_catalogue_update_check: None,
             sources_add_dialog: None,
             gamer_view_pending_first_scan: None,
+            gamer_view_scan_review_available: false,
+            gamer_view_scan_pending_review: false,
             sources_remove_dialog: None,
             library_views: load_library_view_configs_default().unwrap_or_default(),
             library_view_action: None,
@@ -8158,6 +8175,8 @@ impl ArchiveFsApp {
         }
         let log_category = source_action_log_category(&action);
         let path = source_action_path(&action);
+        let gamer_scan_pending =
+            self.gamer_view_scan_pending_review || self.gamer_view_pending_first_scan.is_some();
         match result {
             Ok(outcome) => {
                 let message = source_action_success_message(&outcome);
@@ -8215,9 +8234,11 @@ impl ArchiveFsApp {
                         SourceAction::ScanOne(added.path.clone()),
                     );
                 } else if let SourceActionOutcome::Scanned(summary) = &outcome
-                    && self.gamer_view_pending_first_scan.is_some()
+                    && gamer_scan_pending
                 {
                     self.gamer_view_pending_first_scan = None;
+                    self.gamer_view_scan_pending_review = false;
+                    self.gamer_view_scan_review_available = gamer_view_scan_needs_review(summary);
                     self.feedback = Some(ActionFeedback {
                         succeeded: true,
                         message: gamer_view_first_scan_message(summary),
@@ -8256,6 +8277,9 @@ impl ArchiveFsApp {
                 self.start_database_action(context.clone(), false);
             }
             Err(message) => {
+                if self.gamer_view_scan_pending_review {
+                    self.gamer_view_scan_pending_review = false;
+                }
                 self.history.record(HistoryEntry::new(
                     log_category,
                     path,
@@ -17513,8 +17537,57 @@ impl ArchiveFsApp {
                         if loading || busy {
                             ui.spinner();
                         }
-                        ui.menu_button("\u{2699}", |ui| {
-                            if ui.button("Advanced View").clicked() {
+                        ui.menu_button(GAMER_MENU_LABEL, |ui| {
+                            let source_actions_available = !busy && self.source_action_available();
+                            if ui
+                                .add_enabled(
+                                    source_actions_available,
+                                    egui::Button::new(GAMER_MENU_ADD_FOLDER_LABEL),
+                                )
+                                .on_hover_text(
+                                    "Choose another folder for EmuWiz to scan for games.",
+                                )
+                                .clicked()
+                            {
+                                if let Some(folder) = rfd::FileDialog::new()
+                                    .set_title("Choose another games folder")
+                                    .pick_folder()
+                                {
+                                    self.gamer_view_scan_review_available = false;
+                                    self.start_source_action(
+                                        context.clone(),
+                                        SourceAction::Add(folder),
+                                    );
+                                }
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    source_actions_available,
+                                    egui::Button::new(GAMER_MENU_SCAN_LABEL),
+                                )
+                                .on_hover_text(
+                                    "Look through all enabled game folders for new and changed games.",
+                                )
+                                .clicked()
+                            {
+                                self.gamer_view_scan_review_available = false;
+                                self.gamer_view_scan_pending_review = true;
+                                self.start_source_action(context.clone(), SourceAction::ScanAll);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(GAMER_MENU_SETUP_LABEL)
+                                .on_hover_text("Check emulator setup and launch readiness.")
+                                .clicked()
+                            {
+                                self.ui_mode = GuiMode::AdvancedView;
+                                save_gui_mode(self.ui_mode);
+                                self.navigate_to_main_view(MainView::EmulatorSetup);
+                                ui.close();
+                            }
+                            if ui.button(GAMER_MENU_ADVANCED_LABEL).clicked() {
                                 self.switch_to_advanced_view_at_home();
                                 save_gui_mode(self.ui_mode);
                                 ui.close();
@@ -17793,6 +17866,16 @@ impl ArchiveFsApp {
                     let gamer_launch_input = self.build_launch_readiness_input(data);
                     let gamer_play_action =
                         launch_readiness_page::gamer_play_action(&gamer_launch_input);
+                    let gamer_identity_status = match &self.selected_evidence {
+                        selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                            Some(gamer_identity_status_from_verdict(report.identity.status))
+                        }
+                        selected_evidence_page::SelectedEvidenceState::Loading { .. }
+                        | selected_evidence_page::SelectedEvidenceState::Idle => {
+                            Some(GamerIdentityStatus::StillChecking)
+                        }
+                        selected_evidence_page::SelectedEvidenceState::Error { .. } => None,
+                    };
                     let gamer_action = show_gamer_view(
                         ui,
                         data,
@@ -17806,11 +17889,13 @@ impl ArchiveFsApp {
                             cleanup_after_unmount: self.cleanup_after_unmount,
                             cheat_workflow: self.cheat_workflow.as_ref(),
                             feedback: self.feedback.as_ref(),
+                            scan_review_available: self.gamer_view_scan_review_available,
                             artwork_directory: self.custom_platform_artwork_directory.as_deref(),
                             artwork_cache: &mut self.platform_artwork_cache,
                             covers: &mut self.gamer_covers,
                             cover_requests: &mut cover_requests,
                             game_metadata,
+                            identity_status: gamer_identity_status,
                             play_action: &gamer_play_action,
                             retroarch_launch_state: &mut self.launch_retroarch,
                         },
@@ -17869,6 +17954,12 @@ impl ArchiveFsApp {
                         Some(GamerViewAction::AddGamesFolder(folder)) => {
                             self.gamer_view_pending_first_scan = Some(folder.clone());
                             self.start_source_action(context.clone(), SourceAction::Add(folder));
+                        }
+                        Some(GamerViewAction::ReviewScan) => {
+                            self.gamer_view_scan_review_available = false;
+                            self.ui_mode = GuiMode::AdvancedView;
+                            save_gui_mode(self.ui_mode);
+                            self.navigate_to_sources_tab(SourcesTab::Discovery);
                         }
                         Some(GamerViewAction::ReviewIdentity(archive_path)) => {
                             self.review_identity(archive_path);

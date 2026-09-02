@@ -1607,6 +1607,32 @@ fn gamer_view_first_scan_message_uses_plain_language() {
             "Gamer View's scan message must not name {banned:?}: {message:?}"
         );
     }
+
+    summary.counts.skipped_unsupported_extension = 2;
+    assert_eq!(
+        gamer_view_first_scan_message(&summary),
+        "Found 1233 games. 2 files need attention."
+    );
+    assert!(gamer_view_scan_needs_review(&summary));
+}
+
+#[test]
+fn gamer_identity_wording_uses_only_the_existing_verdict() {
+    use archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus;
+
+    assert_eq!(
+        gamer_identity_status_from_verdict(IdentityStatus::ContentAndDatAgree),
+        GamerIdentityStatus::Identified
+    );
+    assert_eq!(
+        gamer_identity_status_from_verdict(IdentityStatus::Ambiguous),
+        GamerIdentityStatus::Uncertain
+    );
+    assert_eq!(
+        gamer_identity_status_from_verdict(IdentityStatus::Conflict),
+        GamerIdentityStatus::ConflictingEvidence
+    );
+    assert_eq!(GamerIdentityStatus::StillChecking.label(), "Still checking");
 }
 
 /// Phase 3: Gamer View's own wording for a cached/unvalidated row must
@@ -3541,7 +3567,7 @@ fn unknown_platform_rows_are_needs_attention_in_the_list_too() {
     );
     assert_eq!(
         gamer_view_row_state_label(false, MountState::Pending),
-        "Ready to mount"
+        "Prepare game"
     );
     assert_eq!(
         gamer_view_row_state_label(false, MountState::NotMountable),

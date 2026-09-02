@@ -588,6 +588,59 @@ fn gamer_view_gear_menu_always_lands_on_home_regardless_of_prior_view() {
 }
 
 #[test]
+fn gamer_menu_keeps_everyday_actions_visible_and_names_the_menu() {
+    assert_eq!(GAMER_MENU_LABEL, "Menu");
+    assert_eq!(GAMER_MENU_ADD_FOLDER_LABEL, "Add another game folder");
+    assert_eq!(GAMER_MENU_SCAN_LABEL, "Scan for new games");
+    assert_eq!(GAMER_MENU_SETUP_LABEL, "Emulator Setup");
+    assert_eq!(GAMER_MENU_ADVANCED_LABEL, "Advanced View");
+
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::GamerView;
+    app.retroarch_profiles = RetroArchProfilesState::Error("test".to_string());
+    if let LoadState::Ready(data) = &mut app.state {
+        data.records
+            .push(record("/roms/another-game.zip", MountState::Pending));
+    }
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let output = ctx.run(advanced_screen_input(), |ctx| app.update(ctx, &mut frame));
+    let menu = find_exact_text_center(&output, GAMER_MENU_LABEL).expect("Gamer menu renders");
+    let _ = ctx.run(
+        egui::RawInput {
+            events: pointer_click(menu),
+            ..advanced_screen_input()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+    let output = ctx.run(advanced_screen_input(), |ctx| app.update(ctx, &mut frame));
+
+    for label in [
+        GAMER_MENU_ADD_FOLDER_LABEL,
+        GAMER_MENU_SCAN_LABEL,
+        GAMER_MENU_SETUP_LABEL,
+        GAMER_MENU_ADVANCED_LABEL,
+    ] {
+        assert!(
+            rendered_text_contains(&output, label),
+            "Gamer menu must expose {label:?}"
+        );
+    }
+
+    let setup = find_exact_text_center(&output, GAMER_MENU_SETUP_LABEL)
+        .expect("Emulator Setup menu action renders");
+    let _ = ctx.run(
+        egui::RawInput {
+            events: pointer_click(setup),
+            ..advanced_screen_input()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+    assert_eq!(app.ui_mode, GuiMode::AdvancedView);
+    assert_eq!(app.view, MainView::EmulatorSetup);
+}
+
+#[test]
 fn returning_home_from_any_destination_is_reliable() {
     let mut app = app_for_operation_tests();
     for destination in [

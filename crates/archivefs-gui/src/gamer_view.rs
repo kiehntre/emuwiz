@@ -19,6 +19,44 @@ pub(crate) enum GamerViewScreen {
     Details,
 }
 
+/// The small identity vocabulary used by Gamer View's Details screen. The
+/// underlying evidence verdict remains authoritative; these labels only make
+/// an already-available result understandable without exposing its internal
+/// evidence terminology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GamerIdentityStatus {
+    Identified,
+    Uncertain,
+    ConflictingEvidence,
+    StillChecking,
+}
+
+impl GamerIdentityStatus {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Identified => "Identified",
+            Self::Uncertain => "Uncertain",
+            Self::ConflictingEvidence => "Conflicting evidence",
+            Self::StillChecking => "Still checking",
+        }
+    }
+}
+
+pub(crate) fn gamer_identity_status_from_verdict(
+    status: archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus,
+) -> GamerIdentityStatus {
+    use archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus;
+
+    match status {
+        IdentityStatus::Conflict => GamerIdentityStatus::ConflictingEvidence,
+        IdentityStatus::Ambiguous | IdentityStatus::Unknown => GamerIdentityStatus::Uncertain,
+        IdentityStatus::VerifiedByDat
+        | IdentityStatus::ContentAndDatAgree
+        | IdentityStatus::ContentOnly
+        | IdentityStatus::DatOnly => GamerIdentityStatus::Identified,
+    }
+}
+
 pub(crate) const GAMER_SEARCH_MIN_WIDTH: f32 = 320.0;
 pub(crate) const GAMER_SEARCH_MAX_WIDTH: f32 = 760.0;
 pub(crate) const GAMER_TOP_BAR_CONTROL_RESERVE: f32 = 64.0;
@@ -53,7 +91,34 @@ pub(crate) fn gamer_view_first_scan_message(summary: &ScanPersistSummary) -> Str
             .to_string();
     }
     let plural = if found == 1 { "game" } else { "games" };
+    let skipped = summary.skipped_files_total();
+    if skipped > 0 {
+        return format!(
+            "Found {found} {plural}. {skipped} file{} need attention.",
+            if skipped == 1 { "" } else { "s" }
+        );
+    }
+    let ingestion_skipped = summary.ingestion_skip_reasons.total();
+    if ingestion_skipped > 0 {
+        return format!(
+            "Found {found} {plural}. {ingestion_skipped} item{} need attention.",
+            if ingestion_skipped == 1 { "" } else { "s" }
+        );
+    }
+    if summary.counts.errors_count > 0 || !summary.folder_errors.is_empty() {
+        return format!("Found {found} {plural}. Some folders need attention.");
+    }
     format!("Found {found} {plural}!")
+}
+
+/// Whether the completed scan has existing, truthful detail that the user can
+/// review. This only consults counters already supplied by the scan; it does
+/// not infer a count from the library rows.
+pub(crate) fn gamer_view_scan_needs_review(summary: &ScanPersistSummary) -> bool {
+    summary.skipped_files_total() > 0
+        || summary.ingestion_skip_reasons.total() > 0
+        || summary.counts.errors_count > 0
+        || !summary.folder_errors.is_empty()
 }
 /// Gamer View's plain-language primary-action state for a selected game -
 /// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
@@ -74,8 +139,8 @@ pub(crate) fn gamer_primary_action(state: MountState) -> GamerPrimaryAction {
         MountState::Mounted => GamerPrimaryAction::Unmount,
         MountState::NotMountable => GamerPrimaryAction::NoMountingNeeded,
         MountState::MountPathExists => GamerPrimaryAction::Blocked(
-            "A file already exists at this game's mount destination. Open Advanced View's \
-             Mount page to resolve this."
+            "A file already exists where EmuWiz would prepare this game. Open Advanced View to \
+             resolve this."
                 .to_string(),
         ),
     }
@@ -88,7 +153,7 @@ pub(crate) fn gamer_primary_action(state: MountState) -> GamerPrimaryAction {
 /// verdict ("Ready to play" vs "Needs setup"), never claimed here.
 pub(crate) fn gamer_primary_action_short_label(action: &GamerPrimaryAction) -> &'static str {
     match action {
-        GamerPrimaryAction::Mount => "Ready to mount",
+        GamerPrimaryAction::Mount => "Prepare game",
         GamerPrimaryAction::Unmount => "Mounted",
         GamerPrimaryAction::NoMountingNeeded => "Game found",
         GamerPrimaryAction::Blocked(_) => "Needs attention",
@@ -145,7 +210,7 @@ pub(crate) fn gamer_readiness<'a>(
 /// the card's status line, kept in lockstep with its primary action.
 pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'static str {
     match readiness {
-        GamerReadiness::Mount => "Ready to mount",
+        GamerReadiness::Mount => "Prepare game",
         GamerReadiness::Unmount => "Mounted",
         GamerReadiness::Ready { .. } => "Ready to play",
         GamerReadiness::NeedsSetup { .. } => "Needs setup",
@@ -227,6 +292,9 @@ pub(crate) enum GamerViewAction {
     /// View Sources page uses - see `gamer_view_pending_first_scan` for
     /// how the resulting scan is chained automatically.
     AddGamesFolder(PathBuf),
+    /// Open the existing Sources -> Discovery review for the most recent
+    /// scan, without starting another scan or changing any file.
+    ReviewScan,
     /// Phase 5: "Review" on a game whose platform couldn't be confidently
     /// identified - the archive to keep selected while switching into
     /// Advanced View's Selected page, which already shows the real
@@ -502,7 +570,7 @@ pub(crate) fn show_featured_cover(
 }
 
 /// The featured panel's primary button: full width and taller than a secondary
-/// one, so Mount reads as the thing to do from across a room.
+/// one, so the current action reads as the thing to do from across a room.
 ///
 /// Still `widgets::action_button`'s `Primary` fill and still an ordinary
 /// `egui::Button`, so its enable/disable rules, focus behaviour and activation are
@@ -782,6 +850,7 @@ pub(crate) struct GamerViewViewState<'a> {
     pub(crate) cleanup_after_unmount: bool,
     pub(crate) cheat_workflow: Option<&'a CheatWorkflowState>,
     pub(crate) feedback: Option<&'a ActionFeedback>,
+    pub(crate) scan_review_available: bool,
     pub(crate) artwork_directory: Option<&'a Path>,
     pub(crate) artwork_cache: &'a mut PlatformArtworkCache,
     /// RomM covers already answered for, and the scheduling that decides what
@@ -800,6 +869,7 @@ pub(crate) struct GamerViewViewState<'a> {
     /// which are real (already-answered) results this view still renders
     /// (as "no game information available" wording), never network calls.
     pub(crate) game_metadata: Option<&'a crate::game_metadata::GameMetadataResult>,
+    pub(crate) identity_status: Option<GamerIdentityStatus>,
     pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
     pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
 }
@@ -813,6 +883,7 @@ pub(crate) fn show_gamer_details_panel(
     ui: &mut egui::Ui,
     record: &ArchiveRecord,
     enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+    identity_status: Option<GamerIdentityStatus>,
 ) -> Option<GamerViewAction> {
     let view = GamerMetadataView::merge(&record.metadata, enrichment);
     widgets::section_header(ui, "Details", None);
@@ -830,6 +901,9 @@ pub(crate) fn show_gamer_details_panel(
                     .or(record.identity.platform.as_deref())
                     .unwrap_or("Unknown"),
             );
+            if let Some(status) = identity_status {
+                detail_row(ui, "Identity", status.label());
+            }
             detail_row(
                 ui,
                 "Format",
@@ -945,11 +1019,13 @@ pub(crate) fn show_gamer_view(
         cleanup_after_unmount,
         cheat_workflow,
         feedback,
+        scan_review_available,
         artwork_directory,
         artwork_cache,
         covers,
         cover_requests,
         game_metadata,
+        identity_status,
         play_action,
         retroarch_launch_state,
     } = view_state;
@@ -971,6 +1047,12 @@ pub(crate) fn show_gamer_view(
             std::borrow::Cow::Owned(gamer_view_failure_message(&feedback.message))
         };
         ui.colored_label(color, message.as_ref());
+        if feedback.succeeded
+            && scan_review_available
+            && widgets::action_button(ui, "Review", widgets::ActionStyle::Quiet, true).clicked()
+        {
+            action = Some(GamerViewAction::ReviewScan);
+        }
         ui.add_space(4.0);
     }
 
@@ -989,7 +1071,9 @@ pub(crate) fn show_gamer_view(
         ui.add_space(theme::SECTION_GAP);
         let details_action =
             match selected_record(&data.records, archive_context.focused.as_deref()) {
-                Some(record) => show_gamer_details_panel(ui, record, game_metadata),
+                Some(record) => {
+                    show_gamer_details_panel(ui, record, game_metadata, identity_status)
+                }
                 None => {
                     ui.label("Select a game to view its details.");
                     None
@@ -1530,7 +1614,14 @@ pub(crate) fn show_gamer_view(
                                     // keyboard reaches in this panel.
                                     match &readiness {
                                         GamerReadiness::Mount => {
-                                            if featured_primary_button(ui, "Mount", !busy).clicked()
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Temporarily makes this archived game available. The original is unchanged.",
+                                                )
+                                                .color(theme::muted(ui)),
+                                            );
+                                            if featured_primary_button(ui, "Prepare game", !busy)
+                                                .clicked()
                                             {
                                                 action = Some(GamerViewAction::Operation(
                                                     OperationRequest {
@@ -1751,6 +1842,17 @@ mod game_metadata_enrichment_tests {
             readiness,
             GamerReadiness::NeedsSetup { reason } if reason == refusal
         ));
+    }
+
+    #[test]
+    fn archived_game_uses_prepare_game_wording_without_changing_operation_kind() {
+        let action = gamer_primary_action(MountState::Pending);
+        assert_eq!(gamer_primary_action_short_label(&action), "Prepare game");
+        assert_eq!(
+            gamer_readiness_short_label(&GamerReadiness::Mount),
+            "Prepare game"
+        );
+        assert!(matches!(action, GamerPrimaryAction::Mount));
     }
 
     #[test]

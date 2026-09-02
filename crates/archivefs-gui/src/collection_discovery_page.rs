@@ -141,7 +141,7 @@ pub(super) fn show_skipped_files_window(
                         ui.label(
                             egui::RichText::new(
                                 "This scan also found items EmuWiz recognised but couldn't \
-                                 confidently match - see Tools -> Collection Discovery for the \
+                                 confidently match - see Sources -> Discovery for the \
                                  full breakdown with suggested actions.",
                             )
                             .color(theme::muted(ui)),

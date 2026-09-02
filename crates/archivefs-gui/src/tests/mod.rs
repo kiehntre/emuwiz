@@ -1183,6 +1183,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         dolphin_catalogue_update_check: None,
         sources_add_dialog: None,
         gamer_view_pending_first_scan: None,
+        gamer_view_scan_review_available: false,
+        gamer_view_scan_pending_review: false,
         sources_remove_dialog: None,
         // Deliberately `Vec::new()`, never `load_library_view_configs_default()`,
         // in this test-only constructor - every other field here is a

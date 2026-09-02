@@ -2441,7 +2441,7 @@ fn gamer_view_game_list_uses_the_remaining_height_not_two_or_three_rows() {
                 let title = format!("Game {index:02}");
                 rec.metadata.title = Some(title.clone());
                 rec.metadata.platform = Some("GameCube".to_string());
-                labels.push(format!("{title} \u{2014} GameCube \u{b7} Ready to mount"));
+                labels.push(format!("{title} \u{2014} GameCube \u{b7} Prepare game"));
                 rec
             })
             .collect();
