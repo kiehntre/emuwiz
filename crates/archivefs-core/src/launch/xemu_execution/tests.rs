@@ -1,40 +1,28 @@
 //! Tests for native xemu launch preflight/execution.
 //!
-//! # Why executable-drift/binding-success is unit-tested, not full end-to-end
+//! # Two executable provenances, and why one leg is unit-tested
 //!
-//! [`crate::patch_manager::resolve_xemu_native_launch_binding`] only ever
-//! authorizes an executable candidate whose
-//! [`crate::patch_manager::XemuInstallationType`] is `Native` - and, exactly
-//! like [`crate::patch_manager::duckstation_local`]'s own executable
-//! discovery, `discover_xemu_profiles` only ever classifies an executable
-//! `Native` when it is found by literally searching the current process's
-//! real `PATH` (`roots.explicit_executables` is deliberately classified
-//! `Explicit`, a different, unsupported installation type - see
-//! `discover_xemu_profiles`'s own executable-discovery logic). Mutating this
-//! test binary's real, process-global `PATH` at runtime to fabricate a
-//! `Native` match would race every other concurrently running test in this
-//! same binary that also reads `PATH` (many adapters' own discovery tests
-//! do) - `std::env::set_var` is `unsafe` for exactly this reason. Exactly
-//! the same limitation is already accepted, unchanged, in
-//! `duckstation_execution`'s own test suite: spawn mechanics are proven
-//! against a hand-built command, never a full preflight-derived one, and no
-//! preflight test in that suite ever exercises a genuine binding success
-//! either.
+//! [`crate::patch_manager::resolve_xemu_native_launch_binding`] authorizes
+//! two provenances for a profile discovered at xemu's own standard XDG
+//! location ([`crate::patch_manager::XemuInstallationType::Native`]):
 //!
-//! So here: every content/identity/profile-lookup preflight step that fires
-//! *before* binding resolution (steps 1-6) is proven through the real,
-//! full [`preflight_xemu_launch`] pipeline, on a real synthetic XDVDFS Xbox
-//! disc image via the exact same `inspect_catalogued_game_identity` and
-//! `discover_xemu_profiles` production code uses. The final pre-spawn
-//! recheck (step 10) and command-plan/firmware gating (step 9) are already
-//! covered as pure units - `recheck_executable`/
-//! `inspect_and_capture_content_identity` directly here, and
-//! `build_xemu_command_plan`'s own firmware gating in
-//! `xemu_command::tests` - so no coverage is lost, only the single
-//! PATH-dependent "genuinely Native-installed xemu" leg is int all done
-//! through units instead of one shared, actually-installed fixture. Spawn
-//! mechanics themselves never depend on any of this: they are proven
-//! directly against a hand-built [`XemuCommand`], mirroring
+//! * a `Native` executable - one `discover_xemu_profiles` classified
+//!   `Native` because it was found by literally searching the current
+//!   process's real `PATH`. Fabricating that match needs a process-global
+//!   `PATH` mutation that would race every concurrent test reading `PATH`
+//!   (`std::env::set_var` is `unsafe`), so that single leg stays a pure
+//!   unit - the same accepted limitation as `duckstation_execution`'s
+//!   suite.
+//! * an `Explicit` executable - an exact path supplied via
+//!   `roots.explicit_executables` that the host already confirmed through
+//!   its own provenance (an EmuWiz-managed AppImage). This *is* exercised
+//!   end-to-end: the `ReadyFixture` is exactly that shape and
+//!   `*_reaches_a_real_command` runs the full [`preflight_xemu_launch`]
+//!   pipeline - including the command planner's own MCPX/BIOS/EEPROM/HDD
+//!   gating - through to a produced [`XemuCommand`].
+//!
+//! Spawn mechanics themselves are still proven directly against a
+//! hand-built [`XemuCommand`], mirroring
 //! `duckstation_execution::tests::hand_built_command`.
 
 use std::fs;
@@ -157,16 +145,15 @@ fn write_healthy_config(profile_root: &std::path::Path) {
     .unwrap();
 }
 
-/// A profile-discoverable (but never `Native`-executable-bound, see the
-/// module doc comment) native xemu fixture: a real `xemu.toml` with all four
-/// system files present, a fake `explicit` executable (never authorized by
-/// `resolve_xemu_native_launch_binding`, which is exactly what the
-/// early-preflight-step tests below rely on to reach `BindingUnavailable`
-/// only after every earlier check has already passed), and a loose
-/// original-Xbox disc image whose verified title ID becomes the request's
-/// expected title id/game key - computed via the same
-/// `inspect_catalogued_game_identity` the module itself uses, never
-/// hand-typed.
+/// A ready native xemu fixture in the managed-AppImage shape: a Native XDG
+/// profile with a real `xemu.toml` and all four system files present,
+/// launched by a caller-confirmed explicit executable supplied via
+/// `roots.explicit_executables` (classified `Explicit`, which
+/// `resolve_xemu_native_launch_binding` now accepts for a `Native`
+/// profile - see the module doc comment), and a loose original-Xbox disc
+/// image whose verified title ID becomes the request's expected title
+/// id/game key - computed via the same `inspect_catalogued_game_identity`
+/// the module itself uses, never hand-typed.
 struct ReadyFixture {
     fixture: Fixture,
     roots: XemuProfileDiscoveryRoots,
@@ -353,18 +340,76 @@ fn profile_root_drift_is_rejected() {
     assert_eq!(error.kind, XemuLaunchPreflightErrorKind::ProfileNotFound);
 }
 
-// --- every earlier check passing reaches binding resolution, never skips it ------------------------
+// --- every earlier check passing reaches binding resolution and a real command --------------------
 
 #[test]
-fn a_fully_valid_request_reaches_binding_resolution() {
-    // Proves steps 1-6 all pass cleanly for a completely valid request -
-    // `BindingUnavailable` here can only mean the pipeline reached real
-    // binding resolution (this fixture's executable is deliberately
-    // `Explicit`, never `Native` - see the module doc comment), not that an
-    // earlier content/identity/profile check misfired.
+fn a_fully_valid_request_with_a_caller_confirmed_executable_reaches_a_real_command() {
+    // The `ReadyFixture` is the managed-AppImage shape: a Native XDG profile
+    // (with all four system files healthy) launched by a caller-confirmed
+    // explicit executable. Every earlier preflight step passes, binding
+    // resolution now succeeds, and the command plan's own Xbox system-file
+    // gating is satisfied, so a real `XemuCommand` is produced.
     let ready = build_ready_fixture("reaches-binding");
+    let command = preflight(&ready).expect("a Native profile binds a caller-confirmed executable");
+    assert_eq!(command.executable, ready.request.expected_executable);
+    assert_eq!(
+        command.arguments,
+        vec![
+            std::ffi::OsString::from("-dvd_path"),
+            ready.request.selected_content_path.clone().into_os_string(),
+        ]
+    );
+    assert_eq!(command.selection.platform_id, "Xbox");
+    assert_eq!(command.selection.verified_xbox_title_id, XBOX_TITLE_ID);
+}
+
+#[test]
+fn a_forced_untrusted_profile_never_binds_the_caller_confirmed_executable() {
+    use crate::patch_manager::{
+        XemuInstallationType, XemuLaunchBlockerKind, resolve_xemu_native_launch_binding,
+    };
+    let ready = build_ready_fixture("forced-untrusted");
+    let base = discover_xemu_profiles(&ready.roots)
+        .profiles
+        .into_iter()
+        .find(|profile| profile.configuration_path == ready.profile_root)
+        .expect("fixture profile must be discovered");
+    resolve_xemu_native_launch_binding(&base).expect("native profile binds the confirmed exe");
+    for forced in [
+        XemuInstallationType::Portable,
+        XemuInstallationType::FlatpakUser,
+        XemuInstallationType::Explicit,
+    ] {
+        let mut profile = base.clone();
+        profile.installation_type = forced;
+        let error = resolve_xemu_native_launch_binding(&profile)
+            .expect_err("only a Native profile may bind a caller-confirmed executable");
+        assert_eq!(
+            error.kind,
+            XemuLaunchBlockerKind::UnsupportedInstallationType
+        );
+    }
+}
+
+#[test]
+fn without_xbox_system_files_a_trusted_executable_is_still_blocked() {
+    // The caller-confirmed executable binds, but the Xbox MCPX/BIOS/EEPROM/
+    // HDD readiness is independent: an unhealthy config must keep the launch
+    // blocked rather than let a trusted executable imply readiness.
+    let ready = build_ready_fixture("no-system-files");
+    // Drop the MCPX/BIOS/EEPROM/HDD files the healthy config references,
+    // keeping `xemu.toml`, so the command planner's own gating fires.
+    fs::remove_dir_all(ready.profile_root.join("system")).unwrap();
     let error = preflight(&ready).unwrap_err();
-    assert_eq!(error.kind, XemuLaunchPreflightErrorKind::BindingUnavailable);
+    assert!(
+        matches!(
+            error.kind,
+            XemuLaunchPreflightErrorKind::CommandBlocked
+                | XemuLaunchPreflightErrorKind::CandidateNotReady
+        ),
+        "system-file-unmet launch must stay blocked, got {:?}",
+        error.kind
+    );
 }
 
 // --- final pre-spawn recheck units (step 10) --------------------------------------------------------

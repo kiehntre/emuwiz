@@ -4462,3 +4462,50 @@ fn managed_appimage_explicit_executables_refuses_ambiguous_managed_installs() {
     ];
     assert!(managed_appimage_explicit_executables(&installs, "PPSSPP").is_empty());
 }
+
+#[test]
+fn managed_appimage_explicit_executables_projects_the_new_standalone_adapters() {
+    // The same generic helper feeds RPCS3 / DuckStation / xemu discovery
+    // from an `install.json`-backed managed install, keyed by exact
+    // catalogue display name; a non-managed form for the same emulator is
+    // never promoted, and one adapter's install never leaks into another.
+    let managed = archivefs_core::diagnostics::profiles::MANAGED_APPIMAGE_INSTALLATION_FORM;
+    let installs = [
+        managed_appimage_evidence(
+            "RPCS3",
+            managed,
+            "/data/emuwiz/emulators/rpcs3/RPCS3.AppImage",
+        ),
+        managed_appimage_evidence(
+            "DuckStation",
+            managed,
+            "/data/emuwiz/emulators/duckstation/DuckStation.AppImage",
+        ),
+        managed_appimage_evidence("xemu", managed, "/data/emuwiz/emulators/xemu/xemu.AppImage"),
+        managed_appimage_evidence(
+            "RPCS3",
+            "AppImage",
+            "/home/u/Applications/RPCS3/RPCS3.AppImage",
+        ),
+    ];
+    assert_eq!(
+        managed_appimage_explicit_executables(&installs, "RPCS3"),
+        vec![std::path::PathBuf::from(
+            "/data/emuwiz/emulators/rpcs3/RPCS3.AppImage"
+        )],
+    );
+    assert_eq!(
+        managed_appimage_explicit_executables(&installs, "DuckStation"),
+        vec![std::path::PathBuf::from(
+            "/data/emuwiz/emulators/duckstation/DuckStation.AppImage"
+        )],
+    );
+    assert_eq!(
+        managed_appimage_explicit_executables(&installs, "xemu"),
+        vec![std::path::PathBuf::from(
+            "/data/emuwiz/emulators/xemu/xemu.AppImage"
+        )],
+    );
+    // Wrong-emulator query never leaks another adapter's install.
+    assert!(managed_appimage_explicit_executables(&installs, "PPSSPP").is_empty());
+}

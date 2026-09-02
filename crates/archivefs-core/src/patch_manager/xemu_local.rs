@@ -411,19 +411,40 @@ pub fn resolve_xemu_native_launch_binding(
             "profile is not eligible",
         ));
     }
-    if profile.installation_type != XemuInstallationType::Native {
-        return Err(launch_blocker(
-            XemuLaunchBlockerKind::UnsupportedInstallationType,
-            format!(
-                "only native xemu installations are supported, got {:?}",
-                profile.installation_type
-            ),
-        ));
-    }
+    // A profile discovered at xemu's own standard XDG location
+    // (`XemuInstallationType::Native`) may be launched by *either* a
+    // PATH/name-matched `xemu` binary *or* an exact executable path the host
+    // integration already confirmed through its own provenance (an
+    // EmuWiz-managed AppImage supplied via
+    // `XemuProfileDiscoveryRoots::explicit_executables`, classified
+    // `XemuInstallationType::Explicit`). Both are held to the identical
+    // `validate_native_xemu_executable` checks and the identical "exactly
+    // one candidate" rule below - the same equivalence PPSSPP/PCSX2 already
+    // make for their `explicit_executables`. `Portable` (a `*.AppImage`
+    // merely found by name or beside `$APPIMAGE`), `FlatpakUser`, and a
+    // caller-supplied `Explicit` *configuration root* stay refused: no
+    // reviewed config-dir/argv contract exists for them here. The
+    // executable fact proven here is independent of xemu's MCPX/BIOS/EEPROM/
+    // HDD readiness, which `crate::launch::xemu_command` validates at
+    // preflight.
+    let acceptable: &[XemuInstallationType] = match profile.installation_type {
+        XemuInstallationType::Native => {
+            &[XemuInstallationType::Native, XemuInstallationType::Explicit]
+        }
+        other => {
+            return Err(launch_blocker(
+                XemuLaunchBlockerKind::UnsupportedInstallationType,
+                format!(
+                    "only native xemu installations (optionally launched by a caller-confirmed \
+                     executable) are supported, got {other:?}"
+                ),
+            ));
+        }
+    };
     let matching: Vec<&XemuExecutable> = profile
         .executable_candidates
         .iter()
-        .filter(|candidate| candidate.installation_type == XemuInstallationType::Native)
+        .filter(|candidate| acceptable.contains(&candidate.installation_type))
         .collect();
     if matching.is_empty() {
         return Err(launch_blocker(
@@ -1219,6 +1240,39 @@ mod tests {
         }];
         let binding = resolve_xemu_native_launch_binding(&candidate).unwrap();
         assert_eq!(binding.executable, executable);
+    }
+
+    #[test]
+    fn native_profile_binds_a_caller_confirmed_explicit_executable() {
+        // The managed-AppImage seam: a path fed via
+        // `roots.explicit_executables` is classified `Explicit`, and a
+        // Native XDG profile accepts it under the identical safety and
+        // single-candidate rules. A guessed `Portable` `*.AppImage` is
+        // never accepted.
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_config(&root(&roots), "");
+        let appimage = temp.path().join("emulators/xemu/xemu.AppImage");
+        fs::create_dir_all(appimage.parent().unwrap()).unwrap();
+        fs::write(&appimage, b"managed appimage").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&appimage, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut candidate = profile(&roots);
+        candidate.executable_candidates = vec![XemuExecutable {
+            path: appimage.clone(),
+            installation_type: XemuInstallationType::Explicit,
+            version: None,
+        }];
+        let binding = resolve_xemu_native_launch_binding(&candidate).unwrap();
+        assert_eq!(binding.executable, appimage);
+
+        // Same path, but classified `Portable` (a guessed AppImage) - refused.
+        candidate.executable_candidates[0].installation_type = XemuInstallationType::Portable;
+        let blocker = resolve_xemu_native_launch_binding(&candidate).unwrap_err();
+        assert_eq!(blocker.kind, XemuLaunchBlockerKind::ExecutableMissing);
     }
 
     #[test]

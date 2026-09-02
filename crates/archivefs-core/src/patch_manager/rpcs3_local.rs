@@ -188,8 +188,24 @@ fn rpcs3_launch_blocker(
 }
 
 /// Resolves one safe native Linux RPCS3 executable for a discovered profile.
-/// Flatpak/portable profiles are intentionally not bound here because this
-/// milestone has no proven configuration-directory/argv contract for them.
+///
+/// A profile discovered at RPCS3's own standard XDG location
+/// ([`Rpcs3InstallationType::Native`]) may be launched by *either* a
+/// PATH/name-matched native binary *or* an exact executable path the host
+/// integration already confirmed through its own provenance (for example an
+/// EmuWiz-managed AppImage supplied via
+/// [`Rpcs3ProfileDiscoveryRoots::explicit_executables`], classified
+/// [`Rpcs3InstallationType::Explicit`]). Both are held to the identical
+/// file-safety checks ([`validate_rpcs3_executable`]: absolute path,
+/// present, regular non-symlink file, execute bit) and the identical
+/// "exactly one candidate" rule - this is the same equivalence PCSX2 and
+/// PPSSPP already make for their `explicit_executables`.
+///
+/// [`Rpcs3InstallationType::Portable`] (a `*.AppImage` merely *found* by
+/// name or beside `$APPIMAGE`), [`Rpcs3InstallationType::FlatpakUser`], and
+/// a caller-supplied [`Rpcs3InstallationType::Explicit`] *configuration
+/// root* are still refused: this milestone has no reviewed
+/// configuration-directory/argv contract for them.
 pub fn resolve_rpcs3_native_launch_binding(
     profile: &Rpcs3Profile,
 ) -> Result<Rpcs3LaunchBinding, Rpcs3LaunchBlocker> {
@@ -199,16 +215,25 @@ pub fn resolve_rpcs3_native_launch_binding(
             "profile is not eligible",
         ));
     }
-    if profile.installation_type != Rpcs3InstallationType::Native {
-        return Err(rpcs3_launch_blocker(
-            Rpcs3LaunchBlockerKind::UnsupportedInstallation,
-            "only native Linux RPCS3 profiles have a reviewed direct argv contract",
-        ));
-    }
+    let acceptable: &[Rpcs3InstallationType] = match profile.installation_type {
+        Rpcs3InstallationType::Native => &[
+            Rpcs3InstallationType::Native,
+            Rpcs3InstallationType::Explicit,
+        ],
+        other => {
+            return Err(rpcs3_launch_blocker(
+                Rpcs3LaunchBlockerKind::UnsupportedInstallation,
+                format!(
+                    "only native RPCS3 profiles (optionally launched by a caller-confirmed \
+                     executable) have a reviewed direct argv contract, got {other:?}"
+                ),
+            ));
+        }
+    };
     let matching: Vec<&Rpcs3Executable> = profile
         .executable_candidates
         .iter()
-        .filter(|candidate| candidate.installation_type == Rpcs3InstallationType::Native)
+        .filter(|candidate| acceptable.contains(&candidate.installation_type))
         .collect();
     if matching.is_empty() {
         return Err(rpcs3_launch_blocker(
@@ -1635,6 +1660,46 @@ mod tests {
         assert!(profile.eligible, "{:?}", profile.blockers);
         assert_eq!(profile.installation_type, Rpcs3InstallationType::Native);
         assert!(profile.dev_hdd0_path.ends_with("dev_hdd0"));
+    }
+
+    #[test]
+    fn native_profile_binds_a_caller_confirmed_explicit_executable() {
+        // The managed-AppImage seam: a path fed via
+        // `roots.explicit_executables` is classified `Explicit`, and a
+        // Native XDG profile accepts it under the identical
+        // `validate_rpcs3_executable` and single-candidate rules. The same
+        // path classified `Portable` (a guessed AppImage) is refused.
+        let dir = TempDir::new().unwrap();
+        let mut profile = native_profile(&dir);
+        let appimage = dir.path().join("emulators/rpcs3/RPCS3.AppImage");
+        std::fs::create_dir_all(appimage.parent().unwrap()).unwrap();
+        std::fs::write(&appimage, b"managed appimage").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&appimage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        profile.executable_candidates = vec![Rpcs3Executable {
+            path: appimage.clone(),
+            installation_type: Rpcs3InstallationType::Explicit,
+            version: None,
+        }];
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, appimage);
+
+        profile.executable_candidates[0].installation_type = Rpcs3InstallationType::Portable;
+        let blocker = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, Rpcs3LaunchBlockerKind::ExecutableMissing);
+
+        // A caller-supplied Explicit *config-root* profile is still refused
+        // outright (the widening is Native-profile-only).
+        profile.installation_type = Rpcs3InstallationType::Explicit;
+        profile.executable_candidates[0].installation_type = Rpcs3InstallationType::Explicit;
+        let blocker = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            Rpcs3LaunchBlockerKind::UnsupportedInstallation
+        );
     }
 
     #[test]

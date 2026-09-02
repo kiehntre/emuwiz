@@ -1,25 +1,27 @@
 //! Tests for native RPCS3 launch preflight/execution.
 //!
-//! # Why executable-drift/binding-success is unit-tested, not full end-to-end
+//! # Two executable provenances, and why one leg is unit-tested
 //!
-//! [`crate::patch_manager::resolve_rpcs3_native_launch_binding`] only ever
-//! authorizes an executable candidate whose
-//! [`crate::patch_manager::Rpcs3InstallationType`] is `Native` - and,
-//! exactly like [`crate::launch::xemu_execution`]'s,
-//! `crate::launch::ppsspp_execution`'s, and `duckstation_execution`'s own
-//! executable discovery, `discover_rpcs3_profiles` only ever classifies an
-//! executable `Native` when it is found by literally searching the current
-//! process's real `PATH` (`roots.explicit_executables` is deliberately
-//! classified `Explicit`, a different, unsupported installation type - see
-//! `discover_rpcs3_profiles`'s own executable-discovery logic). Mutating
-//! this test binary's real, process-global `PATH` at runtime to fabricate a
-//! `Native` match would race every other concurrently running test in this
-//! same binary that also reads `PATH` - `std::env::set_var` is `unsafe` for
-//! exactly this reason. Exactly the same limitation is already accepted,
-//! unchanged, in the xemu/PPSSPP/DuckStation test suites: spawn mechanics
-//! are proven against a hand-built command, never a full preflight-derived
-//! one, and no preflight test in any of those suites ever exercises a
-//! genuine binding success either.
+//! [`crate::patch_manager::resolve_rpcs3_native_launch_binding`] authorizes
+//! two provenances for a profile discovered at RPCS3's own standard XDG
+//! location ([`crate::patch_manager::Rpcs3InstallationType::Native`]):
+//!
+//! * a `Native` executable - one `discover_rpcs3_profiles` classified
+//!   `Native` because it was found by literally searching the current
+//!   process's real `PATH`. Mutating this test binary's process-global
+//!   `PATH` at runtime to fabricate that match would race every other
+//!   concurrently running test that also reads `PATH` (`std::env::set_var`
+//!   is `unsafe` for exactly this reason), so that single leg stays a pure
+//!   unit (`recheck_executable` / `inspect_and_capture_content_identity`
+//!   directly) - the same accepted limitation as the xemu/PPSSPP/
+//!   DuckStation suites.
+//! * an `Explicit` executable - an exact path supplied via
+//!   `roots.explicit_executables` that the host integration already
+//!   confirmed through its own provenance (an EmuWiz-managed AppImage).
+//!   This *is* exercised end-to-end below: the `ReadyFixture` is exactly
+//!   that shape, and `*_reaches_a_real_command` runs the full
+//!   [`preflight_rpcs3_launch`] pipeline through to a produced
+//!   [`Rpcs3Command`].
 //!
 //! So here: every content/identity/profile-lookup preflight step that fires
 //! *before* binding resolution (steps 1-6) is proven through the real, full
@@ -208,16 +210,17 @@ fn base_roots(fixture: &Fixture) -> Rpcs3ProfileDiscoveryRoots {
     }
 }
 
-/// A profile-discoverable (but never `Native`-executable-bound, see the
-/// module doc comment) native RPCS3 fixture: a real `config.yml` evidence
-/// file, a fake `explicit` executable (never authorized by
-/// `resolve_rpcs3_native_launch_binding`, which is exactly what the
-/// early-preflight-step tests below rely on to reach `BindingUnavailable`
-/// only after every earlier check has already passed), and either a direct
-/// PS3 ISO or an extracted PS3 folder whose verified TITLE_ID becomes the
-/// request's expected title id/game key - computed via the same
+/// A ready native RPCS3 fixture in the managed-AppImage shape: a Native XDG
+/// profile with a real `config.yml` evidence file, launched by a caller-
+/// confirmed explicit executable supplied via `roots.explicit_executables`
+/// (classified `Explicit`, which `resolve_rpcs3_native_launch_binding` now
+/// accepts for a `Native` profile - see the module doc comment), and either
+/// a direct PS3 ISO or an extracted PS3 folder whose verified TITLE_ID
+/// becomes the request's expected title id/game key - computed via the same
 /// `inspect_catalogued_game_identity` the module itself uses, never
-/// hand-typed.
+/// hand-typed. Every early-preflight-step test below still exercises the
+/// full pipeline; those steps all pass here and binding resolution then
+/// succeeds.
 struct ReadyFixture {
     fixture: Fixture,
     roots: Rpcs3ProfileDiscoveryRoots,
@@ -234,6 +237,12 @@ fn build_ready_fixture(
     let profile_root = roots.xdg_config_home.join("rpcs3");
     fs::create_dir_all(&profile_root).unwrap();
     fs::write(profile_root.join("config.yml"), b"---\n").unwrap();
+    // Independent PS3 firmware evidence under `dev_flash/` so the happy-path
+    // tests exercise a genuinely Ready candidate. Tests that need the
+    // firmware-unmet case remove this marker (see
+    // `without_ps3_firmware_a_trusted_executable_is_still_blocked`).
+    fs::create_dir_all(profile_root.join("dev_flash/vsh/module")).unwrap();
+    fs::write(profile_root.join("dev_flash/vsh/module/vsh.self"), b"x").unwrap();
     let executable = fixture.write_executable("bin/rpcs3", b"#!/bin/sh\nexit 0\n");
     roots.explicit_executables.push(executable.clone());
     let content_path = make_content(&fixture);
@@ -360,13 +369,19 @@ fn mount_input_archive_content_is_rejected() {
 // --- content path checks, extracted folder ------------------------------------------------------
 
 #[test]
-fn extracted_folder_preflight_reaches_binding_resolution() {
+fn extracted_folder_preflight_with_a_caller_confirmed_executable_reaches_a_real_command() {
+    // The `ReadyFixture` is a Native XDG profile launched by a caller-
+    // confirmed explicit executable (the managed-AppImage shape). Every
+    // earlier preflight step passes and binding resolution now succeeds.
     let ready = build_ready_folder_fixture("folder-ready");
-    let error = preflight(&ready).unwrap_err();
+    let command = preflight(&ready).expect("a Native profile binds a caller-confirmed executable");
+    assert_eq!(command.executable, ready.request.expected_executable);
     assert_eq!(
-        error.kind,
-        Rpcs3LaunchPreflightErrorKind::BindingUnavailable
+        command.arguments,
+        vec![ready.request.selected_content_path.clone().into_os_string()]
     );
+    assert_eq!(command.selection.platform_id, "PS3");
+    assert_eq!(command.selection.verified_ps3_title_id, PS3_TITLE_ID);
 }
 
 #[test]
@@ -500,13 +515,66 @@ fn profile_root_drift_is_rejected() {
 // --- every earlier check passing reaches binding resolution, never skips it ------------------------
 
 #[test]
-fn a_fully_valid_iso_request_reaches_binding_resolution() {
+fn a_fully_valid_iso_request_with_a_caller_confirmed_executable_reaches_a_real_command() {
     let ready = build_ready_iso_fixture("reaches-binding");
-    let error = preflight(&ready).unwrap_err();
+    let command = preflight(&ready).expect("a Native profile binds a caller-confirmed executable");
+    assert_eq!(command.executable, ready.request.expected_executable);
     assert_eq!(
-        error.kind,
-        Rpcs3LaunchPreflightErrorKind::BindingUnavailable
+        command.arguments,
+        vec![ready.request.selected_content_path.clone().into_os_string()]
     );
+    assert_eq!(command.selection.platform_id, "PS3");
+    assert_eq!(command.selection.verified_ps3_title_id, PS3_TITLE_ID);
+}
+
+#[test]
+fn without_ps3_firmware_a_trusted_executable_is_still_blocked() {
+    // The caller-confirmed executable binds, but PS3 firmware is an
+    // independent requirement: removing `dev_flash/` must keep the launch
+    // blocked rather than let a trusted executable imply readiness.
+    let ready = build_ready_iso_fixture("no-firmware");
+    fs::remove_dir_all(ready.profile_root.join("dev_flash")).unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert!(
+        matches!(
+            error.kind,
+            Rpcs3LaunchPreflightErrorKind::CommandBlocked
+                | Rpcs3LaunchPreflightErrorKind::CandidateNotReady
+        ),
+        "firmware-unmet launch must stay blocked, got {:?}",
+        error.kind
+    );
+}
+
+#[test]
+fn a_forced_portable_or_flatpak_profile_never_binds_the_caller_confirmed_executable() {
+    // The widening is strictly Native-profile-only. Force the discovered
+    // profile onto each untrusted installation type and confirm the binding
+    // still refuses.
+    use crate::patch_manager::{
+        Rpcs3InstallationType, Rpcs3LaunchBlockerKind, resolve_rpcs3_native_launch_binding,
+    };
+    let ready = build_ready_iso_fixture("forced-untrusted");
+    let discovery = discover_rpcs3_profiles(&ready.roots);
+    let base = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.configuration_path == ready.profile_root)
+        .expect("fixture profile must be discovered")
+        .clone();
+    // Sanity: the untouched Native profile does bind.
+    resolve_rpcs3_native_launch_binding(&base).expect("native profile binds the confirmed exe");
+    for forced in [
+        Rpcs3InstallationType::Portable,
+        Rpcs3InstallationType::FlatpakUser,
+        Rpcs3InstallationType::Explicit,
+    ] {
+        let mut profile = base.clone();
+        profile.installation_type = forced;
+        let error = resolve_rpcs3_native_launch_binding(&profile)
+            .expect_err("only a Native profile may bind a caller-confirmed executable");
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::UnsupportedInstallation);
+    }
 }
 
 // --- final pre-spawn recheck units (step 10) --------------------------------------------------------

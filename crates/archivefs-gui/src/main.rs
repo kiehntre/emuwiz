@@ -7457,18 +7457,24 @@ impl ArchiveFsApp {
         // own preflight and execution path.
         let empty_firmware: &[archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord] = &[];
 
-        // Already-validated EmuWiz-managed PPSSPP AppImage (if any) - a
-        // caller-confirmed explicit executable fed into the *existing*
-        // discovery, computed once and reused by both the standalone-profile
-        // projection and the launch context below. Bounded, read-only, no
-        // shell; empty on any machine without a managed install, so launch
-        // readiness there is byte-for-byte unchanged. This adds no app-level
-        // state - it is derived here, exactly like every other discovery
-        // call in this function.
-        let managed_ppsspp_appimages: Vec<PathBuf> = managed_appimage_explicit_executables(
-            &discover_managed_appimage_installations(),
-            "PPSSPP",
-        );
+        // Already-validated EmuWiz-managed AppImages (if any) - caller-
+        // confirmed explicit executables fed into the *existing* per-adapter
+        // discovery. The `install.json`-backed managed slice is swept once
+        // here (bounded, read-only, no shell) and each adapter's executable
+        // is projected from it by exact catalogue display name. Empty on any
+        // machine without a managed install, so launch readiness there is
+        // byte-for-byte unchanged. This adds no app-level state - it is
+        // derived here, exactly like every other discovery call in this
+        // function.
+        let managed_appimage_installs = discover_managed_appimage_installations();
+        let managed_ppsspp_appimages: Vec<PathBuf> =
+            managed_appimage_explicit_executables(&managed_appimage_installs, "PPSSPP");
+        let managed_rpcs3_appimages: Vec<PathBuf> =
+            managed_appimage_explicit_executables(&managed_appimage_installs, "RPCS3");
+        let managed_duckstation_appimages: Vec<PathBuf> =
+            managed_appimage_explicit_executables(&managed_appimage_installs, "DuckStation");
+        let managed_xemu_appimages: Vec<PathBuf> =
+            managed_appimage_explicit_executables(&managed_appimage_installs, "xemu");
         if let Ok(roots) =
             archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
         {
@@ -7584,16 +7590,28 @@ impl ArchiveFsApp {
         let duckstation_context =
             archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
                 .ok()
-                .map(|roots| launch_readiness_page::DuckStationLaunchContext {
-                    discovery: archivefs_core::patch_manager::discover_duckstation_profiles(&roots),
-                    roots,
-                    firmware_evidence: Vec::new(),
-                    verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
-                        archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
-                            Some(serial.clone())
-                        }
-                        _ => None,
-                    }),
+                .map(|mut roots| {
+                    // Feed an already-validated EmuWiz-managed DuckStation
+                    // AppImage (if one exists) as a caller-confirmed explicit
+                    // executable; the launch context re-runs discovery at
+                    // preflight time, so its roots must carry it. Empty ->
+                    // no-op, behaviour unchanged.
+                    roots
+                        .explicit_executables
+                        .extend(managed_duckstation_appimages.iter().cloned());
+                    launch_readiness_page::DuckStationLaunchContext {
+                        discovery: archivefs_core::patch_manager::discover_duckstation_profiles(
+                            &roots,
+                        ),
+                        roots,
+                        firmware_evidence: Vec::new(),
+                        verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
+                            archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
+                                Some(serial.clone())
+                            }
+                            _ => None,
+                        }),
+                    }
                 });
         let ppsspp_context =
             archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
@@ -7620,28 +7638,46 @@ impl ArchiveFsApp {
         let rpcs3_context =
             archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots::from_environment()
                 .ok()
-                .map(|roots| launch_readiness_page::Rpcs3LaunchContext {
-                    discovery: archivefs_core::patch_manager::discover_rpcs3_profiles(&roots),
-                    roots,
-                    verified_ps3_title_id: verified_facts.iter().find_map(|fact| match fact {
-                        archivefs_core::launch::VerifiedIdentityFact::Ps3TitleId(id) => {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    }),
+                .map(|mut roots| {
+                    // Already-validated EmuWiz-managed RPCS3 AppImage (if
+                    // any) as a caller-confirmed explicit executable. Empty
+                    // -> no-op, behaviour unchanged.
+                    roots
+                        .explicit_executables
+                        .extend(managed_rpcs3_appimages.iter().cloned());
+                    launch_readiness_page::Rpcs3LaunchContext {
+                        discovery: archivefs_core::patch_manager::discover_rpcs3_profiles(&roots),
+                        roots,
+                        verified_ps3_title_id: verified_facts.iter().find_map(|fact| match fact {
+                            archivefs_core::launch::VerifiedIdentityFact::Ps3TitleId(id) => {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        }),
+                    }
                 });
         let xemu_context =
             archivefs_core::patch_manager::XemuProfileDiscoveryRoots::from_environment()
                 .ok()
-                .map(|roots| launch_readiness_page::XemuLaunchContext {
-                    discovery: archivefs_core::patch_manager::discover_xemu_profiles(&roots),
-                    roots,
-                    verified_xbox_title_id: verified_facts.iter().find_map(|fact| match fact {
-                        archivefs_core::launch::VerifiedIdentityFact::XboxTitleId(id) => {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    }),
+                .map(|mut roots| {
+                    // Already-validated EmuWiz-managed xemu AppImage (if any)
+                    // as a caller-confirmed explicit executable. The Xbox
+                    // BIOS/MCPX/EEPROM/HDD readiness stays independent - it
+                    // is validated by the xemu command planner at preflight,
+                    // not here. Empty -> no-op, behaviour unchanged.
+                    roots
+                        .explicit_executables
+                        .extend(managed_xemu_appimages.iter().cloned());
+                    launch_readiness_page::XemuLaunchContext {
+                        discovery: archivefs_core::patch_manager::discover_xemu_profiles(&roots),
+                        roots,
+                        verified_xbox_title_id: verified_facts.iter().find_map(|fact| match fact {
+                            archivefs_core::launch::VerifiedIdentityFact::XboxTitleId(id) => {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        }),
+                    }
                 });
         let xenia_context = if let XeniaProfilesState::Ready(discovery) = &self.xenia_profiles {
             let roots = archivefs_core::patch_manager::XeniaProfileDiscoveryRoots {

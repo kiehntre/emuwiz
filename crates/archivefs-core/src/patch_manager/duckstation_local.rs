@@ -1622,10 +1622,26 @@ fn portable_marker_conflict(executable: &Path) -> Option<DuckStationLaunchBlocke
 fn resolve_native_duckstation_executable(
     profile: &DuckStationProfile,
 ) -> Result<PathBuf, DuckStationLaunchBlocker> {
+    // `resolve_default_native_binding` only ever routes a `Native` profile
+    // here (the top-level match in `resolve_duckstation_native_launch_binding`
+    // rejects `FlatpakUser` / `Portable` / `Explicit` *profiles*). Such a
+    // profile - DuckStation's own `Core::SetDataRoot()` default user
+    // directory, already proven present with `settings.ini` above - may bind
+    // either a PATH/name-matched `duckstation-qt` or an exact path the host
+    // integration already confirmed through its own provenance (an
+    // EmuWiz-managed AppImage supplied via
+    // `DuckStationProfileDiscoveryRoots::explicit_executables`, classified
+    // `DuckStationInstallationType::Explicit`). Both pass
+    // `validate_native_duckstation_executable` and the
+    // `portable_marker_conflict` gate in `resolve_default_native_binding`. A
+    // guessed `*.AppImage` (classified `Portable`) is never accepted.
     let matching: Vec<&DuckStationExecutable> = profile
         .executable_candidates
         .iter()
-        .filter(|candidate| candidate.installation_type == profile.installation_type)
+        .filter(|candidate| {
+            candidate.installation_type == DuckStationInstallationType::Native
+                || candidate.installation_type == DuckStationInstallationType::Explicit
+        })
         .collect();
     if matching.is_empty() {
         return Err(launch_blocker(
@@ -2123,6 +2139,86 @@ mod tests {
         assert_eq!(
             binding.user_directory_mode,
             DuckStationUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- 1b: a Native profile binds a caller-confirmed Explicit executable ---------------------
+
+    #[test]
+    fn native_profile_binds_a_caller_confirmed_explicit_executable() {
+        // The managed-AppImage seam: a path fed via
+        // `roots.explicit_executables` is classified `Explicit`, and a
+        // profile at DuckStation's own default user directory accepts it -
+        // held to the identical file-safety and single-candidate rules.
+        let root = binding_fixture_root("explicit-exe");
+        let roots = binding_roots(&root);
+        let appimage = root.join("emulators/duckstation/DuckStation.AppImage");
+        make_native_executable(&appimage);
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                appimage.clone(),
+                DuckStationInstallationType::Explicit,
+            )],
+        );
+        let binding = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, appimage);
+        assert_eq!(
+            binding.user_directory_mode,
+            DuckStationUserDirectoryMode::DefaultNative
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_forced_untrusted_profile_never_binds_the_caller_confirmed_executable() {
+        let root = binding_fixture_root("explicit-exe-forced");
+        let roots = binding_roots(&root);
+        let appimage = root.join("emulators/duckstation/DuckStation.AppImage");
+        make_native_executable(&appimage);
+        for forced in [
+            DuckStationInstallationType::Portable,
+            DuckStationInstallationType::FlatpakUser,
+            DuckStationInstallationType::Explicit,
+        ] {
+            let mut profile = native_duckstation_profile(
+                &roots,
+                vec![duckstation_executable(
+                    appimage.clone(),
+                    DuckStationInstallationType::Explicit,
+                )],
+            );
+            profile.installation_type = forced;
+            let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+            assert_eq!(
+                blocker.kind,
+                DuckStationLaunchBlockerKind::UnsupportedInstallationType
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_settings_ini_beside_the_caller_confirmed_executable_still_forces_portable_conflict() {
+        // The `portable_marker_conflict` gate is unchanged and still runs on
+        // the resolved executable path even when it is an Explicit AppImage.
+        let root = binding_fixture_root("explicit-exe-portable-marker");
+        let roots = binding_roots(&root);
+        let appimage = root.join("emulators/duckstation/DuckStation.AppImage");
+        make_native_executable(&appimage);
+        fs::write(appimage.parent().unwrap().join("settings.ini"), "[Main]\n").unwrap();
+        let profile = native_duckstation_profile(
+            &roots,
+            vec![duckstation_executable(
+                appimage,
+                DuckStationInstallationType::Explicit,
+            )],
+        );
+        let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            DuckStationLaunchBlockerKind::PortableMarkerConflict
         );
         fs::remove_dir_all(root).unwrap();
     }

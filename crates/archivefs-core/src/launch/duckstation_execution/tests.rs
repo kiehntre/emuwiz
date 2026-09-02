@@ -374,13 +374,16 @@ fn fresh_identity_revalidates_a_real_ps1_chd() {
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
     };
     // Identity itself must succeed for the CHD, exactly as it does for the
-    // equivalent ISO above - reaching the later BindingUnavailable failure
-    // (not IdentityUnresolved/Ps1SerialUnavailable) proves fresh CHD
-    // identity revalidation, not just that the file was readable.
+    // equivalent ISO above. The caller-confirmed Explicit executable now
+    // binds against this Native XDG profile, so the terminal failure is the
+    // independent BIOS gate (`CandidateNotReady`), not IdentityUnresolved /
+    // Ps1SerialUnavailable / BindingUnavailable - which still proves fresh
+    // CHD identity revalidation, and additionally proves a trusted
+    // executable does not imply readiness while BIOS is unverified.
     let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
     assert_eq!(
         error.kind,
-        DuckStationLaunchPreflightErrorKind::BindingUnavailable
+        DuckStationLaunchPreflightErrorKind::CandidateNotReady
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -447,10 +450,14 @@ fn fresh_identity_revalidates_a_real_ps1_disc() {
         expected_executable: executable,
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
     };
+    // The caller-confirmed Explicit executable binds against this Native XDG
+    // profile; the terminal failure is now the independent, unverified-BIOS
+    // readiness gate, not BindingUnavailable. Fresh identity revalidation
+    // still had to succeed to get this far.
     let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
     assert_eq!(
         error.kind,
-        DuckStationLaunchPreflightErrorKind::BindingUnavailable
+        DuckStationLaunchPreflightErrorKind::CandidateNotReady
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -500,10 +507,14 @@ fn preflight_revalidates_a_real_ps1_cue_bin_disc() {
         expected_executable: executable,
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
     };
+    // The caller-confirmed Explicit executable binds against this Native XDG
+    // profile; the terminal failure is now the independent, unverified-BIOS
+    // readiness gate, not BindingUnavailable. Fresh identity revalidation
+    // still had to succeed to get this far.
     let error = preflight_duckstation_launch(&request, &roots, &[]).unwrap_err();
     assert_eq!(
         error.kind,
-        DuckStationLaunchPreflightErrorKind::BindingUnavailable
+        DuckStationLaunchPreflightErrorKind::CandidateNotReady
     );
     std::fs::remove_dir_all(root).unwrap();
 }
