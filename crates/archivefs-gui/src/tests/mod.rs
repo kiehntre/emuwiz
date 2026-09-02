@@ -240,6 +240,7 @@ mod cheats_mods_workflows;
 mod database_and_catalogue;
 mod doctor_and_repair;
 mod emulator_profiles_and_setup;
+mod gamehacking_browser_import;
 mod health_and_platform_actions;
 mod library_views_and_sources;
 mod mounts_and_history;
@@ -570,6 +571,8 @@ fn app_with_cheats_mods_context() -> ArchiveFsApp {
         gamecube_gamehacking_cancellation: None,
         gamecube_gamehacking_generation: 0,
         gamecube_gamehacking_blocked: false,
+        browser_import: None,
+        browser_import_open_error: None,
         bsfree_gamecube: CheatStepResource::NotLoaded,
         bsfree_gamecube_cancellation: None,
         bsfree_gamecube_generation: 0,

@@ -390,6 +390,8 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         gamecube_gamehacking_cancellation: None,
         gamecube_gamehacking_generation: 0,
         gamecube_gamehacking_blocked: false,
+        browser_import: None,
+        browser_import_open_error: None,
         bsfree_gamecube: CheatStepResource::NotLoaded,
         bsfree_gamecube_cancellation: None,
         bsfree_gamecube_generation: 0,
