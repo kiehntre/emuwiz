@@ -707,6 +707,9 @@ fn discover_direct_file(
     if extension == "dc42" {
         return discover_dc42_image(path, source_root);
     }
+    if extension == "fds" {
+        return discover_fds_media(path, source_root);
+    }
     if matches!(extension.as_str(), "trd" | "scl") {
         return discover_trdos_media(path, source_root);
     }
@@ -994,6 +997,51 @@ fn discover_dc42_image(path: &Path, source_root: &Path) -> GameDiscovery {
                     .unwrap_or_else(|| "not a valid DC42 image".to_string()),
             ),
             "This file is named like a Macintosh Disk Copy 4.2 image but its bounded structure did not validate.".to_string(),
+        ),
+    }
+}
+
+/// A raw FDS image is accepted only after the shared disk-format layer has
+/// validated its side framing and ordered blocks. The `.fds` extension and an
+/// NES folder alone are not sufficient evidence.
+fn discover_fds_media(path: &Path, source_root: &Path) -> GameDiscovery {
+    use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
+    let evidence = inspect_disk_format(
+        path,
+        &crate::safe_read::TrustedRoots::none(),
+        DiskFormatContext::default(),
+        None,
+    );
+    match evidence.format {
+        Some(DiskFormat::FamicomDiskSystem) => {
+            let mut identity = identity_for(path, source_root);
+            if let Some(summary) = identity.as_mut() {
+                summary.platform = Some("NES".to_string());
+            }
+            accepted(
+                path.to_path_buf(),
+                ContainerKind::DirectFile,
+                ContentKind::ComputerDisk,
+                identity,
+                format!(
+                    "Valid Famicom Disk System image ({}). Exact game identity still requires a +                     DAT/hash match; the disk metadata is not used as a title.",
+                    evidence.evidence.first().cloned().unwrap_or_default()
+                ),
+            )
+        }
+        _ => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::ComputerDisk),
+            SkipReason::InvalidContent(
+                evidence
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.detail())
+                    .unwrap_or_else(|| "not a valid raw FDS image".to_string()),
+            ),
+            "This .fds file did not pass the bounded Famicom Disk System structure checks."
+                .to_string(),
         ),
     }
 }

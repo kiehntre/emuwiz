@@ -55,6 +55,7 @@ pub mod d88;
 pub mod dc42;
 pub mod dfs;
 pub mod dsk;
+pub mod fds;
 pub mod hdi;
 pub mod scl;
 pub mod trd;
@@ -89,6 +90,15 @@ pub const MAX_RAW_FLOPPY_BYTES: u64 = 4 * 1024 * 1024;
 /// The largest file this module will treat as a Pasti image. Flux-level
 /// preservation dumps are larger than the disk they describe.
 pub const MAX_PASTI_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The fixed size of one side in the common raw FDS representation.
+pub const FDS_SIDE_BYTES: u64 = 65_500;
+
+/// The largest raw FDS image this bounded evidence layer will inspect.
+pub const MAX_FDS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A raw FDS side cannot contain more file pairs than fit before its padding.
+pub const MAX_FDS_FILES_PER_SIDE: u8 = 64;
 
 /// Sector size this module accepts for a raw floppy. Atari ST TOS floppies are
 /// always 512-byte sectors; accepting others would weaken the check for no real
@@ -156,6 +166,8 @@ pub enum DiskFormat {
     AtariStRawFloppy,
     /// The Pasti (`.stx`) preservation container.
     AtariStPasti,
+    /// A structurally valid raw Famicom Disk System side image.
+    FamicomDiskSystem,
     /// A CPCEMU `.dsk` container (standard or extended), recognised from its
     /// `MV - CPC`/`EXTENDED CPC DSK` disk-information block and a track table
     /// that is internally consistent with the file's length. This container
@@ -206,6 +218,7 @@ impl DiskFormat {
             Self::Commodore1541D64 => "Commodore 1541 D64 disk image",
             Self::AtariStRawFloppy => "Atari ST raw floppy image",
             Self::AtariStPasti => "Atari ST Pasti (STX) image",
+            Self::FamicomDiskSystem => "Famicom Disk System image",
             Self::CpcEmuDsk => "CPCEMU DSK disk image",
             Self::SpectrumPlus3Disk => "ZX Spectrum +3 (+3DOS) disk image",
             Self::SpectrumTrDosDisk => "ZX Spectrum TR-DOS disk image",
@@ -226,6 +239,7 @@ impl DiskFormat {
         match self {
             Self::Commodore1541D64 => "Commodore disk media",
             Self::AtariStRawFloppy | Self::AtariStPasti => "AtariST",
+            Self::FamicomDiskSystem => "NES",
             // The bare CPCEMU container narrows towards Amstrad CPC (its
             // authoring system and dominant use) without settling it - see
             // `proves_platform`, which is `false` here.
@@ -257,6 +271,7 @@ impl DiskFormat {
         match self {
             Self::Commodore1541D64 | Self::AtariStRawFloppy | Self::CpcEmuDsk => false,
             Self::AtariStPasti
+            | Self::FamicomDiskSystem
             | Self::SpectrumPlus3Disk
             | Self::SpectrumTrDosDisk
             | Self::SpectrumSclArchive
@@ -591,6 +606,7 @@ pub enum DiskFormatMetadata {
     D64(D64Layout),
     Floppy(FloppyGeometry),
     Pasti(PastiLayout),
+    Fds(FdsLayout),
     Dsk(DskLayout),
     TrDos(TrDosDescriptor),
     Scl(SclLayout),
@@ -601,6 +617,16 @@ pub enum DiskFormatMetadata {
     Crt(CrtLayout),
     X68000(X68000Layout),
     Dc42(Dc42Layout),
+}
+
+/// Structural facts from a raw FDS image. The file and disk names are not
+/// retained as identity: they are descriptive media fields, not trustworthy
+/// release identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FdsLayout {
+    pub header_bytes: u8,
+    pub sides: u8,
+    pub files_per_side: u8,
 }
 
 /// The shared result. One shape, whatever the format, so a caller does not need
@@ -703,6 +729,7 @@ pub fn inspect_disk_format(
         "d64" => Adapter::Commodore1541D64,
         "st" => Adapter::AtariStRawFloppy,
         "stx" => Adapter::AtariStPasti,
+        "fds" => Adapter::FamicomDiskSystem,
         "dsk" => Adapter::CpcEmuDsk,
         "trd" => Adapter::SpectrumTrDos,
         "scl" => Adapter::SpectrumScl,
@@ -739,6 +766,7 @@ pub fn inspect_disk_format(
         Adapter::Commodore1541D64 => d64::inspect(&mut reader, context, cancel),
         Adapter::AtariStRawFloppy => atari_st::inspect(&mut reader, context, cancel),
         Adapter::AtariStPasti => atari_stx::inspect(&mut reader, context, cancel),
+        Adapter::FamicomDiskSystem => fds::inspect(&mut reader, context, cancel),
         Adapter::CpcEmuDsk => dsk::inspect(&mut reader, context, cancel),
         Adapter::SpectrumTrDos => trd::inspect(&mut reader, context, cancel),
         Adapter::SpectrumScl => scl::inspect(&mut reader, context, cancel),
@@ -767,6 +795,7 @@ enum Adapter {
     Commodore1541D64,
     AtariStRawFloppy,
     AtariStPasti,
+    FamicomDiskSystem,
     CpcEmuDsk,
     SpectrumTrDos,
     SpectrumScl,
@@ -893,7 +922,17 @@ impl<'a> BoundedReader<'a> {
         self.read_exact_at_with_offset_limit(offset, length, MAX_DC42_BYTES)
     }
 
-    fn read_exact_at_with_offset_limit(
+    /// FDS sides are larger than the ordinary structural offset window, but
+    /// the format remains bounded by its fixed side geometry and file limit.
+    pub(crate) fn read_exact_at_fds(
+        &mut self,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, DiskFormatRefusal> {
+        self.read_exact_at_with_offset_limit(offset, length, MAX_FDS_BYTES)
+    }
+
+    pub(crate) fn read_exact_at_with_offset_limit(
         &mut self,
         offset: u64,
         length: usize,

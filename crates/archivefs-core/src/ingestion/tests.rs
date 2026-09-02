@@ -977,7 +977,19 @@ fn every_registered_content_extension_is_discovered_end_to_end() {
 #[test]
 fn fds_is_discovered_as_nes_computer_disk_media() {
     let root = source_dir("fds-discovery");
-    std::fs::write(root.path().join("game.fds"), b"raw FDS fixture").unwrap();
+    let mut image = vec![0_u8; 65_500];
+    image[0] = 0x01;
+    image[1..15].copy_from_slice(b"*NINTENDO-HVC*");
+    image[0x13] = b' ';
+    image[56] = 0x02;
+    image[57] = 1;
+    image[58] = 0x03;
+    image[60] = 1;
+    image[61..69].copy_from_slice(b"TEST    ");
+    image[71..73].copy_from_slice(&4_u16.to_le_bytes());
+    image[75] = 0x04;
+    image[76..80].copy_from_slice(b"FDS!");
+    std::fs::write(root.path().join("game.fds"), image).unwrap();
     let report = discover_source(root.path()).unwrap();
     assert_eq!(report.items.len(), 1);
     let item = &report.items[0];

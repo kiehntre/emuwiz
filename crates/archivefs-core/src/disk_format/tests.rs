@@ -226,6 +226,96 @@ fn valid_dfs_dsd() -> Vec<u8> {
     image
 }
 
+fn valid_fds(with_header: bool) -> Vec<u8> {
+    let mut side = vec![0_u8; FDS_SIDE_BYTES as usize];
+    side[0] = 0x01;
+    side[1..15].copy_from_slice(b"*NINTENDO-HVC*");
+    side[0x10..0x14].copy_from_slice(b"TST ");
+    side[0x13] = b' ';
+    side[0x15] = 0;
+    side[0x16] = 0;
+    side[0x17] = 0;
+    side[0x19] = 0;
+    side[0x35] = 0;
+    side[0x36] = 0;
+    side[56] = 0x02;
+    side[57] = 1;
+    side[58] = 0x03;
+    side[59] = 0;
+    side[60] = 1;
+    side[61..69].copy_from_slice(b"TEST    ");
+    side[69..71].copy_from_slice(&0x8000_u16.to_le_bytes());
+    side[71..73].copy_from_slice(&4_u16.to_le_bytes());
+    side[73] = 0;
+    side[75] = 0x04;
+    side[76..80].copy_from_slice(b"FDS!");
+
+    if with_header {
+        let mut image = vec![0_u8; 16];
+        image[..4].copy_from_slice(b"FDS\x1a");
+        image[4] = 1;
+        image.extend_from_slice(&side);
+        image
+    } else {
+        side
+    }
+}
+
+#[test]
+fn raw_fds_structure_is_validated_without_claiming_game_identity() {
+    let fixture = Fixture::new("fds-valid");
+    for (name, bytes) in [
+        ("headered.fds", valid_fds(true)),
+        ("raw.fds", valid_fds(false)),
+    ] {
+        let evidence = fixture.inspect(&fixture.write(&format!("library/{name}"), &bytes));
+        assert_eq!(evidence.format, Some(DiskFormat::FamicomDiskSystem));
+        assert_eq!(evidence.platform, Some("NES"));
+        assert!(evidence.conclusive);
+        assert!(
+            evidence
+                .evidence
+                .iter()
+                .any(|line| line.contains("not a particular game"))
+        );
+        assert!(matches!(
+            evidence.metadata,
+            Some(DiskFormatMetadata::Fds(_))
+        ));
+    }
+}
+
+#[test]
+fn malformed_raw_fds_is_refused_fail_closed() {
+    let fixture = Fixture::new("fds-invalid");
+    let valid = valid_fds(false);
+    let cases = [
+        ("random.fds", vec![0x5a; FDS_SIDE_BYTES as usize]),
+        ("truncated.fds", valid[..75].to_vec()),
+        ("bad-order.fds", {
+            let mut bytes = valid.clone();
+            bytes[56] = 0x03;
+            bytes
+        }),
+        ("bad-length.fds", {
+            let mut bytes = valid.clone();
+            bytes[71..73].copy_from_slice(&u16::MAX.to_le_bytes());
+            bytes
+        }),
+        ("bad-metadata.fds", {
+            let mut bytes = valid.clone();
+            bytes[61] = 0x01;
+            bytes
+        }),
+        ("wrong-extension.bin", valid),
+    ];
+    for (name, bytes) in cases {
+        let path = fixture.write(&format!("library/{name}"), &bytes);
+        let evidence = fixture.inspect(&path);
+        assert!(evidence.format.is_none(), "{name} was accepted");
+    }
+}
+
 #[test]
 fn standard_dfs_ssd_catalogue_is_valid_and_exposes_title_and_entry_metadata() {
     let fixture = Fixture::new("dfs-ssd");
