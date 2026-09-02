@@ -243,6 +243,18 @@ pub(crate) fn has_envelope(transaction: &RenameTransaction) -> bool {
     transaction.unknown.contains_key(ENVELOPE_KEY)
 }
 
+/// Reads the durable exact-resume checkpoint without requiring a current plan.
+///
+/// History cleanup uses this to distinguish a legacy journal (no envelope), an
+/// explicitly refused exact-resume record, and a record whose approved
+/// envelope may still become usable after a current plan is loaded. A malformed
+/// checkpoint remains an error so callers can fail closed.
+pub fn exact_resume_state(
+    transaction: &RenameTransaction,
+) -> Result<Option<ExactResumeState>, ExactResumeRefusal> {
+    read_state(transaction)
+}
+
 fn read_envelope(
     transaction: &RenameTransaction,
 ) -> Result<Option<ExactResumeEnvelope>, ExactResumeRefusal> {

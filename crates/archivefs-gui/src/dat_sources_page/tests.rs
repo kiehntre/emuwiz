@@ -4687,6 +4687,7 @@ fn fixture_recovery_transaction(
         resolution: None,
         exact_resume: ExactResumeStatusView::NeedsCurrentPlan,
         resume_action_available: false,
+        cleanup: RecoveryCleanupClassification::Actionable,
     }
 }
 
@@ -4736,6 +4737,9 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
         ],
         journal_dir: "/journal".to_string(),
         recovery_resolution_error: None,
+        recovery_archive_error: None,
+        recovery_archive_confirm: None,
+        recovery_archive_outcome: None,
     };
     let plan = RenamePlanView {
         generation: 1,

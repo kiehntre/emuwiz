@@ -64,9 +64,11 @@ use archivefs_core::dat::policy::{
 };
 use archivefs_core::dat::rename_apply::{
     ApplyError, ApplyExecution, ApplyOutcome, EntryState, ExactResumeExecution,
-    ExactResumeInspection, ExactResumeOutcome, HardConflictMode, RollbackOutcome, RollbackResult,
-    TransactionEntry, TransactionState, apply_transaction, inspect_exact_resume,
-    resume_exact_transaction, rollback_transaction,
+    ExactResumeInspection, ExactResumeOutcome, HardConflictMode, RecoveryCleanupClassification,
+    RecoveryHistoryState, RollbackOutcome, RollbackResult, TransactionEntry, TransactionState,
+    apply_transaction, archive_recovery_transactions, classify_recovery_cleanup,
+    inspect_exact_resume, load_recovery_history_state, resume_exact_transaction,
+    rollback_transaction,
 };
 use archivefs_core::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
@@ -839,6 +841,9 @@ pub(crate) struct RenameApplyView {
     /// The error from the last failed attempt to persist a "Leave
     /// untouched" resolution, if any.
     pub(crate) recovery_resolution_error: Option<String>,
+    pub(crate) recovery_archive_error: Option<String>,
+    pub(crate) recovery_archive_confirm: Option<Vec<String>>,
+    pub(crate) recovery_archive_outcome: Option<ArchiveRecoveryOutcome>,
 }
 
 /// The review a user must confirm before any rename.
@@ -956,6 +961,7 @@ pub(crate) struct RecoveryTransactionView {
     pub(crate) resolution: Option<archivefs_core::dat::rename_apply::RecoveryResolution>,
     pub(crate) exact_resume: ExactResumeStatusView,
     pub(crate) resume_action_available: bool,
+    pub(crate) cleanup: RecoveryCleanupClassification,
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,6 +1699,15 @@ pub(crate) enum DatSourcesPageAction {
         id: String,
         choice: RecoveryChoice,
     },
+    /// Archive one core-proven stale recovery record. This only updates the
+    /// durable visibility sidecar, never the transaction journal or files.
+    ArchiveStaleRecovery {
+        id: String,
+    },
+    /// Open the explicit confirmation for the frozen stale-record set.
+    OpenArchiveAllStaleRecovery,
+    ConfirmArchiveAllStaleRecovery,
+    CancelArchiveAllStaleRecovery,
     /// Forget the apply outcome display.
     ClearApplyOutcome,
     /// Quick Rename's "Rename another library" / "Rename N another
@@ -1718,6 +1733,12 @@ pub(crate) enum DatSourcesPageAction {
 pub(crate) enum RecoveryChoice {
     RollBack,
     LeaveUntouched,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ArchiveRecoveryOutcome {
+    pub(crate) archived: usize,
+    pub(crate) rejected: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2502,6 +2523,12 @@ pub(crate) struct DatSourcesPageState {
     /// (`refresh_recovery` reloads from disk on every poll and would
     /// otherwise re-surface it next frame).
     dismissed_recovery_ids: std::collections::BTreeSet<String>,
+    /// Durable visibility-only archive state shared with Repair History. It
+    /// never rewrites transaction journals or touches game files.
+    recovery_archive_state: RecoveryHistoryState,
+    recovery_archive_error: Option<String>,
+    recovery_archive_confirm: Option<Vec<String>>,
+    recovery_archive_outcome: Option<ArchiveRecoveryOutcome>,
     /// History & Logs records produced by apply/rollback outcomes, drained by
     /// the shell. No private paths are included.
     history_records: Vec<RenameHistoryRecord>,
@@ -2613,7 +2640,18 @@ impl DatSourcesPageState {
         // already-running page, so a transaction rediscovered after a
         // restart can never disagree with one the page had open the whole
         // time - see `load_reconciled_recovery_transactions`.
-        let recovery_transactions = Self::load_reconciled_recovery_transactions(&transaction_dir);
+        let mut recovery_transactions =
+            Self::load_reconciled_recovery_transactions(&transaction_dir);
+        let (recovery_archive_state, recovery_archive_error) =
+            match load_recovery_history_state(&transaction_dir) {
+                Ok(state) => (state, None),
+                Err(error) => (RecoveryHistoryState::default(), Some(error)),
+            };
+        recovery_transactions.retain(|transaction| {
+            !recovery_archive_state
+                .archived_transaction_ids
+                .contains(&transaction.transaction_id)
+        });
         Self {
             config_path,
             managed_config_path,
@@ -2674,6 +2712,10 @@ impl DatSourcesPageState {
             recovery_transactions,
             recovery_resolution_error: None,
             dismissed_recovery_ids: std::collections::BTreeSet::new(),
+            recovery_archive_state,
+            recovery_archive_error,
+            recovery_archive_confirm: None,
+            recovery_archive_outcome: None,
             history_records: Vec::new(),
         }
     }
@@ -2852,6 +2894,18 @@ impl DatSourcesPageState {
     /// reflect what actually happened. A settled `Applied` transaction is
     /// listed as-is, eligible for rollback.
     fn refresh_recovery(&mut self) {
+        match load_recovery_history_state(&self.transaction_dir) {
+            Ok(state) => {
+                self.recovery_archive_state = state;
+                self.recovery_archive_error = None;
+            }
+            Err(error) => {
+                // A damaged sidecar must never cause a journal to disappear
+                // or make an archive action available.
+                self.recovery_archive_state = RecoveryHistoryState::default();
+                self.recovery_archive_error = Some(error);
+            }
+        }
         let mut recovery = Self::load_reconciled_recovery_transactions(&self.transaction_dir);
         // The transaction applied this session is already shown by the apply
         // outcome card; do not list it a second time in the recovery list.
@@ -2869,7 +2923,48 @@ impl DatSourcesPageState {
                 .dismissed_recovery_ids
                 .contains(&transaction.transaction_id)
         });
+        recovery.retain(|transaction| {
+            !self
+                .recovery_archive_state
+                .archived_transaction_ids
+                .contains(&transaction.transaction_id)
+        });
         self.recovery_transactions = recovery;
+    }
+
+    fn stale_recovery_ids(&self) -> Vec<String> {
+        if self.recovery_archive_error.is_some() {
+            return Vec::new();
+        }
+        self.recovery_transactions
+            .iter()
+            .filter(|transaction| classify_recovery_cleanup(transaction).is_stale())
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect()
+    }
+
+    fn archive_stale_recovery(&mut self, ids: &[String]) {
+        if self.recovery_archive_error.is_some() {
+            return;
+        }
+        let before = self.recovery_archive_state.archived_transaction_ids.len();
+        match archive_recovery_transactions(&self.transaction_dir, ids) {
+            Ok((archive_state, rejected)) => {
+                let archived = archive_state
+                    .archived_transaction_ids
+                    .len()
+                    .saturating_sub(before);
+                self.recovery_archive_state = archive_state;
+                self.recovery_archive_outcome = Some(ArchiveRecoveryOutcome { archived, rejected });
+                self.refresh_recovery();
+            }
+            Err(error) => {
+                self.recovery_archive_outcome = Some(ArchiveRecoveryOutcome {
+                    archived: 0,
+                    rejected: vec![error],
+                });
+            }
+        }
     }
 
     /// Every still-actionable transaction in `transaction_dir`, reconciled
@@ -3426,6 +3521,23 @@ impl DatSourcesPageState {
             DatSourcesPageAction::ResumeTransaction { id } => self.start_exact_resume(id),
             DatSourcesPageAction::RecoveryChoice { id, choice } => {
                 self.handle_recovery_choice(id, choice)
+            }
+            DatSourcesPageAction::ArchiveStaleRecovery { id } => {
+                self.archive_stale_recovery(std::slice::from_ref(&id));
+            }
+            DatSourcesPageAction::OpenArchiveAllStaleRecovery => {
+                let ids = self.stale_recovery_ids();
+                if !ids.is_empty() {
+                    self.recovery_archive_confirm = Some(ids);
+                }
+            }
+            DatSourcesPageAction::ConfirmArchiveAllStaleRecovery => {
+                if let Some(ids) = self.recovery_archive_confirm.take() {
+                    self.archive_stale_recovery(&ids);
+                }
+            }
+            DatSourcesPageAction::CancelArchiveAllStaleRecovery => {
+                self.recovery_archive_confirm = None;
             }
             DatSourcesPageAction::ClearApplyOutcome => {
                 self.apply_outcome = None;
@@ -5303,6 +5415,7 @@ impl DatSourcesPageState {
                     resolution: transaction.recovery_resolution,
                     resume_action_available: exact_resume == ExactResumeStatusView::Available,
                     exact_resume,
+                    cleanup: classify_recovery_cleanup(transaction),
                 }
             })
             .collect();
@@ -5345,6 +5458,9 @@ impl DatSourcesPageState {
             recovery,
             journal_dir: self.transaction_dir.to_string_lossy().into_owned(),
             recovery_resolution_error: self.recovery_resolution_error.clone(),
+            recovery_archive_error: self.recovery_archive_error.clone(),
+            recovery_archive_confirm: self.recovery_archive_confirm.clone(),
+            recovery_archive_outcome: self.recovery_archive_outcome.clone(),
         }
     }
 
@@ -6224,6 +6340,8 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) plan_page: usize,
     /// The typed confirmation phrase for a large apply batch.
     pub(crate) plan_typed_confirmation: String,
+    /// Whether the advanced recovery surface is narrowed to stale records.
+    pub(crate) recovery_stale_review_open: bool,
 }
 
 impl DatSourcesPageUi {
@@ -6251,6 +6369,7 @@ impl DatSourcesPageUi {
         self.plan_review_open = None;
         self.plan_page = 0;
         self.plan_typed_confirmation.clear();
+        self.recovery_stale_review_open = false;
     }
 }
 
@@ -9923,7 +10042,39 @@ fn show_recovery_transactions(
                     ));
                 },
             );
-            if let Some(resolution) = recovery.resolution {
+            if let RecoveryCleanupClassification::Stale(reason) = recovery.cleanup {
+                ui.label(
+                    egui::RichText::new(
+                        "This recovery record no longer matches the files on disk. Nothing will be changed.",
+                    )
+                    .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Reason: {}", reason.label()))
+                        .small()
+                        .color(theme::muted(ui)),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Archive this record",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::ArchiveStaleRecovery {
+                            id: recovery.transaction_id.clone(),
+                        });
+                    }
+                    let _ = widgets::action_button(
+                        ui,
+                        "Keep in history",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    );
+                });
+            } else if let Some(resolution) = recovery.resolution {
                 // Already resolved: `state` still truthfully says
                 // "interrupted" (never rewritten - see
                 // `RecoveryResolution`'s own doc), so this must never be
@@ -10028,6 +10179,64 @@ fn show_recovery_transactions(
     action
 }
 
+/// Explicit confirmation for the Recovery surface's bulk archive action. The
+/// ids are frozen by the page state before this dialog is drawn and are
+/// rechecked by the core before the visibility sidecar is written.
+fn show_recovery_archive_confirmation(
+    ui: &mut egui::Ui,
+    ids: &[String],
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    let mut open = true;
+    let mut cancel = false;
+    let mut confirm = false;
+    egui::Window::new("Archive stale recovery records?")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} old recovery record{} can no longer be resumed or rolled back.",
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
+                ))
+                .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Archive hides these records from the active recovery surface only. It does \
+                     not change game files, transaction contents, or execution state.",
+                )
+                .color(theme::muted(ui)),
+            );
+            ui.add_space(6.0);
+            for id in ids {
+                ui.label(egui::RichText::new(id).monospace().small());
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Keep in history").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add(egui::Button::new("Archive all stale records").fill(theme::DANGER))
+                    .clicked()
+                {
+                    confirm = true;
+                }
+            });
+        });
+    if cancel || !open {
+        action = Some(DatSourcesPageAction::CancelArchiveAllStaleRecovery);
+    } else if confirm {
+        action = Some(DatSourcesPageAction::ConfirmArchiveAllStaleRecovery);
+    }
+    action
+}
+
 /// The gated apply and crash-recovery section.
 ///
 /// This is the only place the advanced planner offers a rename: an
@@ -10044,6 +10253,12 @@ fn show_rename_apply_section(
     ui_state: &mut DatSourcesPageUi,
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
+
+    if let Some(ids) = &apply.recovery_archive_confirm
+        && let Some(archive_action) = show_recovery_archive_confirmation(ui, ids)
+    {
+        action = Some(archive_action);
+    }
 
     if let Some(result) = &apply.resume_result {
         ui.add_space(8.0);
@@ -10071,9 +10286,119 @@ fn show_rename_apply_section(
     if !apply.recovery.is_empty() {
         ui.add_space(10.0);
         widgets::section_header(ui, "Rename transactions", None);
+        let stale_count = apply
+            .recovery
+            .iter()
+            .filter(|transaction| transaction.cleanup.is_stale())
+            .count();
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Needs attention").strong());
+            ui.label(format!(
+                "resumable: {}",
+                apply
+                    .recovery
+                    .iter()
+                    .filter(|transaction| {
+                        transaction.resume_action_available
+                            || matches!(transaction.exact_resume, ExactResumeStatusView::Available)
+                    })
+                    .count()
+            ));
+            ui.label(format!(
+                "rollbackable: {}",
+                apply
+                    .recovery
+                    .iter()
+                    .filter(|transaction| !transaction.cleanup.is_stale())
+                    .count()
+            ));
+            ui.label(format!("stale/non-actionable: {stale_count}"));
+            if stale_count > 0 {
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Review stale records",
+                        widgets::ActionStyle::Secondary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        ui_state.recovery_stale_review_open = true;
+                    }
+                    if widgets::action_button(
+                        ui,
+                        "Archive all stale records",
+                        widgets::ActionStyle::Primary,
+                        apply.recovery_archive_error.is_none(),
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::OpenArchiveAllStaleRecovery);
+                    }
+                });
+            }
+            if let Some(error) = &apply.recovery_archive_error {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Archive state is unavailable; records stay visible: {error}"
+                    ))
+                    .small()
+                    .color(theme::muted(ui)),
+                );
+            }
+        });
+        if let Some(outcome) = &apply.recovery_archive_outcome {
+            if outcome.rejected.is_empty() {
+                widgets::banner(
+                    ui,
+                    "Stale records archived",
+                    &format!(
+                        "{} record{} hidden from the active recovery view. Nothing on disk was changed.",
+                        outcome.archived,
+                        if outcome.archived == 1 {
+                            " was"
+                        } else {
+                            "s were"
+                        }
+                    ),
+                    widgets::StatusTone::Success,
+                );
+            } else {
+                widgets::failure_summary(
+                    ui,
+                    "rename_archive_recovery_result",
+                    "Some stale records stayed visible",
+                    Some("Records that became actionable or uncertain were not archived."),
+                    &outcome.rejected.join("\n"),
+                );
+            }
+        }
+        let recovery_to_show: Vec<RecoveryTransactionView> = if ui_state.recovery_stale_review_open
+        {
+            apply
+                .recovery
+                .iter()
+                .filter(|transaction| transaction.cleanup.is_stale())
+                .cloned()
+                .collect()
+        } else {
+            apply.recovery.clone()
+        };
+        if ui_state.recovery_stale_review_open {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Reviewing stale/non-actionable records")
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+                if ui.button("Show all recovery records").clicked() {
+                    ui_state.recovery_stale_review_open = false;
+                }
+            });
+        }
         if let Some(recovery_action) = show_recovery_transactions(
             ui,
-            &apply.recovery,
+            &recovery_to_show,
             apply.rollback_running,
             apply.resume_running,
         ) {

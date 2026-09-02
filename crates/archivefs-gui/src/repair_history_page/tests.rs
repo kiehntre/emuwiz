@@ -215,6 +215,127 @@ fn history_loads_from_the_persistent_journal_on_disk() {
     assert!(state.load_problems.is_empty());
 }
 
+#[test]
+fn stale_record_can_be_archived_without_rewriting_the_journal_or_game_file() {
+    let dir = TestDir::new("archive-stale");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let game_file = dir.path().join("game.bin");
+    std::fs::write(&game_file, b"untouched game data").unwrap();
+    let stale = bare_transaction(
+        "legacy-stale",
+        TransactionState::ApplyFailed,
+        EntryState::ApplyFailed,
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &stale).unwrap();
+    let journal_path =
+        archivefs_core::dat::rename_apply::journal_path(&journal_dir, &stale.transaction_id)
+            .unwrap();
+    let before = std::fs::read_to_string(&journal_path).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir.clone());
+    assert_eq!(
+        state.stale_transaction_ids(),
+        vec![stale.transaction_id.clone()]
+    );
+    state.archive_one(&stale.transaction_id);
+
+    assert_eq!(std::fs::read(&game_file).unwrap(), b"untouched game data");
+    assert_eq!(std::fs::read_to_string(&journal_path).unwrap(), before);
+    assert!(state.is_archived(&stale.transaction_id));
+    assert!(state_visible_transaction_ids(&state).is_empty());
+    state.show_archived = true;
+    state.hide_settled = false;
+    assert_eq!(
+        state_visible_transaction_ids(&state),
+        vec![stale.transaction_id]
+    );
+}
+
+#[test]
+fn resumable_and_rollbackable_records_are_rejected_by_stale_archive() {
+    let dir = TestDir::new("archive-gates");
+    let (_roms, journal_dir, applied_result) = scan_and_apply(dir.path());
+    // The real applied transaction is rollbackable and its destination files
+    // still match their recorded identities.
+    let mut resumable = bare_transaction(
+        "resumable-gated",
+        TransactionState::ApplyFailed,
+        EntryState::ApplyFailed,
+    );
+    resumable.unknown.insert(
+        "emuwiz_exact_resume_envelope".to_string(),
+        serde_json::json!({"format_version": 1}),
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &resumable).unwrap();
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    state.archive_one("resumable-gated");
+    assert!(!state.is_archived("resumable-gated"));
+    assert!(state.archive_outcome.as_ref().unwrap().archived == 0);
+    state.archive_one(&applied_result.summary.transaction_id);
+    assert!(!state.is_archived(&applied_result.summary.transaction_id));
+}
+
+#[test]
+fn bulk_archive_freezes_exact_count_requires_confirmation_and_survives_restart() {
+    let dir = TestDir::new("archive-bulk");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    for id in ["stale-one", "stale-two"] {
+        let stale = bare_transaction(id, TransactionState::ApplyFailed, EntryState::ApplyFailed);
+        archivefs_core::dat::rename_apply::write_journal(&journal_dir, &stale).unwrap();
+    }
+
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir.clone());
+    state.open_archive_confirmation();
+    assert_eq!(state.archive_confirm.as_ref().map(Vec::len), Some(2));
+    assert!(!archivefs_core::dat::rename_apply::recovery_history_state_path(&journal_dir).exists());
+    state.cancel_archive_confirmation();
+    assert!(!archivefs_core::dat::rename_apply::recovery_history_state_path(&journal_dir).exists());
+
+    state.open_archive_confirmation();
+    state.confirm_archive();
+    assert_eq!(state.archive_outcome.as_ref().unwrap().archived, 2);
+    assert_eq!(state.stale_transaction_ids().len(), 0);
+
+    let restarted = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    assert_eq!(
+        restarted.transactions.len(),
+        2,
+        "archiving keeps historical journals"
+    );
+    assert!(
+        restarted
+            .transactions
+            .iter()
+            .all(|transaction| restarted.is_archived(&transaction.transaction_id))
+    );
+}
+
+#[test]
+fn stale_card_uses_beginner_archive_wording_and_keeps_record_available() {
+    let dir = TestDir::new("archive-wording");
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let stale = bare_transaction(
+        "stale-wording",
+        TransactionState::ApplyFailed,
+        EntryState::ApplyFailed,
+    );
+    archivefs_core::dat::rename_apply::write_journal(&journal_dir, &stale).unwrap();
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    state.hide_settled = false;
+    let output = render(&mut state);
+    assert!(rendered_text_contains(
+        &output,
+        "This recovery record no longer matches the files on disk."
+    ));
+    assert!(rendered_text_contains(&output, "Nothing will be changed."));
+    assert!(rendered_text_contains(&output, "Archive this record"));
+    assert!(rendered_text_contains(&output, "Keep in history"));
+}
+
 // --- transaction rows reflect counts/status accurately ----------------------
 
 #[test]
@@ -743,6 +864,12 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         undo_error: None,
         clear_confirm: None,
         clear_outcome: None,
+        archive_state: RecoveryHistoryState::default(),
+        archive_state_error: None,
+        archive_confirm: None,
+        archive_outcome: None,
+        show_archived: false,
+        stale_only: false,
         hide_settled: false,
         search_query: String::new(),
     };
@@ -783,6 +910,12 @@ fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
         undo_error: None,
         clear_confirm: None,
         clear_outcome: None,
+        archive_state: RecoveryHistoryState::default(),
+        archive_state_error: None,
+        archive_confirm: None,
+        archive_outcome: None,
+        show_archived: false,
+        stale_only: false,
         hide_settled: false,
         search_query: String::new(),
     };

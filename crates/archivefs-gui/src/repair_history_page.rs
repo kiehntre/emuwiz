@@ -35,9 +35,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use archivefs_core::dat::rename_apply::{
-    EntryState, RenameTransaction, RollbackOutcome, RollbackResult, TransactionSummary,
-    journal_path, list_journals, read_journal, reconcile_recovery, remove_journal,
-    rollback_transaction,
+    EntryState, ExactResumeState, RecoveryCleanupClassification, RecoveryHistoryState,
+    RenameTransaction, RollbackOutcome, RollbackResult, TransactionSummary,
+    archive_recovery_transaction, archive_recovery_transactions, classify_recovery_cleanup,
+    exact_resume_state, journal_path, list_journals, load_recovery_history_state, read_journal,
+    reconcile_recovery, remove_journal, rollback_transaction,
 };
 use archivefs_core::repair::execute::{
     RepairReverifyEntry, RepairReverifyOutcome, reverify_transaction,
@@ -100,6 +102,18 @@ pub(crate) struct RepairHistoryPageState {
     /// The outcome of the last "Clear completed history" run: how many
     /// journals were actually removed, and any that failed to delete.
     pub(crate) clear_outcome: Option<ClearHistoryOutcome>,
+    /// Durable archive markers for records hidden from the active attention
+    /// surface. The journals themselves remain in `transactions`.
+    pub(crate) archive_state: RecoveryHistoryState,
+    pub(crate) archive_state_error: Option<String>,
+    /// Frozen ids awaiting explicit bulk-archive confirmation.
+    pub(crate) archive_confirm: Option<Vec<String>>,
+    pub(crate) archive_outcome: Option<ArchiveHistoryOutcome>,
+    /// Whether the list includes archived records. Off by default so the
+    /// normal page stays focused on current attention and recovery work.
+    pub(crate) show_archived: bool,
+    /// Narrow the list to stale records after “Review stale records”.
+    pub(crate) stale_only: bool,
     /// When true (the default), transactions with nothing left to undo -
     /// [`RenameTransaction::is_rollbackable`] is false - are hidden from the
     /// list. Purely a display filter: `transactions` itself is never
@@ -117,6 +131,12 @@ pub(crate) struct RepairHistoryPageState {
 pub(crate) struct ClearHistoryOutcome {
     pub(crate) removed: usize,
     pub(crate) failed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ArchiveHistoryOutcome {
+    pub(crate) archived: usize,
+    pub(crate) rejected: Vec<String>,
 }
 
 impl RepairHistoryPageState {
@@ -145,6 +165,12 @@ impl RepairHistoryPageState {
             undo_error: None,
             clear_confirm: None,
             clear_outcome: None,
+            archive_state: RecoveryHistoryState::default(),
+            archive_state_error: None,
+            archive_confirm: None,
+            archive_outcome: None,
+            show_archived: false,
+            stale_only: false,
             hide_settled: true,
             search_query: String::new(),
         };
@@ -163,6 +189,18 @@ impl RepairHistoryPageState {
     /// page's own recovery pass already calls - never a second
     /// implementation of that classification.
     pub(crate) fn refresh(&mut self) {
+        match load_recovery_history_state(&self.journal_dir) {
+            Ok(archive_state) => {
+                self.archive_state = archive_state;
+                self.archive_state_error = None;
+            }
+            Err(error) => {
+                // Fail closed: a damaged visibility index must not hide any
+                // journal or enable an archive action.
+                self.archive_state = RecoveryHistoryState::default();
+                self.archive_state_error = Some(error);
+            }
+        }
         let (mut transactions, problems) = list_journals(&self.journal_dir);
         for transaction in &mut transactions {
             let needs_reconciliation = transaction
@@ -382,6 +420,93 @@ impl RepairHistoryPageState {
         self.clear_outcome = Some(outcome);
         self.refresh();
     }
+
+    /// Stale records that are not already archived. Classification is
+    /// repeated from the current in-memory journal snapshot for display; the
+    /// archive operation re-reads each journal and rechecks it before writing.
+    pub(crate) fn stale_transaction_ids(&self) -> Vec<String> {
+        if self.archive_state_error.is_some() {
+            return Vec::new();
+        }
+        self.transactions
+            .iter()
+            .filter(|transaction| {
+                !self
+                    .archive_state
+                    .archived_transaction_ids
+                    .contains(&transaction.transaction_id)
+                    && classify_recovery_cleanup(transaction).is_stale()
+            })
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn is_archived(&self, transaction_id: &str) -> bool {
+        self.archive_state
+            .archived_transaction_ids
+            .contains(transaction_id)
+    }
+
+    /// Archives one stale record immediately. This only changes the visibility
+    /// sidecar; the core re-reads and rechecks the journal before doing so.
+    pub(crate) fn archive_one(&mut self, transaction_id: &str) {
+        if self.archive_state_error.is_some() {
+            return;
+        }
+        match archive_recovery_transaction(&self.journal_dir, transaction_id) {
+            Ok(archive_state) => {
+                self.archive_state = archive_state;
+                self.archive_outcome = Some(ArchiveHistoryOutcome {
+                    archived: 1,
+                    rejected: Vec::new(),
+                });
+                self.refresh();
+            }
+            Err(error) => {
+                self.archive_outcome = Some(ArchiveHistoryOutcome {
+                    archived: 0,
+                    rejected: vec![format!("{transaction_id}: {error}")],
+                });
+            }
+        }
+    }
+
+    pub(crate) fn open_archive_confirmation(&mut self) {
+        let ids = self.stale_transaction_ids();
+        if !ids.is_empty() {
+            self.archive_confirm = Some(ids);
+        }
+    }
+
+    pub(crate) fn cancel_archive_confirmation(&mut self) {
+        self.archive_confirm = None;
+    }
+
+    /// Confirms bulk archive for the exact frozen set. Each id is rechecked by
+    /// the core, so a record that became actionable remains visible.
+    pub(crate) fn confirm_archive(&mut self) {
+        let Some(ids) = self.archive_confirm.take() else {
+            return;
+        };
+        let before = self.archive_state.archived_transaction_ids.len();
+        match archive_recovery_transactions(&self.journal_dir, &ids) {
+            Ok((archive_state, rejected)) => {
+                let archived = archive_state
+                    .archived_transaction_ids
+                    .len()
+                    .saturating_sub(before);
+                self.archive_state = archive_state;
+                self.archive_outcome = Some(ArchiveHistoryOutcome { archived, rejected });
+            }
+            Err(error) => {
+                self.archive_outcome = Some(ArchiveHistoryOutcome {
+                    archived: 0,
+                    rejected: vec![error],
+                });
+            }
+        }
+        self.refresh();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +557,19 @@ fn visible_transaction_ids(
         .filter(|transaction| !(hide_settled && is_settled(transaction)))
         .filter(|transaction| transaction_matches_search(transaction, &query_lower))
         .map(|transaction| transaction.transaction_id.clone())
+        .collect()
+}
+
+fn state_visible_transaction_ids(state: &RepairHistoryPageState) -> Vec<String> {
+    visible_transaction_ids(&state.transactions, state.hide_settled, &state.search_query)
+        .into_iter()
+        .filter(|id| state.show_archived || !state.is_archived(id))
+        .filter(|id| {
+            !state.stale_only
+                || state
+                    .transaction_by_id(id)
+                    .is_some_and(|transaction| classify_recovery_cleanup(transaction).is_stale())
+        })
         .collect()
 }
 
@@ -583,6 +721,7 @@ pub(crate) fn show_repair_history_page(
 
     show_undo_confirmation_dialog(ui, state);
     show_clear_confirmation_dialog(ui, state);
+    show_archive_confirmation_dialog(ui, state);
 
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
@@ -646,6 +785,101 @@ pub(crate) fn show_repair_history_page(
         }
     }
 
+    let stale_count = state.stale_transaction_ids().len();
+    let resumable_count = state
+        .transactions
+        .iter()
+        .filter(|transaction| {
+            !state.is_archived(&transaction.transaction_id)
+                && matches!(
+                    exact_resume_state(transaction),
+                    Ok(Some(
+                        ExactResumeState::Pending
+                            | ExactResumeState::Failed
+                            | ExactResumeState::Interrupted
+                    ))
+                )
+        })
+        .count();
+    let rollbackable_count = state
+        .transactions
+        .iter()
+        .filter(|transaction| {
+            !state.is_archived(&transaction.transaction_id)
+                && transaction.is_rollbackable()
+                && !classify_recovery_cleanup(transaction).is_stale()
+        })
+        .count();
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Needs attention").strong());
+        ui.label(format!("resumable: {resumable_count}"));
+        ui.label(format!("rollbackable: {rollbackable_count}"));
+        ui.label(format!("stale/non-actionable: {stale_count}"));
+        if stale_count > 0 {
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Review stale records",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                {
+                    state.stale_only = true;
+                    state.hide_settled = false;
+                    state.search_query.clear();
+                }
+                if widgets::action_button(
+                    ui,
+                    "Archive all stale records",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    state.open_archive_confirmation();
+                }
+            });
+        }
+        if let Some(error) = &state.archive_state_error {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Archive state is unavailable; records stay visible: {error}"
+                ))
+                .small()
+                .color(theme::muted(ui)),
+            );
+        }
+    });
+
+    if let Some(outcome) = &state.archive_outcome {
+        ui.add_space(6.0);
+        if outcome.rejected.is_empty() {
+            widgets::banner(
+                ui,
+                "Stale records archived",
+                &format!(
+                    "{} record{} hidden from the active recovery view. Nothing on disk was changed.",
+                    outcome.archived,
+                    if outcome.archived == 1 {
+                        " was"
+                    } else {
+                        "s were"
+                    }
+                ),
+                widgets::StatusTone::Success,
+            );
+        } else {
+            widgets::failure_summary(
+                ui,
+                "archive_recovery_result",
+                "Some stale records stayed visible",
+                Some("Records that became actionable or uncertain were not archived."),
+                &outcome.rejected.join("\n"),
+            );
+        }
+    }
+
     if !state.load_problems.is_empty() {
         ui.add_space(6.0);
         widgets::banner(
@@ -675,7 +909,10 @@ pub(crate) fn show_repair_history_page(
 
     // Filtering only earns its keep once there is actually a list to sift
     // through; a handful of transactions reads fine without it.
-    if state.transactions.len() > 5 {
+    if state.transactions.len() > 5
+        || !state.archive_state.archived_transaction_ids.is_empty()
+        || state.stale_only
+    {
         widgets::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Search:");
@@ -688,11 +925,15 @@ pub(crate) fn show_repair_history_page(
                     &mut state.hide_settled,
                     "Hide completed (nothing left to undo)",
                 );
+                ui.checkbox(&mut state.show_archived, "Show archived");
+                if state.stale_only && ui.button("Show all records").clicked() {
+                    state.stale_only = false;
+                }
             });
         });
     }
 
-    let ids = visible_transaction_ids(&state.transactions, state.hide_settled, &state.search_query);
+    let ids = state_visible_transaction_ids(state);
     if ids.len() != state.transactions.len() {
         ui.label(
             egui::RichText::new(format!(
@@ -731,6 +972,8 @@ fn show_transaction_row(
     let summary = TransactionSummary::from_transaction(transaction);
     let reverify = reverify_transaction(transaction);
     let reverify_summary = reverify_summary(&reverify);
+    let cleanup = classify_recovery_cleanup(transaction);
+    let archived = state.is_archived(&transaction.transaction_id);
 
     ui.add_space(6.0);
     widgets::card(ui, |ui| {
@@ -751,6 +994,9 @@ fn show_transaction_row(
             );
             if let Some(hover) = transaction_headline_hover(transaction) {
                 headline_label.on_hover_text(hover);
+            }
+            if archived {
+                widgets::status_badge(ui, "Archived", widgets::StatusTone::Info);
             }
         });
 
@@ -828,7 +1074,8 @@ fn show_transaction_row(
                 });
             }
 
-            let undoable = state.can_undo(&transaction.transaction_id);
+            let undoable = state.can_undo(&transaction.transaction_id)
+                && matches!(cleanup, RecoveryCleanupClassification::Actionable);
             let undo = widgets::action_button(
                 ui,
                 if state.undo_running {
@@ -854,11 +1101,96 @@ fn show_transaction_row(
             }
         });
 
+        if !archived && let RecoveryCleanupClassification::Stale(reason) = cleanup {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("This recovery record no longer matches the files on disk.")
+                    .strong(),
+            );
+            ui.label("Nothing will be changed.");
+            ui.label(
+                egui::RichText::new(format!("Reason: {}", reason.label()))
+                    .small()
+                    .color(theme::muted(ui)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Archive this record",
+                    widgets::ActionStyle::Secondary,
+                    state.archive_state_error.is_none(),
+                )
+                .clicked()
+                {
+                    state.archive_one(&transaction.transaction_id);
+                }
+                let _ = widgets::action_button(
+                    ui,
+                    "Keep in history",
+                    widgets::ActionStyle::Quiet,
+                    true,
+                );
+            });
+        }
+
         if state.details_id.as_deref() == Some(transaction.transaction_id.as_str()) {
             ui.separator();
             show_transaction_details(ui, transaction, &reverify, clipboard);
         }
     });
+}
+
+fn show_archive_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairHistoryPageState) {
+    let Some(ids) = state.archive_confirm.clone() else {
+        return;
+    };
+    let mut open = true;
+    let mut cancel_clicked = false;
+    let mut archive_clicked = false;
+    egui::Window::new("Archive stale records?")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} old recovery record{} will be hidden from the active view",
+                    ids.len(),
+                    if ids.len() == 1 { "" } else { "s" }
+                ))
+                .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "This changes only EmuWiz's recovery-history visibility marker. Game files, \
+                     transaction contents, and rollback/resume state will not be changed.",
+                )
+                .color(theme::muted(ui)),
+            );
+            ui.add_space(6.0);
+            for id in &ids {
+                ui.label(egui::RichText::new(id).monospace().small());
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Keep in history").clicked() {
+                    cancel_clicked = true;
+                }
+                if ui
+                    .add(egui::Button::new("Archive all stale records").fill(theme::DANGER))
+                    .clicked()
+                {
+                    archive_clicked = true;
+                }
+            });
+        });
+    if cancel_clicked || !open {
+        state.cancel_archive_confirmation();
+    } else if archive_clicked {
+        state.confirm_archive();
+    }
 }
 
 /// The details panel for one transaction: every entry's full source and

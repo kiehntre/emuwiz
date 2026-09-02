@@ -35,6 +35,7 @@
 
 pub mod exact_resume;
 pub mod executor;
+pub mod history;
 pub mod identity;
 pub mod journal;
 pub mod model;
@@ -45,12 +46,17 @@ pub mod rollback;
 
 pub use exact_resume::{
     ExactResumeError, ExactResumeExecution, ExactResumeInspection, ExactResumeOutcome,
-    ExactResumeRefusal, ExactResumeResult, build_envelope, compute_plan_digest,
+    ExactResumeRefusal, ExactResumeResult, build_envelope, compute_plan_digest, exact_resume_state,
     inspect_exact_resume, resume_exact_transaction,
 };
 pub use executor::{
     ApplyError, ApplyExecution, ApplyOutcome, HardConflictMode, apply_transaction,
     build_transaction, build_transaction_entries, is_approved,
+};
+pub use history::{
+    RECOVERY_HISTORY_STATE_FILE, RecoveryCleanupClassification, RecoveryHistoryState,
+    StaleRecoveryReason, archive_recovery_transaction, archive_recovery_transactions,
+    classify_recovery_cleanup, load_recovery_history_state, recovery_history_state_path,
 };
 pub use identity::{capture_identity, classify_at, identity_matches};
 pub use journal::{
