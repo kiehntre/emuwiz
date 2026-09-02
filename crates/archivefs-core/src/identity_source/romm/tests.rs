@@ -899,3 +899,270 @@ fn the_detail_timeout_is_a_real_bound_not_an_unlimited_wait() {
     assert!(DETAIL_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
     assert!(DETAIL_REQUEST_TIMEOUT < std::time::Duration::from_secs(3600));
 }
+
+// --- Optional local-media mapping degradation (regression for 71bdb29) --------
+//
+// `ValidatedRommSource::validate` treats the optional `media_mapping` as
+// best-effort: a mapping that no longer validates (root gone, root replaced by a
+// file, symlinked root, unsafe provider prefix, non-absolute root) is dropped
+// for that validation cycle so the RomM HTTP/cache source stays usable, while a
+// broken *required* setting still fails the whole validation. The caller's
+// persisted `RommSourceConfig` is never rewritten. These tests pin that
+// configuration contract; the artwork-side consequence (`media_mapping()` ==
+// `None` -> local reuse skipped -> existing HTTP/cache fallback) is already
+// covered by `identity_source::artwork::tests` and is not repeated here.
+
+use crate::identity_source::romm::media_mapping::{RommMediaMapping, RommMediaMappingError};
+
+const DEGRADATION_MEDIA_PREFIX: &str = "/assets/romm/resources";
+
+/// A RomM config whose every *required* part is good (a validating loopback
+/// endpoint, no ROM mappings), carrying the given optional media mapping - so
+/// only the mapping is ever in question.
+fn config_with_media_mapping(media_mapping: Option<RommMediaMapping>) -> RommSourceConfig {
+    RommSourceConfig {
+        enabled: true,
+        url: "http://127.0.0.1:8080".to_string(),
+        mappings: Vec::new(),
+        media_mapping,
+        provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
+        token_path: None,
+    }
+}
+
+fn validate_source(config: &RommSourceConfig) -> Result<ValidatedRommSource, ConfigRefusal> {
+    ValidatedRommSource::validate(config, &token(), &[], &StaticResolver::new())
+}
+
+/// 1. A valid mapping is kept, and the retained root is the canonical form of
+///    the configured root.
+#[test]
+fn a_valid_media_mapping_is_kept_and_canonicalised() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("cover.png"), b"png").unwrap();
+    let config = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: root.path().to_path_buf(),
+    }));
+
+    let source =
+        validate_source(&config).expect("a valid optional mapping must not block validation");
+    let mapping = source.media_mapping().expect("a valid mapping is kept");
+    assert_eq!(mapping.provider_prefix(), DEGRADATION_MEDIA_PREFIX);
+    assert_eq!(
+        mapping.local_root(),
+        std::fs::canonicalize(root.path()).unwrap(),
+        "the kept root is the canonical form of the configured root"
+    );
+    assert_eq!(source.server_id(), "http://127.0.0.1:8080");
+}
+
+/// 2. A configured root that does not exist disables reuse but leaves the
+///    source - endpoint, token, server id - fully usable.
+#[test]
+fn a_missing_media_root_disables_reuse_but_keeps_the_source() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let absent = parent.path().join("not-mounted-yet");
+    assert!(!absent.exists());
+    let config = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: absent,
+    }));
+
+    let source =
+        validate_source(&config).expect("a missing optional media root must not fail the source");
+    assert!(
+        source.media_mapping().is_none(),
+        "reuse is disabled while the root is absent"
+    );
+    assert_eq!(source.server_id(), "http://127.0.0.1:8080");
+    let _ = source.endpoint();
+    let _ = source.token();
+}
+
+/// 3. A configured root that is a regular file, not a directory, is never
+///    trusted as a media root; the source still validates.
+#[test]
+fn a_media_root_that_is_a_regular_file_is_never_trusted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_root = dir.path().join("root-is-a-file");
+    std::fs::write(&file_root, b"not a directory").unwrap();
+    // The primitive itself refuses it (a file is not a media root).
+    assert!(matches!(
+        crate::identity_source::romm::media_mapping::validate_romm_media_mapping(
+            &RommMediaMapping {
+                provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+                local_root: file_root.clone(),
+            }
+        ),
+        Err(RommMediaMappingError::RootUnavailable(_))
+    ));
+
+    let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: file_root,
+    })))
+    .expect("a file where a media root should be must not fail the source");
+    assert!(source.media_mapping().is_none());
+}
+
+/// 4. A symlinked root is dropped, never followed or trusted; the source still
+///    validates.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_media_root_is_never_trusted() {
+    let real = tempfile::tempdir().expect("tempdir");
+    let parent = tempfile::tempdir().expect("tempdir");
+    let link = parent.path().join("root-link");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    assert!(matches!(
+        crate::identity_source::romm::media_mapping::validate_romm_media_mapping(
+            &RommMediaMapping {
+                provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+                local_root: link.clone(),
+            }
+        ),
+        Err(RommMediaMappingError::RootIsSymlink(_))
+    ));
+
+    let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: link,
+    })))
+    .expect("a symlinked media root must not fail the source");
+    assert!(
+        source.media_mapping().is_none(),
+        "a symlinked root is dropped, not trusted"
+    );
+}
+
+/// 5. Representative unsafe provider prefixes (traversal, malformed separator)
+///    disable reuse without failing the source. The exhaustive parser cases
+///    live in `media_mapping.rs`.
+#[test]
+fn an_unsafe_provider_prefix_disables_reuse_without_failing_the_source() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for prefix in ["/assets/../romm/resources", "/assets\\romm\\resources"] {
+        let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+            provider_prefix: prefix.to_string(),
+            local_root: root.path().to_path_buf(),
+        })))
+        .unwrap_or_else(|_| panic!("prefix {prefix:?} must not fail the whole source"));
+        assert!(
+            source.media_mapping().is_none(),
+            "unsafe prefix {prefix:?} must not become a trusted mapping"
+        );
+    }
+}
+
+/// 6. A non-absolute local root is dropped; the source remains valid.
+#[test]
+fn a_non_absolute_media_root_is_dropped() {
+    let source = validate_source(&config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: std::path::PathBuf::from("relative/media/root"),
+    })))
+    .expect("a non-absolute optional root must not fail the source");
+    assert!(source.media_mapping().is_none());
+}
+
+/// 7. With no mapping configured, validation is unchanged.
+#[test]
+fn no_media_mapping_leaves_validation_unchanged() {
+    let source = validate_source(&config_with_media_mapping(None)).expect("validates");
+    assert!(source.media_mapping().is_none());
+    assert_eq!(source.server_id(), "http://127.0.0.1:8080");
+}
+
+/// 8. A broken *required* setting still fails the whole validation, even when
+///    the optional mapping is perfectly valid - optional degradation never
+///    rescues a required failure.
+#[test]
+fn a_broken_required_setting_still_fails_even_with_a_valid_optional_mapping() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let good_mapping = || {
+        Some(RommMediaMapping {
+            provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+            local_root: root.path().to_path_buf(),
+        })
+    };
+
+    // Bad endpoint: a public address is never approved.
+    let mut bad_endpoint = config_with_media_mapping(good_mapping());
+    bad_endpoint.url = "http://8.8.8.8:8080".to_string();
+    let refusal = validate_source(&bad_endpoint)
+        .expect_err("a bad endpoint must still fail the whole source");
+    assert_eq!(refusal.code(), "not_private_address");
+
+    // Bad required ROM mapping: destination outside every trusted root.
+    let mut bad_mapping = config_with_media_mapping(good_mapping());
+    bad_mapping.mappings = vec![crate::identity_source::path_map::PathMapping {
+        provider_prefix: "/romm/library".to_string(),
+        archivefs_prefix: std::path::PathBuf::from("/etc"),
+    }];
+    let refusal = ValidatedRommSource::validate(
+        &bad_mapping,
+        &token(),
+        &[std::path::PathBuf::from("/mnt/games/roms")],
+        &StaticResolver::new(),
+    )
+    .expect_err("a required ROM mapping outside the trusted roots must still fail");
+    assert_eq!(refusal.code(), "outside_trusted_roots");
+}
+
+/// 9. Validation disables the mapping only for that cycle: the caller's config
+///    is byte-for-byte unchanged, still carrying the configured mapping.
+#[test]
+fn validation_does_not_rewrite_the_persisted_config_when_the_root_is_absent() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let absent = parent.path().join("offline-mount");
+    let original = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: absent.clone(),
+    }));
+    let before = original.clone();
+
+    let source = validate_source(&original).expect("validates with the mapping disabled");
+    assert!(source.media_mapping().is_none());
+
+    assert_eq!(
+        original, before,
+        "validation must not mutate the caller's config"
+    );
+    let kept = original
+        .media_mapping
+        .as_ref()
+        .expect("the mapping is still configured after validation");
+    assert_eq!(kept.provider_prefix, DEGRADATION_MEDIA_PREFIX);
+    assert_eq!(kept.local_root, absent);
+}
+
+/// 10. Transient mount recovery: the same persisted config validates with the
+///     mapping disabled while the root is absent, then re-enables it once the
+///     root returns.
+#[test]
+fn a_media_root_that_returns_is_honoured_on_the_next_validation() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let root = parent.path().join("removable-media");
+    let config = config_with_media_mapping(Some(RommMediaMapping {
+        provider_prefix: DEGRADATION_MEDIA_PREFIX.to_string(),
+        local_root: root.clone(),
+    }));
+
+    assert!(
+        validate_source(&config)
+            .expect("validates while the root is absent")
+            .media_mapping()
+            .is_none(),
+        "reuse is disabled while the mount is offline"
+    );
+
+    std::fs::create_dir_all(&root).unwrap();
+
+    let source = validate_source(&config).expect("validates after the root returns");
+    let mapping = source
+        .media_mapping()
+        .expect("the same persisted config enables reuse once the root returns");
+    assert_eq!(mapping.local_root(), std::fs::canonicalize(&root).unwrap());
+    assert_eq!(mapping.provider_prefix(), DEGRADATION_MEDIA_PREFIX);
+}
