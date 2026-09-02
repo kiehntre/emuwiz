@@ -138,6 +138,7 @@ mod administration_pages;
 mod cheats_mods_preview;
 use cheats_mods_preview::*;
 mod cheatbase_page;
+mod emulator_download_page;
 mod gamer_platform_shelf;
 mod user_cheat_import_page;
 use gamer_platform_shelf::*;
@@ -4457,6 +4458,10 @@ struct ArchiveFsApp {
     /// search, and inspection work is explicit and independent of emulator
     /// cheat installation workflows.
     cheatbase_page: cheatbase_page::CheatBasePageState,
+    /// The approval-bound managed-emulator download section shown inside
+    /// Emulator Setup. Downloads only run after an explicit confirmation
+    /// click; installing an emulator never implies it is launch-ready.
+    emulator_download_page: emulator_download_page::EmulatorDownloadPageState,
     rom_organisation_page: Option<rom_organisation_page::RomOrganisationPageState>,
     /// The Repair Review page, loaded lazily on first visit. Preview-only;
     /// it never applies anything.
@@ -4958,6 +4963,7 @@ impl ArchiveFsApp {
             sources_last_scan: None,
             cheat_sources_page: None,
             cheatbase_page: cheatbase_page::CheatBasePageState::default(),
+            emulator_download_page: emulator_download_page::EmulatorDownloadPageState::default(),
             rom_organisation_page: None,
             repair_review_page: None,
             repair_history_page: None,
@@ -6664,6 +6670,16 @@ impl ArchiveFsApp {
         ui.add_space(theme::SECTION_GAP);
         show_emulator_setup_summary(ui, self.doctor_scan.displayed(), &self.retroarch_profiles);
         ui.add_space(theme::SECTION_GAP);
+        // The managed-emulator download section is progressive disclosure:
+        // it appears only after the readiness check has run, so the
+        // pre-check page stays the single grouped "not checked yet" state.
+        // The check remains authoritative for whether Play is available.
+        if self.doctor_scan.displayed().is_some() {
+            if let Some(action) = self.emulator_download_page.show(ui) {
+                self.emulator_download_page.handle(action, context.clone());
+            }
+            ui.add_space(theme::SECTION_GAP);
+        }
         self.show_retroarch_core_folder_card(ui, context, focus_retroarch);
         ui.add_space(theme::SECTION_GAP);
         fn show_emulator_setup_summary(
@@ -17589,6 +17605,14 @@ impl ArchiveFsApp {
         self.poll_pcsx2_firmware_evidence();
         self.poll_cheat_workflow(context);
         self.cheatbase_page.poll(context);
+        self.emulator_download_page.poll(context);
+        if let Some(_installed_id) = self.emulator_download_page.take_completed_install() {
+            // A managed AppImage was just installed: re-run the read-only
+            // discovery / Doctor / readiness so Emulator Setup and Play
+            // availability reflect it. Discovery is authoritative - the
+            // download page never asserts launch readiness itself.
+            self.start_doctor_scan(context.clone());
+        }
         if matches!(
             self.view,
             MainView::Sources | MainView::CheatsMods | MainView::CheatSources

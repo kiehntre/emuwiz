@@ -111,6 +111,35 @@ fn first_executable(home: &Path, names: &[&str]) -> Option<PathBuf> {
     candidates.into_iter().find(|path| safe_executable(path))
 }
 
+/// Bounded, read-only discovery of EmuWiz-managed AppImage installs under
+/// `<data_dir>/emulators/<id>/<binary>` - the location the emulator
+/// download flow writes to, which the PATH / `~/Applications` / Flatpak
+/// checks above do not cover.
+///
+/// One fixed set of `symlink_metadata` calls per automated-lane catalogue
+/// entry (see [`crate::emulator_download::managed_appimage_install`]); no
+/// recursion, no shell. A managed install here is reported as installation
+/// *evidence* only - launch readiness is still decided elsewhere.
+fn discover_managed_emulator_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
+    let data_dir = crate::app_dirs::data_dir_in(home);
+    let mut evidence = Vec::new();
+    for spec in crate::emulator_download::EMULATOR_DOWNLOAD_CATALOGUE {
+        if let Some(binary) = crate::emulator_download::managed_appimage_install(&data_dir, spec) {
+            evidence.push(LinuxEmulatorInstallationEvidence {
+                emulator: spec.display_name.to_string(),
+                installation_form: "EmuWiz-managed AppImage".to_string(),
+                executable: Some(EncodedPath::from_path(&binary)),
+                profile: None,
+                detail: format!(
+                    "EmuWiz-managed AppImage found at {} (install.json provenance present)",
+                    binary.display()
+                ),
+            });
+        }
+    }
+    evidence
+}
+
 fn discover_shadps4_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
     let mut evidence = Vec::new();
     // shadPS4 is commonly installed with a stable native binary beside a
@@ -258,6 +287,7 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
         }
     }
     evidence.extend(discover_shadps4_installations(&home));
+    evidence.extend(discover_managed_emulator_installations(&home));
     if let Some(path) = [home.join(".config/scummvm"), home.join(".config/ScummVM")]
         .into_iter()
         .find(|path| {
@@ -3901,6 +3931,104 @@ mod tests {
             found
                 .iter()
                 .any(|item| item.installation_form == "Qt launcher")
+        );
+    }
+
+    /// Lays out a successful EmuWiz-managed AppImage install for `id` under
+    /// a temp `home`: `<home>/.local/share/emuwiz/emulators/<id>/<binary>`
+    /// (executable) plus an `install.json` provenance marker.
+    fn managed_install(home: &Path, id: &str) -> PathBuf {
+        let spec = crate::emulator_download::emulator_download_spec(id).unwrap();
+        let directory = home.join(".local/share/emuwiz/emulators").join(spec.id);
+        fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join(spec.installed_binary);
+        fs::write(&binary, b"\x7fELF managed fixture").unwrap();
+        fs::write(directory.join("install.json"), b"{\"emulator\":\"x\"}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        binary
+    }
+
+    #[test]
+    fn managed_appimage_is_discovered_after_install() {
+        let home = TempTree::new("profiles-managed-found");
+        let binary = managed_install(home.path(), "pcsx2");
+        let evidence = discover_managed_emulator_installations(home.path());
+        let pcsx2 = evidence
+            .iter()
+            .find(|item| item.emulator == "PCSX2")
+            .expect("managed PCSX2 discovered");
+        assert_eq!(pcsx2.installation_form, "EmuWiz-managed AppImage");
+        assert_eq!(
+            pcsx2.executable.as_ref().map(|path| path.display.clone()),
+            Some(binary.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn missing_managed_binary_and_missing_provenance_are_not_discovered() {
+        let home = TempTree::new("profiles-managed-missing");
+        // Nothing installed at all.
+        assert!(discover_managed_emulator_installations(home.path()).is_empty());
+
+        // Binary present but no install.json provenance marker.
+        let spec = crate::emulator_download::emulator_download_spec("rpcs3").unwrap();
+        let directory = home
+            .path()
+            .join(".local/share/emuwiz/emulators")
+            .join(spec.id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(spec.installed_binary), b"\x7fELF").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                directory.join(spec.installed_binary),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        assert!(discover_managed_emulator_installations(home.path()).is_empty());
+    }
+
+    #[test]
+    fn non_regular_managed_binary_path_is_rejected() {
+        let home = TempTree::new("profiles-managed-nonregular");
+        let spec = crate::emulator_download::emulator_download_spec("ppsspp").unwrap();
+        let directory = home
+            .path()
+            .join(".local/share/emuwiz/emulators")
+            .join(spec.id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("install.json"), b"{}").unwrap();
+        // The "binary" is actually a directory - never treated as an install.
+        fs::create_dir(directory.join(spec.installed_binary)).unwrap();
+        assert!(discover_managed_emulator_installations(home.path()).is_empty());
+    }
+
+    #[test]
+    fn manual_lane_emulator_never_reports_a_managed_install() {
+        let home = TempTree::new("profiles-managed-manual");
+        // Even with a provenance marker + executable laid out by hand, a
+        // Manual-distribution emulator (shadPS4) is not in the automated
+        // lane and is never reported as EmuWiz-managed.
+        let directory = home.path().join(".local/share/emuwiz/emulators/shadps4");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("install.json"), b"{}").unwrap();
+        fs::write(directory.join("shadps4"), b"\x7fELF").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.join("shadps4"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        assert!(
+            discover_managed_emulator_installations(home.path())
+                .iter()
+                .all(|item| item.emulator != "shadPS4")
         );
     }
 }

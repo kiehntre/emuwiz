@@ -534,15 +534,60 @@ pub struct EmulatorDownloadReceipt {
     pub digest_verified: bool,
 }
 
-/// Resolve, download, validate, and atomically install one official Linux
-/// AppImage. This is the explicit side-effecting entry point; constructing a
-/// catalogue/spec or an options value performs no network or filesystem I/O.
-pub fn download_and_install_appimage(
+/// A fully resolved, approval-bound plan for one managed AppImage install.
+///
+/// Produced by [`resolve_download_plan`], which performs the read-only
+/// release-metadata fetch and the deterministic release/asset selection but
+/// **creates nothing**. An approved plan binds the exact release tag and the
+/// exact asset URL; [`download_and_install_resolved`] consumes it verbatim
+/// and never re-resolves `latest` after approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EmulatorDownloadPlan {
+    pub emulator_id: String,
+    pub display_name: String,
+    pub distribution: EmulatorDistribution,
+    /// The official project name, for the confirmation panel.
+    pub official_project: String,
+    /// The official project URL (source project).
+    pub project_url: String,
+    /// The exact selected release tag - bound, never re-resolved.
+    pub release_tag: String,
+    /// The release's human name, when the metadata carried one.
+    pub release_name: Option<String>,
+    /// The exact selected asset file name.
+    pub asset_name: String,
+    /// The exact selected asset download URL (an allowlisted GitHub URL).
+    pub asset_url: String,
+    /// The normalized (64-hex, lowercase) upstream SHA-256, when the release
+    /// metadata provided one. `None` means no upstream digest was published;
+    /// the downloaded bytes are still ELF/AppImage-validated and hashed.
+    pub expected_sha256: Option<String>,
+    /// The raw upstream digest string as published, retained for the
+    /// receipt/provenance.
+    pub upstream_digest: Option<String>,
+    /// Where the validated AppImage will be installed:
+    /// `<root>/emulators/<id>/<installed_binary>`. Not created here.
+    pub destination_path: PathBuf,
+    /// The release-selection policy this plan was resolved under.
+    pub selection_policy: ReleaseSelectionPolicy,
+    /// Whether an EmuWiz-managed install already exists at the destination
+    /// and this plan would replace it. A caller must obtain explicit
+    /// confirmation for a replacement.
+    pub replaces_existing_managed: bool,
+}
+
+/// Resolve the exact release + asset for one managed emulator, **read-only**.
+///
+/// Fetches the official release metadata and applies the deterministic
+/// release / x86_64-AppImage selection, then computes the destination path
+/// and whether an EmuWiz-managed install is already there. It creates no
+/// file, writes nothing, sets no permissions, and replaces nothing.
+pub fn resolve_download_plan(
     root: &Path,
     spec: &EmulatorDownloadSpec,
     transport: &dyn EmulatorDownloadTransport,
     options: &EmulatorDownloadOptions,
-) -> Result<EmulatorDownloadReceipt, DownloadError> {
+) -> Result<EmulatorDownloadPlan, DownloadError> {
     if spec.distribution != EmulatorDistribution::GithubAppImage {
         return Err(DownloadError::Unsupported(
             "this emulator does not have an automated AppImage download lane".into(),
@@ -587,11 +632,93 @@ pub fn download_and_install_appimage(
     );
     ensure_not_cancelled(options)?;
     let asset = select_x86_64_asset(spec, &release.assets)?;
-    let expected_digest = asset
+    let expected_sha256 = asset
         .digest
         .as_deref()
         .map(normalize_sha256_digest)
         .transpose()?;
+    let destination_path = managed_appimage_destination(root, spec);
+    let replaces_existing_managed = matches!(
+        fs::symlink_metadata(&destination_path),
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()
+    ) && destination_path.parent().is_some_and(is_emuwiz_managed);
+    Ok(EmulatorDownloadPlan {
+        emulator_id: spec.id.to_string(),
+        display_name: spec.display_name.to_string(),
+        distribution: spec.distribution,
+        official_project: spec.official_project.to_string(),
+        project_url: spec.project_url.to_string(),
+        release_tag: release.tag_name,
+        release_name: release.name,
+        asset_name: asset.name,
+        asset_url: asset.download_url,
+        expected_sha256,
+        upstream_digest: asset.digest,
+        destination_path,
+        selection_policy: options.release_policy,
+        replaces_existing_managed,
+    })
+}
+
+/// The destination path a managed AppImage install writes to. Pure.
+pub fn managed_appimage_destination(root: &Path, spec: &EmulatorDownloadSpec) -> PathBuf {
+    root.join("emulators")
+        .join(spec.id)
+        .join(spec.installed_binary)
+}
+
+/// Download, validate, and atomically install the exact asset an approved
+/// [`EmulatorDownloadPlan`] names.
+///
+/// This consumes the plan verbatim: it never fetches release metadata,
+/// never calls `select_release`, and never re-resolves `latest`. Every
+/// existing safety property is preserved - HTTPS-only allowlisted transport,
+/// redirect rules, size bounds, streaming, cancellation, ELF/AppImage
+/// validation, checksum verification against `plan.expected_sha256`, atomic
+/// replacement, executable mode, `install.json` provenance, and temp-file
+/// cleanup on any failure.
+pub fn download_and_install_resolved(
+    root: &Path,
+    plan: &EmulatorDownloadPlan,
+    transport: &dyn EmulatorDownloadTransport,
+    options: &EmulatorDownloadOptions,
+) -> Result<EmulatorDownloadReceipt, DownloadError> {
+    if plan.distribution != EmulatorDistribution::GithubAppImage {
+        return Err(DownloadError::Unsupported(
+            "this plan is not an automated AppImage install".into(),
+        ));
+    }
+    let spec = emulator_download_spec(&plan.emulator_id).ok_or_else(|| {
+        DownloadError::Unsupported("plan names an emulator that is not in the catalogue".into())
+    })?;
+    if plan.destination_path != managed_appimage_destination(root, spec) {
+        return Err(DownloadError::Unsupported(
+            "plan destination does not match this install root; re-resolve the plan".into(),
+        ));
+    }
+    if options
+        .cancellation
+        .as_ref()
+        .is_some_and(EmulatorDownloadCancellation::is_cancelled)
+    {
+        report(
+            options,
+            EmulatorDownloadProgressPhase::Cancelled,
+            None,
+            None,
+            0,
+            None,
+        );
+        return Err(DownloadError::Cancelled);
+    }
+
+    let release = SelectedRelease {
+        tag_name: plan.release_tag.clone(),
+        asset_name: plan.asset_name.clone(),
+        asset_url: plan.asset_url.clone(),
+        expected_digest: plan.expected_sha256.clone(),
+        upstream_digest: plan.upstream_digest.clone(),
+    };
 
     let directory = prepare_install_directory(root, spec)?;
     let temporary = create_download_temporary(&directory, spec.installed_binary)?;
@@ -605,12 +732,12 @@ pub fn download_and_install_appimage(
             options,
             EmulatorDownloadProgressPhase::Downloading,
             Some(&release.tag_name),
-            Some(&asset.name),
+            Some(&release.asset_name),
             0,
             None,
         );
         let response = download_with_redirects(
-            &asset.download_url,
+            &release.asset_url,
             spec,
             EndpointKind::Asset,
             transport,
@@ -628,7 +755,7 @@ pub fn download_and_install_appimage(
             options,
             EmulatorDownloadProgressPhase::Validating,
             Some(&release.tag_name),
-            Some(&asset.name),
+            Some(&release.asset_name),
             response.bytes_received,
             response.content_length,
         );
@@ -640,7 +767,7 @@ pub fn download_and_install_appimage(
                 received: validation.size_bytes,
             });
         }
-        if let Some(expected) = expected_digest.as_deref()
+        if let Some(expected) = release.expected_digest.as_deref()
             && !expected.eq_ignore_ascii_case(&validation.sha256)
         {
             return Err(DownloadError::ChecksumMismatch {
@@ -652,7 +779,7 @@ pub fn download_and_install_appimage(
             options,
             EmulatorDownloadProgressPhase::Installing,
             Some(&release.tag_name),
-            Some(&asset.name),
+            Some(&release.asset_name),
             validation.size_bytes,
             Some(validation.size_bytes),
         );
@@ -663,24 +790,24 @@ pub fn download_and_install_appimage(
             &temporary,
             &validation.sha256,
             &release.tag_name,
-            expected_digest.as_deref(),
+            release.expected_digest.as_deref(),
         )?;
         report(
             options,
             EmulatorDownloadProgressPhase::Complete,
             Some(&release.tag_name),
-            Some(&asset.name),
+            Some(&release.asset_name),
             validation.size_bytes,
             Some(validation.size_bytes),
         );
         Ok(EmulatorDownloadReceipt {
             emulator_id: spec.id.to_string(),
             release_tag: release.tag_name,
-            asset_name: asset.name,
+            asset_name: release.asset_name,
             installed_path: destination,
             sha256: validation.sha256,
-            upstream_digest: asset.digest,
-            digest_verified: expected_digest.is_some(),
+            upstream_digest: release.upstream_digest,
+            digest_verified: release.expected_digest.is_some(),
         })
     })();
     if result.is_err() {
@@ -697,6 +824,31 @@ pub fn download_and_install_appimage(
         }
     }
     result
+}
+
+/// Backward-compatible one-shot: [`resolve_download_plan`] then
+/// [`download_and_install_resolved`]. Existing callers keep working; the
+/// plan step is not separately approvable through this entry point.
+pub fn download_and_install_appimage(
+    root: &Path,
+    spec: &EmulatorDownloadSpec,
+    transport: &dyn EmulatorDownloadTransport,
+    options: &EmulatorDownloadOptions,
+) -> Result<EmulatorDownloadReceipt, DownloadError> {
+    let plan = resolve_download_plan(root, spec, transport, options)?;
+    download_and_install_resolved(root, &plan, transport, options)
+}
+
+/// The exact release/asset an approved plan (or the one-shot path) is bound
+/// to, threaded through the download/validate/install closure so it can
+/// never be re-resolved mid-flight.
+#[derive(Debug, Clone)]
+struct SelectedRelease {
+    tag_name: String,
+    asset_name: String,
+    asset_url: String,
+    expected_digest: Option<String>,
+    upstream_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1192,6 +1344,43 @@ struct InstallProvenance {
 fn is_emuwiz_managed(directory: &Path) -> bool {
     fs::symlink_metadata(directory.join("install.json"))
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+/// Bounded, read-only check for a successfully EmuWiz-managed AppImage
+/// install of `spec` under `root` (`<root>/emulators/<id>/<binary>`).
+///
+/// Returns the binary path only when **all** of these hold, checked by a
+/// fixed number of `symlink_metadata` calls with no directory traversal:
+///
+/// * `spec` is an automated AppImage lane emulator;
+/// * `<root>/emulators/<id>/install.json` is a regular, non-symlink file
+///   (the managed-install provenance marker);
+/// * `<root>/emulators/<id>/<binary>` is a regular, non-symlink file;
+/// * that file has an executable mode bit set (Unix).
+///
+/// A managed install being present does **not** by itself mean the emulator
+/// is launch-ready - that remains the readiness layer's decision.
+pub fn managed_appimage_install(root: &Path, spec: &EmulatorDownloadSpec) -> Option<PathBuf> {
+    if spec.distribution != EmulatorDistribution::GithubAppImage {
+        return None;
+    }
+    let directory = root.join("emulators").join(spec.id);
+    if !is_emuwiz_managed(&directory) {
+        return None;
+    }
+    let binary = directory.join(spec.installed_binary);
+    let metadata = fs::symlink_metadata(&binary).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(binary)
 }
 
 fn io_error(error: io::Error) -> DownloadError {
@@ -1776,5 +1965,224 @@ mod tests {
                 EmulatorDistribution::Manual
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Approval-bound plan / plan-bound executor
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolving_a_plan_performs_no_filesystem_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let transport = MockTransport::new(vec![metadata_response(&release(vec![asset(None)]))]);
+        let plan = resolve_download_plan(
+            root.path(),
+            spec(),
+            &transport,
+            &EmulatorDownloadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.emulator_id, "pcsx2");
+        assert_eq!(plan.release_tag, "v1.2.3");
+        assert_eq!(plan.asset_name, "pcsx2-x86_64.AppImage");
+        assert_eq!(
+            plan.asset_url,
+            "https://github.com/PCSX2/pcsx2/releases/download/v1.2.3/pcsx2-x86_64.AppImage"
+        );
+        assert_eq!(
+            plan.destination_path,
+            root.path().join("emulators/pcsx2/pcsx2.AppImage")
+        );
+        assert!(!plan.replaces_existing_managed);
+        // Only the metadata call happened, and the root is still empty.
+        assert_eq!(transport.calls().len(), 1);
+        assert_eq!(root.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn approved_plan_binds_the_exact_release_and_asset_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = image();
+        let digest = format!("sha256:{}", sha256_hex(&bytes));
+        let transport =
+            MockTransport::new(vec![metadata_response(&release(vec![asset(Some(digest))]))]);
+        let plan = resolve_download_plan(
+            root.path(),
+            spec(),
+            &transport,
+            &EmulatorDownloadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.expected_sha256.as_deref(),
+            Some(sha256_hex(&bytes).as_str())
+        );
+        assert!(
+            plan.upstream_digest
+                .as_deref()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+
+        // The executor consumes the plan verbatim: one call (asset only),
+        // never a fresh metadata fetch.
+        let install_transport = MockTransport::new(vec![asset_response(bytes.clone())]);
+        let receipt = download_and_install_resolved(
+            root.path(),
+            &plan,
+            &install_transport,
+            &EmulatorDownloadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(install_transport.calls(), vec![plan.asset_url.clone()]);
+        assert_eq!(receipt.release_tag, "v1.2.3");
+        assert_eq!(receipt.asset_name, "pcsx2-x86_64.AppImage");
+        assert!(receipt.digest_verified);
+        assert_eq!(fs::read(&receipt.installed_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn executor_uses_the_plans_url_even_when_a_newer_release_would_resolve_differently() {
+        let root = tempfile::tempdir().unwrap();
+        let old_bytes = image();
+        let plan = EmulatorDownloadPlan {
+            emulator_id: "pcsx2".into(),
+            display_name: "PCSX2".into(),
+            distribution: EmulatorDistribution::GithubAppImage,
+            official_project: "PCSX2".into(),
+            project_url: "https://github.com/PCSX2/pcsx2".into(),
+            release_tag: "v1.2.3".into(),
+            release_name: Some("Stable release".into()),
+            asset_name: "pcsx2-x86_64.AppImage".into(),
+            asset_url:
+                "https://github.com/PCSX2/pcsx2/releases/download/v1.2.3/pcsx2-x86_64.AppImage"
+                    .into(),
+            expected_sha256: None,
+            upstream_digest: None,
+            destination_path: root.path().join("emulators/pcsx2/pcsx2.AppImage"),
+            selection_policy: ReleaseSelectionPolicy::default(),
+            replaces_existing_managed: false,
+        };
+        // Only an asset body is queued. If the executor re-resolved
+        // `latest` it would try to fetch metadata first and panic on the
+        // missing mock response.
+        let transport = MockTransport::new(vec![asset_response(old_bytes.clone())]);
+        let receipt = download_and_install_resolved(
+            root.path(),
+            &plan,
+            &transport,
+            &EmulatorDownloadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(transport.calls(), vec![plan.asset_url]);
+        assert_eq!(receipt.release_tag, "v1.2.3");
+        assert_eq!(fs::read(&receipt.installed_path).unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn executor_rejects_a_plan_resolved_for_a_different_root() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let transport = MockTransport::new(vec![metadata_response(&release(vec![asset(None)]))]);
+        let plan = resolve_download_plan(
+            other.path(),
+            spec(),
+            &transport,
+            &EmulatorDownloadOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            download_and_install_resolved(
+                root.path(),
+                &plan,
+                &MockTransport::new(Vec::new()),
+                &EmulatorDownloadOptions::default(),
+            ),
+            Err(DownloadError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn plan_flags_an_existing_managed_install_for_replacement_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        install_appimage_at(root.path(), spec(), &image(), None).unwrap();
+        let transport = MockTransport::new(vec![metadata_response(&release(vec![asset(None)]))]);
+        let plan = resolve_download_plan(
+            root.path(),
+            spec(),
+            &transport,
+            &EmulatorDownloadOptions::default(),
+        )
+        .unwrap();
+        assert!(plan.replaces_existing_managed);
+    }
+
+    #[test]
+    fn resolved_executor_cancellation_leaves_nothing_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let cancellation = EmulatorDownloadCancellation::default();
+        cancellation.cancel();
+        let options = EmulatorDownloadOptions {
+            cancellation: Some(cancellation),
+            ..Default::default()
+        };
+        let plan = EmulatorDownloadPlan {
+            emulator_id: "pcsx2".into(),
+            display_name: "PCSX2".into(),
+            distribution: EmulatorDistribution::GithubAppImage,
+            official_project: "PCSX2".into(),
+            project_url: "https://github.com/PCSX2/pcsx2".into(),
+            release_tag: "v1.2.3".into(),
+            release_name: None,
+            asset_name: "pcsx2-x86_64.AppImage".into(),
+            asset_url:
+                "https://github.com/PCSX2/pcsx2/releases/download/v1.2.3/pcsx2-x86_64.AppImage"
+                    .into(),
+            expected_sha256: None,
+            upstream_digest: None,
+            destination_path: root.path().join("emulators/pcsx2/pcsx2.AppImage"),
+            selection_policy: ReleaseSelectionPolicy::default(),
+            replaces_existing_managed: false,
+        };
+        assert_eq!(
+            download_and_install_resolved(
+                root.path(),
+                &plan,
+                &MockTransport::new(Vec::new()),
+                &options,
+            )
+            .unwrap_err(),
+            DownloadError::Cancelled
+        );
+        assert!(!root.path().join("emulators/pcsx2/pcsx2.AppImage").exists());
+    }
+
+    #[test]
+    fn managed_appimage_install_is_a_bounded_regular_file_plus_provenance_check() {
+        let root = tempfile::tempdir().unwrap();
+        // Nothing installed yet.
+        assert!(managed_appimage_install(root.path(), spec()).is_none());
+        // A real managed install is discovered.
+        let destination = install_appimage_at(root.path(), spec(), &image(), None).unwrap();
+        assert_eq!(
+            managed_appimage_install(root.path(), spec()),
+            Some(destination.clone())
+        );
+        // Remove the provenance marker: no longer considered managed.
+        fs::remove_file(root.path().join("emulators/pcsx2/install.json")).unwrap();
+        assert!(managed_appimage_install(root.path(), spec()).is_none());
+        // A non-regular binary path (directory) is rejected even with the
+        // marker present.
+        fs::write(root.path().join("emulators/pcsx2/install.json"), b"{}").unwrap();
+        fs::remove_file(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(managed_appimage_install(root.path(), spec()).is_none());
+    }
+
+    #[test]
+    fn managed_appimage_install_ignores_manual_lane_emulators() {
+        let root = tempfile::tempdir().unwrap();
+        let dolphin = emulator_download_spec("dolphin").unwrap();
+        assert!(managed_appimage_install(root.path(), dolphin).is_none());
     }
 }
