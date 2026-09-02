@@ -1138,6 +1138,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         select_all_visible_requested: false,
         source_action: None,
         mount_root_draft: None,
+        mount_root_feedback: None,
         bsfree_manager: BsFreeManagerState::NotLoaded,
         bsfree_operation: None,
         bsfree_ui: BsFreeGuiState::default(),

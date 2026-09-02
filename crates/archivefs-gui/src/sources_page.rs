@@ -135,6 +135,23 @@ pub(super) enum SourcesPageAction {
     ViewInLibrary(PathBuf),
 }
 
+/// The visible outcome of the most recent "Apply folder" for the temporary
+/// preparation folder, rendered inside the Sources -> Libraries mount-root
+/// card. Set from the background `SetupAction::SetMountRoot` result; `None`
+/// until one has finished.
+pub(super) struct MountRootFeedback {
+    pub(super) succeeded: bool,
+    /// One plain sentence for a beginner (success confirmation or a
+    /// friendly failure summary).
+    pub(super) summary: String,
+    /// The raw backend/config/I-O error, shown only under "Technical
+    /// details" on failure.
+    pub(super) detail: Option<String>,
+    /// A visible warning when the config write succeeded but EmuWiz could
+    /// not reload its configuration afterwards.
+    pub(super) warning: Option<String>,
+}
+
 pub(super) fn catalogue_status_label(status: CheatCatalogueStatus) -> &'static str {
     match status {
         CheatCatalogueStatus::Missing => "Missing",
@@ -1146,6 +1163,7 @@ pub(super) fn show_sources_page(
         busy,
         &mut mount_root_draft,
         false,
+        None,
         add_dialog,
         remove_dialog,
         clipboard,
@@ -1171,6 +1189,7 @@ pub(super) fn show_sources_page_with_mount_root(
     busy: bool,
     mount_root_draft: &mut Option<PathBuf>,
     mount_root_busy: bool,
+    mount_root_feedback: Option<&MountRootFeedback>,
     add_dialog: &mut Option<SourcesAddDialogState>,
     remove_dialog: &mut Option<SourcesRemoveDialogState>,
     clipboard: &mut dyn ClipboardBackend,
@@ -1498,6 +1517,26 @@ pub(super) fn show_sources_page_with_mount_root(
             && widgets::path_value(ui, "Selected folder", draft)
         {
             let _ = clipboard.set_text(draft.display().to_string());
+        }
+        if let Some(feedback) = mount_root_feedback {
+            let color = if feedback.succeeded {
+                egui::Color32::from_rgb(70, 170, 90)
+            } else {
+                ui.visuals().error_fg_color
+            };
+            ui.colored_label(color, &feedback.summary);
+            if let Some(warning) = &feedback.warning {
+                ui.colored_label(ui.visuals().warn_fg_color, warning);
+            }
+            if let Some(detail) = &feedback.detail {
+                widgets::technical_details(
+                    ui,
+                    ("sources_mount_root_feedback_detail", detail.as_str()),
+                    |ui| {
+                        ui.label(detail);
+                    },
+                );
+            }
         }
     });
 

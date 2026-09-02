@@ -294,6 +294,7 @@ fn staged_mount_root_button_pos(ctx: &egui::Context, staged: &Path, label: &str)
                 false,
                 &mut draft,
                 false,
+                None,
                 &mut add_dialog,
                 &mut remove_dialog,
                 &mut clipboard,
@@ -331,6 +332,7 @@ fn clicking_apply_folder_emits_apply_mount_root_for_exactly_the_staged_folder() 
                 false,
                 &mut draft.borrow_mut(),
                 false,
+                None,
                 &mut add_dialog.borrow_mut(),
                 &mut remove_dialog.borrow_mut(),
                 &mut *clipboard.borrow_mut(),
@@ -382,6 +384,7 @@ fn clicking_cancel_clears_the_staged_draft_and_emits_no_action() {
                 false,
                 &mut draft_in_render.borrow_mut(),
                 false,
+                None,
                 &mut add_dialog.borrow_mut(),
                 &mut remove_dialog.borrow_mut(),
                 &mut *clipboard.borrow_mut(),
@@ -403,6 +406,90 @@ fn clicking_cancel_clears_the_staged_draft_and_emits_no_action() {
         captured.borrow().is_none(),
         "clicking Cancel must not emit any SourcesPageAction"
     );
+}
+
+/// Renders the Sources page once with the given mount-root feedback and
+/// returns the frame output.
+fn render_sources_with_mount_root_feedback(
+    feedback: &sources_page::MountRootFeedback,
+) -> egui::FullOutput {
+    let ctx = egui::Context::default();
+    let sources = three_source_views();
+    let mut add_dialog = None;
+    let mut remove_dialog = None;
+    let mut clipboard = InMemoryClipboard::default();
+    let mut draft = None;
+    ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_sources_page_with_mount_root(
+                ui,
+                &sources,
+                &[],
+                Some(Path::new("/mnt/archivefs")),
+                false,
+                &mut draft,
+                false,
+                Some(feedback),
+                &mut add_dialog,
+                &mut remove_dialog,
+                &mut clipboard,
+            );
+        });
+    })
+}
+
+#[test]
+fn mount_root_success_feedback_renders_a_plain_confirmation_in_the_sources_card() {
+    let output = render_sources_with_mount_root_feedback(&sources_page::MountRootFeedback {
+        succeeded: true,
+        summary: "Temporary game preparation folder updated to /srv/prep.".to_string(),
+        detail: None,
+        warning: None,
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Temporary game preparation folder updated to /srv/prep."
+    ));
+    // No failure affordance on a success.
+    assert!(!rendered_text_contains(&output, "Technical details"));
+}
+
+#[test]
+fn mount_root_failure_feedback_renders_beginner_text_with_backend_error_under_technical_details() {
+    let output = render_sources_with_mount_root_feedback(&sources_page::MountRootFeedback {
+        succeeded: false,
+        summary: "Could not change the temporary game preparation folder. Choose an existing \
+                  writable folder and try again."
+            .to_string(),
+        detail: Some(
+            "config error: the selected temporary preparation folder is not writable: /x"
+                .to_string(),
+        ),
+        warning: None,
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Could not change the temporary game preparation folder. Choose an existing writable folder and try again."
+    ));
+    // The backend error is present, collapsed under Technical details.
+    assert!(rendered_text_contains(&output, "Technical details"));
+}
+
+#[test]
+fn mount_root_reload_warning_is_visible_when_config_write_succeeded_but_reload_failed() {
+    let output = render_sources_with_mount_root_feedback(&sources_page::MountRootFeedback {
+        succeeded: true,
+        summary: "Temporary game preparation folder updated to /srv/prep.".to_string(),
+        detail: None,
+        warning: Some(
+            "The folder changed successfully, but EmuWiz could not reload its configuration: boom."
+                .to_string(),
+        ),
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "The folder changed successfully, but EmuWiz could not reload its configuration: boom."
+    ));
 }
 
 #[test]

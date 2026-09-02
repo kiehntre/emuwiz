@@ -2294,14 +2294,41 @@ pub fn set_mount_root_default(path: &Path) -> Result<PathBuf> {
 /// existing config is parsed before anything is written, and a symlinked or
 /// otherwise unsafe config path is rejected.
 pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
-    validate_mount_root_selection(path)?;
+    // Validate the configuration file first - it must exist, be a regular
+    // non-symlinked file, be readable, and parse cleanly. Only if all of
+    // that holds is the selected directory probed (a probe creates and
+    // removes a temp file inside it) or anything written.
     let contents = read_config_for_update(config_path)?;
+    validate_mount_root_selection(path)?;
     let updated = replace_mount_root_assignment(&contents, path)?;
+    // The exact bytes about to be published must parse and round-trip the
+    // requested folder. This is what stops a path containing an embedded
+    // newline (or any other text that breaks the assignment line) from ever
+    // publishing an invalid config.
+    verify_proposed_config(&updated, path)?;
     if updated != contents {
         ensure_safe_config_target(config_path)?;
         atomic_write_text(config_path, &updated)?;
     }
     Ok(path.to_path_buf())
+}
+
+/// Parses the exact proposed configuration text and confirms it round-trips
+/// the requested mount root. If parsing fails, or the parsed `mount_root`
+/// differs from what was requested, nothing is published.
+fn verify_proposed_config(proposed: &str, expected_mount_root: &Path) -> Result<()> {
+    let parsed = parse_config(proposed).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "the updated configuration would not parse and was not written: {source}"
+        ))
+    })?;
+    if parsed.mount_root != expected_mount_root {
+        return Err(ArchiveFsError::Config(
+            "the updated configuration did not round-trip the selected folder and was not written"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_mount_root_selection(path: &Path) -> Result<()> {
@@ -2424,12 +2451,48 @@ fn replace_mount_root_assignment(contents: &str, path: &Path) -> Result<String> 
                     "could not locate the mount_root assignment safely".to_string(),
                 )
             })?;
+            // Whitespace between `=` and the opening quote of the value.
+            let after_equals = &uncommented[equals + 1..];
+            let value_offset = after_equals
+                .find(|character: char| !character.is_whitespace())
+                .ok_or_else(|| {
+                    ArchiveFsError::Config("the mount_root setting has no value".to_string())
+                })?;
+            let whitespace_after_equals = &after_equals[..value_offset];
+            let value_and_trailing = &after_equals[value_offset..];
+            if !value_and_trailing.starts_with('"') {
+                return Err(ArchiveFsError::Config(
+                    "the mount_root value is not a quoted string".to_string(),
+                ));
+            }
+            // Length of the quoted value, honouring `\"` escapes.
+            let mut value_len = None;
+            let mut escaped = false;
+            for (index, character) in value_and_trailing[1..].char_indices() {
+                if character == '"' && !escaped {
+                    // +1 for the skipped opening quote, +1 to sit past the close.
+                    value_len = Some(index + 2);
+                    break;
+                }
+                escaped = character == '\\' && !escaped;
+            }
+            let value_len = value_len.ok_or_else(|| {
+                ArchiveFsError::Config(
+                    "the mount_root value is missing its closing quote".to_string(),
+                )
+            })?;
+            // Whitespace between the value and any inline comment / line end.
+            let trailing_whitespace = &value_and_trailing[value_len..];
+            let comment = &line[uncommented.len()..];
+
             output.push_str(&line[..key_start]);
             output.push_str("mount_root");
+            // Whitespace between the key and `=`, plus `=` itself.
             output.push_str(&line[key_start + "mount_root".len()..equals + 1]);
-            output.push(' ');
+            output.push_str(whitespace_after_equals);
             output.push_str(&quoted);
-            output.push_str(&line[uncommented.len()..]);
+            output.push_str(trailing_whitespace);
+            output.push_str(comment);
         } else {
             output.push_str(line);
         }
@@ -13205,6 +13268,86 @@ mod tests {
         let added = add_source_folder_at(&config_path, &database_path, &games).unwrap();
         assert_eq!(added.path, games);
         assert!(config_path.exists());
+    }
+
+    #[test]
+    fn a_malformed_config_is_rejected_before_the_selected_directory_is_touched() {
+        let root = test_root("mount_root_update_config_before_probe");
+        let config_path = root.join("config.toml");
+        // Malformed (unterminated array) *and* a selection that does not
+        // exist. Config validation runs first, so the error is about the
+        // config, never about the (never-probed) selected directory.
+        fs::write(&config_path, "source_folders = [\nmount_root = \"/old\"\n").unwrap();
+        let missing_selection = root.join("never-created");
+
+        let error = set_mount_root_to(&config_path, &missing_selection).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            !text.contains("never-created"),
+            "config validation must fail before the selected directory is looked at: {text}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "source_folders = [\nmount_root = \"/old\"\n"
+        );
+    }
+
+    #[test]
+    fn a_newline_containing_selected_path_never_publishes_a_malformed_config() {
+        let root = test_root("mount_root_update_newline_path");
+        let config_path = root.join("config.toml");
+        let original =
+            "source_folders = []\nmount_root = \"/old\"\nratarmount_bin = \"ratarmount\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        // A real directory whose name embeds a newline plus injected TOML.
+        let evil = root.join("evil\nratarmount_bin = \"pwned\"");
+        fs::create_dir_all(&evil).unwrap();
+
+        let error = set_mount_root_to(&config_path, &evil).unwrap_err();
+        assert!(
+            error.to_string().contains("was not written"),
+            "proposed config must be verified before publication: {error}"
+        );
+        // The on-disk config is byte-for-byte the untouched original, and
+        // still parses to the old mount root.
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().mount_root,
+            PathBuf::from("/old")
+        );
+    }
+
+    #[test]
+    fn set_mount_root_preserves_exact_crlf_and_inline_comment_spacing() {
+        let root = test_root("mount_root_update_spacing");
+        let config_path = root.join("config.toml");
+        let new_mount_root = root.join("new mounts");
+        fs::create_dir_all(&new_mount_root).unwrap();
+
+        // CRLF throughout; odd spacing around the assignment; two spaces
+        // before an inline comment; unrelated lines that must be byte-exact.
+        let original = "# top comment\r\n\
+                        source_folders = []\r\n\
+                        mount_root   =   \"/old\"  # chosen before\r\n\
+                        ratarmount_bin = \"custom\"\r\n";
+        fs::write(&config_path, original).unwrap();
+
+        set_mount_root_to(&config_path, &new_mount_root).unwrap();
+
+        let updated = fs::read_to_string(&config_path).unwrap();
+        let quoted = quote_config_string(&new_mount_root.display().to_string());
+        let expected = format!(
+            "# top comment\r\n\
+             source_folders = []\r\n\
+             mount_root   =   {quoted}  # chosen before\r\n\
+             ratarmount_bin = \"custom\"\r\n"
+        );
+        assert_eq!(updated, expected);
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().mount_root,
+            new_mount_root
+        );
     }
 
     #[test]

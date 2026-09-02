@@ -4617,6 +4617,11 @@ struct ArchiveFsApp {
     /// A folder picked for the temporary preparation root but not yet
     /// applied. Picking or cancelling never writes config.toml.
     mount_root_draft: Option<PathBuf>,
+    /// The visible outcome of the most recent "Apply folder" for the
+    /// temporary preparation root, rendered in the Sources -> Libraries
+    /// mount-root card. Set from the background `SetupAction::SetMountRoot`
+    /// result; cleared when a new apply starts.
+    mount_root_feedback: Option<sources_page::MountRootFeedback>,
     bsfree_manager: BsFreeManagerState,
     bsfree_operation: Option<RunningBsFreeOperation>,
     bsfree_ui: BsFreeGuiState,
@@ -5094,6 +5099,7 @@ impl ArchiveFsApp {
             select_all_visible_requested: false,
             source_action: None,
             mount_root_draft: None,
+            mount_root_feedback: None,
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
@@ -6107,6 +6113,11 @@ impl ArchiveFsApp {
             || (matches!(&action, SetupAction::SetMountRoot(_)) && self.source_action.is_some())
         {
             return;
+        }
+        if matches!(&action, SetupAction::SetMountRoot(_)) {
+            // The previous outcome is no longer current the moment a new
+            // apply begins.
+            self.mount_root_feedback = None;
         }
         let (sender, receiver) = mpsc::channel();
         let started_message = match &action {
@@ -7745,6 +7756,7 @@ impl ArchiveFsApp {
             self.setup_action.is_some()
                 || self.source_action.is_some()
                 || self.database_state.is_loading(),
+            self.mount_root_feedback.as_ref(),
             &mut self.sources_add_dialog,
             &mut self.sources_remove_dialog,
             &mut self.clipboard,
@@ -8205,22 +8217,29 @@ impl ArchiveFsApp {
                         ActivityOutcome::Completed,
                         message.clone(),
                     ));
+                    let reload_warning = if matches!(&action, SetupAction::SetMountRoot(_)) {
+                        self.gui_config.reload_default().err().map(|error| {
+                            format!(
+                                "The folder changed successfully, but EmuWiz could not reload its configuration: {error}."
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     self.feedback = Some(ActionFeedback {
                         succeeded: true,
-                        message,
+                        message: message.clone(),
                         cleanup: None,
-                        warning: if matches!(&action, SetupAction::SetMountRoot(_)) {
-                            self.gui_config.reload_default().err().map(|error| {
-                                format!(
-                                    "The folder changed successfully, but EmuWiz could not reload its configuration: {error}."
-                                )
-                            })
-                        } else {
-                            None
-                        },
+                        warning: reload_warning.clone(),
                         more_information: None,
                     });
                     if matches!(&action, SetupAction::SetMountRoot(_)) {
+                        self.mount_root_feedback = Some(sources_page::MountRootFeedback {
+                            succeeded: true,
+                            summary: message,
+                            detail: None,
+                            warning: reload_warning,
+                        });
                         self.mount_root_draft = None;
                         self.refresh(context);
                     } else if action != SetupAction::OpenConfigFolder {
@@ -8246,6 +8265,14 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         message.clone(),
                     ));
+                    if matches!(&action, SetupAction::SetMountRoot(_)) {
+                        self.mount_root_feedback = Some(sources_page::MountRootFeedback {
+                            succeeded: false,
+                            summary: feedback_message.clone(),
+                            detail: Some(message.clone()),
+                            warning: None,
+                        });
+                    }
                     self.feedback = Some(ActionFeedback {
                         succeeded: false,
                         message: feedback_message,
