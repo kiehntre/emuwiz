@@ -1518,6 +1518,8 @@ mod identity_model {
             artwork: Some(ArtworkReference {
                 reference: "assets/roms/345/cover_l.png".to_string(),
                 small_reference: Some("assets/roms/345/cover_s.png".to_string()),
+                screenshots: Vec::new(),
+                manual: None,
             }),
             related_files: Vec::new(),
             sibling_game_ids: Vec::new(),

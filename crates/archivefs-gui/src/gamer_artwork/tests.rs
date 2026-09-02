@@ -53,6 +53,8 @@ fn romm_hosted() -> ArtworkReference {
         small_reference: Some(
             "/assets/romm/resources/roms/149/1/cover/small.png?ts=17".to_string(),
         ),
+        screenshots: Vec::new(),
+        manual: None,
     }
 }
 
@@ -61,6 +63,8 @@ fn public_only() -> ArtworkReference {
     ArtworkReference {
         reference: "https://images.igdb.com/igdb/image/upload/t_cover_big/co1234.png".to_string(),
         small_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     }
 }
 

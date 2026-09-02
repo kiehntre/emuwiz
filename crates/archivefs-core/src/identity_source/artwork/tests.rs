@@ -126,6 +126,7 @@ impl RommTransport for FakeArtworkServer {
 fn request<'a>(id: &'a str, small: Option<&'a str>, public: Option<&'a str>) -> ArtworkRequest<'a> {
     ArtworkRequest {
         provider_game_id: id,
+        kind: ArtworkKind::Cover,
         small_reference: small,
         public_reference: public,
     }
@@ -208,6 +209,28 @@ fn a_public_scraper_url_is_never_fetched() {
         0,
         "not one request should have left the process"
     );
+}
+
+#[test]
+fn a_public_screenshot_reference_is_refused_without_a_request() {
+    let tree = Tree::new("public-screenshot-refused");
+    let cache = tree.cache();
+    let server = FakeArtworkServer::serving(synthetic_png(10, 10));
+    let media = crate::identity_source::model::MediaReference {
+        hosted_reference: None,
+        public_reference: Some("https://images.example/screenshot.jpg".to_string()),
+    };
+    let refusal = cache
+        .fetch(
+            &source(),
+            &server,
+            &ArtworkRequest::from_media("1", &media),
+            1_000,
+            None,
+        )
+        .expect_err("a public screenshot host must not be fetched");
+    assert_eq!(refusal.code(), "remote_host_not_allowed");
+    assert_eq!(server.request_count(), 0);
 }
 
 /// Relative-URL forms that change the host are refusals, not requests.

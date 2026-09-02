@@ -149,6 +149,8 @@ pub(crate) struct CandidateView {
     pub(crate) evidence: Vec<String>,
     pub(crate) conflicts: Vec<ConflictLineView>,
     pub(crate) artwork: ArtworkAvailability,
+    pub(crate) has_screenshot: bool,
+    pub(crate) manual_available: bool,
     pub(crate) related_files: usize,
     pub(crate) siblings: usize,
     pub(crate) provenance: String,
@@ -432,6 +434,15 @@ fn candidate_view(
             })
             .collect(),
         artwork: availability_of(record),
+        has_screenshot: record
+            .artwork
+            .as_ref()
+            .is_some_and(|artwork| !artwork.screenshots.is_empty()),
+        manual_available: record
+            .artwork
+            .as_ref()
+            .and_then(|artwork| artwork.manual.as_ref())
+            .is_some(),
         related_files: record.related_files.len(),
         siblings: record.sibling_game_ids.len(),
         provenance: record.server_id.clone(),
@@ -443,6 +454,7 @@ pub(crate) fn availability_of(record: &ExternalIdentityRecord) -> ArtworkAvailab
     match record.artwork.as_ref() {
         None => ArtworkAvailability::None,
         Some(artwork) if artwork.small_reference.is_some() => ArtworkAvailability::Fetchable,
+        Some(artwork) if artwork.reference.trim().is_empty() => ArtworkAvailability::None,
         Some(_) => ArtworkAvailability::PublicOnly,
     }
 }
@@ -859,12 +871,15 @@ pub(crate) struct GamePanelState {
     pub(crate) chosen_game_id: Option<String>,
     pub(crate) verification: Option<Box<VerificationOutcomeView>>,
     pub(crate) cover: CoverState,
+    pub(crate) screenshot: CoverState,
     /// Uploaded on the UI thread, and dropped when the cover changes.
     pub(crate) cover_texture: Option<egui::TextureHandle>,
     pub(crate) cover_key: Option<String>,
     /// The artwork cache's totals as read after the last cover load. Read from the
     /// cache rather than incremented, so a clear cannot leave a stale figure here.
     pub(crate) cover_cache: Option<(u64, u64)>,
+    pub(crate) screenshot_texture: Option<egui::TextureHandle>,
+    pub(crate) screenshot_key: Option<String>,
     /// Set when a result arrived that no longer answers what is on screen.
     pub(crate) needs_reload: bool,
     /// Whether someone closed the panel for this selection.
@@ -888,9 +903,12 @@ impl GamePanelState {
         self.chosen_game_id = None;
         self.verification = None;
         self.cover = CoverState::Idle;
+        self.screenshot = CoverState::Idle;
         self.cover_texture = None;
         self.cover_key = None;
         self.cover_cache = None;
+        self.screenshot_texture = None;
+        self.screenshot_key = None;
         self.needs_reload = false;
         self.dismissed = false;
         true
@@ -926,6 +944,9 @@ pub(crate) enum GamePanelRequest {
     },
     /// Fetch or read this record's small cover.
     LoadCover {
+        romm_game_id: String,
+    },
+    LoadScreenshot {
         romm_game_id: String,
     },
     /// Choose which claimant to show.
@@ -1078,6 +1099,7 @@ pub(crate) fn show_game_identity_panel(
         if let Some(found) = show_cover(ui, &candidate, state, inputs) {
             request = Some(found);
         }
+        show_screenshot_and_manual(ui, &candidate, state, inputs, &mut request);
     });
 
     // Escape leaves the panel, which is also what a controller's back button sends.
@@ -1436,6 +1458,66 @@ fn show_cover(
         );
     }
     request
+}
+
+fn show_screenshot_and_manual(
+    ui: &mut egui::Ui,
+    candidate: &CandidateView,
+    state: &mut GamePanelState,
+    inputs: &GamePanelInputs<'_>,
+    request: &mut Option<GamePanelRequest>,
+) {
+    ui.add_space(theme::SECTION_GAP / 2.0);
+    ui.label(egui::RichText::new("Screenshot").strong());
+    if candidate.has_screenshot {
+        if widgets::action_button(
+            ui,
+            "Show screenshot",
+            widgets::ActionStyle::Quiet,
+            !inputs.busy,
+        )
+        .clicked()
+        {
+            *request = Some(GamePanelRequest::LoadScreenshot {
+                romm_game_id: candidate.romm_game_id.clone(),
+            });
+        }
+        ui.label(state.screenshot.line());
+        if let CoverState::Ready(image) = state.screenshot.clone() {
+            if state.screenshot_key.as_deref() != Some(image.key.as_str()) {
+                state.screenshot_texture = Some(ui.ctx().load_texture(
+                    format!("romm-screenshot-{}", image.key),
+                    image.image.clone(),
+                    egui::TextureOptions::LINEAR,
+                ));
+                state.screenshot_key = Some(image.key.clone());
+            }
+            if let Some(texture) = &state.screenshot_texture {
+                ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(fitted_cover_size(image.width, image.height))
+                        .alt_text("RomM screenshot"),
+                );
+            }
+        } else if matches!(state.screenshot, CoverState::Loading) {
+            ui.add(egui::Spinner::new());
+        }
+    } else {
+        ui.label("No screenshot is available.");
+    }
+    ui.add_space(theme::SECTION_GAP / 2.0);
+    ui.label(egui::RichText::new("Manual").strong());
+    if candidate.manual_available {
+        ui.label("Manual available");
+        ui.label(
+            egui::RichText::new(
+                "The manual is recorded by RomM. Secure viewing is not available in this build.",
+            )
+            .weak(),
+        );
+    } else {
+        ui.label("No manual is available.");
+    }
 }
 
 /// Fits a thumbnail inside the UI's 200x280 box without changing its aspect ratio.

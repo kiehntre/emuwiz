@@ -94,6 +94,8 @@ fn varied_cache() -> IdentityCache {
     snes.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/x.jpg".to_string(),
         small_reference: Some("/assets/small.png".to_string()),
+        screenshots: Vec::new(),
+        manual: None,
     });
     records.push(snes);
     // A multi-file record.
@@ -623,6 +625,8 @@ fn the_detail_panel_carries_the_full_evidence() {
     records[0].artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/x.jpg".to_string(),
         small_reference: Some("/assets/small.png".to_string()),
+        screenshots: Vec::new(),
+        manual: None,
     });
     let cache = cache(records);
     let detail = build_record_detail(&cache, "1", &all_absent).expect("the record exists");
@@ -1513,6 +1517,8 @@ fn detail_artwork_is_typed_and_public_urls_never_enter_the_view_model() {
     public.artwork = Some(ArtworkReference {
         reference: "https://retroachievements.org/Images/020770.png".to_string(),
         small_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     let detail =
         build_record_detail(&cache(vec![public]), "public", &all_absent).expect("record detail");

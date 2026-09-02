@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::identity_source::model::{
     ArtworkReference, ExternalHash, ExternalIdentityRecord, ExternalVerification, HashAlgorithm,
-    IdentityProvider, MetadataProviderId,
+    IdentityProvider, MediaReference, MetadataProviderId,
 };
 use crate::identity_source::path_map::{PathMappings, PathTranslation};
 
@@ -162,11 +162,18 @@ pub fn normalise_rom(
         .collect();
 
     // Artwork references only - never bytes, and never fetched here.
-    let artwork = string_field(value, "url_cover")
-        .or_else(|| string_field(value, "path_cover_large"))
-        .map(|reference| ArtworkReference {
-            reference,
-            small_reference: string_field(value, "path_cover_small"),
+    let screenshots = media_references(value, "path_screenshots", "url_screenshots");
+    let manual = media_reference(value, "path_manual", "url_manual");
+    let cover_reference =
+        string_field(value, "url_cover").or_else(|| string_field(value, "path_cover_large"));
+    let artwork =
+        (cover_reference.is_some() || !screenshots.is_empty() || manual.is_some()).then(|| {
+            ArtworkReference {
+                reference: cover_reference.unwrap_or_default(),
+                small_reference: string_field(value, "path_cover_small"),
+                screenshots: screenshots.clone(),
+                manual: manual.clone(),
+            }
         });
 
     // Enrichment (game metadata milestone, 2026-08-22): `summary` is a flat
@@ -508,6 +515,39 @@ fn string_array(value: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn media_references(value: &Value, hosted_field: &str, public_field: &str) -> Vec<MediaReference> {
+    let hosted = string_array_or_single(value, hosted_field);
+    let public = string_array_or_single(value, public_field);
+    (0..hosted.len().max(public.len()))
+        .map(|index| MediaReference {
+            hosted_reference: hosted.get(index).cloned(),
+            public_reference: public.get(index).cloned(),
+        })
+        .collect()
+}
+
+fn media_reference(
+    value: &Value,
+    hosted_field: &str,
+    public_field: &str,
+) -> Option<MediaReference> {
+    let hosted = string_field(value, hosted_field);
+    let public = string_field(value, public_field);
+    (hosted.is_some() || public.is_some()).then_some(MediaReference {
+        hosted_reference: hosted,
+        public_reference: public,
+    })
+}
+
+fn string_array_or_single(value: &Value, field: &str) -> Vec<String> {
+    let array = string_array(value, field);
+    if !array.is_empty() {
+        array
+    } else {
+        string_field(value, field).into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +571,10 @@ mod tests {
             "platform_slug": "gb",
             "fs_name": "game.gb",
             "name": "Example Game",
+            "path_screenshots": ["assets/screens/second.jpg", "assets/screens/first.png"],
+            "url_screenshots": ["https://public.example/second.jpg", "https://public.example/first.png"],
+            "path_manual": "assets/manuals/game.pdf",
+            "url_manual": "https://public.example/game.pdf",
             "summary": "A short adventure across five islands.",
             "metadatum": {
                 "rom_id": 42,
@@ -569,6 +613,36 @@ mod tests {
         assert_eq!(record.players.as_deref(), Some("1-2"));
         assert_eq!(record.rating, Some(87));
         assert_eq!(record.release_year, Some(1998));
+    }
+
+    #[test]
+    fn romm_media_is_preserved_in_provider_order_without_fetching_it() {
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &rom_with_enrichment(),
+            "server",
+            &no_mappings(),
+            1,
+            &mut report,
+        )
+        .expect("a record with an id normalises");
+        let artwork = record.artwork.expect("media keeps the artwork envelope");
+        assert_eq!(artwork.screenshots.len(), 2);
+        assert_eq!(
+            artwork.screenshots[0].hosted_reference.as_deref(),
+            Some("assets/screens/second.jpg")
+        );
+        assert_eq!(
+            artwork.screenshots[1].hosted_reference.as_deref(),
+            Some("assets/screens/first.png")
+        );
+        assert_eq!(
+            artwork
+                .manual
+                .as_ref()
+                .and_then(|m| m.hosted_reference.as_deref()),
+            Some("assets/manuals/game.pdf")
+        );
     }
 
     #[test]

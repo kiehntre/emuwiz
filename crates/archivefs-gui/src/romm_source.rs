@@ -92,6 +92,10 @@ pub(crate) enum RommOperation {
         local_path: std::path::PathBuf,
         romm_game_id: String,
     },
+    LoadScreenshot {
+        local_path: std::path::PathBuf,
+        romm_game_id: String,
+    },
 }
 
 impl RommOperation {
@@ -115,6 +119,7 @@ impl RommOperation {
                 // reports separately. Neither changes identity.
                 | Self::ResolveGame { .. }
                 | Self::LoadCover { .. }
+                | Self::LoadScreenshot { .. }
         )
     }
 
@@ -136,6 +141,7 @@ impl RommOperation {
                 | Self::Refresh
                 | Self::Preview { .. }
                 | Self::LoadCover { .. }
+                | Self::LoadScreenshot { .. }
         )
     }
 
@@ -170,6 +176,7 @@ impl RommOperation {
             Self::ResolveGame { .. } => "Looking up the selected game in RomM",
             Self::VerifyLocalFile { .. } => "Verifying the local file",
             Self::LoadCover { .. } => "Loading a cover",
+            Self::LoadScreenshot { .. } => "Loading a screenshot",
         }
     }
 }
@@ -212,6 +219,7 @@ pub(crate) enum RommOperationOutcome {
     GameIdentity(Box<crate::romm_game::GameIdentityPanel>),
     Verified(Box<crate::romm_game::VerificationOutcomeView>),
     Cover(Box<crate::romm_game::CoverOutcome>),
+    Screenshot(Box<crate::romm_game::CoverOutcome>),
 }
 
 /// The connection test, reduced to what the card shows. Built in the worker so no
@@ -1003,6 +1011,13 @@ pub(crate) fn build_result_view(
         Ok(RommOperationOutcome::Cover(outcome)) => RommResultView {
             succeeded: matches!(outcome.state, crate::romm_game::CoverState::Ready(_)),
             headline: "Cover loaded".to_string(),
+            rows: Vec::new(),
+            notes: vec![outcome.state.line()],
+            informational: false,
+        },
+        Ok(RommOperationOutcome::Screenshot(outcome)) => RommResultView {
+            succeeded: matches!(outcome.state, crate::romm_game::CoverState::Ready(_)),
+            headline: "Screenshot loaded".to_string(),
             rows: Vec::new(),
             notes: vec![outcome.state.line()],
             informational: false,

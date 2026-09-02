@@ -99,6 +99,7 @@ pub const LAST_USED_WRITE_INTERVAL_SECONDS: i64 = 3600;
 #[derive(Debug, Clone, Copy)]
 pub struct ArtworkRequest<'a> {
     pub provider_game_id: &'a str,
+    pub kind: ArtworkKind,
     /// RomM's own small-cover path. The only fetchable reference.
     pub small_reference: Option<&'a str>,
     /// Whatever scraper URL RomM recorded. Kept for provenance, never fetched.
@@ -111,10 +112,26 @@ impl<'a> ArtworkRequest<'a> {
         let artwork = record.artwork.as_ref();
         Self {
             provider_game_id: &record.provider_game_id,
+            kind: ArtworkKind::Cover,
             small_reference: artwork.and_then(|art| art.small_reference.as_deref()),
             public_reference: artwork.map(|art| art.reference.as_str()),
         }
     }
+
+    pub fn from_media(provider_game_id: &'a str, media: &'a super::model::MediaReference) -> Self {
+        Self {
+            provider_game_id,
+            kind: ArtworkKind::Screenshot,
+            small_reference: media.hosted_reference.as_deref(),
+            public_reference: media.public_reference.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkKind {
+    Cover,
+    Screenshot,
 }
 
 /// Why a thumbnail is not available.
@@ -588,6 +605,8 @@ impl ArtworkCache {
         digest.update(server_id.as_bytes());
         digest.update(b"\0");
         digest.update(request.provider_game_id.as_bytes());
+        digest.update(b"\0");
+        digest.update([request.kind as u8]);
         digest.update(b"\0");
         digest.update(artwork_identity(request).as_bytes());
         digest

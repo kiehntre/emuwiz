@@ -771,6 +771,8 @@ fn a_record_with_only_a_public_scraper_link_is_never_fetchable() {
     public_only.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     assert_eq!(
         availability_of(&public_only),
@@ -788,6 +790,8 @@ fn a_record_with_romms_own_small_cover_is_fetchable() {
     fetchable.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: Some("assets/romm/resources/small.png".to_string()),
+        screenshots: Vec::new(),
+        manual: None,
     });
     assert_eq!(availability_of(&fetchable), ArtworkAvailability::Fetchable);
     assert!(
@@ -1132,6 +1136,8 @@ fn no_view_model_can_carry_a_token_or_a_url() {
     with_artwork.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: Some("assets/romm/resources/small.png?ts=1 2".to_string()),
+        screenshots: Vec::new(),
+        manual: None,
     });
     let panel = resolve(
         vec![with_artwork],
@@ -1429,6 +1435,8 @@ fn a_public_only_cover_is_explained_rather_than_fetched() {
     public_only.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: None,
+        screenshots: Vec::new(),
+        manual: None,
     });
     let mut state = GamePanelState::default();
     state.focus(Some(Path::new(LOCAL)));
@@ -1459,6 +1467,8 @@ fn a_visible_romm_thumbnail_is_requested_once_but_public_artwork_is_not() {
     fetchable.artwork = Some(ArtworkReference {
         reference: "https://images.igdb.com/cover.jpg".to_string(),
         small_reference: Some("assets/romm/resources/small.png".to_string()),
+        screenshots: Vec::new(),
+        manual: None,
     });
     let mut state = GamePanelState::default();
     state.focus(Some(Path::new(LOCAL)));

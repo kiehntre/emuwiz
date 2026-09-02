@@ -9108,6 +9108,14 @@ impl ArchiveFsApp {
                     // panel result rather than a source-card outcome banner.
                     true
                 }
+                RommOperationOutcome::Screenshot(outcome) => {
+                    if self.romm_game.accepts_cover(outcome) {
+                        self.romm_game.screenshot_texture = None;
+                        self.romm_game.screenshot_key = None;
+                        self.romm_game.screenshot = outcome.state.clone();
+                    }
+                    true
+                }
                 _ => false,
             };
             if landed {
@@ -9763,6 +9771,17 @@ impl ArchiveFsApp {
                     },
                 ) {
                     self.romm_game.cover = crate::romm_game::CoverState::Loading;
+                }
+            }
+            GamePanelRequest::LoadScreenshot { romm_game_id } => {
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadScreenshot {
+                        local_path,
+                        romm_game_id,
+                    },
+                ) {
+                    self.romm_game.screenshot = crate::romm_game::CoverState::Loading;
                 }
             }
             GamePanelRequest::Cancel => self.cancel_romm_operation(),
@@ -33108,6 +33127,16 @@ fn run_romm_operation(
                 return Ok(RommOperationOutcome::Cover(Box::new(outcome)));
             }
         }
+        RommOperation::LoadScreenshot {
+            local_path,
+            romm_game_id,
+        } => {
+            if let Some(outcome) =
+                screenshot_from_cache(&api, &identity_root, &settings, local_path, romm_game_id)?
+            {
+                return Ok(RommOperationOutcome::Screenshot(Box::new(outcome)));
+            }
+        }
         _ => {}
     }
 
@@ -33140,6 +33169,23 @@ fn run_romm_operation(
             romm_game_id,
             cancellation,
         )?)));
+    }
+    if let RommOperation::LoadScreenshot {
+        local_path,
+        romm_game_id,
+    } = operation
+    {
+        return Ok(RommOperationOutcome::Screenshot(Box::new(
+            fetch_screenshot(
+                &api,
+                &identity_root,
+                &source,
+                &transport,
+                local_path,
+                romm_game_id,
+                cancellation,
+            )?,
+        )));
     }
 
     let capability = api
@@ -33360,6 +33406,7 @@ fn run_romm_operation(
         | RommOperation::ResolveGame { .. }
         | RommOperation::VerifyLocalFile { .. }
         | RommOperation::LoadCover { .. } => unreachable!("handled before this match"),
+        RommOperation::LoadScreenshot { .. } => unreachable!("handled before this match"),
     }
 }
 
@@ -33697,6 +33744,94 @@ fn fetch_cover(
     };
     // Read after the fetch rather than incremented, so a clear that ran alongside it
     // cannot leave a figure on screen that was never true.
+    let stats = cache.stats(source.server_id());
+    Ok(crate::romm_game::CoverOutcome {
+        local_path: local_path.to_path_buf(),
+        romm_game_id: romm_game_id.to_string(),
+        state,
+        cached_items: stats.items as u64,
+        cached_bytes: stats.bytes,
+    })
+}
+
+fn screenshot_from_cache(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    settings: &archivefs_core::identity_source::settings::ProviderSettings,
+    local_path: &Path,
+    romm_game_id: &str,
+) -> Result<Option<crate::romm_game::CoverOutcome>, String> {
+    use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
+    use archivefs_core::identity_source::hashing::LocalHashCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let Some(media) = record
+        .artwork
+        .as_ref()
+        .and_then(|artwork| artwork.screenshots.first())
+    else {
+        return Ok(Some(crate::romm_game::CoverOutcome {
+            local_path: local_path.to_path_buf(),
+            romm_game_id: romm_game_id.to_string(),
+            state: crate::romm_game::CoverState::Failed("No screenshot is available.".to_string()),
+            cached_items: 0,
+            cached_bytes: 0,
+        }));
+    };
+    let cache = ArtworkCache::new(identity_root, IdentityProvider::Romm);
+    let status = api.status(&settings.source, &LocalHashCache::new(), false);
+    let server_id = status
+        .server_id
+        .clone()
+        .unwrap_or_else(|| settings.source.url.clone());
+    let stats = cache.stats(&server_id);
+    let request = ArtworkRequest::from_media(&record.provider_game_id, media);
+    let Some(thumbnail) = cache.lookup(&server_id, &request) else {
+        return Ok(None);
+    };
+    let state = crate::romm_game::decode_thumbnail(&thumbnail, true)
+        .map(|image| crate::romm_game::CoverState::Ready(Box::new(image)))
+        .unwrap_or_else(crate::romm_game::CoverState::Failed);
+    Ok(Some(crate::romm_game::CoverOutcome {
+        local_path: local_path.to_path_buf(),
+        romm_game_id: romm_game_id.to_string(),
+        state,
+        cached_items: stats.items as u64,
+        cached_bytes: stats.bytes,
+    }))
+}
+
+fn fetch_screenshot(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    source: &archivefs_core::identity_source::romm::config::ValidatedRommSource,
+    transport: &archivefs_core::identity_source::romm::client::UreqTransport,
+    local_path: &Path,
+    romm_game_id: &str,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<crate::romm_game::CoverOutcome, String> {
+    use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRefusal, ArtworkRequest};
+    use archivefs_core::identity_source::model::IdentityProvider;
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let media = record
+        .artwork
+        .as_ref()
+        .and_then(|artwork| artwork.screenshots.first())
+        .ok_or_else(|| "No screenshot is available.".to_string())?;
+    let cache = ArtworkCache::new(identity_root, IdentityProvider::Romm);
+    let request = ArtworkRequest::from_media(&record.provider_game_id, media);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default();
+    let state = match cache.fetch(source, transport, &request, now, Some(cancellation)) {
+        Ok(thumbnail) => crate::romm_game::decode_thumbnail(&thumbnail, false)
+            .map(|image| crate::romm_game::CoverState::Ready(Box::new(image)))
+            .unwrap_or_else(crate::romm_game::CoverState::Failed),
+        Err(ArtworkRefusal::Cancelled) => crate::romm_game::CoverState::Cancelled,
+        Err(refusal) => crate::romm_game::CoverState::Failed(refusal.detail()),
+    };
     let stats = cache.stats(source.server_id());
     Ok(crate::romm_game::CoverOutcome {
         local_path: local_path.to_path_buf(),

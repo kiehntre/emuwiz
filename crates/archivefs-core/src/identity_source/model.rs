@@ -117,6 +117,22 @@ pub struct ArtworkReference {
     pub reference: String,
     /// The smaller of the provider's variants, when it publishes more than one.
     pub small_reference: Option<String>,
+    /// RomM-hosted screenshot references, kept in provider order.
+    #[serde(default)]
+    pub screenshots: Vec<MediaReference>,
+    /// The manual reference published by RomM, if any.
+    #[serde(default)]
+    pub manual: Option<MediaReference>,
+}
+
+/// A non-cover media reference published by RomM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaReference {
+    /// A provider-hosted path. This is the only reference eligible for EmuWiz's
+    /// approved RomM-origin fetch policy.
+    pub hosted_reference: Option<String>,
+    /// A public/provider-derived reference retained as provenance only.
+    pub public_reference: Option<String>,
 }
 
 /// How well an external record agrees with what EmuWiz can see locally.
