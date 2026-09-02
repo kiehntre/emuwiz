@@ -172,6 +172,13 @@ pub(crate) fn gamer_primary_action_short_label(action: &GamerPrimaryAction) -> &
 pub(crate) enum GamerReadiness<'a> {
     /// Pending mount - the media is usable once mounted.
     Mount,
+    /// A container needs a bounded read-only preparation pass before it can
+    /// expose Play.
+    Prepare,
+    /// More than one safe member was found; the user must choose one.
+    ChooseMember {
+        candidates: &'a [archivefs_core::PreparedMemberCandidate],
+    },
     /// Currently mounted.
     Unmount,
     /// Media usable and a safe launch plan exists.
@@ -206,11 +213,47 @@ pub(crate) fn gamer_readiness<'a>(
     }
 }
 
+/// Archive containers have one extra, explicit preparation step. Mount state
+/// alone is never treated as launch readiness: Play is available only after a
+/// specific member has been retained and the shared planner accepts it.
+pub(crate) fn gamer_archive_readiness<'a>(
+    mount_state: MountState,
+    prepared: bool,
+    play_action: &'a launch_readiness_page::GamerPlayAction,
+    member_choices: Option<&'a [archivefs_core::PreparedMemberCandidate]>,
+) -> GamerReadiness<'a> {
+    match gamer_primary_action(mount_state) {
+        GamerPrimaryAction::Blocked(reason) => GamerReadiness::NeedsAttention { reason },
+        GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount if member_choices.is_some() => {
+            GamerReadiness::ChooseMember {
+                candidates: member_choices.expect("checked above"),
+            }
+        }
+        GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount if !prepared => {
+            GamerReadiness::Prepare
+        }
+        GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount => {
+            // A stale prepared state cannot make an unmounted archive ready.
+            GamerReadiness::Prepare
+        }
+        GamerPrimaryAction::NoMountingNeeded => match play_action {
+            launch_readiness_page::GamerPlayAction::Ready(request) => {
+                GamerReadiness::Ready { request }
+            }
+            launch_readiness_page::GamerPlayAction::Blocked(reason) => {
+                GamerReadiness::NeedsSetup { reason }
+            }
+        },
+    }
+}
+
 /// The one- or two-word status word for a [`GamerReadiness`] - the text on
 /// the card's status line, kept in lockstep with its primary action.
 pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'static str {
     match readiness {
         GamerReadiness::Mount => "Prepare game",
+        GamerReadiness::Prepare => "Ready to prepare",
+        GamerReadiness::ChooseMember { .. } => "Choose game file",
         GamerReadiness::Unmount => "Mounted",
         GamerReadiness::Ready { .. } => "Ready to play",
         GamerReadiness::NeedsSetup { .. } => "Needs setup",
@@ -277,6 +320,8 @@ pub(crate) fn gamer_undo_available(
 
 pub(crate) enum GamerViewAction {
     Operation(OperationRequest),
+    Prepare(PathBuf),
+    SelectArchiveMember(PathBuf, String),
     Play(archivefs_core::launch::RetroArchLaunchRequest),
     OpenCheatsMods(PathBuf),
     /// The folder to copy to the clipboard - "Copy folder location" (§2.1's
@@ -870,6 +915,9 @@ pub(crate) struct GamerViewViewState<'a> {
     /// (as "no game information available" wording), never network calls.
     pub(crate) game_metadata: Option<&'a crate::game_metadata::GameMetadataResult>,
     pub(crate) identity_status: Option<GamerIdentityStatus>,
+    pub(crate) prepared_member: bool,
+    pub(crate) member_choices: Option<&'a [archivefs_core::PreparedMemberCandidate]>,
+    pub(crate) preparation_message: Option<&'a str>,
     pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
     pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
 }
@@ -1026,6 +1074,9 @@ pub(crate) fn show_gamer_view(
         cover_requests,
         game_metadata,
         identity_status,
+        prepared_member,
+        member_choices,
+        preparation_message,
         play_action,
         retroarch_launch_state,
     } = view_state;
@@ -1546,8 +1597,16 @@ pub(crate) fn show_gamer_view(
                                     // below, so the card can never say
                                     // "Ready to play" while the action is
                                     // blocked.
-                                    let readiness =
-                                        gamer_readiness(record.mount_state, play_action);
+                                    let readiness = if record.is_mount_input() {
+                                        gamer_archive_readiness(
+                                            record.mount_state,
+                                            prepared_member,
+                                            play_action,
+                                            member_choices,
+                                        )
+                                    } else {
+                                        gamer_readiness(record.mount_state, play_action)
+                                    };
                                     featured_meta_line(
                                         ui,
                                         gamer_readiness_short_label(&readiness).to_string(),
@@ -1613,23 +1672,51 @@ pub(crate) fn show_gamer_view(
                                     // needs right now, and the first control a
                                     // keyboard reaches in this panel.
                                     match &readiness {
-                                        GamerReadiness::Mount => {
+                                        GamerReadiness::Mount | GamerReadiness::Prepare => {
                                             ui.label(
                                                 egui::RichText::new(
                                                     "Temporarily makes this archived game available. The original is unchanged.",
                                                 )
                                                 .color(theme::muted(ui)),
                                             );
+                                            if let Some(message) = preparation_message {
+                                                ui.colored_label(
+                                                    ui.visuals().warn_fg_color,
+                                                    message,
+                                                );
+                                            }
                                             if featured_primary_button(ui, "Prepare game", !busy)
                                                 .clicked()
                                             {
-                                                action = Some(GamerViewAction::Operation(
-                                                    OperationRequest {
-                                                        action: ArchiveAction::Mount,
-                                                        archive_path: archive_path.clone(),
-                                                        cleanup_after_unmount,
-                                                    },
+                                                action = Some(GamerViewAction::Prepare(
+                                                    archive_path.clone(),
                                                 ));
+                                            }
+                                        }
+                                        GamerReadiness::ChooseMember { candidates } => {
+                                            ui.label("Choose the game file to play:");
+                                            for candidate in *candidates {
+                                                let label = format!(
+                                                    "{} ({})",
+                                                    candidate.member_name,
+                                                    format_size(Some(candidate.size_bytes)),
+                                                );
+                                                if widgets::action_button(
+                                                    ui,
+                                                    &label,
+                                                    widgets::ActionStyle::Secondary,
+                                                    !busy,
+                                                )
+                                                .on_hover_text(&candidate.reason)
+                                                .clicked()
+                                                {
+                                                    action = Some(
+                                                        GamerViewAction::SelectArchiveMember(
+                                                            archive_path.clone(),
+                                                            candidate.member_name.clone(),
+                                                        ),
+                                                    );
+                                                }
                                             }
                                         }
                                         GamerReadiness::Unmount => {
@@ -1735,6 +1822,18 @@ pub(crate) fn show_gamer_view(
                                         }
                                     };
                                     let mut body = |ui: &mut egui::Ui| {
+                                        if record.is_mount_input()
+                                            && record.mount_state == MountState::Mounted
+                                            && secondary(ui, "Unmount").clicked()
+                                        {
+                                            action = Some(GamerViewAction::Operation(
+                                                OperationRequest {
+                                                    action: ArchiveAction::Unmount,
+                                                    archive_path: archive_path.clone(),
+                                                    cleanup_after_unmount,
+                                                },
+                                            ));
+                                        }
                                         if secondary(ui, "Cheats & Mods").clicked() {
                                             action = Some(GamerViewAction::OpenCheatsMods(
                                                 archive_path.clone(),
@@ -1853,6 +1952,33 @@ mod game_metadata_enrichment_tests {
             "Prepare game"
         );
         assert!(matches!(action, GamerPrimaryAction::Mount));
+    }
+
+    #[test]
+    fn mounted_archive_shows_prepare_until_a_member_is_retained() {
+        let play_action = launch_readiness_page::GamerPlayAction::Blocked(
+            "archive member has not been resolved".to_string(),
+        );
+        let readiness = gamer_archive_readiness(MountState::Mounted, false, &play_action, None);
+        assert!(matches!(readiness, GamerReadiness::Prepare));
+        assert_eq!(gamer_readiness_short_label(&readiness), "Ready to prepare");
+    }
+
+    #[test]
+    fn multiple_archive_members_show_a_chooser_instead_of_unmount_or_play() {
+        let candidates = vec![archivefs_core::PreparedMemberCandidate {
+            member_name: "disc1.iso".to_string(),
+            size_bytes: 10,
+            reason: "ISO media accepted for PlayStation 2".to_string(),
+        }];
+        let play_action = launch_readiness_page::GamerPlayAction::Blocked(
+            "archive member has not been resolved".to_string(),
+        );
+        let readiness =
+            gamer_archive_readiness(MountState::Mounted, false, &play_action, Some(&candidates));
+        assert!(
+            matches!(readiness, GamerReadiness::ChooseMember { candidates } if candidates.len() == 1)
+        );
     }
 
     #[test]

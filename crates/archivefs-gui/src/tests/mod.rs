@@ -1203,6 +1203,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         library_column_widths: LibraryColumnWidths::default(),
         archive_inspector: None,
         archive_inspector_generation: RefreshGeneration::INITIAL,
+        archive_preparation: ArchivePreparationState::default(),
+        archive_preparation_generation: RefreshGeneration::INITIAL,
         // Hermetic literal default, matching every other field in
         // this test-only constructor - never `load_gui_mode()`.
         ui_mode: GuiMode::default(),

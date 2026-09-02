@@ -3215,7 +3215,7 @@ fn every_secondary_action_is_still_present() {
 #[test]
 fn mount_is_the_first_actionable_widget_in_the_panel() {
     // Artwork is painted, never allocated as a control, so the first thing a
-    // keyboard reaches inside the panel is Mount - and the order after it is
+    // keyboard reaches inside the panel is Prepare game - and the order after it is
     // the reading order.
     let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let mut order = Vec::new();
@@ -3429,7 +3429,7 @@ fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
 }
 
 #[test]
-fn the_panel_keeps_mount_and_the_actions_on_screen_at_every_supported_size() {
+fn the_panel_keeps_prepare_and_the_actions_on_screen_at_every_supported_size() {
     for (width, height) in [
         (1280.0, 720.0),
         (1366.0, 768.0),

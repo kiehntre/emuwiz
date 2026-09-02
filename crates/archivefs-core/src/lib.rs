@@ -54,6 +54,13 @@ pub use inspector::{
     is_inspectable, is_known_disc_companion,
 };
 
+pub mod archive_member_resolver;
+pub use archive_member_resolver::{
+    ArchiveMemberResolution, MAX_PREPARE_CANDIDATES, MAX_PREPARE_MEMBER_COMPONENTS,
+    MAX_PREPARE_MEMBER_PATH_BYTES, PreparedMemberCandidate, prepared_member_path,
+    resolve_prepared_members,
+};
+
 pub mod game_identity;
 pub mod scummvm_detection;
 

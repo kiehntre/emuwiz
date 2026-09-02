@@ -3929,6 +3929,45 @@ struct ArchiveInspectorState {
     path_column_width: f32,
 }
 
+type ArchivePreparationMessage = (
+    RefreshGeneration,
+    Result<archivefs_core::ArchiveMemberResolution, String>,
+);
+
+/// Session-only launch preparation. The archive itself is never rewritten or
+/// extracted; this retains the exact member selected from the existing mount.
+#[derive(Default)]
+enum ArchivePreparationState {
+    #[default]
+    Idle,
+    Inspecting {
+        archive_path: PathBuf,
+        identity: archivefs_core::ArchiveIdentity,
+        generation: RefreshGeneration,
+        receiver: Receiver<ArchivePreparationMessage>,
+    },
+    Choosing {
+        archive_path: PathBuf,
+        identity: archivefs_core::ArchiveIdentity,
+        candidates: Vec<archivefs_core::PreparedMemberCandidate>,
+    },
+    PendingMount {
+        archive_path: PathBuf,
+        identity: archivefs_core::ArchiveIdentity,
+        candidate: archivefs_core::PreparedMemberCandidate,
+    },
+    Ready {
+        archive_path: PathBuf,
+        identity: archivefs_core::ArchiveIdentity,
+        mount_path: PathBuf,
+        candidate: archivefs_core::PreparedMemberCandidate,
+    },
+    Failed {
+        archive_path: PathBuf,
+        message: String,
+    },
+}
+
 impl ArchiveInspectorState {
     fn loading(
         archive_path: PathBuf,
@@ -4728,6 +4767,8 @@ struct ArchiveFsApp {
     /// report instead of re-inspecting from scratch.
     archive_inspector: Option<ArchiveInspectorState>,
     archive_inspector_generation: RefreshGeneration,
+    archive_preparation: ArchivePreparationState,
+    archive_preparation_generation: RefreshGeneration,
     /// docs/GUI_NAVIGATION_RESET_DESIGN.md's mode switch - a view-layer
     /// concept only, persisted independently of every other field (see
     /// `load_gui_mode`/`save_gui_mode`).
@@ -5091,6 +5132,8 @@ impl ArchiveFsApp {
             library_column_widths: LibraryColumnWidths::default(),
             archive_inspector: None,
             archive_inspector_generation: RefreshGeneration::INITIAL,
+            archive_preparation: ArchivePreparationState::default(),
+            archive_preparation_generation: RefreshGeneration::INITIAL,
             ui_mode: load_gui_mode(),
             gamer_view_screen: GamerViewScreen::default(),
             mount_all_typed_count: String::new(),
@@ -5334,6 +5377,334 @@ impl ArchiveFsApp {
                 Err(message) => ArchiveInspectorStatus::Error(message),
             };
         }
+    }
+
+    fn current_archive_record(&self, archive_path: &Path) -> Option<ArchiveRecord> {
+        match &self.state {
+            LoadState::Ready(data) => data
+                .records
+                .iter()
+                .find(|record| record.mount_plan.archive.path == archive_path)
+                .cloned(),
+            LoadState::Loading { previous, .. } => previous.as_ref().and_then(|data| {
+                data.records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == archive_path)
+                    .cloned()
+            }),
+            LoadState::Error(_) => None,
+        }
+    }
+
+    fn start_archive_preparation(&mut self, context: egui::Context, archive_path: PathBuf) {
+        let Some(record) = self.current_archive_record(&archive_path) else {
+            self.archive_preparation = ArchivePreparationState::Failed {
+                archive_path,
+                message:
+                    "This game is no longer in the current library snapshot. Refresh and try again."
+                        .to_string(),
+            };
+            return;
+        };
+        let platform = record
+            .metadata
+            .platform
+            .clone()
+            .or_else(|| record.identity.platform.clone());
+        self.archive_preparation_generation = self.archive_preparation_generation.next();
+        let generation = self.archive_preparation_generation;
+        let (sender, receiver) = mpsc::channel();
+        let job_path = archive_path.clone();
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                archivefs_core::inspect_archive(&job_path)
+                    .map(|report| {
+                        archivefs_core::resolve_prepared_members(&report, platform.as_deref())
+                    })
+                    .map_err(|error| error.to_string())
+            }))
+            .unwrap_or_else(|_| {
+                Err("archive preparation stopped while inspecting this archive".to_string())
+            });
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+        self.archive_preparation = ArchivePreparationState::Inspecting {
+            archive_path,
+            identity: record.identity,
+            generation,
+            receiver,
+        };
+    }
+
+    fn poll_archive_preparation(&mut self, context: &egui::Context) {
+        let result = match &self.archive_preparation {
+            ArchivePreparationState::Inspecting {
+                generation,
+                receiver,
+                ..
+            } => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some((
+                    *generation,
+                    Err("archive preparation worker stopped unexpectedly".to_string()),
+                )),
+            },
+            _ => None,
+        };
+        let Some((generation, result)) = result else {
+            return;
+        };
+        if generation != self.archive_preparation_generation {
+            return;
+        }
+        let ArchivePreparationState::Inspecting { archive_path, .. } = &self.archive_preparation
+        else {
+            return;
+        };
+        let archive_path = archive_path.clone();
+        match result {
+            Ok(archivefs_core::ArchiveMemberResolution::One(candidate)) => {
+                self.begin_archive_member_preparation(context, archive_path, candidate);
+            }
+            Ok(archivefs_core::ArchiveMemberResolution::Multiple(candidates)) => {
+                let identity = self
+                    .current_archive_record(&archive_path)
+                    .map(|record| record.identity);
+                if let Some(identity) = identity {
+                    self.archive_preparation = ArchivePreparationState::Choosing {
+                        archive_path,
+                        identity,
+                        candidates,
+                    };
+                } else {
+                    self.archive_preparation = ArchivePreparationState::Failed {
+                        archive_path,
+                        message: "The selected game changed while its archive was being inspected. Refresh and try again.".to_string(),
+                    };
+                }
+            }
+            Ok(archivefs_core::ArchiveMemberResolution::None(message)) | Err(message) => {
+                self.archive_preparation = ArchivePreparationState::Failed {
+                    archive_path,
+                    message,
+                };
+            }
+        }
+    }
+
+    fn begin_archive_member_preparation(
+        &mut self,
+        context: &egui::Context,
+        archive_path: PathBuf,
+        candidate: archivefs_core::PreparedMemberCandidate,
+    ) {
+        let Some(record) = self.current_archive_record(&archive_path) else {
+            self.archive_preparation = ArchivePreparationState::Failed {
+                archive_path,
+                message:
+                    "This game is no longer in the current library snapshot. Refresh and try again."
+                        .to_string(),
+            };
+            return;
+        };
+        let identity = record.identity.clone();
+        if record.mount_state == MountState::Mounted {
+            match archivefs_core::prepared_member_path(
+                &record.mount_plan.mount_path,
+                &candidate.member_name,
+            ) {
+                Ok(_member_path) => {
+                    self.archive_preparation = ArchivePreparationState::Ready {
+                        archive_path,
+                        identity,
+                        mount_path: record.mount_plan.mount_path,
+                        candidate,
+                    };
+                }
+                Err(message) => {
+                    self.archive_preparation = ArchivePreparationState::Failed {
+                        archive_path,
+                        message,
+                    };
+                }
+            }
+            return;
+        }
+        self.archive_preparation = ArchivePreparationState::PendingMount {
+            archive_path: archive_path.clone(),
+            identity,
+            candidate,
+        };
+        let started = self.start_operation(
+            context.clone(),
+            ArchiveAction::Mount,
+            archive_path.clone(),
+            false,
+        );
+        if !started {
+            self.archive_preparation = ArchivePreparationState::Failed {
+                archive_path,
+                message: "Another archive operation is already running. Try Prepare game again when it finishes.".to_string(),
+            };
+        }
+    }
+
+    fn select_archive_member(
+        &mut self,
+        context: &egui::Context,
+        archive_path: PathBuf,
+        member_name: String,
+    ) {
+        let candidate = match &self.archive_preparation {
+            ArchivePreparationState::Choosing {
+                archive_path: state_path,
+                candidates,
+                ..
+            } if *state_path == archive_path => candidates
+                .iter()
+                .find(|candidate| candidate.member_name == member_name)
+                .cloned(),
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            self.begin_archive_member_preparation(context, archive_path, candidate);
+        }
+    }
+
+    fn reconcile_archive_preparation(&mut self) {
+        let state_path = match &self.archive_preparation {
+            ArchivePreparationState::Idle => None,
+            ArchivePreparationState::Inspecting { archive_path, .. }
+            | ArchivePreparationState::Choosing { archive_path, .. }
+            | ArchivePreparationState::PendingMount { archive_path, .. }
+            | ArchivePreparationState::Ready { archive_path, .. }
+            | ArchivePreparationState::Failed { archive_path, .. } => Some(archive_path),
+        };
+        if state_path != self.archive_context.focused.as_ref() {
+            if state_path.is_some() {
+                self.archive_preparation_generation = self.archive_preparation_generation.next();
+                self.archive_preparation = ArchivePreparationState::Idle;
+            }
+            return;
+        }
+        let Some(path) = state_path.cloned() else {
+            return;
+        };
+        let Some(record) = self.current_archive_record(&path) else {
+            self.archive_preparation = ArchivePreparationState::Idle;
+            return;
+        };
+        let state = std::mem::take(&mut self.archive_preparation);
+        self.archive_preparation = match state {
+            ArchivePreparationState::PendingMount {
+                archive_path,
+                identity,
+                candidate,
+            } if record.mount_state == MountState::Mounted => {
+                self.finalize_archive_member(archive_path, identity, candidate, &record)
+            }
+            ArchivePreparationState::Choosing { identity, .. } if identity != record.identity => {
+                ArchivePreparationState::Idle
+            }
+            ArchivePreparationState::Inspecting { identity, .. } if identity != record.identity => {
+                ArchivePreparationState::Idle
+            }
+            ArchivePreparationState::Ready {
+                archive_path: _archive_path,
+                identity,
+                mount_path,
+                candidate,
+            } if identity != record.identity
+                || record.mount_state != MountState::Mounted
+                || mount_path != record.mount_plan.mount_path
+                || archivefs_core::prepared_member_path(&mount_path, &candidate.member_name)
+                    .is_err() =>
+            {
+                ArchivePreparationState::Idle
+            }
+            other => other,
+        };
+    }
+
+    fn finalize_archive_member(
+        &self,
+        archive_path: PathBuf,
+        identity: archivefs_core::ArchiveIdentity,
+        candidate: archivefs_core::PreparedMemberCandidate,
+        record: &ArchiveRecord,
+    ) -> ArchivePreparationState {
+        match archivefs_core::prepared_member_path(
+            &record.mount_plan.mount_path,
+            &candidate.member_name,
+        ) {
+            Ok(_) => ArchivePreparationState::Ready {
+                archive_path,
+                identity,
+                mount_path: record.mount_plan.mount_path.clone(),
+                candidate,
+            },
+            Err(message) => ArchivePreparationState::Failed {
+                archive_path,
+                message,
+            },
+        }
+    }
+
+    fn archive_preparation_view(
+        &self,
+        archive_path: &Path,
+    ) -> (
+        bool,
+        Option<Vec<archivefs_core::PreparedMemberCandidate>>,
+        Option<String>,
+    ) {
+        match &self.archive_preparation {
+            ArchivePreparationState::Ready {
+                archive_path: path, ..
+            } if path == archive_path => (true, None, None),
+            ArchivePreparationState::Choosing {
+                archive_path: path,
+                candidates,
+                ..
+            } if path == archive_path => (false, Some(candidates.clone()), None),
+            ArchivePreparationState::Inspecting {
+                archive_path: path, ..
+            } if path == archive_path => (
+                false,
+                None,
+                Some("Inspecting this archive safely…".to_string()),
+            ),
+            ArchivePreparationState::PendingMount {
+                archive_path: path, ..
+            } if path == archive_path => (false, None, Some("Preparing this game…".to_string())),
+            ArchivePreparationState::Failed {
+                archive_path: path,
+                message,
+            } if path == archive_path => (false, None, Some(message.clone())),
+            _ => (false, None, None),
+        }
+    }
+
+    fn resolved_archive_member_path(&self, record: &ArchiveRecord) -> Option<PathBuf> {
+        let ArchivePreparationState::Ready {
+            archive_path,
+            identity,
+            mount_path,
+            candidate,
+        } = &self.archive_preparation
+        else {
+            return None;
+        };
+        if archive_path != &record.mount_plan.archive.path
+            || identity != &record.identity
+            || mount_path != &record.mount_plan.mount_path
+            || record.mount_state != MountState::Mounted
+        {
+            return None;
+        }
+        archivefs_core::prepared_member_path(mount_path, &candidate.member_name).ok()
     }
 
     fn poll_load(&mut self, _context: &egui::Context) {
@@ -6813,14 +7184,16 @@ impl ArchiveFsApp {
                     .find(|record| record.mount_plan.archive.path == path)
             })
         });
-        // Archive safety: this first slice never tracks a specific resolved
-        // inner archive member, so a mounted container archive always
-        // stays honestly unresolved/blocked here - see
-        // `evidence_bridge::launch_content_ref_from_archive_record`'s own
-        // doc comment. Never the outer archive path, never guessed.
+        // Archive safety: only the transient, selection-bound preparation
+        // state may provide an inner member. The bridge still refuses it
+        // unless the record is genuinely mounted.
         let content = match focused_record {
             Some(record) => {
-                archivefs_core::launch::launch_content_ref_from_archive_record(record, None)
+                let member = self.resolved_archive_member_path(record);
+                archivefs_core::launch::launch_content_ref_from_archive_record(
+                    record,
+                    member.as_deref(),
+                )
             }
             // Live library data isn't loaded, so content cannot be honestly
             // classified either way - this reads exactly like an
@@ -17156,6 +17529,7 @@ impl ArchiveFsApp {
         self.reconcile_problems_repair_tab();
         self.reconcile_sources_tab();
         self.reconcile_selected_evidence_selection();
+        self.reconcile_archive_preparation();
         self.poll_platform_artwork_task(context);
         self.poll_shared_history();
         // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
@@ -17198,6 +17572,7 @@ impl ArchiveFsApp {
         self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
         self.poll_archive_inspection();
+        self.poll_archive_preparation(context);
         self.poll_selected_evidence();
         self.poll_identity_sources();
         self.poll_plan_preview();
@@ -17877,6 +18252,13 @@ impl ArchiveFsApp {
                         }
                         selected_evidence_page::SelectedEvidenceState::Error { .. } => None,
                     };
+                    let (prepared_member, member_choices_owned, preparation_message_owned) =
+                        focused_archive
+                            .as_deref()
+                            .map(|path| self.archive_preparation_view(path))
+                            .unwrap_or((false, None, None));
+                    let member_choices = member_choices_owned.as_deref();
+                    let preparation_message = preparation_message_owned.as_deref();
                     let gamer_action = show_gamer_view(
                         ui,
                         data,
@@ -17897,6 +18279,9 @@ impl ArchiveFsApp {
                             cover_requests: &mut cover_requests,
                             game_metadata,
                             identity_status: gamer_identity_status,
+                            prepared_member,
+                            member_choices,
+                            preparation_message,
                             play_action: &gamer_play_action,
                             retroarch_launch_state: &mut self.launch_retroarch,
                         },
@@ -17918,10 +18303,28 @@ impl ArchiveFsApp {
                         }
                     }
                     match gamer_action {
+                        Some(GamerViewAction::Prepare(archive_path)) => {
+                            self.start_archive_preparation(context.clone(), archive_path);
+                        }
+                        Some(GamerViewAction::SelectArchiveMember(archive_path, member_name)) => {
+                            self.select_archive_member(
+                                context,
+                                archive_path,
+                                member_name,
+                            );
+                        }
                         Some(GamerViewAction::Play(request)) => {
                             self.launch_retroarch.start(request);
                         }
                         Some(GamerViewAction::Operation(request)) => {
+                            if matches!(
+                                request.action,
+                                ArchiveAction::Unmount | ArchiveAction::LazyUnmount
+                            ) {
+                                self.archive_preparation_generation =
+                                    self.archive_preparation_generation.next();
+                                self.archive_preparation = ArchivePreparationState::Idle;
+                            }
                             requested_action = Some(AppOperationRequest::Archive(request));
                         }
                         Some(GamerViewAction::OpenCheatsMods(archive_path)) => {
