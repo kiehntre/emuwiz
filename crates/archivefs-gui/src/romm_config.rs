@@ -28,6 +28,9 @@ use archivefs_core::identity_source::net_policy::{StaticResolver, validate_endpo
 use archivefs_core::identity_source::path_map::{
     PathMapping, PathMappings, PathTranslation, ProviderPathKind, normalise_prefix,
 };
+use archivefs_core::identity_source::romm::media_mapping::{
+    RommMediaMapping, validate_romm_media_mapping,
+};
 use archivefs_core::identity_source::settings::{
     MAX_CONFIGURED_IMPORT_TIMEOUT_SECONDS, MAX_CONFIGURED_PAGE_SIZE,
     MIN_CONFIGURED_IMPORT_TIMEOUT_SECONDS, MIN_CONFIGURED_PAGE_SIZE, ProviderSettings,
@@ -101,6 +104,8 @@ pub(crate) struct RommConfigDraft {
     pub(crate) import_timeout_seconds: String,
     /// The working copy of the mappings. Not written until the draft is saved.
     pub(crate) mappings: Vec<PathMapping>,
+    pub(crate) media_provider_prefix: String,
+    pub(crate) media_local_root: String,
     pub(crate) new_prefix: String,
     pub(crate) new_destination: String,
     /// A prefix whose replacement is awaiting confirmation.
@@ -136,6 +141,16 @@ impl RommConfigDraft {
                 .as_secs()
                 .to_string(),
             mappings: source.mappings.clone(),
+            media_provider_prefix: source
+                .media_mapping
+                .as_ref()
+                .map(|mapping| mapping.provider_prefix.clone())
+                .unwrap_or_default(),
+            media_local_root: source
+                .media_mapping
+                .as_ref()
+                .map(|mapping| mapping.local_root.display().to_string())
+                .unwrap_or_default(),
             preview_limit: DEFAULT_PREVIEW_LIMIT.to_string(),
             ..Self::default()
         }
@@ -163,6 +178,16 @@ impl RommConfigDraft {
         };
         settings.source.provider_path_kind = self.path_kind;
         settings.source.mappings = self.mappings.clone();
+        let provider_prefix = self.media_provider_prefix.trim();
+        let local_root = self.media_local_root.trim();
+        settings.source.media_mapping = if provider_prefix.is_empty() && local_root.is_empty() {
+            None
+        } else {
+            Some(RommMediaMapping {
+                provider_prefix: provider_prefix.to_string(),
+                local_root: PathBuf::from(local_root),
+            })
+        };
         // The field is prefilled with the *effective* size, so a page size that was
         // never set explicitly would otherwise be written out as though it had been.
         // Leaving it unset when it still matches keeps a no-change save a no-change
@@ -198,6 +223,7 @@ pub(crate) struct RommConfigValidation {
     pub(crate) token: FieldState,
     pub(crate) page_size: FieldState,
     pub(crate) import_timeout_seconds: FieldState,
+    pub(crate) media_mapping: FieldState,
     /// Mappings that the chosen path kind would strand. A non-empty list refuses
     /// the save: mappings that can never match are worse than none.
     pub(crate) stranded_mappings: Vec<String>,
@@ -223,6 +249,7 @@ pub(crate) fn validate_draft(
     });
     let page_size = validate_page_size(&draft.page_size);
     let import_timeout_seconds = validate_import_timeout(&draft.import_timeout_seconds);
+    let media_mapping = validate_media_mapping_draft(draft);
     // A mapping written for the other shape can never match anything, so the save
     // is refused and the offending prefixes are named.
     let stranded_mappings: Vec<String> = draft
@@ -244,6 +271,7 @@ pub(crate) fn validate_draft(
         && !token.is_problem()
         && !page_size.is_problem()
         && !import_timeout_seconds.is_problem()
+        && !media_mapping.is_problem()
         && stranded_mappings.is_empty()
         && mapping_set_problem.is_none();
     RommConfigValidation {
@@ -258,8 +286,32 @@ pub(crate) fn validate_draft(
             page_size
         },
         import_timeout_seconds,
+        media_mapping,
         stranded_mappings,
         can_save,
+    }
+}
+
+fn validate_media_mapping_draft(draft: &RommConfigDraft) -> FieldState {
+    let provider_prefix = draft.media_provider_prefix.trim();
+    let local_root = draft.media_local_root.trim();
+    if provider_prefix.is_empty() && local_root.is_empty() {
+        return FieldState::Good(
+            "Not configured (optional). Remote/cache media remains unchanged.".into(),
+        );
+    }
+    if provider_prefix.is_empty() || local_root.is_empty() {
+        return FieldState::Problem("Enter both the RomM media prefix and the host-visible local root, or clear both to disable local reuse.".into());
+    }
+    match validate_romm_media_mapping(&RommMediaMapping {
+        provider_prefix: provider_prefix.to_string(),
+        local_root: PathBuf::from(local_root),
+    }) {
+        Ok(mapping) => FieldState::Good(format!(
+            "Mapping is readable. Canonical root: {}",
+            mapping.local_root().display()
+        )),
+        Err(error) => FieldState::Problem(error.to_string()),
     }
 }
 
@@ -891,6 +943,40 @@ pub(crate) fn show_config_dialog(
                 widgets::StatusTone::Blocked,
             );
         }
+
+        // --- Optional local media mapping --------------------------------
+        ui.add_space(theme::SECTION_GAP / 2.0);
+        ui.label("Local RomM media (optional)");
+        ui.label(
+            "Map RomM's served media references to an existing host-visible resources folder. \
+             EmuWiz never guesses Docker mounts, copies media, or changes game files. Clear \
+             both fields to disable local reuse.",
+        );
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut draft.media_provider_prefix)
+                    .desired_width(420.0)
+                    .hint_text("/assets/romm/resources"),
+            )
+            .on_hover_text("The provider namespace prefix exactly as RomM reports it.")
+            .changed()
+        {
+            draft.dirty = true;
+        }
+        ui.label("RomM media prefix");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut draft.media_local_root)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/romm/resources"),
+            )
+            .on_hover_text("An existing directory visible to this EmuWiz process.")
+            .changed()
+        {
+            draft.dirty = true;
+        }
+        ui.label("Host-visible local media root");
+        field_note(ui, &validation.media_mapping);
 
         // --- Page size -----------------------------------------------------
         ui.add_space(theme::SECTION_GAP / 2.0);

@@ -68,6 +68,7 @@ mod romm_dispatch_tests {
                     enabled: true,
                     url: "http://172.19.0.20:8080".to_string(),
                     mappings: Vec::new(),
+                    media_mapping: None,
                     provider_path_kind: ProviderPathKind::ProviderRelative,
                     token_path: None,
                 },

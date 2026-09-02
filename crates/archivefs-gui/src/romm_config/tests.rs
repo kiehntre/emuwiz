@@ -73,6 +73,7 @@ fn snapshot(configured: bool, kind: ProviderPathKind, mappings: Vec<PathMapping>
                     String::new()
                 },
                 mappings,
+                media_mapping: None,
                 provider_path_kind: kind,
                 token_path: configured
                     .then(|| PathBuf::from("/home/user/.config/archivefs/romm-token")),
@@ -327,6 +328,7 @@ fn an_import_timeout_that_was_never_set_stays_unset_when_it_is_not_changed() {
             enabled: true,
             url: "http://172.19.0.20:8080".to_string(),
             mappings: Vec::new(),
+            media_mapping: None,
             provider_path_kind: ProviderPathKind::ProviderRelative,
             token_path: None,
         },
@@ -357,6 +359,36 @@ fn an_import_timeout_that_was_never_set_stays_unset_when_it_is_not_changed() {
     assert_eq!(
         draft.to_settings(Some(&explicit)).import_timeout_seconds,
         Some(1800)
+    );
+}
+
+#[test]
+fn clearing_both_media_mapping_fields_disables_local_reuse() {
+    let previous = ProviderSettings {
+        source: RommSourceConfig {
+            enabled: true,
+            url: "http://172.19.0.20:8080".to_string(),
+            mappings: Vec::new(),
+            media_mapping: Some(
+                archivefs_core::identity_source::romm::media_mapping::RommMediaMapping {
+                    provider_prefix: "/assets/romm/resources".to_string(),
+                    local_root: PathBuf::from("/srv/romm/resources"),
+                },
+            ),
+            provider_path_kind: ProviderPathKind::ProviderRelative,
+            token_path: None,
+        },
+        page_size: None,
+        import_timeout_seconds: None,
+    };
+    let draft = RommConfigDraft {
+        media_provider_prefix: String::new(),
+        media_local_root: String::new(),
+        ..RommConfigDraft::blank()
+    };
+    assert_eq!(
+        draft.to_settings(Some(&previous)).source.media_mapping,
+        None
     );
 }
 
@@ -557,6 +589,7 @@ fn a_page_size_that_was_never_set_stays_unset_when_it_is_not_changed() {
             enabled: true,
             url: "http://172.19.0.20:8080".to_string(),
             mappings: Vec::new(),
+            media_mapping: None,
             provider_path_kind: ProviderPathKind::ProviderRelative,
             token_path: None,
         },
@@ -595,6 +628,7 @@ fn to_settings_keeps_fields_the_dialog_does_not_edit() {
             enabled: true,
             url: "http://old:8080".to_string(),
             mappings: Vec::new(),
+            media_mapping: None,
             provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
             token_path: None,
         },

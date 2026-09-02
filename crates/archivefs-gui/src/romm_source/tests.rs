@@ -70,6 +70,7 @@ fn config(enabled: bool, configured: bool) -> RommSourceConfig {
         } else {
             Vec::new()
         },
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::ProviderRelative,
         token_path: configured.then(|| PathBuf::from("/home/user/.config/archivefs/romm-token")),
     }

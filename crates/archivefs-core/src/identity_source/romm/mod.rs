@@ -25,6 +25,7 @@ pub mod client;
 pub mod config;
 pub mod enrichment;
 pub mod import;
+pub mod media_mapping;
 pub mod normalise;
 
 #[cfg(test)]

@@ -90,6 +90,7 @@ impl Tree {
                 provider_prefix: "/romm/library".to_string(),
                 archivefs_prefix: self.library(),
             }],
+            media_mapping: None,
             provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
             token_path: None,
         };
@@ -1513,6 +1514,7 @@ fn a_first_ever_failed_import_leaves_no_fake_ready_state() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -1565,6 +1567,7 @@ fn cached_identity_is_browsable_with_no_network() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -1589,6 +1592,7 @@ fn a_disabled_source_reports_disabled_and_contacts_nothing() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -2150,6 +2154,7 @@ fn an_end_to_end_import_produces_matched_records_and_a_status() {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };

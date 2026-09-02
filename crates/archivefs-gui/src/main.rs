@@ -33060,6 +33060,19 @@ fn run_romm_operation(
             proposed_settings.source.provider_path_kind,
         )
         .map_err(|refusal| refusal.detail())?;
+        if let Some(media_mapping) = proposed_settings.source.media_mapping.as_ref() {
+            let validated =
+                archivefs_core::identity_source::romm::media_mapping::validate_romm_media_mapping(
+                    media_mapping,
+                )
+                .map_err(|error| error.to_string())?;
+            proposed_settings.source.media_mapping = Some(
+                archivefs_core::identity_source::romm::media_mapping::RommMediaMapping {
+                    provider_prefix: validated.provider_prefix().to_string(),
+                    local_root: validated.local_root().to_path_buf(),
+                },
+            );
+        }
         // Atomic, and only after everything above agreed - so a refused save leaves
         // the previous configuration byte-identical.
         location

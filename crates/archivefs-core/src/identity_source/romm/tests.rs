@@ -179,6 +179,7 @@ fn source() -> ValidatedRommSource {
         enabled: true,
         url: "http://172.19.0.20:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -228,6 +229,7 @@ fn the_token_reaches_the_header_and_nowhere_else() {
         enabled: true,
         url: "http://127.0.0.1:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: Some(std::path::PathBuf::from("/tmp/x")),
     };
@@ -668,6 +670,7 @@ fn a_configuration_is_validated_as_a_whole() {
         enabled: true,
         url: "http://8.8.8.8:8080".to_string(),
         mappings: Vec::new(),
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
@@ -684,6 +687,7 @@ fn a_configuration_is_validated_as_a_whole() {
             provider_prefix: "/romm/library".to_string(),
             archivefs_prefix: std::path::PathBuf::from("/etc"),
         }],
+        media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
         token_path: None,
     };
