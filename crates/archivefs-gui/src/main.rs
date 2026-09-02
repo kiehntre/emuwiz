@@ -8677,7 +8677,10 @@ impl ArchiveFsApp {
                 // gets its own human-language override below instead of
                 // "Scan complete: N source(s)... N archive(s)...".
                 if let SourceActionOutcome::Added(added) = &outcome
-                    && self.gamer_view_pending_first_scan.as_deref() == Some(added.path.as_path())
+                    && let Some(scan_action) = gamer_first_scan_after_add(
+                        self.gamer_view_pending_first_scan.as_deref(),
+                        added,
+                    )
                 {
                     self.feedback = Some(ActionFeedback {
                         succeeded: true,
@@ -8686,10 +8689,7 @@ impl ArchiveFsApp {
                         warning: config_reload_warning.clone(),
                         more_information: None,
                     });
-                    self.start_source_action(
-                        context.clone(),
-                        SourceAction::ScanOne(added.path.clone()),
-                    );
+                    self.start_source_action(context.clone(), scan_action);
                 } else if let SourceActionOutcome::Scanned(summary) = &outcome
                     && gamer_scan_pending
                 {
@@ -8734,8 +8734,20 @@ impl ArchiveFsApp {
                 self.start_database_action(context.clone(), false);
             }
             Err(message) => {
+                let gamer_add_failed = matches!(
+                    &action,
+                    SourceAction::Add(candidate)
+                        if self.gamer_view_pending_first_scan.as_deref()
+                            == Some(candidate.as_path())
+                );
                 if self.gamer_view_scan_pending_review {
                     self.gamer_view_scan_pending_review = false;
+                }
+                if gamer_add_failed {
+                    // A failed add must never leave a stale pending path that
+                    // could relabel a later unrelated scan as this folder's
+                    // first scan. No scan is queued from the error branch.
+                    self.gamer_view_pending_first_scan = None;
                 }
                 self.history.record(HistoryEntry::new(
                     log_category,
@@ -8745,10 +8757,14 @@ impl ArchiveFsApp {
                 ));
                 self.feedback = Some(ActionFeedback {
                     succeeded: false,
-                    message,
+                    message: if gamer_add_failed {
+                        GAMER_ADD_GAMES_FAILURE_MESSAGE.to_string()
+                    } else {
+                        message.clone()
+                    },
                     cleanup: None,
                     warning: None,
-                    more_information: None,
+                    more_information: gamer_add_failed.then_some(message),
                 });
             }
         }
@@ -18881,6 +18897,9 @@ impl ArchiveFsApp {
                             save_gui_mode(self.ui_mode);
                             self.navigate_to_sources_tab(SourcesTab::Discovery);
                         }
+                        Some(GamerViewAction::ScanForNewGames) => {
+                            self.start_source_action(context.clone(), SourceAction::ScanAll);
+                        }
                         Some(GamerViewAction::ReviewIdentity(archive_path)) => {
                             self.review_identity(archive_path);
                         }
@@ -21993,6 +22012,17 @@ fn source_action_success_message(outcome: &SourceActionOutcome) -> String {
             ),
         },
     }
+}
+
+/// The one continuation decision behind Gamer View's seamless Add games
+/// journey. It deliberately returns the existing `ScanOne` action only for
+/// the exact path whose successful Add set the pending marker; Advanced View
+/// adds and unrelated source results cannot start or steal this scan.
+fn gamer_first_scan_after_add(
+    pending_path: Option<&Path>,
+    added: &SourceFolderConfig,
+) -> Option<SourceAction> {
+    (pending_path == Some(added.path.as_path())).then(|| SourceAction::ScanOne(added.path.clone()))
 }
 
 /// Runs one [`SourceAction`] against the default config/database paths -

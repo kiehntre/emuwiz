@@ -47,12 +47,10 @@ fn gamer_view_shows_list_and_selected_game_actions_at_1024x600() {
     // must both be visible together at this exact viewport, with no
     // sidebar consuming width (Gamer View never renders one).
     let mut app = app_for_operation_tests();
-    if let LoadState::Ready(data) = &mut app.state {
-        let mut a = record("/roms/a.zip", MountState::Pending);
-        a.metadata.title = Some("A Real Game Title".to_string());
-        a.metadata.platform = Some("GameCube".to_string());
-        data.records.push(a);
-    }
+    let mut a = record("/roms/a.zip", MountState::Pending);
+    a.metadata.title = Some("A Real Game Title".to_string());
+    a.metadata.platform = Some("GameCube".to_string());
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![a])));
     app.ui_mode = GuiMode::GamerView;
     app.view = MainView::Library;
     app.archive_context
@@ -71,6 +69,8 @@ fn gamer_view_shows_list_and_selected_game_actions_at_1024x600() {
 
     for expected in [
         "Search games...",
+        "Add another game folder",
+        "Scan for new games",
         "A Real Game Title",
         "GameCube",
         "Cheats & Mods",
@@ -85,6 +85,99 @@ fn gamer_view_shows_list_and_selected_game_actions_at_1024x600() {
     // The Advanced-only sidebar/menu bar must be completely absent.
     assert!(!rendered_text_contains(&output, "Active Mounts"));
     assert!(!rendered_text_contains(&output, "Mount All"));
+}
+
+#[test]
+fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/roms/existing-game.gb");
+    let mut game = record(path.to_str().unwrap(), MountState::NotMountable);
+    game.metadata.title = Some("Existing Game".to_string());
+    game.metadata.platform = Some("Game Boy".to_string());
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![game])));
+
+    let play_action =
+        launch_readiness_page::GamerPlayAction::BlockedTyped(launch_readiness_page::GamerBlocker {
+            kind: launch_readiness_page::GamerBlockerKind::NoSafeEmulator,
+            emulator: None,
+            detail: "setup is incomplete".to_string(),
+        });
+    let ctx = egui::Context::default();
+    let mut cover_requests = Vec::new();
+    let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
+    let base = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1400.0, 900.0),
+        )),
+        ..Default::default()
+    };
+    let mut frame = |input: egui::RawInput| -> (egui::FullOutput, Option<GamerViewAction>) {
+        let mut captured = None;
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let LoadState::Ready(data) = &app.state else {
+                    unreachable!()
+                };
+                captured = show_gamer_view(
+                    ui,
+                    Some(data),
+                    GamerViewViewState {
+                        filter: "",
+                        library_filters: &mut app.library_filters,
+                        archive_context: &mut app.archive_context,
+                        screen: &mut app.gamer_view_screen,
+                        busy: false,
+                        block_reason: None,
+                        cleanup_after_unmount: false,
+                        cheat_workflow: app.cheat_workflow.as_ref(),
+                        feedback: None,
+                        scan_review_available: false,
+                        artwork_directory: None,
+                        artwork_cache: &mut app.platform_artwork_cache,
+                        covers: &mut app.gamer_covers,
+                        cover_requests: &mut cover_requests,
+                        game_metadata: None,
+                        identity_status: None,
+                        prepared_member: false,
+                        member_choices: None,
+                        preparation_message: None,
+                        play_action: &play_action,
+                        retroarch_launch_state: &mut launch_state,
+                        dolphin_launch_state: &mut app.launch_dolphin,
+                        pcsx2_launch_state: &mut app.launch_pcsx2,
+                        standalone_launch_state: &mut app.launch_standalone,
+                    },
+                );
+            });
+        });
+        (output, captured)
+    };
+
+    let (first, _) = frame(base.clone());
+    let button = first_text_shape_rect(&first, "Scan for new games")
+        .expect("non-empty Gamer View must expose its scan action");
+    let pointer = button.center();
+    let _ = frame(egui::RawInput {
+        events: vec![egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }],
+        ..base.clone()
+    });
+    let (_, action) = frame(egui::RawInput {
+        events: vec![egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+        ..base
+    });
+
+    assert!(matches!(action, Some(GamerViewAction::ScanForNewGames)));
 }
 
 #[test]

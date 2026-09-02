@@ -2881,13 +2881,19 @@ pub fn assign_source_platform_default(target: &Path, platform: &str) -> Result<S
     )
 }
 
-/// Adds `candidate` as a new, enabled source folder: validates it against
-/// every currently configured source (see [`validate_new_source_folder`]),
-/// atomically saves the updated config, then immediately registers it in
-/// the database so it has a stable id and shows up on the Sources page
-/// right away - deliberately *never* scans it (the milestone requires an
-/// explicit, separate Scan action; adding a source must never itself walk
-/// the filesystem beyond the one-time validation check).
+/// Adds `candidate` as a new, enabled source folder: bootstraps the existing
+/// starter configuration only when the config path is genuinely absent,
+/// validates the folder against every currently configured source (see
+/// [`validate_new_source_folder`]), atomically saves the updated config, then
+/// immediately registers it in the database so it has a stable id and shows
+/// up on the Sources page right away.
+///
+/// This remains an explicit, write-authorised source-add operation. Startup,
+/// diagnostics, config loading, and page rendering do not call it and remain
+/// read-only. An existing path - including a malformed file, directory, or
+/// symlink - is never replaced with a starter config. Source addition also
+/// deliberately *never* scans: callers decide whether to queue a scan after a
+/// successful add.
 pub fn add_source_folder_default(candidate: &Path) -> Result<SourceFolderConfig> {
     add_source_folder_at(
         &default_config_path()?,
@@ -2901,6 +2907,7 @@ pub fn add_source_folder_at(
     database_path: &Path,
     candidate: &Path,
 ) -> Result<SourceFolderConfig> {
+    ensure_config_for_explicit_source_add(config_path)?;
     let mut sources = load_source_folder_configs_from(config_path)?;
     let config = Config::load_from(config_path)?;
 
@@ -2927,6 +2934,21 @@ pub fn add_source_folder_at(
     database.register_source_folders(&all_paths)?;
 
     Ok(new_source)
+}
+
+/// Creates the established starter config only for an explicit source-add
+/// operation and only after `symlink_metadata` proves there is no filesystem
+/// entry at `config_path`. Using `symlink_metadata` rather than `exists()` is
+/// important: a dangling symlink is still an existing configuration path and
+/// must fail closed instead of being treated as permission to replace it.
+/// `create_starter_config` retains the final create-new/no-overwrite guard for
+/// a concurrent creator between this check and the write.
+fn ensure_config_for_explicit_source_add(config_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(config_path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_starter_config(config_path),
+        Err(source) => Err(ArchiveFsError::io(config_path.to_path_buf(), source)),
+    }
 }
 
 /// The result of enabling or disabling a source folder. `scan` is only
@@ -13113,6 +13135,145 @@ mod tests {
     }
 
     #[test]
+    fn explicit_source_add_bootstraps_a_genuinely_missing_config_and_registers_source() {
+        let root = test_root("add_source_folder_first_run_bootstrap");
+        let config_path = root.join("config/config.toml");
+        let database_path = root.join("data/library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+
+        assert!(!config_path.exists());
+        let added = add_source_folder_at(&config_path, &database_path, &games).unwrap();
+
+        assert_eq!(added.path, games);
+        assert!(config_path.is_file());
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(config.source_folders, vec![games.clone()]);
+        assert_eq!(
+            config.mount_root,
+            PathBuf::from("/path/to/archivefs-mounts")
+        );
+        assert_eq!(config.ratarmount_bin, "ratarmount");
+
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].path, games);
+        assert!(views[0].id.is_some());
+        assert_eq!(
+            views[0].last_archive_count, None,
+            "core source registration must not replace Gamer View's queued first scan"
+        );
+    }
+
+    #[test]
+    fn explicit_source_add_preserves_existing_config_fields_without_starter_reset() {
+        let root = test_root("add_source_folder_existing_config");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let mount_root = root.join("custom-mounts");
+        let master_rom_root = root.join("custom-master-library");
+        let ratarmount = root.join("bin/custom-ratarmount");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "# existing user configuration\nsource_folders = []\nmount_root = \"{}\"\nratarmount_bin = \"{}\"\nmaster_rom_root = \"{}\"\n",
+                mount_root.display(),
+                ratarmount.display(),
+                master_rom_root.display()
+            ),
+        )
+        .unwrap();
+
+        add_source_folder_at(&config_path, &database_path, &games).unwrap();
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("EmuWiz starter configuration"));
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(config.mount_root, mount_root);
+        assert_eq!(config.ratarmount_bin, ratarmount.to_string_lossy());
+        assert_eq!(config.master_rom_root, Some(master_rom_root));
+        assert_eq!(config.source_folders, vec![games]);
+    }
+
+    #[test]
+    fn explicit_source_add_never_replaces_an_existing_malformed_config() {
+        let root = test_root("add_source_folder_existing_malformed_config");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+        let existing = b"this is the user's existing malformed config [[[\n";
+        fs::write(&config_path, existing).unwrap();
+
+        let error = add_source_folder_at(&config_path, &database_path, &games).unwrap_err();
+
+        assert!(error.to_string().contains("config error"));
+        assert_eq!(fs::read(&config_path).unwrap(), existing);
+        assert!(!database_path.exists(), "source must not be registered");
+    }
+
+    #[test]
+    fn starter_config_creation_failure_registers_nothing() {
+        let root = test_root("add_source_folder_starter_failure");
+        let database_path = root.join("library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+
+        let error = add_source_folder_at(Path::new(""), &database_path, &games).unwrap_err();
+
+        assert!(error.to_string().contains("config path has no parent"));
+        assert!(!database_path.exists(), "source must not be registered");
+    }
+
+    #[test]
+    fn first_run_bootstrap_preserves_invalid_folder_validation() {
+        let root = test_root("add_source_folder_first_run_invalid");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let missing = root.join("missing-games");
+
+        let error = add_source_folder_at(&config_path, &database_path, &missing).unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+        assert!(config_path.is_file(), "the safe starter creation completed");
+        assert!(
+            !database_path.exists(),
+            "an invalid source must not be registered"
+        );
+        assert!(
+            Config::load_from(&config_path)
+                .unwrap()
+                .source_folders
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_source_semantics_are_unchanged_after_bootstrap() {
+        let root = test_root("add_source_folder_first_run_duplicate");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        let games = root.join("games");
+        fs::create_dir_all(&games).unwrap();
+
+        add_source_folder_at(&config_path, &database_path, &games).unwrap();
+        let before = fs::read_to_string(&config_path).unwrap();
+        let error = add_source_folder_at(&config_path, &database_path, &games).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already a configured source folder")
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+        let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].path, games);
+    }
+
+    #[test]
     fn add_source_folder_rejects_an_overlap_through_the_orchestration_layer() {
         let root = test_root("add_source_folder_overlap");
         let config_path = root.join("config.toml");
@@ -13496,6 +13657,10 @@ mod tests {
         let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
 
         assert!(report.config_missing);
+        assert!(
+            !config_path.exists(),
+            "launch/read-only diagnostics must never create the starter config"
+        );
         assert!(!report.ready_for_scanning);
         assert!(!report.ready_for_actions);
         assert!(

@@ -120,6 +120,12 @@ pub(crate) fn gamer_view_scan_needs_review(summary: &ScanPersistSummary) -> bool
         || summary.counts.errors_count > 0
         || !summary.folder_errors.is_empty()
 }
+
+/// Beginner-facing failure copy for Gamer View's explicit folder-add action.
+/// The precise backend/config/I/O error is retained separately in
+/// `ActionFeedback::more_information` and rendered under Technical details.
+pub(crate) const GAMER_ADD_GAMES_FAILURE_MESSAGE: &str =
+    "EmuWiz couldn't finish adding that game folder, so no scan was started.";
 /// Gamer View's plain-language primary-action state for a selected game -
 /// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
 /// `MountState` variant name (finding #4); Advanced View keeps the
@@ -372,6 +378,10 @@ pub(crate) enum GamerViewAction {
     /// Open the existing Sources -> Discovery review for the most recent
     /// scan, without starting another scan or changing any file.
     ReviewScan,
+    /// Reuses the existing `SourceAction::ScanAll` path. Gamer View owns only
+    /// the beginner-facing entry point; source enumeration, cancellation, and
+    /// scan persistence remain in the shared background action.
+    ScanForNewGames,
     /// Phase 5: "Review" on a game whose platform couldn't be confidently
     /// identified - the archive to keep selected while switching into
     /// Advanced View's Selected page, which already shows the real
@@ -556,6 +566,9 @@ pub(crate) fn gamer_view_row_state_label(
 /// (retry; Advanced View has the detail), and no invented certainty
 /// about a cause this function cannot actually determine.
 pub(crate) fn gamer_view_failure_message(raw: &str) -> String {
+    if raw == GAMER_ADD_GAMES_FAILURE_MESSAGE {
+        return raw.to_string();
+    }
     let lower = raw.to_ascii_lowercase();
     if lower.contains("permission denied") {
         "EmuWiz doesn't have permission to access this file or folder. Check the folder's \
@@ -1178,6 +1191,15 @@ pub(crate) fn show_gamer_view(
         {
             action = Some(GamerViewAction::ReviewScan);
         }
+        if let Some(more_information) = &feedback.more_information {
+            widgets::technical_details(
+                ui,
+                ("gamer_action_feedback_details", more_information.as_str()),
+                |ui| {
+                    ui.label(more_information);
+                },
+            );
+        }
         ui.add_space(4.0);
     }
 
@@ -1233,6 +1255,35 @@ pub(crate) fn show_gamer_view(
     // what is selected, and so a cover is asked for by the record's own path rather
     // than by whichever row happens to be drawn at its position.
     let selected_path = archive_context.focused.clone();
+
+    // Once a library exists, keep its two recurring maintenance actions in
+    // the simple view. Both dispatch the same source actions as Advanced View;
+    // this layer adds no filesystem walking or scan implementation of its own.
+    if !data.rows.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Add another game folder",
+                widgets::ActionStyle::Secondary,
+                !busy,
+            )
+            .on_hover_text("Choose another folder for EmuWiz to look through.")
+            .clicked()
+                && let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Choose another games folder")
+                    .pick_folder()
+            {
+                action = Some(GamerViewAction::AddGamesFolder(folder));
+            }
+            if widgets::action_button(ui, "Scan for new games", widgets::ActionStyle::Quiet, !busy)
+                .on_hover_text("Look through all your game folders again.")
+                .clicked()
+            {
+                action = Some(GamerViewAction::ScanForNewGames);
+            }
+        });
+        ui.add_space(theme::SECTION_GAP);
+    }
 
     // The visual platform picker (milestone: "Gamer View Visual Platform
     // Picker and Library Layout Polish"): a single-row, horizontally

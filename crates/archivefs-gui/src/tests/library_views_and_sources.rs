@@ -16,6 +16,59 @@
 use super::*;
 
 #[test]
+fn gamer_add_success_queues_the_existing_scan_one_action_for_the_exact_folder() {
+    let games = PathBuf::from("/games/first-folder");
+    let added = SourceFolderConfig {
+        path: games.clone(),
+        enabled: true,
+        created_at: Some("2026-09-02T12:00:00Z".to_string()),
+    };
+
+    assert_eq!(
+        gamer_first_scan_after_add(Some(&games), &added),
+        Some(SourceAction::ScanOne(games.clone()))
+    );
+    assert_eq!(
+        gamer_first_scan_after_add(Some(Path::new("/games/other")), &added),
+        None,
+        "an unrelated or Advanced View add must not inherit Gamer View's scan"
+    );
+    assert_eq!(gamer_first_scan_after_add(None, &added), None);
+}
+
+#[test]
+fn gamer_add_failure_clears_pending_scan_and_keeps_backend_error_in_details() {
+    let mut app = app_for_operation_tests();
+    let games = PathBuf::from("/games/first-folder");
+    app.gamer_view_pending_first_scan = Some(games.clone());
+    let (sender, receiver) = mpsc::channel();
+    app.source_action = Some(RunningSourceAction {
+        action: SourceAction::Add(games),
+        receiver,
+        worker: None,
+    });
+    let technical_error = "config error: first-time config parent is not writable";
+    sender.send(Err(technical_error.to_string())).unwrap();
+
+    app.poll_source_action(&egui::Context::default());
+
+    assert!(app.source_action.is_none());
+    assert!(
+        app.gamer_view_pending_first_scan.is_none(),
+        "a failed add must not leave any scan queued"
+    );
+    let feedback = app.feedback.as_ref().expect("visible failure feedback");
+    assert!(!feedback.succeeded);
+    assert_eq!(feedback.message, GAMER_ADD_GAMES_FAILURE_MESSAGE);
+    assert_eq!(feedback.more_information.as_deref(), Some(technical_error));
+    assert_eq!(
+        gamer_view_failure_message(&feedback.message),
+        GAMER_ADD_GAMES_FAILURE_MESSAGE,
+        "Gamer View must not replace the clear folder-add failure with its generic fallback"
+    );
+}
+
+#[test]
 fn sources_page_scan_populates_the_sources_last_scan_banner_state() {
     let mut app = app_for_operation_tests();
     let generation = DatabaseGeneration::INITIAL.next();
