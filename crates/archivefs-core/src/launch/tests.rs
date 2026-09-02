@@ -715,3 +715,221 @@ fn platform_mapping_does_not_alter_canonical_identity() {
     assert_eq!(plan.platform_id.as_deref(), Some("PSX"));
     assert_eq!(plan.game_key.as_deref(), Some("TEST-00001"));
 }
+
+// ---------------------------------------------------------------------
+// Standalone <-> RetroArch preference boundary
+//
+// The one decision `apply_preference` makes when a platform has both a
+// discovered standalone profile *and* a matching installed RetroArch core:
+// which (if either) becomes the single recommended launch. This is exactly
+// the seam where the historical "fell back toward RetroArch when standalone
+// trust was unresolved" behaviour lived, so these pin *when* a fallback
+// happens and, just as importantly, when it does not. Nothing here weakens
+// a readiness check - readiness is an input (`FirmwareReadiness` on the
+// standalone profile), and the tests only assert how the planner ranks two
+// already-classified candidates.
+//
+// PS2 is used because its reviewed row carries `retroarch_core_hints: &[]`
+// (see `platform_map`), so a discovered PS2 core is never auto-preferred by
+// the single-hint path - the tie is decided purely by the standalone-vs-
+// core preference rule under test.
+// ---------------------------------------------------------------------
+
+/// A discovered RetroArch core whose `.info` `systemname` resolves to
+/// `platform_id`. `firmware` in the `.info` is empty, so the core itself
+/// contributes no blocker/warning.
+fn retroarch_core_for(system_name: &str) -> CoreFinding {
+    core_finding("some_libretro", Some(system_name), None)
+}
+
+fn ps2_standalone_and_retroarch_plan(
+    standalone_firmware: FirmwareReadiness,
+    retroarch: &RetroArchEnvironmentReport,
+    remembered: &[RememberedPreference],
+) -> LaunchPlan {
+    build_launch_plan(
+        &resolved("PS2"),
+        &resolved_content(),
+        &[eligible_standalone("pcsx2", standalone_firmware)],
+        retroarch,
+        remembered,
+    )
+}
+
+fn standalone_candidate(plan: &LaunchPlan) -> &LaunchCandidate {
+    plan.candidates
+        .iter()
+        .find(|candidate| matches!(candidate.target, LaunchTarget::Standalone { .. }))
+        .expect("a standalone candidate must be present")
+}
+
+fn retroarch_candidate(plan: &LaunchPlan) -> &LaunchCandidate {
+    plan.candidates
+        .iter()
+        .find(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
+        .expect("a RetroArch candidate must be present")
+}
+
+#[test]
+fn ready_standalone_beside_a_ready_unhinted_retroarch_core_is_ambiguous_never_a_silent_pick() {
+    let plan = ps2_standalone_and_retroarch_plan(
+        FirmwareReadiness::Verified,
+        &retroarch_environment_with_cores(vec![retroarch_core_for("PlayStation 2")]),
+        &[],
+    );
+
+    assert_eq!(
+        plan.candidates.len(),
+        2,
+        "one standalone, one RetroArch core"
+    );
+    // Neither candidate is singled out: no `SoleEligible`, no `Remembered`.
+    // A caller that only launches an unambiguous recommendation must
+    // launch nothing here.
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|candidate| candidate.preference == CandidatePreference::Undetermined),
+        "an unresolved standalone/core tie stays Undetermined on both sides"
+    );
+    for candidate in &plan.candidates {
+        assert!(
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == LaunchWarningKind::MultipleEligibleProfiles),
+            "each tied candidate carries the multiple-eligible warning"
+        );
+        assert_eq!(candidate.readiness, LaunchReadiness::ReadyWithWarnings);
+    }
+    assert_eq!(plan.summary.ready, 0);
+    assert_eq!(plan.summary.ready_with_warnings, 2);
+}
+
+#[test]
+fn a_blocked_standalone_falls_back_to_the_ready_retroarch_core_deterministically() {
+    // The standalone is genuinely blocked (its required firmware is
+    // *proven* missing - not merely unverified or unknown), so the only
+    // non-blocked way to play is the RetroArch core. That, and only that,
+    // is when the plan falls back to RetroArch.
+    let plan = ps2_standalone_and_retroarch_plan(
+        FirmwareReadiness::Missing,
+        &retroarch_environment_with_cores(vec![retroarch_core_for("PlayStation 2")]),
+        &[],
+    );
+
+    let standalone = standalone_candidate(&plan);
+    assert_eq!(standalone.readiness, LaunchReadiness::Blocked);
+    assert!(
+        standalone
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::RequiredFirmwareMissing),
+        "the standalone stays blocked for its own concrete reason"
+    );
+
+    let core = retroarch_candidate(&plan);
+    assert_eq!(core.readiness, LaunchReadiness::Ready);
+    assert_eq!(
+        core.preference,
+        CandidatePreference::SoleEligible,
+        "with the standalone blocked, the RetroArch core is the sole eligible launch"
+    );
+    assert!(
+        core.warnings.is_empty(),
+        "the fallback core is offered cleanly, not as an ambiguous choice"
+    );
+    assert_eq!(plan.summary.ready, 1);
+    assert_eq!(plan.summary.blocked, 1);
+}
+
+#[test]
+fn an_unverified_standalone_firmware_does_not_trigger_a_retroarch_fallback() {
+    // `PresentUnverified` is a warning, never a blocker: the standalone is
+    // still a launch candidate, so this must NOT collapse to "RetroArch is
+    // the sole eligible" the way a genuinely blocked standalone does. It is
+    // instead an ordinary two-eligible tie.
+    let plan = ps2_standalone_and_retroarch_plan(
+        FirmwareReadiness::PresentUnverified,
+        &retroarch_environment_with_cores(vec![retroarch_core_for("PlayStation 2")]),
+        &[],
+    );
+
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|candidate| candidate.readiness != LaunchReadiness::Blocked),
+        "an unverified (not missing) firmware never blocks the standalone"
+    );
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|candidate| candidate.preference == CandidatePreference::Undetermined),
+        "two eligible candidates, nothing remembered - no silent RetroArch pick"
+    );
+}
+
+#[test]
+fn a_remembered_standalone_profile_wins_over_a_ready_retroarch_core() {
+    let plan = ps2_standalone_and_retroarch_plan(
+        FirmwareReadiness::Verified,
+        &retroarch_environment_with_cores(vec![retroarch_core_for("PlayStation 2")]),
+        &[RememberedPreference {
+            adapter_id: "pcsx2".to_string(),
+            profile_id: "pcsx2-native".to_string(),
+        }],
+    );
+
+    let standalone = standalone_candidate(&plan);
+    assert_eq!(
+        standalone.preference,
+        CandidatePreference::Remembered,
+        "an explicit remembered choice is honoured over an equally-ready core"
+    );
+    assert!(
+        standalone.warnings.is_empty(),
+        "the remembered candidate is not also flagged as an ambiguous tie"
+    );
+    // The RetroArch core is still listed as an available alternative - a
+    // remembered standalone preference narrows the recommendation, it does
+    // not delete the other option.
+    assert!(
+        plan.candidates
+            .iter()
+            .any(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. })),
+        "RetroArch stays a listed alternative, never removed by a remembered pick"
+    );
+}
+
+#[test]
+fn a_ready_standalone_with_no_matching_retroarch_core_is_the_sole_eligible_launch() {
+    let plan = ps2_standalone_and_retroarch_plan(
+        FirmwareReadiness::Verified,
+        // A core that resolves to a *different* platform - never a PS2
+        // candidate, so no fallback target exists.
+        &retroarch_environment_with_cores(vec![retroarch_core_for("Nintendo 64")]),
+        &[],
+    );
+
+    assert_eq!(plan.candidates.len(), 1);
+    let standalone = standalone_candidate(&plan);
+    assert_eq!(standalone.readiness, LaunchReadiness::Ready);
+    assert_eq!(standalone.preference, CandidatePreference::SoleEligible);
+}
+
+#[test]
+fn a_blocked_standalone_with_no_retroarch_core_never_invents_a_fallback() {
+    let plan = ps2_standalone_and_retroarch_plan(
+        FirmwareReadiness::Missing,
+        &empty_retroarch_environment(),
+        &[],
+    );
+
+    assert_eq!(plan.candidates.len(), 1);
+    let standalone = standalone_candidate(&plan);
+    assert_eq!(standalone.readiness, LaunchReadiness::Blocked);
+    assert_eq!(
+        plan.summary.ready, 0,
+        "a blocked standalone with no core yields no runnable launch - fail closed"
+    );
+}

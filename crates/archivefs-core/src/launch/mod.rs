@@ -97,6 +97,8 @@ pub mod xenia_command;
 pub mod xenia_execution;
 
 #[cfg(test)]
+mod plan_to_spawn_tests;
+#[cfg(test)]
 mod tests;
 
 pub use dolphin_command::{

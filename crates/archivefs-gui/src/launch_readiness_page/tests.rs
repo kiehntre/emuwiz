@@ -557,6 +557,91 @@ fn gamer_blockers_route_identity_content_choice_and_no_safe_states() {
     ));
 }
 
+// --- mixed standalone + RetroArch plan: the GUI's plan->action projection ---
+//
+// `archivefs_core::launch::build_launch_plan` already has its own dedicated
+// tests for *when* a standalone candidate and a matching RetroArch core
+// resolve to a tie, a remembered pick, or a blocked-standalone fallback
+// (see `launch::tests` in archivefs-core). These two only check that
+// `gamer_play_action` - the GUI's projection of that plan onto the single
+// Play button - consumes such a mixed-target plan honestly: it never
+// silently launches one target when the plan left the choice open, and it
+// does launch the RetroArch core when the standalone is the blocked one.
+
+fn standalone_candidate_for(
+    adapter_id: &'static str,
+    readiness: LaunchReadiness,
+) -> LaunchCandidate {
+    LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id,
+            profile_id: format!("{adapter_id}-native"),
+            profile_path: Some(PathBuf::from(format!("/home/user/.config/{adapter_id}"))),
+        },
+        content: resolved_content("/library/Game.bin"),
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+        readiness,
+        preference: CandidatePreference::Undetermined,
+    }
+}
+
+#[test]
+fn a_ready_standalone_beside_a_ready_retroarch_core_never_silently_picks_either() {
+    // Both eligible, nothing distinguishes them: the planner left both
+    // `Undetermined` with a multiple-eligible warning. The Play button must
+    // ask the user to choose, not guess.
+    let mut standalone = standalone_candidate_for("pcsx2", LaunchReadiness::ReadyWithWarnings);
+    standalone.warnings.push(LaunchWarning::new(
+        LaunchWarningKind::MultipleEligibleProfiles,
+        "more than one eligible profile exists for this platform and none is remembered",
+    ));
+    let mut core = ready_candidate();
+    core.readiness = LaunchReadiness::ReadyWithWarnings;
+    core.preference = CandidatePreference::Undetermined;
+    core.warnings.push(LaunchWarning::new(
+        LaunchWarningKind::MultipleEligibleProfiles,
+        "more than one eligible profile exists for this platform and none is remembered",
+    ));
+
+    let action = gamer_play_action(&plan_input(plan_with(vec![standalone, core])));
+    assert!(
+        matches!(
+            action,
+            GamerPlayAction::BlockedTyped(GamerBlocker {
+                kind: GamerBlockerKind::MultipleChoices,
+                ..
+            })
+        ),
+        "a standalone/core tie must surface a choice, never an implicit launch"
+    );
+}
+
+#[test]
+fn a_blocked_standalone_beside_a_ready_retroarch_core_launches_the_retroarch_core() {
+    // The standalone is the blocked one; the RetroArch core is the sole
+    // clean, recommended candidate. This is exactly when falling back to
+    // RetroArch is correct - and it must actually happen.
+    let mut standalone = standalone_candidate_for("pcsx2", LaunchReadiness::Blocked);
+    standalone.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::RequiredFirmwareMissing,
+        "required firmware/BIOS is missing",
+    ));
+    let core = ready_candidate(); // Ready, SoleEligible, clean
+
+    let action = gamer_play_action(&plan_input(plan_with(vec![standalone, core])));
+    let GamerPlayAction::Launch(request) = action else {
+        panic!("a blocked standalone must not stop the ready RetroArch core from launching");
+    };
+    assert!(matches!(
+        request.as_ref(),
+        TypedLaunchRequest::RetroArch(request)
+            if request.expected_platform_id == "PSX"
+                && request.selected_content_path == Path::new("/library/Game.bin")
+    ));
+}
+
 #[test]
 fn typed_launch_request_keeps_adapter_dispatch_typed_without_shell_text() {
     let action = gamer_play_action(&plan_input(plan_with(vec![ready_candidate()])));
