@@ -59,6 +59,16 @@ use crate::patch_manager::{
     resolve_xemu_native_launch_binding, resolve_xenia_launch_binding, select_dolphin_profile,
 };
 
+/// The one [`LinuxEmulatorInstallationEvidence::installation_form`] value
+/// whose executable path carries strong enough provenance to feed into a
+/// standalone adapter's `explicit_executables`: an EmuWiz-managed AppImage
+/// under `<data_dir>/emulators/<id>/` with an `install.json` marker, whose
+/// binary [`crate::emulator_download::managed_appimage_install`] already
+/// proved is a regular, non-symlink, executable file. Every other form
+/// (plain `"AppImage"` at a fixed `~/Applications` path, Flatpak, PATH,
+/// config-only evidence) is intentionally *not* a launch-trust source.
+pub const MANAGED_APPIMAGE_INSTALLATION_FORM: &str = "EmuWiz-managed AppImage";
+
 /// Read-only evidence about an emulator installation form. This is separate
 /// from launch readiness: finding a Flatpak or AppImage is useful to the user
 /// but does not authorize EmuWiz to spawn it.
@@ -120,6 +130,20 @@ fn first_executable(home: &Path, names: &[&str]) -> Option<PathBuf> {
 /// entry (see [`crate::emulator_download::managed_appimage_install`]); no
 /// recursion, no shell. A managed install here is reported as installation
 /// *evidence* only - launch readiness is still decided elsewhere.
+/// Just the `install.json`-backed EmuWiz-managed AppImage evidence under
+/// `<data_dir>/emulators/<id>/` for `$HOME`, without the (much larger)
+/// `PATH` / `~/Applications` / Flatpak sweep that
+/// [`discover_linux_emulator_installations`] also performs. A fixed handful
+/// of `symlink_metadata` calls per automated-lane catalogue entry - cheap
+/// enough to call from a per-frame launch-readiness projection, unlike the
+/// full sweep. Returns an empty vec when `$HOME` is unset.
+pub fn discover_managed_appimage_installations() -> Vec<LinuxEmulatorInstallationEvidence> {
+    match env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => discover_managed_emulator_installations(&home),
+        None => Vec::new(),
+    }
+}
+
 fn discover_managed_emulator_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
     let data_dir = crate::app_dirs::data_dir_in(home);
     let mut evidence = Vec::new();
@@ -127,7 +151,7 @@ fn discover_managed_emulator_installations(home: &Path) -> Vec<LinuxEmulatorInst
         if let Some(binary) = crate::emulator_download::managed_appimage_install(&data_dir, spec) {
             evidence.push(LinuxEmulatorInstallationEvidence {
                 emulator: spec.display_name.to_string(),
-                installation_form: "EmuWiz-managed AppImage".to_string(),
+                installation_form: MANAGED_APPIMAGE_INSTALLATION_FORM.to_string(),
                 executable: Some(EncodedPath::from_path(&binary)),
                 profile: None,
                 detail: format!(
@@ -321,6 +345,43 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
         });
     }
     evidence
+}
+
+/// The single trusted local executable path to feed into a standalone
+/// adapter's `explicit_executables` for `emulator` (a
+/// [`LinuxEmulatorInstallationEvidence::emulator`] display name, e.g.
+/// `"PPSSPP"` / `"PCSX2"`), taken only from already-validated evidence.
+///
+/// # Trust
+///
+/// Returns a path **only** when exactly one evidence entry both names
+/// `emulator` and carries [`MANAGED_APPIMAGE_INSTALLATION_FORM`] - the
+/// `install.json`-backed managed AppImage that
+/// [`crate::emulator_download::managed_appimage_install`] already proved is
+/// a regular, non-symlink, executable file. It never returns a plain
+/// `"AppImage"` (a fixed `~/Applications` path with no provenance marker), a
+/// Flatpak, a `$APPIMAGE` guess, a `PATH` match, or a config-only entry;
+/// and if zero or more than one managed install matches, or the recorded
+/// path is a lossy (non-UTF-8) rendering, it returns `None` so the caller
+/// stays deterministic and fail-closed. Widening trust is out of scope here
+/// - this is only the wiring that carries an *already*-validated path into
+/// the existing adapter discovery/binding.
+pub fn managed_appimage_executable_for(
+    installations: &[LinuxEmulatorInstallationEvidence],
+    emulator: &str,
+) -> Option<PathBuf> {
+    let mut managed = installations.iter().filter(|item| {
+        item.emulator == emulator && item.installation_form == MANAGED_APPIMAGE_INSTALLATION_FORM
+    });
+    let only = managed.next()?;
+    if managed.next().is_some() {
+        return None;
+    }
+    let encoded = only.executable.as_ref()?;
+    if encoded.lossy {
+        return None;
+    }
+    Some(PathBuf::from(&encoded.display))
 }
 
 pub fn findings_from_linux_emulator_installations(
@@ -4029,6 +4090,139 @@ mod tests {
             discover_managed_emulator_installations(home.path())
                 .iter()
                 .all(|item| item.emulator != "shadPS4")
+        );
+    }
+
+    // --- managed_appimage_executable_for: the launch-trust extraction ------
+
+    fn evidence(
+        emulator: &str,
+        installation_form: &str,
+        executable: Option<&str>,
+    ) -> LinuxEmulatorInstallationEvidence {
+        LinuxEmulatorInstallationEvidence {
+            emulator: emulator.to_string(),
+            installation_form: installation_form.to_string(),
+            executable: executable.map(|path| EncodedPath::from_path(Path::new(path))),
+            profile: None,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn managed_appimage_executable_is_returned_for_the_matching_emulator_only() {
+        let installs = [
+            evidence(
+                "PPSSPP",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/data/emuwiz/emulators/ppsspp/ppsspp.AppImage"),
+            ),
+            evidence(
+                "PCSX2",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/data/emuwiz/emulators/pcsx2/pcsx2.AppImage"),
+            ),
+        ];
+        assert_eq!(
+            managed_appimage_executable_for(&installs, "PPSSPP"),
+            Some(PathBuf::from(
+                "/data/emuwiz/emulators/ppsspp/ppsspp.AppImage"
+            )),
+        );
+        assert_eq!(
+            managed_appimage_executable_for(&installs, "PCSX2"),
+            Some(PathBuf::from("/data/emuwiz/emulators/pcsx2/pcsx2.AppImage")),
+        );
+        assert_eq!(managed_appimage_executable_for(&installs, "Dolphin"), None);
+    }
+
+    #[test]
+    fn only_the_managed_installation_form_is_a_launch_trust_source() {
+        for form in [
+            "AppImage", // fixed ~/Applications path, no install.json
+            "Flatpak (user installation)",
+            "Native/PATH",
+            "AppImage/config evidence",
+        ] {
+            let installs = [evidence("PPSSPP", form, Some("/somewhere/PPSSPP.AppImage"))];
+            assert_eq!(
+                managed_appimage_executable_for(&installs, "PPSSPP"),
+                None,
+                "{form} must never be promoted to a trusted explicit executable"
+            );
+        }
+    }
+
+    #[test]
+    fn no_managed_install_leaves_the_result_empty() {
+        assert_eq!(managed_appimage_executable_for(&[], "PPSSPP"), None);
+    }
+
+    #[test]
+    fn ambiguous_multiple_managed_installs_are_refused_deterministically() {
+        let installs = [
+            evidence(
+                "PPSSPP",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/a/ppsspp.AppImage"),
+            ),
+            evidence(
+                "PPSSPP",
+                MANAGED_APPIMAGE_INSTALLATION_FORM,
+                Some("/b/ppsspp.AppImage"),
+            ),
+        ];
+        assert_eq!(managed_appimage_executable_for(&installs, "PPSSPP"), None);
+    }
+
+    #[test]
+    fn a_lossy_recorded_path_is_not_reconstructed() {
+        let mut item = evidence("PPSSPP", MANAGED_APPIMAGE_INSTALLATION_FORM, Some("/x"));
+        item.executable = Some(EncodedPath {
+            display: "/x/ppsspp.AppImage".to_string(),
+            lossy: true,
+        });
+        assert_eq!(managed_appimage_executable_for(&[item], "PPSSPP"), None);
+    }
+
+    #[test]
+    fn a_real_managed_install_flows_through_the_extractor() {
+        let home = TempTree::new("profiles-managed-extract");
+        let binary = managed_install(home.path(), "ppsspp");
+        let installs = discover_managed_emulator_installations(home.path());
+        assert_eq!(
+            managed_appimage_executable_for(&installs, "PPSSPP"),
+            Some(binary),
+        );
+    }
+
+    #[test]
+    fn discover_managed_appimage_installations_is_a_bounded_managed_only_slice() {
+        // Even with a full `~/Applications/PPSSPP/PPSSPP.AppImage` laid out,
+        // the managed-only slice reports only the `install.json`-backed one.
+        let home = TempTree::new("profiles-managed-slice");
+        let apps = home.path().join("Applications/PPSSPP");
+        fs::create_dir_all(&apps).unwrap();
+        let plain = apps.join("PPSSPP.AppImage");
+        fs::write(&plain, b"\x7fELF").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plain, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let binary = managed_install(home.path(), "ppsspp");
+
+        // `discover_managed_appimage_installations` reads `$HOME`; drive it
+        // deterministically through the private helper it delegates to.
+        let slice = discover_managed_emulator_installations(home.path());
+        assert!(
+            slice
+                .iter()
+                .all(|item| item.installation_form == MANAGED_APPIMAGE_INSTALLATION_FORM)
+        );
+        assert_eq!(
+            managed_appimage_executable_for(&slice, "PPSSPP"),
+            Some(binary),
         );
     }
 }

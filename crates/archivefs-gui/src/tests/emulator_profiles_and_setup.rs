@@ -4376,3 +4376,89 @@ fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads
 
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+// --- managed AppImage -> explicit_executables wiring helper -----------------
+
+fn managed_appimage_evidence(
+    emulator: &str,
+    form: &str,
+    executable: &str,
+) -> LinuxEmulatorInstallationEvidence {
+    LinuxEmulatorInstallationEvidence {
+        emulator: emulator.to_string(),
+        installation_form: form.to_string(),
+        executable: Some(
+            archivefs_core::emulator_environment::EncodedPath::from_path(std::path::Path::new(
+                executable,
+            )),
+        ),
+        profile: None,
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn managed_appimage_explicit_executables_feeds_only_a_managed_install() {
+    let managed = archivefs_core::diagnostics::profiles::MANAGED_APPIMAGE_INSTALLATION_FORM;
+    let installs = [
+        managed_appimage_evidence(
+            "PPSSPP",
+            managed,
+            "/data/emuwiz/emulators/ppsspp/ppsspp.AppImage",
+        ),
+        managed_appimage_evidence(
+            "PCSX2",
+            managed,
+            "/data/emuwiz/emulators/pcsx2/pcsx2.AppImage",
+        ),
+        // Non-managed forms that must never be promoted:
+        managed_appimage_evidence(
+            "PPSSPP",
+            "AppImage",
+            "/home/u/Applications/PPSSPP/PPSSPP.AppImage",
+        ),
+        managed_appimage_evidence("PPSSPP", "Flatpak (user installation)", "/usr/bin/flatpak"),
+    ];
+
+    assert_eq!(
+        managed_appimage_explicit_executables(&installs, "PPSSPP"),
+        vec![std::path::PathBuf::from(
+            "/data/emuwiz/emulators/ppsspp/ppsspp.AppImage"
+        )],
+    );
+    assert_eq!(
+        managed_appimage_explicit_executables(&installs, "PCSX2"),
+        vec![std::path::PathBuf::from(
+            "/data/emuwiz/emulators/pcsx2/pcsx2.AppImage"
+        )],
+    );
+    // Wrong emulator never leaks in.
+    assert!(managed_appimage_explicit_executables(&installs, "Dolphin").is_empty());
+}
+
+#[test]
+fn managed_appimage_explicit_executables_is_empty_without_a_managed_install() {
+    // Only guessed / Flatpak / config-only evidence -> nothing fed, so
+    // PPSSPP / PCSX2 discovery roots stay exactly as `from_environment`
+    // built them.
+    let installs = [
+        managed_appimage_evidence(
+            "PPSSPP",
+            "AppImage",
+            "/home/u/Applications/PPSSPP/PPSSPP.AppImage",
+        ),
+        managed_appimage_evidence("PPSSPP", "Native/PATH", "/usr/bin/PPSSPPSDL"),
+    ];
+    assert!(managed_appimage_explicit_executables(&installs, "PPSSPP").is_empty());
+    assert!(managed_appimage_explicit_executables(&[], "PPSSPP").is_empty());
+}
+
+#[test]
+fn managed_appimage_explicit_executables_refuses_ambiguous_managed_installs() {
+    let managed = archivefs_core::diagnostics::profiles::MANAGED_APPIMAGE_INSTALLATION_FORM;
+    let installs = [
+        managed_appimage_evidence("PPSSPP", managed, "/a/ppsspp.AppImage"),
+        managed_appimage_evidence("PPSSPP", managed, "/b/ppsspp.AppImage"),
+    ];
+    assert!(managed_appimage_explicit_executables(&installs, "PPSSPP").is_empty());
+}

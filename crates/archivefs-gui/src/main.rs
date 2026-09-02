@@ -26,7 +26,8 @@ use archivefs_core::diagnostics::profiles::{
     ProfileAssessmentReport, Rpcs3ReadinessAssessment, XemuReadinessAssessment,
     XeniaReadinessAssessment, assess_emulator_profiles, assess_ppsspp_readiness,
     assess_rpcs3_readiness, assess_xemu_readiness, assess_xenia_readiness,
-    discover_linux_emulator_installations, managed_scan_targets, profile_destination_directories,
+    discover_linux_emulator_installations, discover_managed_appimage_installations,
+    managed_appimage_executable_for, managed_scan_targets, profile_destination_directories,
 };
 use archivefs_core::diagnostics::repair::{
     DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRejection,
@@ -7455,6 +7456,19 @@ impl ArchiveFsApp {
         // Ready result. A later launch click still invokes that adapter's
         // own preflight and execution path.
         let empty_firmware: &[archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord] = &[];
+
+        // Already-validated EmuWiz-managed PPSSPP AppImage (if any) - a
+        // caller-confirmed explicit executable fed into the *existing*
+        // discovery, computed once and reused by both the standalone-profile
+        // projection and the launch context below. Bounded, read-only, no
+        // shell; empty on any machine without a managed install, so launch
+        // readiness there is byte-for-byte unchanged. This adds no app-level
+        // state - it is derived here, exactly like every other discovery
+        // call in this function.
+        let managed_ppsspp_appimages: Vec<PathBuf> = managed_appimage_explicit_executables(
+            &discover_managed_appimage_installations(),
+            "PPSSPP",
+        );
         if let Ok(roots) =
             archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
         {
@@ -7486,9 +7500,12 @@ impl ArchiveFsApp {
                 }
             }));
         }
-        if let Ok(roots) =
+        if let Ok(mut roots) =
             archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
         {
+            roots
+                .explicit_executables
+                .extend(managed_ppsspp_appimages.iter().cloned());
             let discovery = archivefs_core::patch_manager::discover_ppsspp_profiles(&roots);
             standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
                 archivefs_core::launch::StandaloneProfileInput {
@@ -7581,15 +7598,24 @@ impl ArchiveFsApp {
         let ppsspp_context =
             archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
                 .ok()
-                .map(|roots| launch_readiness_page::PpssppLaunchContext {
-                    discovery: archivefs_core::patch_manager::discover_ppsspp_profiles(&roots),
-                    roots,
-                    verified_psp_disc_id: verified_facts.iter().find_map(|fact| match fact {
-                        archivefs_core::launch::VerifiedIdentityFact::PspDiscId(id) => {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    }),
+                .map(|mut roots| {
+                    // Same validated managed-AppImage evidence as the
+                    // standalone-profile projection above; the launch
+                    // context re-runs discovery at preflight time, so its
+                    // roots must carry the exact same explicit executable.
+                    roots
+                        .explicit_executables
+                        .extend(managed_ppsspp_appimages.iter().cloned());
+                    launch_readiness_page::PpssppLaunchContext {
+                        discovery: archivefs_core::patch_manager::discover_ppsspp_profiles(&roots),
+                        roots,
+                        verified_psp_disc_id: verified_facts.iter().find_map(|fact| match fact {
+                            archivefs_core::launch::VerifiedIdentityFact::PspDiscId(id) => {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        }),
+                    }
                 });
         let rpcs3_context =
             archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots::from_environment()
@@ -16979,7 +17005,19 @@ impl ArchiveFsApp {
         thread::spawn(move || {
             let result = Pcsx2ProfileDiscoveryRoots::from_environment()
                 .map_err(|error| error.to_string())
-                .and_then(|roots| {
+                .and_then(|mut roots| {
+                    // Feed an already-validated EmuWiz-managed PCSX2 AppImage
+                    // (if one exists) as a caller-confirmed explicit
+                    // executable. `discover_managed_appimage_installations`
+                    // (bounded, read-only, no shell - `install.json`-backed
+                    // entries only) is re-run here so this scan does not
+                    // depend on when the Doctor gather ran.
+                    roots
+                        .explicit_executables
+                        .extend(managed_appimage_explicit_executables(
+                            &discover_managed_appimage_installations(),
+                            "PCSX2",
+                        ));
                     discover_pcsx2_profiles(&roots)
                         .map_err(|error| error.to_string())
                         .map(|discovery| Pcsx2LaunchProfilesReady { discovery, roots })
@@ -17732,6 +17770,28 @@ impl ArchiveFsApp {
             self.refresh(context);
         }
     }
+}
+
+/// The caller-confirmed local executable paths to add to a standalone
+/// adapter's `explicit_executables` for `emulator` (a
+/// [`LinuxEmulatorInstallationEvidence::emulator`] display name, e.g.
+/// `"PPSSPP"` / `"PCSX2"`), taken **only** from an `install.json`-backed
+/// EmuWiz-managed AppImage already present in `installations` - see
+/// [`managed_appimage_executable_for`] for the exact trust rule (managed
+/// form only; never a plain `~/Applications` AppImage, a Flatpak,
+/// `$APPIMAGE`, `PATH`, config-only evidence, a lossy path, or an ambiguous
+/// multi-match).
+///
+/// Returns an empty vec whenever no such validated install exists, so
+/// feeding it into `ProfileDiscoveryRoots` is a no-op on any machine that
+/// does not have one - launch readiness there is byte-for-byte unchanged.
+fn managed_appimage_explicit_executables(
+    installations: &[LinuxEmulatorInstallationEvidence],
+    emulator: &str,
+) -> Vec<PathBuf> {
+    managed_appimage_executable_for(installations, emulator)
+        .into_iter()
+        .collect()
 }
 
 /// Runs the legacy CRC-only PNACH migration (staged alongside the primary

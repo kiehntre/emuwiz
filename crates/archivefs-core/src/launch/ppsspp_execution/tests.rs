@@ -3,27 +3,26 @@
 //! # The two binding provenances, and how each is exercised here
 //!
 //! [`crate::patch_manager::resolve_ppsspp_native_launch_binding`] authorizes
-//! two [`crate::patch_manager::PpssppInstallationType`] forms:
+//! two [`crate::patch_manager::PpssppInstallationType`] executable
+//! provenances - `Native` (a PPSSPP binary name on `PATH` / a documented
+//! user directory) and `Explicit` (an exact path a host integration already
+//! confirmed, e.g. a local AppImage in `roots.explicit_executables`) - and a
+//! `Native` *profile* (PPSSPP's own standard config location) may bind
+//! either.
 //!
-//! * `Native` - a plausible PPSSPP binary name found on the current
-//!   process's real `PATH`. Mutating this test binary's process-global
-//!   `PATH` at runtime to fabricate a `Native` match would race every other
-//!   concurrently running test that also reads `PATH` (`std::env::set_var`
-//!   is `unsafe` for exactly this reason), so the `Native` leg's genuine
-//!   binding success is proven as a pure unit in
-//!   `crate::patch_manager::ppsspp_local`'s own tests, and here every
-//!   preflight step that fires *before* binding resolution (steps 1-6) is
-//!   proven through the full [`preflight_ppsspp_launch`] pipeline on a real
-//!   synthetic PSP ISO9660 disc (see `build_ready_fixture` /
-//!   `a_fully_valid_request_reaches_binding_resolution`).
-//! * `Explicit` - an exact executable path a host integration already
-//!   confirmed (e.g. a local AppImage), supplied via
-//!   `roots.explicit_executables` and paired with an explicit configuration
-//!   root. This path has no `PATH` dependency, so it *is* exercised
-//!   end-to-end here: `build_explicit_appimage_fixture` +
-//!   `explicit_appimage_*` run the full identity -> discovery -> binding ->
-//!   command-plan -> preflight -> spawn chain against a harmless fake
-//!   `PPSSPP.AppImage`.
+//! Only a genuine `PATH`-discovered `Native` executable is untestable
+//! end-to-end here: fabricating one means mutating this test binary's
+//! process-global `PATH`, which races every other test that reads it
+//! (`std::env::set_var` is `unsafe` for exactly this reason), so that one
+//! leg stays a pure unit in `crate::patch_manager::ppsspp_local`'s tests.
+//! Everything else runs the full identity -> discovery -> binding ->
+//! command-plan -> preflight -> spawn chain on a real synthetic PSP ISO9660
+//! disc:
+//!
+//! * `build_ready_fixture` - a `Native` XDG-config profile launched by a
+//!   caller-confirmed executable (the common managed-AppImage shape).
+//! * `build_explicit_appimage_fixture` - a caller-supplied `Explicit`
+//!   configuration root launched by a caller-confirmed `PPSSPP.AppImage`.
 //!
 //! Bare spawn mechanics are still also proven directly against a hand-built
 //! [`PpssppCommand`], mirroring `xemu_execution::tests::hand_built_command`.
@@ -36,8 +35,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::*;
+use crate::diagnostics::profiles::{
+    LinuxEmulatorInstallationEvidence, MANAGED_APPIMAGE_INSTALLATION_FORM,
+    managed_appimage_executable_for,
+};
+use crate::emulator_environment::EncodedPath;
 use crate::launch::process_spawn::CapturedFileIdentity;
-use crate::patch_manager::PpssppProfileDiscoveryRoots;
+use crate::patch_manager::{PpssppProfileDiscoveryRoots, resolve_ppsspp_native_launch_binding};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -171,17 +175,14 @@ fn base_roots(fixture: &Fixture) -> PpssppProfileDiscoveryRoots {
     }
 }
 
-/// The standard XDG `Native` PPSSPP fixture: a real `PSP/SYSTEM/ppsspp.ini`
-/// evidence file, a fake executable supplied via `explicit_executables`
-/// (classified `Explicit`, so it never matches this `Native` profile's own
-/// installation type - which is exactly what the early-preflight-step tests
-/// below rely on to reach `BindingUnavailable` only after every earlier
-/// check has already passed), and a loose PSP ISO whose verified disc ID
-/// becomes the request's expected disc id/game key - computed via the same
-/// `inspect_catalogued_game_identity` the module itself uses, never
-/// hand-typed. The `Explicit` provenance's own genuine binding success is
-/// covered end-to-end by `build_explicit_appimage_fixture` /
-/// `explicit_appimage_*`.
+/// The standard XDG `Native` PPSSPP fixture - the common managed-AppImage
+/// shape: a real `PSP/SYSTEM/ppsspp.ini` evidence file at PPSSPP's own
+/// config location (so the discovered profile is `Native` and eligible), a
+/// fake executable supplied via `explicit_executables` (a caller-confirmed
+/// exact path, which a `Native` profile may bind), and a loose PSP ISO
+/// whose verified disc ID becomes the request's expected disc id/game key -
+/// computed via the same `inspect_catalogued_game_identity` the module
+/// itself uses, never hand-typed.
 struct ReadyFixture {
     fixture: Fixture,
     roots: PpssppProfileDiscoveryRoots,
@@ -386,21 +387,19 @@ fn profile_root_drift_is_rejected() {
 // --- every earlier check passing reaches binding resolution, never skips it ------------------------
 
 #[test]
-fn a_fully_valid_request_reaches_binding_resolution() {
-    // Proves steps 1-6 all pass cleanly for a completely valid request -
-    // `BindingUnavailable` here can only mean the pipeline reached real
-    // binding resolution. This fixture's profile is the standard XDG
-    // `Native` one, but its only executable candidate is `Explicit` (from
-    // `explicit_executables`), so the profile's own installation type has no
-    // matching executable to bind - not an earlier content/identity/profile
-    // check misfiring. The `Explicit` provenance's own genuine binding
-    // success is covered end-to-end by `explicit_appimage_*` below.
-    let ready = build_ready_fixture("reaches-binding");
-    let error = preflight(&ready).unwrap_err();
+fn a_native_xdg_profile_with_a_caller_confirmed_executable_reaches_a_real_command() {
+    // The common managed shape: PPSSPP is installed at its own XDG config
+    // location (`Native`, eligible) and launched by a caller-confirmed exact
+    // executable path. Every preflight step passes and a real command is
+    // produced.
+    let ready = build_ready_fixture("native-plus-confirmed");
+    let command = preflight(&ready).expect("a Native profile binds a caller-confirmed executable");
+    assert_eq!(command.executable, ready.request.expected_executable);
     assert_eq!(
-        error.kind,
-        PpssppLaunchPreflightErrorKind::BindingUnavailable
+        command.arguments,
+        vec![ready.request.selected_content_path.clone().into_os_string()]
     );
+    assert_eq!(command.selection.platform_id, "PSP");
 }
 
 // --- final pre-spawn recheck units (step 10) --------------------------------------------------------
@@ -742,4 +741,99 @@ fn explicit_appimage_config_evidence_missing_keeps_the_profile_ineligible() {
             | PpssppLaunchPreflightErrorKind::BindingUnavailable
             | PpssppLaunchPreflightErrorKind::CandidateNotReady
     ));
+}
+
+// --- the production wiring seam: managed evidence -> roots -> binding -------
+
+/// One `install.json`-backed EmuWiz-managed AppImage evidence entry for
+/// `emulator`, pointing at `executable` (the exact shape
+/// `diagnostics::profiles::discover_managed_emulator_installations`
+/// produces).
+fn managed_evidence(
+    emulator: &str,
+    executable: &std::path::Path,
+) -> LinuxEmulatorInstallationEvidence {
+    LinuxEmulatorInstallationEvidence {
+        emulator: emulator.to_string(),
+        installation_form: MANAGED_APPIMAGE_INSTALLATION_FORM.to_string(),
+        executable: Some(EncodedPath::from_path(executable)),
+        profile: None,
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn managed_ppsspp_appimage_evidence_reaches_a_trusted_binding_through_normal_discovery() {
+    let fixture = Fixture::new("managed-evidence-seam");
+    let mut roots = base_roots(&fixture);
+
+    // PPSSPP installed at its own XDG config location.
+    let profile_root = roots.xdg_config_home.join("ppsspp");
+    fs::create_dir_all(profile_root.join("PSP/SYSTEM")).unwrap();
+    fs::write(profile_root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
+
+    // The managed AppImage on disk, exactly as the download flow would leave it.
+    let appimage = fixture.write_executable(
+        "data/emuwiz/emulators/ppsspp/ppsspp.AppImage",
+        b"#!/bin/sh\nexit 0\n",
+    );
+
+    // The production seam: validated evidence -> explicit_executables.
+    let evidence = [managed_evidence("PPSSPP", &appimage)];
+    roots
+        .explicit_executables
+        .extend(managed_appimage_executable_for(&evidence, "PPSSPP"));
+    assert_eq!(roots.explicit_executables, vec![appimage.clone()]);
+
+    let discovery = discover_ppsspp_profiles(&roots);
+    let profile = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.configuration_path == profile_root)
+        .expect("the XDG profile is discovered");
+    assert!(profile.eligible);
+
+    let binding = resolve_ppsspp_native_launch_binding(profile).expect("a trusted binding");
+    assert_eq!(binding.executable, appimage);
+}
+
+#[test]
+fn without_managed_evidence_the_ppsspp_roots_and_binding_are_unchanged() {
+    let fixture = Fixture::new("no-managed-evidence-seam");
+    let mut roots = base_roots(&fixture);
+    let profile_root = roots.xdg_config_home.join("ppsspp");
+    fs::create_dir_all(profile_root.join("PSP/SYSTEM")).unwrap();
+    fs::write(profile_root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
+
+    // A *guessed* `~/Applications` AppImage - the non-managed form - is
+    // present as evidence but must never be promoted.
+    let guessed = fixture.write_executable(
+        "Applications/PPSSPP/PPSSPP.AppImage",
+        b"#!/bin/sh\nexit 0\n",
+    );
+    let evidence = [LinuxEmulatorInstallationEvidence {
+        emulator: "PPSSPP".to_string(),
+        installation_form: "AppImage".to_string(),
+        executable: Some(EncodedPath::from_path(&guessed)),
+        profile: None,
+        detail: String::new(),
+    }];
+    roots
+        .explicit_executables
+        .extend(managed_appimage_executable_for(&evidence, "PPSSPP"));
+    assert!(roots.explicit_executables.is_empty());
+
+    let discovery = discover_ppsspp_profiles(&roots);
+    let profile = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.configuration_path == profile_root)
+        .expect("the XDG profile is discovered");
+    // No executable candidate at all -> still Blocked, exactly as before.
+    assert_eq!(
+        resolve_ppsspp_native_launch_binding(profile)
+            .unwrap_err()
+            .kind,
+        crate::patch_manager::PpssppLaunchBlockerKind::ExecutableMissing,
+    );
 }

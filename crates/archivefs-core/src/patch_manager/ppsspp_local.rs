@@ -342,19 +342,25 @@ fn launch_blocker(kind: PpssppLaunchBlockerKind, detail: impl Into<String>) -> P
 /// Revalidates one discovered profile and proves exactly one safe
 /// executable.
 ///
-/// Two installation forms carry a trustworthy executable provenance and are
-/// bound here, held to the *identical* file-safety checks
-/// ([`validate_native_ppsspp_executable`]: absolute path, present, regular
-/// non-symlink file, execute bit) and the identical "exactly one candidate"
-/// rule:
+/// Which executable provenances a profile may bind, all held to the
+/// *identical* file-safety checks ([`validate_native_ppsspp_executable`]:
+/// absolute path, present, regular non-symlink file, execute bit) and the
+/// identical "exactly one candidate" rule:
 ///
 /// * [`PpssppInstallationType::Native`] - a plausible PPSSPP binary name
 ///   discovered on `PATH` or in a documented user directory.
 /// * [`PpssppInstallationType::Explicit`] - an exact executable path the
 ///   host integration already confirmed through its own provenance (for
 ///   example a local AppImage), supplied via
-///   [`PpssppProfileDiscoveryRoots::explicit_executables`] and paired with
-///   an equally explicit configuration root.
+///   [`PpssppProfileDiscoveryRoots::explicit_executables`].
+///
+/// A profile discovered at PPSSPP's own standard config location
+/// ([`PpssppInstallationType::Native`]) may be launched by *either* - a
+/// caller-confirmed exact path is at least as trustworthy as a `PATH` name
+/// match, and this is precisely the equivalence PCSX2's binding already
+/// makes for its `explicit_executables`. An
+/// [`PpssppInstallationType::Explicit`] *profile* (a caller-supplied
+/// configuration root) still requires an equally explicit executable.
 ///
 /// [`PpssppInstallationType::Portable`] stays refused on purpose: a
 /// `*.AppImage` merely *found* beside `$APPIMAGE` or by name is never a
@@ -370,9 +376,12 @@ pub fn resolve_ppsspp_native_launch_binding(
             "profile is not eligible",
         ));
     }
-    let installation_type = match profile.installation_type {
-        PpssppInstallationType::Native => PpssppInstallationType::Native,
-        PpssppInstallationType::Explicit => PpssppInstallationType::Explicit,
+    let acceptable: &[PpssppInstallationType] = match profile.installation_type {
+        PpssppInstallationType::Native => &[
+            PpssppInstallationType::Native,
+            PpssppInstallationType::Explicit,
+        ],
+        PpssppInstallationType::Explicit => &[PpssppInstallationType::Explicit],
         other @ (PpssppInstallationType::FlatpakUser | PpssppInstallationType::Portable) => {
             return Err(launch_blocker(
                 PpssppLaunchBlockerKind::UnsupportedInstallationType,
@@ -386,12 +395,12 @@ pub fn resolve_ppsspp_native_launch_binding(
     let matching: Vec<&PpssppExecutable> = profile
         .executable_candidates
         .iter()
-        .filter(|candidate| candidate.installation_type == installation_type)
+        .filter(|candidate| acceptable.contains(&candidate.installation_type))
         .collect();
     if matching.is_empty() {
         return Err(launch_blocker(
             PpssppLaunchBlockerKind::ExecutableMissing,
-            format!("no {installation_type:?} PPSSPP executable was discovered for this profile"),
+            "no native or caller-confirmed PPSSPP executable was discovered for this profile",
         ));
     }
     let mut valid = Vec::new();
@@ -410,7 +419,7 @@ pub fn resolve_ppsspp_native_launch_binding(
         count => Err(launch_blocker(
             PpssppLaunchBlockerKind::AmbiguousExecutable,
             format!(
-                "{count} viable {installation_type:?} PPSSPP executables match this profile and none is distinguished as authoritative"
+                "{count} viable PPSSPP executables match this profile and none is distinguished as authoritative"
             ),
         )),
     }
@@ -1878,27 +1887,51 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_appimage_never_binds_to_a_non_explicit_profile() {
-        // The same confirmed AppImage exists as an `Explicit` candidate, but
-        // a `Native` profile only ever matches `Native` executables - the
-        // AppImage does not leak into an unrelated installation.
+    fn a_native_profile_binds_a_caller_confirmed_appimage_and_untrusted_profiles_do_not() {
+        // A PPSSPP install discovered at its own standard config location
+        // (`Native`, eligible) *is* launchable by a caller-confirmed exact
+        // executable path - this is the common managed-AppImage case, and
+        // the equivalence PCSX2's binding already makes.
         let temp = TempDir::new().unwrap();
-        let (mut roots, _config_root) = explicit_setup(&temp);
-        let appimage = write_fake_appimage(&temp, "PPSSPP.AppImage");
-        roots.explicit_executables.push(appimage);
+        let mut roots = roots(&temp);
         let native_root = profile_root(&roots);
         write_global(&native_root, "");
+        let appimage = write_fake_appimage(&temp, "PPSSPP.AppImage");
+        roots.explicit_executables.push(appimage.clone());
 
-        let native_profile = discover_ppsspp_profiles(&roots)
+        let discovery = discover_ppsspp_profiles(&roots);
+        let native_profile = discovery
             .profiles
-            .into_iter()
+            .iter()
             .find(|profile| {
                 profile.configuration_path == native_root
                     && profile.installation_type == PpssppInstallationType::Native
             })
-            .expect("the standard XDG profile is discovered as Native");
-        let blocker = resolve_ppsspp_native_launch_binding(&native_profile).unwrap_err();
-        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::ExecutableMissing);
+            .expect("the standard XDG profile is discovered as Native")
+            .clone();
+        assert_eq!(
+            resolve_ppsspp_native_launch_binding(&native_profile)
+                .unwrap()
+                .executable,
+            appimage,
+        );
+
+        // But the confirmed executable never leaks into an untrusted
+        // installation form: a `Portable` (guessed) or `FlatpakUser` profile
+        // still refuses it outright.
+        for form in [
+            PpssppInstallationType::Portable,
+            PpssppInstallationType::FlatpakUser,
+        ] {
+            let mut untrusted = native_profile.clone();
+            untrusted.installation_type = form;
+            assert_eq!(
+                resolve_ppsspp_native_launch_binding(&untrusted)
+                    .unwrap_err()
+                    .kind,
+                PpssppLaunchBlockerKind::UnsupportedInstallationType,
+            );
+        }
     }
 
     #[test]
