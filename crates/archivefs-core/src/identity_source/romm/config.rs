@@ -312,12 +312,13 @@ impl ValidatedRommSource {
         let mappings =
             PathMappings::validate(&config.mappings, trusted_roots, config.provider_path_kind)
                 .map_err(ConfigRefusal::Mapping)?;
+        // Media reuse is optional. A root can disappear after configuration or
+        // become unsafe independently of the RomM endpoint; that must disable
+        // only local reuse and leave the established HTTP/cache path usable.
         let media_mapping = config
             .media_mapping
             .as_ref()
-            .map(validate_romm_media_mapping)
-            .transpose()
-            .map_err(|error| ConfigRefusal::MediaMapping(error))?;
+            .and_then(|mapping| validate_romm_media_mapping(mapping).ok());
         Ok(Self {
             endpoint,
             mappings,
