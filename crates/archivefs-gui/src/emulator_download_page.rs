@@ -799,6 +799,27 @@ mod tests {
     }
 
     #[test]
+    fn refresh_is_read_only_and_never_creates_the_managed_tree() {
+        // Opening Emulator Setup runs this discovery pass. It must classify
+        // every catalogue entry without writing anything - no `emulators/`
+        // directory, no provenance marker, no placeholder binary.
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = EmulatorDownloadPageState::default();
+        state.test_refresh_from_root(temp.path());
+        assert_eq!(
+            state.entry("pcsx2"),
+            Some(&EmulatorDownloadEntryState::NotInstalled)
+        );
+        assert!(
+            std::fs::read_dir(temp.path()).unwrap().next().is_none(),
+            "discovery must not create anything under the managed root"
+        );
+        // Re-running discovery is still inert.
+        state.test_refresh_from_root(temp.path());
+        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
     fn manual_lane_emulator_never_exposes_a_managed_download_row() {
         // The section only iterates GithubAppImage-lane specs.
         let ids: Vec<_> = EmulatorDownloadPageState::managed_specs()

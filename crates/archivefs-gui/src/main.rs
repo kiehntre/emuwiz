@@ -6681,16 +6681,17 @@ impl ArchiveFsApp {
             focus_emulator.as_deref(),
         );
         ui.add_space(theme::SECTION_GAP);
-        // The managed-emulator download section is progressive disclosure:
-        // it appears only after the readiness check has run, so the
-        // pre-check page stays the single grouped "not checked yet" state.
-        // The check remains authoritative for whether Play is available.
-        if self.doctor_scan.displayed().is_some() {
-            if let Some(action) = self.emulator_download_page.show(ui) {
-                self.emulator_download_page.handle(action, context.clone());
-            }
-            ui.add_space(theme::SECTION_GAP);
+        // The managed-emulator download catalogue is always shown: a beginner
+        // must be able to see whether an emulator is installed, available to
+        // download automatically, or manual-install-only without first running
+        // Full diagnostics. The section runs its own bounded, read-only on-disk
+        // discovery (`EmulatorDownloadPageState::poll` -> `refresh`); it never
+        // depends on `doctor_scan`, and the readiness checks above (and Doctor)
+        // remain authoritative for whether Play is available.
+        if let Some(action) = self.emulator_download_page.show(ui) {
+            self.emulator_download_page.handle(action, context.clone());
         }
+        ui.add_space(theme::SECTION_GAP);
         self.show_retroarch_core_folder_card(ui, context, focus_retroarch);
         ui.add_space(theme::SECTION_GAP);
         fn show_emulator_setup_summary(

@@ -2312,7 +2312,53 @@ fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
         &output,
         "No emulator-specific evidence was returned"
     ));
-    assert!(!rendered_text_contains(&output, "PPSSPP"));
+    // The readiness *summary* stays grouped: no per-emulator readiness rows
+    // and no readiness badges before a scan has run.
+    assert!(!rendered_text_contains(&output, "Setup incomplete"));
+    // The managed-download catalogue, however, is no longer gated behind a
+    // Doctor scan - it renders its own read-only discovery immediately.
+    assert!(rendered_text_contains(
+        &output,
+        "Download managed emulators"
+    ));
+}
+
+#[test]
+fn emulator_download_catalogue_is_visible_without_running_doctor() {
+    // V1 blocker: the download catalogue used to be gated behind
+    // `doctor_scan.displayed().is_some()`, so a beginner had to run Full
+    // diagnostics before they could even see that an emulator was available
+    // to download. A fresh Emulator Setup with no prior Doctor result must
+    // now surface the catalogue and its per-emulator state directly.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.doctor_scan = DoctorScanState::NotRun;
+    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.view = MainView::EmulatorSetup;
+
+    let output = render_problems_repair_app(&mut app);
+    // The catalogue and an automatic-download-lane emulator are usable now.
+    assert!(rendered_text_contains(
+        &output,
+        "Download managed emulators"
+    ));
+    assert!(rendered_text_contains(&output, "PCSX2"));
+    assert!(rendered_text_contains(&output, "Download emulator"));
+    // In an environment with no managed install, the automatic lane reads
+    // "Not installed" (offer to download), never a launch-readiness claim.
+    assert!(rendered_text_contains(&output, "Not installed"));
+    // The pre-scan readiness summary stays grouped, and Doctor stays a
+    // separate, still-reachable destination.
+    assert!(rendered_text_contains(
+        &output,
+        "Emulators have not been checked"
+    ));
+    app.view = MainView::Doctor;
+    let on_diagnostics = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(
+        &on_diagnostics,
+        "Check for problems"
+    ));
 }
 
 #[test]
