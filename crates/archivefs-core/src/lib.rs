@@ -27,6 +27,7 @@ mod database;
 /// for the read-only contract.
 pub mod diagnostics;
 pub mod emulator_download;
+pub mod managed_appimage_bootstrap;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,

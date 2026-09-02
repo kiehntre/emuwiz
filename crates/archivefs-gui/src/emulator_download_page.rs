@@ -23,6 +23,10 @@ use archivefs_core::emulator_download::{
     EmulatorDownloadSpec, HttpsEmulatorDownloadTransport, download_and_install_resolved,
     emulator_download_spec, managed_appimage_install, resolve_download_plan,
 };
+use archivefs_core::managed_appimage_bootstrap::{
+    ManagedAppImageBootstrapError, ManagedAppImageBootstrapReceipt, initialize_managed_appimage,
+    managed_appimage_is_initialized,
+};
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
@@ -40,6 +44,15 @@ pub(crate) enum EmulatorDownloadEntryState {
     /// A successfully EmuWiz-managed AppImage is present (not a claim about
     /// launch readiness).
     Installed(PathBuf),
+    /// A managed PPSSPP/PCSX2 AppImage is present but has not created its
+    /// emulator-owned first-run configuration yet.
+    NeedsInitialization(PathBuf),
+    /// The user has explicitly confirmed first-run initialization.
+    AwaitingInitializationConfirmation(PathBuf),
+    /// The explicit first-run operation is running.
+    Initializing,
+    /// Initialization failed; launch remains blocked until a later retry.
+    InitializationFailed(ManagedAppImageBootstrapError),
     /// No managed install; a download is offered.
     NotInstalled,
     /// This emulator has no automated AppImage lane - the user installs it
@@ -92,6 +105,10 @@ pub(crate) enum EmulatorDownloadPageAction {
     Resolve(String),
     /// Install the plan currently held for `id` (Install emulator click).
     Install(String),
+    /// Ask for confirmation before native first-run initialization.
+    Initialize(String),
+    /// Confirm native first-run initialization after its safety explanation.
+    ConfirmInitialization(String),
     /// The user ticked the replacement-confirmation checkbox for `id`.
     ConfirmReplacement(String),
     /// Cancel the in-flight operation for `id`.
@@ -103,6 +120,7 @@ pub(crate) enum EmulatorDownloadPageAction {
 enum TaskResult {
     Resolved(Result<EmulatorDownloadPlan, DownloadError>),
     Installed(Result<EmulatorDownloadReceipt, DownloadError>),
+    Initialized(Result<ManagedAppImageBootstrapReceipt, ManagedAppImageBootstrapError>),
 }
 
 /// Shared page state, held once on the app and threaded into Emulator Setup.
@@ -148,6 +166,7 @@ impl EmulatorDownloadPageState {
                                 | EmulatorDownloadEntryState::AwaitingConfirmation(_)
                                 | EmulatorDownloadEntryState::Complete(_)
                                 | EmulatorDownloadEntryState::Failed(_)
+                                | EmulatorDownloadEntryState::InitializationFailed(_)
                                 | EmulatorDownloadEntryState::Cancelled
                         )
             );
@@ -158,7 +177,13 @@ impl EmulatorDownloadPageState {
                 EmulatorDownloadEntryState::ManualInstallRequired
             } else if let Some(binary) = root.and_then(|root| managed_appimage_install(root, spec))
             {
-                EmulatorDownloadEntryState::Installed(binary)
+                if matches!(spec.id, "ppsspp" | "pcsx2")
+                    && !managed_appimage_is_initialized(spec).unwrap_or(false)
+                {
+                    EmulatorDownloadEntryState::NeedsInitialization(binary)
+                } else {
+                    EmulatorDownloadEntryState::Installed(binary)
+                }
             } else {
                 EmulatorDownloadEntryState::NotInstalled
             };
@@ -258,6 +283,17 @@ impl EmulatorDownloadPageState {
                 self.entries
                     .insert(key, EmulatorDownloadEntryState::Failed(error));
             }
+            TaskResult::Initialized(Ok(receipt)) => {
+                self.completed_install = Some(key.to_string());
+                self.entries.insert(
+                    key,
+                    EmulatorDownloadEntryState::Installed(receipt.executable),
+                );
+            }
+            TaskResult::Initialized(Err(error)) => {
+                self.entries
+                    .insert(key, EmulatorDownloadEntryState::InitializationFailed(error));
+            }
         }
     }
 
@@ -271,6 +307,10 @@ impl EmulatorDownloadPageState {
         match action {
             EmulatorDownloadPageAction::Resolve(id) => self.start_resolve(id, context),
             EmulatorDownloadPageAction::Install(id) => self.start_install(id, context),
+            EmulatorDownloadPageAction::Initialize(id) => self.request_initialization(id),
+            EmulatorDownloadPageAction::ConfirmInitialization(id) => {
+                self.start_initialization(id, context)
+            }
             EmulatorDownloadPageAction::ConfirmReplacement(id) => {
                 let key = catalogue_id(&id);
                 if let Some(EmulatorDownloadEntryState::ReadyToDownload(plan)) =
@@ -384,6 +424,54 @@ impl EmulatorDownloadPageState {
         });
     }
 
+    fn request_initialization(&mut self, id: String) {
+        let key = catalogue_id(&id);
+        if matches!(
+            self.entries.get(key),
+            Some(EmulatorDownloadEntryState::NeedsInitialization(_))
+        ) {
+            let path = match self.entries.remove(key) {
+                Some(EmulatorDownloadEntryState::NeedsInitialization(path)) => path,
+                _ => return,
+            };
+            self.entries.insert(
+                key,
+                EmulatorDownloadEntryState::AwaitingInitializationConfirmation(path),
+            );
+        }
+    }
+
+    fn start_initialization(&mut self, id: String, context: egui::Context) {
+        if self.task.is_some() {
+            return;
+        }
+        let key = catalogue_id(&id);
+        let Some(EmulatorDownloadEntryState::AwaitingInitializationConfirmation(_)) =
+            self.entries.get(key)
+        else {
+            return;
+        };
+        let Some(spec) = emulator_download_spec(&id) else {
+            return;
+        };
+        self.entries
+            .insert(key, EmulatorDownloadEntryState::Initializing);
+        let (sender, receiver) = mpsc::channel();
+        self.task = Some((id.clone(), receiver));
+        let spec_id = spec.id;
+        thread::spawn(move || {
+            let result = (|| {
+                let root = managed_root()
+                    .map_err(|error| ManagedAppImageBootstrapError::SpawnFailed(error))?;
+                let spec = emulator_download_spec(spec_id)
+                    .ok_or(ManagedAppImageBootstrapError::UnsupportedEmulator)?;
+                initialize_managed_appimage(&root, spec)
+            })();
+            let _ = sender.send(TaskResult::Initialized(result));
+            context.request_repaint();
+        });
+    }
+
     /// Render the managed-emulator download section. Returns at most one
     /// action; the caller passes it back to [`Self::handle`].
     pub(crate) fn show(&self, ui: &mut egui::Ui) -> Option<EmulatorDownloadPageAction> {
@@ -437,6 +525,20 @@ impl EmulatorDownloadPageState {
                 EmulatorDownloadEntryState::Installed(_) => {
                     widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
                 }
+                EmulatorDownloadEntryState::NeedsInitialization(_) => {
+                    widgets::status_badge(ui, "Needs initialization", widgets::StatusTone::Warning);
+                }
+                EmulatorDownloadEntryState::AwaitingInitializationConfirmation(_)
+                | EmulatorDownloadEntryState::Initializing => {
+                    widgets::status_badge(ui, "Initializing", widgets::StatusTone::Active);
+                }
+                EmulatorDownloadEntryState::InitializationFailed(_) => {
+                    widgets::status_badge(
+                        ui,
+                        "Initialization failed",
+                        widgets::StatusTone::Blocked,
+                    );
+                }
                 EmulatorDownloadEntryState::NotInstalled => {
                     widgets::status_badge(ui, "Not installed", widgets::StatusTone::Pending);
                     if ui
@@ -489,6 +591,55 @@ impl EmulatorDownloadPageState {
                 widgets::technical_details(ui, ("emu-dl-installed", spec.id), |ui| {
                     widgets::detail_row(ui, "Path", &path.to_string_lossy());
                 });
+            }
+            EmulatorDownloadEntryState::NeedsInitialization(path) => {
+                ui.label(format!(
+                    "A managed {} AppImage was found, but it has not created its first-run configuration yet.",
+                    spec.display_name
+                ));
+                ui.label("EmuWiz will start it without a game, wait briefly for it to exit, and verify the configuration it creates.");
+                if self.task.is_none()
+                    && ui
+                        .button(format!("Initialize {}", spec.display_name))
+                        .clicked()
+                {
+                    action = Some(EmulatorDownloadPageAction::Initialize(id.clone()));
+                }
+                widgets::technical_details(ui, ("emu-dl-initialize", spec.id), |ui| {
+                    widgets::detail_row(ui, "Managed AppImage", &path.to_string_lossy());
+                });
+            }
+            EmulatorDownloadEntryState::AwaitingInitializationConfirmation(path) => {
+                ui.label(format!(
+                    "Initialize {} now? Nothing will be launched with a game, and EmuWiz will not create or edit its configuration.",
+                    spec.display_name
+                ));
+                ui.label("The managed AppImage will be started directly with no shell command and stopped if it exceeds the short setup limit.");
+                ui.horizontal(|ui| {
+                    if self.task.is_none() && ui.button("Confirm initialization").clicked() {
+                        action = Some(EmulatorDownloadPageAction::ConfirmInitialization(
+                            id.clone(),
+                        ));
+                    }
+                    if ui.button("Not now").clicked() {
+                        action = Some(EmulatorDownloadPageAction::Dismiss(id.clone()));
+                    }
+                });
+                widgets::technical_details(ui, ("emu-dl-initialize-confirm", spec.id), |ui| {
+                    widgets::detail_row(ui, "Managed AppImage", &path.to_string_lossy());
+                });
+            }
+            EmulatorDownloadEntryState::Initializing => {
+                ui.label("EmuWiz is waiting for the emulator to finish first-run setup. No game was supplied.");
+            }
+            EmulatorDownloadEntryState::InitializationFailed(error) => {
+                ui.label("Initialization did not prove that the emulator is ready. Launch remains blocked.");
+                widgets::technical_details(ui, ("emu-dl-initialize-error", spec.id), |ui| {
+                    ui.label(error.to_string());
+                });
+                if self.task.is_none() && ui.button("Try initialization again").clicked() {
+                    action = Some(EmulatorDownloadPageAction::Initialize(id.clone()));
+                }
             }
             EmulatorDownloadEntryState::NotInstalled => {
                 ui.label(format!(
@@ -718,6 +869,13 @@ impl EmulatorDownloadPageState {
 
     fn test_ingest(&mut self, id: &str, result: TaskResult) {
         self.apply_task_result(id, result);
+    }
+
+    fn test_set_needs_initialization(&mut self, id: &str, path: PathBuf) {
+        self.entries.insert(
+            catalogue_id(id),
+            EmulatorDownloadEntryState::NeedsInitialization(path),
+        );
     }
 }
 
@@ -973,5 +1131,18 @@ mod tests {
             state.entry("pcsx2"),
             Some(EmulatorDownloadEntryState::Failed(_))
         ));
+    }
+
+    #[test]
+    fn initialization_requires_a_separate_explicit_confirmation() {
+        let ctx = egui::Context::default();
+        let mut state = EmulatorDownloadPageState::default();
+        state.test_set_needs_initialization("ppsspp", PathBuf::from("/managed/ppsspp.AppImage"));
+        state.handle(EmulatorDownloadPageAction::Initialize("ppsspp".into()), ctx);
+        assert!(matches!(
+            state.entry("ppsspp"),
+            Some(EmulatorDownloadEntryState::AwaitingInitializationConfirmation(_))
+        ));
+        assert!(state.task.is_none());
     }
 }
