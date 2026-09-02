@@ -27,6 +27,20 @@
 //! makes `//evil.example/x` and `http://evil.example/x` refusals rather than
 //! requests: both are legal relative-URL forms that change the host.
 //!
+//! # A mapped local file is read instead of fetched
+//!
+//! When a RomM source carries an explicit media mapping
+//! ([`super::romm::config::ValidatedRommSource::media_mapping`]) and the hosted
+//! reference resolves through it - and only through it - to a readable local
+//! file, that file is decoded directly and no HTTP request is made. The
+//! resolution is done exclusively by
+//! [`super::romm::media_mapping::resolve_romm_media_reference`], which owns the
+//! provider-prefix, traversal, symlink-escape and media-type checks. Anything it
+//! does not resolve cleanly - no mapping, an absent file, an unsafe reference,
+//! an oversized or non-decodable file - falls straight through to the fetch
+//! path above, so local media is only ever a read-instead-of-fetch, never a new
+//! way to fail or a new trust surface.
+//!
 //! # Bounded at every step
 //!
 //! Response bytes, source dimensions, decode allocation, thumbnail dimensions and
@@ -41,6 +55,12 @@
 //! index holds the approved origin, record ids and digests, and no cover path or
 //! URL at all. Artwork on the tested instance needs no authentication, so the token
 //! is only offered if a request is actually refused without it.
+//!
+//! A cover or screenshot resolved from a mapped local file is thumbnailed and
+//! cached under that *same* key: it is the same image, identified the same way,
+//! so provenance never enters the key. An offline [`ArtworkCache::lookup`] then
+//! finds it, and a cover RomM later replaces (new `ts` in the reference) still
+//! produces a different key and is re-resolved.
 
 use std::collections::HashMap;
 use std::fs;
@@ -56,6 +76,7 @@ use super::model::IdentityProvider;
 use super::net_policy::EndpointRefusal;
 use super::romm::client::{REQUEST_TIMEOUT, RommRequestError, RommTransport};
 use super::romm::config::ValidatedRommSource;
+use super::romm::media_mapping::resolve_romm_media_reference;
 
 /// The box a thumbnail must fit inside. Matches the GUI's cover aspect closely
 /// enough that nothing is stretched: an image is scaled to fit, never to fill.
@@ -755,6 +776,21 @@ impl ArtworkCache {
         cancel: Option<&AtomicBool>,
     ) -> Result<CachedThumbnail, ArtworkRefusal> {
         let server_id = source.server_id().to_string();
+
+        // An explicitly-configured local media mapping can make RomM's hosted
+        // reference resolve to a readable file on disk. When it does, that file
+        // is the same image RomM would serve, so it is decoded directly and the
+        // HTTP fetch is skipped. Every way this can come up short - no mapping,
+        // the file is absent, the reference is unsafe, the file is oversized, or
+        // it does not decode - falls through to the existing approved-origin
+        // fetch below, so local media is only ever an optimisation, never a new
+        // failure mode.
+        if let Some(thumbnail) =
+            self.fetch_local_media(source, &server_id, request, now_unix_seconds, cancel)?
+        {
+            return Ok(thumbnail);
+        }
+
         let url = self.resolve(source, request)?;
         if cancelled(cancel) {
             return Err(ArtworkRefusal::Cancelled);
@@ -811,6 +847,97 @@ impl ArtworkCache {
             return Err(ArtworkRefusal::Cancelled);
         }
         self.store(&server_id, request, thumbnail, now_unix_seconds)
+    }
+
+    /// Tries to satisfy `request` from an explicitly-mapped local media file
+    /// instead of an HTTP fetch.
+    ///
+    /// `Ok(Some(_))` is a local hit: the mapped file decoded and was stored
+    /// under the identical cache key the remote path would have used - it is the
+    /// same image, identified the same way (RomM's reference and its `ts`), so a
+    /// later [`Self::lookup`] finds it with no network and a replaced cover
+    /// still invalidates it.
+    ///
+    /// `Ok(None)` means there is nothing usable locally and the caller must fall
+    /// back to the existing remote/cache path: no mapping is configured, the
+    /// reference does not resolve to a present regular file, the reference is
+    /// unsafe (traversal, symlink escape, wrong provider prefix, unsupported
+    /// type, unreadable), the file is over [`MAX_ARTWORK_RESPONSE_BYTES`], or it
+    /// failed to decode. A local problem is never surfaced as an error - the
+    /// remote copy may still be usable.
+    ///
+    /// The only `Err` is [`ArtworkRefusal::Cancelled`] or a genuine
+    /// cache-write failure from [`Self::store`], both of which the remote path
+    /// raises identically.
+    fn fetch_local_media(
+        &self,
+        source: &ValidatedRommSource,
+        server_id: &str,
+        request: &ArtworkRequest<'_>,
+        now_unix_seconds: i64,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<CachedThumbnail>, ArtworkRefusal> {
+        let Some(mapping) = source.media_mapping() else {
+            return Ok(None);
+        };
+        // `fetch` already tries the large reference and then the small one in
+        // turn, so exactly one reference is resolved here - the same one
+        // `resolve` would fetch for this call.
+        let Some(reference) = request
+            .large_reference
+            .or(request.small_reference)
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+        else {
+            return Ok(None);
+        };
+        // RomM appends a `?ts=...` cache-busting query to hosted references. It
+        // identifies a version over HTTP but is not part of the on-disk file
+        // name, so the local lookup uses the path portion only. The mapping
+        // primitive's traversal / `..` / control-character refusals act on the
+        // path components, which dropping a trailing `?query` or `#fragment`
+        // cannot affect.
+        let path_reference = reference
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(reference)
+            .trim();
+        if path_reference.is_empty() {
+            return Ok(None);
+        }
+        // The only local-path primitive: it validates the provider prefix, the
+        // configured root, `..`/traversal, symlink escape and the media type,
+        // and returns `Ok(None)` when the mapped file is simply absent.
+        let local_path = match resolve_romm_media_reference(Some(mapping), path_reference) {
+            Ok(Some(path)) => path,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        if cancelled(cancel) {
+            return Err(ArtworkRefusal::Cancelled);
+        }
+        // The same ceiling the transport enforces on a response body, applied
+        // before the file is read into memory.
+        match fs::metadata(&local_path) {
+            Ok(metadata) if metadata.len() <= MAX_ARTWORK_RESPONSE_BYTES as u64 => {}
+            _ => return Ok(None),
+        }
+        let Ok(bytes) = fs::read(&local_path) else {
+            return Ok(None);
+        };
+        if bytes.len() > MAX_ARTWORK_RESPONSE_BYTES {
+            return Ok(None);
+        }
+        // Decoding uses the identical bounded decoder the remote body goes
+        // through. A local file that is not a PNG this build decodes is not an
+        // error - the remote copy might be - so fall through instead.
+        let Ok(thumbnail) = render_thumbnail(&bytes) else {
+            return Ok(None);
+        };
+        if cancelled(cancel) {
+            return Err(ArtworkRefusal::Cancelled);
+        }
+        self.store(server_id, request, thumbnail, now_unix_seconds)
+            .map(Some)
     }
 
     /// Resolves a request to a URL on the approved origin, or refuses.
