@@ -8149,6 +8149,51 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_scan_run_does_not_mark_any_archive_missing() {
+        // A scan that started but never completed (process killed, machine
+        // lost power) is relabelled `interrupted` on the next startup. That
+        // relabel must never be treated as evidence of absence: an
+        // interrupted scan verified nothing, so no `archives` row may gain
+        // `last_verified_missing_at`, and the confirmed-missing cleanup the
+        // "fix it here" card offers therefore has nothing to act on.
+        let root = temp_dir("interrupted-scan-marks-nothing-missing");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let doomed = write_archive_file(&source, "gone.zip", b"b");
+        write_archive_file(&source, "keep.zip", b"a");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+
+        // The file disappears, then a scan starts but is cut short before
+        // it can persist any observation for this source folder.
+        fs::remove_file(&doomed).unwrap();
+        let scan_run_id = database.start_scan_run("interrupted", None).unwrap();
+        let relabelled = database.mark_interrupted_scan_runs().unwrap();
+        assert_eq!(relabelled, 1);
+
+        let status: String = database
+            .connection
+            .query_row(
+                "SELECT status FROM scan_runs WHERE id = ?1",
+                params![scan_run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "interrupted");
+
+        let archives = database.load_archives().unwrap();
+        assert!(
+            archives
+                .iter()
+                .all(|archive| archive.last_verified_missing_at.is_none()),
+            "an interrupted scan must not mark the vanished archive missing"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn unavailable_source_folder_does_not_destroy_prior_catalogue_state() {
         let root = temp_dir("unavailable-source-folder");
         let source_a = root.join("source-a");

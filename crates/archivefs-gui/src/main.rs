@@ -17849,6 +17849,17 @@ enum AppOperationRequest {
         kind: BulkPlatformActionKind,
     },
     RemoveMissing(Vec<PathBuf>),
+    /// The moved-library "fix it here" card's navigation-only actions. None
+    /// of these change catalogue rows, source configuration, or the
+    /// filesystem themselves: they route the user to the existing explicit
+    /// flow (`SourcesTab::Libraries` folder editor, `SourceAction::ScanAll`,
+    /// missing-only review mode). The card's own "Clean up confirmed missing
+    /// entries" button does not use this enum - it opens the existing
+    /// `confirm_remove_missing` dialog directly, so the typed-count gate and
+    /// explicit confirmation are unchanged.
+    UpdateGameFolder,
+    FullRescan,
+    ReviewMissingGames,
     InspectArchive(PathBuf),
     /// Navigates to the Library Views page with this archive as the
     /// "Show in Library View preview" focus - see
@@ -20309,6 +20320,15 @@ impl ArchiveFsApp {
                 }
                 AppOperationRequest::RemoveMissing(archive_paths) => {
                     self.start_missing_removal(context.clone(), archive_paths);
+                }
+                AppOperationRequest::UpdateGameFolder => {
+                    self.navigate_to_sources_tab(SourcesTab::Libraries);
+                }
+                AppOperationRequest::FullRescan => {
+                    self.start_source_action(context.clone(), SourceAction::ScanAll);
+                }
+                AppOperationRequest::ReviewMissingGames => {
+                    self.navigate_to_missing_catalogue_review();
                 }
                 AppOperationRequest::InspectArchive(archive_path) => {
                     self.start_archive_inspection(context.clone(), archive_path);

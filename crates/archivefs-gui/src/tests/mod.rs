@@ -243,6 +243,7 @@ mod emulator_profiles_and_setup;
 mod gamehacking_browser_import;
 mod health_and_platform_actions;
 mod library_views_and_sources;
+mod missing_library_fixit;
 mod mounts_and_history;
 mod platform_shelf_and_library_shell;
 mod selected;
@@ -1484,6 +1485,36 @@ fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
     }
 }
 
+/// Like [`cached_snapshot`] but with `last_completed_scan` populated, so a
+/// test exercising the moved-library "fix it here" card reaches its
+/// "Clean up confirmed missing entries" branch (the branch shown once a
+/// successful scan has completed) rather than the "Rescan and clean up"
+/// fallback.
+fn cached_snapshot_with_completed_scan(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
+    CachedLibrarySnapshot {
+        last_completed_scan: Some(archivefs_core::CompletedScanSummary {
+            scan_run_id: 1,
+            started_at: "2026-01-02T00:00:00Z".to_string(),
+            finished_at: Some("2026-01-02T00:01:00Z".to_string()),
+            triggered_by: "test".to_string(),
+            source_folders_scanned: 1,
+            archives_seen: 0,
+            archives_added: 0,
+            archives_updated: 0,
+            archives_missing: archives
+                .iter()
+                .filter(|archive| archive.last_verified_missing_at.is_some())
+                .count() as i64,
+            archives_unchanged: 0,
+            skipped_unsupported_extension: 0,
+            skipped_ambiguous_platform: 0,
+            errors_count: 0,
+            error_message: None,
+        }),
+        ..cached_snapshot(archives)
+    }
+}
+
 fn source_view_fixture(id: i64, path: &str, enabled: bool) -> SourceFolderView {
     SourceFolderView {
         path: PathBuf::from(path),
@@ -1914,6 +1945,17 @@ struct RealLoadedDataHarness {
     focus_unmount_selected_cancel: bool,
     cleanup_after_unmount: bool,
     history: OperationHistory,
+    /// Persistent across `.render()` calls, like `confirm_unmount_selected`,
+    /// so a test can drive the confirmed-missing cleanup flow (open the
+    /// dialog from the "fix it here" card on one frame, confirm on a later
+    /// one). Defaults keep every existing caller's behaviour identical to
+    /// the previous hard-coded `None` / `false` / empty values.
+    cached: Option<CachedLibrarySnapshot>,
+    missing_removal_available: bool,
+    missing_removal_busy: bool,
+    confirm_remove_missing: Option<Vec<PathBuf>>,
+    missing_removal_typed_count: String,
+    recent_view: bool,
     requested_action: Option<AppOperationRequest>,
     /// The last `.render()` call's full output, for
     /// `rendered_text_contains` checks - `.render()` itself keeps
@@ -1938,6 +1980,12 @@ impl RealLoadedDataHarness {
             focus_unmount_selected_cancel: false,
             cleanup_after_unmount: false,
             history: OperationHistory::default(),
+            cached: None,
+            missing_removal_available: false,
+            missing_removal_busy: false,
+            confirm_remove_missing: None,
+            missing_removal_typed_count: String::new(),
+            recent_view: false,
             requested_action: None,
             last_output: None,
         }
@@ -1974,8 +2022,6 @@ impl RealLoadedDataHarness {
         let mut platform_choice = None;
         let mut platform_custom_text = String::new();
         let mut bulk_platform_choice = None;
-        let mut confirm_remove_missing = None;
-        let mut missing_removal_typed_count = String::new();
         let mut clipboard = InMemoryClipboard::default();
         let mut select_all_visible_requested = false;
         let mut library_source_filter = None;
@@ -2021,7 +2067,7 @@ impl RealLoadedDataHarness {
                         mount_all_result: None,
                         unmount_all_result: None,
                         history: &mut self.history,
-                        cached: None,
+                        cached: self.cached.as_ref(),
                         library_filters: &mut self.library_filters,
                         platform_choice: &mut platform_choice,
                         platform_custom_text: &mut platform_custom_text,
@@ -2031,11 +2077,11 @@ impl RealLoadedDataHarness {
                         selected_archives: &mut self.archive_context.selected,
                         bulk_platform_choice: &mut bulk_platform_choice,
                         bulk_platform_busy: false,
-                        missing_removal_available: false,
+                        missing_removal_available: self.missing_removal_available,
                         missing_removal_unavailable_reason: None,
-                        missing_removal_busy: false,
-                        confirm_remove_missing: &mut confirm_remove_missing,
-                        missing_removal_typed_count: &mut missing_removal_typed_count,
+                        missing_removal_busy: self.missing_removal_busy,
+                        confirm_remove_missing: &mut self.confirm_remove_missing,
+                        missing_removal_typed_count: &mut self.missing_removal_typed_count,
                         sort_field: &mut self.sort_field,
                         sort_ascending: &mut self.sort_ascending,
                         library_scroll_offset: &mut self.library_scroll_offset,
@@ -2046,7 +2092,7 @@ impl RealLoadedDataHarness {
                         library_views_configured: false,
                         library_view_last_plan: None,
                         recent_scan: None,
-                        recent_view: false,
+                        recent_view: self.recent_view,
                         library_platform_query: &mut self.library_platform_query,
                     },
                 );

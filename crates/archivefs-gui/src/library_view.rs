@@ -132,6 +132,81 @@ pub(crate) fn show_loaded_data(
             }
         });
     }
+
+    // The moved-library "fix it here" card. Shown on the ordinary Library
+    // view (never Recently Found) whenever the last successful scan left
+    // catalogue entries confirmed missing - a moved or removed game folder
+    // is the common cause. Every fix stays on this screen instead of the
+    // Sources -> scan -> Problems & Repair -> history trail.
+    if !recent_view {
+        let confirmed_missing = confirmed_missing_catalogue_paths(cached);
+        if !confirmed_missing.is_empty() {
+            let has_completed_scan = cached
+                .map(|snapshot| snapshot.last_completed_scan.is_some())
+                .unwrap_or(false);
+            if let Some(request) = show_missing_library_fixit_card(
+                ui,
+                &confirmed_missing,
+                has_completed_scan,
+                missing_removal_available,
+                missing_removal_unavailable_reason.as_deref(),
+                missing_removal_busy,
+                confirm_remove_missing,
+            ) {
+                requested_action = Some(request);
+            }
+            ui.add_space(crate::ui::theme::SECTION_GAP);
+        }
+    }
+
+    // The confirmed-missing removal dialog is rendered here, at the top
+    // level, rather than only inside the "More filters" section below, so
+    // the "fix it here" card's "Clean up confirmed missing entries" button
+    // opens it even while that collapsing section is closed. Gated purely
+    // on `confirm_remove_missing` so both entry points share exactly one
+    // dialog. The typed-count gate and explicit confirm are unchanged; a
+    // stale selection (a path that is no longer missing) disables Confirm.
+    if let Some(paths) = confirm_remove_missing.clone() {
+        let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let still_valid = selected_missing_paths(cached, &confirmation_selection).is_ok();
+        widgets::centered_window(format!(
+            "Remove {} missing catalogue entr{}?",
+            paths.len(),
+            if paths.len() == 1 { "y" } else { "ies" }
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(missing_removal_confirmation_text(paths.len()));
+            ui.add_space(8.0);
+            let confirm_enabled = show_bulk_action_typed_count_gate(
+                ui,
+                paths.len(),
+                missing_removal_typed_count,
+                missing_removal_available && still_valid,
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
+                    *confirm_remove_missing = None;
+                    missing_removal_typed_count.clear();
+                }
+                if ui
+                    .add_enabled(
+                        confirm_enabled,
+                        egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
+                    )
+                    .clicked()
+                {
+                    requested_action = Some(AppOperationRequest::RemoveMissing(paths.clone()));
+                    *confirm_remove_missing = None;
+                    missing_removal_typed_count.clear();
+                }
+            });
+        });
+    }
+
     // Merged rows are rebuilt fresh every frame (cheap for realistic
     // library sizes, and always exactly consistent with the current
     // self.state/self.database_state - see build_display_rows). Only the
@@ -1041,49 +1116,10 @@ pub(crate) fn show_loaded_data(
                     // for the ordinary in-card transition into this mode.
                     ui.label("Showing missing entries only.");
                 }
-
-                if let Some(paths) = confirm_remove_missing.clone() {
-                    let confirmation_selection: HashSet<PathBuf> = paths.iter().cloned().collect();
-                    let still_valid =
-                        selected_missing_paths(cached, &confirmation_selection).is_ok();
-                    widgets::centered_window(format!(
-                        "Remove {} missing catalogue entr{}?",
-                        paths.len(),
-                        if paths.len() == 1 { "y" } else { "ies" }
-                    ))
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                    .show(ui.ctx(), |ui| {
-                        ui.label(missing_removal_confirmation_text(paths.len()));
-                        ui.add_space(8.0);
-                        let confirm_enabled = show_bulk_action_typed_count_gate(
-                            ui,
-                            paths.len(),
-                            missing_removal_typed_count,
-                            missing_removal_available && still_valid,
-                        );
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button(REMOVE_MISSING_CANCEL_LABEL).clicked() {
-                                *confirm_remove_missing = None;
-                                missing_removal_typed_count.clear();
-                            }
-                            if ui
-                                .add_enabled(
-                                    confirm_enabled,
-                                    egui::Button::new(REMOVE_MISSING_CONFIRM_LABEL),
-                                )
-                                .clicked()
-                            {
-                                requested_action =
-                                    Some(AppOperationRequest::RemoveMissing(paths.clone()));
-                                *confirm_remove_missing = None;
-                                missing_removal_typed_count.clear();
-                            }
-                        });
-                    });
-                }
+                // The removal confirmation dialog is rendered once, at the
+                // top level of `show_loaded_data`, so it is reachable from
+                // both this section and the "fix it here" card regardless
+                // of whether this collapsing section is open.
             });
     });
     let missing_count = merged_rows
@@ -1410,6 +1446,166 @@ pub(crate) fn show_loaded_data(
     }
 
     requested_action
+}
+
+/// Every catalogue entry the last successful scan confirmed missing, as the
+/// exact stored absolute paths - the same set
+/// [`archivefs_core::Database::remove_missing_archives`] operates on
+/// (`archives.last_verified_missing_at IS NOT NULL`), sorted for a stable
+/// confirmation preview. A game found again at a new location has that
+/// column cleared by the rediscovering scan, so it is never in this list.
+/// Empty when no catalogue snapshot is loaded.
+pub(crate) fn confirmed_missing_catalogue_paths(
+    cached: Option<&CachedLibrarySnapshot>,
+) -> Vec<PathBuf> {
+    let Some(cached) = cached else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = cached
+        .archives
+        .iter()
+        .filter(|archive| archive.last_verified_missing_at.is_some())
+        .map(|archive| archive.absolute_path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The moved-library "fix it here" card, shown at the top of Library ->
+/// Archives whenever the last successful scan left catalogue entries
+/// confirmed missing. It puts the sensible next steps on the same screen
+/// the problem is seen on, instead of requiring the user to remember
+/// Sources -> change folder -> scan -> Problems & Repair -> history ->
+/// clean.
+///
+/// Safety model - this card never deletes a game file and never edits
+/// source configuration:
+/// - "Update game folder" only navigates to the existing folder editor
+///   ([`AppOperationRequest::UpdateGameFolder`]); the user still applies
+///   any change explicitly there.
+/// - "Full rescan" runs the existing `SourceAction::ScanAll`
+///   ([`AppOperationRequest::FullRescan`]). A failed or interrupted scan
+///   never marks anything missing, so it can never widen what cleanup
+///   would touch.
+/// - "Clean up confirmed missing entries" opens the existing
+///   `confirm_remove_missing` dialog - typed-count gate and explicit
+///   confirmation unchanged - pre-populated with exactly
+///   `confirmed_missing`, which is only ever the rows a successful scan
+///   marked missing (`last_verified_missing_at` set) and never a game
+///   rediscovered at a new location. Removal is catalogue-only.
+///
+/// Returns the navigation request a button asked for, if any; the cleanup
+/// button sets `confirm_remove_missing` directly instead.
+fn show_missing_library_fixit_card(
+    ui: &mut egui::Ui,
+    confirmed_missing: &[PathBuf],
+    has_completed_scan: bool,
+    missing_removal_available: bool,
+    missing_removal_unavailable_reason: Option<&str>,
+    missing_removal_busy: bool,
+    confirm_remove_missing: &mut Option<Vec<PathBuf>>,
+) -> Option<AppOperationRequest> {
+    let count = confirmed_missing.len();
+    let mut request = None;
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Missing games", widgets::StatusTone::Warning);
+        ui.add(egui::Label::new(
+            egui::RichText::new(if count == 1 {
+                "1 game is missing from its previous location.".to_string()
+            } else {
+                format!("{count} games are missing from their previous locations.")
+            })
+            .strong()
+            .size(15.0),
+        ));
+        ui.add(
+            egui::Label::new(
+                "Did you move or remove this game folder? If you moved it, update the game \
+                 folder and run a full rescan - EmuWiz will find the games at the new location. \
+                 Your original game and ROM files are never deleted; this only tidies EmuWiz's \
+                 catalogue.",
+            )
+            .wrap(),
+        );
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Update game folder",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+            {
+                request = Some(AppOperationRequest::UpdateGameFolder);
+            }
+            let rescan = widgets::action_button(
+                ui,
+                "Full rescan",
+                widgets::ActionStyle::Secondary,
+                missing_removal_available,
+            );
+            if !missing_removal_available && let Some(reason) = missing_removal_unavailable_reason {
+                rescan.clone().on_hover_text(reason);
+            }
+            if rescan.clicked() {
+                request = Some(AppOperationRequest::FullRescan);
+            }
+            if widgets::action_button(
+                ui,
+                format!("Review missing games ({count})"),
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                request = Some(AppOperationRequest::ReviewMissingGames);
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if has_completed_scan {
+                let cleanup_enabled =
+                    missing_removal_available && !missing_removal_busy && count > 0;
+                let cleanup = widgets::action_button(
+                    ui,
+                    format!("Clean up confirmed missing entries ({count})"),
+                    widgets::ActionStyle::Destructive,
+                    cleanup_enabled,
+                );
+                if !cleanup_enabled {
+                    let reason = missing_removal_unavailable_reason.unwrap_or(
+                        "Wait for the current catalogue operation to finish before cleaning up.",
+                    );
+                    cleanup.clone().on_hover_text(reason);
+                }
+                if cleanup.clicked() {
+                    *confirm_remove_missing = Some(confirmed_missing.to_vec());
+                }
+            } else if widgets::action_button(
+                ui,
+                "Rescan and clean up confirmed missing entries",
+                widgets::ActionStyle::Secondary,
+                missing_removal_available,
+            )
+            .clicked()
+            {
+                request = Some(AppOperationRequest::FullRescan);
+            }
+            if missing_removal_busy {
+                ui.spinner();
+                ui.label("Cleaning up catalogue entries...");
+            }
+        });
+        ui.weak(
+            "Cleaning up removes only EmuWiz database records for games it could not find in the \
+             last successful scan. It never deletes ROM or archive files, source folders, \
+             symlinks, or mounts, and there is no undo journal. Technical details are in \
+             Problems & Repair -> Diagnostics, but you do not need them for this.",
+        );
+    });
+    request
 }
 
 pub(crate) fn recent_scan_contains(recent: &RecentScanAdditions, path: &Path) -> bool {
