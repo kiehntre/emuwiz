@@ -4685,6 +4685,8 @@ fn fixture_recovery_transaction(
         human_summary: human_summary.to_string(),
         source_scan_root: String::new(),
         resolution: None,
+        exact_resume: ExactResumeStatusView::NeedsCurrentPlan,
+        resume_action_available: false,
     }
 }
 
@@ -4710,8 +4712,11 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
         subset_available: false,
         rollback_result: None,
         rollback_error: None,
+        resume_result: None,
+        resume_error: None,
         apply_running: false,
         rollback_running: false,
+        resume_running: false,
         recovery: vec![
             fixture_recovery_transaction(
                 "tx-applied-1",
@@ -7625,7 +7630,7 @@ fn settled_history_remains_available_once_expanded() {
     let mut action = None;
     let output = context.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            action = show_recovery_transactions(ui, &settled, false);
+            action = show_recovery_transactions(ui, &settled, false, false);
         });
     });
     assert!(rendered_text_contains(&output, "Roll back transaction"));

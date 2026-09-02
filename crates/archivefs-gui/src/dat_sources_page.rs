@@ -63,8 +63,10 @@ use archivefs_core::dat::policy::{
     RegionId, RevisionPolicy, participating_sources, resolve, validate_policy_config,
 };
 use archivefs_core::dat::rename_apply::{
-    ApplyError, ApplyExecution, ApplyOutcome, EntryState, HardConflictMode, RollbackOutcome,
-    RollbackResult, TransactionEntry, TransactionState, apply_transaction, rollback_transaction,
+    ApplyError, ApplyExecution, ApplyOutcome, EntryState, ExactResumeExecution,
+    ExactResumeInspection, ExactResumeOutcome, HardConflictMode, RollbackOutcome, RollbackResult,
+    TransactionEntry, TransactionState, apply_transaction, inspect_exact_resume,
+    resume_exact_transaction, rollback_transaction,
 };
 use archivefs_core::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
@@ -825,8 +827,11 @@ pub(crate) struct RenameApplyView {
     pub(crate) subset_available: bool,
     pub(crate) rollback_result: Option<RollbackResultView>,
     pub(crate) rollback_error: Option<String>,
+    pub(crate) resume_result: Option<ResumeResultView>,
+    pub(crate) resume_error: Option<String>,
     pub(crate) apply_running: bool,
     pub(crate) rollback_running: bool,
+    pub(crate) resume_running: bool,
     /// Interrupted transactions found on disk, offered for review.
     pub(crate) recovery: Vec<RecoveryTransactionView>,
     /// The journal directory, shown for transparency.
@@ -885,6 +890,42 @@ pub(crate) struct RollbackResultView {
     pub(crate) detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeResultView {
+    pub(crate) transaction_id: String,
+    pub(crate) headline: String,
+    pub(crate) result: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactResumeStatusView {
+    Available,
+    AlreadyComplete,
+    UnavailableLegacy,
+    Refused,
+    NeedsCurrentPlan,
+}
+
+impl ExactResumeStatusView {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Available => "Exact resume available",
+            Self::AlreadyComplete => "Already complete",
+            Self::UnavailableLegacy => "Resume unavailable (legacy journal)",
+            Self::Refused => "Resume unavailable",
+            Self::NeedsCurrentPlan => "Resume requires a fresh plan",
+        }
+    }
+
+    fn tone(self) -> widgets::StatusTone {
+        match self {
+            Self::Available => widgets::StatusTone::Success,
+            Self::AlreadyComplete | Self::NeedsCurrentPlan => widgets::StatusTone::Info,
+            Self::UnavailableLegacy | Self::Refused => widgets::StatusTone::Blocked,
+        }
+    }
+}
+
 /// One persisted transaction offered for rollback or crash recovery: either a
 /// settled `Applied` batch (roll back the whole transaction) or an interrupted
 /// batch (roll back completed steps or leave untouched).
@@ -913,6 +954,8 @@ pub(crate) struct RecoveryTransactionView {
     /// means it still genuinely needs a decision (or was never interrupted
     /// in the first place, for a settled `Applied` transaction).
     pub(crate) resolution: Option<archivefs_core::dat::rename_apply::RecoveryResolution>,
+    pub(crate) exact_resume: ExactResumeStatusView,
+    pub(crate) resume_action_available: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1642,6 +1685,9 @@ pub(crate) enum DatSourcesPageAction {
     RollbackTransaction {
         id: String,
     },
+    ResumeTransaction {
+        id: String,
+    },
     /// A crash-recovery choice for an interrupted transaction.
     RecoveryChoice {
         id: String,
@@ -1833,6 +1879,7 @@ struct RunningManagedDatJob {
 enum ApplyJobMessage {
     Applied(Box<ApplyOutcome>),
     RolledBack(Box<RollbackOutcome>),
+    Resumed(Box<ExactResumeOutcome>),
     Failed(String),
     /// An AbortAll apply found hard conflicts; nothing was mutated and the
     /// safe-subset option is now offered.
@@ -2429,6 +2476,9 @@ pub(crate) struct DatSourcesPageState {
     rollback_running: bool,
     rollback_result: Option<RollbackResult>,
     rollback_error: Option<String>,
+    resume_running: bool,
+    resume_result: Option<ExactResumeOutcome>,
+    resume_error: Option<String>,
     /// The apply/rollback worker.
     apply_job: Option<ApplyJob>,
     /// Transactions found on disk that are still actionable: settled `Applied`
@@ -2617,6 +2667,9 @@ impl DatSourcesPageState {
             rollback_running: false,
             rollback_result: None,
             rollback_error: None,
+            resume_running: false,
+            resume_result: None,
+            resume_error: None,
             apply_job: None,
             recovery_transactions,
             recovery_resolution_error: None,
@@ -2693,6 +2746,7 @@ impl DatSourcesPageState {
         };
         let mut changed = false;
         let mut finished = false;
+        let mut refresh_recovery = false;
         loop {
             match job.messages.try_recv() {
                 Ok(ApplyJobMessage::Applied(outcome)) => {
@@ -2738,6 +2792,14 @@ impl DatSourcesPageState {
                     changed = true;
                     finished = true;
                 }
+                Ok(ApplyJobMessage::Resumed(outcome)) => {
+                    self.resume_result = Some(*outcome);
+                    self.resume_error = None;
+                    self.resume_running = false;
+                    refresh_recovery = true;
+                    changed = true;
+                    finished = true;
+                }
                 Ok(ApplyJobMessage::HardConflicts(detail)) => {
                     self.apply_error = Some(detail);
                     self.subset_available = true;
@@ -2752,6 +2814,9 @@ impl DatSourcesPageState {
                     } else if self.rollback_running {
                         self.rollback_error = Some(error);
                         self.rollback_running = false;
+                    } else if self.resume_running {
+                        self.resume_error = Some(error);
+                        self.resume_running = false;
                     }
                     changed = true;
                     finished = true;
@@ -2759,6 +2824,7 @@ impl DatSourcesPageState {
                 Ok(ApplyJobMessage::Cancelled) => {
                     self.apply_running = false;
                     self.rollback_running = false;
+                    self.resume_running = false;
                     changed = true;
                     finished = true;
                 }
@@ -2766,6 +2832,7 @@ impl DatSourcesPageState {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.apply_running = false;
                     self.rollback_running = false;
+                    self.resume_running = false;
                     finished = true;
                     break;
                 }
@@ -2773,6 +2840,9 @@ impl DatSourcesPageState {
         }
         if finished {
             self.apply_job = None;
+        }
+        if refresh_recovery {
+            self.refresh_recovery();
         }
         changed
     }
@@ -3353,6 +3423,7 @@ impl DatSourcesPageState {
                 self.subset_available = false;
             }
             DatSourcesPageAction::RollbackTransaction { id } => self.start_rollback(id),
+            DatSourcesPageAction::ResumeTransaction { id } => self.start_exact_resume(id),
             DatSourcesPageAction::RecoveryChoice { id, choice } => {
                 self.handle_recovery_choice(id, choice)
             }
@@ -3361,6 +3432,8 @@ impl DatSourcesPageState {
                 self.rollback_result = None;
                 self.apply_error = None;
                 self.rollback_error = None;
+                self.resume_result = None;
+                self.resume_error = None;
             }
             DatSourcesPageAction::ResetQuickRenameSession => {
                 self.audit = None;
@@ -3452,7 +3525,7 @@ impl DatSourcesPageState {
 
     /// Spawns the apply worker for the current review transaction.
     fn spawn_apply(&mut self, mode: HardConflictMode) {
-        if self.apply_job.is_some() {
+        if self.apply_job.is_some() || self.resume_running {
             return;
         }
         let Some(review) = self.apply_review.as_ref() else {
@@ -3515,7 +3588,7 @@ impl DatSourcesPageState {
 
     /// Rolls back a transaction (the last applied one, or a recovered one).
     fn start_rollback(&mut self, transaction_id: String) {
-        if self.apply_job.is_some() {
+        if self.apply_job.is_some() || self.resume_running {
             return;
         }
         // Load the journal for this transaction id.
@@ -3547,6 +3620,69 @@ impl DatSourcesPageState {
         self.apply_job = Some(ApplyJob { cancel, messages });
         self.rollback_running = true;
         self.rollback_error = None;
+    }
+
+    /// Starts exact resume using only the approval-bound journal and the
+    /// current plan identity. The current core executor performs every
+    /// filesystem reconciliation and mutation check immediately before work.
+    fn start_exact_resume(&mut self, transaction_id: String) {
+        if self.apply_job.is_some() || self.resume_running {
+            return;
+        }
+        let Some(plan) = self.rename_plan.as_ref() else {
+            self.resume_error = Some(
+                "exact resume needs the current approved plan; run a fresh audit first".to_string(),
+            );
+            return;
+        };
+        let Some(path) =
+            archivefs_core::dat::rename_apply::journal_path(&self.transaction_dir, &transaction_id)
+        else {
+            self.resume_error = Some("transaction id cannot name a journal".to_string());
+            return;
+        };
+        let transaction = match archivefs_core::dat::rename_apply::read_journal(&path) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.resume_error = Some(format!("journal unreadable: {error}"));
+                return;
+            }
+        };
+        let digest =
+            archivefs_core::dat::rename_apply::compute_plan_digest(plan, &self.apply_approved);
+        if !matches!(
+            inspect_exact_resume(&transaction, plan.generation, &digest),
+            ExactResumeInspection::Available { .. }
+        ) {
+            self.resume_error =
+                Some("exact resume is no longer available for this transaction".to_string());
+            return;
+        }
+        let mut transaction = transaction;
+        let current_generation = plan.generation;
+        let trusted = self.trusted.clone();
+        let journal_dir = self.transaction_dir.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (sender, messages) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = resume_exact_transaction(&mut ExactResumeExecution {
+                transaction: &mut transaction,
+                current_generation,
+                current_plan_digest: digest,
+                trusted,
+                journal_dir,
+                cancel: &worker_cancel,
+            });
+            let _ = match result {
+                Ok(outcome) => sender.send(ApplyJobMessage::Resumed(Box::new(outcome))),
+                Err(error) => sender.send(ApplyJobMessage::Failed(error.to_string())),
+            };
+        });
+        self.apply_job = Some(ApplyJob { cancel, messages });
+        self.resume_running = true;
+        self.resume_result = None;
+        self.resume_error = None;
     }
 
     /// Handles a crash-recovery choice for an interrupted transaction.
@@ -3604,6 +3740,9 @@ impl DatSourcesPageState {
         self.rollback_running = false;
         self.rollback_result = None;
         self.rollback_error = None;
+        self.resume_running = false;
+        self.resume_result = None;
+        self.resume_error = None;
     }
 
     /// Applies `edit` to the four policy fields at `scope` (global or one
@@ -5152,16 +5291,45 @@ impl DatSourcesPageState {
         let recovery = self
             .recovery_transactions
             .iter()
-            .map(|transaction| RecoveryTransactionView {
-                transaction_id: transaction.transaction_id.clone(),
-                state: transaction.state,
-                applied_count: transaction.applied_count(),
-                total_count: transaction.entries.len(),
-                human_summary: rename_transaction_human_summary(&transaction.entries),
-                source_scan_root: transaction.source_scan_root.clone(),
-                resolution: transaction.recovery_resolution,
+            .map(|transaction| {
+                let exact_resume = self.exact_resume_status(transaction);
+                RecoveryTransactionView {
+                    transaction_id: transaction.transaction_id.clone(),
+                    state: transaction.state,
+                    applied_count: transaction.applied_count(),
+                    total_count: transaction.entries.len(),
+                    human_summary: rename_transaction_human_summary(&transaction.entries),
+                    source_scan_root: transaction.source_scan_root.clone(),
+                    resolution: transaction.recovery_resolution,
+                    resume_action_available: exact_resume == ExactResumeStatusView::Available,
+                    exact_resume,
+                }
             })
             .collect();
+        let resume_result = self.resume_result.as_ref().map(|outcome| ResumeResultView {
+            transaction_id: outcome.transaction.transaction_id.clone(),
+            headline: match outcome.result {
+                archivefs_core::dat::rename_apply::ExactResumeResult::Completed => {
+                    "Exact resume completed".to_string()
+                }
+                archivefs_core::dat::rename_apply::ExactResumeResult::AlreadyComplete => {
+                    "Transaction was already complete".to_string()
+                }
+                archivefs_core::dat::rename_apply::ExactResumeResult::Interrupted => {
+                    "Exact resume stopped safely".to_string()
+                }
+            },
+            result: format!(
+                "{} of {} operation(s) are now applied.",
+                outcome
+                    .transaction
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == EntryState::Applied)
+                    .count(),
+                outcome.transaction.entries.len()
+            ),
+        });
         RenameApplyView {
             review,
             outcome,
@@ -5169,11 +5337,31 @@ impl DatSourcesPageState {
             subset_available: self.subset_available,
             rollback_result,
             rollback_error: self.rollback_error.clone(),
+            resume_result,
+            resume_error: self.resume_error.clone(),
             apply_running: self.apply_running,
             rollback_running: self.rollback_running,
+            resume_running: self.resume_running,
             recovery,
             journal_dir: self.transaction_dir.to_string_lossy().into_owned(),
             recovery_resolution_error: self.recovery_resolution_error.clone(),
+        }
+    }
+
+    fn exact_resume_status(
+        &self,
+        transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+    ) -> ExactResumeStatusView {
+        let Some(plan) = self.rename_plan.as_ref() else {
+            return ExactResumeStatusView::NeedsCurrentPlan;
+        };
+        let digest =
+            archivefs_core::dat::rename_apply::compute_plan_digest(plan, &self.apply_approved);
+        match inspect_exact_resume(transaction, plan.generation, &digest) {
+            ExactResumeInspection::Available { .. } => ExactResumeStatusView::Available,
+            ExactResumeInspection::AlreadyComplete => ExactResumeStatusView::AlreadyComplete,
+            ExactResumeInspection::UnavailableLegacy => ExactResumeStatusView::UnavailableLegacy,
+            ExactResumeInspection::Refused(_) => ExactResumeStatusView::Refused,
         }
     }
 
@@ -7005,9 +7193,12 @@ pub(crate) fn show_quick_rename_page(
                     .small(),
                 );
                 ui.add_space(4.0);
-                if let Some(recovery_action) =
-                    show_recovery_transactions(ui, &blocking, view.rename_apply.rollback_running)
-                {
+                if let Some(recovery_action) = show_recovery_transactions(
+                    ui,
+                    &blocking,
+                    view.rename_apply.rollback_running,
+                    view.rename_apply.resume_running,
+                ) {
                     action = Some(recovery_action);
                 }
             });
@@ -7034,9 +7225,12 @@ pub(crate) fn show_quick_rename_page(
                     {
                         action = Some(DatSourcesPageAction::HideSettledRecoveryHistory);
                     }
-                    if let Some(recovery_action) =
-                        show_recovery_transactions(ui, &other, view.rename_apply.rollback_running)
-                    {
+                    if let Some(recovery_action) = show_recovery_transactions(
+                        ui,
+                        &other,
+                        view.rename_apply.rollback_running,
+                        view.rename_apply.resume_running,
+                    ) {
                         action = Some(recovery_action);
                     }
                 });
@@ -9687,6 +9881,7 @@ fn show_recovery_transactions(
     ui: &mut egui::Ui,
     recoveries: &[RecoveryTransactionView],
     rollback_running: bool,
+    resume_running: bool,
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
@@ -9699,6 +9894,14 @@ fn show_recovery_transactions(
                         recovery_human_state_label(recovery.state)
                     ))
                     .color(theme::muted(ui)),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Recovery:").small());
+                widgets::status_badge(
+                    ui,
+                    recovery.exact_resume.label(),
+                    recovery.exact_resume.tone(),
                 );
             });
             // The raw transaction ID and exact applied/total counts are
@@ -9773,12 +9976,29 @@ fn show_recovery_transactions(
                         .color(theme::muted(ui))
                         .small(),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if recovery.resume_action_available
+                        && widgets::action_button(
+                            ui,
+                            if resume_running {
+                                "Resuming…"
+                            } else {
+                                "Resume approved transaction"
+                            },
+                            widgets::ActionStyle::Primary,
+                            !resume_running && !rollback_running,
+                        )
+                        .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::ResumeTransaction {
+                            id: recovery.transaction_id.clone(),
+                        });
+                    }
                     if widgets::action_button(
                         ui,
                         rollback_label,
                         widgets::ActionStyle::Destructive,
-                        !rollback_running,
+                        !rollback_running && !resume_running,
                     )
                     .clicked()
                     {
@@ -9791,7 +10011,7 @@ fn show_recovery_transactions(
                         ui,
                         "Leave untouched",
                         widgets::ActionStyle::Quiet,
-                        !rollback_running,
+                        !rollback_running && !resume_running,
                     )
                     .clicked()
                     {
@@ -9825,15 +10045,38 @@ fn show_rename_apply_section(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
 
+    if let Some(result) = &apply.resume_result {
+        ui.add_space(8.0);
+        widgets::banner(
+            ui,
+            &result.headline,
+            &result.result,
+            widgets::StatusTone::Success,
+        );
+    }
+    if let Some(error) = &apply.resume_error {
+        ui.add_space(8.0);
+        widgets::failure_summary(
+            ui,
+            "exact_resume_error",
+            "Exact resume was not completed",
+            Some("No fresh plan was rebuilt and the current safety checks remain authoritative."),
+            error,
+        );
+    }
+
     // Transactions found on disk first: a settled `Applied` batch is offered
     // for rollback, and an interrupted batch is surfaced for crash recovery -
     // never auto-resumed.
     if !apply.recovery.is_empty() {
         ui.add_space(10.0);
         widgets::section_header(ui, "Rename transactions", None);
-        if let Some(recovery_action) =
-            show_recovery_transactions(ui, &apply.recovery, apply.rollback_running)
-        {
+        if let Some(recovery_action) = show_recovery_transactions(
+            ui,
+            &apply.recovery,
+            apply.rollback_running,
+            apply.resume_running,
+        ) {
             action = Some(recovery_action);
         }
         if let Some(error) = &apply.recovery_resolution_error {
