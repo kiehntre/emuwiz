@@ -221,6 +221,21 @@ pub(crate) fn gamer_readiness<'a>(
     }
 }
 
+/// Maps the shared launch planner's typed projection onto a
+/// [`GamerReadiness`]. Play is offered only when the planner actually
+/// produced a safe request; a typed blocker becomes `NeedsSetup`, which
+/// routes to the correct setup action - never back to Prepare.
+fn planner_readiness(play_action: &launch_readiness_page::GamerPlayAction) -> GamerReadiness<'_> {
+    match play_action {
+        launch_readiness_page::GamerPlayAction::Launch(request) => {
+            GamerReadiness::Ready { request }
+        }
+        launch_readiness_page::GamerPlayAction::BlockedTyped(blocker) => {
+            GamerReadiness::NeedsSetup { blocker }
+        }
+    }
+}
+
 /// Archive containers have one extra, explicit preparation step. Mount state
 /// alone is never treated as launch readiness: Play is available only after a
 /// specific member has been retained and the shared planner accepts it.
@@ -232,26 +247,27 @@ pub(crate) fn gamer_archive_readiness<'a>(
 ) -> GamerReadiness<'a> {
     match gamer_primary_action(mount_state) {
         GamerPrimaryAction::Blocked(reason) => GamerReadiness::NeedsAttention { reason },
+        // An explicit multi-member chooser always wins: the user must pick
+        // one member before any launch plan can be trusted.
         GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount if member_choices.is_some() => {
             GamerReadiness::ChooseMember {
                 candidates: member_choices.expect("checked above"),
             }
         }
-        GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount if !prepared => {
-            GamerReadiness::Prepare
-        }
-        GamerPrimaryAction::Mount | GamerPrimaryAction::Unmount => {
-            // A stale prepared state cannot make an unmounted archive ready.
-            GamerReadiness::Prepare
-        }
-        GamerPrimaryAction::NoMountingNeeded => match play_action {
-            launch_readiness_page::GamerPlayAction::Launch(request) => {
-                GamerReadiness::Ready { request }
-            }
-            launch_readiness_page::GamerPlayAction::BlockedTyped(blocker) => {
-                GamerReadiness::NeedsSetup { blocker }
-            }
-        },
+        // Not mounted yet: the bounded preparation pass still has to run. A
+        // leftover `prepared` flag from a previous selection cannot stand in
+        // for a live mount.
+        GamerPrimaryAction::Mount => GamerReadiness::Prepare,
+        // Mounted, but no compatible member has been retained yet.
+        GamerPrimaryAction::Unmount if !prepared => GamerReadiness::Prepare,
+        // Mounted with exactly one retained compatible member: the shared
+        // launch planner has already evaluated that exact member (its inner
+        // path is fed through `build_launch_readiness_input`), so defer to
+        // it just like a mount-free game. Successful retention therefore
+        // reaches Play - or the correct typed blocker - instead of looping
+        // back to Prepare.
+        GamerPrimaryAction::Unmount => planner_readiness(play_action),
+        GamerPrimaryAction::NoMountingNeeded => planner_readiness(play_action),
     }
 }
 
@@ -2161,6 +2177,110 @@ mod game_metadata_enrichment_tests {
         assert!(
             matches!(readiness, GamerReadiness::ChooseMember { candidates } if candidates.len() == 1)
         );
+    }
+
+    /// A ready RetroArch play action, standing in for the shared launch
+    /// planner's `Launch` projection over an already-retained archive member.
+    fn ready_retroarch_play_action() -> launch_readiness_page::GamerPlayAction {
+        let request = archivefs_core::launch::RetroArchLaunchRequest {
+            selected_content_path: PathBuf::from("/mnt/archive/disc1.iso"),
+            expected_platform_id: "PlayStation 2".to_string(),
+            expected_game_key: "retained-member".to_string(),
+            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            },
+            core_stem: "pcsx2".to_string(),
+        };
+        launch_readiness_page::GamerPlayAction::Launch(Box::new(
+            launch_readiness_page::TypedLaunchRequest::RetroArch(request),
+        ))
+    }
+
+    #[test]
+    fn mounted_archive_with_retained_member_and_ready_plan_shows_play() {
+        let play_action = ready_retroarch_play_action();
+        let readiness = gamer_archive_readiness(MountState::Mounted, true, &play_action, None);
+        assert!(
+            matches!(readiness, GamerReadiness::Ready { .. }),
+            "a successfully retained member with a ready launch plan must reach Play, \
+             not loop back to Prepare"
+        );
+        assert_eq!(gamer_readiness_short_label(&readiness), "Ready to play");
+    }
+
+    #[test]
+    fn mounted_archive_with_retained_member_but_blocked_launch_routes_to_setup_not_prepare() {
+        let refusal = "RetroArch is installed but its setup is incomplete";
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete,
+                emulator: Some("RetroArch".to_string()),
+                detail: refusal.to_string(),
+            },
+        );
+        let readiness = gamer_archive_readiness(MountState::Mounted, true, &play_action, None);
+        assert!(
+            matches!(
+                &readiness,
+                GamerReadiness::NeedsSetup { blocker }
+                    if blocker.kind
+                        == launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete
+                        && blocker.detail == refusal
+            ),
+            "a retained member with a typed launch blocker must route to the blocker's \
+             setup action, never back to Prepare"
+        );
+        assert_eq!(gamer_readiness_short_label(&readiness), "Needs setup");
+    }
+
+    #[test]
+    fn retained_member_flag_is_ignored_until_the_archive_is_actually_mounted() {
+        // `reconcile_archive_preparation` clears a stale Ready state, but even
+        // if a `prepared` flag survived one frame it must never make an
+        // unmounted archive look launch-ready.
+        let play_action = ready_retroarch_play_action();
+        let readiness = gamer_archive_readiness(MountState::Pending, true, &play_action, None);
+        assert!(matches!(readiness, GamerReadiness::Prepare));
+    }
+
+    #[test]
+    fn multiple_members_win_over_a_retained_member_and_ready_plan() {
+        let candidates = vec![
+            archivefs_core::PreparedMemberCandidate {
+                member_name: "disc1.iso".to_string(),
+                size_bytes: 10,
+                reason: "ISO media accepted for PlayStation 2".to_string(),
+            },
+            archivefs_core::PreparedMemberCandidate {
+                member_name: "disc2.iso".to_string(),
+                size_bytes: 11,
+                reason: "ISO media accepted for PlayStation 2".to_string(),
+            },
+        ];
+        let play_action = ready_retroarch_play_action();
+        let readiness =
+            gamer_archive_readiness(MountState::Mounted, true, &play_action, Some(&candidates));
+        assert!(
+            matches!(readiness, GamerReadiness::ChooseMember { candidates } if candidates.len() == 2),
+            "an unresolved multi-member choice is never auto-collapsed into Play"
+        );
+    }
+
+    #[test]
+    fn failed_preparation_keeps_prepare_and_surfaces_the_failure_message() {
+        // `archive_preparation_view` reports a `Failed` state as
+        // `prepared == false` plus a preparation message; readiness stays on
+        // Prepare so the failure is shown above the retry button.
+        let play_action = launch_readiness_page::GamerPlayAction::BlockedTyped(
+            launch_readiness_page::GamerBlocker {
+                kind: launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation,
+                emulator: None,
+                detail: "archive member has not been resolved".to_string(),
+            },
+        );
+        let readiness = gamer_archive_readiness(MountState::Mounted, false, &play_action, None);
+        assert!(matches!(readiness, GamerReadiness::Prepare));
     }
 
     #[test]
