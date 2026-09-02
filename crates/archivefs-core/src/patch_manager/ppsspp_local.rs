@@ -305,9 +305,11 @@ pub struct PpssppGameInspection {
 // Native launch binding
 // ---------------------------------------------------------------------------
 
-/// A freshly checked native PPSSPP executable.  PPSSPP's application accepts
-/// a game path as a positional argument; this binding deliberately contains
-/// only the executable fact and never a shell command.
+/// A freshly checked PPSSPP executable - either a distro/native binary or a
+/// caller-confirmed explicit path (for example a local AppImage the host
+/// integration has already verified). PPSSPP's application accepts a game
+/// path as a positional argument; this binding deliberately contains only
+/// the executable fact and never a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PpssppNativeLaunchBinding {
     pub executable: PathBuf,
@@ -337,10 +339,28 @@ fn launch_blocker(kind: PpssppLaunchBlockerKind, detail: impl Into<String>) -> P
     }
 }
 
-/// Revalidates one discovered profile and proves exactly one safe native
-/// executable.  Flatpak, portable, and explicit profiles are intentionally
-/// not bound here: only native Linux invocation is reviewed by this launch
-/// slice, and no sandbox/configuration override is invented.
+/// Revalidates one discovered profile and proves exactly one safe
+/// executable.
+///
+/// Two installation forms carry a trustworthy executable provenance and are
+/// bound here, held to the *identical* file-safety checks
+/// ([`validate_native_ppsspp_executable`]: absolute path, present, regular
+/// non-symlink file, execute bit) and the identical "exactly one candidate"
+/// rule:
+///
+/// * [`PpssppInstallationType::Native`] - a plausible PPSSPP binary name
+///   discovered on `PATH` or in a documented user directory.
+/// * [`PpssppInstallationType::Explicit`] - an exact executable path the
+///   host integration already confirmed through its own provenance (for
+///   example a local AppImage), supplied via
+///   [`PpssppProfileDiscoveryRoots::explicit_executables`] and paired with
+///   an equally explicit configuration root.
+///
+/// [`PpssppInstallationType::Portable`] stays refused on purpose: a
+/// `*.AppImage` merely *found* beside `$APPIMAGE` or by name is never a
+/// caller-confirmed path, so it must never become a trusted binding.
+/// [`PpssppInstallationType::FlatpakUser`] is refused because this slice
+/// invents no sandbox invocation.
 pub fn resolve_ppsspp_native_launch_binding(
     profile: &PpssppProfile,
 ) -> Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker> {
@@ -350,24 +370,28 @@ pub fn resolve_ppsspp_native_launch_binding(
             "profile is not eligible",
         ));
     }
-    if profile.installation_type != PpssppInstallationType::Native {
-        return Err(launch_blocker(
-            PpssppLaunchBlockerKind::UnsupportedInstallationType,
-            format!(
-                "only native PPSSPP installations are supported, got {:?}",
-                profile.installation_type
-            ),
-        ));
-    }
+    let installation_type = match profile.installation_type {
+        PpssppInstallationType::Native => PpssppInstallationType::Native,
+        PpssppInstallationType::Explicit => PpssppInstallationType::Explicit,
+        other @ (PpssppInstallationType::FlatpakUser | PpssppInstallationType::Portable) => {
+            return Err(launch_blocker(
+                PpssppLaunchBlockerKind::UnsupportedInstallationType,
+                format!(
+                    "only native or caller-confirmed explicit PPSSPP installations are \
+                     supported, got {other:?}"
+                ),
+            ));
+        }
+    };
     let matching: Vec<&PpssppExecutable> = profile
         .executable_candidates
         .iter()
-        .filter(|candidate| candidate.installation_type == PpssppInstallationType::Native)
+        .filter(|candidate| candidate.installation_type == installation_type)
         .collect();
     if matching.is_empty() {
         return Err(launch_blocker(
             PpssppLaunchBlockerKind::ExecutableMissing,
-            "no native PPSSPP executable was discovered for this profile",
+            format!("no {installation_type:?} PPSSPP executable was discovered for this profile"),
         ));
     }
     let mut valid = Vec::new();
@@ -386,7 +410,7 @@ pub fn resolve_ppsspp_native_launch_binding(
         count => Err(launch_blocker(
             PpssppLaunchBlockerKind::AmbiguousExecutable,
             format!(
-                "{count} viable native PPSSPP executables match this profile and none is distinguished as authoritative"
+                "{count} viable {installation_type:?} PPSSPP executables match this profile and none is distinguished as authoritative"
             ),
         )),
     }
@@ -1682,5 +1706,214 @@ mod tests {
             blocker.kind,
             PpssppLaunchBlockerKind::UnsupportedInstallationType
         );
+    }
+
+    // --- caller-confirmed explicit (local AppImage) launch binding ---------
+    //
+    // The trust anchor is `explicit_executables` + `explicit_configuration_roots`:
+    // both are exact paths a host integration has already confirmed through
+    // its own provenance (e.g. an EmuWiz-managed AppImage with an
+    // `install.json`, or a user-picked `~/Applications/.../PPSSPP.AppImage`).
+    // The launch binding then holds them to the *same* file-safety checks a
+    // `Native` binary gets - it never trusts a path merely because it ends
+    // in `.AppImage`.
+
+    fn explicit_setup(temp: &TempDir) -> (PpssppProfileDiscoveryRoots, PathBuf) {
+        // A configuration root that is deliberately *not* the XDG default, so
+        // it survives `discover_ppsspp_profiles`' dedup as an `Explicit`
+        // profile rather than collapsing into the standard `Native` one.
+        let config_root = temp.path().join("apps/PPSSPP/config");
+        write_global(&config_root, "[General]\n");
+        let mut roots = roots(temp);
+        roots.explicit_configuration_roots.push(config_root.clone());
+        (roots, config_root)
+    }
+
+    fn discovered_explicit_profile(
+        roots: &PpssppProfileDiscoveryRoots,
+        config_root: &Path,
+    ) -> PpssppProfile {
+        discover_ppsspp_profiles(roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.configuration_path == config_root)
+            .expect("the explicit configuration root must be discovered as a profile")
+    }
+
+    fn write_fake_appimage(temp: &TempDir, name: &str) -> PathBuf {
+        let path = temp.path().join(name);
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn explicit_local_appimage_becomes_a_trusted_binding() {
+        let temp = TempDir::new().unwrap();
+        let (mut roots, config_root) = explicit_setup(&temp);
+        let appimage = write_fake_appimage(&temp, "PPSSPP.AppImage");
+        roots.explicit_executables.push(appimage.clone());
+
+        let profile = discovered_explicit_profile(&roots, &config_root);
+        assert_eq!(profile.installation_type, PpssppInstallationType::Explicit);
+        assert!(profile.eligible);
+        assert!(profile.executable_candidates.iter().any(|candidate| {
+            candidate.path == appimage
+                && candidate.installation_type == PpssppInstallationType::Explicit
+        }));
+
+        let binding = resolve_ppsspp_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, appimage);
+    }
+
+    #[test]
+    fn explicit_appimage_missing_file_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let (mut roots, config_root) = explicit_setup(&temp);
+        roots
+            .explicit_executables
+            .push(temp.path().join("gone/PPSSPP.AppImage"));
+
+        let profile = discovered_explicit_profile(&roots, &config_root);
+        let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
+        // A non-existent path never even becomes an executable candidate, so
+        // the profile has no `Explicit` executable to bind.
+        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[test]
+    fn explicit_appimage_directory_instead_of_file_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let (mut roots, config_root) = explicit_setup(&temp);
+        let dir = temp.path().join("PPSSPP.AppImage");
+        fs::create_dir_all(&dir).unwrap();
+        roots.explicit_executables.push(dir);
+
+        let profile = discovered_explicit_profile(&roots, &config_root);
+        let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[test]
+    fn explicit_appimage_without_execute_bit_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let (mut roots, config_root) = explicit_setup(&temp);
+        let appimage = temp.path().join("PPSSPP.AppImage");
+        fs::write(&appimage, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&appimage, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        roots.explicit_executables.push(appimage);
+
+        let profile = discovered_explicit_profile(&roots, &config_root);
+        let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            PpssppLaunchBlockerKind::ExecutableNotExecutable
+        );
+    }
+
+    #[test]
+    fn explicit_appimage_symlink_is_refused_by_discovery_and_by_the_binding() {
+        let temp = TempDir::new().unwrap();
+        let (mut roots, config_root) = explicit_setup(&temp);
+        let real = write_fake_appimage(&temp, "real-ppsspp");
+        let link = temp.path().join("PPSSPP.AppImage");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        roots.explicit_executables.push(link.clone());
+
+        // Discovery's `is_regular_file` (no-follow) already drops the symlink,
+        // so it never becomes a candidate.
+        let profile = discovered_explicit_profile(&roots, &config_root);
+        assert_eq!(
+            resolve_ppsspp_native_launch_binding(&profile)
+                .unwrap_err()
+                .kind,
+            PpssppLaunchBlockerKind::ExecutableMissing
+        );
+
+        // Defence in depth: even a hand-forced `Explicit` candidate pointing
+        // at that symlink is rejected by the binding's own file-safety check.
+        let mut forced = profile.clone();
+        forced.executable_candidates = vec![PpssppExecutable {
+            path: link,
+            installation_type: PpssppInstallationType::Explicit,
+            version: None,
+        }];
+        assert_eq!(
+            resolve_ppsspp_native_launch_binding(&forced)
+                .unwrap_err()
+                .kind,
+            PpssppLaunchBlockerKind::ExecutableUnsafe
+        );
+    }
+
+    #[test]
+    fn a_guessed_portable_appimage_is_still_refused() {
+        // A `*.AppImage` fed only through `portable_configuration_roots`
+        // (never `explicit_executables`) is a guess, not a confirmed path.
+        let temp = TempDir::new().unwrap();
+        let mut roots = roots(&temp);
+        let portable = temp.path().join("portable");
+        write_global(&portable, "");
+        roots.portable_configuration_roots.push(portable.clone());
+
+        let profile = discover_ppsspp_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == PpssppInstallationType::Portable)
+            .expect("portable profile must be discovered");
+        let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(
+            blocker.kind,
+            PpssppLaunchBlockerKind::UnsupportedInstallationType
+        );
+    }
+
+    #[test]
+    fn a_confirmed_appimage_never_binds_to_a_non_explicit_profile() {
+        // The same confirmed AppImage exists as an `Explicit` candidate, but
+        // a `Native` profile only ever matches `Native` executables - the
+        // AppImage does not leak into an unrelated installation.
+        let temp = TempDir::new().unwrap();
+        let (mut roots, _config_root) = explicit_setup(&temp);
+        let appimage = write_fake_appimage(&temp, "PPSSPP.AppImage");
+        roots.explicit_executables.push(appimage);
+        let native_root = profile_root(&roots);
+        write_global(&native_root, "");
+
+        let native_profile = discover_ppsspp_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| {
+                profile.configuration_path == native_root
+                    && profile.installation_type == PpssppInstallationType::Native
+            })
+            .expect("the standard XDG profile is discovered as Native");
+        let blocker = resolve_ppsspp_native_launch_binding(&native_profile).unwrap_err();
+        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[test]
+    fn two_confirmed_explicit_executables_are_ambiguous() {
+        let temp = TempDir::new().unwrap();
+        let (mut roots, config_root) = explicit_setup(&temp);
+        roots
+            .explicit_executables
+            .push(write_fake_appimage(&temp, "PPSSPP.AppImage"));
+        roots
+            .explicit_executables
+            .push(write_fake_appimage(&temp, "PPSSPP-dev.AppImage"));
+
+        let profile = discovered_explicit_profile(&roots, &config_root);
+        let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::AmbiguousExecutable);
     }
 }

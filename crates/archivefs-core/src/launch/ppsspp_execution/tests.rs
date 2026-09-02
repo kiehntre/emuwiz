@@ -1,38 +1,31 @@
-//! Tests for native PPSSPP launch preflight/execution.
+//! Tests for native / caller-confirmed PPSSPP launch preflight/execution.
 //!
-//! # Why executable-drift/binding-success is unit-tested, not full end-to-end
+//! # The two binding provenances, and how each is exercised here
 //!
-//! [`crate::patch_manager::resolve_ppsspp_native_launch_binding`] only ever
-//! authorizes an executable candidate whose
-//! [`crate::patch_manager::PpssppInstallationType`] is `Native` - and,
-//! exactly like [`crate::launch::xemu_execution`]'s and
-//! `duckstation_execution`'s own executable discovery,
-//! `discover_ppsspp_profiles` only ever classifies an executable `Native`
-//! when it is found by literally searching the current process's real
-//! `PATH` (`roots.explicit_executables` is deliberately classified
-//! `Explicit`, a different, unsupported installation type - see
-//! `discover_ppsspp_profiles`'s own executable-discovery logic). Mutating
-//! this test binary's real, process-global `PATH` at runtime to fabricate a
-//! `Native` match would race every other concurrently running test in this
-//! same binary that also reads `PATH` - `std::env::set_var` is `unsafe` for
-//! exactly this reason. Exactly the same limitation is already accepted,
-//! unchanged, in `xemu_execution`'s and `duckstation_execution`'s own test
-//! suites: spawn mechanics are proven against a hand-built command, never a
-//! full preflight-derived one, and no preflight test in either suite ever
-//! exercises a genuine binding success either.
+//! [`crate::patch_manager::resolve_ppsspp_native_launch_binding`] authorizes
+//! two [`crate::patch_manager::PpssppInstallationType`] forms:
 //!
-//! So here: every content/identity/profile-lookup preflight step that fires
-//! *before* binding resolution (steps 1-6) is proven through the real, full
-//! [`preflight_ppsspp_launch`] pipeline, on a real synthetic PSP ISO9660
-//! disc image (with a real `PARAM.SFO` `DISC_ID`) via the exact same
-//! `inspect_catalogued_game_identity` and `discover_ppsspp_profiles`
-//! production code uses. The final pre-spawn recheck (step 10) is already
-//! covered as pure units - `recheck_executable`/
-//! `inspect_and_capture_content_identity` directly here - so no coverage is
-//! lost, only the single PATH-dependent "genuinely Native-installed
-//! PPSSPP" leg is done through units instead of one shared,
-//! actually-installed fixture. Spawn mechanics themselves never depend on
-//! any of this: they are proven directly against a hand-built
+//! * `Native` - a plausible PPSSPP binary name found on the current
+//!   process's real `PATH`. Mutating this test binary's process-global
+//!   `PATH` at runtime to fabricate a `Native` match would race every other
+//!   concurrently running test that also reads `PATH` (`std::env::set_var`
+//!   is `unsafe` for exactly this reason), so the `Native` leg's genuine
+//!   binding success is proven as a pure unit in
+//!   `crate::patch_manager::ppsspp_local`'s own tests, and here every
+//!   preflight step that fires *before* binding resolution (steps 1-6) is
+//!   proven through the full [`preflight_ppsspp_launch`] pipeline on a real
+//!   synthetic PSP ISO9660 disc (see `build_ready_fixture` /
+//!   `a_fully_valid_request_reaches_binding_resolution`).
+//! * `Explicit` - an exact executable path a host integration already
+//!   confirmed (e.g. a local AppImage), supplied via
+//!   `roots.explicit_executables` and paired with an explicit configuration
+//!   root. This path has no `PATH` dependency, so it *is* exercised
+//!   end-to-end here: `build_explicit_appimage_fixture` +
+//!   `explicit_appimage_*` run the full identity -> discovery -> binding ->
+//!   command-plan -> preflight -> spawn chain against a harmless fake
+//!   `PPSSPP.AppImage`.
+//!
+//! Bare spawn mechanics are still also proven directly against a hand-built
 //! [`PpssppCommand`], mirroring `xemu_execution::tests::hand_built_command`.
 
 use std::fs;
@@ -178,15 +171,17 @@ fn base_roots(fixture: &Fixture) -> PpssppProfileDiscoveryRoots {
     }
 }
 
-/// A profile-discoverable (but never `Native`-executable-bound, see the
-/// module doc comment) native PPSSPP fixture: a real `PSP/SYSTEM/ppsspp.ini`
-/// evidence file, a fake `explicit` executable (never authorized by
-/// `resolve_ppsspp_native_launch_binding`, which is exactly what the
-/// early-preflight-step tests below rely on to reach `BindingUnavailable`
-/// only after every earlier check has already passed), and a loose PSP ISO
-/// whose verified disc ID becomes the request's expected disc id/game key -
-/// computed via the same `inspect_catalogued_game_identity` the module
-/// itself uses, never hand-typed.
+/// The standard XDG `Native` PPSSPP fixture: a real `PSP/SYSTEM/ppsspp.ini`
+/// evidence file, a fake executable supplied via `explicit_executables`
+/// (classified `Explicit`, so it never matches this `Native` profile's own
+/// installation type - which is exactly what the early-preflight-step tests
+/// below rely on to reach `BindingUnavailable` only after every earlier
+/// check has already passed), and a loose PSP ISO whose verified disc ID
+/// becomes the request's expected disc id/game key - computed via the same
+/// `inspect_catalogued_game_identity` the module itself uses, never
+/// hand-typed. The `Explicit` provenance's own genuine binding success is
+/// covered end-to-end by `build_explicit_appimage_fixture` /
+/// `explicit_appimage_*`.
 struct ReadyFixture {
     fixture: Fixture,
     roots: PpssppProfileDiscoveryRoots,
@@ -394,9 +389,12 @@ fn profile_root_drift_is_rejected() {
 fn a_fully_valid_request_reaches_binding_resolution() {
     // Proves steps 1-6 all pass cleanly for a completely valid request -
     // `BindingUnavailable` here can only mean the pipeline reached real
-    // binding resolution (this fixture's executable is deliberately
-    // `Explicit`, never `Native` - see the module doc comment), not that an
-    // earlier content/identity/profile check misfired.
+    // binding resolution. This fixture's profile is the standard XDG
+    // `Native` one, but its only executable candidate is `Explicit` (from
+    // `explicit_executables`), so the profile's own installation type has no
+    // matching executable to bind - not an earlier content/identity/profile
+    // check misfiring. The `Explicit` provenance's own genuine binding
+    // success is covered end-to-end by `explicit_appimage_*` below.
     let ready = build_ready_fixture("reaches-binding");
     let error = preflight(&ready).unwrap_err();
     assert_eq!(
@@ -588,4 +586,160 @@ fn spawn_failure_is_reported() {
     );
     let result = spawn_ppsspp(command);
     assert!(matches!(result, Err(PpssppLaunchSpawnError::Spawn(_))));
+}
+
+// --- Explicit (caller-confirmed local AppImage) end-to-end -------------------
+//
+// The `Explicit` provenance has no `PATH` dependency, so - unlike the
+// `Native` leg - the full chain
+//   identity -> discover_ppsspp_profiles -> resolve_ppsspp_native_launch_binding
+//   -> build_launch_plan_from_results -> build_ppsspp_command_plan
+//   -> preflight_ppsspp_launch -> spawn_ppsspp
+// runs here against a harmless fake `PPSSPP.AppImage`. No real emulator,
+// GPU, DISPLAY, audio, or network.
+
+struct ExplicitAppImageFixture {
+    fixture: Fixture,
+    roots: PpssppProfileDiscoveryRoots,
+    appimage: PathBuf,
+    content: PathBuf,
+    request: PpssppLaunchRequest,
+}
+
+/// Writes a fake `PPSSPP.AppImage` (a `/bin/sh` script that appends its argv,
+/// one per line, to `argv-capture.txt` and exits 0), a real explicit PPSSPP
+/// configuration root with `PSP/SYSTEM/ppsspp.ini`, and a loose PSP ISO, then
+/// resolves the discovered `Explicit` profile id.
+fn build_explicit_appimage_fixture(label: &str) -> ExplicitAppImageFixture {
+    let fixture = Fixture::new(label);
+    let mut roots = base_roots(&fixture);
+
+    // A configuration root that is deliberately not the XDG default, so it is
+    // discovered as an `Explicit` profile rather than the standard `Native`
+    // one.
+    let config_root = fixture.path("apps/PPSSPP/config");
+    fs::create_dir_all(config_root.join("PSP/SYSTEM")).unwrap();
+    fs::write(config_root.join("PSP/SYSTEM/ppsspp.ini"), b"[General]\n").unwrap();
+    roots.explicit_configuration_roots.push(config_root.clone());
+
+    let capture = fixture.path("argv-capture.txt");
+    let appimage = fixture.write_executable(
+        "apps/PPSSPP/PPSSPP.AppImage",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 0\n",
+            capture.display()
+        )
+        .as_bytes(),
+    );
+    roots.explicit_executables.push(appimage.clone());
+
+    let content = fixture.write("games/game.iso", &psp_iso_bytes(PSP_DISC_ID.as_bytes()));
+
+    let profile_id = discover_ppsspp_profiles(&roots)
+        .profiles
+        .iter()
+        .find(|profile| profile.configuration_path == config_root)
+        .expect("the explicit configuration root must be discovered")
+        .profile_id
+        .clone();
+
+    let request = PpssppLaunchRequest {
+        selected_content_path: content.clone(),
+        expected_platform_id: "PSP".to_string(),
+        expected_game_key: PSP_DISC_ID.to_string(),
+        expected_psp_disc_id: PSP_DISC_ID.to_string(),
+        profile_id,
+        expected_executable: appimage.clone(),
+    };
+
+    ExplicitAppImageFixture {
+        fixture,
+        roots,
+        appimage,
+        content,
+        request,
+    }
+}
+
+#[test]
+fn explicit_appimage_reaches_a_real_command_and_spawns_with_exact_argv() {
+    let ready = build_explicit_appimage_fixture("appimage-e2e");
+
+    let command = preflight_ppsspp_launch(&ready.request, &ready.roots)
+        .expect("a fully wired explicit AppImage fixture must preflight cleanly");
+
+    assert_eq!(
+        command.executable, ready.appimage,
+        "the spawned executable is exactly the caller-confirmed AppImage"
+    );
+    assert_eq!(
+        command.arguments,
+        vec![ready.content.clone().into_os_string()],
+        "the only argument is the verified PSP ISO, passed verbatim"
+    );
+    assert_eq!(command.selection.content_path, ready.content);
+    assert_eq!(command.selection.platform_id, "PSP");
+    assert!(command.working_directory.is_none());
+
+    let mut process = spawn_ppsspp(command).expect("the fake AppImage must spawn");
+    let report = wait_for_exit(&mut process);
+    assert!(
+        report
+            .status
+            .as_ref()
+            .expect("child wait succeeds")
+            .success(),
+        "the fake AppImage exits 0"
+    );
+
+    let captured = fs::read_to_string(ready.fixture.path("argv-capture.txt")).unwrap();
+    let lines: Vec<&str> = captured.lines().collect();
+    assert_eq!(
+        lines,
+        vec![ready.content.to_str().unwrap()],
+        "argv reaching the process boundary is exactly [<content path>]"
+    );
+}
+
+#[test]
+fn explicit_appimage_binding_drift_is_refused() {
+    let mut ready = build_explicit_appimage_fixture("appimage-drift");
+    // The user authorised one executable; the freshly resolved binding now
+    // points at a different one.
+    ready.request.expected_executable = ready.fixture.path("apps/PPSSPP/other.AppImage");
+    let error = preflight_ppsspp_launch(&ready.request, &ready.roots).unwrap_err();
+    assert_eq!(error.kind, PpssppLaunchPreflightErrorKind::BindingDrift);
+}
+
+#[test]
+fn explicit_appimage_removed_between_discovery_and_preflight_is_refused() {
+    let ready = build_explicit_appimage_fixture("appimage-vanished");
+    fs::remove_file(&ready.appimage).unwrap();
+    let error = preflight_ppsspp_launch(&ready.request, &ready.roots).unwrap_err();
+    // A vanished executable is no longer a discovered candidate, so the fresh
+    // binding cannot be produced - fail closed, no spawn.
+    assert_eq!(
+        error.kind,
+        PpssppLaunchPreflightErrorKind::BindingUnavailable
+    );
+}
+
+#[test]
+fn explicit_appimage_config_evidence_missing_keeps_the_profile_ineligible() {
+    let ready = build_explicit_appimage_fixture("appimage-no-config-evidence");
+    // Remove the PPSSPP configuration evidence; the profile is no longer
+    // eligible, so no candidate is Ready and preflight refuses.
+    fs::remove_file(
+        ready
+            .fixture
+            .path("apps/PPSSPP/config/PSP/SYSTEM/ppsspp.ini"),
+    )
+    .unwrap();
+    let error = preflight_ppsspp_launch(&ready.request, &ready.roots).unwrap_err();
+    assert!(matches!(
+        error.kind,
+        PpssppLaunchPreflightErrorKind::ProfileNotFound
+            | PpssppLaunchPreflightErrorKind::BindingUnavailable
+            | PpssppLaunchPreflightErrorKind::CandidateNotReady
+    ));
 }
