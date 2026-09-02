@@ -466,6 +466,7 @@ fn sources_context_menu_never_offers_filesystem_deletion() {
         action,
         SourcesPageAction::ConfirmRemove { .. }
             | SourcesPageAction::AddFolder(_)
+            | SourcesPageAction::ApplyMountRoot(_)
             | SourcesPageAction::ScanOne(_)
             | SourcesPageAction::ScanAll
             | SourcesPageAction::RefreshStatus

@@ -2278,6 +2278,157 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
     Ok(previous)
 }
 
+/// Sets the temporary preparation/mount root without rewriting any unrelated
+/// configuration. The selected directory must already exist, be a real
+/// directory (not a symlink), and be writable by the current user.
+pub fn set_mount_root_default(path: &Path) -> Result<PathBuf> {
+    let config_path = default_config_path()?;
+    set_mount_root_to(&config_path, path)
+}
+
+/// Sets the temporary preparation/mount root in an explicit config file.
+///
+/// This is intentionally a text-preserving update rather than a call through
+/// the source-config renderer: users may have unrelated settings or comments
+/// in `config.toml`, and changing one setting must not discard them. The
+/// existing config is parsed before anything is written, and a symlinked or
+/// otherwise unsafe config path is rejected.
+pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
+    validate_mount_root_selection(path)?;
+    let contents = read_config_for_update(config_path)?;
+    let updated = replace_mount_root_assignment(&contents, path)?;
+    if updated != contents {
+        ensure_safe_config_target(config_path)?;
+        atomic_write_text(config_path, &updated)?;
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validate_mount_root_selection(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(ArchiveFsError::Config(
+            "choose an absolute folder for the temporary preparation folder".to_string(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder cannot be used at {}: {source}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is a symlink; choose the real writable folder: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not a directory: {}",
+            path.display()
+        )));
+    }
+    if !directory_is_writable(path) {
+        return Err(ArchiveFsError::Config(format!(
+            "the selected temporary preparation folder is not writable: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_config_for_update(config_path: &Path) -> Result<String> {
+    ensure_safe_config_target(config_path)?;
+    let contents = fs::read_to_string(config_path)
+        .map_err(|source| ArchiveFsError::io(config_path.to_path_buf(), source))?;
+    // Parsing before the write is the fail-closed boundary for malformed
+    // config. In particular, no partial update is attempted on a file the
+    // application cannot understand.
+    parse_config(&contents)?;
+    Ok(contents)
+}
+
+fn ensure_safe_config_target(config_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ArchiveFsError::Config(format!(
+            "refusing to overwrite symlinked config path: {}",
+            config_path.display()
+        ))),
+        Ok(metadata) if !metadata.is_file() => Err(ArchiveFsError::Config(format!(
+            "refusing to overwrite config path that is not a regular file: {}",
+            config_path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(source) => Err(ArchiveFsError::io(config_path.to_path_buf(), source)),
+    }
+}
+
+fn replace_mount_root_assignment(contents: &str, path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        ArchiveFsError::Config(
+            "the selected temporary preparation folder cannot be stored losslessly in config.toml"
+                .to_string(),
+        )
+    })?;
+    let quoted = quote_config_string(value);
+    let mut output = String::with_capacity(contents.len() + quoted.len());
+    let mut in_source_block = false;
+    let mut matches = 0;
+
+    for segment in contents.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let (line, carriage_return) = line
+            .strip_suffix('\r')
+            .map_or((line, ""), |line| (line, "\r"));
+        let uncommented = strip_comment(line);
+        let trimmed = uncommented.trim();
+
+        if trimmed == "[[source]]" {
+            in_source_block = true;
+        } else if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_source_block = false;
+        }
+
+        let is_mount_root = !in_source_block
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "mount_root");
+        if is_mount_root {
+            matches += 1;
+            let key_start = line.find("mount_root").ok_or_else(|| {
+                ArchiveFsError::Config("could not locate the mount_root setting safely".to_string())
+            })?;
+            let equals = uncommented.find('=').ok_or_else(|| {
+                ArchiveFsError::Config(
+                    "could not locate the mount_root assignment safely".to_string(),
+                )
+            })?;
+            output.push_str(&line[..key_start]);
+            output.push_str("mount_root");
+            output.push_str(&line[key_start + "mount_root".len()..equals + 1]);
+            output.push(' ');
+            output.push_str(&quoted);
+            output.push_str(&line[uncommented.len()..]);
+        } else {
+            output.push_str(line);
+        }
+        output.push_str(carriage_return);
+        output.push_str(newline);
+    }
+
+    match matches {
+        1 => Ok(output),
+        0 => Err(ArchiveFsError::Config(
+            "config.toml has no unambiguous top-level mount_root setting".to_string(),
+        )),
+        _ => Err(ArchiveFsError::Config(
+            "config.toml has multiple top-level mount_root settings".to_string(),
+        )),
+    }
+}
+
 /// Clears the configured master ROM root (returns the removed value, if any).
 pub fn clear_master_rom_root_default() -> Result<Option<PathBuf>> {
     clear_master_rom_root_to(&default_config_path()?)
@@ -2417,6 +2568,24 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
     })?;
+    // Never publish over a symlink. `fs::rename` would replace the symlink
+    // itself, which is not equivalent to safely updating the intended target.
+    // Existing callers that create a new file still retain that behaviour;
+    // existing paths must be regular files.
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(ArchiveFsError::Config(format!(
+                "refusing to overwrite symlinked config path: {}",
+                path.display()
+            )));
+        }
+        if !metadata.is_file() {
+            return Err(ArchiveFsError::Config(format!(
+                "refusing to overwrite config path that is not a regular file: {}",
+                path.display()
+            )));
+        }
+    }
     fs::create_dir_all(parent)
         .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
 
@@ -2443,6 +2612,25 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     // the write still has to happen, just with default permissions.
     if let Ok(existing) = fs::metadata(path) {
         let _ = fs::set_permissions(&temp_path, existing.permissions());
+    }
+
+    // Re-check after preparing the replacement so a path that became a
+    // symlink during the operation still fails closed rather than replacing
+    // that link.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(ArchiveFsError::Config(format!(
+                "refusing to overwrite config path that is not a regular file: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(ArchiveFsError::io(path.to_path_buf(), source));
+        }
     }
 
     fs::rename(&temp_path, path).map_err(|source| {
@@ -12804,6 +12992,107 @@ mod tests {
         assert_eq!(
             Config::load_from(&config_path).unwrap().master_rom_root,
             None
+        );
+    }
+
+    #[test]
+    fn mount_root_update_preserves_unrelated_config_text_and_fields() {
+        let root = test_root("mount_root_update_preserves_config");
+        let config_path = root.join("config.toml");
+        let old_mount_root = root.join("old-mounts");
+        let new_mount_root = root.join("new-mounts");
+        fs::create_dir_all(&old_mount_root).unwrap();
+        fs::create_dir_all(&new_mount_root).unwrap();
+        let original = format!(
+            "# keep this comment\nsource_folders = []\nmount_root = {} # keep this note\nratarmount_bin = \"custom-ratarmount\"\nfuture_setting = \"preserve me\"\n",
+            quote_config_string(&old_mount_root.display().to_string())
+        );
+        fs::write(&config_path, &original).unwrap();
+
+        set_mount_root_to(&config_path, &new_mount_root).unwrap();
+
+        let updated = fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("ratarmount_bin = \"custom-ratarmount\""));
+        assert!(updated.contains("future_setting = \"preserve me\""));
+        assert!(updated.contains("# keep this note"));
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().mount_root,
+            new_mount_root
+        );
+    }
+
+    #[test]
+    fn mount_root_update_fails_closed_on_malformed_config() {
+        let root = test_root("mount_root_update_malformed_config");
+        let config_path = root.join("config.toml");
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        let original = "source_folders = [\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let error = set_mount_root_to(&config_path, &selected).unwrap_err();
+
+        assert!(error.to_string().contains("never closed"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_root_update_never_overwrites_a_symlinked_config_path() {
+        let root = test_root("mount_root_update_symlink_config");
+        let target = root.join("real-config.toml");
+        let config_path = root.join("config.toml");
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&target, original).unwrap();
+        std::os::unix::fs::symlink(&target, &config_path).unwrap();
+
+        let error = set_mount_root_to(&config_path, &selected).unwrap_err();
+
+        assert!(error.to_string().contains("symlinked config path"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), original);
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn mount_root_update_rejects_missing_or_non_directory_selection() {
+        let root = test_root("mount_root_update_invalid_selection");
+        let config_path = root.join("config.toml");
+        let selected_file = root.join("not-a-folder");
+        let original = "source_folders = []\nmount_root = \"/old\"\n";
+        fs::write(&config_path, original).unwrap();
+        fs::write(&selected_file, b"file").unwrap();
+
+        let error = set_mount_root_to(&config_path, &selected_file).unwrap_err();
+
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn archive_snapshot_consumes_the_updated_mount_root() {
+        let root = test_root("mount_root_update_snapshot");
+        let config_path = root.join("config.toml");
+        let selected = root.join("mounts");
+        fs::create_dir_all(&selected).unwrap();
+        fs::write(
+            &config_path,
+            "source_folders = []\nmount_root = \"/old\"\nratarmount_bin = \"ratarmount\"\n",
+        )
+        .unwrap();
+
+        set_mount_root_to(&config_path, &selected).unwrap();
+
+        assert_eq!(
+            load_read_only_snapshot(&config_path).unwrap().mount_root,
+            selected
         );
     }
 

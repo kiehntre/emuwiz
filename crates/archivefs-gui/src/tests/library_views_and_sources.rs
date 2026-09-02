@@ -245,21 +245,34 @@ fn sources_page_shows_every_configured_source_with_its_full_state_and_actions() 
         "Refresh status",
         "Mount root",
         "/mnt/archivefs",
-        "Configuration editing is intentionally unavailable",
+        "Temporary game preparation folder",
+        "EmuWiz temporarily makes archived games available here while you play",
+        "Choose folder",
     ] {
         assert!(
             rendered_text_contains(&output, expected),
             "expected the Sources page to render {expected:?}"
         );
     }
-    assert!(!rendered_text_contains(&output, "Change Mount Root"));
-    // The old wording implied mounting itself was unavailable, not just
-    // editing the setting - make sure it is truly gone, not just masked
-    // by the new assertions above.
     assert!(!rendered_text_contains(
         &output,
-        "Mount-root editing will be added after multi-source scanning is stable."
+        "Configuration editing is intentionally unavailable"
     ));
+}
+
+#[test]
+fn mount_root_picker_stages_only_explicit_selections_and_cancel_keeps_the_draft() {
+    let selected = PathBuf::from("/tmp/selected-mount-root");
+    let replacement = PathBuf::from("/tmp/replacement-mount-root");
+    let mut draft = Some(selected.clone());
+
+    stage_mount_root_pick(&mut draft, None);
+    assert_eq!(draft, Some(selected.clone()));
+    assert!(mount_root_apply_available(draft.as_deref(), false));
+    assert!(!mount_root_apply_available(draft.as_deref(), true));
+
+    stage_mount_root_pick(&mut draft, Some(replacement.clone()));
+    assert_eq!(draft, Some(replacement));
 }
 
 #[test]

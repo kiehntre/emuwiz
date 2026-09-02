@@ -111,6 +111,7 @@ pub(super) enum CatalogueManagerAction {
 
 pub(super) enum SourcesPageAction {
     AddFolder(PathBuf),
+    ApplyMountRoot(PathBuf),
     ScanOne(PathBuf),
     ScanAll,
     RefreshStatus,
@@ -1125,12 +1126,51 @@ pub(super) fn show_sources_overview(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) fn show_sources_page(
     ui: &mut egui::Ui,
     sources: &[SourceFolderView],
     archives: &[PersistedArchive],
     mount_root: Option<&Path>,
     busy: bool,
+    add_dialog: &mut Option<SourcesAddDialogState>,
+    remove_dialog: &mut Option<SourcesRemoveDialogState>,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<SourcesPageAction> {
+    let mut mount_root_draft = None;
+    show_sources_page_with_mount_root(
+        ui,
+        sources,
+        archives,
+        mount_root,
+        busy,
+        &mut mount_root_draft,
+        false,
+        add_dialog,
+        remove_dialog,
+        clipboard,
+    )
+}
+
+pub(super) fn stage_mount_root_pick(draft: &mut Option<PathBuf>, picked: Option<PathBuf>) {
+    if let Some(path) = picked {
+        *draft = Some(path);
+    }
+}
+
+pub(super) fn mount_root_apply_available(draft: Option<&Path>, busy: bool) -> bool {
+    draft.is_some() && !busy
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn show_sources_page_with_mount_root(
+    ui: &mut egui::Ui,
+    sources: &[SourceFolderView],
+    archives: &[PersistedArchive],
+    mount_root: Option<&Path>,
+    busy: bool,
+    mount_root_draft: &mut Option<PathBuf>,
+    mount_root_busy: bool,
     add_dialog: &mut Option<SourcesAddDialogState>,
     remove_dialog: &mut Option<SourcesRemoveDialogState>,
     clipboard: &mut dyn ClipboardBackend,
@@ -1407,7 +1447,7 @@ pub(super) fn show_sources_page(
     widgets::section_header(
         ui,
         "Mount destination",
-        Some("The configured mount root is read-only here."),
+        Some("Choose where EmuWiz temporarily prepares archived games."),
     );
     widgets::card(ui, |ui| {
         if let Some(root) = mount_root {
@@ -1417,10 +1457,48 @@ pub(super) fn show_sources_page(
         } else {
             ui.label("Mount root: unknown");
         }
+        ui.label("Temporary game preparation folder");
         ui.label(
-            egui::RichText::new("Configuration editing is intentionally unavailable on this page.")
-                .color(theme::muted(ui)),
+            "EmuWiz temporarily makes archived games available here while you play. It does not rewrite your original game files.",
         );
+        ui.label(
+            egui::RichText::new(
+                "Choose an existing writable folder. EmuWiz will not create it automatically.",
+            )
+            .color(theme::muted(ui)),
+        );
+        ui.horizontal(|ui| {
+            if widgets::action_button(
+                ui,
+                "Choose folder",
+                widgets::ActionStyle::Secondary,
+                !mount_root_busy,
+            )
+            .clicked()
+            {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Choose Temporary Game Preparation Folder")
+                    .pick_folder();
+                stage_mount_root_pick(mount_root_draft, picked);
+            }
+            if mount_root_apply_available(mount_root_draft.as_deref(), mount_root_busy) {
+                if widgets::action_button(ui, "Apply folder", widgets::ActionStyle::Primary, true)
+                    .clicked()
+                    && let Some(path) = mount_root_draft.clone()
+                {
+                    action = Some(SourcesPageAction::ApplyMountRoot(path));
+                }
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
+                {
+                    *mount_root_draft = None;
+                }
+            }
+        });
+        if let Some(draft) = mount_root_draft.as_deref()
+            && widgets::path_value(ui, "Selected folder", draft)
+        {
+            let _ = clipboard.set_text(draft.display().to_string());
+        }
     });
 
     if let Some(dialog) = add_dialog.as_mut() {

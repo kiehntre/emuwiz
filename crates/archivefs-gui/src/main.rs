@@ -249,7 +249,7 @@ use archivefs_core::{
     preview_library_view_default, read_archive_index, remount_one_archive_path,
     remove_library_view_default, remove_source_folder_default, repair_library_view_default,
     run_setup_diagnostics_default, scan_all_enabled_sources_default, scan_and_persist,
-    scan_source_folder_default, set_library_view_enabled_default,
+    scan_source_folder_default, set_library_view_enabled_default, set_mount_root_default,
     set_source_folder_enabled_default, source_health_issues, unmount_one_archive_path,
     upgrade_library_database, validate_library_view_destination, validate_new_source_folder,
 };
@@ -2311,11 +2311,12 @@ impl DiagnosticsState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SetupAction {
     CreateStarterConfig,
     CreateMountRoot,
     OpenConfigFolder,
+    SetMountRoot(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4613,6 +4614,9 @@ struct ArchiveFsApp {
     /// mirrors `alias_action` exactly, including the "one writer at a
     /// time" convention `source_action_available` enforces.
     source_action: Option<RunningSourceAction>,
+    /// A folder picked for the temporary preparation root but not yet
+    /// applied. Picking or cancelling never writes config.toml.
+    mount_root_draft: Option<PathBuf>,
     bsfree_manager: BsFreeManagerState,
     bsfree_operation: Option<RunningBsFreeOperation>,
     bsfree_ui: BsFreeGuiState,
@@ -5089,6 +5093,7 @@ impl ArchiveFsApp {
             skipped_files_filter: None,
             select_all_visible_requested: false,
             source_action: None,
+            mount_root_draft: None,
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
@@ -6098,28 +6103,39 @@ impl ArchiveFsApp {
     }
 
     fn start_setup_action(&mut self, context: egui::Context, action: SetupAction) {
-        if self.is_busy() {
+        if self.is_busy()
+            || (matches!(&action, SetupAction::SetMountRoot(_)) && self.source_action.is_some())
+        {
             return;
         }
         let (sender, receiver) = mpsc::channel();
+        let started_message = match &action {
+            SetupAction::CreateStarterConfig => "Creating starter config.",
+            SetupAction::CreateMountRoot => "Creating configured mount root.",
+            SetupAction::OpenConfigFolder => "Opening config folder.",
+            SetupAction::SetMountRoot(_) => "Updating temporary preparation folder.",
+        };
         self.history.record(HistoryEntry::new(
             ActivityAction::Setup,
             None,
             ActivityOutcome::Started,
-            match action {
-                SetupAction::CreateStarterConfig => "Creating starter config.",
-                SetupAction::CreateMountRoot => "Creating configured mount root.",
-                SetupAction::OpenConfigFolder => "Opening config folder.",
-            },
+            started_message,
         ));
+        let worker_action = action.clone();
         self.setup_action = Some(RunningSetupAction { action, receiver });
         thread::spawn(move || {
-            let result = match action {
+            let result = match worker_action {
                 SetupAction::CreateStarterConfig => create_starter_config_default()
                     .map(|path| format!("Created starter config at {}.", path.display())),
                 SetupAction::CreateMountRoot => create_configured_mount_root_default()
                     .map(|path| format!("Created mount root at {}.", path.display())),
                 SetupAction::OpenConfigFolder => open_default_config_folder(),
+                SetupAction::SetMountRoot(path) => set_mount_root_default(&path).map(|path| {
+                    format!(
+                        "Temporary game preparation folder updated to {}.",
+                        path.display()
+                    )
+                }),
             }
             .map_err(|error| error.to_string());
             let _ = sender.send(result);
@@ -7719,12 +7735,16 @@ impl ArchiveFsApp {
         }
         ui.add_space(theme::SECTION_GAP);
 
-        let sources_action = show_sources_page(
+        let sources_action = show_sources_page_with_mount_root(
             ui,
             sources,
             archives,
             mount_root,
             self.source_action.is_some(),
+            &mut self.mount_root_draft,
+            self.setup_action.is_some()
+                || self.source_action.is_some()
+                || self.database_state.is_loading(),
             &mut self.sources_add_dialog,
             &mut self.sources_remove_dialog,
             &mut self.clipboard,
@@ -7733,6 +7753,9 @@ impl ArchiveFsApp {
             match sources_action {
                 SourcesPageAction::AddFolder(path) => {
                     self.start_source_action(context.clone(), SourceAction::Add(path));
+                }
+                SourcesPageAction::ApplyMountRoot(path) => {
+                    self.start_setup_action(context.clone(), SetupAction::SetMountRoot(path));
                 }
                 SourcesPageAction::ScanOne(path) => {
                     self.start_source_action(context.clone(), SourceAction::ScanOne(path));
@@ -8170,7 +8193,7 @@ impl ArchiveFsApp {
                 .receiver
                 .try_recv()
                 .ok()
-                .map(|result| (running.action, result))
+                .map(|result| (running.action.clone(), result))
         });
         if let Some((action, result)) = result {
             self.setup_action = None;
@@ -8186,14 +8209,37 @@ impl ArchiveFsApp {
                         succeeded: true,
                         message,
                         cleanup: None,
-                        warning: None,
+                        warning: if matches!(&action, SetupAction::SetMountRoot(_)) {
+                            self.gui_config.reload_default().err().map(|error| {
+                                format!(
+                                    "The folder changed successfully, but EmuWiz could not reload its configuration: {error}."
+                                )
+                            })
+                        } else {
+                            None
+                        },
                         more_information: None,
                     });
-                    if action != SetupAction::OpenConfigFolder {
+                    if matches!(&action, SetupAction::SetMountRoot(_)) {
+                        self.mount_root_draft = None;
+                        self.refresh(context);
+                    } else if action != SetupAction::OpenConfigFolder {
                         self.refresh_diagnostics(context);
                     }
                 }
                 Err(message) => {
+                    let (feedback_message, more_information) = if matches!(
+                        &action,
+                        SetupAction::SetMountRoot(_)
+                    ) {
+                        (
+                                "Could not change the temporary game preparation folder. Choose an existing writable folder and try again."
+                                    .to_string(),
+                                Some(message.clone()),
+                            )
+                    } else {
+                        (message.clone(), None)
+                    };
                     self.history.record(HistoryEntry::new(
                         ActivityAction::Setup,
                         None,
@@ -8202,10 +8248,10 @@ impl ArchiveFsApp {
                     ));
                     self.feedback = Some(ActionFeedback {
                         succeeded: false,
-                        message,
+                        message: feedback_message,
                         cleanup: None,
                         warning: None,
-                        more_information: None,
+                        more_information,
                     });
                 }
             }
