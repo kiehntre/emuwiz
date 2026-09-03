@@ -2793,29 +2793,54 @@ fn load_snapshot_from(
     };
     let schema_version = database.schema_version().map_err(to_failed)?;
     let archives = database.load_archives().map_err(to_failed)?;
-    let configured_dat_source_ids =
+    let configured_dat_sources =
         archivefs_core::dat::sources::load_dat_sources_config_from(config_path)
             .ok()
             .and_then(|config| config.sources)
             .unwrap_or_default()
             .into_iter()
-            .map(|source| source.id)
-            .collect::<HashSet<_>>();
+            .filter(|source| source.enabled.unwrap_or(true))
+            .map(|source| (source.id.clone(), source))
+            .collect::<HashMap<_, _>>();
     let mut dat_identities = HashMap::new();
     for archive in &archives {
         let persisted = database
             .library_dat_identities_for_item(archive.id)
             .map_err(to_failed)?;
         let mut summaries = Vec::with_capacity(persisted.len());
+        // The only current, already-loaded evidence about this archive's
+        // bytes - `size_bytes`, refreshed on every scan - with no
+        // cryptographic hash: EmuWiz never hashes a ROM outside an
+        // explicit "Run Audit"/RomM lookup, so nothing stronger is
+        // available here without reopening and rehashing the file, which
+        // opening this view must never do. `freshness()` already falls
+        // back to comparing `size_bytes` when no hash pair overlaps, so
+        // this genuinely lets a same-path/different-size replacement
+        // resolve to `Stale` rather than always `Unknown` - a same-size
+        // replacement still correctly resolves `Unknown` (insufficient
+        // evidence), never fabricated as `Current`.
+        let current_hashes = archivefs_core::dat::library_identity_summary::LibraryItemHashes {
+            size_bytes: archive.size_bytes,
+            ..Default::default()
+        };
         for identity in persisted {
             let source_id = identity.source.source_id;
+            let configured_source = configured_dat_sources.get(&source_id);
+            let current_source_revision = configured_source.and_then(|source| {
+                let revisions = source.health_arcade_catalogue_revisions.as_deref()?;
+                if revisions.len() != 1 {
+                    return None;
+                }
+                let (_, revision) = revisions[0].split_once('=')?;
+                (!revision.is_empty()).then_some(revision)
+            });
             if let Some(summary) = database
                 .library_dat_identity_summary_for_item(
                     archive.id,
                     &source_id,
-                    None,
-                    None,
-                    configured_dat_source_ids.contains(&source_id),
+                    Some(&current_hashes),
+                    current_source_revision,
+                    configured_source.is_some(),
                 )
                 .map_err(to_failed)?
             {

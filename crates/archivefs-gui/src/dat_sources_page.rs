@@ -676,6 +676,47 @@ fn managed_dat_status_from_outcome(outcome: ManagedDatUpdateOutcome) -> ManagedD
     }
 }
 
+fn source_requires_dat_identity_stale_mark(
+    before: &DatSourceEntry,
+    after: &DatSourceEntry,
+) -> bool {
+    before.path != after.path
+        || before.kind != after.kind
+        || before.health.observed_size_bytes != after.health.observed_size_bytes
+        || before.health.observed_modified_unix_seconds
+            != after.health.observed_modified_unix_seconds
+        || before.health.arcade_catalogue_revisions != after.health.arcade_catalogue_revisions
+}
+
+/// Whether a completed managed-DAT-update job result should stale-mark that
+/// source's prior audit results, and what to mark them with.
+///
+/// `Some((dat_source_id, upstream_revision))` only for a genuinely
+/// successful, newly-published update (`Ok(ManagedDatUpdateOutcome::Updated
+/// { .. })`) - `update_managed_dat` only ever reaches that variant after
+/// the new snapshot passed every validation and was atomically published
+/// (see `publish_validated_snapshot`), never on a failed download, a
+/// validation failure, an offline/disabled/rate-limited/already-current
+/// check, or a transport/build error. `dat_source_id` is the exact string a
+/// managed catalogue's audit results are persisted under (see
+/// [`archivefs_core::dat::catalogue_selection::managed_dat_audit_source_id`]),
+/// never `ManagedDatSourceId`'s own `Display`.
+fn managed_update_stale_mark_target(
+    source_id: &ManagedDatSourceId,
+    result: &archivefs_core::Result<ManagedDatUpdateOutcome>,
+) -> Option<(String, String)> {
+    let Ok(ManagedDatUpdateOutcome::Updated {
+        upstream_revision, ..
+    }) = result
+    else {
+        return None;
+    };
+    Some((
+        archivefs_core::dat::catalogue_selection::managed_dat_audit_source_id(source_id),
+        upstream_revision.clone(),
+    ))
+}
+
 fn managed_dat_failure_message(kind: ManagedDatUpdateFailureKind, detail: &str) -> String {
     let message = match kind {
         ManagedDatUpdateFailureKind::Forbidden | ManagedDatUpdateFailureKind::NotFound => {
@@ -4428,6 +4469,14 @@ impl DatSourcesPageState {
         };
         match job.messages.try_recv() {
             Ok(message) => {
+                if let Some((dat_source_id, upstream_revision)) =
+                    managed_update_stale_mark_target(&message.source_id, &message.result)
+                {
+                    self.mark_dat_source_stale_after_update(
+                        &dat_source_id,
+                        Some(&upstream_revision),
+                    );
+                }
                 let status = match message.result {
                     Ok(outcome) => managed_dat_status_from_outcome(outcome),
                     Err(error) => ManagedDatStatusView::Failed {
@@ -4450,6 +4499,30 @@ impl DatSourcesPageState {
                 self.managed_job = None;
                 true
             }
+        }
+    }
+
+    fn mark_dat_source_stale_after_update(
+        &mut self,
+        source_id: &str,
+        current_revision: Option<&str>,
+    ) {
+        let Some(database_path) = self.database_path.clone() else {
+            return;
+        };
+        let result =
+            archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
+                database.mark_library_dat_identity_stale_for_source_revision(
+                    source_id,
+                    current_revision,
+                )?;
+                database.mark_dat_set_results_stale(source_id, current_revision)?;
+                Ok(())
+            });
+        if let Err(error) = result {
+            self.managed_action_error = Some(format!(
+                "Managed DAT updated, but existing audit results could not be marked stale: {error}"
+            ));
         }
     }
 
@@ -4508,10 +4581,41 @@ impl DatSourcesPageState {
             );
             return;
         }
+        let stale_sources = self
+            .draft
+            .entries()
+            .iter()
+            .filter_map(|after| {
+                let should_stale = self
+                    .saved
+                    .get(&after.id)
+                    .map(|before| source_requires_dat_identity_stale_mark(before, after))
+                    .unwrap_or(true);
+                should_stale.then_some(after.id.clone())
+            })
+            .collect::<Vec<_>>();
         match save_dat_sources_config_to(&self.config_path, &self.draft.to_config()) {
             Ok(()) => {
                 self.saved = self.draft.clone();
                 self.save_state = DatSaveState::Saved;
+                if let Some(database_path) = self.database_path.clone() {
+                    if !stale_sources.is_empty() {
+                        let result = archivefs_core::Database::open_or_create(database_path)
+                            .and_then(|mut database| {
+                                for source_id in &stale_sources {
+                                    database
+                                        .mark_library_dat_identities_stale_for_source(source_id)?;
+                                    database.mark_dat_set_results_stale_for_source(source_id)?;
+                                }
+                                Ok(())
+                            });
+                        if let Err(error) = result {
+                            self.action_error = Some(format!(
+                                "DAT sources were saved, but prior audit results could not be marked stale: {error}"
+                            ));
+                        }
+                    }
+                }
             }
             Err(error) => self.save_state = DatSaveState::Failed(error.to_string()),
         }

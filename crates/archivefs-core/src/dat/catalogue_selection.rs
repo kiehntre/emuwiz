@@ -161,6 +161,27 @@ fn managed_provider_token(provider: ManagedDatProvider) -> &'static str {
     }
 }
 
+/// The exact `dat_source_id` string a managed catalogue's audit results are
+/// persisted under (`library_dat_identities`/`dat_set_audit_results`), for
+/// callers that need to key off it without re-resolving the whole catalogue
+/// - e.g. marking a source's rows stale right after a successful managed
+/// update. This is the single source of truth for that format: it is what
+/// [`resolve_catalogue`]'s own [`CatalogueRef::ManagedCurrent`] arm builds
+/// (`format!("{provider_token}:{source_key}")`) - deliberately **not**
+/// [`ManagedDatSourceId`]'s own [`std::fmt::Display`] impl, which uses a
+/// different token/separator (`"{storage_component}/{source_key}"`) meant
+/// for `managed_dat_sources.toml` provenance, not for
+/// `library_dat_identities.dat_source_id`. Using the two interchangeably
+/// would silently key stale-marking off a string no persisted row ever
+/// carries.
+pub fn managed_dat_audit_source_id(source_id: &ManagedDatSourceId) -> String {
+    format!(
+        "{}:{}",
+        managed_provider_token(source_id.provider),
+        source_id.source_key
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Evidence-carrying values
 // ---------------------------------------------------------------------------
@@ -1100,11 +1121,7 @@ pub fn resolve_catalogue(
             })?;
             Ok(ResolvedCatalogue {
                 reference: reference.clone(),
-                source_id: format!(
-                    "{}:{}",
-                    managed_provider_token(source_id.provider),
-                    source_id.source_key
-                ),
+                source_id: managed_dat_audit_source_id(source_id),
                 display_name,
                 backing_path: resolved_path,
                 kind: DatSourceKind::File,

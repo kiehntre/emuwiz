@@ -3704,6 +3704,26 @@ impl Database {
 
         for archive_id in &ids {
             tx.execute(
+                "DELETE FROM library_dat_identities WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove library DAT identities for missing archive",
+                    error,
+                )
+            })?;
+            tx.execute(
+                "DELETE FROM verified_identity_facts WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove verified identity facts for missing archive",
+                    error,
+                )
+            })?;
+            tx.execute(
                 "DELETE FROM platform_assignments WHERE archive_id = ?1",
                 params![archive_id],
             )
@@ -3786,6 +3806,26 @@ impl Database {
         };
 
         for archive_id in &archive_ids {
+            tx.execute(
+                "DELETE FROM library_dat_identities WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove library DAT identities for source folder archive",
+                    error,
+                )
+            })?;
+            tx.execute(
+                "DELETE FROM verified_identity_facts WHERE archive_id = ?1",
+                params![archive_id],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to remove verified identity facts for source folder archive",
+                    error,
+                )
+            })?;
             tx.execute(
                 "DELETE FROM platform_assignments WHERE archive_id = ?1",
                 params![archive_id],
@@ -4644,6 +4684,33 @@ impl Database {
             )
             .map_err(|error| db_error("failed to clear library DAT identity stale marks", error))?;
         Ok(marked)
+    }
+
+    /// Marks every stored per-item DAT identity for a source stale. This is
+    /// used when a user replaces a source but the old and new catalogue
+    /// revisions cannot be compared safely.
+    pub fn mark_library_dat_identities_stale_for_source(
+        &mut self,
+        dat_source_id: &str,
+    ) -> Result<usize> {
+        self.connection
+            .execute(
+                "UPDATE library_dat_identities SET revision_marked_stale = 1, updated_at = ?2
+                 WHERE dat_source_id = ?1 AND revision_marked_stale = 0",
+                params![dat_source_id, now_utc_string()],
+            )
+            .map_err(|error| db_error("failed to mark library DAT identities stale", error))
+    }
+
+    /// Marks all set-level results for a source stale when its replacement
+    /// revision is not safely comparable.
+    pub fn mark_dat_set_results_stale_for_source(&mut self, source_id: &str) -> Result<usize> {
+        self.connection
+            .execute(
+                "UPDATE dat_set_audit_results SET stale = 1 WHERE source_id = ?1 AND stale = 0",
+                params![source_id],
+            )
+            .map_err(|error| db_error("failed to mark DAT set results stale", error))
     }
 
     /// Rebuilds a [`crate::dat::library_identity_summary::LibraryDatIdentitySummary`]
@@ -7880,6 +7947,15 @@ mod tests {
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
         scan_and_persist(&mut database, &config, "initial").unwrap();
         let archive_id = database.load_archives().unwrap()[0].id;
+        database
+            .connection
+            .execute(
+                "INSERT INTO library_dat_identities
+                 (archive_id, dat_source_id, verification_state, completeness, audited_at, facts_json, created_at, updated_at)
+                 VALUES (?1, 'test-dat', 'verified_single_match', 'exhaustive', 'now', X'7B7D', 'now', 'now')",
+                params![archive_id],
+            )
+            .unwrap();
         fs::remove_file(&archive_path).unwrap();
         scan_and_persist(&mut database, &config, "missing").unwrap();
 
@@ -7889,7 +7965,11 @@ mod tests {
         assert_eq!(result.removed, 1);
         assert_eq!(result.archive_ids, vec![archive_id]);
         assert!(database.load_archives().unwrap().is_empty());
-        for table in ["platform_assignments", "archive_scan_observations"] {
+        for table in [
+            "platform_assignments",
+            "archive_scan_observations",
+            "library_dat_identities",
+        ] {
             let count: i64 = database
                 .connection
                 .query_row(
@@ -7908,6 +7988,45 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_key_errors, 0);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_folder_catalogue_removal_cleans_library_dat_identities_before_archives() {
+        let root = temp_dir("remove-source-folder-dat-identities");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "n64/game.zip", b"game");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "initial").unwrap();
+        let archive = database.load_archives().unwrap().remove(0);
+        database
+            .connection
+            .execute(
+                "INSERT INTO library_dat_identities
+                 (archive_id, dat_source_id, verification_state, completeness, audited_at, facts_json, created_at, updated_at)
+                 VALUES (?1, 'test-dat', 'verified_single_match', 'exhaustive', 'now', X'7B7D', 'now', 'now')",
+                params![archive.id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            database
+                .remove_source_folder_catalogue(archive.source_folder_id)
+                .unwrap(),
+            1
+        );
+        let remaining: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM library_dat_identities WHERE archive_id = ?1",
+                params![archive.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(database.load_archives().unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -13135,6 +13254,91 @@ mod tests {
         }
 
         #[test]
+        fn size_bytes_only_current_hashes_still_resolve_current_stale_or_unknown() {
+            // The exact shape `archivefs-gui`'s `load_snapshot_from` now
+            // supplies: no cryptographic hash (EmuWiz never hashes a ROM
+            // merely to open this view), only the already-loaded, always-
+            // current `archives.size_bytes`. `freshness()`'s own size
+            // fallback (no schema/logic change here) must still resolve a
+            // genuine Current/Stale/Unknown from that alone.
+            let (root, mut database) = open("persist-freshness-size-only");
+            let archive_id = seed_archive(&database, "SizeOnly.nes");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("20240501"),
+                        "Size Only Game",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            // The persisted row's `audited_hashes` (via `hashes()`) carries
+            // `size_bytes: Some(65_536)`.
+
+            let size_only = |size_bytes: Option<u64>| LibraryItemHashes {
+                size_bytes,
+                crc32: None,
+                md5: None,
+                sha1: None,
+                sha256: None,
+            };
+
+            let current = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&size_only(Some(65_536))),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.provenance_freshness,
+                DatProvenanceFreshness::Current,
+                "same size, no hash overlap, still resolves Current via the size fallback"
+            );
+
+            let stale = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&size_only(Some(1))),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stale.provenance_freshness,
+                DatProvenanceFreshness::Stale,
+                "a genuinely different size at the same path is a real, detectable change"
+            );
+
+            let unknown = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&size_only(None)),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                unknown.provenance_freshness,
+                DatProvenanceFreshness::Unknown,
+                "no size and no hash is genuinely insufficient evidence, never fabricated"
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
         fn a_source_revision_drift_makes_the_stored_identity_stale_not_gone() {
             let (root, mut database) = open("persist-revision-drift");
             let archive_id = seed_archive(&database, "Drift.nes");
@@ -13220,6 +13424,242 @@ mod tests {
             assert_eq!(
                 refreshed.provenance_freshness,
                 DatProvenanceFreshness::Current
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn unconditional_source_replacement_staling_preserves_sibling_rows() {
+            let (root, mut database) = open("persist-source-replacement-stale");
+            let archive_id = seed_archive(&database, "Replacement.nes");
+            for source_id in ["no-intro-nes", "redump-nes"] {
+                database
+                    .persist_library_dat_identity(
+                        archive_id,
+                        &verified(
+                            source_id,
+                            DatEcosystem::NoIntro,
+                            Some("v1"),
+                            "Replacement Game",
+                            DatAuditCompleteness::Exhaustive,
+                        ),
+                    )
+                    .unwrap();
+            }
+
+            assert_eq!(
+                database
+                    .mark_library_dat_identities_stale_for_source("no-intro-nes")
+                    .unwrap(),
+                1
+            );
+            let stale = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-nes",
+                    Some(&hashes()),
+                    Some("v1"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            let sibling = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "redump-nes",
+                    Some(&hashes()),
+                    Some("v1"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(stale.provenance_freshness, DatProvenanceFreshness::Stale);
+            assert_eq!(
+                sibling.provenance_freshness,
+                DatProvenanceFreshness::Current
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_managed_source_revision_update_stales_only_its_own_identity_and_set_rows() {
+            // Mirrors the production seam: after `update_managed_dat`
+            // publishes a genuinely new snapshot,
+            // `mark_library_dat_identity_stale_for_source_revision` and
+            // `mark_dat_set_results_stale` are called for that source's
+            // canonical `dat_source_id` - never touching an unrelated
+            // source's rows for the same archive, whether flat-item or
+            // Arcade-set.
+            let (root, mut database) = open("managed-update-stales-own-source");
+            let archive_id = seed_archive(&database, "SNK.zip");
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "mame:neogeo",
+                        DatEcosystem::MAMEArcade,
+                        Some("0.267"),
+                        "Metal Slug",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "no-intro-snk",
+                        DatEcosystem::NoIntro,
+                        Some("20240501"),
+                        "Metal Slug",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            database
+                .connection
+                .execute(
+                    "INSERT INTO dat_set_audit_results \
+                     (archive_id, archive_path, source_id, game_name, set_state_json, \
+                      dependency_state_json, dat_revision, audited_at, stale, exhaustive) \
+                     VALUES (?1, X'0102', 'mame:neogeo', 'mslug', '\"Complete\"', '\"Satisfied\"', \
+                              '0.267', 'now', 0, 1)",
+                    params![archive_id],
+                )
+                .unwrap();
+            database
+                .connection
+                .execute(
+                    "INSERT INTO dat_set_audit_results \
+                     (archive_id, archive_path, source_id, game_name, set_state_json, \
+                      dependency_state_json, dat_revision, audited_at, stale, exhaustive) \
+                     VALUES (?1, X'0304', 'no-intro-snk', 'unrelated', '\"Complete\"', \
+                              '\"Satisfied\"', '20240501', 'now', 0, 1)",
+                    params![archive_id],
+                )
+                .unwrap();
+
+            // The exact string `managed_update_stale_mark_target`
+            // (`archivefs-gui`) produces for a MAME managed source.
+            let canonical_managed_source_id = "mame:neogeo";
+            assert_eq!(
+                database
+                    .mark_library_dat_identity_stale_for_source_revision(
+                        canonical_managed_source_id,
+                        Some("new-upstream-commit-sha"),
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                database
+                    .mark_dat_set_results_stale(
+                        canonical_managed_source_id,
+                        Some("new-upstream-commit-sha"),
+                    )
+                    .unwrap(),
+                1
+            );
+
+            let updated_source = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    canonical_managed_source_id,
+                    Some(&hashes()),
+                    Some("new-upstream-commit-sha"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                updated_source.provenance_freshness,
+                DatProvenanceFreshness::Stale
+            );
+            let unrelated_source = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "no-intro-snk",
+                    Some(&hashes()),
+                    Some("20240501"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                unrelated_source.provenance_freshness,
+                DatProvenanceFreshness::Current,
+                "an unrelated source for the same archive must not be marked stale"
+            );
+
+            let updated_set_stale: i64 = database
+                .connection
+                .query_row(
+                    "SELECT stale FROM dat_set_audit_results WHERE source_id = ?1",
+                    params![canonical_managed_source_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(updated_set_stale, 1);
+            let unrelated_set_stale: i64 = database
+                .connection
+                .query_row(
+                    "SELECT stale FROM dat_set_audit_results WHERE source_id = 'no-intro-snk'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                unrelated_set_stale, 0,
+                "an unrelated source's Arcade set row must not be marked stale"
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_failed_or_cancelled_managed_update_marks_nothing_stale() {
+            // The database-level guarantee behind
+            // `managed_update_stale_mark_target` (`archivefs-gui`): the mark
+            // functions themselves are the only thing that can change
+            // `revision_marked_stale`/`stale`, and nothing calls them for a
+            // failed, offline, disabled, rate-limited, or not-yet-arrived
+            // update - proven here by simply never calling them and
+            // confirming the row is untouched.
+            let (root, database) = open("managed-update-failed-marks-nothing");
+            let archive_id = seed_archive(&database, "Untouched.zip");
+            let mut database = database;
+            database
+                .persist_library_dat_identity(
+                    archive_id,
+                    &verified(
+                        "mame:neogeo",
+                        DatEcosystem::MAMEArcade,
+                        Some("0.267"),
+                        "Metal Slug",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+
+            let untouched = database
+                .library_dat_identity_summary_for_item(
+                    archive_id,
+                    "mame:neogeo",
+                    Some(&hashes()),
+                    Some("0.267"),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                untouched.provenance_freshness,
+                DatProvenanceFreshness::Current,
+                "no stale-mark call was made, so nothing changed"
             );
 
             database.close().unwrap();

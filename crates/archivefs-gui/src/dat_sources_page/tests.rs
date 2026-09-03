@@ -7971,3 +7971,98 @@ fn combined_multi_source_audits_get_no_completion_claim() {
         "a combined audit has no single selected DAT/snapshot to measure completion against"
     );
 }
+
+#[test]
+fn source_replacement_staleness_is_conservative_but_ignores_enablement_only() {
+    let mut before = DatSourceEntry::new(
+        "source".to_string(),
+        "Source".to_string(),
+        PathBuf::from("/catalogue/one.dat"),
+        DatSourceKind::File,
+    );
+    let mut disabled = before.clone();
+    disabled.enabled = false;
+    assert!(!source_requires_dat_identity_stale_mark(&before, &disabled));
+
+    let mut replaced = before.clone();
+    replaced.path = PathBuf::from("/catalogue/two.dat");
+    assert!(source_requires_dat_identity_stale_mark(&before, &replaced));
+
+    before.health.observed_size_bytes = Some(10);
+    replaced = before.clone();
+    replaced.health.observed_size_bytes = Some(11);
+    assert!(source_requires_dat_identity_stale_mark(&before, &replaced));
+}
+
+// --- managed-update stale-mark decision (task: staleness lifecycle wiring) ---
+
+#[test]
+fn a_successful_managed_update_targets_the_canonical_audit_source_id() {
+    let source_id = ManagedDatSourceId::mame_software_list("neogeo").unwrap();
+    let result: archivefs_core::Result<ManagedDatUpdateOutcome> =
+        Ok(ManagedDatUpdateOutcome::Updated {
+            upstream_revision: "abc123".to_string(),
+            sha256: "d".repeat(64),
+        });
+    let target = managed_update_stale_mark_target(&source_id, &result)
+        .expect("a successful Updated outcome must target a stale-mark");
+    assert_eq!(
+        target.0,
+        archivefs_core::dat::catalogue_selection::managed_dat_audit_source_id(&source_id),
+        "must use the canonical audit dat_source_id, never ManagedDatSourceId::Display"
+    );
+    assert_ne!(
+        target.0,
+        source_id.to_string(),
+        "ManagedDatSourceId's own Display uses a different token/separator"
+    );
+    assert_eq!(target.1, "abc123");
+}
+
+#[test]
+fn a_failed_managed_update_never_targets_a_stale_mark() {
+    let source_id = ManagedDatSourceId::mame_software_list("neogeo").unwrap();
+    for result in [
+        Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::Network,
+            detail: "connection reset".to_string(),
+        }),
+        Ok(ManagedDatUpdateOutcome::Offline),
+        Ok(ManagedDatUpdateOutcome::Disabled),
+        Ok(ManagedDatUpdateOutcome::RateLimited {
+            retry_after_seconds: Some(60),
+        }),
+        Ok(ManagedDatUpdateOutcome::UpToDate {
+            upstream_revision: Some("abc123".to_string()),
+        }),
+        Ok(ManagedDatUpdateOutcome::UpdateAvailable {
+            upstream_revision: "def456".to_string(),
+        }),
+        Err(archivefs_core::ArchiveFsError::Config(
+            "transport could not be built".to_string(),
+        )),
+    ] {
+        assert!(
+            managed_update_stale_mark_target(&source_id, &result).is_none(),
+            "must not stale-mark for {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_or_unresolved_check_never_targets_a_stale_mark() {
+    // "Cancelled" has no dedicated outcome variant in this core API - a
+    // check/update that never completes simply never reaches
+    // `poll_managed_dat_job` with a message at all (no channel send), which
+    // this module's own logic already treats as "no result yet, nothing to
+    // mark". The `Checking`-in-flight-with-no-message case is proven by
+    // `managed_update_stale_mark_target` never being called except from
+    // inside `Ok(message) => ...` after a real `try_recv()` - and every
+    // *arrived* non-`Updated` result is already proven inert above.
+    let source_id = ManagedDatSourceId::mame_software_list("neogeo").unwrap();
+    let result: archivefs_core::Result<ManagedDatUpdateOutcome> =
+        Ok(ManagedDatUpdateOutcome::UpToDate {
+            upstream_revision: None,
+        });
+    assert!(managed_update_stale_mark_target(&source_id, &result).is_none());
+}
