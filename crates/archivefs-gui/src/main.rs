@@ -6734,12 +6734,16 @@ impl ArchiveFsApp {
              for each one. This page keeps library diagnostics out of the way.",
         );
         ui.add_space(theme::SECTION_GAP);
-        show_emulator_setup_summary(
+        let check_emulators = show_emulator_setup_summary(
             ui,
             self.doctor_scan.displayed(),
+            self.doctor_scan.is_running(),
             &self.retroarch_profiles,
             focus_emulator.as_deref(),
         );
+        if check_emulators {
+            self.start_doctor_scan(context.clone());
+        }
         ui.add_space(theme::SECTION_GAP);
         // The managed-emulator download catalogue is always shown: a beginner
         // must be able to see whether an emulator is installed, available to
@@ -6757,18 +6761,29 @@ impl ArchiveFsApp {
         fn show_emulator_setup_summary(
             ui: &mut egui::Ui,
             outcome: Option<&DoctorScanOutcome>,
+            checking: bool,
             retroarch_profiles: &RetroArchProfilesState,
             focused_emulator: Option<&str>,
-        ) {
+        ) -> bool {
+            let mut check_emulators = false;
             widgets::card(ui, |ui| {
                 ui.heading("Emulator readiness");
                 let Some(outcome) = outcome else {
-                    widgets::empty_state(
+                    if checking {
+                        widgets::empty_state(
+                            ui,
+                            "Checking emulators…",
+                            "EmuWiz is checking the supported emulators on this computer.",
+                            None,
+                        );
+                    } else if widgets::empty_state(
                         ui,
                         "Emulators have not been checked",
-                        "Open Full diagnostics to check the supported emulators on this computer.",
-                        None,
-                    );
+                        "Check the supported emulators on this computer before trying to play.",
+                        Some("Check emulators"),
+                    ) {
+                        check_emulators = true;
+                    }
                     return;
                 };
                 let emulators = [
@@ -6935,6 +6950,7 @@ impl ArchiveFsApp {
                         });
                 }
             });
+            check_emulators
         }
         egui::CollapsingHeader::new("Full diagnostics")
             .id_salt("emulator-setup-full-diagnostics")

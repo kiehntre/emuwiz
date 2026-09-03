@@ -2326,6 +2326,68 @@ fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
 }
 
 #[test]
+fn emulator_setup_summary_starts_the_shared_doctor_scan() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    app.doctor_scan = DoctorScanState::NotRun;
+    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.view = MainView::EmulatorSetup;
+
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1600.0));
+    let first = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ctx| app.update(ctx, &mut frame),
+    );
+    let button = first_text_shape_rect(&first, "Check emulators")
+        .expect("unchecked Emulator Setup must expose Check emulators");
+    let pos = button.center();
+
+    let click = |app: &mut ArchiveFsApp, input: egui::RawInput| {
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+    };
+    click(
+        &mut app,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    click(
+        &mut app,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        },
+    );
+    assert!(app.doctor_scan.is_running());
+
+    let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&output, "Checking emulators…"));
+    assert!(!rendered_text_contains(&output, "Check emulators"));
+}
+
+#[test]
 fn emulator_download_catalogue_is_visible_without_running_doctor() {
     // V1 blocker: the download catalogue used to be gated behind
     // `doctor_scan.displayed().is_some()`, so a beginner had to run Full
@@ -3652,6 +3714,23 @@ fn render_problems_repair_app(app: &mut ArchiveFsApp) -> egui::FullOutput {
     ctx.run(problems_repair_screen_input(), |ctx| {
         app.update(ctx, &mut frame)
     })
+}
+
+fn first_text_shape_rect(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+    fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, needle)),
+            _ => None,
+        }
+    }
+
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| walk(&clipped.shape, needle))
 }
 
 #[test]
