@@ -37,6 +37,12 @@ pub(crate) enum HomeCard {
     QuickRename,
     CheatSources,
     DatSources,
+    /// Not a card in `HomeView::cards` - returned only by the
+    /// [`HomeBanner::ConfigDisappeared`] banner's own action button, so a
+    /// user told their settings could not be found has a direct way to
+    /// reach the destination that can explain why, through the same
+    /// `Option<HomeCard>` channel every other Home action already uses.
+    CheckProblems,
     RomM,
     CheckSetup,
     Settings,
@@ -514,6 +520,17 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
                  the problem before starting another task.",
                 widgets::StatusTone::Warning,
             );
+            // `widgets::banner` itself stays a plain title/detail/tone strip -
+            // it has dozens of other callers, and giving it an action button
+            // would mean touching every one of them for a single Home-only
+            // need. The button is rendered here instead, immediately below,
+            // using the same `action_button` primitive `empty_state` already
+            // wraps for its own optional action.
+            if widgets::action_button(ui, "Check the problem", widgets::ActionStyle::Primary, true)
+                .clicked()
+            {
+                clicked = Some(HomeCard::CheckProblems);
+            }
             ui.add_space(theme::SECTION_GAP);
         }
         HomeBanner::None => {}

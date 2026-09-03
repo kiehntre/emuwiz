@@ -97,6 +97,41 @@ fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         .any(|clipped| shape_contains(&clipped.shape, needle))
 }
 
+fn exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn find(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == needle => {
+                Some(text.pos + text.galley.size() / 2.0)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, needle)),
+            _ => None,
+        }
+    }
+
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find(&clipped.shape, needle))
+}
+
+fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        },
+    ]
+}
+
 fn render(view: &HomeView, width: f32) -> (egui::FullOutput, Option<HomeCard>) {
     let ctx = egui::Context::default();
     let mut clicked = None;
@@ -176,6 +211,101 @@ fn config_disappeared_after_being_confirmed_shows_the_warning_banner_not_the_wel
     ));
     assert!(!rendered_text_contains(&output, "Doctor"));
     assert!(!rendered_text_contains(&output, "Welcome to EmuWiz"));
+    // The banner's own direct next action: a beginner told their settings
+    // could not be found must not be left to independently rediscover
+    // Problems & Repair.
+    assert!(rendered_text_contains(&output, "Check the problem"));
+}
+
+#[test]
+fn only_the_config_disappeared_banner_shows_its_check_the_problem_action() {
+    // Fresh install: expected/cheerful, and has nothing to "check" yet -
+    // the action button must not appear there.
+    let fresh_view = build_home_view(&fresh_install_inputs());
+    assert_eq!(fresh_view.banner, HomeBanner::FreshInstall);
+    let (fresh_output, fresh_clicked) = render(&fresh_view, 1100.0);
+    assert!(!rendered_text_contains(&fresh_output, "Check the problem"));
+    assert_eq!(
+        fresh_clicked, None,
+        "an unclicked render must report no action"
+    );
+
+    // Normal, fully configured Home: no banner at all, so definitely no
+    // erroneous or duplicate action button.
+    let checks = [passing_check("config file")];
+    let established_view = build_home_view(&established_inputs(&checks));
+    assert_eq!(established_view.banner, HomeBanner::None);
+    let (established_output, established_clicked) = render(&established_view, 1100.0);
+    assert!(!rendered_text_contains(
+        &established_output,
+        "Check the problem"
+    ));
+    assert_eq!(established_clicked, None);
+
+    // Exactly one "Check the problem" affordance renders for the disappeared
+    // state - not a duplicate alongside some other label for the same
+    // action.
+    let mut inputs = fresh_install_inputs();
+    inputs.first_run = false;
+    let disappeared_view = build_home_view(&inputs);
+    let (disappeared_output, _) = render(&disappeared_view, 1100.0);
+    let occurrences = disappeared_output
+        .shapes
+        .iter()
+        .filter(|clipped| {
+            fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+                match shape {
+                    egui::Shape::Text(text_shape) => text_shape.galley.text() == needle,
+                    egui::Shape::Vec(nested) => nested.iter().any(|s| shape_contains(s, needle)),
+                    _ => false,
+                }
+            }
+            shape_contains(&clipped.shape, "Check the problem")
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "exactly one \"Check the problem\" label must render, found {occurrences}"
+    );
+}
+
+#[test]
+fn clicking_the_config_disappeared_action_emits_check_problems() {
+    let mut inputs = fresh_install_inputs();
+    inputs.first_run = false;
+    let view = build_home_view(&inputs);
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 2000.0));
+
+    let first = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_home_page(ui, &view);
+            });
+        },
+    );
+    let button_pos = exact_text_center(&first, "Check the problem")
+        .expect("the config-disappeared recovery action should render");
+
+    let mut clicked = None;
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(button_pos),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = show_home_page(ui, &view);
+            });
+        },
+    );
+
+    assert_eq!(clicked, Some(HomeCard::CheckProblems));
 }
 
 // --- Purity: identical inputs produce byte-identical (structurally equal) views ---

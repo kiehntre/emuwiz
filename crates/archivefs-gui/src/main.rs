@@ -3725,6 +3725,10 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         // backed by the same `doctor_scan` state its badge summarises.
         home_page::HomeCard::CheckSetup => MainView::EmulatorSetup,
         home_page::HomeCard::Settings => MainView::Settings,
+        // The config-disappeared banner's own action button - the existing
+        // Diagnostics destination is what can actually explain a missing
+        // configuration, via a fresh check.
+        home_page::HomeCard::CheckProblems => MainView::Doctor,
     }
 }
 

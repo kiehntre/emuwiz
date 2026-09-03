@@ -196,6 +196,7 @@ fn every_home_card_maps_to_its_real_existing_destination() {
         (home_page::HomeCard::CheckSetup, MainView::EmulatorSetup),
         (home_page::HomeCard::Settings, MainView::Settings),
         (home_page::HomeCard::QuickRename, MainView::IdentifyRename),
+        (home_page::HomeCard::CheckProblems, MainView::Doctor),
     ];
     for (card, expected_view) in expected {
         assert_eq!(main_view_for_home_card(card), expected_view, "{card:?}");
@@ -220,6 +221,7 @@ fn main_view_for_home_card_agrees_with_runtime_navigate_to_home_card() {
         home_page::HomeCard::RomM,
         home_page::HomeCard::CheckSetup,
         home_page::HomeCard::Settings,
+        home_page::HomeCard::CheckProblems,
     ] {
         let mut app = app_for_operation_tests();
         app.navigate_to_home_card(card);
