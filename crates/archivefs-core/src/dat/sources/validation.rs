@@ -533,7 +533,21 @@ fn observe_file(path: &Path) -> (Option<u64>, Option<i64>) {
 /// being attempted. Parsing itself is bounded by `limits`; every ceiling in
 /// [`DatLimits`] applies, including the file-size one, so a hostile or
 /// accidental 4 GB file is refused rather than read.
-pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatValidationReport {
+/// Validates `entry`, and - as a pure by-product of the same parse this
+/// already performs, never a second one - projects its named expected
+/// inventory (see [`crate::dat::expected_inventory`]). The caller decides
+/// whether and when to persist the projection (only on
+/// `Valid`/`ValidWithWarnings` - see [`DatValidationReport::state`] and
+/// `crate::dat::expected_inventory`'s doc on why a failed/partial parse
+/// must not overwrite a previous good inventory).
+pub fn validate_dat_source(
+    entry: &DatSourceEntry,
+    limits: DatLimits,
+) -> (
+    DatValidationReport,
+    crate::dat::expected_inventory::ExpectedDatInventoryProjection,
+) {
+    let mut expected = crate::dat::expected_inventory::ExpectedDatInventoryProjection::default();
     let mut report = DatValidationReport {
         source_id: entry.id.clone(),
         path: entry.path.to_string_lossy().into_owned(),
@@ -554,7 +568,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
     if let Err(refusal) = validate_dat_path(&entry.path, entry.kind) {
         report.summary = refusal.detail();
         report.path_refusal = Some(refusal.code().to_string());
-        return report;
+        return (report, expected);
     }
 
     let files: Vec<PathBuf> = match entry.kind {
@@ -569,7 +583,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
             Err(refusal) => {
                 report.summary = refusal.detail();
                 report.path_refusal = Some(refusal.code().to_string());
-                return report;
+                return (report, expected);
             }
         },
     };
@@ -584,7 +598,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
             }
             DatSourceKind::File => "The file is empty.".to_string(),
         };
-        return report;
+        return (report, expected);
     }
 
     let mut formats: Vec<String> = Vec::new();
@@ -604,6 +618,10 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
                 let source = &parsed.dat.source;
                 report.entry_count = report.entry_count.saturating_add(source.entry_count);
                 report.rom_count = report.rom_count.saturating_add(source.rom_count);
+                // The same parse already produced `parsed.dat.games` - this
+                // is a projection of it, never a second parse. See
+                // `crate::dat::expected_inventory`'s doc.
+                expected.extend_from(&parsed.dat.games);
                 let label = source.format.label().to_string();
                 if !formats.contains(&label) {
                     formats.push(label);
@@ -699,7 +717,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
     };
 
     report.summary = summarise(&report, files.len(), failures);
-    report
+    (report, expected)
 }
 
 fn header_identity(name: Option<&str>, version: Option<&str>) -> Option<String> {

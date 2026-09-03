@@ -48,8 +48,9 @@ fn create_schema_seven_database(path: &Path) {
 
 fn database_upgrade_backups(database_path: &Path) -> Vec<PathBuf> {
     let prefix = format!(
-        "{}.schema-7-before-10.backup",
-        database_path.file_name().unwrap().to_string_lossy()
+        "{}.schema-7-before-{}.backup",
+        database_path.file_name().unwrap().to_string_lossy(),
+        latest_schema_version()
     );
     std::fs::read_dir(database_path.parent().unwrap())
         .unwrap()
@@ -96,10 +97,18 @@ fn schema_seven_diagnostic_stays_read_only_and_offers_the_upgrade_action() {
                 "Your library was created by an older EmuWiz version."
             ));
             assert!(rendered_text_contains(&output, "schema 7"));
-            assert!(rendered_text_contains(&output, "required schema 10"));
+            let latest = latest_schema_version();
             assert!(rendered_text_contains(
                 &output,
-                "migration chain 8 → 9 → 10"
+                &format!("required schema {latest}")
+            ));
+            let chain = (8..=latest)
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            assert!(rendered_text_contains(
+                &output,
+                &format!("migration chain {chain}")
             ));
             assert!(rendered_text_contains(&output, "Scan and upgrade library"));
             assert!(!rendered_text_contains(&output, "Retry database load"));
@@ -155,10 +164,11 @@ fn schema_seven_scan_action_backs_up_upgrades_and_refreshes_gui_state() {
             upgrade: Some(report),
             ..
         }) => {
-            assert_eq!(snapshot.schema_version, 10);
+            let latest = latest_schema_version();
+            assert_eq!(snapshot.schema_version, latest);
             assert_eq!(report.from_version, 7);
-            assert_eq!(report.to_version, 10);
-            assert_eq!(report.applied_versions, vec![8, 9, 10]);
+            assert_eq!(report.to_version, latest);
+            assert_eq!(report.applied_versions, (8..=latest).collect::<Vec<_>>());
             assert!(report.backup_path.is_file());
             assert_eq!(
                 check_database_health(&report.backup_path).schema_version,
@@ -168,7 +178,7 @@ fn schema_seven_scan_action_backs_up_upgrades_and_refreshes_gui_state() {
         _ => panic!("expected a scanned outcome with an upgrade report"),
     }
     let health = check_database_health(&database_path);
-    assert_eq!(health.schema_version, Some(10));
+    assert_eq!(health.schema_version, Some(latest_schema_version()));
     assert!(health.migrations_current);
     assert_eq!(database_upgrade_backups(&database_path).len(), 1);
 
@@ -187,7 +197,9 @@ fn schema_seven_scan_action_backs_up_upgrades_and_refreshes_gui_state() {
     app.poll_database_load(&egui::Context::default());
 
     match &app.database_state {
-        DatabaseState::Ready { snapshot, .. } => assert_eq!(snapshot.schema_version, 10),
+        DatabaseState::Ready { snapshot, .. } => {
+            assert_eq!(snapshot.schema_version, latest_schema_version())
+        }
         _ => panic!("successful upgrade did not refresh the GUI state to Ready"),
     }
     let feedback = app.feedback.as_ref().unwrap();

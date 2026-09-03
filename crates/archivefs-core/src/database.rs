@@ -151,6 +151,16 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist verified per-game identity facts (verified_identity_facts) as a catalogue-side cache/projection - never a launch trust anchor",
         sql: include_str!("migrations/0010_verified_identity_facts.sql"),
     },
+    Migration {
+        version: 11,
+        description: "persist named expected DAT inventory (dat_expected_entries) per source, so Expected/Missing/Full-set coverage can be proven without reopening a DAT file",
+        sql: include_str!("migrations/0011_dat_expected_entries.sql"),
+    },
+    Migration {
+        version: 12,
+        description: "per-source expected-inventory metadata (dat_expected_inventory_meta): the validation generation, revision, entry count, and duplicate-name-skip count the dat_expected_entries rows describe",
+        sql: include_str!("migrations/0012_dat_expected_inventory_meta.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -4751,6 +4761,877 @@ impl Database {
         Ok(Some(persisted.reconstruct_summary(current_hashes, context)))
     }
 
+    // Expected DAT inventory (migration 0011).
+    //
+    // The durable, named prerequisite for Expected/Missing/Full-set
+    // coverage: one row per `<game>`/`<machine>` a DAT source declares, at
+    // whatever granularity that source's own catalogue uses - see
+    // `crate::dat::expected_inventory`'s module doc. This says nothing
+    // about what the library owns; that comparison is made by joining
+    // against `library_dat_identities` (or, for Arcade,
+    // `dat_set_audit_results`) at read time.
+    // -------------------------------------------------------------------
+
+    /// Atomically replaces `dat_source_id`'s entire expected inventory - the
+    /// `dat_expected_entries` rows **and** its `dat_expected_inventory_meta`
+    /// row - in one transaction: delete the old rows, replace the metadata
+    /// row, insert the new rows via one reused prepared statement (never one
+    /// transaction per row). If anything fails, nothing is committed and the
+    /// previous known-good inventory *and* its metadata both remain intact -
+    /// there is never a half-new inventory with old metadata or vice versa.
+    ///
+    /// Callers must only call this for a validation that actually
+    /// succeeded (`Valid`/`ValidWithWarnings`) - see
+    /// `crate::dat::expected_inventory`'s doc on why a failed/partial parse
+    /// must never destroy prior good inventory. This method itself does not
+    /// know or check the caller's validation state; it replaces whatever it
+    /// is given, unconditionally, which is exactly why the caller's gate
+    /// matters.
+    ///
+    /// `duplicate_names_skipped` is stored on the metadata row and gates
+    /// Full-Set proof later: a source that had to skip a pathological
+    /// duplicate `<game name="...">` does not have a proven one-to-one
+    /// canonical identity set, so Full Set can never read `Complete` for it
+    /// (see `crate::dat::coverage`).
+    ///
+    /// Returns the number of `dat_expected_entries` rows written.
+    pub fn replace_expected_dat_inventory(
+        &mut self,
+        dat_source_id: &str,
+        source_revision: Option<&str>,
+        ecosystem: Option<crate::dat::model::DatEcosystem>,
+        entries: &[crate::dat::expected_inventory::ExpectedDatEntryRecord],
+        duplicate_names_skipped: u64,
+    ) -> Result<usize> {
+        use crate::dat::expected_inventory::ExpectedDatEntryMetadata;
+
+        let ecosystem_json = ecosystem
+            .map(|value| serde_json::to_string(&value))
+            .transpose()
+            .map_err(|error| {
+                ArchiveFsError::Database(format!("failed to encode DAT ecosystem: {error}"))
+            })?;
+        let now = now_utc_string();
+
+        let tx = self.connection.transaction().map_err(|error| {
+            db_error("failed to start expected DAT inventory transaction", error)
+        })?;
+        tx.execute(
+            "DELETE FROM dat_expected_entries WHERE dat_source_id = ?1",
+            params![dat_source_id],
+        )
+        .map_err(|error| db_error("failed to clear prior expected DAT inventory", error))?;
+        tx.execute(
+            "INSERT INTO dat_expected_inventory_meta \
+             (dat_source_id, source_revision, ecosystem, entry_count, \
+              duplicate_names_skipped, validated_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) \
+             ON CONFLICT(dat_source_id) DO UPDATE SET \
+              source_revision = excluded.source_revision, \
+              ecosystem = excluded.ecosystem, \
+              entry_count = excluded.entry_count, \
+              duplicate_names_skipped = excluded.duplicate_names_skipped, \
+              validated_at = excluded.validated_at, \
+              updated_at = excluded.updated_at",
+            params![
+                dat_source_id,
+                source_revision,
+                ecosystem_json,
+                entries.len() as i64,
+                duplicate_names_skipped as i64,
+                now,
+            ],
+        )
+        .map_err(|error| db_error("failed to replace expected DAT inventory metadata", error))?;
+
+        let mut written = 0usize;
+        {
+            let mut statement = tx
+                .prepare(
+                    "INSERT INTO dat_expected_entries \
+                     (dat_source_id, canonical_identity, display_name, source_revision, \
+                      ecosystem, metadata_json, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                )
+                .map_err(|error| {
+                    db_error("failed to prepare expected DAT inventory insert", error)
+                })?;
+            for entry in entries {
+                let metadata = ExpectedDatEntryMetadata {
+                    dat_game_id: entry.dat_game_id.clone(),
+                    rom_count: entry.rom_count,
+                };
+                let metadata_bytes = serde_json::to_vec(&metadata).map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "failed to encode expected DAT entry metadata: {error}"
+                    ))
+                })?;
+                statement
+                    .execute(params![
+                        dat_source_id,
+                        entry.canonical_identity,
+                        entry.display_name,
+                        source_revision,
+                        ecosystem_json,
+                        metadata_bytes,
+                        now,
+                    ])
+                    .map_err(|error| db_error("failed to persist expected DAT entry", error))?;
+                written += 1;
+            }
+        }
+        tx.commit().map_err(|error| {
+            db_error("failed to commit expected DAT inventory replacement", error)
+        })?;
+        Ok(written)
+    }
+
+    /// How many expected identities are durably known for `dat_source_id`
+    /// right now - `COUNT(*)` over the unique-indexed `dat_source_id`
+    /// column, not a re-parse.
+    pub fn expected_dat_entry_count(&self, dat_source_id: &str) -> Result<usize> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM dat_expected_entries WHERE dat_source_id = ?1",
+                params![dat_source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .map_err(|error| db_error("failed to count expected DAT entries", error))
+    }
+
+    /// Every expected canonical identity for `dat_source_id`, for a
+    /// set-difference comparison against verified library identities. One
+    /// query, bounded to this source's own rows.
+    pub fn expected_dat_canonical_identities(
+        &self,
+        dat_source_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT canonical_identity FROM dat_expected_entries WHERE dat_source_id = ?1")
+            .map_err(|error| db_error("failed to prepare expected DAT identity query", error))?;
+        let rows = statement
+            .query_map(params![dat_source_id], |row| row.get::<_, String>(0))
+            .map_err(|error| db_error("failed to run expected DAT identity query", error))?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(|error| db_error("failed to read expected DAT identity row", error))
+    }
+
+    /// The metadata row for `dat_source_id`'s persisted expected inventory,
+    /// or `None` when no successful validation has ever captured one. One
+    /// primary-key lookup, no re-parse.
+    pub fn expected_dat_inventory_meta(
+        &self,
+        dat_source_id: &str,
+    ) -> Result<Option<crate::dat::coverage::ExpectedDatInventoryMeta>> {
+        self.connection
+            .query_row(
+                "SELECT source_revision, ecosystem, entry_count, duplicate_names_skipped, \
+                 validated_at FROM dat_expected_inventory_meta WHERE dat_source_id = ?1",
+                params![dat_source_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read expected DAT inventory metadata", error))?
+            .map(
+                |(
+                    source_revision,
+                    ecosystem,
+                    entry_count,
+                    duplicate_names_skipped,
+                    validated_at,
+                )| {
+                    Ok(crate::dat::coverage::ExpectedDatInventoryMeta {
+                        dat_source_id: dat_source_id.to_string(),
+                        source_revision,
+                        ecosystem: ecosystem
+                            .as_deref()
+                            .and_then(|value| serde_json::from_str(value).ok()),
+                        entry_count: entry_count.max(0) as u64,
+                        duplicate_names_skipped: duplicate_names_skipped.max(0) as u64,
+                        validated_at,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    // -------------------------------------------------------------------
+    // DAT coverage aggregation (reads migrations 0008-0012; writes nothing).
+    //
+    // Everything here is bounded SQL over already-persisted rows: no DAT
+    // parse, no DAT validation, no filesystem walk, no ROM read, no hash,
+    // no audit. The explicit-platform rule (see
+    // `crate::dat::coverage`'s doc and `CoverageSourceScope`) is enforced
+    // here: an Expected/Missing/Completion/Full-Set answer is only produced
+    // when the caller proves the source is explicitly assigned to the
+    // requested platform.
+    // -------------------------------------------------------------------
+
+    /// Aggregates one `(platform, dat_source_id)` pair's DAT coverage.
+    ///
+    /// Verification metrics (owned / checked / verified-current /
+    /// verified-stale / probable / unmatched / ambiguous / unknown /
+    /// provable duplicates) are always computed - one `GROUP BY` over a
+    /// `LEFT JOIN` of `platform_assignments` and `library_dat_identities`,
+    /// both already indexed, scoped to exactly the archives currently on
+    /// `platform`.
+    ///
+    /// Expected / Missing / Completion / Full-Set are only computed when
+    /// `scope` proves the source is explicitly assigned to `platform`
+    /// (`scope.source_platform == Some(platform)`), its configured revision
+    /// still matches the captured inventory's, and durable inventory
+    /// exists. Otherwise those degrade to "unavailable" /
+    /// `CompleteSetVerdict::NotProvable` with a specific reason - never to a
+    /// fabricated `0` denominator (see
+    /// [`crate::dat::coverage::ExpectedInventoryStatus`]).
+    ///
+    /// Two or three bounded queries total, never one-per-row.
+    pub fn platform_dat_coverage(
+        &self,
+        platform: &str,
+        dat_source_id: &str,
+        scope: crate::dat::coverage::CoverageSourceScope<'_>,
+    ) -> Result<crate::dat::coverage::PlatformDatCoverage> {
+        use crate::dat::coverage::{
+            CompleteSetVerdict, DatCoverageUnit, ExpectedInventoryStatus, PlatformDatCoverage,
+        };
+        use crate::dat::library_identity_summary::PersistedLibraryDatIdentity;
+
+        // ---- verification metrics: always available -------------------
+        let mut owned_applicable = 0usize;
+        let mut checked = 0usize;
+        let mut verified_current = 0usize;
+        let mut verified_stale = 0usize;
+        let mut probable = 0usize;
+        let mut unmatched = 0usize;
+        let mut ambiguous = 0usize;
+        let mut unknown = 0usize;
+        {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT ldi.verification_state, ldi.revision_marked_stale, COUNT(*) \
+                     FROM platform_assignments pa \
+                     LEFT JOIN library_dat_identities ldi \
+                       ON ldi.archive_id = pa.archive_id AND ldi.dat_source_id = ?2 \
+                     WHERE pa.platform = ?1 AND pa.is_current = 1 \
+                     GROUP BY ldi.verification_state, ldi.revision_marked_stale",
+                )
+                .map_err(|error| {
+                    db_error("failed to prepare platform DAT coverage query", error)
+                })?;
+            let rows = statement
+                .query_map(params![platform, dat_source_id], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|error| db_error("failed to run platform DAT coverage query", error))?;
+            for row in rows {
+                let (state, stale, count) = row
+                    .map_err(|error| db_error("failed to read platform DAT coverage row", error))?;
+                let count = count as usize;
+                owned_applicable += count;
+                match state.as_deref() {
+                    None => {}
+                    Some("verified_single_match") => {
+                        checked += count;
+                        if stale == Some(1) {
+                            verified_stale += count;
+                        } else {
+                            verified_current += count;
+                        }
+                    }
+                    Some("probable") => {
+                        checked += count;
+                        probable += count;
+                    }
+                    Some("no_match") => {
+                        checked += count;
+                        unmatched += count;
+                    }
+                    Some("ambiguous_multiple_candidates") | Some("conflicting") => {
+                        checked += count;
+                        ambiguous += count;
+                    }
+                    Some("filename_only_not_verified") | Some("no_usable_evidence") => {
+                        checked += count;
+                        unknown += count;
+                    }
+                    Some(_) => checked += count,
+                }
+            }
+        }
+
+        // ---- the verified-current canonical identity set (deduplicated) ---
+        // One query over exactly this (platform, source)'s checked rows -
+        // bounded by `checked`, not the library. Used both for the provable
+        // duplicate counts and, when the platform scope allows, for Missing.
+        let mut source_name = None;
+        let mut ecosystem = None;
+        let mut row_source_revision: Option<String> = None;
+        let mut verified_current_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut verified_current_name_hits: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        if checked > 0 {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT ldi.facts_json, ldi.verification_state, ldi.revision_marked_stale \
+                     FROM platform_assignments pa \
+                     JOIN library_dat_identities ldi \
+                       ON ldi.archive_id = pa.archive_id AND ldi.dat_source_id = ?2 \
+                     WHERE pa.platform = ?1 AND pa.is_current = 1",
+                )
+                .map_err(|error| {
+                    db_error(
+                        "failed to prepare platform DAT coverage detail query",
+                        error,
+                    )
+                })?;
+            let rows = statement
+                .query_map(params![platform, dat_source_id], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|error| {
+                    db_error("failed to run platform DAT coverage detail query", error)
+                })?;
+            for row in rows {
+                let (bytes, state, stale) = row.map_err(|error| {
+                    db_error("failed to read platform DAT coverage detail row", error)
+                })?;
+                let persisted: PersistedLibraryDatIdentity = serde_json::from_slice(&bytes)
+                    .map_err(|error| {
+                        ArchiveFsError::Database(format!(
+                            "stored library DAT identity is unreadable: {error}"
+                        ))
+                    })?;
+                if source_name.is_none() {
+                    source_name = Some(persisted.source.source_name.clone());
+                    ecosystem = persisted.source.ecosystem;
+                    row_source_revision = persisted.source.source_revision.clone();
+                }
+                if state == "verified_single_match"
+                    && stale != 1
+                    && let Some(name) = &persisted.canonical.canonical_dat_name
+                {
+                    verified_current_names.insert(name.clone());
+                    *verified_current_name_hits.entry(name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let duplicate_canonical_identities = verified_current_name_hits
+            .values()
+            .filter(|count| **count > 1)
+            .count();
+        let duplicate_extra_archives: usize = verified_current_name_hits
+            .values()
+            .filter(|count| **count > 1)
+            .map(|count| count - 1)
+            .sum();
+
+        // ---- explicit-platform gate for Expected / Missing / Full Set ----
+        let expected_inventory =
+            self.resolve_expected_inventory_status(dat_source_id, platform, &scope)?;
+
+        let (
+            expected_unique_count,
+            represented_unique_count,
+            missing_count,
+            completion_percent,
+            complete_set,
+        ) = match &expected_inventory {
+            ExpectedInventoryStatus::Available {
+                entry_count,
+                duplicate_names_skipped,
+            } => {
+                // One streaming query over this source's expected names -
+                // bounded output: we only accumulate counts, never a big Vec.
+                let mut represented_unique = 0u64;
+                {
+                    let mut statement = self
+                        .connection
+                        .prepare(
+                            "SELECT canonical_identity FROM dat_expected_entries \
+                             WHERE dat_source_id = ?1",
+                        )
+                        .map_err(|error| {
+                            db_error("failed to prepare expected identity scan", error)
+                        })?;
+                    let rows = statement
+                        .query_map(params![dat_source_id], |row| row.get::<_, String>(0))
+                        .map_err(|error| db_error("failed to scan expected identities", error))?;
+                    for row in rows {
+                        let name = row.map_err(|error| {
+                            db_error("failed to read expected identity row", error)
+                        })?;
+                        if verified_current_names.contains(&name) {
+                            represented_unique += 1;
+                        }
+                    }
+                }
+                let expected = *entry_count;
+                let missing = expected.saturating_sub(represented_unique);
+                let percent = if expected == 0 {
+                    None
+                } else {
+                    Some((represented_unique as f64 / expected as f64) * 100.0)
+                };
+                let verdict = if *duplicate_names_skipped > 0 {
+                    CompleteSetVerdict::NotProvable {
+                        reason: format!(
+                            "this DAT declared {duplicate_names_skipped} duplicate <game> \
+                             name(s); its expected canonical identity set is not proven \
+                             one-to-one, so a full-set claim cannot be made (counts may \
+                             still be shown)"
+                        ),
+                    }
+                } else if expected == 0 {
+                    CompleteSetVerdict::NotProvable {
+                        reason: "the persisted expected inventory for this source is empty"
+                            .to_string(),
+                    }
+                } else if missing == 0 {
+                    CompleteSetVerdict::Complete {
+                        extra_duplicate_archives: duplicate_extra_archives as u64,
+                    }
+                } else {
+                    CompleteSetVerdict::Incomplete {
+                        missing_count: missing,
+                    }
+                };
+                (
+                    Some(expected),
+                    Some(represented_unique),
+                    Some(missing),
+                    percent,
+                    verdict,
+                )
+            }
+            other => (
+                None,
+                None,
+                None,
+                None,
+                CompleteSetVerdict::NotProvable {
+                    reason: other.unavailable_reason(),
+                },
+            ),
+        };
+
+        Ok(PlatformDatCoverage {
+            platform: platform.to_string(),
+            dat_source_id: dat_source_id.to_string(),
+            source_name,
+            ecosystem: ecosystem.or_else(|| match &expected_inventory {
+                ExpectedInventoryStatus::Available { .. } => self
+                    .expected_dat_inventory_meta(dat_source_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|meta| meta.ecosystem),
+                _ => None,
+            }),
+            source_revision: row_source_revision,
+            unit: DatCoverageUnit::CanonicalDatEntry,
+            owned_applicable,
+            checked,
+            verified_current,
+            verified_stale,
+            probable,
+            unmatched,
+            ambiguous,
+            unknown,
+            duplicate_canonical_identities,
+            duplicate_extra_archives,
+            expected_inventory,
+            expected_unique_count,
+            represented_unique_count,
+            missing_count,
+            completion_percent,
+            complete_set,
+        })
+    }
+
+    /// The explicit-platform + currentness gate for Expected/Missing/Full
+    /// Set. `platform` is the requested coverage platform; `scope` carries
+    /// what the config layer resolved about the source (its assigned
+    /// platform, its current revision, whether it is still configured).
+    fn resolve_expected_inventory_status(
+        &self,
+        dat_source_id: &str,
+        platform: &str,
+        scope: &crate::dat::coverage::CoverageSourceScope<'_>,
+    ) -> Result<crate::dat::coverage::ExpectedInventoryStatus> {
+        use crate::dat::coverage::ExpectedInventoryStatus;
+
+        if !scope.configured {
+            return Ok(ExpectedInventoryStatus::SourceUnconfigured);
+        }
+        match scope.source_platform {
+            None => return Ok(ExpectedInventoryStatus::PlatformUnassigned),
+            Some(assigned) if assigned != platform => {
+                return Ok(ExpectedInventoryStatus::PlatformMismatch {
+                    source_platform: assigned.to_string(),
+                });
+            }
+            Some(_) => {}
+        }
+
+        let Some(meta) = self.expected_dat_inventory_meta(dat_source_id)? else {
+            return Ok(ExpectedInventoryStatus::InventoryMissing);
+        };
+
+        // Currentness: the captured inventory's revision must still match the
+        // source's configured revision. Both `None` is treated as "no
+        // revision either side" - not a drift. One side known and different
+        // is drift.
+        let drifted = match (
+            meta.source_revision.as_deref(),
+            scope.current_source_revision,
+        ) {
+            (Some(captured), Some(current)) => captured.trim() != current.trim(),
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        if drifted {
+            return Ok(ExpectedInventoryStatus::InventoryStale {
+                reason: "the DAT source has been revised since its expected inventory was \
+                         captured; re-validate the source to refresh it"
+                    .to_string(),
+            });
+        }
+
+        Ok(ExpectedInventoryStatus::Available {
+            entry_count: meta.entry_count,
+            duplicate_names_skipped: meta.duplicate_names_skipped,
+        })
+    }
+
+    /// A bounded, ordered page of the expected canonical identities for
+    /// `(platform, dat_source_id)` that have **no** verified-current library
+    /// representation - the Missing list. Empty when the platform scope does
+    /// not permit an Expected answer at all (same gate as
+    /// [`Self::platform_dat_coverage`]).
+    ///
+    /// One expected-name query (ordered, `LIMIT`/`OFFSET`) plus one
+    /// verified-current-name query; never one lookup per candidate.
+    pub fn missing_dat_canonical_identities(
+        &self,
+        platform: &str,
+        dat_source_id: &str,
+        scope: crate::dat::coverage::CoverageSourceScope<'_>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<String>> {
+        use crate::dat::coverage::ExpectedInventoryStatus;
+
+        if !matches!(
+            self.resolve_expected_inventory_status(dat_source_id, platform, &scope)?,
+            ExpectedInventoryStatus::Available { .. }
+        ) {
+            return Ok(Vec::new());
+        }
+
+        let verified_current_names =
+            self.verified_current_canonical_names_for(platform, dat_source_id)?;
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT canonical_identity FROM dat_expected_entries \
+                 WHERE dat_source_id = ?1 ORDER BY canonical_identity",
+            )
+            .map_err(|error| db_error("failed to prepare missing identity query", error))?;
+        let rows = statement
+            .query_map(params![dat_source_id], |row| row.get::<_, String>(0))
+            .map_err(|error| db_error("failed to run missing identity query", error))?;
+
+        let mut skipped = 0u32;
+        let mut page = Vec::new();
+        for row in rows {
+            let name =
+                row.map_err(|error| db_error("failed to read missing identity row", error))?;
+            if verified_current_names.contains(&name) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if page.len() as u32 >= limit {
+                break;
+            }
+            page.push(name);
+        }
+        Ok(page)
+    }
+
+    /// The deduplicated set of canonical DAT names that have at least one
+    /// `verified_single_match`, not `revision_marked_stale` row for
+    /// `(platform, dat_source_id)`. Bounded to that scope's checked rows.
+    fn verified_current_canonical_names_for(
+        &self,
+        platform: &str,
+        dat_source_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        use crate::dat::library_identity_summary::PersistedLibraryDatIdentity;
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ldi.facts_json FROM platform_assignments pa \
+                 JOIN library_dat_identities ldi \
+                   ON ldi.archive_id = pa.archive_id AND ldi.dat_source_id = ?2 \
+                 WHERE pa.platform = ?1 AND pa.is_current = 1 \
+                   AND ldi.verification_state = 'verified_single_match' \
+                   AND ldi.revision_marked_stale = 0",
+            )
+            .map_err(|error| db_error("failed to prepare verified-current name query", error))?;
+        let rows = statement
+            .query_map(params![platform, dat_source_id], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|error| db_error("failed to run verified-current name query", error))?;
+        let mut names = std::collections::HashSet::new();
+        for row in rows {
+            let bytes =
+                row.map_err(|error| db_error("failed to read verified-current name row", error))?;
+            let persisted: PersistedLibraryDatIdentity =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "stored library DAT identity is unreadable: {error}"
+                    ))
+                })?;
+            if let Some(name) = persisted.canonical.canonical_dat_name {
+                names.insert(name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// Aggregates one `(platform, dat_source_id)` Arcade/FinalBurn Neo
+    /// source's set-level coverage from `dat_set_audit_results` - the
+    /// dependency-aware `SetState` verdicts, never re-derived from flat
+    /// per-file identity rows.
+    ///
+    /// The expected-set denominator obeys the same explicit-platform rule as
+    /// [`Self::platform_dat_coverage`]: `scope.source_platform` must equal
+    /// `platform`, or Expected/Missing/Full-Set degrade to unavailable /
+    /// `NotProvable`. Set completeness itself always comes from the stored
+    /// `SetState` (which already has the dependency verdict folded in).
+    pub fn arcade_dat_set_coverage(
+        &self,
+        platform: &str,
+        dat_source_id: &str,
+        scope: crate::dat::coverage::CoverageSourceScope<'_>,
+    ) -> Result<crate::dat::coverage::ArcadeDatSetCoverage> {
+        use crate::dat::coverage::{
+            ArcadeDatSetCoverage, CompleteSetVerdict, DatCoverageUnit, ExpectedInventoryStatus,
+        };
+
+        let mut checked_sets = 0usize;
+        let mut incomplete_sets = 0usize;
+        let mut bad_metadata_sets = 0usize;
+        let mut needs_review_sets = 0usize;
+        let mut stale_sets = 0usize;
+        let mut row_platform: Option<String> = None;
+        let mut ecosystem: Option<crate::dat::model::DatEcosystem> = None;
+        let mut source_revision: Option<String> = None;
+        // Distinct machine names with at least one dependency-aware
+        // `Complete` row, and every distinct machine name that has any row.
+        let mut complete_set_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut any_row_set_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT game_name, set_state_json, stale, platform, ecosystem, dat_revision \
+                     FROM dat_set_audit_results WHERE source_id = ?1",
+                )
+                .map_err(|error| {
+                    db_error("failed to prepare arcade DAT set coverage query", error)
+                })?;
+            let rows = statement
+                .query_map(params![dat_source_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .map_err(|error| db_error("failed to run arcade DAT set coverage query", error))?;
+            for row in rows {
+                let (game_name, state_json, stale, rp, re, rr) = row.map_err(|error| {
+                    db_error("failed to read arcade DAT set coverage row", error)
+                })?;
+                checked_sets += 1;
+                any_row_set_names.insert(game_name.clone());
+                if stale == 1 {
+                    stale_sets += 1;
+                }
+                if row_platform.is_none() {
+                    row_platform = rp;
+                }
+                if ecosystem.is_none() {
+                    ecosystem = re
+                        .as_deref()
+                        .and_then(|value| serde_json::from_str(value).ok());
+                    source_revision = rr;
+                }
+                let state: crate::dat::set::SetState =
+                    serde_json::from_str(&state_json).map_err(|error| {
+                        ArchiveFsError::Database(format!(
+                            "stored DAT set state is unreadable: {error}"
+                        ))
+                    })?;
+                match state {
+                    crate::dat::set::SetState::Complete => {
+                        complete_set_names.insert(game_name);
+                    }
+                    crate::dat::set::SetState::Incomplete => incomplete_sets += 1,
+                    crate::dat::set::SetState::BadMetadata(_) => bad_metadata_sets += 1,
+                    crate::dat::set::SetState::NeedsReview(_) => needs_review_sets += 1,
+                }
+            }
+        }
+        let complete_sets = complete_set_names.len();
+
+        let expected_inventory =
+            self.resolve_expected_inventory_status(dat_source_id, platform, &scope)?;
+        let (
+            expected_sets,
+            represented_complete_sets,
+            missing_sets,
+            completion_percent,
+            complete_set,
+        ) = match &expected_inventory {
+            ExpectedInventoryStatus::Available {
+                entry_count,
+                duplicate_names_skipped,
+            } => {
+                let mut represented = 0u64;
+                let mut missing = 0u64;
+                {
+                    let mut statement = self
+                        .connection
+                        .prepare(
+                            "SELECT canonical_identity FROM dat_expected_entries \
+                                 WHERE dat_source_id = ?1",
+                        )
+                        .map_err(|error| {
+                            db_error("failed to prepare arcade expected scan", error)
+                        })?;
+                    let rows = statement
+                        .query_map(params![dat_source_id], |row| row.get::<_, String>(0))
+                        .map_err(|error| db_error("failed to scan arcade expected sets", error))?;
+                    for row in rows {
+                        let name = row.map_err(|error| {
+                            db_error("failed to read arcade expected set row", error)
+                        })?;
+                        if complete_set_names.contains(&name) {
+                            represented += 1;
+                        } else if !any_row_set_names.contains(&name) {
+                            missing += 1;
+                        }
+                    }
+                }
+                let expected = *entry_count;
+                let percent = if expected == 0 {
+                    None
+                } else {
+                    Some((represented as f64 / expected as f64) * 100.0)
+                };
+                let verdict = if *duplicate_names_skipped > 0 {
+                    CompleteSetVerdict::NotProvable {
+                        reason: format!(
+                            "this Arcade DAT declared {duplicate_names_skipped} duplicate \
+                                 <machine> name(s); the expected machine set is not proven \
+                                 one-to-one"
+                        ),
+                    }
+                } else if expected == 0 {
+                    CompleteSetVerdict::NotProvable {
+                        reason: "the persisted expected machine inventory for this source \
+                                     is empty"
+                            .to_string(),
+                    }
+                } else if represented == expected {
+                    CompleteSetVerdict::Complete {
+                        extra_duplicate_archives: 0,
+                    }
+                } else {
+                    CompleteSetVerdict::Incomplete {
+                        missing_count: expected.saturating_sub(represented),
+                    }
+                };
+                (
+                    Some(expected),
+                    Some(represented),
+                    // Machines the library has zero representation of at
+                    // all - distinct from a machine whose only rows are
+                    // Incomplete/NeedsReview (those show in the
+                    // incomplete/needs_review counters, not here).
+                    Some(missing),
+                    percent,
+                    verdict,
+                )
+            }
+            other => (
+                None,
+                None,
+                None,
+                None,
+                CompleteSetVerdict::NotProvable {
+                    reason: other.unavailable_reason(),
+                },
+            ),
+        };
+
+        Ok(ArcadeDatSetCoverage {
+            platform: platform.to_string(),
+            dat_source_id: dat_source_id.to_string(),
+            source_platform_of_row: row_platform,
+            ecosystem,
+            source_revision,
+            unit: DatCoverageUnit::ArcadeSet,
+            checked_sets,
+            complete_sets,
+            incomplete_sets,
+            bad_metadata_sets,
+            needs_review_sets,
+            stale_sets,
+            expected_inventory,
+            expected_sets,
+            represented_complete_sets,
+            missing_sets,
+            completion_percent,
+            complete_set,
+        })
+    }
+
     // Verified identity fact cache (migration 0010).
     //
     // A catalogue-side projection of the `Verified` identity facts a
@@ -6082,19 +6963,18 @@ mod tests {
         create_representative_older_database(&database_path, 7);
 
         let report = upgrade_library_database(&database_path).unwrap();
+        let latest = latest_known_version(MIGRATIONS);
+        let pending: Vec<i64> = (8..=latest).collect();
 
         assert_eq!(report.database_path, database_path);
         assert_eq!(report.from_version, 7);
-        assert_eq!(report.to_version, 10);
-        assert_eq!(report.applied_versions, vec![8, 9, 10]);
+        assert_eq!(report.to_version, latest);
+        assert_eq!(report.applied_versions, pending);
         assert!(report.backup_path.is_file());
-        assert_eq!(
-            pending_schema_migration_versions(7).unwrap(),
-            vec![8, 9, 10]
-        );
+        assert_eq!(pending_schema_migration_versions(7).unwrap(), pending);
 
         let upgraded = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 10);
+        assert_eq!(upgraded.schema_version().unwrap(), latest);
         assert_eq!(upgraded.load_archives().unwrap()[0].display_name, "ZooCube");
         upgraded.close().unwrap();
 
@@ -6166,7 +7046,10 @@ mod tests {
         let restored_path = root.join("restored.sqlite3");
         fs::copy(&backup_path, &restored_path).unwrap();
         let restored = Database::open_or_create(&restored_path).unwrap();
-        assert_eq!(restored.schema_version().unwrap(), 10);
+        assert_eq!(
+            restored.schema_version().unwrap(),
+            latest_known_version(MIGRATIONS)
+        );
         assert_eq!(restored.load_archives().unwrap()[0].display_name, "ZooCube");
         restored.close().unwrap();
 
@@ -6952,6 +7835,8 @@ mod tests {
             vec![
                 "archive_scan_observations",
                 "archives",
+                "dat_expected_entries",
+                "dat_expected_inventory_meta",
                 "dat_set_audit_dependencies",
                 "dat_set_audit_results",
                 "discovery_details",
@@ -14038,7 +14923,7 @@ mod tests {
 
         #[test]
         fn migrations_0008_through_0010_are_registered_in_order() {
-            assert_eq!(latest_known_version(MIGRATIONS), 10);
+            assert!(latest_known_version(MIGRATIONS) >= 10);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 8
                     && migration
@@ -14054,6 +14939,959 @@ mod tests {
                     && migration
                         .sql
                         .contains("CREATE TABLE verified_identity_facts")
+            }));
+        }
+
+        // -------------------------------------------------------------
+        // DAT coverage aggregation: `platform_dat_coverage`,
+        // `missing_dat_canonical_identities`, `arcade_dat_set_coverage`.
+        // -------------------------------------------------------------
+        mod coverage {
+            use super::*;
+            use crate::dat::coverage::{
+                CompleteSetVerdict, CoverageSourceScope, ExpectedInventoryStatus,
+            };
+            use crate::dat::expected_inventory::ExpectedDatEntryRecord;
+
+            fn on_platform(database: &mut Database, file_name: &str, platform: &str) -> i64 {
+                let id = seed_archive(database, file_name);
+                database
+                    .assign_platform(id, Some(platform), "heuristic-path-detector")
+                    .unwrap();
+                id
+            }
+
+            fn expected(
+                database: &mut Database,
+                source: &str,
+                revision: Option<&str>,
+                names: &[&str],
+                dup: u64,
+            ) {
+                let entries: Vec<ExpectedDatEntryRecord> = names
+                    .iter()
+                    .map(|n| ExpectedDatEntryRecord {
+                        canonical_identity: (*n).to_string(),
+                        display_name: (*n).to_string(),
+                        dat_game_id: None,
+                        rom_count: 1,
+                    })
+                    .collect();
+                database
+                    .replace_expected_dat_inventory(
+                        source,
+                        revision,
+                        Some(DatEcosystem::NoIntro),
+                        &entries,
+                        dup,
+                    )
+                    .unwrap();
+            }
+
+            fn persist_verified(
+                database: &mut Database,
+                archive_id: i64,
+                source: &str,
+                name: &str,
+            ) {
+                database
+                    .persist_library_dat_identity(
+                        archive_id,
+                        &verified(
+                            source,
+                            DatEcosystem::NoIntro,
+                            Some("v1"),
+                            name,
+                            DatAuditCompleteness::Exhaustive,
+                        ),
+                    )
+                    .unwrap();
+            }
+
+            fn assigned(platform: &'static str) -> CoverageSourceScope<'static> {
+                CoverageSourceScope::assigned_to(platform, Some("v1"))
+            }
+
+            // --- explicit-platform scope (items 7-11, 15) --------------
+
+            #[test]
+            fn an_assigned_source_exposes_expected_for_its_platform() {
+                let (root, mut database) = open("cov-assigned");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &["Game A", "Game B"],
+                    0,
+                );
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert!(cov.expected_inventory.is_available());
+                assert_eq!(cov.expected_unique_count, Some(2));
+                assert_eq!(cov.represented_unique_count, Some(1));
+                assert_eq!(cov.missing_count, Some(1));
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn the_same_source_gives_no_expected_for_a_different_platform() {
+                let (root, mut database) = open("cov-other-platform");
+                on_platform(&mut database, "A.gba", "GBA");
+                expected(&mut database, "no-intro-nes", Some("v1"), &["Game A"], 0);
+
+                // Source is assigned to NES; asking about GBA must not borrow it.
+                let scope = CoverageSourceScope {
+                    source_platform: Some("NES"),
+                    current_source_revision: Some("v1"),
+                    configured: true,
+                };
+                let cov = database
+                    .platform_dat_coverage("GBA", "no-intro-nes", scope)
+                    .unwrap();
+                assert!(matches!(
+                    cov.expected_inventory,
+                    ExpectedInventoryStatus::PlatformMismatch { .. }
+                ));
+                assert_eq!(cov.expected_unique_count, None);
+                assert_eq!(cov.missing_count, None);
+                assert_eq!(cov.completion_percent, None);
+                assert!(!cov.complete_set.is_provable());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn an_unassigned_source_keeps_verification_metrics_but_no_expected() {
+                let (root, mut database) = open("cov-unassigned");
+                let a = on_platform(&mut database, "A.gba", "GBA");
+                let b = on_platform(&mut database, "B.gba", "GBA");
+                persist_verified(&mut database, a, "no-intro-gba", "Game A");
+                database
+                    .persist_library_dat_identity(
+                        b,
+                        &no_match("no-intro-gba", DatAuditCompleteness::Exhaustive),
+                    )
+                    .unwrap();
+                // Even though inventory exists, the source is unassigned.
+                expected(
+                    &mut database,
+                    "no-intro-gba",
+                    Some("v1"),
+                    &["Game A", "Game B"],
+                    0,
+                );
+
+                let scope = CoverageSourceScope {
+                    source_platform: None,
+                    current_source_revision: Some("v1"),
+                    configured: true,
+                };
+                let cov = database
+                    .platform_dat_coverage("GBA", "no-intro-gba", scope)
+                    .unwrap();
+                assert_eq!(cov.owned_applicable, 2);
+                assert_eq!(cov.verified_current, 1);
+                assert_eq!(cov.unmatched, 1);
+                assert!(matches!(
+                    cov.expected_inventory,
+                    ExpectedInventoryStatus::PlatformUnassigned
+                ));
+                assert_eq!(cov.expected_unique_count, None);
+                assert_eq!(cov.completion_percent, None);
+                assert!(!cov.complete_set.is_provable());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_mame_source_cannot_bleed_into_an_unrelated_platform() {
+                let (root, mut database) = open("cov-mame-bleed");
+                on_platform(&mut database, "sf2.zip", "Arcade");
+                on_platform(&mut database, "zelda.nes", "NES");
+                // MAME inventory persisted, MAME source assigned to Arcade.
+                expected(&mut database, "mame", Some("v1"), &["sf2", "sf2ce"], 0);
+
+                let scope = CoverageSourceScope {
+                    source_platform: Some("Arcade"),
+                    current_source_revision: Some("v1"),
+                    configured: true,
+                };
+                let cov = database
+                    .platform_dat_coverage("NES", "mame", scope)
+                    .unwrap();
+                assert!(matches!(
+                    cov.expected_inventory,
+                    ExpectedInventoryStatus::PlatformMismatch { .. }
+                ));
+                assert_eq!(cov.expected_unique_count, None);
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            // --- representation rules (items 12-16) -------------------
+
+            #[test]
+            fn only_verified_current_represents_an_expected_identity() {
+                let (root, mut database) = open("cov-representation");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                let b = on_platform(&mut database, "B.nes", "NES");
+                let c = on_platform(&mut database, "C.nes", "NES");
+                let d = on_platform(&mut database, "D.nes", "NES");
+                // verified-current -> represents "Game A"
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                // verified but revision-stale -> does NOT represent "Game B"
+                persist_verified(&mut database, b, "no-intro-nes", "Game B");
+                database
+                    .mark_library_dat_identities_stale_for_source("no-intro-nes")
+                    .unwrap();
+                // re-persist A as current after the stale sweep
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                // ambiguous -> does NOT represent "Game C"
+                let mut ambiguous = verified(
+                    "no-intro-nes",
+                    DatEcosystem::NoIntro,
+                    Some("v1"),
+                    "Game C",
+                    DatAuditCompleteness::Exhaustive,
+                );
+                ambiguous.verification_state = DatVerificationState::AmbiguousMultipleCandidates {
+                    algorithm: "SHA-1".into(),
+                    candidate_count: 2,
+                };
+                database
+                    .persist_library_dat_identity(c, &ambiguous)
+                    .unwrap();
+                // unmatched -> does NOT represent "Game D"
+                database
+                    .persist_library_dat_identity(
+                        d,
+                        &no_match("no-intro-nes", DatAuditCompleteness::Exhaustive),
+                    )
+                    .unwrap();
+
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &["Game A", "Game B", "Game C", "Game D"],
+                    0,
+                );
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert_eq!(cov.represented_unique_count, Some(1));
+                assert_eq!(cov.missing_count, Some(3));
+                assert_eq!(cov.verified_stale, 1);
+                assert_eq!(cov.ambiguous, 1);
+                assert_eq!(cov.unmatched, 1);
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn duplicate_archives_count_an_expected_identity_once() {
+                let (root, mut database) = open("cov-dup-once");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                let b = on_platform(&mut database, "B (alt dump).nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                persist_verified(&mut database, b, "no-intro-nes", "Game A");
+                expected(&mut database, "no-intro-nes", Some("v1"), &["Game A"], 0);
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert_eq!(cov.verified_current, 2);
+                assert_eq!(cov.represented_unique_count, Some(1));
+                assert_eq!(cov.missing_count, Some(0));
+                assert_eq!(cov.duplicate_canonical_identities, 1);
+                assert_eq!(cov.duplicate_extra_archives, 1);
+                assert!(matches!(
+                    cov.complete_set,
+                    CompleteSetVerdict::Complete {
+                        extra_duplicate_archives: 1
+                    }
+                ));
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            // --- missing / completeness / full set (items 17-23) -----
+
+            #[test]
+            fn one_expected_absent_gives_missing_one() {
+                let (root, mut database) = open("cov-missing-one");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &["Game A", "Game B"],
+                    0,
+                );
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert_eq!(cov.missing_count, Some(1));
+                assert!(matches!(
+                    cov.complete_set,
+                    CompleteSetVerdict::Incomplete { missing_count: 1 }
+                ));
+                let missing = database
+                    .missing_dat_canonical_identities("NES", "no-intro-nes", assigned("NES"), 10, 0)
+                    .unwrap();
+                assert_eq!(missing, vec!["Game B".to_string()]);
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn equal_raw_counts_with_fewer_unique_identities_is_not_full_set() {
+                let (root, mut database) = open("cov-count-equality");
+                // 3 expected; 3 verified archive rows, but they only cover 2
+                // distinct identities (one identity has a duplicate archive).
+                let a = on_platform(&mut database, "A.nes", "NES");
+                let b = on_platform(&mut database, "B.nes", "NES");
+                let c = on_platform(&mut database, "C.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                persist_verified(&mut database, b, "no-intro-nes", "Game B");
+                persist_verified(&mut database, c, "no-intro-nes", "Game B");
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &["Game A", "Game B", "Game C"],
+                    0,
+                );
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert_eq!(cov.verified_current, 3);
+                assert_eq!(cov.represented_unique_count, Some(2));
+                assert_eq!(cov.missing_count, Some(1));
+                assert!(!cov.complete_set.is_complete());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn every_unique_expected_represented_gives_full_set_true() {
+                let (root, mut database) = open("cov-full-set");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                let b = on_platform(&mut database, "B.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                persist_verified(&mut database, b, "no-intro-nes", "Game B");
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &["Game A", "Game B"],
+                    0,
+                );
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert_eq!(cov.missing_count, Some(0));
+                assert!(cov.complete_set.is_complete());
+                assert_eq!(cov.completion_percent, Some(100.0));
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn duplicate_expected_canonical_names_make_full_set_not_provable() {
+                let (root, mut database) = open("cov-dup-names");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                // duplicate_names_skipped = 2 -> identity set not 1:1
+                expected(&mut database, "no-intro-nes", Some("v1"), &["Game A"], 2);
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert!(cov.expected_inventory.is_available());
+                // Counts may still be shown.
+                assert_eq!(cov.expected_unique_count, Some(1));
+                assert_eq!(cov.missing_count, Some(0));
+                // ...but Full Set cannot be Complete.
+                assert!(!cov.complete_set.is_complete());
+                assert!(!cov.complete_set.is_provable());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn completion_percent_uses_unique_identities_never_exceeds_one_hundred() {
+                let (root, mut database) = open("cov-percent");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                let b = on_platform(&mut database, "B.nes", "NES");
+                let c = on_platform(&mut database, "C.nes", "NES");
+                // 3 archive rows, all "Game A" -> represented unique = 1
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                persist_verified(&mut database, b, "no-intro-nes", "Game A");
+                persist_verified(&mut database, c, "no-intro-nes", "Game A");
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &["Game A", "Game B"],
+                    0,
+                );
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert_eq!(cov.completion_percent, Some(50.0));
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn owned_exceeding_expected_still_caps_completion_at_one_hundred() {
+                let (root, mut database) = open("cov-owned-over");
+                // one expected, many owned (dupes + unrelated), one represents it
+                for (i, name) in ["Game A", "Game A", "junk", "hack"].iter().enumerate() {
+                    let id = on_platform(&mut database, &format!("f{i}.nes"), "NES");
+                    if *name == "Game A" {
+                        persist_verified(&mut database, id, "no-intro-nes", "Game A");
+                    } else {
+                        database
+                            .persist_library_dat_identity(
+                                id,
+                                &no_match("no-intro-nes", DatAuditCompleteness::Exhaustive),
+                            )
+                            .unwrap();
+                    }
+                }
+                expected(&mut database, "no-intro-nes", Some("v1"), &["Game A"], 0);
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert!(cov.owned_applicable > 1);
+                assert_eq!(cov.completion_percent, Some(100.0));
+                assert!(cov.complete_set.is_complete());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_stale_inventory_generation_degrades_expected_and_full_set() {
+                let (root, mut database) = open("cov-stale-inv");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                expected(&mut database, "no-intro-nes", Some("v1"), &["Game A"], 0);
+
+                // The source's configured revision has since moved to v2.
+                let scope = CoverageSourceScope::assigned_to("NES", Some("v2"));
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", scope)
+                    .unwrap();
+                assert!(matches!(
+                    cov.expected_inventory,
+                    ExpectedInventoryStatus::InventoryStale { .. }
+                ));
+                assert_eq!(cov.expected_unique_count, None);
+                assert!(!cov.complete_set.is_provable());
+                // verification metrics still there
+                assert_eq!(cov.verified_current, 1);
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn an_inventory_never_captured_is_distinguishable() {
+                let (root, mut database) = open("cov-no-inv");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                // no expected(...) call -> no inventory row
+
+                let cov = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                assert!(matches!(
+                    cov.expected_inventory,
+                    ExpectedInventoryStatus::InventoryMissing
+                ));
+                assert_eq!(cov.verified_current, 1);
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            // --- source / platform isolation (items 24-25) ----------
+
+            #[test]
+            fn two_sources_on_one_platform_stay_independent() {
+                let (root, mut database) = open("cov-two-sources");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Game A");
+                database
+                    .persist_library_dat_identity(
+                        a,
+                        &no_match("homebrew-nes", DatAuditCompleteness::Exhaustive),
+                    )
+                    .unwrap();
+                expected(&mut database, "no-intro-nes", Some("v1"), &["Game A"], 0);
+                expected(
+                    &mut database,
+                    "homebrew-nes",
+                    Some("v1"),
+                    &["Homebrew X"],
+                    0,
+                );
+
+                let ni = database
+                    .platform_dat_coverage("NES", "no-intro-nes", assigned("NES"))
+                    .unwrap();
+                let hb = database
+                    .platform_dat_coverage("NES", "homebrew-nes", assigned("NES"))
+                    .unwrap();
+                assert!(ni.complete_set.is_complete());
+                assert_eq!(hb.missing_count, Some(1));
+                assert!(!hb.complete_set.is_complete());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn two_platforms_stay_independent_for_one_source() {
+                let (root, mut database) = open("cov-two-platforms");
+                let nes = on_platform(&mut database, "Z.nes", "NES");
+                on_platform(&mut database, "X.gba", "GBA");
+                persist_verified(&mut database, nes, "multi", "Zelda");
+                expected(&mut database, "multi", Some("v1"), &["Zelda"], 0);
+
+                // source assigned to NES only
+                let nes_cov = database
+                    .platform_dat_coverage("NES", "multi", assigned("NES"))
+                    .unwrap();
+                assert!(nes_cov.complete_set.is_complete());
+                let gba_cov = database
+                    .platform_dat_coverage(
+                        "GBA",
+                        "multi",
+                        CoverageSourceScope {
+                            source_platform: Some("NES"),
+                            current_source_revision: Some("v1"),
+                            configured: true,
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    gba_cov.expected_inventory,
+                    ExpectedInventoryStatus::PlatformMismatch { .. }
+                ));
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            // --- Arcade (items 27-28) ------------------------------
+
+            fn seed_set_row(database: &Database, source: &str, game_name: &str, state_json: &str) {
+                database
+                    .connection
+                    .execute(
+                        "INSERT INTO dat_set_audit_results \
+                         (archive_path, source_id, game_name, platform, set_state_json, \
+                          dependency_state_json, ecosystem, dat_revision, audited_at, stale, exhaustive) \
+                         VALUES (?1, ?2, ?3, 'Arcade', ?4, '\"satisfied\"', '\"m_a_m_e_arcade\"', 'v1', 'now', 0, 1)",
+                        params![format!("/roms/{game_name}.zip").into_bytes(), source, game_name, state_json],
+                    )
+                    .unwrap();
+            }
+
+            #[test]
+            fn arcade_expected_denominator_obeys_the_explicit_platform_rule() {
+                let (root, database) = open("cov-arcade-scope");
+                seed_set_row(&database, "mame", "sf2", "\"complete\"");
+                // Ask about NES while the MAME source is assigned to Arcade.
+                let cov = database
+                    .arcade_dat_set_coverage(
+                        "NES",
+                        "mame",
+                        CoverageSourceScope {
+                            source_platform: Some("Arcade"),
+                            current_source_revision: Some("v1"),
+                            configured: true,
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    cov.expected_inventory,
+                    ExpectedInventoryStatus::PlatformMismatch { .. }
+                ));
+                assert_eq!(cov.expected_sets, None);
+                // set-level verification metrics still present
+                assert_eq!(cov.checked_sets, 1);
+                assert_eq!(cov.complete_sets, 1);
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_dependency_incomplete_set_does_not_count_toward_arcade_full_set() {
+                let (root, mut database) = open("cov-arcade-incomplete");
+                seed_set_row(&database, "mame", "sf2", "\"complete\"");
+                seed_set_row(&database, "mame", "sf2ce", "\"incomplete\"");
+                expected(
+                    &mut database,
+                    "mame",
+                    Some("v1"),
+                    &["sf2", "sf2ce", "kof98"],
+                    0,
+                );
+
+                let cov = database
+                    .arcade_dat_set_coverage("Arcade", "mame", assigned("Arcade"))
+                    .unwrap();
+                assert_eq!(cov.expected_sets, Some(3));
+                // sf2 is Complete; sf2ce only has an Incomplete row; kof98 has
+                // no row at all.
+                assert_eq!(cov.represented_complete_sets, Some(1));
+                assert_eq!(cov.missing_sets, Some(1)); // kof98 only
+                assert_eq!(cov.incomplete_sets, 1); // sf2ce
+                assert!(!cov.complete_set.is_complete());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn arcade_full_set_true_when_every_expected_machine_has_a_complete_row() {
+                let (root, mut database) = open("cov-arcade-full");
+                seed_set_row(&database, "mame", "sf2", "\"complete\"");
+                seed_set_row(&database, "mame", "kof98", "\"complete\"");
+                expected(&mut database, "mame", Some("v1"), &["sf2", "kof98"], 0);
+
+                let cov = database
+                    .arcade_dat_set_coverage("Arcade", "mame", assigned("Arcade"))
+                    .unwrap();
+                assert_eq!(cov.missing_sets, Some(0));
+                assert!(cov.complete_set.is_complete());
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            // --- pagination (item 11) -----------------------------
+
+            #[test]
+            fn missing_identities_paginate_in_a_stable_order() {
+                let (root, mut database) = open("cov-missing-page");
+                let a = on_platform(&mut database, "A.nes", "NES");
+                persist_verified(&mut database, a, "no-intro-nes", "Represented");
+                expected(
+                    &mut database,
+                    "no-intro-nes",
+                    Some("v1"),
+                    &[
+                        "Missing A",
+                        "Missing B",
+                        "Missing C",
+                        "Missing D",
+                        "Represented",
+                    ],
+                    0,
+                );
+
+                let page1 = database
+                    .missing_dat_canonical_identities("NES", "no-intro-nes", assigned("NES"), 2, 0)
+                    .unwrap();
+                let page2 = database
+                    .missing_dat_canonical_identities("NES", "no-intro-nes", assigned("NES"), 2, 2)
+                    .unwrap();
+                assert_eq!(
+                    page1,
+                    vec!["Missing A".to_string(), "Missing B".to_string()]
+                );
+                assert_eq!(
+                    page2,
+                    vec!["Missing C".to_string(), "Missing D".to_string()]
+                );
+                // never includes the represented one
+                assert!(!page1.contains(&"Represented".to_string()));
+
+                database.close().unwrap();
+                let _ = fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Expected DAT inventory + metadata (migrations 0011 / 0012).
+    // -----------------------------------------------------------------
+    mod dat_expected_inventory {
+        use super::*;
+        use crate::dat::expected_inventory::ExpectedDatEntryRecord;
+        use crate::dat::model::DatEcosystem;
+
+        fn open(name: &str) -> (PathBuf, Database) {
+            let root = temp_dir(name);
+            let database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+            (root, database)
+        }
+
+        fn entry(name: &str) -> ExpectedDatEntryRecord {
+            ExpectedDatEntryRecord {
+                canonical_identity: name.to_string(),
+                display_name: name.to_string(),
+                dat_game_id: None,
+                rom_count: 1,
+            }
+        }
+
+        fn replace(
+            database: &mut Database,
+            source: &str,
+            revision: Option<&str>,
+            ecosystem: Option<DatEcosystem>,
+            names: &[&str],
+            duplicate_names_skipped: u64,
+        ) -> usize {
+            let entries: Vec<ExpectedDatEntryRecord> = names.iter().map(|n| entry(n)).collect();
+            database
+                .replace_expected_dat_inventory(
+                    source,
+                    revision,
+                    ecosystem,
+                    &entries,
+                    duplicate_names_skipped,
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn expected_rows_and_metadata_persist_together() {
+            let (root, mut database) = open("expected-rows-meta");
+            let written = replace(
+                &mut database,
+                "no-intro-nes",
+                Some("20240501"),
+                Some(DatEcosystem::NoIntro),
+                &["The Legend of Zelda (USA)", "Super Mario Bros. (USA)"],
+                0,
+            );
+            assert_eq!(written, 2);
+            assert_eq!(
+                database.expected_dat_entry_count("no-intro-nes").unwrap(),
+                2
+            );
+            let meta = database
+                .expected_dat_inventory_meta("no-intro-nes")
+                .unwrap()
+                .expect("a metadata row");
+            assert_eq!(meta.entry_count, 2);
+            assert_eq!(meta.duplicate_names_skipped, 0);
+            assert_eq!(meta.source_revision.as_deref(), Some("20240501"));
+            assert_eq!(meta.ecosystem, Some(DatEcosystem::NoIntro));
+            let identities = database
+                .expected_dat_canonical_identities("no-intro-nes")
+                .unwrap();
+            assert!(identities.contains("The Legend of Zelda (USA)"));
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn duplicate_names_skipped_is_persisted_on_the_metadata_row() {
+            let (root, mut database) = open("expected-dupnames-meta");
+            replace(
+                &mut database,
+                "tosec-src",
+                Some("v1"),
+                Some(DatEcosystem::Tosec),
+                &["Game A", "Game B"],
+                3,
+            );
+            let meta = database
+                .expected_dat_inventory_meta("tosec-src")
+                .unwrap()
+                .unwrap();
+            assert_eq!(meta.entry_count, 2);
+            assert_eq!(meta.duplicate_names_skipped, 3);
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_newer_validation_atomically_replaces_both_rows_and_metadata() {
+            let (root, mut database) = open("expected-atomic-both");
+            replace(
+                &mut database,
+                "no-intro-nes",
+                Some("v1"),
+                None,
+                &["Old A", "Old B", "Old C"],
+                1,
+            );
+            replace(
+                &mut database,
+                "no-intro-nes",
+                Some("v2"),
+                None,
+                &["New A", "New B"],
+                0,
+            );
+            assert_eq!(
+                database.expected_dat_entry_count("no-intro-nes").unwrap(),
+                2
+            );
+            let meta = database
+                .expected_dat_inventory_meta("no-intro-nes")
+                .unwrap()
+                .unwrap();
+            assert_eq!(meta.entry_count, 2);
+            assert_eq!(meta.duplicate_names_skipped, 0);
+            assert_eq!(meta.source_revision.as_deref(), Some("v2"));
+            let identities = database
+                .expected_dat_canonical_identities("no-intro-nes")
+                .unwrap();
+            assert!(!identities.contains("Old A"));
+            assert!(identities.contains("New A"));
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn not_calling_replace_after_a_failed_validation_leaves_both_intact() {
+            // The GUI persist gate never calls `replace_expected_dat_inventory`
+            // for an Invalid/Unreadable validation - so a prior good
+            // generation (rows + metadata) simply stays. This is that
+            // property at the storage layer.
+            let (root, mut database) = open("expected-failed-keeps-both");
+            replace(
+                &mut database,
+                "no-intro-nes",
+                Some("v1"),
+                None,
+                &["Game A", "Game B"],
+                0,
+            );
+            // ... a later validation fails and the caller does nothing ...
+            assert_eq!(
+                database.expected_dat_entry_count("no-intro-nes").unwrap(),
+                2
+            );
+            assert_eq!(
+                database
+                    .expected_dat_inventory_meta("no-intro-nes")
+                    .unwrap()
+                    .unwrap()
+                    .entry_count,
+                2
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn an_empty_valid_inventory_still_writes_an_explicit_metadata_row() {
+            let (root, mut database) = open("expected-empty-meta");
+            let written = replace(&mut database, "empty-src", Some("v1"), None, &[], 0);
+            assert_eq!(written, 0);
+            assert_eq!(database.expected_dat_entry_count("empty-src").unwrap(), 0);
+            let meta = database
+                .expected_dat_inventory_meta("empty-src")
+                .unwrap()
+                .expect("even an empty inventory records its generation");
+            assert_eq!(meta.entry_count, 0);
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn region_revision_and_multi_disc_entries_stay_distinct() {
+            let (root, mut database) = open("expected-distinct");
+            replace(
+                &mut database,
+                "src",
+                None,
+                None,
+                &[
+                    "Game (USA) (Rev 1)",
+                    "Game (USA) (Rev 2)",
+                    "Game (Europe)",
+                    "FF VII (USA) (Disc 1)",
+                    "FF VII (USA) (Disc 2)",
+                ],
+                0,
+            );
+            assert_eq!(database.expected_dat_entry_count("src").unwrap(), 5);
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn two_dat_sources_stay_completely_independent() {
+            let (root, mut database) = open("expected-two-src");
+            replace(&mut database, "no-intro-nes", None, None, &["Zelda"], 0);
+            replace(
+                &mut database,
+                "redump-psx",
+                None,
+                None,
+                &["FF VII (Disc 1)"],
+                0,
+            );
+            assert_eq!(
+                database.expected_dat_entry_count("no-intro-nes").unwrap(),
+                1
+            );
+            assert_eq!(database.expected_dat_entry_count("redump-psx").unwrap(), 1);
+            assert!(
+                !database
+                    .expected_dat_canonical_identities("no-intro-nes")
+                    .unwrap()
+                    .contains("FF VII (Disc 1)")
+            );
+
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn migrations_0011_and_0012_are_registered() {
+            assert_eq!(latest_known_version(MIGRATIONS), 12);
+            assert!(MIGRATIONS.iter().any(|migration| {
+                migration.version == 11
+                    && migration.sql.contains("CREATE TABLE dat_expected_entries")
+            }));
+            assert!(MIGRATIONS.iter().any(|migration| {
+                migration.version == 12
+                    && migration
+                        .sql
+                        .contains("CREATE TABLE dat_expected_inventory_meta")
             }));
         }
     }

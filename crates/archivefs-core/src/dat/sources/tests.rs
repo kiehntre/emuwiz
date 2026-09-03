@@ -153,7 +153,7 @@ fn a_valid_dat_folder_can_be_registered_and_finds_only_dat_files() {
         .add(entry_for(&folder, DatSourceKind::Folder))
         .expect("a folder of DATs registers");
 
-    let report = validate_dat_source(&registry.entries()[0], DatLimits::default());
+    let (report, _expected) = validate_dat_source(&registry.entries()[0], DatLimits::default());
     assert_eq!(report.state, DatHealthState::Valid, "{report:?}");
     let names: Vec<&str> = report
         .files
@@ -409,12 +409,12 @@ fn format_detection_names_both_supported_formats() {
     assert_eq!(sniff_dat_format(&logiqx), Some(DatFormat::Logiqx));
     assert_eq!(sniff_dat_format(&clrmamepro), Some(DatFormat::ClrMamePro));
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&logiqx, DatSourceKind::File),
         DatLimits::default(),
     );
     assert_eq!(report.formats, vec!["Logiqx XML".to_string()]);
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&clrmamepro, DatSourceKind::File),
         DatLimits::default(),
     );
@@ -452,7 +452,8 @@ fn malformed_xml_is_reported_as_invalid_with_an_actionable_error() {
     );
     let before = std::fs::read(&path).unwrap();
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(
         !report.summary.is_empty(),
@@ -485,7 +486,8 @@ fn invalid_utf8_does_not_panic_and_is_reported() {
     assert_eq!(sniff_dat_format(&path), Some(DatFormat::Logiqx));
 
     // And validation must produce a verdict rather than unwinding.
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert!(
         report.state.is_checked(),
         "an undecodable DAT still gets a verdict: {report:?}"
@@ -499,7 +501,7 @@ fn a_file_above_the_size_limit_is_refused_rather_than_read() {
     let path = write(dir.path(), "big.dat", LOGIQX);
     let tiny = DatLimits::builder().max_file_size(8).build();
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), tiny);
+    let (report, _expected) = validate_dat_source(&entry_for(&path, DatSourceKind::File), tiny);
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(
         report.summary.contains("limit"),
@@ -521,12 +523,13 @@ fn a_large_entry_count_is_handled_and_its_ceiling_is_enforced() {
     xml.push_str("</datafile>\n");
     let path = write(dir.path(), "big.dat", &xml);
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.state, DatHealthState::Valid, "{}", report.summary);
     assert_eq!(report.entry_count, 5_000);
 
     let capped = DatLimits::builder().max_entries(10).build();
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), capped);
+    let (report, _expected) = validate_dat_source(&entry_for(&path, DatSourceKind::File), capped);
     assert_eq!(
         report.state,
         DatHealthState::Invalid,
@@ -544,7 +547,7 @@ fn two_dat_files_claiming_one_identity_are_reported_not_resolved() {
     write(&folder, "copy-a.dat", LOGIQX);
     write(&folder, "copy-b.dat", LOGIQX);
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -565,7 +568,7 @@ fn an_empty_folder_is_invalid_and_says_what_it_looked_for() {
     let dir = temp();
     let folder = dir.path().join("empty");
     std::fs::create_dir(&folder).unwrap();
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -605,7 +608,8 @@ fn a_doctype_parser_note_keeps_the_source_valid() {
         &logiqx_with_doctype_and_entries(1005),
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.entry_count, 1005);
     assert_eq!(report.rom_count, 1005);
     assert_eq!(
@@ -642,7 +646,8 @@ fn a_real_warning_produces_valid_with_warnings() {
 <datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(
         report.state,
         DatHealthState::ValidWithWarnings,
@@ -669,7 +674,8 @@ fn a_real_parser_failure_is_invalid() {
         "<?xml version=\"1.0\"?><datafile><game",
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(matches!(
         report.files[0].outcome,
@@ -690,7 +696,8 @@ fn mixed_warnings_and_notes_produce_valid_with_warnings() {
 <datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    let (report, _expected) =
+        validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
     assert_eq!(
         report.state,
         DatHealthState::ValidWithWarnings,
@@ -734,7 +741,7 @@ fn mixed_errors_warnings_and_notes_produce_invalid() {
 <datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
     );
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -769,7 +776,7 @@ fn clrmamepro_diagnostics_carry_their_line() {
         "the ClrMamePro parser must record the offending line: {warning:?}"
     );
 
-    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), limits);
+    let (report, _expected) = validate_dat_source(&entry_for(&path, DatSourceKind::File), limits);
     let DatFileOutcome::Parsed { diagnostics, .. } = &report.files[0].outcome else {
         panic!("the DAT must parse");
     };
@@ -793,7 +800,7 @@ fn a_safety_limit_stop_reports_an_honest_total_when_it_knows_one() {
         write(&folder, &format!("set-{index:04}.dat"), LOGIQX);
     }
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -815,7 +822,7 @@ fn a_folder_that_fits_reports_its_exact_count() {
     write(&folder, "a.dat", LOGIQX);
     write(&folder, "b.dat", LOGIQX);
 
-    let report = validate_dat_source(
+    let (report, _expected) = validate_dat_source(
         &entry_for(&folder, DatSourceKind::Folder),
         DatLimits::default(),
     );
@@ -831,7 +838,7 @@ fn a_source_whose_path_disappeared_is_unreadable_not_invalid() {
     let entry = entry_for(&path, DatSourceKind::File);
     std::fs::remove_file(&path).unwrap();
 
-    let report = validate_dat_source(&entry, DatLimits::default());
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
     assert_eq!(
         report.state,
         DatHealthState::Unreadable,
@@ -870,7 +877,7 @@ fn a_stored_verdict_goes_stale_when_the_file_changes() {
     let dir = temp();
     let path = write(dir.path(), "changing.dat", LOGIQX);
     let entry = entry_for(&path, DatSourceKind::File);
-    let report = validate_dat_source(&entry, DatLimits::default());
+    let (report, _expected) = validate_dat_source(&entry, DatLimits::default());
     let health = report.to_health(&path, DatSourceKind::File);
     assert_eq!(health.state(), DatHealthState::Valid);
     assert!(!health.is_stale_for(&path, DatSourceKind::File));
@@ -949,8 +956,9 @@ fn everything_a_user_set_round_trips() {
         entry.platform = Some("NES".to_string());
         entry.origin = Some("added via GUI".to_string());
         entry.priority = 42;
-        entry.health =
-            validate_dat_source(entry, DatLimits::default()).to_health(&path, DatSourceKind::File);
+        entry.health = validate_dat_source(entry, DatLimits::default())
+            .0
+            .to_health(&path, DatSourceKind::File);
     }
     let before = registry.get("full").unwrap().clone();
 

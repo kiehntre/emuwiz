@@ -2007,6 +2007,75 @@ fn send_progress(sender: &SyncSender<JobMessage>, message: JobMessage) {
     }
 }
 
+/// Persists one validated source's expected DAT inventory - the durable
+/// prerequisite for Expected/Missing/Full-set coverage - when, and only
+/// when, this validation is trustworthy enough to replace what is already
+/// stored.
+///
+/// Runs on the same worker thread `validate_dat_source` just ran on, right
+/// after it - no second parse, no second DAT read. A `Invalid`/`Unreadable`
+/// or cancelled-partial validation writes nothing, leaving any previously
+/// persisted good inventory for this source exactly as it was (see
+/// `crate::dat::expected_inventory`'s doc on why a failed/partial parse
+/// must never destroy prior good inventory). Persistence failure is
+/// reported as a progress note; it never blocks or hides the validation
+/// result itself, which the caller sends regardless.
+fn persist_expected_inventory_if_valid(
+    database_path: Option<&std::path::Path>,
+    report: &archivefs_core::dat::sources::validation::DatValidationReport,
+    expected: &archivefs_core::dat::expected_inventory::ExpectedDatInventoryProjection,
+    sender: &SyncSender<JobMessage>,
+) {
+    if !matches!(
+        report.state,
+        DatHealthState::Valid | DatHealthState::ValidWithWarnings
+    ) {
+        return;
+    }
+    let Some(database_path) = database_path else {
+        return;
+    };
+    let ecosystem = report.files.iter().find_map(|file| match &file.outcome {
+        DatFileOutcome::Parsed { ecosystem, .. } => Some(*ecosystem),
+        DatFileOutcome::Failed { .. } => None,
+    });
+    let source_revision = report.files.iter().find_map(|file| match &file.outcome {
+        DatFileOutcome::Parsed { version, .. } => version.clone(),
+        DatFileOutcome::Failed { .. } => None,
+    });
+    let result =
+        archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
+            database.replace_expected_dat_inventory(
+                &report.source_id,
+                source_revision.as_deref(),
+                ecosystem,
+                &expected.entries,
+                expected.duplicate_names_skipped as u64,
+            )
+        });
+    match result {
+        Ok(written) => {
+            if expected.duplicate_names_skipped > 0 {
+                send_progress(
+                    sender,
+                    JobMessage::Progress(format!(
+                        "Expected DAT inventory: {written} identit(y/ies) persisted, {} duplicate name(s) in the catalogue skipped.",
+                        expected.duplicate_names_skipped
+                    )),
+                );
+            }
+        }
+        Err(error) => {
+            send_progress(
+                sender,
+                JobMessage::Progress(format!(
+                    "Expected DAT inventory could not be updated: {error}"
+                )),
+            );
+        }
+    }
+}
+
 /// The percentage, as a whole number, or `None` when the total is unknown or
 /// zero. A total that is not known is never replaced by a guessed one.
 fn format_percentage(checked: u64, total: u64) -> Option<u8> {
@@ -4634,10 +4703,17 @@ impl DatSourcesPageState {
         let limits = self.limits;
         let name = entry.display_name.clone();
         let platform_display = authoritative_platform(&entry);
+        let database_path = self.database_path.clone();
 
         std::thread::spawn(move || {
             send_progress(&sender, JobMessage::Progress(format!("Reading {name}…")));
-            let report = validate_dat_source(&entry, limits);
+            let (report, expected) = validate_dat_source(&entry, limits);
+            persist_expected_inventory_if_valid(
+                database_path.as_deref(),
+                &report,
+                &expected,
+                &sender,
+            );
             let _ = sender.send(JobMessage::Validated(Box::new(report)));
         });
 
@@ -4678,6 +4754,7 @@ impl DatSourcesPageState {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let limits = self.limits;
+        let database_path = self.database_path.clone();
 
         std::thread::spawn(move || {
             for entry in entries {
@@ -4701,7 +4778,13 @@ impl DatSourcesPageState {
                     // ever see the result of.
                     return;
                 }
-                let report = validate_dat_source(&entry, limits);
+                let (report, expected) = validate_dat_source(&entry, limits);
+                persist_expected_inventory_if_valid(
+                    database_path.as_deref(),
+                    &report,
+                    &expected,
+                    &sender,
+                );
                 if sender
                     .send(JobMessage::Validated(Box::new(report)))
                     .is_err()

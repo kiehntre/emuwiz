@@ -8066,3 +8066,168 @@ fn a_cancelled_or_unresolved_check_never_targets_a_stale_mark() {
         });
     assert!(managed_update_stale_mark_target(&source_id, &result).is_none());
 }
+
+// --- `persist_expected_inventory_if_valid` --------------------------------
+
+mod persist_expected_inventory {
+    use archivefs_core::dat::expected_inventory::{
+        ExpectedDatEntryRecord, ExpectedDatInventoryProjection,
+    };
+
+    use super::*;
+
+    fn report(state: DatHealthState, source_id: &str) -> DatValidationReport {
+        DatValidationReport {
+            source_id: source_id.to_string(),
+            path: "/dats/source.dat".to_string(),
+            kind: "DAT file",
+            state,
+            files: vec![DatFileReport {
+                path: "/dats/source.dat".to_string(),
+                file_name: "source.dat".to_string(),
+                outcome: DatFileOutcome::Parsed {
+                    format: DatFormat::Logiqx,
+                    ecosystem: DatEcosystem::NoIntro,
+                    name: Some("Test Catalogue".to_string()),
+                    version: Some("v1".to_string()),
+                    entry_count: 1,
+                    rom_count: 1,
+                    diagnostics: Vec::new(),
+                },
+            }],
+            duplicate_identities: Vec::new(),
+            skipped: Vec::new(),
+            truncated: false,
+            total_dat_files: None,
+            summary: "1 DAT files, 1 entries, 1 ROMs".to_string(),
+            entry_count: 1,
+            rom_count: 1,
+            formats: vec!["Logiqx XML".to_string()],
+            path_refusal: None,
+        }
+    }
+
+    fn projection(names: &[&str]) -> ExpectedDatInventoryProjection {
+        let mut projection = ExpectedDatInventoryProjection::default();
+        for name in names {
+            projection.entries.push(ExpectedDatEntryRecord {
+                canonical_identity: (*name).to_string(),
+                display_name: (*name).to_string(),
+                dat_game_id: None,
+                rom_count: 1,
+            });
+        }
+        projection
+    }
+
+    fn database_path(fixture: &Fixture) -> PathBuf {
+        let path = fixture.root.join("library.sqlite3");
+        archivefs_core::Database::open_or_create(&path)
+            .unwrap()
+            .close()
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_valid_report_persists_its_projected_entries() {
+        let fixture = Fixture::new();
+        let db_path = database_path(&fixture);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
+        persist_expected_inventory_if_valid(
+            Some(&db_path),
+            &report(DatHealthState::Valid, "no-intro-nes"),
+            &projection(&["Game A", "Game B"]),
+            &sender,
+        );
+
+        let database = archivefs_core::Database::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            database.expected_dat_entry_count("no-intro-nes").unwrap(),
+            2
+        );
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn an_invalid_report_persists_nothing() {
+        let fixture = Fixture::new();
+        let db_path = database_path(&fixture);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
+        persist_expected_inventory_if_valid(
+            Some(&db_path),
+            &report(DatHealthState::Invalid, "no-intro-nes"),
+            &projection(&["Game A"]),
+            &sender,
+        );
+
+        let database = archivefs_core::Database::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            database.expected_dat_entry_count("no-intro-nes").unwrap(),
+            0
+        );
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn a_later_invalid_report_never_destroys_prior_good_inventory() {
+        let fixture = Fixture::new();
+        let db_path = database_path(&fixture);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
+        persist_expected_inventory_if_valid(
+            Some(&db_path),
+            &report(DatHealthState::Valid, "no-intro-nes"),
+            &projection(&["Game A", "Game B"]),
+            &sender,
+        );
+        // A later validation of the same source fails to parse (a
+        // corrupted download, say). The good inventory from the earlier
+        // successful validation must survive untouched.
+        persist_expected_inventory_if_valid(
+            Some(&db_path),
+            &report(DatHealthState::Invalid, "no-intro-nes"),
+            &ExpectedDatInventoryProjection::default(),
+            &sender,
+        );
+
+        let database = archivefs_core::Database::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            database.expected_dat_entry_count("no-intro-nes").unwrap(),
+            2
+        );
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_report_also_persists_nothing() {
+        let fixture = Fixture::new();
+        let db_path = database_path(&fixture);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
+        persist_expected_inventory_if_valid(
+            Some(&db_path),
+            &report(DatHealthState::Unreadable, "no-intro-nes"),
+            &projection(&["Game A"]),
+            &sender,
+        );
+
+        let database = archivefs_core::Database::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            database.expected_dat_entry_count("no-intro-nes").unwrap(),
+            0
+        );
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn no_database_path_persists_nothing_and_does_not_panic() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
+        persist_expected_inventory_if_valid(
+            None,
+            &report(DatHealthState::Valid, "no-intro-nes"),
+            &projection(&["Game A"]),
+            &sender,
+        );
+        // No assertion beyond "did not panic" - there is no database to
+        // check anything against.
+    }
+}
