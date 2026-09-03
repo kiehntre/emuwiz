@@ -631,22 +631,9 @@ pub(crate) fn show_featured_cover(
     artwork_cache: &mut PlatformArtworkCache,
     artwork_directory: Option<&Path>,
 ) {
-    let full_width = ui.available_width();
-    // Centred by allocating the panel's width and drawing into the middle of it,
-    // rather than by padding, so the box is centred at every panel width.
-    let (outer, _) =
-        ui.allocate_exact_size(egui::vec2(full_width, box_size.y), egui::Sense::hover());
-    let rect = egui::Rect::from_center_size(outer.center(), box_size);
-
-    // A restrained plate behind the artwork: it gives a letterboxed or missing
-    // cover a defined edge instead of leaving a hole in the panel, and it is the
-    // placeholder's whole visual identity.
-    ui.painter()
-        .rect_filled(rect, 10.0, ui.visuals().extreme_bg_color);
-    ui.painter()
-        .rect_stroke(rect, 10.0, theme::border(ui), egui::StrokeKind::Inside);
-
-    match cover {
+    let fallback = matches!(cover, Some(crate::gamer_artwork::CoverSlot::None(_)))
+        .then_some("No cover available");
+    widgets::media_frame(ui, box_size, fallback, |ui, rect| match cover {
         Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
             let drawn = crate::gamer_artwork::fit_within(box_size, texture.size_vec2());
             ui.painter().image(
@@ -656,10 +643,6 @@ pub(crate) fn show_featured_cover(
                 egui::Color32::WHITE,
             );
         }
-        // Loading, revalidating, and "there is no cover" all draw the same thing.
-        // A spinner that becomes a picture is the same visual jump the reserved box
-        // exists to prevent, and the platform artwork is a truthful, readable image
-        // of what this game is meanwhile.
         _ => {
             let glyph = (box_size.y * 0.42).min(96.0);
             paint_game_row_artwork(
@@ -672,17 +655,8 @@ pub(crate) fn show_featured_cover(
                     ..placeholder
                 },
             );
-            if matches!(cover, Some(crate::gamer_artwork::CoverSlot::None(_))) {
-                ui.painter().text(
-                    egui::pos2(rect.center().x, rect.bottom() - 18.0),
-                    egui::Align2::CENTER_CENTER,
-                    "No cover available",
-                    egui::FontId::proportional(13.0),
-                    theme::muted(ui),
-                );
-            }
         }
-    }
+    });
 }
 
 /// The featured panel's primary button: full width and taller than a secondary
@@ -760,7 +734,7 @@ fn featured_typed_launch_action(
 pub(crate) fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) {
     let text = egui::RichText::new(text).size(if strong { 16.0 } else { 14.0 });
     ui.label(if strong {
-        text.color(ui.visuals().text_color())
+        text.color(theme::PRIMARY_TEXT)
     } else {
         text.color(theme::muted(ui))
     });
@@ -1657,9 +1631,14 @@ pub(crate) fn show_gamer_view(
                         // The measurement covers the block itself; the gap the
                         // artwork adds beneath it, and a couple of pixels of rounding
                         // in the last row's spacing, come off here.
-                        let for_artwork =
-                            (usable - measured - theme::SECTION_GAP - 12.0).max(0.0);
+                        let for_artwork = (usable - measured - theme::SECTION_GAP - 12.0)
+                            .max(if to_screen_bottom >= 680.0 {
+                                crate::gamer_artwork::FEATURED_COVER_MIN_HEIGHT
+                            } else {
+                                0.0
+                            });
 
+                        widgets::hero_card(ui, |ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(content_width, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Min),
@@ -1717,7 +1696,7 @@ pub(crate) fn show_gamer_view(
                                     // right game, not a diagnostic dump.
                                     ui.label(
                                         egui::RichText::new(&title)
-                                            .size(23.0)
+                                            .size(theme::DISPLAY_SIZE)
                                             .strong()
                                             .color(ui.visuals().strong_text_color()),
                                     );
@@ -2071,6 +2050,7 @@ pub(crate) fn show_gamer_view(
                                 }
                             },
                         );
+                        });
                     }
                 }
             },

@@ -136,15 +136,19 @@ pub(crate) fn page_header_with_icon(ui: &mut egui::Ui, icon: &str, title: &str, 
             ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
         });
     });
-    ui.add_space(theme::SECTION_GAP);
+    ui.add_space(theme::SPACE_2XL.min(theme::SECTION_GAP));
 }
 
 pub(crate) fn section_header(ui: &mut egui::Ui, title: &str, description: Option<&str>) {
-    ui.label(egui::RichText::new(title).size(19.0).strong());
+    ui.label(
+        egui::RichText::new(title)
+            .size(theme::SECTION_TITLE_SIZE)
+            .strong(),
+    );
     if let Some(description) = description {
         ui.label(egui::RichText::new(description).color(theme::muted(ui)));
     }
-    ui.add_space(4.0);
+    ui.add_space(theme::SPACE_XS);
 }
 
 pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -155,6 +159,80 @@ pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
         .inner_margin(egui::Margin::same(14))
         .show(ui, add_contents)
         .inner
+}
+
+/// The selected-content surface used by Gamer View. It provides elevation and
+/// hierarchy while leaving all actions and state decisions to the caller.
+pub(crate) fn hero_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(theme::RAISED_SURFACE)
+        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_FOCUS))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
+        .show(ui, add_contents)
+        .inner
+}
+
+/// A consistent letterboxed artwork plate. The closure paints the actual
+/// image, keeping media loading and fallback selection in the existing caller.
+pub(crate) fn media_frame(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    fallback_label: Option<&str>,
+    paint: impl FnOnce(&mut egui::Ui, egui::Rect),
+) {
+    let (allocated, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let rect = egui::Rect::from_min_size(allocated.min, size);
+    ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+    ui.painter()
+        .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
+    paint(ui, rect);
+    if let Some(label) = fallback_label {
+        ui.painter().text(
+            rect.center_bottom() - egui::vec2(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(theme::TECHNICAL_SIZE),
+            theme::SECONDARY_TEXT,
+        );
+    }
+}
+
+#[allow(dead_code)] // Foundation primitive; callers are added as operation UIs migrate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProgressRow<'a> {
+    pub(crate) spinner: bool,
+    pub(crate) current: Option<(u64, u64)>,
+    pub(crate) phase: Option<&'a str>,
+    pub(crate) cancel_label: Option<&'a str>,
+}
+
+/// Shared long-operation presentation. Cancellation is opt-in and therefore
+/// cannot accidentally appear for a non-cancellable operation.
+#[allow(dead_code)] // Foundation primitive; intentionally not wired everywhere yet.
+pub(crate) fn progress_row(ui: &mut egui::Ui, progress: ProgressRow<'_>) -> bool {
+    let mut cancelled = false;
+    ui.horizontal(|ui| {
+        if progress.spinner {
+            ui.spinner();
+        }
+        if let Some((current, total)) = progress.current {
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                current as f32 / total as f32
+            };
+            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(150.0));
+            ui.label(format!("{current}/{total}"));
+        }
+        if let Some(phase) = progress.phase {
+            ui.label(egui::RichText::new(phase).color(theme::SECONDARY_TEXT));
+        }
+        if let Some(label) = progress.cancel_label {
+            cancelled = ui.button(label).clicked();
+        }
+    });
+    cancelled
 }
 
 /// A restrained workflow identity for a major navigation card. This colour is
@@ -169,7 +247,7 @@ pub(crate) fn workflow_card<R>(
         .fill(accent.gamma_multiply(0.075))
         .stroke(theme::border(ui))
         .corner_radius(9)
-        .inner_margin(egui::Margin::same(16))
+        .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
         .show(ui, add_contents);
     ui.painter().line_segment(
         [
@@ -438,7 +516,14 @@ pub(crate) fn failure_summary(
     );
     if !detail.is_empty() {
         technical_details(ui, id_salt, |ui| {
-            ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(detail)
+                        .monospace()
+                        .color(theme::TECHNICAL_TEXT),
+                )
+                .wrap(),
+            );
         });
     }
 }
@@ -671,6 +756,59 @@ mod tests {
             center.y,
             pos.y
         );
+    }
+
+    #[test]
+    fn hero_card_and_media_frame_render_title_and_fallback() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                hero_card(ui, |ui| {
+                    ui.label(egui::RichText::new("Selected game").size(theme::DISPLAY_SIZE));
+                    media_frame(
+                        ui,
+                        egui::vec2(120.0, 160.0),
+                        Some("Artwork unavailable"),
+                        |ui, _| {
+                            ui.label("Cover");
+                        },
+                    );
+                });
+            });
+        });
+        assert!(rendered_text_contains(&output, "Selected game"));
+        assert!(rendered_text_contains(&output, "Artwork unavailable"));
+        assert!(rendered_text_contains(&output, "Cover"));
+    }
+
+    #[test]
+    fn progress_row_renders_indeterminate_determinate_and_optional_cancel() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(!progress_row(
+                    ui,
+                    ProgressRow {
+                        spinner: true,
+                        current: None,
+                        phase: Some("Scanning"),
+                        cancel_label: None
+                    }
+                ));
+                assert!(!progress_row(
+                    ui,
+                    ProgressRow {
+                        spinner: false,
+                        current: Some((3, 10)),
+                        phase: Some("Reading"),
+                        cancel_label: Some("Cancel")
+                    }
+                ));
+            });
+        });
+        assert!(rendered_text_contains(&output, "Scanning"));
+        assert!(rendered_text_contains(&output, "3/10"));
+        assert!(rendered_text_contains(&output, "Cancel"));
     }
 
     #[test]
