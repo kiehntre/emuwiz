@@ -19366,6 +19366,23 @@ impl ArchiveFsApp {
                     {
                         self.view = MainView::Library;
                     }
+                    let play_target = if self.cheat_workflow.is_some() {
+                        let live_for_play_target = match &self.state {
+                            LoadState::Ready(data) => Some(data.as_ref()),
+                            LoadState::Loading { previous, .. } => previous.as_deref(),
+                            LoadState::Error(_) => None,
+                        };
+                        match launch_readiness_page::gamer_play_action(
+                            &self.build_launch_readiness_input(live_for_play_target),
+                        ) {
+                            launch_readiness_page::GamerPlayAction::Launch(request) => {
+                                Some(request.adapter_name())
+                            }
+                            launch_readiness_page::GamerPlayAction::BlockedTyped(_) => None,
+                        }
+                    } else {
+                        None
+                    };
                     let live = match &self.state {
                         LoadState::Ready(data) => Some(data.as_ref()),
                         LoadState::Loading { previous, .. } => previous.as_deref(),
@@ -19475,6 +19492,14 @@ impl ArchiveFsApp {
                             }
                             if self.local_mod_package.poll() || self.local_mod_package.is_busy() {
                                 ui.ctx().request_repaint();
+                            }
+                            if let Some(workflow) = self.cheat_workflow.as_ref() {
+                                show_cheat_play_target_warning(
+                                    ui,
+                                    workflow.adapter,
+                                    play_target,
+                                );
+                                ui.add_space(theme::SECTION_GAP / 2.0);
                             }
                             let action = show_cheats_mods_page(
                                 ui,
@@ -23689,6 +23714,42 @@ impl CheatActivationReadiness {
             None => Self::Unknown,
         }
     }
+}
+
+impl CheatEmulatorAdapter {
+    const fn display_name(self) -> Option<&'static str> {
+        match self {
+            Self::RetroArch => Some("RetroArch"),
+            Self::Pcsx2 => Some("PCSX2"),
+            Self::Dolphin => Some("Dolphin"),
+            Self::Xenia => Some("Xenia"),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+fn show_cheat_play_target_warning(
+    ui: &mut egui::Ui,
+    cheat_target: CheatEmulatorAdapter,
+    play_target: Option<&'static str>,
+) {
+    let Some(cheat_target) = cheat_target.display_name() else {
+        return;
+    };
+    let Some(play_target) = play_target else {
+        return;
+    };
+    if cheat_target == play_target {
+        return;
+    }
+    widgets::banner(
+        ui,
+        "Cheat target differs from Play",
+        &format!(
+            "These cheats target {cheat_target}, but this game is set to play with {play_target}. These cheats will not affect that launch."
+        ),
+        widgets::StatusTone::Warning,
+    );
 }
 
 fn show_cheat_activation_status(

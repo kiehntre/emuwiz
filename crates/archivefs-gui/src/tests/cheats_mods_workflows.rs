@@ -17,6 +17,37 @@ use super::*;
 use archivefs_core::patch_manager::SharedPreviewEntry;
 
 #[test]
+fn cheat_play_target_warning_only_appears_for_known_mismatches() {
+    assert_eq!(
+        CheatEmulatorAdapter::RetroArch.display_name(),
+        Some("RetroArch")
+    );
+    assert_eq!(CheatEmulatorAdapter::Unsupported.display_name(), None);
+
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_cheat_play_target_warning(
+                ui,
+                CheatEmulatorAdapter::RetroArch,
+                Some("DuckStation"),
+            );
+        });
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "These cheats target RetroArch, but this game is set to play with DuckStation."
+    ));
+
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_cheat_play_target_warning(ui, CheatEmulatorAdapter::RetroArch, Some("RetroArch"));
+        });
+    });
+    assert!(!rendered_text_contains(&output, "These cheats target"));
+}
+
+#[test]
 fn cheat_activation_projection_preserves_known_pcsx2_and_dolphin_states() {
     assert_eq!(
         CheatActivationReadiness::from_bool(Some(true)),
