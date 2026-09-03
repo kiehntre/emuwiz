@@ -996,6 +996,27 @@ pub fn inspect_pcsx2_profile(
     inspect_pcsx2_profile_with_limits(profile, PCSX2_MAX_PNACH_FILES, PCSX2_MAX_DIRECTORY_DEPTH)
 }
 
+/// The bounded PNACH inspection plus the already-parsed global cheat switch
+/// needed by read-only consumers.  This deliberately reuses the existing
+/// inventory inspection and config parser; it does not write configuration
+/// or change PNACH semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pcsx2CheatInspection {
+    pub inventory: Pcsx2PnachInventory,
+    pub cheats_enabled: Option<bool>,
+}
+
+pub fn inspect_pcsx2_profile_with_activation(
+    profile: &Pcsx2Profile,
+) -> Result<Pcsx2CheatInspection, Pcsx2InspectionError> {
+    let inventory = inspect_pcsx2_profile(profile)?;
+    let config = inspect_pcsx2_config(&pcsx2_global_config_path(&profile.configuration_path));
+    Ok(Pcsx2CheatInspection {
+        inventory,
+        cheats_enabled: config.settings.cheats_enabled,
+    })
+}
+
 fn inspect_pcsx2_profile_with_limits(
     profile: &Pcsx2Profile,
     max_pnach_files: usize,

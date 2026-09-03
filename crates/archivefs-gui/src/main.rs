@@ -118,10 +118,10 @@ use archivefs_core::patch_manager::{
     execute_shared_apply, execute_shared_rollback, fetch_dolphin_catalogue_with_transport,
     fetch_dolphin_upstream_gecko, fetch_retroarch_cheat_source, fetch_xenia_provider_patches,
     generate_shared_operation_id, import_gamehacking_browser_content, import_local_bsfree_database,
-    inspect_bsfree_source, inspect_dolphin_profile, inspect_pcsx2_profile,
-    inspect_retroarch_cheat_library_for_game, list_retroarch_cheat_sources,
-    load_candidate_document, load_cheat_catalogue_snapshot, load_dolphin_catalogue,
-    load_dolphin_catalogue_update_state, load_dolphin_destination,
+    inspect_bsfree_source, inspect_dolphin_profile_with_activation,
+    inspect_pcsx2_profile_with_activation, inspect_retroarch_cheat_library_for_game,
+    list_retroarch_cheat_sources, load_candidate_document, load_cheat_catalogue_snapshot,
+    load_dolphin_catalogue, load_dolphin_catalogue_update_state, load_dolphin_destination,
     load_remembered_emulator_profiles_default, load_xenia_destination, match_dolphin_inventory,
     match_pcsx2_inventory, match_strength_for_candidate, materialize_retroarch_shared_preview,
     open_gamehacking_url_in_browser, parse_dolphin_ini, plan_gamehacking_browser_import,
@@ -11183,6 +11183,8 @@ impl ArchiveFsApp {
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,
             pcsx2_inventory: CheatStepResource::NotLoaded,
+            pcsx2_activation: CheatActivationReadiness::Unknown,
+            pcsx2_activation_receiver: None,
             pcsx2_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking: CheatStepResource::NotLoaded,
             gamecube_gamehacking_request: None,
@@ -11201,6 +11203,8 @@ impl ArchiveFsApp {
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
             dolphin_inventory: CheatStepResource::NotLoaded,
+            dolphin_activation: CheatActivationReadiness::Unknown,
+            dolphin_activation_receiver: None,
             dolphin_provider_request: None,
             dolphin_provider: CheatStepResource::NotLoaded,
             dolphin_provider_selection: None,
@@ -15686,6 +15690,9 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         workflow.pcsx2_inventory_profile_id = Some(profile_id.clone());
         workflow.pcsx2_inventory = CheatStepResource::Loading { receiver };
+        workflow.pcsx2_activation = CheatActivationReadiness::Unknown;
+        let (activation_sender, activation_receiver) = mpsc::channel();
+        workflow.pcsx2_activation_receiver = Some(activation_receiver);
         workflow.preview_request = None;
         workflow.preview = CheatStepResource::NotLoaded;
         self.history.record(HistoryEntry::new(
@@ -15695,8 +15702,19 @@ impl ArchiveFsApp {
             format!("PCSX2 PNACH inspection started for profile '{profile_id}'."),
         ));
         thread::spawn(move || {
-            let result = inspect_pcsx2_profile(&profile).map_err(|error| error.to_string());
-            let _ = sender.send(result);
+            let result =
+                inspect_pcsx2_profile_with_activation(&profile).map_err(|error| error.to_string());
+            match result {
+                Ok(inspection) => {
+                    let _ = activation_sender.send(Ok(inspection.cheats_enabled));
+                    let _ = sender.send(Ok(inspection.inventory));
+                }
+                Err(error) => {
+                    let message = error.clone();
+                    let _ = activation_sender.send(Err(message));
+                    let _ = sender.send(Err(error));
+                }
+            }
             context.request_repaint();
         });
     }
@@ -15730,6 +15748,9 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         workflow.dolphin_inventory_profile_id = Some(profile_id.clone());
         workflow.dolphin_inventory = CheatStepResource::Loading { receiver };
+        workflow.dolphin_activation = CheatActivationReadiness::Unknown;
+        let (activation_sender, activation_receiver) = mpsc::channel();
+        workflow.dolphin_activation_receiver = Some(activation_receiver);
         workflow.preview_request = None;
         workflow.preview = CheatStepResource::NotLoaded;
         self.history.record(HistoryEntry::new(
@@ -15739,8 +15760,19 @@ impl ArchiveFsApp {
             format!("Dolphin GameSettings inspection started for profile '{profile_id}'."),
         ));
         thread::spawn(move || {
-            let result = inspect_dolphin_profile(&profile).map_err(|error| error.to_string());
-            let _ = sender.send(result);
+            let result = inspect_dolphin_profile_with_activation(&profile)
+                .map_err(|error| error.to_string());
+            match result {
+                Ok(inspection) => {
+                    let _ = activation_sender.send(Ok(inspection.cheats_enabled));
+                    let _ = sender.send(Ok(inspection.inventory));
+                }
+                Err(error) => {
+                    let message = error.clone();
+                    let _ = activation_sender.send(Err(message));
+                    let _ = sender.send(Err(error));
+                }
+            }
             context.request_repaint();
         });
     }
@@ -16378,6 +16410,28 @@ impl ArchiveFsApp {
                 }
             }
         }
+        if let Some(receiver) = workflow.pcsx2_activation_receiver.take() {
+            match receiver.try_recv() {
+                Ok(Ok(value)) => {
+                    workflow.pcsx2_activation = CheatActivationReadiness::from_bool(value);
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    workflow.pcsx2_activation = CheatActivationReadiness::Unknown;
+                }
+                Err(TryRecvError::Empty) => workflow.pcsx2_activation_receiver = Some(receiver),
+            }
+        }
+        if let Some(receiver) = workflow.dolphin_activation_receiver.take() {
+            match receiver.try_recv() {
+                Ok(Ok(value)) => {
+                    workflow.dolphin_activation = CheatActivationReadiness::from_bool(value);
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    workflow.dolphin_activation = CheatActivationReadiness::Unknown;
+                }
+                Err(TryRecvError::Empty) => workflow.dolphin_activation_receiver = Some(receiver),
+            }
+        }
         let mut pcsx2_history_entry = None;
         if let CheatStepResource::Loading { receiver } = &workflow.pcsx2_inventory {
             match receiver.try_recv() {
@@ -16404,6 +16458,7 @@ impl ArchiveFsApp {
                     }
                 }
                 Ok(Err(message)) => {
+                    workflow.pcsx2_activation = CheatActivationReadiness::Unknown;
                     pcsx2_history_entry = Some(HistoryEntry::new(
                         ActivityAction::Pcsx2PnachInspection,
                         Some(workflow.archive_path.clone()),
@@ -16414,6 +16469,7 @@ impl ArchiveFsApp {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
+                    workflow.pcsx2_activation = CheatActivationReadiness::Unknown;
                     workflow.pcsx2_inventory = CheatStepResource::Failed(
                         "PCSX2 PNACH inspection stopped unexpectedly.".to_string(),
                     );
@@ -16446,6 +16502,7 @@ impl ArchiveFsApp {
                     }
                 }
                 Ok(Err(message)) => {
+                    workflow.dolphin_activation = CheatActivationReadiness::Unknown;
                     dolphin_history_entry = Some(HistoryEntry::new(
                         ActivityAction::DolphinGameIniInspection,
                         Some(workflow.archive_path.clone()),
@@ -16456,6 +16513,7 @@ impl ArchiveFsApp {
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
+                    workflow.dolphin_activation = CheatActivationReadiness::Unknown;
                     workflow.dolphin_inventory = CheatStepResource::Failed(
                         "Dolphin GameSettings inspection stopped unexpectedly.".to_string(),
                     );
@@ -16865,6 +16923,8 @@ impl ArchiveFsApp {
         workflow.selected_dolphin_profile_id = Some(profile_id.clone());
         workflow.dolphin_inventory_profile_id = None;
         workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+        workflow.dolphin_activation = CheatActivationReadiness::Unknown;
+        workflow.dolphin_activation_receiver = None;
         workflow.dolphin_profile_selection = Some(EmulatorProfileSelection::Auto {
             profile_id: profile_id.clone(),
             reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::ExplicitChoice,
@@ -16992,6 +17052,8 @@ impl ArchiveFsApp {
                             workflow.selected_dolphin_profile_id = Some(profile_id.clone());
                             workflow.dolphin_inventory_profile_id = None;
                             workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                            workflow.dolphin_activation = CheatActivationReadiness::Unknown;
+                            workflow.dolphin_activation_receiver = None;
                         } else if !matches!(selection, EmulatorProfileSelection::Auto { .. })
                             && !install_in_progress
                             && workflow
@@ -17002,6 +17064,8 @@ impl ArchiveFsApp {
                             workflow.selected_dolphin_profile_id = None;
                             workflow.dolphin_inventory_profile_id = None;
                             workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                            workflow.dolphin_activation = CheatActivationReadiness::Unknown;
+                            workflow.dolphin_activation_receiver = None;
                         }
                         workflow.dolphin_profile_selection = Some(selection);
                     }
@@ -22971,6 +23035,8 @@ struct CheatWorkflowState {
     /// The PCSX2 profile identity bound to this archive's inventory.
     pcsx2_inventory_profile_id: Option<String>,
     pcsx2_inventory: CheatStepResource<Pcsx2PnachInventory>,
+    pcsx2_activation: CheatActivationReadiness,
+    pcsx2_activation_receiver: Option<Receiver<Result<Option<bool>, String>>>,
     pcsx2_gamehacking: CheatStepResource<Pcsx2GameHackingState>,
     /// Dolphin-family GameHacking.org coverage. Wii is adapted into this
     /// existing state only after its own identity and safety policy runs.
@@ -23013,6 +23079,8 @@ struct CheatWorkflowState {
     /// The Dolphin profile identity bound to this archive's inventory.
     dolphin_inventory_profile_id: Option<String>,
     dolphin_inventory: CheatStepResource<DolphinGameIniInventory>,
+    dolphin_activation: CheatActivationReadiness,
+    dolphin_activation_receiver: Option<Receiver<Result<Option<bool>, String>>>,
     /// External discovery is bound only to exact archive/game/revision identity.
     /// Dolphin paths enter only when the adapter builds the selection below.
     dolphin_provider_request: Option<DolphinProviderRequestKey>,
@@ -23604,6 +23672,72 @@ enum CheatEmulatorAdapter {
     Dolphin,
     Xenia,
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheatActivationReadiness {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+impl CheatActivationReadiness {
+    const fn from_bool(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::Enabled,
+            Some(false) => Self::Disabled,
+            None => Self::Unknown,
+        }
+    }
+}
+
+fn show_cheat_activation_status(
+    ui: &mut egui::Ui,
+    emulator: &str,
+    readiness: CheatActivationReadiness,
+) {
+    let is_xenia = emulator == "Xenia";
+    let (label, tone, detail) = match readiness {
+        CheatActivationReadiness::Enabled => (
+            if is_xenia {
+                "Patch activation: Enabled"
+            } else {
+                "Cheat activation: Enabled"
+            },
+            widgets::StatusTone::Success,
+            None,
+        ),
+        CheatActivationReadiness::Disabled => (
+            if is_xenia {
+                "Patch activation: Disabled"
+            } else {
+                "Cheat activation: Disabled"
+            },
+            widgets::StatusTone::Warning,
+            Some(format!(
+                "Turn on Enable Cheats in {emulator} before playing."
+            )),
+        ),
+        CheatActivationReadiness::Unknown => (
+            if is_xenia {
+                "Patch activation: Not confirmed"
+            } else {
+                "Cheat activation: Not confirmed"
+            },
+            widgets::StatusTone::Warning,
+            Some(if is_xenia {
+                "Patch files can be installed here, but EmuWiz does not currently confirm Xenia's patch activation state.".to_string()
+            } else {
+                format!(
+                    "EmuWiz can install the cheat file, but cannot confirm {emulator} will activate it automatically."
+                )
+            }),
+        ),
+    };
+    widgets::status_badge(ui, label, tone);
+    if let Some(detail) = detail {
+        ui.label(detail);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25477,6 +25611,7 @@ fn show_pcsx2_workflow(
         } else {
             "Choose a usable PCSX2 setup below before installing cheats."
         });
+        show_cheat_activation_status(ui, "PCSX2", workflow.pcsx2_activation);
     });
     widgets::section_header(
         ui,
@@ -25514,6 +25649,8 @@ fn show_pcsx2_workflow(
                 workflow.selected_pcsx2_profile_id = None;
                 workflow.pcsx2_inventory_profile_id = None;
                 workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                workflow.pcsx2_activation = CheatActivationReadiness::Unknown;
+                workflow.pcsx2_activation_receiver = None;
             }
             if discovery.profiles.is_empty() {
                 widgets::banner(
@@ -25722,6 +25859,7 @@ fn show_dolphin_beginner_summary(
     }
     let status = dolphin_beginner_status(workflow);
     widgets::status_badge(ui, status.label(), status.tone());
+    show_cheat_activation_status(ui, "Dolphin", workflow.dolphin_activation);
     match &status {
         BeginnerCheatStatus::CouldNotCheckForCheats { .. } => {
             ui.label(
@@ -26704,6 +26842,7 @@ fn show_xenia_beginner_summary(
     }
     let status = xenia_beginner_status(workflow);
     widgets::status_badge(ui, status.label(), status.tone());
+    show_cheat_activation_status(ui, "Xenia", CheatActivationReadiness::Unknown);
     match &status {
         BeginnerCheatStatus::CouldNotCheckForCheats { .. } => {
             ui.label(
@@ -27821,6 +27960,8 @@ fn show_dolphin_profile_card(
                     });
                     workflow.dolphin_inventory_profile_id = None;
                     workflow.dolphin_inventory = CheatStepResource::NotLoaded;
+                    workflow.dolphin_activation = CheatActivationReadiness::Unknown;
+                    workflow.dolphin_activation_receiver = None;
                     workflow.dolphin_provider_selection = None;
                     workflow.dolphin_destination_error = None;
                     workflow.preview_request = None;
@@ -28131,6 +28272,8 @@ fn show_pcsx2_profile_card(
                     workflow.selected_pcsx2_profile_id = Some(profile.profile_id.clone());
                     workflow.pcsx2_inventory_profile_id = None;
                     workflow.pcsx2_inventory = CheatStepResource::NotLoaded;
+                    workflow.pcsx2_activation = CheatActivationReadiness::Unknown;
+                    workflow.pcsx2_activation_receiver = None;
                 }
                 widgets::status_badge(ui, "Ready for cheat setup", widgets::StatusTone::Success);
             } else {
@@ -31626,6 +31769,9 @@ fn show_cheat_workflow_step1(
     busy: bool,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
+    widgets::card(ui, |ui| {
+        show_cheat_activation_status(ui, "RetroArch", CheatActivationReadiness::Unknown);
+    });
     widgets::section_header(
         ui,
         "Choose a RetroArch profile",

@@ -980,6 +980,25 @@ pub fn inspect_dolphin_profile(
     inspect_dolphin_profile_with_limit(profile, DOLPHIN_MAX_GAME_INI_FILES)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DolphinCheatInspection {
+    pub inventory: DolphinGameIniInventory,
+    pub cheats_enabled: Option<bool>,
+}
+
+pub fn inspect_dolphin_profile_with_activation(
+    profile: &DolphinProfile,
+) -> Result<DolphinCheatInspection, DolphinInspectionError> {
+    let inventory = inspect_dolphin_profile(profile)?;
+    let dolphin_ini = profile.resolved.configuration_root.join("Dolphin.ini");
+    let graphics_ini = profile.resolved.configuration_root.join("GFX.ini");
+    let config = inspect_dolphin_config_paths(&dolphin_ini, &graphics_ini);
+    Ok(DolphinCheatInspection {
+        inventory,
+        cheats_enabled: config.settings.cheats_enabled,
+    })
+}
+
 fn inspect_dolphin_profile_with_limit(
     profile: &DolphinProfile,
     file_limit: usize,
@@ -2439,38 +2458,35 @@ fn dolphin_local_game_id(
 }
 
 fn inspect_dolphin_local_config(profile: &DolphinLocalProfile) -> DolphinConfigInspection {
+    inspect_dolphin_config_paths(&profile.dolphin_ini_path, &profile.graphics_ini_path)
+}
+
+fn inspect_dolphin_config_paths(
+    dolphin_ini_path: &Path,
+    graphics_ini_path: &Path,
+) -> DolphinConfigInspection {
     let mut warnings = Vec::new();
     let dolphin = read_dolphin_local_text(
-        &profile.dolphin_ini_path,
+        dolphin_ini_path,
         DOLPHIN_LOCAL_MAX_CONFIG_BYTES,
         &mut warnings,
     );
     let graphics = read_dolphin_local_text(
-        &profile.graphics_ini_path,
+        graphics_ini_path,
         DOLPHIN_LOCAL_MAX_CONFIG_BYTES,
         &mut warnings,
     );
     let mut settings = DolphinSettings::default();
     if let Some(text) = dolphin.as_deref() {
-        parse_dolphin_local_ini(
-            text,
-            &profile.dolphin_ini_path,
-            &mut settings,
-            &mut warnings,
-        );
+        parse_dolphin_local_ini(text, dolphin_ini_path, &mut settings, &mut warnings);
     }
     if let Some(text) = graphics.as_deref() {
-        parse_dolphin_local_ini(
-            text,
-            &profile.graphics_ini_path,
-            &mut settings,
-            &mut warnings,
-        );
+        parse_dolphin_local_ini(text, graphics_ini_path, &mut settings, &mut warnings);
     }
     DolphinConfigInspection {
-        dolphin_ini_path: profile.dolphin_ini_path.clone(),
-        graphics_ini_path: profile.graphics_ini_path.clone(),
-        exists: profile.dolphin_ini_path.exists() || profile.graphics_ini_path.exists(),
+        dolphin_ini_path: dolphin_ini_path.to_path_buf(),
+        graphics_ini_path: graphics_ini_path.to_path_buf(),
+        exists: dolphin_ini_path.exists() || graphics_ini_path.exists(),
         readable: dolphin.is_some(),
         settings,
         warnings,

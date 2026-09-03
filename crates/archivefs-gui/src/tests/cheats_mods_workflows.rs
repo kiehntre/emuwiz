@@ -17,6 +17,58 @@ use super::*;
 use archivefs_core::patch_manager::SharedPreviewEntry;
 
 #[test]
+fn cheat_activation_projection_preserves_known_pcsx2_and_dolphin_states() {
+    assert_eq!(
+        CheatActivationReadiness::from_bool(Some(true)),
+        CheatActivationReadiness::Enabled
+    );
+    assert_eq!(
+        CheatActivationReadiness::from_bool(Some(false)),
+        CheatActivationReadiness::Disabled
+    );
+    assert_eq!(
+        CheatActivationReadiness::from_bool(None),
+        CheatActivationReadiness::Unknown
+    );
+}
+
+#[test]
+fn cheat_activation_status_renders_disabled_guidance_without_blocking_workflow() {
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_cheat_activation_status(ui, "PCSX2", CheatActivationReadiness::Disabled);
+        });
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Cheat activation: Disabled"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Turn on Enable Cheats in PCSX2 before playing."
+    ));
+}
+
+#[test]
+fn xenia_activation_status_stays_not_confirmed() {
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_cheat_activation_status(ui, "Xenia", CheatActivationReadiness::Unknown);
+        });
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Patch activation: Not confirmed"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "EmuWiz does not currently confirm Xenia's patch activation state."
+    ));
+}
+
+#[test]
 fn gamecube_cancel_notice_is_distinct_from_success_and_failure() {
     let directory = std::env::temp_dir().join(format!(
         "archivefs-gui-gamecube-cancel-{}",
