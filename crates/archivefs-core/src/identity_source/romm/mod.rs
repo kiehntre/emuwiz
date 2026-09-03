@@ -25,6 +25,7 @@ pub mod client;
 pub mod config;
 pub mod enrichment;
 pub mod import;
+pub mod linkage;
 pub mod manual;
 pub mod media_mapping;
 pub mod normalise;
