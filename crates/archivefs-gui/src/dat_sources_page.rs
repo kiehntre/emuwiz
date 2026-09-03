@@ -103,6 +103,11 @@ use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
+use crate::dat_coverage_panel::{
+    CoverageLoad, CoveragePanelRequest, CoverageUnitView, MISSING_PAGE_SIZE, MissingListView,
+    SourceCoverageEntry, is_arcade_ecosystem, project_arcade, project_canonical,
+    show_coverage_section,
+};
 use crate::ui::{components as widgets, theme};
 
 /// Said once on the page, because a DAT audit is the one place a user might
@@ -546,6 +551,9 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) rename_plan: Option<RenamePlanView>,
     /// The gated apply flow: review, confirmation, results and crash recovery.
     pub(crate) rename_apply: RenameApplyView,
+    /// One row per configured DAT source for the "Collection coverage"
+    /// section. `load` is `NotOpened` until the user expands that source.
+    pub(crate) coverage_sources: Vec<SourceCoverageEntry>,
 }
 
 impl DatSourcesPageView {
@@ -1767,6 +1775,22 @@ pub(crate) enum DatSourcesPageAction {
     /// existing "Clear completed history" (`remove_journal`), which this
     /// deliberately does not duplicate.
     HideSettledRecoveryHistory,
+    /// Read this source's DAT coverage from the durable, already-computed
+    /// core aggregation (`Database::platform_dat_coverage` /
+    /// `arcade_dat_set_coverage`). One bounded database read - never a DAT
+    /// parse, ROM inspection, hash, or audit.
+    LoadCoverage {
+        id: String,
+    },
+    /// Re-read a source's coverage after a re-validation.
+    RefreshCoverage {
+        id: String,
+    },
+    /// Fetch the next bounded page of a source's missing canonical
+    /// identities (`Database::missing_dat_canonical_identities`).
+    LoadMoreCoverageMissing {
+        id: String,
+    },
 }
 
 /// A crash-recovery choice, mirroring the journal recovery options.
@@ -2519,6 +2543,27 @@ impl EtaEstimator {
 // State
 // ---------------------------------------------------------------------------
 
+/// One source's cached coverage read: the raw core result (or the database
+/// error), plus the pages of missing canonical identities already fetched.
+struct CoverageCacheEntry {
+    result: Result<CoverageCoreOutcome, String>,
+    /// Accumulated pages of missing canonical identities, in order.
+    missing_names: Vec<String>,
+    /// The offset the next `missing_dat_canonical_identities` page starts
+    /// at.
+    missing_next_offset: u32,
+    /// Whether the last page returned a full `MISSING_PAGE_SIZE` (so more
+    /// may exist).
+    missing_has_more: bool,
+}
+
+/// The core coverage struct a read produced, tagged by unit so the GUI
+/// never feeds an Arcade result into the canonical-entry view.
+enum CoverageCoreOutcome {
+    Canonical(Box<archivefs_core::dat::coverage::PlatformDatCoverage>),
+    Arcade(Box<archivefs_core::dat::coverage::ArcadeDatSetCoverage>),
+}
+
 pub(crate) struct DatSourcesPageState {
     config_path: PathBuf,
     /// Dedicated configuration and storage for explicitly managed DATs. This
@@ -2555,6 +2600,12 @@ pub(crate) struct DatSourcesPageState {
     action_error: Option<String>,
     /// The last validation report for each source, this session.
     validations: BTreeMap<String, DatValidationReport>,
+    /// On-demand DAT coverage reads, keyed by source id. Populated only
+    /// when the user expands a source's coverage panel; each value is one
+    /// bounded read of the authoritative core aggregation plus the pages
+    /// of missing identities the user has scrolled to. Never recomputed
+    /// here, never involves a DAT parse / ROM / hash / audit.
+    coverage_cache: BTreeMap<String, CoverageCacheEntry>,
     /// The grouped diagnostics for each validated source, derived once when the
     /// report lands and cached so the per-frame view rebuild does not re-group
     /// thousands of diagnostics. Kept in lockstep with `validations`.
@@ -2782,6 +2833,7 @@ impl DatSourcesPageState {
             no_intro_action_error: None,
             no_intro_import_status: None,
             database_path: None,
+            coverage_cache: BTreeMap::new(),
             saved,
             draft,
             load_error,
@@ -3409,6 +3461,11 @@ impl DatSourcesPageState {
             }
             DatSourcesPageAction::Validate { id } => self.start_validate(id),
             DatSourcesPageAction::ValidateAll => self.start_validate_all(),
+            DatSourcesPageAction::LoadCoverage { id }
+            | DatSourcesPageAction::RefreshCoverage { id } => self.load_coverage(&id),
+            DatSourcesPageAction::LoadMoreCoverageMissing { id } => {
+                self.load_more_coverage_missing(&id)
+            }
             DatSourcesPageAction::Audit { id, scan_root } => self.start_audit(id, scan_root),
             DatSourcesPageAction::VerifyCatalogue {
                 reference,
@@ -4595,6 +4652,189 @@ impl DatSourcesPageState {
         }
     }
 
+    /// The DAT `<version>` and ecosystem the most recent successful
+    /// validation *this session* recorded for `source_id`, if any. Used
+    /// only to (a) decide canonical vs Arcade coverage and (b) supply the
+    /// "current revision" for the core's currentness check. Never re-parses
+    /// anything.
+    fn session_validated_version_and_ecosystem(
+        &self,
+        source_id: &str,
+    ) -> (
+        Option<String>,
+        Option<archivefs_core::dat::model::DatEcosystem>,
+    ) {
+        let Some(report) = self.validations.get(source_id) else {
+            return (None, None);
+        };
+        for file in &report.files {
+            if let DatFileOutcome::Parsed {
+                ecosystem, version, ..
+            } = &file.outcome
+            {
+                return (version.clone(), Some(*ecosystem));
+            }
+        }
+        (None, None)
+    }
+
+    /// Reads one source's DAT coverage from the authoritative core
+    /// aggregation and caches it. Synchronous: this is a bounded database
+    /// read (one/two `GROUP BY`-shaped queries plus one small scoped scan),
+    /// the same shape as [`Self::mark_dat_source_stale_after_update`]. It
+    /// never parses a DAT, never opens a ROM, never hashes, never starts an
+    /// audit.
+    fn load_coverage(&mut self, id: &str) {
+        let Some(database_path) = self.database_path.clone() else {
+            self.coverage_cache.insert(
+                id.to_string(),
+                CoverageCacheEntry {
+                    result: Err(
+                        "No library database is configured, so coverage cannot be read."
+                            .to_string(),
+                    ),
+                    missing_names: Vec::new(),
+                    missing_next_offset: 0,
+                    missing_has_more: false,
+                },
+            );
+            return;
+        };
+        let Some(entry) = self.draft.get(id).cloned() else {
+            return;
+        };
+        let platform = entry.platform.clone();
+        let configured = entry.enabled;
+
+        // The inventory metadata row (if any) tells us the recorded
+        // ecosystem and revision without a re-parse. A fresher signal from
+        // this session's own validation overrides both.
+        let (session_version, session_ecosystem) = self.session_validated_version_and_ecosystem(id);
+
+        let outcome = archivefs_core::Database::open_or_create(&database_path).and_then(
+            |database| -> archivefs_core::Result<(CoverageCacheEntry, ())> {
+                let meta = database.expected_dat_inventory_meta(id)?;
+                let recorded_ecosystem = meta.as_ref().and_then(|meta| meta.ecosystem);
+                let recorded_revision = meta.as_ref().and_then(|meta| meta.source_revision.clone());
+                // Absence of a fresher session signal is not drift: fall
+                // back to the recorded revision so an untouched source reads
+                // as current, not stale.
+                let current_revision = session_version.clone().or(recorded_revision);
+                let ecosystem = session_ecosystem.or(recorded_ecosystem);
+                let arcade = ecosystem.map(is_arcade_ecosystem).unwrap_or(false);
+
+                let platform_for_scope = platform.clone().unwrap_or_default();
+                let scope = archivefs_core::dat::coverage::CoverageSourceScope {
+                    source_platform: platform.as_deref(),
+                    current_source_revision: current_revision.as_deref(),
+                    configured,
+                };
+
+                if arcade {
+                    let coverage =
+                        database.arcade_dat_set_coverage(&platform_for_scope, id, scope)?;
+                    Ok((
+                        CoverageCacheEntry {
+                            result: Ok(CoverageCoreOutcome::Arcade(Box::new(coverage))),
+                            missing_names: Vec::new(),
+                            missing_next_offset: 0,
+                            missing_has_more: false,
+                        },
+                        (),
+                    ))
+                } else {
+                    let coverage =
+                        database.platform_dat_coverage(&platform_for_scope, id, scope)?;
+                    // Pre-fetch the first page of missing identities so
+                    // "View missing games" is instant. Bounded.
+                    let (missing_names, missing_has_more) = match coverage.missing_count {
+                        Some(missing) if missing > 0 => {
+                            let page = database.missing_dat_canonical_identities(
+                                &platform_for_scope,
+                                id,
+                                scope,
+                                MISSING_PAGE_SIZE,
+                                0,
+                            )?;
+                            let has_more = page.len() as u32 == MISSING_PAGE_SIZE;
+                            (page, has_more)
+                        }
+                        _ => (Vec::new(), false),
+                    };
+                    Ok((
+                        CoverageCacheEntry {
+                            result: Ok(CoverageCoreOutcome::Canonical(Box::new(coverage))),
+                            missing_names: missing_names.clone(),
+                            missing_next_offset: missing_names.len() as u32,
+                            missing_has_more,
+                        },
+                        (),
+                    ))
+                }
+            },
+        );
+
+        let cache_entry = match outcome {
+            Ok((entry, ())) => entry,
+            Err(error) => CoverageCacheEntry {
+                result: Err(format!("Coverage could not be read: {error}")),
+                missing_names: Vec::new(),
+                missing_next_offset: 0,
+                missing_has_more: false,
+            },
+        };
+        self.coverage_cache.insert(id.to_string(), cache_entry);
+    }
+
+    /// Fetches the next bounded page of missing canonical identities for a
+    /// source whose coverage is already loaded.
+    fn load_more_coverage_missing(&mut self, id: &str) {
+        let Some(database_path) = self.database_path.clone() else {
+            return;
+        };
+        let Some(entry) = self.draft.get(id).cloned() else {
+            return;
+        };
+        let Some(cache) = self.coverage_cache.get(id) else {
+            return;
+        };
+        if !cache.missing_has_more {
+            return;
+        }
+        let offset = cache.missing_next_offset;
+        let platform = entry.platform.clone().unwrap_or_default();
+        let configured = entry.enabled;
+        let (session_version, _) = self.session_validated_version_and_ecosystem(id);
+
+        let result =
+            archivefs_core::Database::open_or_create(&database_path).and_then(|database| {
+                let meta = database.expected_dat_inventory_meta(id)?;
+                let recorded_revision = meta.and_then(|meta| meta.source_revision);
+                let current_revision = session_version.or(recorded_revision);
+                let scope = archivefs_core::dat::coverage::CoverageSourceScope {
+                    source_platform: entry.platform.as_deref(),
+                    current_source_revision: current_revision.as_deref(),
+                    configured,
+                };
+                database.missing_dat_canonical_identities(
+                    &platform,
+                    id,
+                    scope,
+                    MISSING_PAGE_SIZE,
+                    offset,
+                )
+            });
+
+        if let Ok(page) = result
+            && let Some(cache) = self.coverage_cache.get_mut(id)
+        {
+            let has_more = page.len() as u32 == MISSING_PAGE_SIZE;
+            cache.missing_next_offset += page.len() as u32;
+            cache.missing_names.extend(page);
+            cache.missing_has_more = has_more;
+        }
+    }
+
     /// Swaps a managed source's current and previous local snapshot.
     /// Synchronous and offline: unlike Check/Update this never spawns the
     /// network worker thread, never constructs an
@@ -5253,8 +5493,47 @@ impl DatSourcesPageState {
             policy: self.policy_view(),
             rename_plan: self.rename_plan_view(),
             rename_apply: self.rename_apply_view(),
+            coverage_sources: self.coverage_sources_view(),
             rows,
         }
+    }
+
+    /// One [`SourceCoverageEntry`] per configured DAT source, folding in
+    /// whatever has been read into [`Self::coverage_cache`]. Pure: no
+    /// database access here - the read already happened in
+    /// [`Self::load_coverage`].
+    fn coverage_sources_view(&self) -> Vec<SourceCoverageEntry> {
+        self.draft
+            .sorted_all()
+            .into_iter()
+            .map(|entry| {
+                let load = match self.coverage_cache.get(&entry.id) {
+                    None => CoverageLoad::NotOpened,
+                    Some(cache) => match &cache.result {
+                        Err(message) => CoverageLoad::Failed(message.clone()),
+                        Ok(CoverageCoreOutcome::Canonical(coverage)) => {
+                            let missing = MissingListView {
+                                names: cache.missing_names.clone(),
+                                has_more: cache.missing_has_more,
+                            };
+                            CoverageLoad::Ready(CoverageUnitView::Canonical(Box::new(
+                                project_canonical(coverage, missing),
+                            )))
+                        }
+                        Ok(CoverageCoreOutcome::Arcade(coverage)) => CoverageLoad::Ready(
+                            CoverageUnitView::Arcade(Box::new(project_arcade(coverage))),
+                        ),
+                    },
+                };
+                SourceCoverageEntry {
+                    source_id: entry.id.clone(),
+                    source_label: entry.display_name.clone(),
+                    platform: entry.platform.clone(),
+                    enabled: entry.enabled,
+                    load,
+                }
+            })
+            .collect()
     }
 
     /// Resolves typed managed configuration only against local state/object
@@ -6549,6 +6828,11 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) plan_typed_confirmation: String,
     /// Whether the advanced recovery surface is narrowed to stale records.
     pub(crate) recovery_stale_review_open: bool,
+    /// Which source's "Collection coverage" panel is expanded. Opening one
+    /// triggers a single bounded coverage read; only one is open at a time.
+    pub(crate) open_coverage: Option<String>,
+    /// Which sources' "View missing games" drill-down lists are showing.
+    pub(crate) coverage_missing_open: BTreeSet<String>,
 }
 
 impl DatSourcesPageUi {
@@ -6577,6 +6861,8 @@ impl DatSourcesPageUi {
         self.plan_page = 0;
         self.plan_typed_confirmation.clear();
         self.recovery_stale_review_open = false;
+        self.open_coverage = None;
+        self.coverage_missing_open.clear();
     }
 }
 
@@ -6718,6 +7004,13 @@ pub(crate) fn show_dat_sources_page(
 
     ui.add_space(12.0);
     if action.is_none()
+        && let Some(coverage_action) = show_dat_coverage_section(ui, view, ui_state)
+    {
+        action = Some(coverage_action);
+    }
+
+    ui.add_space(12.0);
+    if action.is_none()
         && let Some(managed_action) = show_managed_dat_sources_section(ui, view, ui_state)
     {
         action = Some(managed_action);
@@ -6819,6 +7112,37 @@ pub(crate) fn show_dat_sources_page(
     }
 
     action
+}
+
+/// The "Collection coverage" section: how much of each platform's catalogue
+/// the library covers, per source. Every number comes from the authoritative
+/// core aggregation via [`DatSourcesPageState::load_coverage`]; this function
+/// only lays it out and maps the panel's requests onto page actions.
+fn show_dat_coverage_section(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let request = show_coverage_section(
+        ui,
+        &view.coverage_sources,
+        &mut ui_state.open_coverage,
+        &mut ui_state.coverage_missing_open,
+    )?;
+    Some(match request {
+        CoveragePanelRequest::Load { source_id } => {
+            DatSourcesPageAction::LoadCoverage { id: source_id }
+        }
+        CoveragePanelRequest::Refresh { source_id } => {
+            DatSourcesPageAction::RefreshCoverage { id: source_id }
+        }
+        CoveragePanelRequest::LoadMoreMissing { source_id } => {
+            DatSourcesPageAction::LoadMoreCoverageMissing { id: source_id }
+        }
+        CoveragePanelRequest::Validate { source_id } => {
+            DatSourcesPageAction::Validate { id: source_id }
+        }
+    })
 }
 
 /// Explicit one-catalogue Verify entry point. The existing all-enabled

@@ -8231,3 +8231,139 @@ mod persist_expected_inventory {
         // check anything against.
     }
 }
+
+/// The Collection Coverage panel's end-to-end wiring through the page: it
+/// reads the authoritative core aggregation and populates the view, and it
+/// starts no background work of any kind.
+mod dat_coverage_section {
+    use super::*;
+    use crate::dat_coverage_panel::{CoverageLoad, CoverageUnitView, FullSetView};
+
+    fn database_at(fixture: &Fixture) -> PathBuf {
+        let path = fixture.root.join("library.sqlite3");
+        archivefs_core::Database::open_or_create(&path)
+            .unwrap()
+            .close()
+            .unwrap();
+        path
+    }
+
+    /// A page with one folder DAT source assigned to `platform`, backed by
+    /// a real (empty) library database.
+    fn page_with_source(
+        fixture: &Fixture,
+        platform: Option<&str>,
+    ) -> (DatSourcesPageState, String) {
+        let db_path = database_at(fixture);
+        let folder = fixture.dir("cov-dat");
+        let mut page = fixture.page().with_database_path(Some(db_path));
+        page.apply(DatSourcesPageAction::AddFolder {
+            path: folder.clone(),
+        });
+        let id = "cov-dat".to_string();
+        page.apply(DatSourcesPageAction::SetPlatform {
+            id: id.clone(),
+            platform: platform.map(str::to_string),
+        });
+        (page, id)
+    }
+
+    #[test]
+    fn loading_coverage_reads_the_core_and_starts_no_job() {
+        let fixture = Fixture::new();
+        let (mut page, id) = page_with_source(&fixture, Some("Game Boy Advance"));
+
+        page.apply(DatSourcesPageAction::LoadCoverage { id: id.clone() });
+
+        // No background work of any kind.
+        assert!(!page.is_busy());
+        let view = page.view();
+        assert!(view.running.is_none());
+        assert!(view.audit.is_none());
+        // The registry has one source and the coverage view has a row for
+        // it, now Ready (an empty library, never validated -> the expected
+        // inventory is missing, verification metrics are all zero).
+        assert_eq!(view.coverage_sources.len(), 1);
+        let entry = &view.coverage_sources[0];
+        match &entry.load {
+            CoverageLoad::Ready(CoverageUnitView::Canonical(canonical)) => {
+                assert_eq!(canonical.owned, 0);
+                assert!(!canonical.expected.is_available());
+                // Not a fabricated 0% / 0 missing.
+                assert_eq!(canonical.missing_count, None);
+                assert_eq!(canonical.completion_percent, None);
+            }
+            other => panic!("expected a Ready canonical coverage, got {other:?}"),
+        }
+        // Loading coverage never produced a validation report.
+        assert!(page.validations.is_empty());
+    }
+
+    #[test]
+    fn an_unassigned_source_loads_verification_metrics_but_no_expected_denominator() {
+        let fixture = Fixture::new();
+        let (mut page, id) = page_with_source(&fixture, None);
+
+        page.apply(DatSourcesPageAction::LoadCoverage { id });
+        assert!(!page.is_busy());
+
+        let view = page.view();
+        let entry = &view.coverage_sources[0];
+        match &entry.load {
+            CoverageLoad::Ready(CoverageUnitView::Canonical(canonical)) => {
+                assert!(!canonical.expected.is_available());
+                assert!(matches!(
+                    canonical.full_set,
+                    FullSetView::NotProvable { .. }
+                ));
+                assert_eq!(canonical.missing_count, None);
+            }
+            other => panic!("expected Ready canonical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_re_reads_without_starting_a_job() {
+        let fixture = Fixture::new();
+        let (mut page, id) = page_with_source(&fixture, Some("NES"));
+        page.apply(DatSourcesPageAction::LoadCoverage { id: id.clone() });
+        page.apply(DatSourcesPageAction::RefreshCoverage { id });
+        assert!(!page.is_busy());
+        assert!(page.validations.is_empty());
+        assert!(matches!(
+            page.view().coverage_sources[0].load,
+            CoverageLoad::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn a_page_without_a_database_reports_a_read_failure_not_a_panic() {
+        let fixture = Fixture::new();
+        let folder = fixture.dir("no-db-dat");
+        let mut page = fixture.page(); // no with_database_path -> None
+        page.apply(DatSourcesPageAction::AddFolder { path: folder });
+        page.apply(DatSourcesPageAction::LoadCoverage {
+            id: "no-db-dat".to_string(),
+        });
+        assert!(!page.is_busy());
+        assert!(matches!(
+            page.view().coverage_sources[0].load,
+            CoverageLoad::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn the_coverage_section_renders_and_the_headline_uses_plain_wording() {
+        let fixture = Fixture::new();
+        let (page, _id) = page_with_source(&fixture, Some("Game Boy Advance"));
+        let view = page.view();
+        let mut ui_state = DatSourcesPageUi::default();
+        let output = render_with_details(&view, &mut ui_state);
+        assert!(rendered_text_contains(&output, "Collection coverage"));
+        // Beginner wording, not raw "DAT".
+        assert!(rendered_text_contains(
+            &output,
+            "How much of each platform's catalogue"
+        ));
+    }
+}
