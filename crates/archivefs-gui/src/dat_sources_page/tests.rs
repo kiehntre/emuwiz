@@ -3076,6 +3076,7 @@ fn minimal_outcome() -> DatAuditOutcome {
         content: Default::default(),
         platform: None,
         cache: Default::default(),
+        known_hashes: Default::default(),
     }
 }
 

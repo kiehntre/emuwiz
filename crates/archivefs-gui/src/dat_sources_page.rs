@@ -4736,16 +4736,36 @@ impl DatSourcesPageState {
                         match archivefs_core::Database::open_or_create(&database_path).and_then(
                             |mut database| {
                                 let persisted = database.persist_dat_audit_results(&outcome)?;
+                                // A projection of the audit already above -
+                                // no additional scan, hash, or match. See
+                                // `Database::persist_library_dat_identities_from_audit`
+                                // for exactly what is/is not safe to persist
+                                // (a combined audit is refused the same way
+                                // `persist_dat_audit_results` already is,
+                                // never called for one - see
+                                // `start_combined_audit`).
+                                let identities =
+                                    database.persist_library_dat_identities_from_audit(&outcome)?;
                                 let enrichment = database
                                     .enrich_platforms_from_dat_audit(&outcome, generation)?;
-                                Ok((persisted, enrichment))
+                                Ok((persisted, identities, enrichment))
                             },
                         ) {
-                            Ok((persisted, enrichment)) => {
+                            Ok((persisted, identities, enrichment)) => {
                                 send_progress(
                                     &sender,
                                     JobMessage::Progress(format!(
-                                        "Persisted {persisted} set verdict(s). Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                                        "Persisted {persisted} set verdict(s) and {} library DAT identity row(s) ({} updated{}). Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                                        identities.inserted,
+                                        identities.updated,
+                                        if identities.unassociated > 0 || identities.ambiguous > 0 {
+                                            format!(
+                                                ", {} unmatched, {} ambiguous",
+                                                identities.unassociated, identities.ambiguous
+                                            )
+                                        } else {
+                                            String::new()
+                                        },
                                         enrichment.applied,
                                         enrichment.unchanged,
                                         enrichment.manual_preserved,
@@ -4758,7 +4778,7 @@ impl DatSourcesPageState {
                                 send_progress(
                                     &sender,
                                     JobMessage::Progress(format!(
-                                        "DAT audit completed, but platform identity metadata could not be updated: {error}"
+                                        "DAT audit completed, but its results could not be fully saved to the catalogue database: {error}"
                                     )),
                                 );
                                 None

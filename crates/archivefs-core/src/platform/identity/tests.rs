@@ -114,6 +114,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         content: Default::default(),
         platform: platform.map(str::to_string),
         cache: Default::default(),
+        known_hashes: Default::default(),
     }
 }
 

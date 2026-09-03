@@ -82,6 +82,13 @@ use crate::safe_read::TrustedRoots;
 /// keeping the walk finite on a tree that has been made pathological.
 pub const MAX_SCAN_DEPTH: usize = 8;
 
+/// [`DatAuditOutcome::source_id`] for a combined multi-source audit
+/// (`run_combined_dat_audit`) - synthetic, never a real configured DAT
+/// source id. Anything keying persistence off a per-entry DAT source
+/// (`crate::dat::library_identity_projection`) must refuse this value
+/// rather than attribute a match to it.
+pub const COMBINED_AUDIT_SOURCE_ID: &str = "combined-enabled-dat-sources";
+
 /// How many files are processed in one bounded hashing chunk.
 ///
 /// This is no longer a whole-audit ceiling: every chunk contributes to one
@@ -317,6 +324,54 @@ pub struct DatAuditOutcome {
     pub platform: Option<String>,
     #[serde(default)]
     pub cache: AuditCacheMetrics,
+    /// The exact per-file hashes `report.entries`' verdicts were decided
+    /// from, keyed by the same `local_path` string `AuditEntry` uses.
+    /// Retained only so a later persistence/projection step (see
+    /// `crate::dat::library_identity_projection`) can snapshot the audited
+    /// hash state without hashing anything again - never re-derived,
+    /// re-hashed, or recomputed. Absent for a file with no computed hash
+    /// (filename-only evidence, or a file that could not be hashed - see
+    /// [`Self::unhashed`]).
+    #[serde(default)]
+    pub known_hashes: std::collections::BTreeMap<String, AuditedFileHashes>,
+}
+
+/// The hash fields [`crate::dat::audit::KnownFileEvidence`] already computed
+/// for one file, retained on [`DatAuditOutcome`] verbatim - a separate type
+/// (rather than reusing `KnownFileEvidence` directly) only so this module
+/// does not need to add `PartialEq`/`Serialize` to a type owned by
+/// `crate::dat::audit`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AuditedFileHashes {
+    pub size_bytes: Option<u64>,
+    pub crc32: Option<String>,
+    pub md5: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
+}
+
+impl From<&KnownFileEvidence> for AuditedFileHashes {
+    fn from(evidence: &KnownFileEvidence) -> Self {
+        Self {
+            size_bytes: evidence.size_bytes,
+            crc32: evidence.crc32.clone(),
+            md5: evidence.md5.clone(),
+            sha1: evidence.sha1.clone(),
+            sha256: evidence.sha256.clone(),
+        }
+    }
+}
+
+/// Builds the `local_path -> hashes` map [`DatAuditOutcome::known_hashes`]
+/// carries, from the same `known` evidence slice that already produced
+/// `report` - no additional hashing.
+fn known_hashes_by_path(
+    known: &[KnownFileEvidence],
+) -> std::collections::BTreeMap<String, AuditedFileHashes> {
+    known
+        .iter()
+        .map(|evidence| (evidence.filepath.clone(), AuditedFileHashes::from(evidence)))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -748,6 +803,7 @@ pub fn run_dat_audit_with_cache(
             let _ = cache.save();
             cache.metrics.clone()
         },
+        known_hashes: known_hashes_by_path(&known),
     };
     Ok(outcome)
 }
@@ -1040,7 +1096,7 @@ pub fn run_combined_dat_audit_with_cache(
     };
 
     let outcome = DatAuditOutcome {
-        source_id: "combined-enabled-dat-sources".to_string(),
+        source_id: COMBINED_AUDIT_SOURCE_ID.to_string(),
         source_display_name: "All enabled evidence catalogues".to_string(),
         dat_path: "multiple local and managed DAT catalogues".to_string(),
         scan_root: request.scan_root.to_string_lossy().into_owned(),
@@ -1075,6 +1131,7 @@ pub fn run_combined_dat_audit_with_cache(
             let _ = cache.save();
             cache.metrics.clone()
         },
+        known_hashes: known_hashes_by_path(&hashed.known),
     };
     Ok(outcome)
 }

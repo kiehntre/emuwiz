@@ -2143,6 +2143,146 @@ pub enum LibraryDatIdentityPersistOutcome {
     SkippedProtectedPriorResult,
 }
 
+/// What [`Database::persist_library_dat_identities_from_audit`] did with one
+/// completed audit's worth of entries. Every count is accounted for -
+/// nothing is silently dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LibraryDatIdentityAuditPersistOutcome {
+    /// New `(archive_id, dat_source_id)` rows written.
+    pub inserted: usize,
+    /// Existing rows replaced atomically.
+    pub updated: usize,
+    /// A partial-run negative result that would have clobbered a prior
+    /// positive row for the same item/source; the prior row was left
+    /// untouched (see [`LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult`]).
+    pub skipped_protected_prior_result: usize,
+    /// Entries the projection itself withheld because the run's
+    /// completeness makes their negative verdict unsafe to persist (see
+    /// `crate::dat::library_identity_projection`'s module doc).
+    pub negative_incomplete_skipped: usize,
+    /// Entries whose path matched no known library item.
+    pub unassociated: usize,
+    /// Entries whose path matched more than one library item - a data
+    /// inconsistency, never guessed at.
+    pub ambiguous: usize,
+    /// Set only when the whole outcome was refused before any row was
+    /// considered (a combined multi-source audit - see
+    /// `crate::dat::library_identity_projection`'s module doc). Every other
+    /// field is `0` when this is set.
+    pub refused:
+        Option<crate::dat::library_identity_projection::LibraryDatIdentityProjectionRefusal>,
+}
+
+/// Shared write path for one `(archive_id, dat_source_id)` row, usable
+/// against either a bare `&Connection` (autocommit - the single-item public
+/// API) or a `&Transaction` (the audit-batch import, one commit for many
+/// rows) - `rusqlite::Transaction` derefs to `Connection`, so one function
+/// serves both without duplicating the UPSERT.
+fn persist_library_dat_identity_row(
+    conn: &Connection,
+    archive_id: i64,
+    persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+    now: &str,
+) -> Result<LibraryDatIdentityPersistOutcome> {
+    use crate::dat::library_identity_summary::DatAuditCompleteness;
+
+    let source_id = persisted.source.source_id.clone();
+    let existing = library_dat_identity_for_item_conn(conn, archive_id, &source_id)?;
+
+    if persisted.completeness == DatAuditCompleteness::Partial
+        && !persisted.carries_identity()
+        && existing
+            .as_ref()
+            .is_some_and(|prior| prior.carries_identity())
+    {
+        return Ok(LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult);
+    }
+
+    let facts_json = serde_json::to_vec(persisted).map_err(|error| {
+        ArchiveFsError::Database(format!("failed to serialize library DAT identity: {error}"))
+    })?;
+    let ecosystem = persisted
+        .source
+        .ecosystem
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| value.as_str().map(str::to_string));
+    let state = serde_json::to_value(&persisted.verification_state)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("state")
+                .and_then(|state| state.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let completeness = match persisted.completeness {
+        DatAuditCompleteness::Exhaustive => "exhaustive",
+        DatAuditCompleteness::Partial => "partial",
+    };
+
+    let outcome = if existing.is_some() {
+        LibraryDatIdentityPersistOutcome::Updated
+    } else {
+        LibraryDatIdentityPersistOutcome::Inserted
+    };
+
+    conn.execute(
+        "INSERT INTO library_dat_identities \
+         (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
+          completeness, audited_at, revision_marked_stale, facts_json, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9) \
+         ON CONFLICT(archive_id, dat_source_id) DO UPDATE SET \
+          dat_ecosystem = excluded.dat_ecosystem, \
+          source_revision = excluded.source_revision, \
+          verification_state = excluded.verification_state, \
+          completeness = excluded.completeness, \
+          audited_at = excluded.audited_at, \
+          revision_marked_stale = 0, \
+          facts_json = excluded.facts_json, \
+          updated_at = excluded.updated_at",
+        params![
+            archive_id,
+            source_id,
+            ecosystem,
+            persisted.source.source_revision,
+            state,
+            completeness,
+            persisted.audited_at,
+            facts_json,
+            now,
+        ],
+    )
+    .map_err(|error| db_error("failed to persist library DAT identity", error))?;
+
+    Ok(outcome)
+}
+
+/// Shared read path behind [`Database::library_dat_identity_for_item`] -
+/// see [`persist_library_dat_identity_row`] for why this takes `&Connection`
+/// rather than `&Database`.
+fn library_dat_identity_for_item_conn(
+    conn: &Connection,
+    archive_id: i64,
+    dat_source_id: &str,
+) -> Result<Option<crate::dat::library_identity_summary::PersistedLibraryDatIdentity>> {
+    conn.query_row(
+        "SELECT facts_json FROM library_dat_identities \
+         WHERE archive_id = ?1 AND dat_source_id = ?2",
+        params![archive_id, dat_source_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(|error| db_error("failed to read library DAT identity", error))?
+    .map(|bytes| {
+        serde_json::from_slice(&bytes).map_err(|error| {
+            ArchiveFsError::Database(format!(
+                "stored library DAT identity is unreadable: {error}"
+            ))
+        })
+    })
+    .transpose()
+}
+
 /// What persisting one current-generation platform identity resolution did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformIdentityApplyOutcome {
@@ -4336,79 +4476,8 @@ impl Database {
         archive_id: i64,
         persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
     ) -> Result<LibraryDatIdentityPersistOutcome> {
-        use crate::dat::library_identity_summary::DatAuditCompleteness;
-
-        let source_id = persisted.source.source_id.clone();
-        let existing = self.library_dat_identity_for_item(archive_id, &source_id)?;
-
-        if persisted.completeness == DatAuditCompleteness::Partial
-            && !persisted.carries_identity()
-            && existing
-                .as_ref()
-                .is_some_and(|prior| prior.carries_identity())
-        {
-            return Ok(LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult);
-        }
-
-        let facts_json = serde_json::to_vec(persisted).map_err(|error| {
-            ArchiveFsError::Database(format!("failed to serialize library DAT identity: {error}"))
-        })?;
-        let ecosystem = persisted
-            .source
-            .ecosystem
-            .and_then(|value| serde_json::to_value(value).ok())
-            .and_then(|value| value.as_str().map(str::to_string));
-        let state = serde_json::to_value(&persisted.verification_state)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("state")
-                    .and_then(|state| state.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        let completeness = match persisted.completeness {
-            DatAuditCompleteness::Exhaustive => "exhaustive",
-            DatAuditCompleteness::Partial => "partial",
-        };
         let now = now_utc_string();
-
-        let outcome = if existing.is_some() {
-            LibraryDatIdentityPersistOutcome::Updated
-        } else {
-            LibraryDatIdentityPersistOutcome::Inserted
-        };
-
-        self.connection
-            .execute(
-                "INSERT INTO library_dat_identities \
-                 (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
-                  completeness, audited_at, revision_marked_stale, facts_json, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9) \
-                 ON CONFLICT(archive_id, dat_source_id) DO UPDATE SET \
-                  dat_ecosystem = excluded.dat_ecosystem, \
-                  source_revision = excluded.source_revision, \
-                  verification_state = excluded.verification_state, \
-                  completeness = excluded.completeness, \
-                  audited_at = excluded.audited_at, \
-                  revision_marked_stale = 0, \
-                  facts_json = excluded.facts_json, \
-                  updated_at = excluded.updated_at",
-                params![
-                    archive_id,
-                    source_id,
-                    ecosystem,
-                    persisted.source.source_revision,
-                    state,
-                    completeness,
-                    persisted.audited_at,
-                    facts_json,
-                    now,
-                ],
-            )
-            .map_err(|error| db_error("failed to persist library DAT identity", error))?;
-
-        Ok(outcome)
+        persist_library_dat_identity_row(&self.connection, archive_id, persisted, &now)
     }
 
     /// The stored DAT identity for one library item and one DAT source, if
@@ -4418,23 +4487,91 @@ impl Database {
         archive_id: i64,
         dat_source_id: &str,
     ) -> Result<Option<crate::dat::library_identity_summary::PersistedLibraryDatIdentity>> {
-        self.connection
-            .query_row(
-                "SELECT facts_json FROM library_dat_identities \
-                 WHERE archive_id = ?1 AND dat_source_id = ?2",
-                params![archive_id, dat_source_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .map_err(|error| db_error("failed to read library DAT identity", error))?
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    ArchiveFsError::Database(format!(
-                        "stored library DAT identity is unreadable: {error}"
-                    ))
-                })
-            })
-            .transpose()
+        library_dat_identity_for_item_conn(&self.connection, archive_id, dat_source_id)
+    }
+
+    /// Persists per-library-item DAT identity rows from one completed,
+    /// single-source DAT audit outcome - a projection of the audit the
+    /// caller already ran (see
+    /// [`crate::dat::library_identity_projection::project_dat_audit_for_library_identity`]),
+    /// never a new scan, hash, or match.
+    ///
+    /// Association from each audited path to a library item is done here,
+    /// one exact indexed lookup per audited entry
+    /// ([`Self::find_archive_id_by_absolute_path`]) - the same targeted,
+    /// per-row approach [`Self::persist_dat_audit_results`] already uses for
+    /// Arcade set verdicts, so this stays O(audit rows), never a full
+    /// library scan. An item whose path matches zero or more than one
+    /// archive is skipped (counted, never guessed) rather than persisted
+    /// against the wrong - or an invented - `archive_id`. Every accepted
+    /// row is then written in one transaction, so a batch of thousands of
+    /// rows takes one commit rather than one per item.
+    ///
+    /// Never fails the caller's audit: a database error here is returned so
+    /// the caller can report it, but the audit outcome itself (already
+    /// shown to the user) is never touched or invalidated by this call.
+    pub fn persist_library_dat_identities_from_audit(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+    ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
+        let now = now_utc_string();
+        let projection =
+            match crate::dat::library_identity_projection::project_dat_audit_for_library_identity(
+                outcome, &now,
+            ) {
+                Ok(projection) => projection,
+                Err(refusal) => {
+                    return Ok(LibraryDatIdentityAuditPersistOutcome {
+                        refused: Some(refusal),
+                        ..Default::default()
+                    });
+                }
+            };
+
+        // Resolve archive ids first, before opening the write transaction:
+        // each lookup is a plain, unlocked SELECT, and doing them up front
+        // mirrors `persist_dat_audit_results`'s own established shape.
+        let mut resolved = Vec::with_capacity(projection.items.len());
+        let mut unassociated = 0usize;
+        let mut ambiguous = 0usize;
+        for item in &projection.items {
+            match self.find_archive_id_by_absolute_path(Path::new(&item.local_path)) {
+                Ok(Some(archive_id)) => resolved.push((archive_id, &item.identity)),
+                Ok(None) => unassociated += 1,
+                Err(_) => ambiguous += 1,
+            }
+        }
+
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        let mut skipped_protected_prior_result = 0usize;
+        if !resolved.is_empty() {
+            let tx = self.connection.transaction().map_err(|error| {
+                db_error("failed to start library DAT identity transaction", error)
+            })?;
+            for (archive_id, persisted) in &resolved {
+                match persist_library_dat_identity_row(&tx, *archive_id, persisted, &now)? {
+                    LibraryDatIdentityPersistOutcome::Inserted => inserted += 1,
+                    LibraryDatIdentityPersistOutcome::Updated => updated += 1,
+                    LibraryDatIdentityPersistOutcome::SkippedProtectedPriorResult => {
+                        skipped_protected_prior_result += 1;
+                    }
+                }
+            }
+            tx.commit().map_err(|error| {
+                db_error("failed to commit library DAT identity transaction", error)
+            })?;
+        }
+
+        Ok(LibraryDatIdentityAuditPersistOutcome {
+            inserted,
+            updated,
+            skipped_protected_prior_result,
+            negative_incomplete_skipped: projection.skipped.len(),
+            unassociated,
+            ambiguous,
+            refused: None,
+        })
     }
 
     /// Every stored DAT identity for one library item, one per DAT source,
@@ -11280,6 +11417,7 @@ mod tests {
             content: Default::default(),
             platform: Some("PSP".to_string()),
             cache: Default::default(),
+            known_hashes: Default::default(),
         };
 
         let summary = database
@@ -11371,6 +11509,7 @@ mod tests {
             content: Default::default(),
             platform: Some("Arcade".to_string()),
             cache: Default::default(),
+            known_hashes: Default::default(),
         };
 
         assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 1);
@@ -11437,6 +11576,417 @@ mod tests {
                 .len(),
             1
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // -------------------------------------------------------------------
+    // `persist_library_dat_identities_from_audit`: the production wiring
+    // from a completed, single-source DAT audit into `library_dat_identities`
+    // - a projection of the audit the caller already ran, never a new scan,
+    // hash, or match.
+    // -------------------------------------------------------------------
+
+    fn single_source_outcome(
+        source_id: &str,
+        entries: Vec<crate::dat::audit::AuditEntry>,
+    ) -> crate::dat::sources::audit_run::DatAuditOutcome {
+        use crate::dat::audit::{AuditReport, AuditSummary};
+        use crate::dat::sources::audit_run::DatAuditOutcome;
+        DatAuditOutcome {
+            source_id: source_id.to_string(),
+            source_display_name: "No-Intro PSP".to_string(),
+            dat_path: "/catalogues/psp.dat".to_string(),
+            scan_root: "/roms/psp".to_string(),
+            catalogue_names: vec!["Sony - PlayStation Portable".to_string()],
+            catalogue_entries: 1,
+            catalogue_roms: 1,
+            catalogue_version: Some("20240501-000000".to_string()),
+            catalogue_author: Some("No-Intro".to_string()),
+            catalogue_homepage: None,
+            catalogue_ecosystem: Some(crate::dat::model::DatEcosystem::NoIntro),
+            unreadable_catalogues: Vec::new(),
+            report: AuditReport {
+                summary: AuditSummary::default(),
+                entries,
+            },
+            evidence_sources: Vec::new(),
+            archives: Vec::new(),
+            sets: Vec::new(),
+            unhashed: Vec::new(),
+            files_scanned: 1,
+            bytes_hashed: 9,
+            archive_bytes_hashed: 0,
+            truncated: false,
+            policy: None,
+            content: Default::default(),
+            platform: Some("PSP".to_string()),
+            cache: Default::default(),
+            known_hashes: Default::default(),
+        }
+    }
+
+    fn exact_entry(local_path: &str, game_name: &str) -> crate::dat::audit::AuditEntry {
+        use crate::dat::audit::{AuditEntry, AuditVerdict};
+        AuditEntry {
+            local_path: local_path.to_string(),
+            local_filename: Path::new(local_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            verdict: AuditVerdict::Exact {
+                game_name: game_name.to_string(),
+                rom_name: format!("{game_name}.zip"),
+                algorithm: "SHA-1",
+            },
+        }
+    }
+
+    #[test]
+    fn a_completed_audit_persists_a_verified_item_against_the_correct_archive() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-verified");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let path = archive.absolute_path.display().to_string();
+        let outcome = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
+
+        let result = database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.unassociated, 0);
+        assert_eq!(result.ambiguous, 0);
+        assert_eq!(result.negative_incomplete_skipped, 0);
+        assert!(result.refused.is_none());
+
+        // Persisted archive_id is the correct library item.
+        let persisted = database
+            .library_dat_identity_for_item(archive_id, "no-intro-psp")
+            .unwrap()
+            .expect("row was written");
+        // Persisted dat_source_id is the actual source, ecosystem/revision
+        // survive round-trip.
+        assert_eq!(persisted.source.source_id, "no-intro-psp");
+        assert_eq!(
+            persisted.source.ecosystem,
+            Some(crate::dat::model::DatEcosystem::NoIntro)
+        );
+        assert_eq!(
+            persisted.source.source_revision.as_deref(),
+            Some("20240501-000000")
+        );
+        // Verification state survives round-trip.
+        assert_eq!(
+            persisted.verification_state,
+            crate::dat::library_identity_summary::DatVerificationState::VerifiedSingleMatch {
+                algorithm: "SHA-1".to_string()
+            }
+        );
+        assert_eq!(
+            persisted.canonical.canonical_dat_name.as_deref(),
+            Some("Mystery")
+        );
+
+        // `library_dat_identity_summary_for_item` can read the row written
+        // by the production projection.
+        let summary = database
+            .library_dat_identity_summary_for_item(archive_id, "no-intro-psp", None, None, true)
+            .unwrap()
+            .expect("summary reconstructs");
+        assert!(summary.is_verified());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_dat_sources_persist_separate_rows_for_one_archive() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-two-sources");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let path = archive.absolute_path.display().to_string();
+
+        let no_intro = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
+        let redump =
+            single_source_outcome("redump-psp", vec![exact_entry(&path, "Mystery (Redump)")]);
+        database
+            .persist_library_dat_identities_from_audit(&no_intro)
+            .unwrap();
+        database
+            .persist_library_dat_identities_from_audit(&redump)
+            .unwrap();
+
+        let all = database
+            .library_dat_identities_for_item(archive_id)
+            .unwrap();
+        assert_eq!(all.len(), 2, "one archive, two independent source rows");
+        let mut source_ids: Vec<&str> = all
+            .iter()
+            .map(|row| row.source.source_id.as_str())
+            .collect();
+        source_ids.sort();
+        assert_eq!(source_ids, vec!["no-intro-psp", "redump-psp"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_repeated_audit_updates_the_row_rather_than_duplicating() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-repeat");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let path = archive.absolute_path.display().to_string();
+
+        let first = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
+        let result = database
+            .persist_library_dat_identities_from_audit(&first)
+            .unwrap();
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.updated, 0);
+
+        let second = single_source_outcome(
+            "no-intro-psp",
+            vec![exact_entry(&path, "Mystery (Revised)")],
+        );
+        let result = database
+            .persist_library_dat_identities_from_audit(&second)
+            .unwrap();
+        assert_eq!(
+            result.inserted, 0,
+            "the same (archive, source) row is updated"
+        );
+        assert_eq!(result.updated, 1);
+
+        let all = database
+            .library_dat_identities_for_item(archive_id)
+            .unwrap();
+        assert_eq!(all.len(), 1, "still exactly one row, not two");
+        assert_eq!(
+            all[0].canonical.canonical_dat_name.as_deref(),
+            Some("Mystery (Revised)")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_ambiguous_archive_association_is_not_persisted() {
+        // Two archives sharing one absolute path is a data inconsistency
+        // `find_archive_id_by_absolute_path` already refuses to resolve;
+        // the batch import must skip that entry rather than guess.
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-ambiguous");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        // A second archive row with a different `relative_path` (required by
+        // `archives`' own `(source_folder_id, relative_path)` uniqueness)
+        // but the identical `absolute_path_cached` - the exact ambiguity
+        // `find_archive_id_by_absolute_path` is documented to refuse.
+        database
+            .connection
+            .execute(
+                "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, \
+                 file_name_cached, archive_kind, display_name, normalized_name, size_bytes, \
+                 modified_time_unix_seconds, content_hash, archive_hash, internal_listing_hash, \
+                 last_known_health, first_seen_at, last_seen_at, created_at, updated_at) \
+                 SELECT source_folder_id, relative_path || '.duplicate', absolute_path_cached, \
+                        file_name_cached, archive_kind, display_name, normalized_name, size_bytes, \
+                        modified_time_unix_seconds, content_hash, archive_hash, \
+                        internal_listing_hash, last_known_health, first_seen_at, last_seen_at, \
+                        created_at, updated_at \
+                 FROM archives WHERE id = ?1",
+                params![archive_id],
+            )
+            .unwrap();
+
+        let path = archive.absolute_path.display().to_string();
+        let outcome = single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
+        let result = database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        assert_eq!(result.ambiguous, 1);
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.updated, 0);
+        assert!(
+            database
+                .library_dat_identities_for_item(archive_id)
+                .unwrap()
+                .is_empty(),
+            "no row is persisted for an ambiguously-associated entry"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unmatched_path_is_not_persisted() {
+        let (root, mut database, _archive_id) =
+            unknown_archive_database("dat-identity-audit-unmatched-path");
+        let outcome = single_source_outcome(
+            "no-intro-psp",
+            vec![exact_entry("/roms/psp/Not In The Library.iso", "Ghost")],
+        );
+
+        let result = database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        assert_eq!(result.unassociated, 1);
+        assert_eq!(result.inserted, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_combined_audit_outcome_is_refused_and_persists_nothing() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-combined-refused");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let path = archive.absolute_path.display().to_string();
+        let mut outcome =
+            single_source_outcome("no-intro-psp", vec![exact_entry(&path, "Mystery")]);
+        outcome.source_id = crate::dat::sources::audit_run::COMBINED_AUDIT_SOURCE_ID.to_string();
+
+        let result = database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        assert_eq!(
+            result.refused,
+            Some(
+                crate::dat::library_identity_projection::LibraryDatIdentityProjectionRefusal::CombinedAudit
+            )
+        );
+        assert_eq!(result.inserted, 0);
+        assert!(
+            database
+                .library_dat_identities_for_item(archive_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_truncated_audit_does_not_persist_an_unsafe_negative_conclusion() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-truncated-negative");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let path = archive.absolute_path.display().to_string();
+        let mut outcome = single_source_outcome(
+            "no-intro-psp",
+            vec![crate::dat::audit::AuditEntry {
+                local_path: path,
+                local_filename: "Mystery.zip".to_string(),
+                verdict: crate::dat::audit::AuditVerdict::NotInDat,
+            }],
+        );
+        outcome.truncated = true;
+
+        let result = database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.negative_incomplete_skipped, 1);
+        assert!(
+            database
+                .library_dat_identities_for_item(archive_id)
+                .unwrap()
+                .is_empty(),
+            "no misleading negative row from an incomplete run"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_dat_set_audit_results_behaviour_is_unchanged_alongside_identity_persistence() {
+        // `persist_dat_audit_results` (Arcade set verdicts) and
+        // `persist_library_dat_identities_from_audit` (flat per-item
+        // identity) are independent, sibling writers over the same
+        // completed outcome - calling the new one must not change what the
+        // existing one already does.
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-identity-audit-sets-unchanged");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let path = archive.absolute_path.display().to_string();
+        let mut outcome = single_source_outcome("mame-arcade", vec![exact_entry(&path, "Mystery")]);
+        outcome.sets = vec![crate::dat::set::SetResolution {
+            identity: crate::dat::set::SetIdentity {
+                source_id: "mame-arcade".to_string(),
+                game_name: "game".to_string(),
+            },
+            archive_path: archive.absolute_path.clone(),
+            state: crate::dat::set::SetState::Complete,
+            members_required: vec!["game.rom".to_string()],
+            members_verified: vec!["game.rom".to_string()],
+            members_bad: Vec::new(),
+            members_optional: Vec::new(),
+            members_borrowed: Vec::new(),
+            disks_required: Vec::new(),
+            disks_verified: Vec::new(),
+            disks_parent_required: Vec::new(),
+            dependencies: crate::dat::dependency::SetDependencyReport::from_requirements(vec![]),
+        }];
+
+        assert_eq!(database.persist_dat_audit_results(&outcome).unwrap(), 1);
+        assert_eq!(
+            database
+                .set_audit_result(&archive.absolute_path, "mame-arcade", "game")
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::dat::set::SetState::Complete
+        );
+
+        let identity_result = database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        assert_eq!(identity_result.inserted, 1);
+
+        // The set-level row is completely unaffected.
+        assert_eq!(
+            database
+                .set_audit_result(&archive.absolute_path, "mame-arcade", "game")
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::dat::set::SetState::Complete
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
