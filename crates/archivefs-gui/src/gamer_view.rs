@@ -1343,8 +1343,11 @@ pub(crate) fn show_gamer_view(
     // left below it).
     let available_width = ui.available_width();
     let available_height = ui.available_height();
-    let list_width = (available_width * 0.6).max(280.0);
-    let panel_width = (available_width - list_width - 24.0).max(220.0);
+    // Keep browsing practical while giving the selected game the visual
+    // majority of the stage. This is one composition that scales continuously
+    // from the 1100px target to wide desktop windows.
+    let list_width = (available_width * 0.44).clamp(320.0, 620.0);
+    let panel_width = (available_width - list_width - theme::SPACE_XL).max(340.0);
 
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
@@ -1480,8 +1483,24 @@ pub(crate) fn show_gamer_view(
                                 // requirements below depend on).
                                 let response = ui
                                     .add(
-                                        egui::Button::new("")
-                                            .min_size(egui::vec2(ui.available_width(), row_height))
+                                        // Keep the complete accessible row label in the
+                                        // widget while painting a calmer two-line visual
+                                        // presentation below. The transparent label also
+                                        // preserves existing rendered-text probes and
+                                        // keyboard semantics without reintroducing the
+                                        // old one-line database slab.
+                                        egui::Button::new(
+                                            egui::RichText::new(&label)
+                                                .color(egui::Color32::TRANSPARENT),
+                                        )
+                                            .min_size(egui::vec2(ui.available_width(), row_height - 6.0))
+                                            .fill(if selected {
+                                                egui::Color32::from_rgb(20, 47, 43)
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            })
+                                            .stroke(egui::Stroke::NONE)
+                                            .corner_radius(6)
                                             .selected(selected),
                                     )
                                     .on_hover_text(hover);
@@ -1536,26 +1555,34 @@ pub(crate) fn show_gamer_view(
                                     );
                                 }
                                 ui.painter().text(
-                                    egui::pos2(
-                                        response.rect.left() + 68.0,
-                                        response.rect.center().y,
-                                    ),
+                                    egui::pos2(response.rect.left() + 68.0, response.rect.center().y - 9.0),
                                     egui::Align2::LEFT_CENTER,
-                                    label,
-                                    egui::FontId::proportional(14.0),
-                                    if selected {
-                                        ui.visuals().selection.stroke.color
-                                    } else {
-                                        ui.visuals().text_color()
-                                    },
+                                    gamer_display_title(record),
+                                    egui::FontId::proportional(theme::BODY_SIZE),
+                                    if selected { theme::PRIMARY_TEXT } else { theme::SECONDARY_TEXT },
+                                );
+                                ui.painter().text(
+                                    egui::pos2(response.rect.left() + 68.0, response.rect.center().y + 12.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("{} · {state_label}", row.platform),
+                                    egui::FontId::proportional(theme::TECHNICAL_SIZE),
+                                    theme::TECHNICAL_TEXT,
                                 );
                                 if selected {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_max(
+                                            response.rect.left_top(),
+                                            egui::pos2(response.rect.left() + 3.0, response.rect.bottom()),
+                                        ),
+                                        3.0,
+                                        theme::AMBER,
+                                    );
                                     ui.painter().rect_stroke(
                                         response.rect,
                                         4.0,
                                         egui::Stroke::new(
-                                            2.0_f32,
-                                            ui.visuals().selection.stroke.color,
+                                            1.0_f32,
+                                            theme::BORDER_FOCUS,
                                         ),
                                         egui::StrokeKind::Inside,
                                     );
@@ -1633,7 +1660,7 @@ pub(crate) fn show_gamer_view(
                         // in the last row's spacing, come off here.
                         let for_artwork = (usable - measured - theme::SECTION_GAP - 12.0)
                             .max(if to_screen_bottom >= 680.0 {
-                                crate::gamer_artwork::FEATURED_COVER_MIN_HEIGHT
+                                168.0
                             } else {
                                 0.0
                             });

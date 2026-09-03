@@ -720,6 +720,13 @@ pub(crate) fn show_platform_shelf_item(
         .add(
             egui::Button::new("")
                 .min_size(egui::vec2(card_width, PLATFORM_CARD_HEIGHT))
+                .fill(if selected {
+                    egui::Color32::from_rgb(18, 50, 47)
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+                .corner_radius(8)
                 .selected(selected),
         )
         .on_hover_text(accessible_name.clone());
@@ -730,9 +737,9 @@ pub(crate) fn show_platform_shelf_item(
     // that label, matching "accessible labels for visuals."
     let artwork_center = response.rect.center() - egui::vec2(0.0, 15.0);
     let color = if selected {
-        ui.visuals().selection.stroke.color
+        theme::TEAL
     } else {
-        ui.visuals().text_color().gamma_multiply(0.8)
+        theme::SECONDARY_TEXT
     };
     let fallback_asset_id = match asset_id {
         "console" | "handheld" | "computer" | "arcade" | "optical-disc" | "cartridge"
@@ -757,8 +764,12 @@ pub(crate) fn show_platform_shelf_item(
         text_pos,
         egui::Align2::CENTER_CENTER,
         format!("{truncated_label}\n{count}"),
-        egui::FontId::proportional(10.0),
-        ui.visuals().text_color(),
+        egui::FontId::proportional(theme::TECHNICAL_SIZE),
+        if selected {
+            theme::PRIMARY_TEXT
+        } else {
+            theme::SECONDARY_TEXT
+        },
     );
     response
 }

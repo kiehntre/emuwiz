@@ -514,11 +514,11 @@ impl GamerCoverCache {
 /// Mount button stretched across all of it read as a form rather than a feature.
 /// Constraining the column keeps the block cohesive and keeps Mount emphatic
 /// without becoming a banner.
-pub(crate) const GAMER_FEATURED_CONTENT_MAX_WIDTH: f32 = 460.0;
+pub(crate) const GAMER_FEATURED_CONTENT_MAX_WIDTH: f32 = 560.0;
 
 /// The tallest a featured cover is drawn, so a 1440p panel does not turn one
 /// thumbnail into a poster.
-pub(crate) const FEATURED_COVER_MAX_HEIGHT: f32 = 300.0;
+pub(crate) const FEATURED_COVER_MAX_HEIGHT: f32 = 360.0;
 
 /// Below this there is not enough of an image left to be worth the space, and the
 /// artwork is dropped rather than the actions.

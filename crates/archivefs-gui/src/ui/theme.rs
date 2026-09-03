@@ -19,11 +19,9 @@ pub(crate) const BODY_SIZE: f32 = 16.0;
 pub(crate) const METADATA_SIZE: f32 = 14.0;
 pub(crate) const TECHNICAL_SIZE: f32 = 12.0;
 
-/// Darkened from (74, 126, 232) (2026-08-22, live-QA Phase 8 contrast
-/// audit): this is also `selection.bg_fill` and `widgets.active.bg_fill`,
-/// so it sits directly behind primary-button and selected-row text. White
-/// text on the old value measured ~3.86:1 - under the 4.5:1 WCAG AA
-/// threshold for normal-size text. This measures ~5.58:1.
+/// Restrained amber for the one primary action and selected-content emphasis.
+/// It is deliberately darker than the source Stitch swatch so light interface
+/// text remains readable and amber does not become the application's chrome.
 pub(crate) const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(13, 21, 19);
 pub(crate) const DEEP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(8, 16, 14);
 pub(crate) const CARD_SURFACE: egui::Color32 = egui::Color32::from_rgb(22, 29, 27);
@@ -35,10 +33,10 @@ pub(crate) const SECONDARY_TEXT: egui::Color32 = egui::Color32::from_rgb(148, 16
 pub(crate) const TECHNICAL_TEXT: egui::Color32 = egui::Color32::from_rgb(100, 116, 139);
 pub(crate) const TEAL: egui::Color32 = egui::Color32::from_rgb(3, 198, 178);
 /// Primary actions and selected-content emphasis. Keep this role sparse.
-pub(crate) const AMBER: egui::Color32 = egui::Color32::from_rgb(245, 158, 11);
+pub(crate) const AMBER: egui::Color32 = egui::Color32::from_rgb(143, 97, 31);
 /// Preserved semantic API name: ACCENT is the primary action role.
 pub(crate) const ACCENT: egui::Color32 = AMBER;
-pub(crate) const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(251, 176, 36);
+pub(crate) const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(170, 119, 43);
 pub(crate) const SUCCESS: egui::Color32 = egui::Color32::from_rgb(16, 185, 129);
 pub(crate) const WARNING: egui::Color32 = AMBER;
 /// Lightened from (214, 82, 88) (2026-08-22, live-QA Phase 7 contrast
@@ -80,18 +78,13 @@ pub(crate) fn apply(context: &egui::Context) {
         style.spacing.button_padding = egui::vec2(SPACE_MD, 7.0);
         style.spacing.interact_size.y = 30.0;
         style.spacing.menu_margin = egui::Margin::same(SPACE_SM as i8);
-        style.visuals.selection.bg_fill = ACCENT;
-        style.visuals.widgets.active.bg_fill = ACCENT;
-        style.visuals.widgets.hovered.bg_fill = ACCENT_HOVER;
-        style.visuals.widgets.open.bg_fill = ACCENT;
-        // Text/border color on top of the accent fills above. egui's stock
-        // defaults for these states are tuned for its own lighter dark
-        // theme and were never overridden here, so blue primary buttons,
-        // selected sidebar rows/tabs, and open dropdowns rendered with a
-        // faint or barely-visible selection border (2026-08-22, live-QA
-        // Phase 8 contrast audit). Pure white against `ACCENT`/`ACCENT_HOVER`
-        // is the highest-contrast choice available without changing the
-        // accent hue itself; see the ratios noted on those constants.
+        // Selection is a dark teal system state. Amber is reserved for
+        // explicit primary actions and attention, rather than every selected
+        // navigation/tab widget.
+        style.visuals.selection.bg_fill = egui::Color32::from_rgb(12, 74, 69);
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(15, 92, 85);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(28, 67, 61);
+        style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(15, 92, 85);
         style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
         style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
         style.visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
@@ -137,5 +130,25 @@ mod tests {
         assert_ne!(TEAL, AMBER);
         assert_ne!(SUCCESS, DANGER);
         assert_ne!(PRIMARY_TEXT, TECHNICAL_TEXT);
+    }
+
+    #[test]
+    fn primary_amber_keeps_light_action_text_contrastable() {
+        fn luminance(color: egui::Color32) -> f32 {
+            let channel = |value: u8| {
+                let value = value as f32 / 255.0;
+                if value <= 0.03928 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+        }
+        let contrast = (luminance(egui::Color32::WHITE) + 0.05) / (luminance(AMBER) + 0.05);
+        assert!(
+            contrast >= 4.5,
+            "amber/light-text contrast was {contrast:.2}:1"
+        );
     }
 }
