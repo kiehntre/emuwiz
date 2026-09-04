@@ -309,6 +309,24 @@ pub enum LaunchBlockerKind {
     /// (only classic DOSBox and DOSBox Staging are modeled; DOSBox-X and
     /// anything else fail closed).
     DosBoxVariantUnsupported,
+    /// A native Amiberry command was given a non-Amiga identity.
+    AmiberryPlatformMismatch,
+    /// The selected Amiberry launch candidate is not a standalone Amiberry target.
+    AmiberryCandidateRequired,
+    /// Amiberry was not discovered or its selected profile is ineligible.
+    AmiberryBindingUnavailable,
+    /// Amiberry requires explicit, readable machine configuration for this slice.
+    AmiberryProfileRequired,
+    /// The selected Amiga media format is outside this native Phase 1 slice.
+    AmiberryContentFormatUnsupported,
+    /// The selected media is not explicitly represented by the Amiberry profile.
+    AmiberryMediaNotConfigured,
+    /// Machine model evidence is absent or conflicting.
+    AmiberryMachineAmbiguous,
+    /// Kickstart evidence is absent, unusable, or only weakly known.
+    AmiberryKickstartUnavailable,
+    /// IPF requires CAPS/SPS support that was not proven available.
+    AmiberryIpfBackendUnavailable,
     /// A MAME launch requires a resolved Arcade platform.
     MamePlatformMismatch,
     /// No unique DAT-backed MAME set identity is available.

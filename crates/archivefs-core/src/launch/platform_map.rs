@@ -154,7 +154,7 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "Amiga",
-        standalone_adapters: &["amiga_whdload"],
+        standalone_adapters: &["amiga_whdload", "amiberry"],
         retroarch_core_hints: &["puae"],
         confidence: MappingConfidence::Exact,
     },

@@ -62,6 +62,7 @@
 //! "Launch-preparation workflows" note for the wider design context this
 //! module implements the first slice of.
 
+pub mod amiberry_command;
 pub mod dolphin_command;
 pub mod dolphin_execution;
 pub mod dosbox_command;
