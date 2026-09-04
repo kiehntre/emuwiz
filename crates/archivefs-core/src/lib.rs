@@ -133,6 +133,10 @@ pub mod source_root_migration;
 /// generic source-root migration planner.
 pub mod source_folder_migration;
 
+/// Read-only projection of active rename/recovery transaction paths into the
+/// generic source-root migration planner.
+pub mod recovery_state_migration;
+
 pub mod disk_format;
 
 /// Pure content/container/media evidence, deliberately separate from
