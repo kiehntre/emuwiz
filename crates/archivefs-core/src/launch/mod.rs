@@ -62,6 +62,8 @@
 //! "Launch-preparation workflows" note for the wider design context this
 //! module implements the first slice of.
 
+pub mod amiberry_cd_command;
+pub mod amiberry_cd_execution;
 pub mod amiberry_command;
 pub mod amiberry_execution;
 pub mod cemu_command;
@@ -117,6 +119,15 @@ mod plan_to_spawn_tests;
 #[cfg(test)]
 mod tests;
 
+pub use amiberry_cd_command::{
+    AmiberryCdCommand, AmiberryCdCommandPlan, AmiberryCdFileBinding, AmiberryCdLaunchRequest,
+    build_amiberry_cd_command_plan,
+};
+pub use amiberry_cd_execution::{
+    AmiberryCdLaunchExecutionError, AmiberryCdLaunchExitReport, AmiberryCdLaunchPreflightError,
+    AmiberryCdLaunchPreflightErrorKind, AmiberryCdLaunchSpawnError, LaunchedAmiberryCdProcess,
+    preflight_amiberry_cd_launch, preflight_and_launch_amiberry_cd, spawn_amiberry_cd,
+};
 pub use amiberry_execution::{
     AmiberryLaunchExecutionError, AmiberryLaunchExitReport, AmiberryLaunchPreflightError,
     AmiberryLaunchPreflightErrorKind, AmiberryLaunchSpawnError, LaunchedAmiberryProcess,

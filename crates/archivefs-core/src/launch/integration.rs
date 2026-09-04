@@ -15,6 +15,9 @@
 
 use std::path::Path;
 
+use crate::amiga_cd_evidence::{
+    AMIGA_CD32_PLATFORM_ID, AMIGA_CDTV_PLATFORM_ID, AmigaCdMachineReadiness,
+};
 use crate::dat::model::DatEcosystem;
 use crate::dat::set::SetResolution;
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
@@ -131,6 +134,10 @@ pub enum DiscoveredStandaloneProfile<'a> {
         profile: &'a AmigaProfile,
         inspection: &'a AmigaGameInspection,
     },
+    AmiberryCd {
+        profile: &'a AmigaProfile,
+        readiness: &'a AmigaCdMachineReadiness,
+    },
     /// A discovered MAME executable, together with the trusted MAME/DAT set
     /// resolutions a caller already computed. `None`/empty means "no trusted
     /// MAME identity for this content" - never inferred from the platform
@@ -238,6 +245,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
             profile,
             inspection,
         }
+    }
+
+    pub fn amiberry_cd(profile: &'a AmigaProfile, readiness: &'a AmigaCdMachineReadiness) -> Self {
+        Self::AmiberryCd { profile, readiness }
     }
 
     pub fn mame(executable: Option<&'a Path>, set_resolutions: &'a [SetResolution]) -> Self {
@@ -494,6 +505,31 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     AmigaKickstartState::Unreadable | AmigaKickstartState::Unknown => {
                         FirmwareReadiness::Unknown
                     }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "amiberry",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_root.clone()),
+                    eligible: profile.eligible,
+                    firmware,
+                })
+            }
+            DiscoveredStandaloneProfile::AmiberryCd { profile, readiness }
+                if profile.emulator == AmigaEmulatorKind::Amiberry
+                    && readiness.readiness != crate::launch::readiness::LaunchReadiness::Blocked
+                    && matches!(
+                        input.identity,
+                        CanonicalIdentityStatus::Resolved(identity)
+                            if (identity.platform_id == AMIGA_CD32_PLATFORM_ID
+                                && matches!(readiness.machine, crate::amiga_cd_evidence::AmigaCdMachine::Cd32))
+                                || (identity.platform_id == AMIGA_CDTV_PLATFORM_ID
+                                    && matches!(readiness.machine, crate::amiga_cd_evidence::AmigaCdMachine::Cdtv))
+                    ) =>
+            {
+                let firmware = if readiness.readiness == crate::launch::readiness::LaunchReadiness::Ready {
+                    FirmwareReadiness::Verified
+                } else {
+                    FirmwareReadiness::PresentUnverified
                 };
                 Some(StandaloneProfileInput {
                     adapter_id: "amiberry",

@@ -165,6 +165,18 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "AmigaCD32",
+        standalone_adapters: &["amiberry"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
+        platform_id: "Commodore CDTV",
+        standalone_adapters: &["amiberry"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "NES",
         standalone_adapters: &[],
         retroarch_core_hints: &["nestopia"],
