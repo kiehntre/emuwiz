@@ -1530,6 +1530,15 @@ pub(crate) fn show_romm_source_card(
             if response.clicked() {
                 request = Some(RommCardRequest::CheckLinks);
             }
+            let review_response = widgets::action_button(
+                ui,
+                "Review path mappings",
+                widgets::ActionStyle::Secondary,
+                enabled,
+            );
+            if review_response.clicked() {
+                request = Some(RommCardRequest::ReviewMappings);
+            }
         });
         if let Some(report) = &state.linkage_report {
             ui.label(format!(
@@ -1634,16 +1643,6 @@ pub(crate) fn show_romm_source_card(
             {
                 request = Some(RommCardRequest::ApplyMappings);
             }
-        } else if state.linkage_report.is_some()
-            && widgets::action_button(
-                ui,
-                "Review path mappings",
-                widgets::ActionStyle::Secondary,
-                !view.busy,
-            )
-            .clicked()
-        {
-            request = Some(RommCardRequest::ReviewMappings);
         }
 
         // Two collapsible blocks, so the card is not a wall of thirty numbers on a

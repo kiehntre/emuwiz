@@ -727,6 +727,25 @@ fn the_rendered_card_draws_linkage_health_summary() {
     }
 }
 
+#[test]
+fn mapping_review_is_visible_without_a_completed_linkage_check() {
+    let view = build_card_view(
+        Some(&snapshot(ProviderState::ReadyOffline, true, true)),
+        None,
+        false,
+    );
+    let mut state = RommCardState::default();
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_romm_source_card(ui, &view, &mut state, None);
+        });
+    });
+
+    assert!(rendered_text_contains(&output, "Check RomM links"));
+    assert!(rendered_text_contains(&output, "Review path mappings"));
+}
+
 /// The same helper the shared widgets' own tests use.
 fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
     fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
