@@ -20,6 +20,30 @@ pub enum MappingProposalKind {
     Conflict,
 }
 
+/// Exact provider-prefix aliases reviewed against the current RomM cache and
+/// local platform registry. This remains an allowlist: arbitrary collection
+/// folders are never promoted to platform aliases.
+pub const CURATED_PROVIDER_PREFIX_ALIASES: &[&str] = &[
+    "roms/Amiga.CD32",
+    "roms/Nintendo Game Boy Advance",
+    // Existing non-GameCube aliases remain accepted by the planner.
+    "roms/amigacd32",
+    "roms/amiga500",
+    "roms/atarilynx",
+    "roms/atarist",
+    "roms/gameboy",
+    "roms/jaguar",
+    "roms/markiii",
+    "roms/mastersystem",
+    "roms/psx",
+];
+
+pub fn is_curated_provider_prefix_alias(prefix: &str) -> bool {
+    CURATED_PROVIDER_PREFIX_ALIASES.contains(&prefix)
+}
+
+const CURATED_PROVIDER_PREFIX_BASES: &[&str] = &["roms/amiga-cd32", "roms/atarijaguar", "roms/ps"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RommMappingProposal {
     pub provider_prefix: String,
@@ -218,7 +242,47 @@ fn consolidate_duplicate_destinations(
         }
     }
     for indices in by_destination.values().filter(|indices| indices.len() > 1) {
-        let first = indices[0];
+        let primary = indices
+            .iter()
+            .copied()
+            .find(|index| proposals[*index].current_mapping.is_some())
+            .or_else(|| {
+                indices.iter().copied().find(|index| {
+                    CURATED_PROVIDER_PREFIX_BASES
+                        .contains(&proposals[*index].provider_prefix.as_str())
+                })
+            })
+            .unwrap_or(indices[0]);
+        let unapproved: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|index| *index != primary)
+            .filter(|index| {
+                !is_approved_alias(&proposals[*index].provider_prefix, mappings.as_slice())
+            })
+            .collect();
+        for index in unapproved {
+            let proposal = &mut proposals[index];
+            if proposal.kind == MappingProposalKind::SafeNewMapping {
+                plan.rescued_by_new_mapping = plan
+                    .rescued_by_new_mapping
+                    .saturating_sub(proposal.record_count);
+                plan.still_unmapped += proposal.record_count;
+            }
+            plan.ambiguous_or_conflicting += proposal.record_count;
+            proposal.kind = MappingProposalKind::Conflict;
+            proposal.reason = "This provider prefix is not in the curated exact-alias allowlist; no alias was proposed.".to_string();
+            remove_mapping(mappings, &proposal.provider_prefix);
+        }
+        let indices: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|index| proposals[*index].kind != MappingProposalKind::Conflict)
+            .collect();
+        if indices.len() < 2 {
+            continue;
+        }
+        let first = primary;
         let equivalent = indices.iter().all(|index| {
             proposals[*index].canonical_platform.is_some()
                 && proposals[*index].canonical_platform == proposals[first].canonical_platform
@@ -234,7 +298,7 @@ fn consolidate_duplicate_destinations(
         });
         if !equivalent {
             for index in indices {
-                let proposal = &mut proposals[*index];
+                let proposal = &mut proposals[index];
                 if proposal.kind == MappingProposalKind::SafeNewMapping {
                     plan.rescued_by_new_mapping = plan
                         .rescued_by_new_mapping
@@ -249,9 +313,11 @@ fn consolidate_duplicate_destinations(
             continue;
         }
 
-        let aliases: Vec<String> = indices[1..]
+        let aliases: Vec<String> = indices
             .iter()
-            .map(|index| proposals[*index].provider_prefix.clone())
+            .copied()
+            .filter(|index| *index != first)
+            .map(|index| proposals[index].provider_prefix.clone())
             .collect();
         if let Some(mapping) = mappings
             .iter_mut()
@@ -259,7 +325,7 @@ fn consolidate_duplicate_destinations(
         {
             mapping.provider_aliases.extend(aliases.iter().cloned());
         }
-        for index in &indices[1..] {
+        for index in indices.iter().filter(|index| **index != first) {
             let proposal = &mut proposals[*index];
             proposal.provider_aliases.clear();
             proposal.kind = MappingProposalKind::ConsolidatedAliasGroup;
@@ -270,6 +336,13 @@ fn consolidate_duplicate_destinations(
         proposals[first].reason =
             "These equivalent RomM platform names share one validated local mapping.".to_string();
     }
+}
+
+fn is_approved_alias(alias: &str, mappings: &[PathMapping]) -> bool {
+    is_curated_provider_prefix_alias(alias)
+        || mappings
+            .iter()
+            .any(|mapping| mapping.provider_aliases.iter().any(|known| known == alias))
 }
 
 fn remove_mapping(mappings: &mut Vec<PathMapping>, provider_prefix: &str) {
@@ -546,13 +619,12 @@ mod tests {
     #[test]
     fn equivalent_provider_prefixes_are_consolidated_and_both_translate() {
         let root = std::env::temp_dir().join("archivefs-mapping-plan-alias-groups-test");
-        for folder in ["amiga-cd32", "jaguar", "ngc", "psx"] {
+        for folder in ["amiga-cd32", "jaguar", "psx"] {
             std::fs::create_dir_all(root.join(folder)).unwrap();
         }
         let pairs = [
             ("amiga-cd32", "amigacd32"),
             ("atarijaguar", "jaguar"),
-            ("gcn", "ngc"),
             ("ps", "psx"),
         ];
         let mut cache = fixture_cache(pairs[0].0, "roms/amiga-cd32/a.zip");
@@ -567,10 +639,10 @@ mod tests {
         let current = PathMappings::validate(&[], &[], ProviderPathKind::ProviderRelative).unwrap();
         let plan = plan_mapping_reconciliation(&cache, &current, std::slice::from_ref(&root));
 
-        assert_eq!(plan.rescued_by_new_mapping, 8);
+        assert_eq!(plan.rescued_by_new_mapping, 6);
         assert_eq!(plan.still_unmapped, 0);
         assert_eq!(plan.ambiguous_or_conflicting, 0);
-        assert_eq!(plan.proposed_mappings.len(), 4);
+        assert_eq!(plan.proposed_mappings.len(), 3);
         let aliases = plan
             .proposed_mappings
             .iter()
@@ -583,7 +655,6 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(aliases["roms/amiga-cd32"], ["roms/amigacd32"]);
         assert_eq!(aliases["roms/atarijaguar"], ["roms/jaguar"]);
-        assert_eq!(aliases["roms/gcn"], ["roms/ngc"]);
         assert_eq!(aliases["roms/ps"], ["roms/psx"]);
         let persisted = RommSourceConfig {
             mappings: plan.proposed_mappings.clone(),
@@ -615,9 +686,48 @@ mod tests {
                 .iter()
                 .filter(|proposal| proposal.kind == MappingProposalKind::ConsolidatedAliasGroup)
                 .count(),
-            4
+            3
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn curated_game_boy_alias_uses_the_existing_canonical_mapping() {
+        let root = std::env::temp_dir().join("archivefs-mapping-plan-gameboy-alias-test");
+        std::fs::create_dir_all(root.join("gb")).unwrap();
+        let mut cache = fixture_cache("gb", "roms/gb/game.gb");
+        let alias = fixture_cache("gameboy", "roms/gameboy/alias.gb");
+        cache.records.push(alias.records[0].clone());
+        let current = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gb".to_string(),
+                archivefs_prefix: root.join("gb"),
+                provider_aliases: Vec::new(),
+            }],
+            std::slice::from_ref(&root),
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let plan = plan_mapping_reconciliation(&cache, &current, std::slice::from_ref(&root));
+        let mapping = plan
+            .proposed_mappings
+            .iter()
+            .find(|mapping| mapping.provider_prefix == "roms/gb")
+            .expect("the canonical Game Boy mapping remains primary");
+        assert_eq!(mapping.provider_aliases, ["roms/gameboy"]);
+        assert_eq!(plan.rescued_by_new_mapping, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collection_role_names_are_not_curated_provider_aliases() {
+        for prefix in ["roms/disk1", "roms/bios", "roms/Data", "roms/New folder"] {
+            assert!(!is_curated_provider_prefix_alias(prefix));
+        }
+        assert!(!is_curated_provider_prefix_alias(
+            "roms/famicom-disk-system"
+        ));
+        assert!(!is_curated_provider_prefix_alias("roms/ngc"));
     }
 
     #[test]

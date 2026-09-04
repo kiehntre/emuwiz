@@ -993,6 +993,7 @@ fn add_mapping(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn s
     let candidate = PathMapping {
         provider_prefix: romm_root.clone(),
         archivefs_prefix: archivefs_root.clone(),
+        provider_aliases: Vec::new(),
     };
     // Normalised first, so the comparison below is against the engine's own form
     // rather than the typed text - and so a prefix of the wrong shape is refused

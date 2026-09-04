@@ -562,6 +562,39 @@ mod tests {
     }
 
     #[test]
+    fn a_curated_provider_alias_translates_during_import_normalisation() {
+        let mappings = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gb".to_string(),
+                archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/gb"),
+                provider_aliases: vec!["roms/gameboy".to_string()],
+            }],
+            &[],
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &json!({
+                "id": 7,
+                "platform_slug": "gameboy",
+                "fs_path": "roms/gameboy",
+                "fs_name": "example.gb",
+                "name": "Example"
+            }),
+            "server",
+            &mappings,
+            1,
+            &mut report,
+        )
+        .expect("record normalises");
+        assert_eq!(
+            record.archivefs_path,
+            Some(PathBuf::from("/mnt/usbdrive/games/gb/example.gb"))
+        );
+    }
+
+    #[test]
     fn an_alias_record_is_translated_during_import_normalisation() {
         let mappings = PathMappings::validate(
             &[PathMapping {
