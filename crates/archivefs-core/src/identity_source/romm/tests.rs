@@ -686,6 +686,7 @@ fn a_configuration_is_validated_as_a_whole() {
         mappings: vec![crate::identity_source::path_map::PathMapping {
             provider_prefix: "/romm/library".to_string(),
             archivefs_prefix: std::path::PathBuf::from("/etc"),
+            provider_aliases: Vec::new(),
         }],
         media_mapping: None,
         provider_path_kind: ProviderPathKind::AbsoluteProviderPath,
@@ -1099,6 +1100,7 @@ fn a_broken_required_setting_still_fails_even_with_a_valid_optional_mapping() {
     bad_mapping.mappings = vec![crate::identity_source::path_map::PathMapping {
         provider_prefix: "/romm/library".to_string(),
         archivefs_prefix: std::path::PathBuf::from("/etc"),
+        provider_aliases: Vec::new(),
     }];
     let refusal = ValidatedRommSource::validate(
         &bad_mapping,

@@ -564,6 +564,7 @@ pub(crate) fn add_mapping(
     let candidate = PathMapping {
         provider_prefix: prefix.clone(),
         archivefs_prefix: PathBuf::from(&destination),
+        provider_aliases: Vec::new(),
     };
     // The prefix must be the shape this source is configured for, and free of
     // traversal, dot components, doubled separators, drive letters and UNC forms.

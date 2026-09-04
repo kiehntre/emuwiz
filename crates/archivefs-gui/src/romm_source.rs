@@ -1436,6 +1436,7 @@ fn mapping_proposal_label(kind: MappingProposalKind) -> &'static str {
         MappingProposalKind::Ambiguous => "Ambiguous local folder",
         MappingProposalKind::NoLocalFolder => "No local folder",
         MappingProposalKind::UnknownPlatform => "Unknown platform",
+        MappingProposalKind::ConsolidatedAliasGroup => "Equivalent RomM platform aliases",
         MappingProposalKind::Conflict => "Mapping conflict",
     }
 }
@@ -1602,6 +1603,12 @@ pub(crate) fn show_romm_source_card(
                         ui.label(mapping_proposal_label(proposal.kind));
                         ui.label(format!("{} record(s)", proposal.record_count));
                     });
+                    if !proposal.provider_aliases.is_empty() {
+                        ui.label(format!(
+                            "Equivalent RomM aliases: {}",
+                            proposal.provider_aliases.join(", ")
+                        ));
+                    }
                     if proposal.kind == MappingProposalKind::StaleSourceRootReplacement {
                         if let Some(current) = &proposal.current_mapping {
                             ui.label(format!("Current: {}", current.archivefs_prefix.display()));

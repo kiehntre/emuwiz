@@ -75,6 +75,7 @@ impl Tree {
             &[PathMapping {
                 provider_prefix: "/romm/library".to_string(),
                 archivefs_prefix: self.library(),
+                provider_aliases: Vec::new(),
             }],
             &[self.library()],
             ProviderPathKind::AbsoluteProviderPath,
@@ -89,6 +90,7 @@ impl Tree {
             mappings: vec![PathMapping {
                 provider_prefix: "/romm/library".to_string(),
                 archivefs_prefix: self.library(),
+                provider_aliases: Vec::new(),
             }],
             media_mapping: None,
             provider_path_kind: ProviderPathKind::AbsoluteProviderPath,

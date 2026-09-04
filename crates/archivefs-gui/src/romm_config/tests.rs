@@ -100,6 +100,7 @@ fn mapping(prefix: &str, destination: &Path) -> PathMapping {
     PathMapping {
         provider_prefix: prefix.to_string(),
         archivefs_prefix: destination.to_path_buf(),
+        provider_aliases: Vec::new(),
     }
 }
 

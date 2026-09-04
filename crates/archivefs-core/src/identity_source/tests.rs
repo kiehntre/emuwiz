@@ -539,6 +539,7 @@ mod path_mapping {
         PathMapping {
             provider_prefix: provider.to_string(),
             archivefs_prefix: PathBuf::from(archivefs),
+            provider_aliases: Vec::new(),
         }
     }
 

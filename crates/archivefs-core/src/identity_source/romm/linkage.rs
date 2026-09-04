@@ -340,6 +340,7 @@ mod tests {
             .map(|(provider, local)| PathMapping {
                 provider_prefix: (*provider).to_string(),
                 archivefs_prefix: PathBuf::from(local),
+                provider_aliases: Vec::new(),
             })
             .collect::<Vec<_>>();
         PathMappings::validate(&items, &[], ProviderPathKind::ProviderRelative).unwrap()

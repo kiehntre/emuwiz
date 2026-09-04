@@ -13,6 +13,7 @@ pub enum MappingProposalKind {
     ExactExisting,
     StaleSourceRootReplacement,
     SafeNewMapping,
+    ConsolidatedAliasGroup,
     Ambiguous,
     NoLocalFolder,
     UnknownPlatform,
@@ -32,6 +33,7 @@ pub struct RommMappingProposal {
     pub inferred_old_root: Option<PathBuf>,
     pub configured_new_source_root: Option<PathBuf>,
     pub proposed_destination: Option<PathBuf>,
+    pub provider_aliases: Vec<String>,
     pub record_count: usize,
     pub kind: MappingProposalKind,
     pub reason: String,
@@ -155,6 +157,7 @@ pub fn plan_mapping_reconciliation(
                 proposed_mappings.push(PathMapping {
                     provider_prefix: provider_prefix.clone(),
                     archivefs_prefix: candidate.clone().expect("safe candidate"),
+                    provider_aliases: Vec::new(),
                 });
             }
             MappingProposalKind::UnknownPlatform => plan.unknown_platforms += record_count,
@@ -163,6 +166,7 @@ pub fn plan_mapping_reconciliation(
             }
             MappingProposalKind::NoLocalFolder => {}
             MappingProposalKind::ExactExisting => {}
+            MappingProposalKind::ConsolidatedAliasGroup => {}
         }
         if !matches!(kind, MappingProposalKind::ExactExisting) {
             plan.still_unmapped += match kind {
@@ -183,14 +187,93 @@ pub fn plan_mapping_reconciliation(
             inferred_old_root,
             configured_new_source_root,
             proposed_destination: candidate,
+            provider_aliases: Vec::new(),
             record_count,
             kind,
             reason,
         });
     }
+    consolidate_duplicate_destinations(&mut proposals, &mut proposed_mappings, &mut plan);
     plan.proposals = proposals;
     plan.proposed_mappings = proposed_mappings;
     plan
+}
+
+fn consolidate_duplicate_destinations(
+    proposals: &mut [RommMappingProposal],
+    mappings: &mut Vec<PathMapping>,
+    plan: &mut RommMappingPlan,
+) {
+    let mut by_destination: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (index, proposal) in proposals.iter().enumerate() {
+        if matches!(
+            proposal.kind,
+            MappingProposalKind::SafeNewMapping | MappingProposalKind::ExactExisting
+        ) && let Some(destination) = &proposal.proposed_destination
+        {
+            by_destination
+                .entry(destination.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    for indices in by_destination.values().filter(|indices| indices.len() > 1) {
+        let first = indices[0];
+        let equivalent = indices.iter().all(|index| {
+            proposals[*index].canonical_platform.is_some()
+                && proposals[*index].canonical_platform == proposals[first].canonical_platform
+                && proposals[*index].candidate_local_folder
+                    == proposals[first].candidate_local_folder
+                && proposals[*index]
+                    .current_mapping
+                    .as_ref()
+                    .is_none_or(|mapping| {
+                        mapping.archivefs_prefix
+                            == proposals[first].proposed_destination.clone().unwrap()
+                    })
+        });
+        if !equivalent {
+            for index in indices {
+                let proposal = &mut proposals[*index];
+                if proposal.kind == MappingProposalKind::SafeNewMapping {
+                    plan.rescued_by_new_mapping = plan
+                        .rescued_by_new_mapping
+                        .saturating_sub(proposal.record_count);
+                    plan.still_unmapped += proposal.record_count;
+                }
+                plan.ambiguous_or_conflicting += proposal.record_count;
+                proposal.kind = MappingProposalKind::Conflict;
+                proposal.reason = "Multiple provider prefixes target one local folder without one proven canonical platform; no mapping was proposed.".to_string();
+                remove_mapping(mappings, &proposal.provider_prefix);
+            }
+            continue;
+        }
+
+        let aliases: Vec<String> = indices[1..]
+            .iter()
+            .map(|index| proposals[*index].provider_prefix.clone())
+            .collect();
+        if let Some(mapping) = mappings
+            .iter_mut()
+            .find(|mapping| mapping.provider_prefix == proposals[first].provider_prefix)
+        {
+            mapping.provider_aliases.extend(aliases.iter().cloned());
+        }
+        for index in &indices[1..] {
+            let proposal = &mut proposals[*index];
+            proposal.provider_aliases.clear();
+            proposal.kind = MappingProposalKind::ConsolidatedAliasGroup;
+            proposal.reason = "This RomM platform name is an equivalent alias and shares the one validated local mapping.".to_string();
+            remove_mapping(mappings, &proposal.provider_prefix);
+        }
+        proposals[first].provider_aliases = aliases;
+        proposals[first].reason =
+            "These equivalent RomM platform names share one validated local mapping.".to_string();
+    }
+}
+
+fn remove_mapping(mappings: &mut Vec<PathMapping>, provider_prefix: &str) {
+    mappings.retain(|mapping| mapping.provider_prefix != provider_prefix);
 }
 
 fn provider_platform_prefix(record: &ExternalIdentityRecord) -> Option<String> {
@@ -254,6 +337,7 @@ fn proposal_reason(
         MappingProposalKind::ExactExisting => "The configured mapping already points at the recognised local platform folder.".to_string(),
         MappingProposalKind::StaleSourceRootReplacement => format!("This mapping appears to point to an older library location. Replace {} with {}.", current.as_ref().map(|m| m.archivefs_prefix.display().to_string()).unwrap_or_default(), candidate.map(|p| p.display().to_string()).unwrap_or_default()),
         MappingProposalKind::SafeNewMapping => "The RomM platform and one existing local platform folder agree, and the folder is inside a configured source.".to_string(),
+        MappingProposalKind::ConsolidatedAliasGroup => "This RomM platform name is an equivalent alias and shares the one validated local mapping.".to_string(),
         MappingProposalKind::Ambiguous => "More than one local folder matches this canonical platform; no mapping was guessed.".to_string(),
         MappingProposalKind::NoLocalFolder => "RomM's platform is known, but no matching local platform folder exists under a configured source.".to_string(),
         MappingProposalKind::UnknownPlatform => "RomM reported a platform EmuWiz does not recognise.".to_string(),
@@ -326,6 +410,7 @@ mod tests {
             &[PathMapping {
                 provider_prefix: "roms/n64".to_string(),
                 archivefs_prefix: PathBuf::from("/mnt/games/roms/n64"),
+                provider_aliases: Vec::new(),
             }],
             &[],
             ProviderPathKind::ProviderRelative,
@@ -381,6 +466,7 @@ mod tests {
             .map(|(provider, local)| PathMapping {
                 provider_prefix: format!("roms/{provider}"),
                 archivefs_prefix: PathBuf::from(local),
+                provider_aliases: Vec::new(),
             })
             .collect::<Vec<_>>()
             .as_slice(),
@@ -429,6 +515,7 @@ mod tests {
             &[PathMapping {
                 provider_prefix: "roms/n64".to_string(),
                 archivefs_prefix: old_folder.clone(),
+                provider_aliases: Vec::new(),
             }],
             &[],
             ProviderPathKind::ProviderRelative,
@@ -452,6 +539,76 @@ mod tests {
             Some(root.join("library"))
         );
         assert_eq!(proposal.proposed_destination, Some(new_folder));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn equivalent_provider_prefixes_are_consolidated_and_both_translate() {
+        let root = std::env::temp_dir().join("archivefs-mapping-plan-alias-groups-test");
+        for folder in ["amiga-cd32", "jaguar", "ngc", "psx"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let pairs = [
+            ("amiga-cd32", "amigacd32"),
+            ("atarijaguar", "jaguar"),
+            ("gcn", "ngc"),
+            ("ps", "psx"),
+        ];
+        let mut cache = fixture_cache(pairs[0].0, "roms/amiga-cd32/a.zip");
+        cache.records.clear();
+        for (id, &(primary, alias)) in pairs.iter().enumerate() {
+            for slug in [primary, alias] {
+                let mut record = fixture_cache(slug, &format!("roms/{slug}/game{id}.zip"));
+                record.records[0].provider_game_id = format!("{id}-{slug}");
+                cache.records.push(record.records.remove(0));
+            }
+        }
+        let current = PathMappings::validate(&[], &[], ProviderPathKind::ProviderRelative).unwrap();
+        let plan = plan_mapping_reconciliation(&cache, &current, std::slice::from_ref(&root));
+
+        assert_eq!(plan.rescued_by_new_mapping, 8);
+        assert_eq!(plan.still_unmapped, 0);
+        assert_eq!(plan.ambiguous_or_conflicting, 0);
+        assert_eq!(plan.proposed_mappings.len(), 4);
+        let aliases = plan
+            .proposed_mappings
+            .iter()
+            .map(|mapping| {
+                (
+                    mapping.provider_prefix.as_str(),
+                    mapping.provider_aliases.as_slice(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(aliases["roms/amiga-cd32"], ["roms/amigacd32"]);
+        assert_eq!(aliases["roms/atarijaguar"], ["roms/jaguar"]);
+        assert_eq!(aliases["roms/gcn"], ["roms/ngc"]);
+        assert_eq!(aliases["roms/ps"], ["roms/psx"]);
+        let mappings = PathMappings::validate(
+            &plan.proposed_mappings,
+            std::slice::from_ref(&root),
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        for (primary, alias) in pairs {
+            assert!(
+                mappings
+                    .translate(&format!("roms/{primary}/game.zip"))
+                    .is_translated()
+            );
+            assert!(
+                mappings
+                    .translate(&format!("roms/{alias}/game.zip"))
+                    .is_translated()
+            );
+        }
+        assert_eq!(
+            plan.proposals
+                .iter()
+                .filter(|proposal| proposal.kind == MappingProposalKind::ConsolidatedAliasGroup)
+                .count(),
+            4
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

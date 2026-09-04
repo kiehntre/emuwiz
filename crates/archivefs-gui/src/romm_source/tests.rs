@@ -69,6 +69,7 @@ fn config(enabled: bool, configured: bool) -> RommSourceConfig {
             vec![PathMapping {
                 provider_prefix: "roms".to_string(),
                 archivefs_prefix: PathBuf::from("/mnt/games/roms"),
+                provider_aliases: Vec::new(),
             }]
         } else {
             Vec::new()
