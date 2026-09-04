@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use archivefs_core::identity_source::artwork::ArtworkCacheStats;
 use archivefs_core::identity_source::romm::capability::RommCapabilityReport;
 use archivefs_core::identity_source::romm::import::{AdaptivePagination, ImportProgress};
+use archivefs_core::identity_source::romm::linkage::{RommLinkageReport, RommLinkageStatus};
 use archivefs_core::identity_source::settings::ProviderSettings;
 use archivefs_core::identity_source::status::{ProviderState, ProviderStatus};
 use eframe::egui;
@@ -49,6 +50,10 @@ pub(crate) enum RommOperation {
     },
     FullImport,
     Refresh,
+    /// Inspect the bounded local archive population against the published RomM cache.
+    CheckLinks {
+        local_paths: Vec<PathBuf>,
+    },
     ClearArtwork,
     /// Write the configuration. Validates again in the worker, and contacts nothing.
     SaveConfiguration(Box<archivefs_core::identity_source::settings::ProviderSettings>),
@@ -118,6 +123,7 @@ impl RommOperation {
                 | Self::LoadRecordDetail { .. }
                 | Self::LoadConflicts { .. }
                 | Self::StaleSummary
+                | Self::CheckLinks { .. }
                 // Resolving reads the cache and metadata, and a cover fetch writes
                 // only into the artwork cache, which is derived data the card
                 // reports separately. Neither changes identity.
@@ -171,6 +177,7 @@ impl RommOperation {
             Self::SampleImport { .. } => "Importing a sample",
             Self::FullImport => "Importing the RomM catalogue",
             Self::Refresh => "Refreshing from RomM",
+            Self::CheckLinks { .. } => "Checking RomM links",
             Self::ClearArtwork => "Clearing cover thumbnails",
             Self::SaveConfiguration(_) => "Saving the RomM configuration",
             Self::Preview { .. } => "Previewing path mappings",
@@ -211,6 +218,7 @@ pub(crate) enum RommOperationOutcome {
     Connection(Box<RommConnectionSummary>),
     Sample(Box<RommImportSummary>),
     Import(Box<RommImportSummary>),
+    Linkage(Box<RommLinkageReport>),
     Enabled(bool),
     ArtworkCleared {
         items: usize,
@@ -851,6 +859,7 @@ pub(crate) struct RommCardState {
     pub(crate) show_quality: bool,
     /// The last completed operation's result, kept until the next one starts.
     pub(crate) last_outcome: Option<RommResultView>,
+    pub(crate) linkage_report: Option<Box<RommLinkageReport>>,
 }
 
 /// A completed operation, reduced to what the result area draws.
@@ -963,6 +972,16 @@ pub(crate) fn build_result_view(
                 summary.examples.len(),
                 summary.sample_source
             )],
+            informational: false,
+        },
+        Ok(RommOperationOutcome::Linkage(report)) => RommResultView {
+            succeeded: true,
+            headline: "RomM link check complete".to_string(),
+            rows: linkage_summary_rows(&report.summary),
+            notes: vec![
+                "Read-only check: files, mappings, imports, hashes and RomM data were not changed."
+                    .to_string(),
+            ],
             informational: false,
         },
         // Browsing results are the views' own state rather than a card result, so
@@ -1334,6 +1353,46 @@ fn yes_no(value: bool) -> String {
     if value { "yes" } else { "no" }.to_string()
 }
 
+pub(crate) fn linkage_status_label(status: RommLinkageStatus) -> &'static str {
+    match status {
+        RommLinkageStatus::Linked => "Linked",
+        RommLinkageStatus::NoImportCache => "No import/cache",
+        RommLinkageStatus::NoPathMapping => "No path mapping",
+        RommLinkageStatus::ProviderPathUnmapped => "Provider path unmapped",
+        RommLinkageStatus::TranslatedPathElsewhere => "Translated elsewhere",
+        RommLinkageStatus::TranslatedPathMissing => "Translated path missing",
+        RommLinkageStatus::LocalPathMovedOrStale => "Moved/stale",
+        RommLinkageStatus::UnknownPlatform => "Unknown platform",
+        RommLinkageStatus::Ambiguous => "Ambiguous",
+    }
+}
+
+pub(crate) fn linkage_summary_rows(
+    summary: &archivefs_core::identity_source::romm::linkage::RommLinkageSummary,
+) -> Vec<CardRow> {
+    vec![
+        row("Inspected", summary.inspected.to_string()),
+        row("Linked", summary.linked.to_string()),
+        row("No import/cache", summary.no_import_cache.to_string()),
+        row("No path mapping", summary.no_path_mapping.to_string()),
+        row(
+            "Provider path unmapped",
+            summary.provider_path_unmapped.to_string(),
+        ),
+        row(
+            "Translated elsewhere",
+            summary.translated_elsewhere.to_string(),
+        ),
+        row(
+            "Translated path missing / moved",
+            summary.stale_or_missing.to_string(),
+        ),
+        row("Unknown platform", summary.unknown_platform.to_string()),
+        row("Ambiguous", summary.ambiguous.to_string()),
+        row("Other unresolved", summary.unresolved_other.to_string()),
+    ]
+}
+
 /// One progress event from a worker.
 ///
 /// Lives beside the card rather than in `main` so the worker and the renderer agree
@@ -1364,6 +1423,7 @@ pub(crate) enum RommCardRequest {
     OpenConfigure,
     /// Open one of the browsing views.
     OpenBrowse(crate::romm_browse::BrowseView),
+    CheckLinks,
 }
 
 /// Draws the card. Thin by design: every decision was made in
@@ -1403,6 +1463,73 @@ pub(crate) fn show_romm_source_card(
                 ui.label(format!("{label}:"));
                 ui.strong(value);
             });
+        }
+
+        ui.add_space(theme::SECTION_GAP / 2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("RomM Linkage Health");
+            let enabled = !view.busy;
+            let mut response = widgets::action_button(
+                ui,
+                "Check RomM links",
+                widgets::ActionStyle::Secondary,
+                enabled,
+            );
+            if !enabled {
+                response = response.on_disabled_hover_text("Another RomM operation is running.");
+            }
+            if response.clicked() {
+                request = Some(RommCardRequest::CheckLinks);
+            }
+        });
+        if let Some(report) = &state.linkage_report {
+            ui.label(format!(
+                "Read-only check of {} local archive path(s).",
+                report.summary.inspected
+            ));
+            for item in linkage_summary_rows(&report.summary) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{}:", item.label));
+                    ui.strong(item.value);
+                });
+            }
+            if report.summary.truncated {
+                ui.label("The library is larger than the safe check bound; counts are bounded.");
+            }
+            if report.problems.is_empty() {
+                ui.label("Every inspected local path has a RomM linkage.");
+            } else {
+                ui.label(format!(
+                    "Problem sample ({} of the bounded sample):",
+                    report.problems.len()
+                ));
+                for diagnostic in &report.problems {
+                    ui.group(|ui| {
+                        ui.strong(diagnostic.local_path.display().to_string());
+                        ui.label(linkage_status_label(diagnostic.status));
+                        if let Some(platform) = &diagnostic.canonical_platform {
+                            ui.label(format!("Platform: {platform}"));
+                        }
+                        ui.label(&diagnostic.explanation);
+                        widgets::technical_details(ui, "Evidence", |ui| {
+                            if let Some(id) = &diagnostic.provider_game_id {
+                                ui.label(format!("RomM game: {id}"));
+                            }
+                            if let Some(slug) = &diagnostic.provider_platform_slug {
+                                ui.label(format!("Provider platform: {slug}"));
+                            }
+                            if let Some(path) = &diagnostic.provider_path {
+                                ui.label(format!("Provider path: {path}"));
+                            }
+                            if let Some(path) = &diagnostic.translated_local_path {
+                                ui.label(format!("Translated local path: {}", path.display()));
+                            }
+                        });
+                    });
+                }
+            }
+        } else {
+            ui.label("Run Check RomM links to inspect the current local library.");
         }
 
         // Two collapsible blocks, so the card is not a wall of thirty numbers on a
@@ -1552,6 +1679,9 @@ pub(crate) fn show_romm_source_card(
                             request = Some(RommCardRequest::OpenBrowse(
                                 crate::romm_browse::BrowseView::StaleSummary,
                             ));
+                        }
+                        None if action.label == "Check RomM links" => {
+                            request = Some(RommCardRequest::CheckLinks);
                         }
                         None => {}
                     }

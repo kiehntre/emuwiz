@@ -262,7 +262,39 @@ pub struct RommLinkageSummary {
     pub translated_elsewhere: usize,
     pub stale_or_missing: usize,
     pub unknown_platform: usize,
+    pub provider_path_unmapped: usize,
+    pub ambiguous: usize,
     pub unresolved_other: usize,
+}
+
+/// A bounded read-only report for a library check. Problem rows are deliberately
+/// capped so the GUI can explain the population without becoming a second table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RommLinkageReport {
+    pub summary: RommLinkageSummary,
+    pub problems: Vec<RommLinkageDiagnostic>,
+}
+
+pub const MAX_PROBLEM_SAMPLE: usize = 32;
+
+pub fn inspect_local_paths(
+    cache: Option<&IdentityCache>,
+    mappings: &PathMappings,
+    local_paths: &[PathBuf],
+) -> RommLinkageReport {
+    let mut report = RommLinkageReport {
+        summary: summarize_local_paths(cache, mappings, local_paths),
+        problems: Vec::new(),
+    };
+    for path in local_paths.iter().take(MAX_SUMMARY_PATHS) {
+        let diagnostic = diagnose_local_path(cache, mappings, path);
+        if diagnostic.status != RommLinkageStatus::Linked
+            && report.problems.len() < MAX_PROBLEM_SAMPLE
+        {
+            report.problems.push(diagnostic);
+        }
+    }
+    report
 }
 
 /// Diagnoses up to [`MAX_SUMMARY_PATHS`] local paths without hashing or network access.
@@ -286,9 +318,8 @@ pub fn summarize_local_paths(
                 summary.stale_or_missing += 1
             }
             RommLinkageStatus::UnknownPlatform => summary.unknown_platform += 1,
-            RommLinkageStatus::ProviderPathUnmapped | RommLinkageStatus::Ambiguous => {
-                summary.unresolved_other += 1
-            }
+            RommLinkageStatus::ProviderPathUnmapped => summary.provider_path_unmapped += 1,
+            RommLinkageStatus::Ambiguous => summary.ambiguous += 1,
         }
     }
     summary

@@ -17,6 +17,9 @@ use archivefs_core::identity_source::romm::config::RommSourceConfig;
 use archivefs_core::identity_source::romm::import::{
     AdaptivePagination, ImportProgress, PageSizeReduction,
 };
+use archivefs_core::identity_source::romm::linkage::{
+    RommLinkageDiagnostic, RommLinkageStatus, RommLinkageSummary,
+};
 use archivefs_core::identity_source::status::{ProviderState, ProviderStatus};
 use std::path::PathBuf;
 
@@ -166,6 +169,98 @@ fn action_named(view: &RommCardView, prefix: &str) -> CardAction {
         .find(|action| action.label.starts_with(prefix))
         .unwrap_or_else(|| panic!("no action starting with {prefix:?}: {:?}", view.actions))
         .clone()
+}
+
+#[test]
+fn linkage_health_uses_plain_language_counts_and_is_read_only() {
+    let operation = RommOperation::CheckLinks {
+        local_paths: vec![PathBuf::from("/library/Game.gb")],
+    };
+    assert!(!operation.is_mutating());
+    assert!(!operation.uses_network());
+    assert!(!operation.reports_progress());
+
+    let summary = RommLinkageSummary {
+        inspected: 100,
+        linked: 61,
+        no_import_cache: 7,
+        no_path_mapping: 8,
+        provider_path_unmapped: 9,
+        translated_elsewhere: 5,
+        stale_or_missing: 4,
+        unknown_platform: 3,
+        ambiguous: 2,
+        unresolved_other: 1,
+        ..Default::default()
+    };
+    let labels = linkage_summary_rows(&summary)
+        .into_iter()
+        .map(|row| format!("{} {}", row.label, row.value))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    for expected in [
+        "Linked 61",
+        "No import/cache 7",
+        "No path mapping 8",
+        "Provider path unmapped 9",
+        "Translated elsewhere 5",
+        "Translated path missing / moved 4",
+        "Unknown platform 3",
+        "Ambiguous 2",
+    ] {
+        assert!(labels.contains(expected), "missing {expected}: {labels}");
+    }
+}
+
+#[test]
+fn linkage_health_problem_labels_are_actionable() {
+    for (status, label) in [
+        (RommLinkageStatus::NoImportCache, "No import/cache"),
+        (RommLinkageStatus::NoPathMapping, "No path mapping"),
+        (
+            RommLinkageStatus::TranslatedPathElsewhere,
+            "Translated elsewhere",
+        ),
+        (RommLinkageStatus::LocalPathMovedOrStale, "Moved/stale"),
+        (RommLinkageStatus::UnknownPlatform, "Unknown platform"),
+        (RommLinkageStatus::Ambiguous, "Ambiguous"),
+    ] {
+        assert_eq!(linkage_status_label(status), label);
+    }
+}
+
+#[test]
+fn linkage_result_is_bounded_and_declares_what_it_did_not_touch() {
+    let report = archivefs_core::identity_source::romm::linkage::RommLinkageReport {
+        summary: RommLinkageSummary {
+            inspected: 32,
+            no_import_cache: 32,
+            ..Default::default()
+        },
+        problems: (0..32)
+            .map(|index| RommLinkageDiagnostic {
+                status: RommLinkageStatus::NoImportCache,
+                reason_code: "no_import_cache",
+                explanation: "No RomM identity data has been imported yet.".to_string(),
+                local_path: PathBuf::from(format!("/library/{index}.gb")),
+                provider_game_id: None,
+                provider_platform_slug: None,
+                provider_path: None,
+                translated_local_path: None,
+                canonical_platform: None,
+            })
+            .collect(),
+    };
+    let result = build_result_view(
+        &RommOperation::CheckLinks {
+            local_paths: Vec::new(),
+        },
+        Ok(&RommOperationOutcome::Linkage(Box::new(report))),
+        false,
+    );
+    assert!(result.succeeded);
+    assert!(result.notes[0].contains("Read-only check"));
+    assert_eq!(result.rows.len(), 10);
 }
 
 // --- Card states ----------------------------------------------------------
@@ -563,6 +658,46 @@ fn the_rendered_card_draws_the_real_counts() {
         assert!(
             rendered_text_contains(&output, expected),
             "the card did not draw {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn the_rendered_card_draws_linkage_health_summary() {
+    let view = build_card_view(
+        Some(&snapshot(ProviderState::Ready, true, true)),
+        None,
+        false,
+    );
+    let mut state = RommCardState {
+        linkage_report: Some(Box::new(
+            archivefs_core::identity_source::romm::linkage::RommLinkageReport {
+                summary: RommLinkageSummary {
+                    inspected: 12,
+                    linked: 8,
+                    no_import_cache: 4,
+                    ..Default::default()
+                },
+                problems: Vec::new(),
+            },
+        )),
+        ..RommCardState::default()
+    };
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_romm_source_card(ui, &view, &mut state, None);
+        });
+    });
+    for expected in [
+        "RomM Linkage Health",
+        "Check RomM links",
+        "Linked:",
+        "No import/cache:",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "the linkage health surface did not draw {expected:?}"
         );
     }
 }

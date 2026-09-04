@@ -7980,6 +7980,17 @@ impl ArchiveFsApp {
             .as_ref()
             .and_then(|running| running.progress.as_ref())
             .cloned();
+        let linkage_paths = self
+            .database_state
+            .snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .map(|archive| archive.absolute_path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         if let Some(request) = romm_source::show_romm_source_card(
             ui,
             &romm_view,
@@ -7995,6 +8006,14 @@ impl ArchiveFsApp {
                 RommCardRequest::Cancel => self.cancel_romm_operation(),
                 RommCardRequest::OpenConfigure => self.open_romm_configuration(),
                 RommCardRequest::OpenBrowse(view) => self.open_romm_browse(view),
+                RommCardRequest::CheckLinks => {
+                    self.start_romm_operation(
+                        context.clone(),
+                        RommOperation::CheckLinks {
+                            local_paths: linkage_paths,
+                        },
+                    );
+                }
             }
         }
 
@@ -9093,6 +9112,9 @@ impl ArchiveFsApp {
             result.as_ref().map_err(String::as_str),
             offline_usable,
         ));
+        if let Ok(RommOperationOutcome::Linkage(report)) = &result {
+            self.romm_ui.linkage_report = Some(report.clone());
+        }
         if operation.is_mutating() {
             // A failed connection test while imported identity is still being
             // served is the offline case working as intended: it must not
@@ -33363,6 +33385,26 @@ fn run_romm_operation(
     // before anything is validated - which is what makes "no request is made merely
     // by browsing" structural rather than a promise.
     match operation {
+        RommOperation::CheckLinks { local_paths } => {
+            let cache = api.open_cache(None).ok();
+            let trusted_roots = trusted_roots.as_deref().map_err(Clone::clone)?;
+            let mappings = archivefs_core::identity_source::path_map::PathMappings::validate(
+                if cache.is_some() {
+                    &settings.source.mappings
+                } else {
+                    &[]
+                },
+                trusted_roots,
+                settings.source.provider_path_kind,
+            )
+            .map_err(|refusal| refusal.detail())?;
+            let report = archivefs_core::identity_source::romm::linkage::inspect_local_paths(
+                cache.as_ref(),
+                &mappings,
+                local_paths,
+            );
+            return Ok(RommOperationOutcome::Linkage(Box::new(report)));
+        }
         RommOperation::LoadRecords {
             filters,
             offset,
@@ -33790,7 +33832,8 @@ fn run_romm_operation(
         | RommOperation::StaleSummary
         | RommOperation::ResolveGame { .. }
         | RommOperation::VerifyLocalFile { .. }
-        | RommOperation::LoadCover { .. } => unreachable!("handled before this match"),
+        | RommOperation::LoadCover { .. }
+        | RommOperation::CheckLinks { .. } => unreachable!("handled before this match"),
         RommOperation::LoadScreenshot { .. } => unreachable!("handled before this match"),
         RommOperation::OpenManual { .. } => unreachable!("handled before this match"),
     }
