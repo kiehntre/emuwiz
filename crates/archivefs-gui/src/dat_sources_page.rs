@@ -1517,6 +1517,12 @@ pub(crate) const MAX_AUDIT_ENTRIES_SHOWN: usize = 500;
 /// screen.
 pub(crate) const RENAME_PLAN_PAGE_SIZE: usize = 150;
 
+const QUICK_RENAME_VERIFIED_CORRECT_EXPLANATION: &str =
+    "These files were checked and already have the expected canonical name.";
+const QUICK_RENAME_UNRESOLVED_EXPLANATION: &str =
+    "EmuWiz could not prove a safe rename, so these files were left untouched.";
+const QUICK_RENAME_CONFLICT_EXPLANATION: &str = "Conflict means EmuWiz found competing safe interpretations and cannot choose one automatically. It does not necessarily mean the files are duplicates.";
+
 /// The `[start, end)` slice bounds and total page count for page `page`
 /// (0-based, clamped into range) over `total` rows at
 /// [`RENAME_PLAN_PAGE_SIZE`] rows per page. Pulled out of the drawing
@@ -7961,9 +7967,29 @@ pub(crate) fn show_quick_rename_page(
                         .strong(),
                 );
                 ui.label(format!("{safe} safe renames"));
-                ui.label(format!("{canonical} already correct"));
+                ui.label(format!("{canonical} verified correct"));
+                ui.label(
+                    egui::RichText::new(QUICK_RENAME_VERIFIED_CORRECT_EXPLANATION)
+                        .color(theme::muted(ui))
+                        .small(),
+                );
                 ui.label(format!("{unsupported} verified but unsupported"));
-                ui.label(format!("{unresolved} files left unchanged"));
+                ui.label(format!("{unresolved} unresolved / no safe rename"));
+                if unresolved > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Unresolved breakdown: {} conflicts · {} ambiguous · {} blocked",
+                            conflicts, ambiguous, plan.counts.blocked
+                        ))
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new(QUICK_RENAME_UNRESOLVED_EXPLANATION)
+                            .color(theme::muted(ui))
+                            .small(),
+                    );
+                }
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     if widgets::action_button(
@@ -8022,6 +8048,13 @@ pub(crate) fn show_quick_rename_page(
                         )
                         .color(theme::muted(ui))
                         .small(),
+                    );
+                }
+                if conflicts > 0 {
+                    ui.label(
+                        egui::RichText::new(QUICK_RENAME_CONFLICT_EXPLANATION)
+                            .color(theme::muted(ui))
+                            .small(),
                     );
                 }
             });
@@ -11462,6 +11495,13 @@ fn show_rename_plan_section(
                 .small(),
             );
         });
+        if ui_state.plan_filter == RenamePlanFilter::Conflicts && plan.counts.conflicts > 0 {
+            ui.label(
+                egui::RichText::new(QUICK_RENAME_CONFLICT_EXPLANATION)
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
 
         // Filter row: which states are shown. Filters only change what is
         // drawn; they never decide anything about the plan.

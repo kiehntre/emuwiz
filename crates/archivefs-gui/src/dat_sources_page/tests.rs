@@ -6638,6 +6638,55 @@ fn quick_rename_can_proceed_without_opening_advanced_planner() {
     );
 }
 
+#[test]
+fn quick_rename_summary_explains_verified_and_unresolved_results() {
+    let (_fixture, _roms, page) = page_with_mixed_quick_rename_plan();
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_quick_rename(&view, &mut ui_state);
+
+    assert!(rendered_text_contains(&output, "verified correct"));
+    assert!(!rendered_text_contains(&output, "already correct"));
+    assert!(rendered_text_contains(
+        &output,
+        "These files were checked and already have the expected canonical name."
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "unresolved / no safe rename"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "EmuWiz could not prove a safe rename, so these files were left untouched."
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Unresolved breakdown: 1 conflicts · 1 ambiguous · 0 blocked"
+    ));
+}
+
+#[test]
+fn quick_rename_conflict_view_distinguishes_conflicts_from_duplicates() {
+    let (_fixture, _roms, page) = page_with_mixed_quick_rename_plan();
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi {
+        quick_review_open: true,
+        plan_filter: RenamePlanFilter::Conflicts,
+        ..Default::default()
+    };
+    let output = render_quick_rename(&view, &mut ui_state);
+
+    assert!(rendered_text_contains(
+        &output,
+        "Conflict means EmuWiz found competing safe interpretations"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "It does not necessarily mean the files are duplicates."
+    ));
+    assert!(rendered_text_contains(&output, "1 conflicts"));
+}
+
 /// Requested test: "Review changes still opens advanced planner". It
 /// remains the deliberate, optional route to the full technical view.
 #[test]
