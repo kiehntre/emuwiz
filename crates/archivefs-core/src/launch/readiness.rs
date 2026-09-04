@@ -238,6 +238,22 @@ pub enum LaunchBlockerKind {
     MgbaContentFormatUnsupported,
     /// The mGBA profile/executable binding could not be safely resolved.
     MgbaBindingUnavailable,
+    /// A FS-UAE command-plan request was given a non-FS-UAE candidate.
+    FsUaeCandidateRequired,
+    /// The canonical identity does not target the ordinary Amiga platform.
+    FsUaePlatformMismatch,
+    /// The selected content is not a directly supported FS-UAE image.
+    FsUaeContentFormatUnsupported,
+    /// No verified Amiga identity is available.
+    FsUaeIdentityMissing,
+    /// FS-UAE requires a profile/configuration for this launch.
+    FsUaeProfileRequired,
+    /// The FS-UAE profile/executable binding could not be resolved.
+    FsUaeBindingUnavailable,
+    /// FS-UAE firmware/Kickstart evidence is not sufficient.
+    FsUaeKickstartUnavailable,
+    /// IPF/CAPS content has no explicitly available backend evidence.
+    FsUaeIpfBackendUnavailable,
     /// A Xenia command-plan request was given a non-Xenia-standalone launch
     /// candidate.
     XeniaCandidateRequired,

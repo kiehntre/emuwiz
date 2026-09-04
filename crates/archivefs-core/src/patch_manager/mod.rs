@@ -106,9 +106,9 @@ pub use adapter::{
 };
 pub use amiga_whdload_local::{
     AMIGA_MAX_CONFIG_BYTES, AMIGA_MAX_PROFILES, AMIGA_MAX_SAVE_STATE_CANDIDATES, AmigaConfig,
-    AmigaEmulatorKind, AmigaGameInspection, AmigaGameRequest, AmigaHdfInspection,
-    AmigaHdfPartitionInspection, AmigaHealth, AmigaInstallationType, AmigaKickstart,
-    AmigaKickstartState, AmigaMachineProfile, AmigaProfile, AmigaProfileDiscovery,
+    AmigaEmulatorKind, AmigaExecutable, AmigaGameInspection, AmigaGameMapping, AmigaGameRequest,
+    AmigaHdfInspection, AmigaHdfPartitionInspection, AmigaHealth, AmigaInstallationType,
+    AmigaKickstart, AmigaKickstartState, AmigaMachineProfile, AmigaProfile, AmigaProfileDiscovery,
     AmigaProfileDiscoveryRoots, AmigaProfileScope, AmigaSlaveCandidate, AmigaWarning,
     AmigaWarningKind, discover_amiga_profiles, inspect_amiga_hdf, inspect_amiga_whdload_game,
     parse_amiga_version,

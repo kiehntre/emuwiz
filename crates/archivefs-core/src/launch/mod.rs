@@ -77,6 +77,8 @@ pub mod fbneo_command;
 pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
+pub mod fsuae_command;
+pub mod fsuae_execution;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
@@ -172,6 +174,15 @@ pub use flycast_execution::{
     FlycastLaunchPreflightError, FlycastLaunchPreflightErrorKind, FlycastLaunchRequest,
     FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
     preflight_flycast_launch, spawn_flycast,
+};
+pub use fsuae_command::{
+    FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,
+    FsUaeLaunchBlocker, FsUaeLaunchBlockerKind, FsUaeNativeLaunchBinding, build_fsuae_command_plan,
+    resolve_fsuae_native_launch_binding,
+};
+pub use fsuae_execution::{
+    FsUaeLaunchPreflightError, FsUaeLaunchPreflightErrorKind, FsUaeLaunchRequest,
+    preflight_fsuae_launch, spawn_fsuae,
 };
 pub use input_projection::{
     LaunchInputProjection, SegaCdGameRequest, VerifiedIdentityFact,

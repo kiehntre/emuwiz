@@ -15,10 +15,10 @@
 
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::launch::input_projection::{
-    LaunchInputProjection, VerifiedIdentityFact, project_duckstation_launch_input,
-    project_flycast_launch_input, project_melonds_launch_input, project_pcsx2_launch_input,
-    project_ppsspp_launch_input, project_rpcs3_launch_input, project_xemu_launch_input,
-    project_xenia_launch_input,
+    LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
+    project_duckstation_launch_input, project_flycast_launch_input, project_melonds_launch_input,
+    project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
+    project_xemu_launch_input, project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
@@ -29,10 +29,11 @@ use crate::launch::readiness::{
     pcsx2_firmware_readiness, ppsspp_firmware_readiness, rpcs3_firmware_readiness,
 };
 use crate::patch_manager::{
-    DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
-    FlycastProfile, FlycastSystemFileState, MelonDsFirmwareState, MelonDsProfile,
-    Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2Profile, PpssppProfile, Rpcs3GameInspection,
-    Rpcs3Profile, XemuProfile, XeniaProfile,
+    AmigaGameInspection, AmigaKickstartState, AmigaProfile, DuckStationBiosState,
+    DuckStationGameInspection, DuckStationProfile, FlycastGameInspection, FlycastProfile,
+    FlycastSystemFileState, MelonDsFirmwareState, MelonDsProfile, Pcsx2BiosVerification,
+    Pcsx2GameInspection, Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile,
+    XemuProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -75,6 +76,10 @@ pub enum DiscoveredStandaloneProfile<'a> {
     },
     Mgba {
         profile: &'a crate::patch_manager::MgbaProfile,
+    },
+    FsUae {
+        profile: &'a AmigaProfile,
+        inspection: &'a AmigaGameInspection,
     },
     Rpcs3 {
         profile: &'a Rpcs3Profile,
@@ -140,6 +145,13 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
         Self::Mgba { profile }
+    }
+
+    pub fn fsuae(profile: &'a AmigaProfile, inspection: &'a AmigaGameInspection) -> Self {
+        Self::FsUae {
+            profile,
+            inspection,
+        }
     }
 
     pub fn rpcs3(profile: &'a Rpcs3Profile, inspection: &'a Rpcs3GameInspection) -> Self {
@@ -266,6 +278,31 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: profile.config_path.clone(),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::FsUae {
+                profile,
+                inspection,
+            } if profile.emulator == crate::patch_manager::AmigaEmulatorKind::FsUae
+                && authorized(project_amiga_whdload_launch_input(
+                    input.verified_identity_facts,
+                )) =>
+            {
+                let firmware = match inspection.health.kickstart.state {
+                    AmigaKickstartState::PresentUnverified => FirmwareReadiness::PresentUnverified,
+                    AmigaKickstartState::Missing | AmigaKickstartState::NotConfigured => {
+                        FirmwareReadiness::Missing
+                    }
+                    AmigaKickstartState::Unreadable | AmigaKickstartState::Unknown => {
+                        FirmwareReadiness::Unknown
+                    }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "fsuae",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_root.clone()),
+                    eligible: profile.eligible,
+                    firmware,
                 })
             }
             DiscoveredStandaloneProfile::Rpcs3 {
