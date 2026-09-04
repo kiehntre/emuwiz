@@ -841,6 +841,25 @@ pub fn source_fingerprint(source: &ValidatedRommSource) -> String {
     for mapping in source.mappings().as_slice() {
         digest.update(b"\0");
         digest.update(mapping.provider_prefix.as_bytes());
+        // Sorted rather than iterated in declaration order: a mapping's
+        // aliases are a *set* of equivalent provider prefixes, and two
+        // configurations that declare the same set in a different order are
+        // the same configuration - they must fingerprint identically, or an
+        // edit that only reordered aliases (never changed which ones exist)
+        // would look like a change worth invalidating cached translations
+        // over, and a config saved back in a different order than it was
+        // typed could spuriously look unchanged-vs-changed depending on
+        // nothing meaningful.
+        let mut aliases: Vec<&str> = mapping
+            .provider_aliases
+            .iter()
+            .map(String::as_str)
+            .collect();
+        aliases.sort_unstable();
+        for alias in aliases {
+            digest.update(b"\0alias=");
+            digest.update(alias.as_bytes());
+        }
         digest.update(b"=>");
         digest.update(mapping.archivefs_prefix.to_string_lossy().as_bytes());
     }

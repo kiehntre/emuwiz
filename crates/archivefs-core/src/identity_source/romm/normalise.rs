@@ -552,12 +552,97 @@ fn string_array_or_single(value: &Value, field: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity_source::path_map::{PathMappings, ProviderPathKind};
+    use crate::identity_source::path_map::{PathMapping, PathMappings, ProviderPathKind};
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn no_mappings() -> PathMappings {
         PathMappings::validate(&[], &[], ProviderPathKind::ProviderRelative)
             .expect("an empty mapping set always validates")
+    }
+
+    #[test]
+    fn an_alias_record_is_translated_during_import_normalisation() {
+        let mappings = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gcn".to_string(),
+                archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/ngc"),
+                provider_aliases: vec!["roms/ngc".to_string()],
+            }],
+            &[],
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(
+            &json!({
+                "id": 101059,
+                "platform_slug": "ngc",
+                "full_path": "roms/ngc/example.iso",
+                "name": "Example",
+            }),
+            "server",
+            &mappings,
+            1,
+            &mut report,
+        )
+        .expect("the alias record is importable");
+
+        assert_eq!(
+            record.archivefs_path,
+            Some(PathBuf::from("/mnt/usbdrive/games/ngc/example.iso"))
+        );
+    }
+
+    #[test]
+    fn refreshing_with_a_corrected_alias_mapping_replaces_a_stale_null_translation() {
+        // The exact real-world shape the source-fingerprint bug produced: an
+        // alias-provider path (`roms/ngc/...`) normalised against a mapping
+        // set that does not yet know about the `ngc` alias comes back
+        // untranslated. `normalise_rom` takes no previous result as input -
+        // there is nothing here for a stale answer to hide in - so a second
+        // call against the *corrected* mapping must independently produce
+        // the real path, never inherit or preserve the earlier `None`.
+        let rom = json!({
+            "id": 101059,
+            "platform_slug": "ngc",
+            "full_path": "roms/ngc/example.iso",
+            "name": "Example",
+        });
+
+        let mut stale_report = NormalisationReport::default();
+        let stale_record = normalise_rom(&rom, "server", &no_mappings(), 1, &mut stale_report)
+            .expect("an unmapped alias path is still importable, just untranslated");
+        assert_eq!(
+            stale_record.archivefs_path, None,
+            "before the corrected mapping exists, the alias path has no local translation"
+        );
+
+        let corrected_mappings = PathMappings::validate(
+            &[PathMapping {
+                provider_prefix: "roms/gcn".to_string(),
+                archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/ngc"),
+                provider_aliases: vec!["roms/ngc".to_string()],
+            }],
+            &[],
+            ProviderPathKind::ProviderRelative,
+        )
+        .unwrap();
+        let mut refreshed_report = NormalisationReport::default();
+        let refreshed_record = normalise_rom(
+            &rom,
+            "server",
+            &corrected_mappings,
+            1,
+            &mut refreshed_report,
+        )
+        .expect("the alias record is importable");
+        assert_eq!(
+            refreshed_record.archivefs_path,
+            Some(PathBuf::from("/mnt/usbdrive/games/ngc/example.iso")),
+            "a refreshed publication with the corrected mapping must replace the stale \
+             null translation, not preserve it"
+        );
     }
 
     /// A realistic ROM object, shaped exactly like a real RomM release's

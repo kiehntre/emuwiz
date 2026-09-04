@@ -8,8 +8,10 @@
 use super::capability::*;
 use super::client::*;
 use super::config::*;
+use super::import::source_fingerprint;
 use crate::identity_source::net_policy::StaticResolver;
-use crate::identity_source::path_map::ProviderPathKind;
+use crate::identity_source::path_map::{PathMapping, ProviderPathKind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- Fixtures -------------------------------------------------------------
@@ -185,6 +187,139 @@ fn source() -> ValidatedRommSource {
     };
     ValidatedRommSource::validate(&config, &token(), &[], &StaticResolver::new())
         .expect("this configuration should validate")
+}
+
+/// Same as [`source`] but with an explicit, already-normalised set of path
+/// mappings - used by the source-fingerprint tests below, which need to
+/// vary the mapping set (including its aliases) between two otherwise
+/// identical sources.
+fn source_with_mappings(mappings: Vec<PathMapping>) -> ValidatedRommSource {
+    let config = RommSourceConfig {
+        enabled: true,
+        url: "http://172.19.0.20:8080".to_string(),
+        mappings,
+        media_mapping: None,
+        provider_path_kind: ProviderPathKind::ProviderRelative,
+        token_path: None,
+    };
+    ValidatedRommSource::validate(&config, &token(), &[], &StaticResolver::new())
+        .expect("this configuration should validate")
+}
+
+fn gcn_mapping(aliases: Vec<&str>) -> PathMapping {
+    PathMapping {
+        provider_prefix: "roms/gcn".to_string(),
+        archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/ngc"),
+        provider_aliases: aliases.into_iter().map(str::to_string).collect(),
+    }
+}
+
+// --- ScummVM-style provider-alias fingerprint safety -----------------------
+//
+// Runtime `PathMappings` translation already treats a provider alias as
+// equivalent to its canonical prefix (see `path_map.rs`), so the source
+// fingerprint - which exists to decide whether previously-imported/cached
+// state is still current - must change whenever the alias *set* changes,
+// and must never change for a merely-reordered but otherwise identical set.
+// The four real alias groups this was found against:
+// amiga-cd32/amigacd32, atarijaguar/jaguar, gcn/ngc, ps/psx.
+
+#[test]
+fn fingerprint_changes_when_a_provider_alias_is_added() {
+    let without_alias = source_with_mappings(vec![gcn_mapping(vec![])]);
+    let with_alias = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    assert_ne!(
+        source_fingerprint(&without_alias),
+        source_fingerprint(&with_alias),
+        "adding the ngc alias must invalidate any fingerprint taken before it existed"
+    );
+}
+
+#[test]
+fn fingerprint_changes_when_a_provider_alias_is_removed() {
+    let with_alias = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    let without_alias = source_with_mappings(vec![gcn_mapping(vec![])]);
+    assert_ne!(
+        source_fingerprint(&with_alias),
+        source_fingerprint(&without_alias)
+    );
+}
+
+#[test]
+fn fingerprint_is_stable_for_an_unchanged_mapping() {
+    let first = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    let second = source_with_mappings(vec![gcn_mapping(vec!["roms/ngc"])]);
+    assert_eq!(
+        source_fingerprint(&first),
+        source_fingerprint(&second),
+        "two sources built from the identical configuration must fingerprint identically"
+    );
+}
+
+#[test]
+fn fingerprint_is_independent_of_alias_declaration_order() {
+    let mapping_a = PathMapping {
+        provider_prefix: "roms/scummvm".to_string(),
+        archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/scummvm"),
+        provider_aliases: vec!["roms/scumm".to_string(), "roms/sci".to_string()],
+    };
+    let mapping_b = PathMapping {
+        provider_prefix: "roms/scummvm".to_string(),
+        archivefs_prefix: PathBuf::from("/mnt/usbdrive/games/scummvm"),
+        provider_aliases: vec!["roms/sci".to_string(), "roms/scumm".to_string()],
+    };
+    let first = source_with_mappings(vec![mapping_a]);
+    let second = source_with_mappings(vec![mapping_b]);
+    assert_eq!(
+        source_fingerprint(&first),
+        source_fingerprint(&second),
+        "the same alias set declared in a different order is the same configuration"
+    );
+}
+
+#[test]
+fn fingerprint_changes_across_all_four_real_alias_groups() {
+    let groups: [(&str, &str, &str); 4] = [
+        (
+            "roms/amiga-cd32",
+            "roms/amigacd32",
+            "/mnt/usbdrive/games/amiga-cd32",
+        ),
+        (
+            "roms/atarijaguar",
+            "roms/jaguar",
+            "/mnt/usbdrive/games/atarijaguar",
+        ),
+        ("roms/gcn", "roms/ngc", "/mnt/usbdrive/games/gcn"),
+        ("roms/ps", "roms/psx", "/mnt/usbdrive/games/ps"),
+    ];
+    for (primary, alias, destination) in groups {
+        let without_alias = source_with_mappings(vec![PathMapping {
+            provider_prefix: primary.to_string(),
+            archivefs_prefix: PathBuf::from(destination),
+            provider_aliases: vec![],
+        }]);
+        let with_alias = source_with_mappings(vec![PathMapping {
+            provider_prefix: primary.to_string(),
+            archivefs_prefix: PathBuf::from(destination),
+            provider_aliases: vec![alias.to_string()],
+        }]);
+        assert_ne!(
+            source_fingerprint(&without_alias),
+            source_fingerprint(&with_alias),
+            "{primary}/{alias}: registering the alias must change the fingerprint"
+        );
+        let with_alias_again = source_with_mappings(vec![PathMapping {
+            provider_prefix: primary.to_string(),
+            archivefs_prefix: PathBuf::from(destination),
+            provider_aliases: vec![alias.to_string()],
+        }]);
+        assert_eq!(
+            source_fingerprint(&with_alias),
+            source_fingerprint(&with_alias_again),
+            "{primary}/{alias}: the same alias mapping must be stable across rebuilds"
+        );
+    }
 }
 
 // --- Token handling -------------------------------------------------------

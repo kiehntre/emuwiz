@@ -351,6 +351,7 @@ mod tests {
     use crate::identity_source::cache::CACHE_FORMAT_VERSION;
     use crate::identity_source::model::IdentityProvider;
     use crate::identity_source::path_map::ProviderPathKind;
+    use crate::identity_source::romm::config::RommSourceConfig;
     use crate::identity_source::romm::normalise::{NormalisationReport, normalise_rom};
     use serde_json::json;
 
@@ -584,10 +585,17 @@ mod tests {
         assert_eq!(aliases["roms/atarijaguar"], ["roms/jaguar"]);
         assert_eq!(aliases["roms/gcn"], ["roms/ngc"]);
         assert_eq!(aliases["roms/ps"], ["roms/psx"]);
+        let persisted = RommSourceConfig {
+            mappings: plan.proposed_mappings.clone(),
+            provider_path_kind: ProviderPathKind::ProviderRelative,
+            ..RommSourceConfig::default()
+        };
+        let reloaded: RommSourceConfig =
+            serde_json::from_slice(&serde_json::to_vec(&persisted).unwrap()).unwrap();
         let mappings = PathMappings::validate(
-            &plan.proposed_mappings,
+            &reloaded.mappings,
             std::slice::from_ref(&root),
-            ProviderPathKind::ProviderRelative,
+            reloaded.provider_path_kind,
         )
         .unwrap();
         for (primary, alias) in pairs {
