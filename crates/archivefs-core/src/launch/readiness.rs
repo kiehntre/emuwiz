@@ -389,6 +389,35 @@ pub enum LaunchBlockerKind {
     HatariIpfBackendUnavailable,
     HatariDiskDriveInvalid,
     HatariContentUnavailable,
+    /// A Cemu command-plan request found no eligible discovered profile, or
+    /// [`crate::patch_manager::resolve_cemu_native_launch_binding`] itself
+    /// refused to produce a binding - see the blocker detail for the
+    /// underlying [`crate::patch_manager::CemuLaunchBlockerKind`].
+    CemuBindingUnavailable,
+    /// The selected content's shape is not [`crate::patch_manager::CemuContentForm::ExtractedTitle`]
+    /// - the only form this build launches - or is not recognised as a Wii
+    /// U content shape at all (an arbitrary folder, an unrelated file).
+    CemuContentFormatUnsupported,
+    /// The selected extracted-title directory does not have the expected
+    /// `code`/`content`/`meta` layout, or `code/` does not contain exactly
+    /// one `.rpx` file - see the blocker detail for the underlying
+    /// [`crate::patch_manager::CemuLayoutErrorKind`].
+    CemuLayoutInvalid,
+    /// The selected content's own `meta.xml` declares a title ID that does
+    /// not classify as [`crate::patch_manager::CemuTitleKind::Base`] - this
+    /// build only launches a selected base game, never an update or DLC
+    /// title directly (see the module doc comment on
+    /// [`crate::launch::cemu_command`]).
+    CemuNotABaseTitle,
+    /// This content form requires `keys.txt` and none was found configured
+    /// for the selected profile.
+    CemuKeysRequired,
+    /// Cemu's configured MLC path (`<mlc_path>` in `settings.xml`) is
+    /// unconfigured, missing, or not a directory.
+    CemuMlcUnavailable,
+    /// The content, executable, or configuration changed between planning
+    /// and the final pre-spawn recheck.
+    CemuDriftBeforeSpawn,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
@@ -421,6 +450,14 @@ pub enum LaunchWarningKind {
     /// none is remembered/preferred - still launchable, just ambiguous
     /// which one is "the" one.
     MultipleEligibleProfiles,
+    /// The selected Cemu extracted title has no `meta.xml`, or `meta.xml`
+    /// could not be read - the layout is still launched from its `.rpx`,
+    /// but with no self-reported title identity to show.
+    CemuTitleIdentityUnavailable,
+    /// A `keys.txt` was found for this Cemu profile, but its contents were
+    /// never inspected (and never will be) - see
+    /// [`crate::patch_manager::CemuKeysState::PresentUnverified`].
+    CemuKeysPresentUnverified,
 }
 
 /// One non-blocking condition on a [`crate::launch::planning::LaunchCandidate`].

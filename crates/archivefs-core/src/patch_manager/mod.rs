@@ -21,6 +21,7 @@ mod amiga_whdload_local;
 mod bsfree;
 mod bsfree_gamecube;
 mod bsfree_wii;
+mod cemu_local;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -145,6 +146,17 @@ pub use bsfree_wii::{
     analyze_bsfree_wii_duplicates, bsfree_cheat_as_wii, bsfree_dolphin_wii_code_name,
     bsfree_wii_cheats, bsfree_wii_load_confirmed, bsfree_wii_match, bsfree_wii_search,
     build_bsfree_wii_install_preview, classify_bsfree_wii_cheat, stage_bsfree_wii_install,
+};
+pub use cemu_local::{
+    CEMU_MAX_CONFIG_BYTES, CEMU_MAX_META_XML_BYTES, CEMU_MAX_PROFILES, CemuConfigInspection,
+    CemuContentForm, CemuContentSupport, CemuDiscoveryError, CemuExecutable, CemuExtractedLayout,
+    CemuInstallationType, CemuKeysEvidence, CemuKeysState, CemuLaunchBlocker,
+    CemuLaunchBlockerKind, CemuLayoutError, CemuLayoutErrorKind, CemuMlcEvidence, CemuMlcState,
+    CemuNativeLaunchBinding, CemuProfile, CemuProfileDiscovery, CemuProfileDiscoveryRoots,
+    CemuTitleIdentity, CemuTitleKind, classify_title_kind, config_path as cemu_config_path,
+    discover_cemu_profiles, extract_title_identity, form_for_path as cemu_form_for_path,
+    inspect_config as cemu_inspect_config, inspect_extracted_layout,
+    keys_evidence as cemu_keys_evidence, parse_cemu_version, resolve_cemu_native_launch_binding,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,

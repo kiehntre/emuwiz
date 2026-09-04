@@ -64,6 +64,8 @@
 
 pub mod amiberry_command;
 pub mod amiberry_execution;
+pub mod cemu_command;
+pub mod cemu_execution;
 pub mod dolphin_command;
 pub mod dolphin_execution;
 pub mod dosbox_command;
@@ -117,6 +119,16 @@ pub use amiberry_execution::{
     AmiberryLaunchExecutionError, AmiberryLaunchExitReport, AmiberryLaunchPreflightError,
     AmiberryLaunchPreflightErrorKind, AmiberryLaunchSpawnError, LaunchedAmiberryProcess,
     preflight_amiberry_launch, preflight_and_launch_amiberry, spawn_amiberry,
+};
+pub use cemu_command::{
+    CEMU_SUPPORTED_PLATFORM_ID, CemuCommand, CemuCommandPlan, CemuCommandSelection,
+    CemuLaunchRequest, CemuReadiness, build_cemu_command_plan, classify_cemu_readiness,
+};
+pub use cemu_execution::{
+    CemuLaunchCommandFacts, CemuLaunchExecutionError, CemuLaunchExitReport,
+    CemuLaunchPreflightError, CemuLaunchPreflightErrorKind, CemuLaunchSpawnError,
+    CemuPreflightRequest, LaunchedCemuProcess, preflight_and_launch_cemu, preflight_cemu_launch,
+    spawn_cemu,
 };
 pub use dolphin_command::{
     DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, DolphinCommandPlan, DolphinCommandSelection,
