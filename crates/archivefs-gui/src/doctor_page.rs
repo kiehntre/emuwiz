@@ -121,26 +121,27 @@ pub(crate) fn show_doctor_page(
             }
         });
         ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            doctor_health_metric(
-                ui,
-                "Blocking",
-                health.blocking,
-                widgets::StatusTone::Blocked,
-            );
-            doctor_health_metric(
-                ui,
-                "Warnings",
-                health.warnings,
-                widgets::StatusTone::Warning,
-            );
-            doctor_health_metric(
-                ui,
+        let health_grid = doctor_health_grid_layout(ui.available_width());
+        let metrics = [
+            ("Blocking", health.blocking, widgets::StatusTone::Blocked),
+            ("Warnings", health.warnings, widgets::StatusTone::Warning),
+            (
                 "Informational",
                 health.informational,
                 widgets::StatusTone::Info,
-            );
-            doctor_health_metric(ui, "Unknown", health.unknown, widgets::StatusTone::Pending);
+            ),
+            ("Unknown", health.unknown, widgets::StatusTone::Pending),
+        ];
+        ui.spacing_mut().item_spacing.x = health_grid.gap;
+        ui.spacing_mut().item_spacing.y = health_grid.gap;
+        ui.horizontal_wrapped(|ui| {
+            for (label, count, tone) in metrics {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(health_grid.card_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| doctor_health_metric(ui, health_grid.card_width, label, count, tone),
+                );
+            }
         });
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
@@ -315,14 +316,90 @@ pub(crate) fn show_doctor_page(
     action
 }
 
-fn doctor_health_metric(ui: &mut egui::Ui, label: &str, count: usize, tone: widgets::StatusTone) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DoctorHealthGridLayout {
+    columns: usize,
+    card_width: f32,
+    gap: f32,
+}
+
+const DOCTOR_HEALTH_CARD_MIN_WIDTH: f32 = 148.0;
+const DOCTOR_HEALTH_GRID_GAP: f32 = 8.0;
+
+fn doctor_health_grid_layout(available_width: f32) -> DoctorHealthGridLayout {
+    let width = available_width.max(0.0);
+    let columns = if width >= DOCTOR_HEALTH_CARD_MIN_WIDTH * 4.0 + DOCTOR_HEALTH_GRID_GAP * 3.0 {
+        4
+    } else if width >= DOCTOR_HEALTH_CARD_MIN_WIDTH * 2.0 + DOCTOR_HEALTH_GRID_GAP {
+        2
+    } else {
+        1
+    };
+    let card_width =
+        ((width - DOCTOR_HEALTH_GRID_GAP * (columns - 1) as f32) / columns as f32).max(0.0);
+    DoctorHealthGridLayout {
+        columns,
+        card_width,
+        gap: DOCTOR_HEALTH_GRID_GAP,
+    }
+}
+
+fn doctor_health_metric(
+    ui: &mut egui::Ui,
+    card_width: f32,
+    label: &str,
+    count: usize,
+    tone: widgets::StatusTone,
+) {
     widgets::card(ui, |ui| {
-        ui.set_min_width(124.0);
+        // `card` sizes its frame from its child. Reserve the target content
+        // width so the visible outer frame follows the grid allocation too.
+        ui.set_min_width((card_width - 28.0).max(0.0));
         ui.vertical_centered(|ui| {
             ui.label(egui::RichText::new(count.to_string()).size(22.0).strong());
             widgets::status_badge(ui, label, tone);
         });
     });
+}
+
+#[cfg(test)]
+mod health_grid_tests {
+    use super::*;
+
+    #[test]
+    fn health_grid_uses_all_four_categories_when_they_fit() {
+        let layout = doctor_health_grid_layout(900.0);
+        assert_eq!(layout.columns, 4);
+        assert!(layout.card_width >= DOCTOR_HEALTH_CARD_MIN_WIDTH);
+        assert_eq!(
+            layout.card_width,
+            doctor_health_grid_layout(900.0).card_width
+        );
+    }
+
+    #[test]
+    fn health_grid_balances_medium_width_into_two_columns() {
+        let layout = doctor_health_grid_layout(500.0);
+        assert_eq!(layout.columns, 2);
+        assert_eq!(layout.card_width, (500.0 - DOCTOR_HEALTH_GRID_GAP) / 2.0);
+    }
+
+    #[test]
+    fn health_grid_stacks_narrow_width_without_overflow() {
+        let layout = doctor_health_grid_layout(240.0);
+        assert_eq!(layout.columns, 1);
+        assert_eq!(layout.card_width, 240.0);
+        assert!(layout.card_width >= 0.0);
+    }
+
+    #[test]
+    fn four_categories_are_preserved_in_the_grid_model() {
+        let labels = ["Blocking", "Warnings", "Informational", "Unknown"];
+        let layout = doctor_health_grid_layout(500.0);
+        let rows = labels.len().div_ceil(layout.columns);
+        assert_eq!(rows, 2);
+        assert_eq!(labels.last(), Some(&"Unknown"));
+    }
 }
 
 /// One category's findings inside a collapsible section, shared by both view
