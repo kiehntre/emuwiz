@@ -172,19 +172,19 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "Game Boy",
-        standalone_adapters: &[],
+        standalone_adapters: &["mgba"],
         retroarch_core_hints: &["gambatte"],
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
         platform_id: "Game Boy Color",
-        standalone_adapters: &[],
+        standalone_adapters: &["mgba"],
         retroarch_core_hints: &["gambatte"],
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
         platform_id: "Game Boy Advance",
-        standalone_adapters: &[],
+        standalone_adapters: &["mgba"],
         retroarch_core_hints: &["mgba"],
         confidence: MappingConfidence::StronglyKnown,
     },
@@ -493,7 +493,14 @@ mod tests {
             "Atari Lynx",
         ] {
             let row = launch_compatibility_for_platform(platform_id).unwrap();
-            assert!(row.standalone_adapters.is_empty(), "{platform_id}");
+            if matches!(
+                platform_id,
+                "Game Boy" | "Game Boy Color" | "Game Boy Advance"
+            ) {
+                assert_eq!(row.standalone_adapters, &["mgba"], "{platform_id}");
+            } else {
+                assert!(row.standalone_adapters.is_empty(), "{platform_id}");
+            }
             assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
             assert_eq!(row.confidence, MappingConfidence::StronglyKnown);
         }

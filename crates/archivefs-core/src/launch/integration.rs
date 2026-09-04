@@ -73,6 +73,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     MelonDs {
         profile: &'a MelonDsProfile,
     },
+    Mgba {
+        profile: &'a crate::patch_manager::MgbaProfile,
+    },
     Rpcs3 {
         profile: &'a Rpcs3Profile,
         inspection: &'a Rpcs3GameInspection,
@@ -133,6 +136,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn melonds(profile: &'a MelonDsProfile) -> Self {
         Self::MelonDs { profile }
+    }
+
+    pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
+        Self::Mgba { profile }
     }
 
     pub fn rpcs3(profile: &'a Rpcs3Profile, inspection: &'a Rpcs3GameInspection) -> Self {
@@ -247,6 +254,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware,
+                })
+            }
+            DiscoveredStandaloneProfile::Mgba { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if matches!(identity.platform_id.as_str(), "Game Boy" | "Game Boy Color" | "Game Boy Advance")) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "mgba",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: profile.config_path.clone(),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
                 })
             }
             DiscoveredStandaloneProfile::Rpcs3 {

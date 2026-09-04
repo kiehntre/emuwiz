@@ -230,6 +230,14 @@ pub enum LaunchBlockerKind {
     MelonDsGameKeyMissing,
     /// The melonDS profile/executable binding could not be safely resolved.
     MelonDsBindingUnavailable,
+    /// A command-plan request was given a non-mGBA candidate.
+    MgbaCandidateRequired,
+    /// The canonical identity does not target a supported mGBA platform.
+    MgbaPlatformMismatch,
+    /// The content is not a direct extension matching the resolved platform.
+    MgbaContentFormatUnsupported,
+    /// The mGBA profile/executable binding could not be safely resolved.
+    MgbaBindingUnavailable,
     /// A Xenia command-plan request was given a non-Xenia-standalone launch
     /// candidate.
     XeniaCandidateRequired,

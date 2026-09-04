@@ -82,6 +82,8 @@ pub mod mame_command;
 pub mod mame_execution;
 pub mod melonds_command;
 pub mod melonds_execution;
+pub mod mgba_command;
+pub mod mgba_execution;
 pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;
@@ -195,6 +197,14 @@ pub use melonds_command::{
 pub use melonds_execution::{
     MelonDsLaunchPreflightError, MelonDsLaunchPreflightErrorKind, MelonDsLaunchRequest,
     preflight_melonds_launch, spawn_melonds,
+};
+pub use mgba_command::{
+    MGBA_SUPPORTED_PLATFORM_IDS, MgbaCommand, MgbaCommandPlan, MgbaCommandSelection,
+    build_mgba_command_plan,
+};
+pub use mgba_execution::{
+    MgbaLaunchPreflightError, MgbaLaunchPreflightErrorKind, MgbaLaunchRequest,
+    preflight_mgba_launch, spawn_mgba,
 };
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,

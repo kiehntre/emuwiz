@@ -64,6 +64,7 @@ mod hatari_local;
 mod import_safety;
 mod matching;
 mod melonds_local;
+mod mgba_local;
 mod pcengine_cd_firmware;
 mod pcsx2;
 mod pcsx2_firmware;
@@ -499,6 +500,13 @@ pub use melonds_local::{
     MelonDsNativeLaunchBinding, MelonDsProfile, MelonDsProfileDiscovery,
     MelonDsProfileDiscoveryRoots, discover_melonds_profiles, parse_melonds_version,
     resolve_melonds_native_launch_binding,
+};
+pub use mgba_local::{
+    MGBA_MAX_CONFIG_BYTES, MGBA_MAX_PROFILES, MgbaBiosState, MgbaConfigInspection,
+    MgbaDiscoveryError, MgbaExecutable, MgbaGameRequest, MgbaInstallationType, MgbaLaunchBlocker,
+    MgbaLaunchBlockerKind, MgbaNativeLaunchBinding, MgbaProfile, MgbaProfileDiscovery,
+    MgbaProfileDiscoveryRoots, discover_mgba_profiles, parse_mgba_version,
+    resolve_mgba_native_launch_binding,
 };
 pub use pcengine_cd_firmware::{
     KNOWN_SYSTEM_CARDS, KnownSystemCard, MAX_SYSTEM_CARD_BYTES, MAX_SYSTEM_CARD_CANDIDATES,
