@@ -40,6 +40,7 @@ pub mod import;
 pub mod managed_lifecycle;
 pub mod pack_import;
 pub mod registry;
+pub mod status_reporting;
 
 pub use convert::{claim_for_representation, lookup_no_intro, observations_from_no_intro_matches};
 pub use import::{ImportedNoIntroSource, NoIntroImportError, NoIntroVariant, import_no_intro_dat};
@@ -61,6 +62,11 @@ pub use pack_import::{
 pub use registry::{
     NoIntroSourceLabel, NoIntroSourceSelection, no_intro_selection_fingerprint,
     select_no_intro_source,
+};
+pub use status_reporting::{
+    ManagedNoIntroCoverageStatus, ManagedNoIntroMemberStatus, ManagedNoIntroPlatformStatus,
+    ManagedNoIntroSnapshotStatus, ManagedNoIntroStatusReport, ManagedNoIntroStatusSummary,
+    NoIntroFreshness, NoIntroLifecycleHealth, report_no_intro_lifecycle,
 };
 
 #[cfg(test)]
