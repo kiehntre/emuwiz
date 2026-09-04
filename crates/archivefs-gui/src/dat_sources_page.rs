@@ -97,7 +97,7 @@ use archivefs_core::dat::updates::{
 use archivefs_core::identity_source::no_intro::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
     NoIntroPackInspection, import_no_intro_pack, inspect_no_intro_pack,
-    load_current_no_intro_pack_summary,
+    load_current_no_intro_pack_summary, load_no_intro_pack_snapshots_at, report_no_intro_lifecycle,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -110,6 +110,9 @@ use crate::dat_coverage_panel::{
 };
 use crate::repair_history_page::presentation::{self, Tier};
 use crate::ui::{components as widgets, theme};
+
+#[path = "verify_summary.rs"]
+mod verify_summary;
 
 /// Said once on the page, because a DAT audit is the one place a user might
 /// reasonably expect a "fix it" button and there is deliberately not one.
@@ -518,6 +521,11 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) no_intro_selected_pack: Option<(String, u64)>,
     pub(crate) no_intro_inspection: Option<NoIntroPackInspection>,
     pub(crate) no_intro_installed: Option<NoIntroPackInspection>,
+    /// Read-only managed No-Intro lifecycle report. This is loaded once when
+    /// the page state opens; rendering never walks DATs or reconstructs it.
+    pub(crate) no_intro_status:
+        Option<archivefs_core::identity_source::no_intro::ManagedNoIntroStatusReport>,
+    pub(crate) no_intro_status_error: Option<String>,
     pub(crate) no_intro_action_error: Option<String>,
     pub(crate) no_intro_import_status: Option<NoIntroPackImportStatus>,
     pub(crate) unresolved: Vec<UnresolvedDatRowView>,
@@ -2621,6 +2629,8 @@ pub(crate) struct DatSourcesPageState {
     no_intro_selected_pack: Option<PathBuf>,
     no_intro_inspection: Option<NoIntroPackInspection>,
     no_intro_installed: Option<NoIntroPackInspection>,
+    no_intro_status: Option<archivefs_core::identity_source::no_intro::ManagedNoIntroStatusReport>,
+    no_intro_status_error: Option<String>,
     no_intro_action_error: Option<String>,
     no_intro_import_status: Option<NoIntroPackImportStatus>,
     /// Existing EmuWiz catalogue to enrich after a completed audit. Absent
@@ -2757,6 +2767,9 @@ impl DatSourcesPageState {
             managed_root,
         );
         state.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
+        let (status, status_error) = load_no_intro_lifecycle_status();
+        state.no_intro_status = status;
+        state.no_intro_status_error = status_error;
         state
     }
 
@@ -2866,6 +2879,8 @@ impl DatSourcesPageState {
             no_intro_selected_pack: None,
             no_intro_inspection: None,
             no_intro_installed: None,
+            no_intro_status: None,
+            no_intro_status_error: None,
             no_intro_action_error: None,
             no_intro_import_status: None,
             database_path: None,
@@ -5468,6 +5483,8 @@ impl DatSourcesPageState {
             }),
             no_intro_inspection: self.no_intro_inspection.clone(),
             no_intro_installed: self.no_intro_installed.clone(),
+            no_intro_status: self.no_intro_status.clone(),
+            no_intro_status_error: self.no_intro_status_error.clone(),
             no_intro_action_error: self.no_intro_action_error.clone(),
             no_intro_import_status: self.no_intro_import_status,
             unresolved: self
@@ -6310,6 +6327,29 @@ impl DatSourcesPageState {
     }
 }
 
+/// Reads the persisted No-Intro lifecycle registry once at page-load time.
+/// The report is already a core-owned, read-only projection; this helper only
+/// locates the app-owned store and never parses a DAT or changes lifecycle
+/// state. An unreadable registry is kept distinct from "no current pack".
+fn load_no_intro_lifecycle_status() -> (
+    Option<archivefs_core::identity_source::no_intro::ManagedNoIntroStatusReport>,
+    Option<String>,
+) {
+    let root = match archivefs_core::app_dirs::data_path("no_intro_pack") {
+        Ok(root) => root,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("Could not locate No-Intro status: {error}")),
+            );
+        }
+    };
+    match load_no_intro_pack_snapshots_at(&root) {
+        Ok(snapshots) => (Some(report_no_intro_lifecycle(&snapshots)), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
 fn combined_source_from_managed(
     source: ManagedDatReadOnlySource,
     source_display_name: String,
@@ -6931,15 +6971,36 @@ pub(crate) fn show_dat_sources_page(
     });
     ui.add_space(10.0);
 
-    if let Some(acquisition_action) = show_evidence_acquisition_section(ui, view) {
-        action = Some(acquisition_action);
-    }
-    ui.add_space(10.0);
+    // The front of Verify is a compact health summary. Detailed source
+    // management remains below, so a large DAT registry cannot dominate the
+    // first screen.
+    verify_summary::show(ui, view);
+    ui.add_space(12.0);
 
     if action.is_none()
-        && let Some(single_action) = show_single_catalogue_verify_section(ui, view, ui_state)
+        && let Some(coverage_action) = show_dat_coverage_section(ui, view, ui_state)
     {
-        action = Some(single_action);
+        action = Some(coverage_action);
+    }
+    ui.add_space(12.0);
+
+    egui::CollapsingHeader::new("Catalogue setup and verification")
+        .default_open(view.rows.is_empty())
+        .show(ui, |ui| {
+            if let Some(acquisition_action) = show_evidence_acquisition_section(ui, view) {
+                action = Some(acquisition_action);
+            }
+            ui.add_space(10.0);
+
+            if action.is_none()
+                && let Some(single_action) =
+                    show_single_catalogue_verify_section(ui, view, ui_state)
+            {
+                action = Some(single_action);
+            }
+        });
+    if action.is_some() {
+        ui.ctx().request_repaint();
     }
     ui.add_space(10.0);
 
@@ -6966,11 +7027,12 @@ pub(crate) fn show_dat_sources_page(
         ui.add_space(8.0);
     }
 
-    widgets::section_header(
-        ui,
-        "Local DAT Sources",
-        Some("User-added DAT files and folders. These stay local-only and are never updateable."),
-    );
+    egui::CollapsingHeader::new("Local DAT Sources")
+        // Keep the established small-source workflow expanded; the wall of
+        // rows is the large-registry case this wrapper is meant to contain.
+        .default_open(view.rows.len() < 10)
+        .show(ui, |ui| {
+    ui.label(egui::RichText::new("User-added DAT files and folders. These stay local-only and are never updateable.").color(theme::muted(ui)).small());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{} source(s)", view.rows.len())).strong());
         if ui.button("Expand all").clicked() {
@@ -7026,13 +7088,7 @@ pub(crate) fn show_dat_sources_page(
             ui.add_space(8.0);
         }
     }
-
-    ui.add_space(12.0);
-    if action.is_none()
-        && let Some(coverage_action) = show_dat_coverage_section(ui, view, ui_state)
-    {
-        action = Some(coverage_action);
-    }
+    });
 
     ui.add_space(12.0);
     if action.is_none()
