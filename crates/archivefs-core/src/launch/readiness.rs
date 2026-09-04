@@ -238,6 +238,22 @@ pub enum LaunchBlockerKind {
     MgbaContentFormatUnsupported,
     /// The mGBA profile/executable binding could not be safely resolved.
     MgbaBindingUnavailable,
+    /// A Vita3K command-plan request was given a non-Vita3K candidate.
+    Vita3kCandidateRequired,
+    /// The canonical identity does not target PlayStation Vita.
+    Vita3kPlatformMismatch,
+    /// The selected content is not an installed Vita title.
+    Vita3kContentUnsupported,
+    /// No trusted Vita title ID is available.
+    Vita3kTitleIdMissing,
+    /// The Vita3K profile/executable binding is unavailable.
+    Vita3kBindingUnavailable,
+    /// The exact Vita title is not installed.
+    Vita3kInstalledTitleMissing,
+    /// Vita3K firmware evidence is insufficient.
+    Vita3kFirmwareUnavailable,
+    /// Vita license evidence is insufficient for a title that needs it.
+    Vita3kLicenseUnavailable,
     /// A FS-UAE command-plan request was given a non-FS-UAE candidate.
     FsUaeCandidateRequired,
     /// The canonical identity does not target the ordinary Amiga platform.

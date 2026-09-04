@@ -105,6 +105,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "PlayStation Vita",
+        standalone_adapters: &["vita3k"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "Xbox",
         standalone_adapters: &["xemu"],
         retroarch_core_hints: &[],

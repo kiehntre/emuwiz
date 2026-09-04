@@ -86,6 +86,7 @@ mod rpcs3_local;
 mod shared_preview;
 mod shared_transaction;
 mod user_cheat_import;
+mod vita3k_local;
 mod xemu_local;
 mod xenia_install_plan;
 mod xenia_local;
@@ -675,6 +676,14 @@ pub use user_cheat_import::{
     UserCheatImportLimits, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatch,
     UserCheatMatchState, UserCheatProvenance, UserCheatSourceOrigin, scan_user_cheat_directory,
     scan_user_cheat_directory_with_limits, scan_user_cheat_file, scan_user_cheat_file_with_limits,
+};
+pub use vita3k_local::{
+    VITA3K_MAX_CONFIG_BYTES, VITA3K_MAX_PROFILES, VITA3K_MAX_SFO_BYTES, Vita3kConfigInspection,
+    Vita3kContentDisposition, Vita3kDiscoveryError, Vita3kExecutable, Vita3kFirmwareState,
+    Vita3kInstallationType, Vita3kInstalledTitle, Vita3kLaunchBlocker, Vita3kLaunchBlockerKind,
+    Vita3kLicenseState, Vita3kNativeLaunchBinding, Vita3kProfile, Vita3kProfileDiscovery,
+    Vita3kProfileDiscoveryRoots, classify_vita3k_content, discover_vita3k_profiles,
+    inspect_installed_title, parse_vita3k_version, resolve_vita3k_native_launch_binding,
 };
 pub use xemu_local::{
     XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,

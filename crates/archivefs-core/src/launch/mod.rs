@@ -105,6 +105,8 @@ pub mod rpcs3_command;
 pub mod rpcs3_execution;
 pub mod scummvm_command;
 pub mod scummvm_execution;
+pub mod vita3k_command;
+pub mod vita3k_execution;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
@@ -305,6 +307,14 @@ pub use scummvm_execution::{
     LaunchedScummVmProcess, ScummVmLaunchExecutionError, ScummVmLaunchPreflightError,
     ScummVmLaunchPreflightErrorKind, ScummVmLaunchRequest, ScummVmLaunchSpawnError,
     preflight_and_launch_scummvm, preflight_scummvm_launch, spawn_scummvm,
+};
+pub use vita3k_command::{
+    VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,
+    build_vita3k_command_plan,
+};
+pub use vita3k_execution::{
+    Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
+    preflight_vita3k_launch, spawn_vita3k,
 };
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,

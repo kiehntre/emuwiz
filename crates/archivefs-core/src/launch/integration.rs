@@ -83,6 +83,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Mgba {
         profile: &'a crate::patch_manager::MgbaProfile,
     },
+    Vita3k {
+        profile: &'a crate::patch_manager::Vita3kProfile,
+    },
     FsUae {
         profile: &'a AmigaProfile,
         inspection: &'a AmigaGameInspection,
@@ -195,6 +198,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
         Self::Mgba { profile }
+    }
+
+    pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
+        Self::Vita3k { profile }
     }
 
     pub fn fsuae(profile: &'a AmigaProfile, inspection: &'a AmigaGameInspection) -> Self {
@@ -357,6 +364,29 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: profile.config_path.clone(),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Vita3k { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "PlayStation Vita") =>
+            {
+                let firmware = match profile.firmware {
+                    crate::patch_manager::Vita3kFirmwareState::PresentUnverified => {
+                        FirmwareReadiness::PresentUnverified
+                    }
+                    crate::patch_manager::Vita3kFirmwareState::Missing => {
+                        FirmwareReadiness::Missing
+                    }
+                    crate::patch_manager::Vita3kFirmwareState::Unknown => {
+                        FirmwareReadiness::Unknown
+                    }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "vita3k",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: profile.config_path.clone(),
+                    eligible: profile.eligible,
+                    firmware,
                 })
             }
             DiscoveredStandaloneProfile::FsUae {
