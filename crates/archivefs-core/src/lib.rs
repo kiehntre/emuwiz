@@ -126,6 +126,9 @@ pub mod dat;
 /// rule, election contract, and apply seam.
 pub mod playing_library;
 
+/// Generic, read-only contract for auditing and planning source-root changes.
+pub mod source_root_migration;
+
 pub mod disk_format;
 
 /// Pure content/container/media evidence, deliberately separate from
