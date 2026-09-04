@@ -63,6 +63,7 @@
 //! module implements the first slice of.
 
 pub mod amiberry_command;
+pub mod amiberry_execution;
 pub mod dolphin_command;
 pub mod dolphin_execution;
 pub mod dosbox_command;
@@ -110,6 +111,11 @@ mod plan_to_spawn_tests;
 #[cfg(test)]
 mod tests;
 
+pub use amiberry_execution::{
+    AmiberryLaunchExecutionError, AmiberryLaunchExitReport, AmiberryLaunchPreflightError,
+    AmiberryLaunchPreflightErrorKind, AmiberryLaunchSpawnError, LaunchedAmiberryProcess,
+    preflight_amiberry_launch, preflight_and_launch_amiberry, spawn_amiberry,
+};
 pub use dolphin_command::{
     DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, DolphinCommandPlan, DolphinCommandSelection,
     build_dolphin_command_plan,

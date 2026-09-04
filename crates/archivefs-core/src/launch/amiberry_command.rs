@@ -6,11 +6,10 @@
 //! and the documented configuration option.
 
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::launch::planning::CanonicalIdentityStatus;
-use crate::launch::process_spawn::{CapturedFileIdentity, PreparedProcessCommand};
+use crate::launch::process_spawn::CapturedFileIdentity;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 use crate::patch_manager::{AmigaKickstartState, AmigaMachineProfile};
 
@@ -52,6 +51,9 @@ pub struct AmiberryKickstartEvidence {
     pub path: Option<PathBuf>,
     pub state: AmigaKickstartState,
     pub hash_verified: bool,
+    /// Identity captured when this evidence was authorized.  A configured
+    /// Kickstart without this binding cannot be safely revalidated at spawn.
+    pub identity: Option<CapturedFileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,62 +212,11 @@ pub fn build_amiberry_command_plan(
     }
 }
 
-pub fn preflight_amiberry_launch(
-    request: &AmiberryLaunchRequest,
-    identity: &CanonicalIdentityStatus,
-    machine: &AmigaMachineProfile,
-) -> Result<PreparedProcessCommand, LaunchBlocker> {
-    for (path, expected, label) in [
-        (
-            &request.executable,
-            request.executable_identity,
-            "Amiberry executable",
-        ),
-        (
-            &request.profile,
-            request.profile_identity,
-            "Amiberry profile",
-        ),
-        (
-            &request.selected_content,
-            request.content_identity,
-            "selected Amiga media",
-        ),
-    ] {
-        let metadata = fs::symlink_metadata(path).map_err(|error| {
-            block(
-                LaunchBlockerKind::AmiberryBindingUnavailable,
-                format!("{label} unavailable: {error}"),
-            )
-        })?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || CapturedFileIdentity::capture(&metadata) != expected
-        {
-            return Err(block(
-                LaunchBlockerKind::AmiberryBindingUnavailable,
-                format!("{label} changed or is unsafe"),
-            ));
-        }
-    }
-    let plan = build_amiberry_command_plan(identity, request, machine);
-    if let Some(blocker) = plan.blockers.into_iter().next() {
-        return Err(blocker);
-    }
-    Ok(PreparedProcessCommand {
-        executable: request.executable.clone(),
-        arguments: vec![
-            OsString::from(AMIBERRY_CONFIG_FLAG),
-            request.profile.clone().into_os_string(),
-        ],
-        working_directory: request.selected_content.parent().map(Path::to_path_buf),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::launch::planning::ResolvedIdentity;
+    use std::fs;
 
     fn request(path: &str) -> (AmiberryLaunchRequest, AmigaMachineProfile) {
         let content = PathBuf::from(path);
@@ -288,6 +239,7 @@ mod tests {
                     path: Some("/roms/kick.rom".into()),
                     state: AmigaKickstartState::PresentUnverified,
                     hash_verified: false,
+                    identity: None,
                 },
                 identity_evidence: "verified-amiga".into(),
                 content_identity: identity,
