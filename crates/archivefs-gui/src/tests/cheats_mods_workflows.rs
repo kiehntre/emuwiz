@@ -258,15 +258,15 @@ fn review_identity_lands_in_library_game_details_with_the_same_game_still_select
 /// render-harness test anywhere in this suite yet.
 #[test]
 fn gamer_view_unknown_platform_block_uses_approved_wording_only() {
-    // `show_gamer_view` lives in `gamer_view.rs`, not `main.rs`, since the
-    // GUI extraction (2026-08-22, Phase A) moved Gamer View rendering out
-    // of the app-shell file.
-    let source = include_str!("../gamer_view.rs");
+    // The selected-game stage's unknown-platform block lives in
+    // `gamer_view/stage.rs` since the structural Gamer View redesign moved
+    // the selected-game rendering into its own region module.
+    let source = include_str!("../gamer_view/stage.rs");
     let block = source
-        .split("if let Some(row) = row\n                                        && row.unknown_platform\n                                    {")
+        .split("if unknown_platform {")
         .nth(1)
-        .expect("the unknown-platform block must exist in show_gamer_view")
-        .split("\n\n                                    ui.add_space(theme::SECTION_GAP);")
+        .expect("the unknown-platform block must exist in the selected-game stage")
+        .split("ui.add_space(theme::SPACE_LG);")
         .next()
         .unwrap();
 

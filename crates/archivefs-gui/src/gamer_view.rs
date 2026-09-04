@@ -8,6 +8,12 @@
 
 use super::*;
 
+mod layout;
+mod rail;
+mod stage;
+
+pub(crate) use layout::GamerStageLayout;
+
 /// Which of Gamer View's two screens is currently showing - the
 /// one-screen game list (default) or the read-only Details view reached
 /// from the selected-game action panel. Never persisted; always starts
@@ -288,7 +294,10 @@ pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'s
 /// Keeps the planner's exact refusal available without exposing backend
 /// terminology in the main sentence, and exposes the blocker-specific next
 /// action to the caller through the returned `GamerViewAction`.
-fn show_gamer_launch_blocker(ui: &mut egui::Ui, blocker: &launch_readiness_page::GamerBlocker) {
+pub(crate) fn show_gamer_launch_blocker(
+    ui: &mut egui::Ui,
+    blocker: &launch_readiness_page::GamerBlocker,
+) {
     ui.colored_label(ui.visuals().warn_fg_color, blocker.heading());
     let next = match blocker.kind {
         launch_readiness_page::GamerBlockerKind::CheckingGame => {
@@ -426,7 +435,7 @@ pub(crate) enum GamerViewAction {
     RefreshGameInformation,
 }
 
-fn emulator_setup_focus(emulator: &str) -> EmulatorSetupFocus {
+pub(crate) fn emulator_setup_focus(emulator: &str) -> EmulatorSetupFocus {
     if emulator.eq_ignore_ascii_case("RetroArch") {
         EmulatorSetupFocus::RetroArch
     } else {
@@ -713,7 +722,7 @@ fn featured_retroarch_launch_action(
     }
 }
 
-fn featured_typed_launch_action(
+pub(crate) fn featured_typed_launch_action(
     ui: &mut egui::Ui,
     request: &launch_readiness_page::TypedLaunchRequest,
     retroarch_launch_state: &mut launch_readiness_page::RetroArchLaunchState,
@@ -757,23 +766,27 @@ pub(crate) fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) 
 /// when known - release year on one line together, so a game's year sits
 /// naturally beside what it *is* rather than getting its own "Released
 /// 1998" line lower in the panel.
-fn featured_platform_line(platform: &str, format_name: &str, year: Option<u16>) -> String {
+pub(crate) fn featured_platform_line(
+    platform: &str,
+    format_name: &str,
+    year: Option<u16>,
+) -> String {
     match year {
         Some(year) => format!("{platform} \u{b7} {format_name} \u{b7} {year}"),
         None => format!("{platform} \u{b7} {format_name}"),
     }
 }
 
-struct GamerMetadataView<'a> {
-    synopsis: Option<&'a str>,
-    genre: Option<&'a str>,
-    players: Option<&'a str>,
-    rating: Option<u8>,
-    release_year: Option<u16>,
+pub(crate) struct GamerMetadataView<'a> {
+    pub(crate) synopsis: Option<&'a str>,
+    pub(crate) genre: Option<&'a str>,
+    pub(crate) players: Option<&'a str>,
+    pub(crate) rating: Option<u8>,
+    pub(crate) release_year: Option<u16>,
 }
 
 impl<'a> GamerMetadataView<'a> {
-    fn merge(
+    pub(crate) fn merge(
         record_metadata: &'a archivefs_core::ArchiveMetadata,
         enrichment: Option<&'a crate::game_metadata::GameMetadataResult>,
     ) -> Self {
@@ -803,7 +816,7 @@ impl<'a> GamerMetadataView<'a> {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.synopsis.is_none()
             && self.genre.is_none()
             && self.players.is_none()
@@ -926,7 +939,7 @@ fn show_synopsis(ui: &mut egui::Ui, synopsis: &str) {
 /// that missing fields simply disappear rather than showing rows of
 /// "Unknown". Release year is shown by the caller, alongside platform, not
 /// here - see the featured panel's platform/format/year line.
-fn show_gamer_metadata_enrichment(ui: &mut egui::Ui, view: &GamerMetadataView<'_>) {
+pub(crate) fn show_gamer_metadata_enrichment(ui: &mut egui::Ui, view: &GamerMetadataView<'_>) {
     if view.is_empty() {
         return;
     }
@@ -1239,40 +1252,43 @@ pub(crate) fn show_gamer_view(
         library_filters.platform = None;
         archive_context.clear_selection();
     }
-    let visible = &snapshot.visible;
     let platform_counts = &snapshot.platform_counts;
-    // Captured once for this frame so the list and the featured panel agree about
-    // what is selected, and so a cover is asked for by the record's own path rather
-    // than by whichever row happens to be drawn at its position.
-    let selected_path = archive_context.focused.clone();
 
-    // Once a library exists, keep its two recurring maintenance actions in
-    // the simple view. Both dispatch the same source actions as Advanced View;
-    // this layer adds no filesystem walking or scan implementation of its own.
+    // Region 1 tail: a slim, right-aligned utility row for the two recurring
+    // maintenance actions. Both dispatch the same shared source actions as
+    // Advanced View; this layer adds no scanning of its own. The window's own
+    // top chrome (search + Menu) is owned by `main.rs`.
     if !data.rows.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            if widgets::action_button(
-                ui,
-                "Add another game folder",
-                widgets::ActionStyle::Secondary,
-                !busy,
-            )
-            .on_hover_text("Choose another folder for EmuWiz to look through.")
-            .clicked()
-                && let Some(folder) = rfd::FileDialog::new()
-                    .set_title("Choose another games folder")
-                    .pick_folder()
-            {
-                action = Some(GamerViewAction::AddGamesFolder(folder));
-            }
-            if widgets::action_button(ui, "Scan for new games", widgets::ActionStyle::Quiet, !busy)
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::action_button(
+                    ui,
+                    "Scan for new games",
+                    widgets::ActionStyle::Quiet,
+                    !busy,
+                )
                 .on_hover_text("Look through all your game folders again.")
                 .clicked()
-            {
-                action = Some(GamerViewAction::ScanForNewGames);
-            }
+                {
+                    action = Some(GamerViewAction::ScanForNewGames);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Add another game folder",
+                    widgets::ActionStyle::Quiet,
+                    !busy,
+                )
+                .on_hover_text("Choose another folder for EmuWiz to look through.")
+                .clicked()
+                    && let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Choose another games folder")
+                        .pick_folder()
+                {
+                    action = Some(GamerViewAction::AddGamesFolder(folder));
+                }
+            });
         });
-        ui.add_space(theme::SECTION_GAP);
+        ui.add_space(theme::SPACE_SM);
     }
 
     // The visual platform picker (milestone: "Gamer View Visual Platform
@@ -1334,755 +1350,76 @@ pub(crate) fn show_gamer_view(
     }
     ui.add_space(theme::SECTION_GAP);
 
-    // Captured once, here, after the chips above have consumed their
-    // actual height - and given explicitly to both columns below via
-    // `allocate_ui_with_layout`, the same technique `ui_layout::page`
-    // itself uses to guarantee a child gets the full height it was
-    // promised rather than an ambiguous inherited one (manual QA finding:
-    // the list must use all remaining height, with no large empty area
-    // left below it).
-    let available_width = ui.available_width();
-    let available_height = ui.available_height();
-    // Keep browsing practical while giving the selected game the visual
-    // majority of the stage. This is one composition that scales continuously
-    // from the 1100px target to wide desktop windows.
-    let list_width = (available_width * 0.44).clamp(320.0, 620.0);
-    let panel_width = (available_width - list_width - theme::SPACE_XL).max(340.0);
+    // ------------------------------------------------------------------
+    // Regions 3 & 4: the dominant selected-game stage, then the
+    // subordinate browsing rail beneath it. One vertically stacked
+    // composition budgeted by `GamerStageLayout`, replacing the old fixed
+    // list-left / detail-right split entirely.
+    // ------------------------------------------------------------------
+    let stage_layout =
+        GamerStageLayout::compute(egui::vec2(ui.available_width(), ui.available_height()));
 
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(list_width, available_height),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                if visible.is_empty() {
-                    // Distinguish *why* nothing is showing - a truthful,
-                    // specific empty state rather than one generic
-                    // message for every cause. Reachable now only when the
-                    // snapshot genuinely holds no such row: the shelf
-                    // counts these same candidates, so "no games match the
-                    // selected platform" cannot contradict a non-zero card.
-                    ui.add_space(theme::SECTION_GAP);
-                    ui.weak(gamer_empty_list_guidance(
-                        data.rows.is_empty(),
-                        !search_text.is_empty(),
-                        library_filters.platform.is_some(),
-                    ));
-                    // First-run only: no games at all, and no search/
-                    // platform filter is hiding anything either - the
-                    // "nothing here yet" state a brand-new install starts
-                    // in, per Phase 3's audit finding that this state
-                    // previously had no action at all, only this text.
-                    // Never Sources/DAT/adapter/mount/identity/evidence/
-                    // transaction vocabulary - a plain folder picker.
-                    if gamer_view_shows_add_games_button(
-                        data.rows.is_empty(),
-                        search_text.is_empty(),
-                        library_filters.platform.is_none(),
-                    ) {
-                        ui.add_space(theme::SECTION_GAP);
-                        if widgets::action_button(
-                            ui,
-                            "Add games",
-                            widgets::ActionStyle::Primary,
-                            true,
-                        )
-                        .on_hover_text(
-                            "Choose the folder where your games are - EmuWiz will look inside \
-                             and add what it finds.",
-                        )
-                        .clicked()
-                            && let Some(folder) = rfd::FileDialog::new()
-                                .set_title("Choose your games folder")
-                                .pick_folder()
-                        {
-                            action = Some(GamerViewAction::AddGamesFolder(folder));
-                        }
-                    }
-                } else {
-                    let row_height = (ui.spacing().interact_size.y * 2.4).max(64.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("gamer_view_game_list")
-                        .max_height(ui.available_height())
-                        .auto_shrink([false, false])
-                        .show_rows(ui, row_height, visible.len(), |ui, row_range| {
-                            // Only what is on screen, plus a small look-ahead, is
-                            // ever asked about. `show_rows` hands us the drawn
-                            // range, so this is bounded by the viewport rather than
-                            // by the library: a 13,891-record catalogue and a
-                            // 20-record one queue the same amount of work.
-                            let wanted = crate::gamer_artwork::look_ahead_range(
-                                row_range.clone(),
-                                visible.len(),
-                            );
-                            let paths_for = |range: std::ops::Range<usize>| {
-                                range
-                                    .map(|position| data.rows[visible[position]].path.clone())
-                                    .collect::<Vec<_>>()
-                            };
-                            let on_screen = paths_for(row_range.clone());
-                            let ahead: Vec<PathBuf> = paths_for(wanted)
-                                .into_iter()
-                                .filter(|path| !on_screen.contains(path))
-                                .collect();
-                            // The selected game is asked for first, so the featured
-                            // panel fills before the rows a person has not looked at
-                            // yet. It takes at most one of the frame's slots, which
-                            // is what stops a held-down arrow key from starving the
-                            // list.
-                            cover_requests.extend(covers.visible(
-                                selected_path.as_deref(),
-                                &on_screen,
-                                &ahead,
-                            ));
-
-                            for visible_index in row_range {
-                                let index = visible[visible_index];
-                                let record = &data.records[index];
-                                let row = &data.rows[index];
-                                let selected =
-                                    archive_context.focused.as_deref() == Some(row.path.as_path());
-                                // Phase 5: an unresolved platform is as much
-                                // "needs attention" as a blocked mount is -
-                                // both get the same list-row word, and the
-                                // selected-game panel explains which one
-                                // applies (and, for the platform case, offers
-                                // Review) once this exact row is opened.
-                                let state_label = gamer_view_row_state_label(
-                                    row.unknown_platform,
-                                    record.mount_state,
-                                );
-                                // Looked up by the row's own path, which is the
-                                // record's identity - `show_rows` reuses row
-                                // positions as the list scrolls, and anything held
-                                // per position would eventually be painted beside a
-                                // different game.
-                                let cover = covers.slot_for(row.path.as_path(), None).cloned();
-                                let label = format!(
-                                    "{} \u{2014} {} \u{b7} {state_label}",
-                                    gamer_display_title(record),
-                                    row.platform
-                                );
-                                // The row's visible text is unchanged; only the
-                                // tooltip gains the reason, so a placeholder is
-                                // explainable without spending a row on it.
-                                let hover = match &cover {
-                                    Some(crate::gamer_artwork::CoverSlot::None(reason)) => {
-                                        format!("{label}\n{}", reason.describe())
-                                    }
-                                    _ => label.clone(),
-                                };
-                                // Stronger selected-row emphasis (manual QA
-                                // finding): bold text plus an explicit
-                                // selection-colored stroke drawn around
-                                // `selectable_label`'s own rect, layered on
-                                // top of - not replacing - its existing
-                                // keyboard focus, Tab order, and
-                                // Enter/Space activation (a plain
-                                // `Sense::click()` label would lose all of
-                                // that, which the accessibility
-                                // requirements below depend on).
-                                let response = ui
-                                    .add(
-                                        // Keep the complete accessible row label in the
-                                        // widget while painting a calmer two-line visual
-                                        // presentation below. The transparent label also
-                                        // preserves existing rendered-text probes and
-                                        // keyboard semantics without reintroducing the
-                                        // old one-line database slab.
-                                        egui::Button::new(
-                                            egui::RichText::new(&label)
-                                                .color(egui::Color32::TRANSPARENT),
-                                        )
-                                            .min_size(egui::vec2(ui.available_width(), row_height - 6.0))
-                                            .fill(if selected {
-                                                egui::Color32::from_rgb(20, 47, 43)
-                                            } else {
-                                                egui::Color32::TRANSPARENT
-                                            })
-                                            .stroke(egui::Stroke::NONE)
-                                            .corner_radius(6)
-                                            .selected(selected),
-                                    )
-                                    .on_hover_text(hover);
-                                let artwork_center = egui::pos2(
-                                    response.rect.left() + 33.0,
-                                    response.rect.center().y,
-                                );
-                                // The cover is drawn to *fit* the slot the platform
-                                // icon already occupied, never to fill it. That
-                                // keeps a 2:3 cover, a square icon and a glyph all
-                                // inside the same box, so no row changes height as
-                                // artwork arrives and none is ever stretched.
-                                //
-                                let drawn = match &cover {
-                                    Some(crate::gamer_artwork::CoverSlot::Ready {
-                                        texture,
-                                        ..
-                                    }) => {
-                                        paint_cover_fitted(
-                                            ui,
-                                            texture,
-                                            artwork_center,
-                                            crate::gamer_artwork::COVER_BOX,
-                                        );
-                                        true
-                                    }
-                                    // Loading and "no cover" draw the same thing.
-                                    // A spinner that becomes a picture is the same
-                                    // visual jump this is meant to avoid, and the
-                                    // placeholder is already a truthful, readable
-                                    // image of the platform.
-                                    _ => false,
-                                };
-                                if !drawn {
-                                    let platform_asset =
-                                        platform_asset_id(&row.platform, row.unknown_platform);
-                                    let platform_fallback = platform_fallback_asset_id(
-                                        &row.platform,
-                                        row.unknown_platform,
-                                    );
-                                    paint_game_row_artwork(
-                                        ui,
-                                        artwork_cache,
-                                        artwork_directory,
-                                        GameRowArtworkPaint {
-                                            center: artwork_center,
-                                            size: crate::gamer_artwork::COVER_BOX,
-                                            title: &gamer_display_title(record),
-                                            platform_asset: &platform_asset,
-                                            platform_fallback,
-                                        },
-                                    );
-                                }
-                                ui.painter().text(
-                                    egui::pos2(response.rect.left() + 68.0, response.rect.center().y - 9.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    gamer_display_title(record),
-                                    egui::FontId::proportional(theme::BODY_SIZE),
-                                    if selected { theme::PRIMARY_TEXT } else { theme::SECONDARY_TEXT },
-                                );
-                                ui.painter().text(
-                                    egui::pos2(response.rect.left() + 68.0, response.rect.center().y + 12.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    format!("{} · {state_label}", row.platform),
-                                    egui::FontId::proportional(theme::TECHNICAL_SIZE),
-                                    theme::TECHNICAL_TEXT,
-                                );
-                                if selected {
-                                    ui.painter().rect_filled(
-                                        egui::Rect::from_min_max(
-                                            response.rect.left_top(),
-                                            egui::pos2(response.rect.left() + 3.0, response.rect.bottom()),
-                                        ),
-                                        3.0,
-                                        theme::AMBER,
-                                    );
-                                    ui.painter().rect_stroke(
-                                        response.rect,
-                                        4.0,
-                                        egui::Stroke::new(
-                                            1.0_f32,
-                                            theme::BORDER_FOCUS,
-                                        ),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                if response.clicked() {
-                                    archive_context.select_only(row.path.clone());
-                                    *screen = GamerViewScreen::GameList;
-                                }
-                            }
-                        });
-                }
-            },
-        );
-
-        ui.separator();
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(panel_width, available_height),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                widgets::section_header(ui, "Selected game", None);
-                match selected_record(&data.records, archive_context.focused.as_deref()) {
-                    None => {
-                        // Clear, specific empty-state guidance (manual QA
-                        // finding) rather than a bare label.
-                        ui.add_space(theme::SECTION_GAP);
-                        ui.weak("No game selected.");
-                        ui.label("Choose a game from the list on the left to see what you can do with it.");
-                    }
-                    Some(record) => {
-                        // The featured block lives in its own constrained column so
-                        // the title, the status and Mount stay a cohesive unit
-                        // rather than stretching the full width of the panel.
-                        let content_width = panel_width.min(crate::gamer_artwork::GAMER_FEATURED_CONTENT_MAX_WIDTH);
-                        let archive_path = record.mount_plan.archive.path.clone();
-                        let platform = record
-                            .metadata
-                            .platform
-                            .as_deref()
-                            .or(record.identity.platform.as_deref())
-                            .unwrap_or("Unknown");
-                        let title = gamer_display_title(record);
-                        let row = data.rows.iter().find(|row| row.path == archive_path);
-                        let unknown_platform = row.is_some_and(|row| row.unknown_platform);
-
-                        // How much height everything *below* the artwork actually
-                        // took last frame: the title, the metadata, the separators
-                        // and both rows of actions.
-                        //
-                        // Measured rather than estimated, and measured as one block
-                        // rather than only the buttons. Its height depends on whether
-                        // the title wrapped to a second line, whether the primary
-                        // action carries a note, whether the secondary row wrapped
-                        // and whether Undo is offered - guessing it puts Mount below
-                        // the fold the moment any of those changes, which is exactly
-                        // what a 1280x720 window did. Stored per panel and converged
-                        // on the first frame.
-                        let actions_id = ui.id().with("gamer_featured_below_height");
-                        let measured = ui
-                            .ctx()
-                            .data(|data| data.get_temp::<f32>(actions_id))
-                            .unwrap_or(crate::gamer_artwork::FEATURED_RESERVED_BELOW);
-                        // Clamped against the physical viewport as well as the
-                        // container's own figure. The Gamer View column reports the
-                        // height it was allocated, which on a short window is more
-                        // than is actually on screen - the list beside it scrolls, so
-                        // it never notices, but this panel does not, and sizing the
-                        // artwork from the larger number is what pushed the secondary
-                        // actions off the bottom at 1280x720.
-                        let to_screen_bottom =
-                            (ui.ctx().screen_rect().bottom() - ui.cursor().top()).max(0.0);
-                        let usable = ui.available_height().min(to_screen_bottom);
-                        // The measurement covers the block itself; the gap the
-                        // artwork adds beneath it, and a couple of pixels of rounding
-                        // in the last row's spacing, come off here.
-                        let for_artwork = (usable - measured - theme::SECTION_GAP - 12.0)
-                            .max(if to_screen_bottom >= 680.0 {
-                                168.0
-                            } else {
-                                0.0
-                            });
-
-                        widgets::hero_card(ui, |ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(content_width, ui.available_height()),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                // --- Featured artwork ---
-                                //
-                                // Reserved at a fixed size for this frame whatever
-                                // the artwork is doing, so the title and the actions
-                                // beneath it never move as a cover arrives, fails, or
-                                // turns out not to exist. Sized from what the actions
-                                // left, so the artwork is what shrinks on a short
-                                // window - never the controls.
-                                //
-                                // Looked up by the selected record's own path, which
-                                // is what a cover is keyed by, so the panel reads the
-                                // *new* selection's slot the instant the selection
-                                // changes and a late reply for the previous one has
-                                // nothing here to draw into.
-                                if let Some(box_size) = crate::gamer_artwork::featured_cover_box(
-                                    content_width,
-                                    for_artwork,
-                                ) {
-                                    let cover =
-                                        covers.slot_for(archive_path.as_path(), None).cloned();
-                                    let platform_asset =
-                                        platform_asset_id(platform, unknown_platform);
-                                    let platform_fallback =
-                                        platform_fallback_asset_id(platform, unknown_platform);
-                                    show_featured_cover(
-                                        ui,
-                                        box_size,
-                                        cover.as_ref(),
-                                        GameRowArtworkPaint {
-                                            center: egui::Pos2::ZERO,
-                                            size: 0.0,
-                                            title: &title,
-                                            platform_asset: &platform_asset,
-                                            platform_fallback,
-                                        },
-                                        artwork_cache,
-                                        artwork_directory,
-                                    );
-                                    ui.add_space(theme::SECTION_GAP);
-                                }
-
-                                // --- Identity, status and actions ---
-                                //
-                                // Measured as one block, so the artwork above can be
-                                // sized from what everything below it really needs.
-                                let below = ui.scope(|ui| {
-                                    // The title is the strongest element; everything
-                                    // under it is one quiet line each. Deliberately
-                                    // not every field the Details screen holds - this
-                                    // is what a person needs to know they picked the
-                                    // right game, not a diagnostic dump.
-                                    ui.label(
-                                        egui::RichText::new(&title)
-                                            .size(theme::DISPLAY_SIZE)
-                                            .strong()
-                                            .color(ui.visuals().strong_text_color()),
-                                    );
-                                    let metadata_view =
-                                        GamerMetadataView::merge(&record.metadata, game_metadata);
-                                    featured_meta_line(
-                                        ui,
-                                        featured_platform_line(
-                                            platform,
-                                            archive_kind_name(record.mount_plan.archive.kind),
-                                            metadata_view.release_year,
-                                        ),
-                                        false,
-                                    );
-                                    show_gamer_metadata_enrichment(ui, &metadata_view);
-                                    // One reconciled readiness state feeds both
-                                    // the status word and the primary action
-                                    // below, so the card can never say
-                                    // "Ready to play" while the action is
-                                    // blocked.
-                                    let readiness = if record.is_mount_input() {
-                                        gamer_archive_readiness(
-                                            record.mount_state,
-                                            prepared_member,
-                                            play_action,
-                                            member_choices,
-                                        )
-                                    } else {
-                                        gamer_readiness(record.mount_state, play_action)
-                                    };
-                                    featured_meta_line(
-                                        ui,
-                                        gamer_readiness_short_label(&readiness).to_string(),
-                                        true,
-                                    );
-                                    if let Some(row) = row
-                                        && row.origin != RowOrigin::Live
-                                    {
-                                        // Only shown when it changes what the
-                                        // buttons below can be trusted to do -
-                                        // Gamer View's own plain wording, not
-                                        // Advanced View's precise state name
-                                        // (RowOrigin::label()).
-                                        featured_meta_line(
-                                            ui,
-                                            row.origin.gamer_view_label().to_string(),
-                                            false,
-                                        );
-                                    }
-                                    // Phase 5 (docs/GUI_NAVIGATION_RESET_DESIGN.md
-                                    // §4.1's fallback, never previously built): an
-                                    // unresolved platform said only "Unknown" with
-                                    // no explanation and no way to help EmuWiz
-                                    // figure it out. Never says "identity",
-                                    // "resolver", "evidence" - just what's true
-                                    // (we're not sure) and one real next step
-                                    // this architecture already supports (Review,
-                                    // which lands on this exact game's existing
-                                    // identity/evidence detail in Advanced View,
-                                    // not a generic page).
-                                    if let Some(row) = row
-                                        && row.unknown_platform
-                                    {
-                                        ui.add_space(4.0);
-                                        ui.colored_label(
-                                            ui.visuals().warn_fg_color,
-                                            "We couldn't tell which game system this is for.",
-                                        );
-                                        if widgets::action_button(
-                                            ui,
-                                            "Review",
-                                            widgets::ActionStyle::Secondary,
-                                            true,
-                                        )
-                                        .on_hover_text(
-                                            "See what EmuWiz found for this game in Advanced \
-                                             View, and help identify it if you can.",
-                                        )
-                                        .clicked()
-                                        {
-                                            action = Some(GamerViewAction::ReviewIdentity(
-                                                archive_path.clone(),
-                                            ));
-                                        }
-                                    }
-
-                                    ui.add_space(theme::SECTION_GAP);
-                                    ui.separator();
-                                    ui.add_space(theme::SECTION_GAP);
-
-                                    // Primary action: the one obvious, full-width,
-                                    // visually prominent button for what this game
-                                    // needs right now, and the first control a
-                                    // keyboard reaches in this panel.
-                                    match &readiness {
-                                        GamerReadiness::Mount | GamerReadiness::Prepare => {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "Temporarily makes this archived game available. The original is unchanged.",
-                                                )
-                                                .color(theme::muted(ui)),
-                                            );
-                                            if let Some(message) = preparation_message {
-                                                ui.colored_label(
-                                                    ui.visuals().warn_fg_color,
-                                                    message,
-                                                );
-                                            }
-                                            if featured_primary_button(ui, "Prepare game", !busy)
-                                                .clicked()
-                                            {
-                                                action = Some(GamerViewAction::Prepare(
-                                                    archive_path.clone(),
-                                                ));
-                                            }
-                                        }
-                                        GamerReadiness::ChooseMember { candidates } => {
-                                            ui.label("Choose the game file to play:");
-                                            for candidate in *candidates {
-                                                let label = format!(
-                                                    "{} ({})",
-                                                    candidate.member_name,
-                                                    format_size(Some(candidate.size_bytes)),
-                                                );
-                                                if widgets::action_button(
-                                                    ui,
-                                                    &label,
-                                                    widgets::ActionStyle::Secondary,
-                                                    !busy,
-                                                )
-                                                .on_hover_text(&candidate.reason)
-                                                .clicked()
-                                                {
-                                                    action = Some(
-                                                        GamerViewAction::SelectArchiveMember(
-                                                            archive_path.clone(),
-                                                            candidate.member_name.clone(),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        GamerReadiness::Unmount => {
-                                            if featured_primary_button(ui, "Unmount", !busy)
-                                                .clicked()
-                                            {
-                                                action = Some(GamerViewAction::Operation(
-                                                    OperationRequest {
-                                                        action: ArchiveAction::Unmount,
-                                                        archive_path: archive_path.clone(),
-                                                        cleanup_after_unmount,
-                                                    },
-                                                ));
-                                            }
-                                        }
-                                        GamerReadiness::Ready { request } => {
-                                            if featured_typed_launch_action(
-                                                ui,
-                                                request,
-                                                retroarch_launch_state,
-                                                !busy,
-                                            )
-                                            {
-                                                action = Some(GamerViewAction::Play(Box::new(
-                                                    (**request).clone(),
-                                                )));
-                                            }
-                                            widgets::technical_details(
-                                                ui,
-                                                "gamer-play-adapter",
-                                                |ui| {
-                                                    ui.label(format!(
-                                                        "Uses the {} launch adapter.",
-                                                        request.adapter_name()
-                                                    ));
-                                                },
-                                            );
-                                        }
-                                        GamerReadiness::NeedsSetup { blocker } => {
-                                            show_gamer_launch_blocker(ui, blocker);
-                                            let (label, next_action) = match &blocker.kind {
-                                                launch_readiness_page::GamerBlockerKind::UnknownSystem
-                                                | launch_readiness_page::GamerBlockerKind::ConflictingIdentity => (
-                                                    "Review game identity",
-                                                    Some(GamerViewAction::ReviewIdentity(
-                                                        archive_path.clone(),
-                                                    )),
-                                                ),
-                                                launch_readiness_page::GamerBlockerKind::EmulatorNotInstalled
-                                                | launch_readiness_page::GamerBlockerKind::EmulatorSetupIncomplete => (
-                                                    "Open Emulator Setup",
-                                                    blocker.emulator.as_deref().map_or_else(
-                                                        || Some(GamerViewAction::CheckEmulators(
-                                                            archive_path.clone(),
-                                                        )),
-                                                        |emulator| {
-                                                            Some(GamerViewAction::OpenEmulatorSetup(
-                                                                archive_path.clone(),
-                                                                emulator_setup_focus(emulator),
-                                                            ))
-                                                        },
-                                                    ),
-                                                ),
-                                                launch_readiness_page::GamerBlockerKind::EmulatorNotChecked => (
-                                                    "Check Emulators",
-                                                    Some(GamerViewAction::CheckEmulators(
-                                                        archive_path.clone(),
-                                                    )),
-                                                ),
-                                                launch_readiness_page::GamerBlockerKind::MultipleChoices => (
-                                                    "Choose an emulator",
-                                                    Some(GamerViewAction::OpenLaunchChoices(
-                                                        archive_path.clone(),
-                                                    )),
-                                                ),
-                                                launch_readiness_page::GamerBlockerKind::ContentNeedsPreparation
-                                                | launch_readiness_page::GamerBlockerKind::LaunchPlanInvalid => (
-                                                    "Open launch readiness",
-                                                    Some(GamerViewAction::OpenLaunchChoices(
-                                                        archive_path.clone(),
-                                                    )),
-                                                ),
-                                                launch_readiness_page::GamerBlockerKind::NoSafeEmulator => (
-                                                    "Check Emulators",
-                                                    Some(GamerViewAction::CheckEmulators(
-                                                        archive_path.clone(),
-                                                    )),
-                                                ),
-                                                launch_readiness_page::GamerBlockerKind::CheckingGame => (
-                                                    "Checking…",
-                                                    None,
-                                                ),
-                                            };
-                                            if let Some(next_action) = next_action
-                                                && widgets::action_button(
-                                                    ui,
-                                                    label,
-                                                    widgets::ActionStyle::Secondary,
-                                                    !busy,
-                                                )
-                                                .clicked()
-                                            {
-                                                action = Some(next_action);
-                                            }
-                                        }
-                                        GamerReadiness::NeedsAttention { reason } => {
-                                            ui.colored_label(
-                                                ui.visuals().warn_fg_color,
-                                                reason.as_str(),
-                                            );
-                                        }
-                                    }
-                                    if let Some(reason) = block_reason {
-                                        widgets::technical_details(
-                                            ui,
-                                            "gamer-operation-block",
-                                            |ui| {
-                                                ui.label(reason);
-                                            },
-                                        );
-                                    }
-
-                                    ui.add_space(theme::SECTION_GAP);
-                                    ui.separator();
-                                    ui.add_space(theme::SECTION_GAP);
-
-                                    // Secondary actions: kept together rather than
-                                    // scattered. One wrapping row while the panel is
-                                    // wide enough for all three, a tidy full-width
-                                    // stack once it is not.
-                                    let stacked = content_width < GAMER_SECONDARY_ROW_MIN_WIDTH;
-                                    let secondary = |ui: &mut egui::Ui, label: &str| {
-                                        if stacked {
-                                            let width = ui.available_width();
-                                            ui.add(
-                                                egui::Button::new(label)
-                                                    .min_size(egui::vec2(width, 34.0)),
-                                            )
-                                        } else {
-                                            widgets::action_button(
-                                                ui,
-                                                label,
-                                                widgets::ActionStyle::Secondary,
-                                                true,
-                                            )
-                                        }
-                                    };
-                                    let mut body = |ui: &mut egui::Ui| {
-                                        if record.is_mount_input()
-                                            && record.mount_state == MountState::Mounted
-                                            && secondary(ui, "Unmount").clicked()
-                                        {
-                                            action = Some(GamerViewAction::Operation(
-                                                OperationRequest {
-                                                    action: ArchiveAction::Unmount,
-                                                    archive_path: archive_path.clone(),
-                                                    cleanup_after_unmount,
-                                                },
-                                            ));
-                                        }
-                                        if secondary(ui, "Cheats & Mods").clicked() {
-                                            action = Some(GamerViewAction::OpenCheatsMods(
-                                                archive_path.clone(),
-                                            ));
-                                        }
-                                        if secondary(ui, "Details").clicked() {
-                                            *screen = GamerViewScreen::Details;
-                                        }
-                                        let folder =
-                                            archive_path.parent().filter(|folder| folder.is_dir());
-                                        if let Some(folder) = folder
-                                            && secondary(ui, gamer_copy_location_label()).clicked()
-                                        {
-                                            action = Some(GamerViewAction::CopyLocation(
-                                                folder.display().to_string(),
-                                            ));
-                                        }
-                                    };
-                                    if stacked {
-                                        body(ui);
-                                    } else {
-                                        ui.horizontal_wrapped(body);
-                                    }
-
-                                    if gamer_undo_available(
-                                        cheat_workflow,
-                                        Some(archive_path.as_path()),
-                                    ) {
-                                        ui.add_space(theme::SECTION_GAP);
-                                        if widgets::action_button(
-                                            ui,
-                                            "Undo last change",
-                                            widgets::ActionStyle::Quiet,
-                                            true,
-                                        )
-                                        .clicked()
-                                        {
-                                            action = Some(GamerViewAction::Undo);
-                                        }
-                                    }
-                                });
-
-                                // Recorded for the next frame. A changed measurement
-                                // asks for one more so the artwork settles
-                                // immediately rather than on the next input.
-                                let height = below.response.rect.height();
-                                if (height - measured).abs() > 0.5 {
-                                    ui.ctx()
-                                        .data_mut(|data| data.insert_temp(actions_id, height));
-                                    ui.ctx().request_repaint();
-                                }
-                            },
-                        );
-                        });
-                    }
-                }
-            },
-        );
+    let selected = selected_record(&data.records, archive_context.focused.as_deref());
+    let selected_row = selected.and_then(|record| {
+        let path = record.mount_plan.archive.path.as_path();
+        data.rows.iter().find(|row| row.path == path)
     });
+    // The stage shows the first-run "add your games" invitation only in the
+    // genuine empty-library case - never "no results for your search", which
+    // has a different real cause a folder picker would not fix.
+    let first_run = gamer_view_shows_add_games_button(
+        data.rows.is_empty(),
+        search_text.is_empty(),
+        library_filters.platform.is_none(),
+    );
+
+    if let Some(stage_action) = stage::show_selected_game_stage(
+        ui,
+        stage::StageContext {
+            record: selected,
+            row: selected_row,
+            busy,
+            block_reason,
+            cleanup_after_unmount,
+            cheat_workflow,
+            artwork_directory,
+            artwork_cache,
+            covers,
+            game_metadata,
+            prepared_member,
+            member_choices,
+            preparation_message,
+            play_action,
+            retroarch_launch_state,
+            screen,
+            layout: stage_layout,
+            first_run,
+        },
+    ) {
+        action = Some(stage_action);
+    }
+
+    ui.add_space(stage_layout.region_gap);
+
+    if let Some(rail_action) = rail::show_browsing_rail(
+        ui,
+        rail::RailContext {
+            data,
+            snapshot: &snapshot,
+            archive_context,
+            screen,
+            covers,
+            cover_requests,
+            artwork_directory,
+            artwork_cache,
+            columns: stage_layout.rail_columns,
+            min_height: stage_layout.rail_min_height,
+            searching: !search_text.is_empty(),
+            platform_selected: library_filters.platform.is_some(),
+        },
+    ) {
+        action = Some(rail_action);
+    }
 
     action
 }

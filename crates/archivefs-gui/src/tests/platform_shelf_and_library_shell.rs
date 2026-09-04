@@ -2951,7 +2951,7 @@ fn the_platform_shelf_never_overlaps_the_content_below_it() {
 
         // 4. The shelf ends above the main content, and no card rectangle
         //    intersects the "Selected game" pane or the game list.
-        let heading = painted_text_rect(&texts, "Selected game");
+        let heading = painted_text_rect(&texts, "YOUR LIBRARY");
         let first_game = painted_text_rect(&texts, "Game 00");
         assert!(
             geometry.row.bottom() <= heading.top(),
@@ -2966,7 +2966,7 @@ fn the_platform_shelf_never_overlaps_the_content_below_it() {
         for card in &geometry.cards {
             assert!(
                 !card.intersects(heading),
-                "{label}: a card overlaps the Selected game heading"
+                "{label}: a card overlaps the library heading below the shelf"
             );
             assert!(
                 !card.intersects(first_game),
@@ -3281,7 +3281,7 @@ fn a_fitting_shelf_keeps_the_same_boundary_and_draws_no_controls() {
         PLATFORM_SHELF_HEIGHT,
         "the shelf height must not depend on whether controls are drawn"
     );
-    let heading = painted_text_rect(&texts, "Selected game");
+    let heading = painted_text_rect(&texts, "YOUR LIBRARY");
     assert!(geometry.row.bottom() <= heading.top());
     for card in &geometry.cards {
         assert!(card.bottom() <= geometry.row.bottom() + 0.5);

@@ -264,8 +264,7 @@ use ui::components::{
 use ui::platform_artwork::{
     GameRowArtworkPaint, PlatformArtworkCache, PlatformArtworkPaint, PlatformAssetCategory,
     bundled_platform_artwork, canonical_platform_asset_id, custom_platform_artwork_path,
-    paint_cover_fitted, paint_game_row_artwork, paint_platform_artwork_at, platform_asset_category,
-    platform_asset_id, platform_fallback_asset_id,
+    paint_game_row_artwork, paint_platform_artwork_at, platform_asset_category, platform_asset_id,
 };
 use ui::{components as widgets, layout as ui_layout, theme};
 // Brings `String`'s char-index-safe insert/delete/slice methods into

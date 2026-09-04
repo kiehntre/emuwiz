@@ -3143,9 +3143,11 @@ fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport(
 }
 
 #[test]
-fn the_featured_panel_shows_artwork_above_the_title_and_the_actions() {
-    // The layout contract, stated relationally rather than in pixels: artwork
-    // at the top, then the title, then Mount, then the secondary actions.
+fn the_stage_puts_the_artwork_beside_the_title_and_the_actions() {
+    // The structural redesign's layout contract, stated relationally rather
+    // than in pixels: on a wide window the artwork is a prominent plate to
+    // the *right* of the text column, and inside that column the reading
+    // order is title, then the primary action, then the secondary actions.
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let generation = app.gamer_covers.generation();
     app.gamer_covers
@@ -3175,8 +3177,13 @@ fn the_featured_panel_shows_artwork_above_the_title_and_the_actions() {
     let mount = text_rect(&output, "Prepare game").expect("Prepare game");
     let cheats = text_rect(&output, "Cheats & Mods").expect("Cheats & Mods");
     assert!(
-        featured.bottom() <= title.top(),
-        "artwork is not above the title"
+        featured.left() >= title.right() - 1.0,
+        "the artwork plate ({featured:?}) overlaps the title text ({title:?}) instead of \
+         sitting to its right"
+    );
+    assert!(
+        featured.left() >= mount.right() - 1.0,
+        "the artwork plate overlaps the primary action"
     );
     assert!(
         title.bottom() <= mount.top(),
@@ -3432,8 +3439,8 @@ fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
     let title = text_rect(&output, long).expect("the title");
 
     assert!(
-        title.top() >= featured.bottom() - 0.5,
-        "a long title rode up over the artwork"
+        title.right() <= featured.left() + 1.0,
+        "a long title ran horizontally into the artwork plate"
     );
     assert!(
         title.bottom() <= mount.top() + 0.5,
