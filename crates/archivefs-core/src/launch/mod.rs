@@ -72,6 +72,8 @@ pub mod es_de_export;
 pub mod es_de_publish;
 pub mod evidence_bridge;
 pub mod execution;
+pub mod fbneo_command;
+pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
 pub mod input_projection;
@@ -149,6 +151,14 @@ pub use execution::{
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
     LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
     preflight_retroarch_launch, spawn_retroarch,
+};
+pub use fbneo_command::{
+    FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
+    FbneoSetEvidence, build_fbneo_command_plan,
+};
+pub use fbneo_execution::{
+    FbneoLaunchExecutionError, FbneoLaunchPreflightError, FbneoLaunchRequest,
+    preflight_and_launch_fbneo, preflight_fbneo_launch, spawn_fbneo,
 };
 pub use flycast_command::{
     FLYCAST_SUPPORTED_PLATFORM_ID, FlycastCommand, FlycastCommandPlan, FlycastCommandSelection,

@@ -319,6 +319,22 @@ pub enum LaunchBlockerKind {
     MameSearchPathUnconfigured,
     /// The requested launch arrangement is outside this native MAME slice.
     MameLaunchArrangementUnsupported,
+    /// A native FBNeo launch requires a resolved Arcade platform.
+    FbneoPlatformMismatch,
+    /// No explicit FBNeo DAT-backed driver identity is available.
+    FbneoIdentityUnavailable,
+    /// More than one FBNeo driver identity remains possible.
+    FbneoIdentityAmbiguous,
+    /// The selected FBNeo set is not storage-complete.
+    FbneoSetIncomplete,
+    /// The selected FBNeo set has a blocking dependency verdict.
+    FbneoDependencyBlocked,
+    /// FBNeo-specific compatibility evidence is absent or not trustworthy.
+    FbneoCompatibilityUnavailable,
+    /// No explicit standalone FBNeo executable binding is available.
+    FbneoEmulatorUnavailable,
+    /// The selected FBNeo archive/content is missing or has drifted.
+    FbneoContentUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
