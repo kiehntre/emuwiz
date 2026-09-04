@@ -66,6 +66,8 @@ pub mod amiberry_cd_command;
 pub mod amiberry_cd_execution;
 pub mod amiberry_command;
 pub mod amiberry_execution;
+pub mod azahar_command;
+pub mod azahar_execution;
 pub mod cemu_command;
 pub mod cemu_execution;
 pub mod dolphin_command;
@@ -132,6 +134,14 @@ pub use amiberry_execution::{
     AmiberryLaunchExecutionError, AmiberryLaunchExitReport, AmiberryLaunchPreflightError,
     AmiberryLaunchPreflightErrorKind, AmiberryLaunchSpawnError, LaunchedAmiberryProcess,
     preflight_amiberry_launch, preflight_and_launch_amiberry, spawn_amiberry,
+};
+pub use azahar_command::{
+    AZAHAR_SUPPORTED_PLATFORM_ID, AzaharCommand, AzaharCommandPlan, AzaharLaunchRequest,
+    build_azahar_command_plan,
+};
+pub use azahar_execution::{
+    AzaharPreflightError, AzaharPreflightErrorKind, LaunchedAzaharProcess, preflight_azahar_launch,
+    spawn_azahar,
 };
 pub use cemu_command::{
     CEMU_SUPPORTED_PLATFORM_ID, CemuCommand, CemuCommandPlan, CemuCommandSelection,

@@ -18,6 +18,7 @@
 
 mod adapter;
 mod amiga_whdload_local;
+mod azahar_local;
 mod bsfree;
 mod bsfree_gamecube;
 mod bsfree_wii;
@@ -99,6 +100,13 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use azahar_local::{
+    AZAHAR_MAX_3DSX_INSPECTION_BYTES, AZAHAR_MAX_CONFIG_BYTES, AzaharContentForm,
+    AzaharDiscoveryRoots, AzaharEvidenceState, AzaharProfile, AzaharTitleIdentity,
+    discover_azahar_executable, discover_azahar_profile, inspect_azahar_3dsx,
+    inspect_azahar_content, parse_azahar_version,
+};
 
 use crate::{Database, PersistedArchive};
 

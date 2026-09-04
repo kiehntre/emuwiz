@@ -65,6 +65,12 @@ pub enum LaunchReadiness {
 /// explanation alongside this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchBlockerKind {
+    /// A native Azahar launch was given a non-Nintendo 3DS identity.
+    AzaharPlatformMismatch,
+    /// Azahar Phase 1 accepts only a loose `.3dsx` homebrew file.
+    AzaharContentFormatUnsupported,
+    /// The selected Azahar configuration exists but cannot safely be read.
+    AzaharProfileUnavailable,
     /// A command-plan request was given a non-RetroArch launch candidate.
     RetroArchCandidateRequired,
     /// A caller supplied a candidate marked blocked without supplying the
