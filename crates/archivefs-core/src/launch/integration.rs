@@ -16,9 +16,9 @@
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
-    project_duckstation_launch_input, project_flycast_launch_input, project_melonds_launch_input,
-    project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
-    project_xemu_launch_input, project_xenia_launch_input,
+    project_duckstation_launch_input, project_flycast_launch_input, project_hatari_launch_input,
+    project_melonds_launch_input, project_pcsx2_launch_input, project_ppsspp_launch_input,
+    project_rpcs3_launch_input, project_xemu_launch_input, project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
@@ -26,14 +26,15 @@ use crate::launch::planning::{
 };
 use crate::launch::readiness::{
     FirmwareReadiness, duckstation_firmware_readiness, flycast_firmware_readiness,
-    pcsx2_firmware_readiness, ppsspp_firmware_readiness, rpcs3_firmware_readiness,
+    hatari_firmware_readiness, pcsx2_firmware_readiness, ppsspp_firmware_readiness,
+    rpcs3_firmware_readiness,
 };
 use crate::patch_manager::{
     AmigaGameInspection, AmigaKickstartState, AmigaProfile, DuckStationBiosState,
     DuckStationGameInspection, DuckStationProfile, FlycastGameInspection, FlycastProfile,
-    FlycastSystemFileState, MelonDsFirmwareState, MelonDsProfile, Pcsx2BiosVerification,
-    Pcsx2GameInspection, Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile,
-    XemuProfile, XeniaProfile,
+    FlycastSystemFileState, HatariGameInspection, HatariProfile, MelonDsFirmwareState,
+    MelonDsProfile, Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2Profile, PpssppProfile,
+    Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -80,6 +81,10 @@ pub enum DiscoveredStandaloneProfile<'a> {
     FsUae {
         profile: &'a AmigaProfile,
         inspection: &'a AmigaGameInspection,
+    },
+    Hatari {
+        profile: &'a HatariProfile,
+        inspection: &'a HatariGameInspection,
     },
     Rpcs3 {
         profile: &'a Rpcs3Profile,
@@ -149,6 +154,13 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn fsuae(profile: &'a AmigaProfile, inspection: &'a AmigaGameInspection) -> Self {
         Self::FsUae {
+            profile,
+            inspection,
+        }
+    }
+
+    pub fn hatari(profile: &'a HatariProfile, inspection: &'a HatariGameInspection) -> Self {
+        Self::Hatari {
             profile,
             inspection,
         }
@@ -303,6 +315,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_root.clone()),
                     eligible: profile.eligible,
                     firmware,
+                })
+            }
+            DiscoveredStandaloneProfile::Hatari {
+                profile,
+                inspection,
+            } if authorized(project_hatari_launch_input(input.verified_identity_facts)) => {
+                Some(StandaloneProfileInput {
+                    adapter_id: "hatari",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.config_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: hatari_firmware_readiness(inspection.health.tos.health),
                 })
             }
             DiscoveredStandaloneProfile::Rpcs3 {

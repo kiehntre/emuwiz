@@ -377,6 +377,18 @@ pub enum LaunchBlockerKind {
     FbneoEmulatorUnavailable,
     /// The selected FBNeo archive/content is missing or has drifted.
     FbneoContentUnavailable,
+    HatariCandidateRequired,
+    HatariPlatformMismatch,
+    HatariProfileUnavailable,
+    HatariEmulatorUnavailable,
+    HatariBindingAmbiguous,
+    HatariMachineMismatch,
+    HatariTosMissing,
+    HatariTosUnavailable,
+    HatariContentFormatUnsupported,
+    HatariIpfBackendUnavailable,
+    HatariDiskDriveInvalid,
+    HatariContentUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].

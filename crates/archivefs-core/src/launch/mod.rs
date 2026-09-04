@@ -80,6 +80,8 @@ pub mod flycast_command;
 pub mod flycast_execution;
 pub mod fsuae_command;
 pub mod fsuae_execution;
+pub mod hatari_command;
+pub mod hatari_execution;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
@@ -189,6 +191,14 @@ pub use fsuae_command::{
 pub use fsuae_execution::{
     FsUaeLaunchPreflightError, FsUaeLaunchPreflightErrorKind, FsUaeLaunchRequest,
     preflight_fsuae_launch, spawn_fsuae,
+};
+pub use hatari_command::{
+    HATARI_SUPPORTED_PLATFORM_ID, HatariCommand, HatariCommandPlan, HatariCommandSelection,
+    HatariMediaFormat, build_hatari_command_plan, hatari_media_format,
+};
+pub use hatari_execution::{
+    HatariLaunchExecutionError, HatariLaunchPreflightError, HatariLaunchPreflightErrorKind,
+    HatariLaunchRequest, preflight_and_launch_hatari, preflight_hatari_launch, spawn_hatari,
 };
 pub use input_projection::{
     LaunchInputProjection, SegaCdGameRequest, VerifiedIdentityFact,
