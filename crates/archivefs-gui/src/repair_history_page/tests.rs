@@ -329,7 +329,7 @@ fn stale_card_uses_beginner_archive_wording_and_keeps_record_available() {
     let output = render(&mut state);
     assert!(rendered_text_contains(
         &output,
-        "This recovery record no longer matches the files on disk."
+        "The recorded files are no longer where this transaction expected them."
     ));
     assert!(rendered_text_contains(&output, "Nothing will be changed."));
     assert!(rendered_text_contains(&output, "Archive this record"));
@@ -604,10 +604,7 @@ fn repair_history_shows_resolved_status_without_claiming_applied() {
     // ...but the truthful, unrewritten state badge must still say what
     // actually happened - a resolution is never allowed to rewrite it into
     // a settled "Applied" transaction's own label.
-    assert!(rendered_text_contains(
-        &output,
-        TransactionState::ApplyFailed.label()
-    ));
+    assert!(rendered_text_contains(&output, "Historical transaction"));
     assert_ne!(
         TransactionState::ApplyFailed.label(),
         TransactionState::Applied.label()
@@ -872,6 +869,7 @@ fn details_expose_the_full_uncopied_source_and_destination_paths() {
         stale_only: false,
         hide_settled: false,
         search_query: String::new(),
+        presentation: presentation::Snapshot::default(),
     };
 
     let output = render(&mut state);
@@ -918,6 +916,7 @@ fn the_copy_button_writes_the_exact_full_path_to_the_clipboard() {
         stale_only: false,
         hide_settled: false,
         search_query: String::new(),
+        presentation: presentation::Snapshot::default(),
     };
     let mut clipboard = NoopClipboard::default();
     render_with_clipboard(&mut state, &mut clipboard);

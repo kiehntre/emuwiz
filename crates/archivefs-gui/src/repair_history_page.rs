@@ -35,11 +35,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use archivefs_core::dat::rename_apply::{
-    EntryState, ExactResumeState, RecoveryCleanupClassification, RecoveryHistoryState,
-    RenameTransaction, RollbackOutcome, RollbackResult, TransactionSummary,
-    archive_recovery_transaction, archive_recovery_transactions, classify_recovery_cleanup,
-    exact_resume_state, journal_path, list_journals, load_recovery_history_state, read_journal,
-    reconcile_recovery, remove_journal, rollback_transaction,
+    EntryState, RecoveryCleanupClassification, RecoveryHistoryState, RenameTransaction,
+    RollbackOutcome, RollbackResult, TransactionSummary, archive_recovery_transaction,
+    archive_recovery_transactions, classify_recovery_cleanup, journal_path, list_journals,
+    load_recovery_history_state, read_journal, reconcile_recovery, remove_journal,
+    rollback_transaction,
 };
 use archivefs_core::repair::execute::{
     RepairReverifyEntry, RepairReverifyOutcome, reverify_transaction,
@@ -47,6 +47,8 @@ use archivefs_core::repair::execute::{
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
+
+pub(crate) mod presentation;
 
 /// One pending "Undo" confirmation, frozen when the dialog opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +125,7 @@ pub(crate) struct RepairHistoryPageState {
     /// Free-text filter matched against the transaction id and each entry's
     /// original/proposed basenames. Empty matches everything.
     pub(crate) search_query: String,
+    pub(crate) presentation: presentation::Snapshot,
 }
 
 /// The result of removing every provably-safe-to-remove transaction's
@@ -173,6 +176,7 @@ impl RepairHistoryPageState {
             stale_only: false,
             hide_settled: true,
             search_query: String::new(),
+            presentation: presentation::Snapshot::default(),
         };
         state.refresh();
         state
@@ -218,6 +222,17 @@ impl RepairHistoryPageState {
         });
         self.transactions = transactions;
         self.load_problems = problems;
+        let cleanups = self
+            .transactions
+            .iter()
+            .map(|transaction| {
+                (
+                    transaction.transaction_id.clone(),
+                    classify_recovery_cleanup(transaction),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.presentation = presentation::Snapshot::build(&self.transactions, &cleanups);
     }
 
     pub(crate) fn transaction_by_id(&self, transaction_id: &str) -> Option<&RenameTransaction> {
@@ -435,7 +450,10 @@ impl RepairHistoryPageState {
                     .archive_state
                     .archived_transaction_ids
                     .contains(&transaction.transaction_id)
-                    && classify_recovery_cleanup(transaction).is_stale()
+                    && self
+                        .presentation
+                        .for_id(&transaction.transaction_id)
+                        .is_some_and(|row| row.cleanup.is_stale())
             })
             .map(|transaction| transaction.transaction_id.clone())
             .collect()
@@ -561,14 +579,25 @@ fn visible_transaction_ids(
 }
 
 fn state_visible_transaction_ids(state: &RepairHistoryPageState) -> Vec<String> {
-    visible_transaction_ids(&state.transactions, state.hide_settled, &state.search_query)
+    visible_transaction_ids(&state.transactions, false, &state.search_query)
         .into_iter()
+        .filter(|id| {
+            !state.hide_settled
+                || state
+                    .transaction_by_id(id)
+                    .is_none_or(|transaction| !is_settled(transaction))
+                || state
+                    .presentation
+                    .for_id(id)
+                    .is_some_and(|row| row.tier == presentation::Tier::TechnicalInvalid)
+        })
         .filter(|id| state.show_archived || !state.is_archived(id))
         .filter(|id| {
             !state.stale_only
                 || state
-                    .transaction_by_id(id)
-                    .is_some_and(|transaction| classify_recovery_cleanup(transaction).is_stale())
+                    .presentation
+                    .for_id(id)
+                    .is_some_and(|row| row.cleanup.is_stale())
         })
         .collect()
 }
@@ -785,36 +814,17 @@ pub(crate) fn show_repair_history_page(
         }
     }
 
-    let stale_count = state.stale_transaction_ids().len();
-    let resumable_count = state
-        .transactions
-        .iter()
-        .filter(|transaction| {
-            !state.is_archived(&transaction.transaction_id)
-                && matches!(
-                    exact_resume_state(transaction),
-                    Ok(Some(
-                        ExactResumeState::Pending
-                            | ExactResumeState::Failed
-                            | ExactResumeState::Interrupted
-                    ))
-                )
-        })
-        .count();
-    let rollbackable_count = state
-        .transactions
-        .iter()
-        .filter(|transaction| {
-            !state.is_archived(&transaction.transaction_id)
-                && transaction.is_rollbackable()
-                && !classify_recovery_cleanup(transaction).is_stale()
-        })
-        .count();
+    let summary = state.presentation.summary.clone();
     widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Needs attention").strong());
-        ui.label(format!("resumable: {resumable_count}"));
-        ui.label(format!("rollbackable: {rollbackable_count}"));
-        ui.label(format!("stale/non-actionable: {stale_count}"));
+        ui.label(egui::RichText::new("Recovery and history").strong());
+        ui.label(format!("Needs attention: {}", summary.needs_attention));
+        ui.label(format!("Undo available: {}", summary.undo_available));
+        ui.label(format!("Historical transactions: {}", summary.historical));
+        ui.label(format!(
+            "Technical journal issues: {}",
+            summary.technical_issues
+        ));
+        let stale_count = state.stale_transaction_ids().len();
         if stale_count > 0 {
             ui.horizontal_wrapped(|ui| {
                 if widgets::action_button(
@@ -954,12 +964,39 @@ pub(crate) fn show_repair_history_page(
         );
         return;
     }
-    for transaction_id in &ids {
-        let Some(transaction) = state.transaction_by_id(transaction_id) else {
+    for tier in [
+        presentation::Tier::NeedsAttention,
+        presentation::Tier::RecentChanges,
+        presentation::Tier::History,
+        presentation::Tier::TechnicalInvalid,
+    ] {
+        let tier_ids: Vec<&String> = ids
+            .iter()
+            .filter(|id| {
+                state
+                    .presentation
+                    .for_id(id)
+                    .map_or(tier == presentation::Tier::History, |row| row.tier == tier)
+            })
+            .collect();
+        if tier_ids.is_empty() {
             continue;
+        }
+        let heading = match tier {
+            presentation::Tier::NeedsAttention => "Needs attention",
+            presentation::Tier::RecentChanges => "Recent changes",
+            presentation::Tier::History => "History",
+            presentation::Tier::TechnicalInvalid => "Technical issues",
         };
-        let transaction = transaction.clone();
-        show_transaction_row(ui, &transaction, state, clipboard);
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("{heading} ({})", tier_ids.len())).strong());
+        for transaction_id in tier_ids {
+            let Some(transaction) = state.transaction_by_id(transaction_id) else {
+                continue;
+            };
+            let transaction = transaction.clone();
+            show_transaction_row(ui, &transaction, state, clipboard);
+        }
     }
 }
 
@@ -972,7 +1009,14 @@ fn show_transaction_row(
     let summary = TransactionSummary::from_transaction(transaction);
     let reverify = reverify_transaction(transaction);
     let reverify_summary = reverify_summary(&reverify);
-    let cleanup = classify_recovery_cleanup(transaction);
+    let presentation = state
+        .presentation
+        .for_id(&transaction.transaction_id)
+        .cloned();
+    let cleanup = presentation
+        .as_ref()
+        .map(|row| row.cleanup)
+        .unwrap_or_else(|| classify_recovery_cleanup(transaction));
     let archived = state.is_archived(&transaction.transaction_id);
 
     ui.add_space(6.0);
@@ -984,8 +1028,18 @@ fn show_transaction_row(
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(
                 ui,
-                transaction.state.label(),
-                rollback_status_tone(&summary),
+                presentation
+                    .as_ref()
+                    .map_or(transaction.state.label(), |row| row.headline),
+                presentation.as_ref().map_or_else(
+                    || rollback_status_tone(&summary),
+                    |row| match row.tone {
+                        presentation::Tone::Warning => widgets::StatusTone::Warning,
+                        presentation::Tone::Info => widgets::StatusTone::Info,
+                        presentation::Tone::Muted => widgets::StatusTone::Pending,
+                        presentation::Tone::Technical => widgets::StatusTone::Warning,
+                    },
+                ),
             );
             let headline_label = ui.label(
                 egui::RichText::new(transaction_headline(transaction))
@@ -1012,6 +1066,13 @@ fn show_transaction_row(
             .monospace()
             .color(theme::muted(ui)),
         );
+        if let Some(presentation) = &presentation {
+            ui.label(
+                egui::RichText::new(presentation.detail)
+                    .small()
+                    .color(theme::muted(ui)),
+            );
+        }
 
         ui.label(
             egui::RichText::new(format!(
@@ -1075,7 +1136,8 @@ fn show_transaction_row(
             }
 
             let undoable = state.can_undo(&transaction.transaction_id)
-                && matches!(cleanup, RecoveryCleanupClassification::Actionable);
+                && matches!(cleanup, RecoveryCleanupClassification::Actionable)
+                && presentation.as_ref().is_none_or(|row| row.actions.undo);
             let undo = widgets::action_button(
                 ui,
                 if state.undo_running {
@@ -1104,8 +1166,10 @@ fn show_transaction_row(
         if !archived && let RecoveryCleanupClassification::Stale(reason) = cleanup {
             ui.separator();
             ui.label(
-                egui::RichText::new("This recovery record no longer matches the files on disk.")
-                    .strong(),
+                egui::RichText::new(
+                    "The recorded files are no longer where this transaction expected them.",
+                )
+                .strong(),
             );
             ui.label("Nothing will be changed.");
             ui.label(
