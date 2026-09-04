@@ -291,6 +291,7 @@ fn staged_mount_root_button_pos(ctx: &egui::Context, staged: &Path, label: &str)
                 &sources,
                 &[],
                 Some(Path::new("/mnt/archivefs")),
+                true,
                 false,
                 &mut draft,
                 false,
@@ -329,6 +330,7 @@ fn clicking_apply_folder_emits_apply_mount_root_for_exactly_the_staged_folder() 
                 &sources_for_render,
                 &[],
                 Some(Path::new("/mnt/archivefs")),
+                true,
                 false,
                 &mut draft.borrow_mut(),
                 false,
@@ -381,6 +383,7 @@ fn clicking_cancel_clears_the_staged_draft_and_emits_no_action() {
                 &sources_for_render,
                 &[],
                 Some(Path::new("/mnt/archivefs")),
+                true,
                 false,
                 &mut draft_in_render.borrow_mut(),
                 false,
@@ -426,6 +429,7 @@ fn render_sources_with_mount_root_feedback(
                 &sources,
                 &[],
                 Some(Path::new("/mnt/archivefs")),
+                true,
                 false,
                 &mut draft,
                 false,
@@ -500,7 +504,7 @@ fn sources_overview_reports_configured_counts_and_catalogue_readiness() {
     let state = CatalogueManagerState::Ready(list);
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            show_sources_overview(ui, &sources, &state, None);
+            show_sources_overview(ui, &sources, true, &state, None);
         });
     });
     for expected in [
@@ -704,6 +708,39 @@ fn sources_page_with_no_configured_sources_shows_empty_state_not_an_error() {
         });
     });
     assert!(rendered_text_contains(&output, "No source folders"));
+}
+
+#[test]
+fn sources_page_keeps_configured_sources_visible_when_catalogue_is_unavailable() {
+    let ctx = egui::Context::default();
+    let sources = three_source_views();
+    let mut add_dialog = None;
+    let mut remove_dialog = None;
+    let mut clipboard = InMemoryClipboard::default();
+    let mut draft = None;
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_sources_page_with_mount_root(
+                ui,
+                &sources,
+                &[],
+                Some(Path::new("/mnt/archivefs")),
+                false,
+                false,
+                &mut draft,
+                false,
+                None,
+                &mut add_dialog,
+                &mut remove_dialog,
+                &mut clipboard,
+            );
+        });
+    });
+
+    assert!(rendered_text_contains(&output, "Configured sources"));
+    assert!(rendered_text_contains(&output, "Catalogue unavailable"));
+    assert!(rendered_text_contains(&output, "/home/davedap/Archives"));
+    assert!(!rendered_text_contains(&output, "0 archives"));
 }
 
 #[test]

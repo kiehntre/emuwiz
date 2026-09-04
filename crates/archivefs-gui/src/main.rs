@@ -205,6 +205,7 @@ pub(crate) mod rpcs3_page;
 pub(crate) mod selected_evidence_no_intro;
 pub(crate) mod selected_evidence_page;
 pub mod selection_guard;
+mod source_state;
 mod sources_page;
 pub mod status_wording;
 mod ui;
@@ -7825,14 +7826,13 @@ impl ArchiveFsApp {
     /// consolidation, unchanged apart from the outer page header now being
     /// `show_sources_page`'s shared one.
     fn show_sources_libraries_tab(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
-        let sources = self
-            .database_state
-            .snapshot()
-            .map(|snapshot| snapshot.source_views.as_slice())
-            .unwrap_or(&[]);
-        let archives = self
-            .database_state
-            .snapshot()
+        let catalogue_snapshot = self.database_state.snapshot();
+        let source_state = source_state::merge_configured_sources(
+            self.gui_config.source_roots().ok().unwrap_or_default(),
+            catalogue_snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+        );
+        let sources = source_state.sources.as_slice();
+        let archives = catalogue_snapshot
             .map(|snapshot| snapshot.archives.as_slice())
             .unwrap_or(&[]);
         let mount_root = match &self.state {
@@ -7843,6 +7843,7 @@ impl ArchiveFsApp {
         show_sources_overview(
             ui,
             sources,
+            source_state.catalogue_available,
             &self.catalogue_manager,
             self.catalogue_retrieval.as_ref(),
         );
@@ -7861,6 +7862,7 @@ impl ArchiveFsApp {
             sources,
             archives,
             mount_root,
+            source_state.catalogue_available,
             self.source_action.is_some(),
             &mut self.mount_root_draft,
             self.setup_action.is_some()

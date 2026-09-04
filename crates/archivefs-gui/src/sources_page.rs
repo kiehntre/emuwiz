@@ -1090,6 +1090,7 @@ pub(super) fn sources_catalogue_overview_status(
 pub(super) fn show_sources_overview(
     ui: &mut egui::Ui,
     sources: &[SourceFolderView],
+    catalogue_available: bool,
     catalogue_manager: &CatalogueManagerState,
     catalogue_retrieval: Option<&RunningCatalogueRetrieval>,
 ) {
@@ -1121,6 +1122,9 @@ pub(super) fn show_sources_overview(
             sources.len(),
             if sources.len() == 1 { "" } else { "s" }
         ));
+        if !catalogue_available {
+            ui.weak("Catalogue unavailable; scan history and archive counts could not be loaded.");
+        }
         let mut items: Vec<(String, widgets::StatusTone)> = vec![(
             format!("{available} available"),
             widgets::StatusTone::Success,
@@ -1160,6 +1164,7 @@ pub(super) fn show_sources_page(
         sources,
         archives,
         mount_root,
+        true,
         busy,
         &mut mount_root_draft,
         false,
@@ -1186,6 +1191,7 @@ pub(super) fn show_sources_page_with_mount_root(
     sources: &[SourceFolderView],
     archives: &[PersistedArchive],
     mount_root: Option<&Path>,
+    catalogue_available: bool,
     busy: bool,
     mount_root_draft: &mut Option<PathBuf>,
     mount_root_busy: bool,
@@ -1208,6 +1214,13 @@ pub(super) fn show_sources_page_with_mount_root(
         "Configured sources",
         Some("Manage the configured folders EmuWiz scans for archives."),
     );
+
+    if !catalogue_available {
+        widgets::card(ui, |ui| {
+            ui.weak("Catalogue unavailable. Configured folders remain visible, but scan status and archive counts are unavailable.");
+        });
+        ui.add_space(12.0);
+    }
 
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {

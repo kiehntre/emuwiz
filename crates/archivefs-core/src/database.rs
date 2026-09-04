@@ -1182,9 +1182,19 @@ fn read_only_database_error(
 fn schema_version(connection: &Connection) -> Result<i64> {
     connection
         .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-        .map_err(|error| {
-            ArchiveFsError::Database(format!("failed to read schema version: {error}"))
-        })
+        .map_err(|error| schema_version_error(&error))
+}
+
+fn schema_version_error(error: &rusqlite::Error) -> ArchiveFsError {
+    if error
+        .sqlite_error()
+        .is_some_and(|sqlite| sqlite.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK)
+    {
+        return ArchiveFsError::Database(format!(
+            "SQLite requires rollback recovery, but this connection is read-only: {error}"
+        ));
+    }
+    ArchiveFsError::Database(format!("failed to read schema version: {error}"))
 }
 
 fn foreign_keys_enabled(connection: &Connection) -> Result<bool> {
@@ -8351,6 +8361,20 @@ mod tests {
         let open_message = open_error.to_string();
         assert!(open_message.contains("rollback recovery"));
         assert!(open_message.contains("copy-first"));
+        let schema_message = schema_version_error(&recovery_error).to_string();
+        assert!(
+            schema_message
+                .contains("SQLite requires rollback recovery, but this connection is read-only")
+        );
+
+        let ordinary_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("not a database".to_string()),
+        );
+        assert_eq!(
+            schema_version_error(&ordinary_error).to_string(),
+            "database error: failed to read schema version: not a database"
+        );
     }
 
     #[test]
