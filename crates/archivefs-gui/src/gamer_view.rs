@@ -1037,38 +1037,82 @@ pub(crate) fn show_gamer_details_panel(
     record: &ArchiveRecord,
     enrichment: Option<&crate::game_metadata::GameMetadataResult>,
     identity_status: Option<GamerIdentityStatus>,
+    covers: &crate::gamer_artwork::GamerCoverCache,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_directory: Option<&Path>,
 ) -> Option<GamerViewAction> {
     let view = GamerMetadataView::merge(&record.metadata, enrichment);
-    widgets::section_header(ui, "Details", None);
-    egui::Grid::new("gamer_details_grid")
+    let platform = record
+        .metadata
+        .platform
+        .as_deref()
+        .or(record.identity.platform.as_deref())
+        .unwrap_or("Unknown");
+    let title = gamer_display_title(record);
+    let archive_path = record.mount_plan.archive.path.as_path();
+    let cover = covers.slot_for(archive_path, None);
+    let real_cover = matches!(cover, Some(crate::gamer_artwork::CoverSlot::Ready { .. }));
+    let media_box = details_cover_box(real_cover);
+    let platform_asset = platform_asset_id(platform, false);
+    let platform_fallback =
+        crate::ui::platform_artwork::platform_fallback_asset_id(platform, false);
+
+    widgets::section_header(ui, "GAME DETAILS", None);
+    widgets::hero_card(ui, |ui| {
+        if ui.available_width() >= 700.0 {
+            ui.horizontal_top(|ui| {
+                show_featured_cover(
+                    ui,
+                    media_box,
+                    cover,
+                    GameRowArtworkPaint {
+                        center: egui::Pos2::ZERO,
+                        size: 0.0,
+                        title: &title,
+                        platform_asset: &platform_asset,
+                        platform_fallback,
+                    },
+                    artwork_cache,
+                    artwork_directory,
+                );
+                ui.add_space(theme::SPACE_MD);
+                show_details_hero_text(ui, record, &view, platform, &title, identity_status);
+            });
+        } else {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    show_featured_cover(
+                        ui,
+                        media_box.min(egui::vec2(220.0, 286.0)),
+                        cover,
+                        GameRowArtworkPaint {
+                            center: egui::Pos2::ZERO,
+                            size: 0.0,
+                            title: &title,
+                            platform_asset: &platform_asset,
+                            platform_fallback,
+                        },
+                        artwork_cache,
+                        artwork_directory,
+                    );
+                });
+                show_details_hero_text(ui, record, &view, platform, &title, identity_status);
+            });
+        }
+    });
+
+    if let Some(synopsis) = view.synopsis {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::section_header(ui, "SYNOPSIS", None);
+        show_synopsis(ui, synopsis);
+    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "GAME INFORMATION", None);
+    egui::Grid::new("gamer_details_information_grid")
         .num_columns(2)
         .striped(true)
         .show(ui, |ui| {
-            detail_row(
-                ui,
-                "Platform",
-                record
-                    .metadata
-                    .platform
-                    .as_deref()
-                    .or(record.identity.platform.as_deref())
-                    .unwrap_or("Unknown"),
-            );
-            if let Some(status) = identity_status {
-                detail_row(ui, "Identity", status.label());
-            }
-            detail_row(
-                ui,
-                "Format",
-                archive_kind_name(record.mount_plan.archive.kind),
-            );
-            detail_row(ui, "Size", &format_size(record.identity.size_bytes));
-            optional_detail_row(ui, "Title", record.metadata.title.as_deref());
-            optional_detail_row(ui, "Region", record.metadata.region.as_deref());
-            optional_detail_row(ui, "Version", record.metadata.version.as_deref());
-            optional_detail_row(ui, "Disc", record.metadata.disc.as_deref());
-            optional_detail_row(ui, "Publisher", record.metadata.publisher.as_deref());
-            optional_detail_row(ui, "Developer", record.metadata.developer.as_deref());
             optional_detail_row(ui, "Genre", view.genre);
             optional_detail_row(
                 ui,
@@ -1081,19 +1125,102 @@ pub(crate) fn show_gamer_details_panel(
                 "Rating",
                 view.rating.map(|rating| format!("{rating}/100")).as_deref(),
             );
+            optional_detail_row(ui, "Publisher", record.metadata.publisher.as_deref());
+            optional_detail_row(ui, "Developer", record.metadata.developer.as_deref());
+            optional_detail_row(ui, "Region", record.metadata.region.as_deref());
+            optional_detail_row(ui, "Version", record.metadata.version.as_deref());
+            optional_detail_row(ui, "Disc", record.metadata.disc.as_deref());
         });
-    if let Some(synopsis) = view.synopsis {
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("Synopsis").strong());
-        egui::ScrollArea::vertical()
-            .id_salt("gamer_details_synopsis")
-            .max_height(160.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(synopsis).color(theme::muted(ui)));
-            });
-    }
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(ui, "PLATFORM / ARCHIVAL INFORMATION", None);
+    egui::Grid::new("gamer_details_archival_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            detail_row(ui, "Platform", platform);
+            detail_row(
+                ui,
+                "Format",
+                archive_kind_name(record.mount_plan.archive.kind),
+            );
+            detail_row(ui, "Mount state", &record.mount_state.to_string());
+            detail_row(ui, "Health", &record.health.to_string());
+        });
+
+    widgets::technical_details(ui, "gamer_details_technical", |ui| {
+        detail_row(ui, "Archive path", &archive_path.display().to_string());
+        detail_row(ui, "Size", &format_size(record.identity.size_bytes));
+        if let Some(source) = record.metadata.source.as_deref() {
+            detail_row(ui, "Metadata source", source);
+        }
+        ui.label("RomM screenshot references are retained in the imported identity cache, but the Gamer record does not yet carry that identity linkage. The future media seam is the selected archive path to its external identity record; no screenshot is fetched here.");
+    });
     show_game_information_provenance(ui, enrichment)
+}
+
+fn show_details_hero_text(
+    ui: &mut egui::Ui,
+    record: &ArchiveRecord,
+    view: &GamerMetadataView<'_>,
+    platform: &str,
+    title: &str,
+    identity_status: Option<GamerIdentityStatus>,
+) {
+    ui.vertical(|ui| {
+        ui.heading(title);
+        ui.add_space(theme::SPACE_XS);
+        let subtitle = details_hero_subtitle(
+            platform,
+            view.release_year,
+            archive_kind_name(record.mount_plan.archive.kind),
+        );
+        ui.label(egui::RichText::new(subtitle).color(theme::muted(ui)));
+        if let Some(genre) = view.genre {
+            widgets::info_chip_row(ui, &split_genre_list(genre));
+        }
+        if let Some(players) = view.players {
+            featured_meta_line(ui, format_players(players), false);
+        }
+        if let Some(rating) = view.rating {
+            featured_meta_line(ui, format_rating(rating), false);
+        }
+        if let Some(status) = identity_status {
+            ui.add_space(theme::SPACE_SM);
+            widgets::status_badge(ui, "Identity", status_tone(status));
+            ui.label(status.label());
+        }
+        ui.add_space(theme::SPACE_SM);
+        ui.label(
+            egui::RichText::new("The cover is reused from Gamer View's shared cache.")
+                .small()
+                .color(theme::muted(ui)),
+        );
+    });
+}
+
+fn details_cover_box(real_cover: bool) -> egui::Vec2 {
+    crate::gamer_artwork::featured_cover_box(300.0, 390.0, real_cover)
+        .unwrap_or_else(|| egui::vec2(220.0, 286.0))
+}
+
+fn details_hero_subtitle(platform: &str, release_year: Option<u16>, format: &str) -> String {
+    let year = release_year.map(|year| year.to_string());
+    [Some(platform), year.as_deref(), Some(format)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("  ·  ")
+}
+
+fn status_tone(status: GamerIdentityStatus) -> widgets::StatusTone {
+    match status {
+        GamerIdentityStatus::Identified => widgets::StatusTone::Success,
+        GamerIdentityStatus::StillChecking => widgets::StatusTone::Info,
+        GamerIdentityStatus::Uncertain | GamerIdentityStatus::ConflictingEvidence => {
+            widgets::StatusTone::Warning
+        }
+    }
 }
 
 /// Game-information (enrichment) provenance and the "Refresh game
@@ -1249,9 +1376,15 @@ pub(crate) fn show_gamer_view(
         ui.add_space(theme::SECTION_GAP);
         let details_action =
             match selected_record(&data.records, archive_context.focused.as_deref()) {
-                Some(record) => {
-                    show_gamer_details_panel(ui, record, game_metadata, identity_status)
-                }
+                Some(record) => show_gamer_details_panel(
+                    ui,
+                    record,
+                    game_metadata,
+                    identity_status,
+                    covers,
+                    artwork_cache,
+                    artwork_directory,
+                ),
                 None => {
                     ui.label("Select a game to view its details.");
                     None
@@ -1486,6 +1619,38 @@ mod game_metadata_enrichment_tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn details_hero_keeps_a_prominent_cover_budget() {
+        let real = details_cover_box(true);
+        let fallback = details_cover_box(false);
+        assert!(real.y >= 300.0);
+        assert!(real.x / real.y > 0.6 && real.x / real.y < 0.8);
+        assert!(real.y > fallback.y);
+    }
+
+    #[test]
+    fn details_hero_subtitle_orders_human_metadata() {
+        assert_eq!(
+            details_hero_subtitle("Nintendo 64", Some(1998), "ZIP"),
+            "Nintendo 64  ·  1998  ·  ZIP"
+        );
+        assert_eq!(
+            details_hero_subtitle("Nintendo 64", None, "ZIP"),
+            "Nintendo 64  ·  ZIP"
+        );
+    }
+
+    #[test]
+    fn details_uses_the_existing_identity_status_vocabulary() {
+        assert_eq!(GamerIdentityStatus::Identified.label(), "Identified");
+        assert_eq!(GamerIdentityStatus::Uncertain.label(), "Uncertain");
+        assert_eq!(
+            GamerIdentityStatus::ConflictingEvidence.label(),
+            "Conflicting evidence"
+        );
+        assert_eq!(GamerIdentityStatus::StillChecking.label(), "Still checking");
     }
 
     #[test]
