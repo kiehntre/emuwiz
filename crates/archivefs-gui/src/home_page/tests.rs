@@ -196,6 +196,162 @@ fn established_install_shows_no_banner_and_ready_cards() {
     assert!(rendered_text_contains(&output, "All checks passed"));
 }
 
+#[test]
+fn healthy_home_hides_the_attention_section() {
+    let view = build_home_view(&established_inputs(&[passing_check("config file")]));
+    assert!(view.attention.is_empty());
+    let (output, _) = render(&view, 1100.0);
+    assert!(!rendered_text_contains(&output, "WHAT NEEDS ATTENTION"));
+}
+
+#[test]
+fn current_setup_problem_is_promoted_to_attention_with_a_real_action() {
+    let view = build_home_view(&established_inputs(&[error_check("emulator")]));
+    assert_eq!(view.attention.len(), 1);
+    assert_eq!(view.attention[0].action, HomeCard::CheckSetup);
+    let (output, _) = render(&view, 1100.0);
+    assert!(rendered_text_contains(&output, "WHAT NEEDS ATTENTION"));
+    assert!(rendered_text_contains(
+        &output,
+        "Emulator setup needs attention"
+    ));
+}
+
+#[test]
+fn attention_is_rendered_before_primary_tasks_when_active() {
+    let view = build_home_view(&established_inputs(&[error_check("emulator")]));
+    let (output, _) = render(&view, 1500.0);
+    let attention_y = exact_text_center(&output, "WHAT NEEDS ATTENTION")
+        .expect("attention heading should render")
+        .y;
+    let primary_y = exact_text_center(&output, "PRIMARY TASKS")
+        .expect("primary heading should render")
+        .y;
+    assert!(attention_y < primary_y);
+}
+
+#[test]
+fn home_grid_uses_deterministic_three_two_one_breakpoints() {
+    assert_eq!(home_grid_columns(1500.0, 8), 3);
+    assert_eq!(home_grid_columns(1100.0, 3), 3);
+    assert_eq!(home_grid_columns(1099.0, 8), 2);
+    assert_eq!(home_grid_columns(800.0, 8), 2);
+    assert_eq!(home_grid_columns(699.0, 8), 1);
+    assert_eq!(home_grid_columns(650.0, 8), 1);
+    assert_eq!(home_grid_columns(1500.0, 0), 0);
+}
+
+#[test]
+fn eight_secondary_cards_form_a_left_aligned_three_three_two_grid() {
+    let columns = home_grid_columns(1500.0, 8);
+    let rows: Vec<usize> = (0..8)
+        .collect::<Vec<_>>()
+        .chunks(columns)
+        .map(<[_]>::len)
+        .collect();
+    assert_eq!(rows, [3, 3, 2]);
+    assert!(rows.iter().all(|&width| width > 0 && width <= columns));
+}
+
+#[test]
+fn grid_geometry_keeps_final_two_cards_at_the_normal_column_width() {
+    let view = build_home_view(&established_inputs(&[]));
+    let cards: Vec<&HomeCardView> = view
+        .cards
+        .iter()
+        .filter(|card| card.tier == HomeCardTier::Secondary)
+        .collect();
+    let geometry = home_grid_geometry(1_500.0);
+    assert_eq!(geometry.columns, 3);
+    assert_eq!(cards.len(), 8);
+    let expected = (1_500.0 - HOME_GRID_GAP * 2.0) / 3.0;
+    assert!((geometry.column_width - expected).abs() < f32::EPSILON);
+    assert_eq!(
+        cards
+            .chunks(geometry.columns)
+            .map(<[_]>::len)
+            .collect::<Vec<_>>(),
+        [3, 3, 2]
+    );
+}
+
+#[test]
+fn every_row_uses_one_shared_height_even_with_badges_details_and_two_actions() {
+    let view = build_home_view(&established_inputs(&[]));
+    let primary: Vec<&HomeCardView> = view
+        .cards
+        .iter()
+        .filter(|card| card.tier == HomeCardTier::Primary)
+        .collect();
+    let secondary: Vec<&HomeCardView> = view
+        .cards
+        .iter()
+        .filter(|card| card.tier == HomeCardTier::Secondary)
+        .collect();
+    assert_eq!(home_card_row_height(&primary), HOME_PRIMARY_CARD_HEIGHT);
+    assert_eq!(home_card_row_height(&secondary), HOME_SECONDARY_CARD_HEIGHT);
+    assert!(secondary.iter().any(|card| card.secondary.is_some()));
+    assert!(primary.iter().any(|card| card.technical_detail.is_some()));
+    assert!(home_grid_geometry(0.0).column_width >= 1.0);
+    assert!(home_grid_geometry(650.0).column_width > 0.0);
+}
+
+#[test]
+fn wide_grid_reuses_exact_column_rects_across_rows() {
+    let geometry = home_grid_geometry(1_500.0);
+    let row_one = (0..3)
+        .map(|column| home_grid_cell_rect(100.0, 20.0, geometry, column, 218.0))
+        .collect::<Vec<_>>();
+    let row_two = (0..3)
+        .map(|column| home_grid_cell_rect(100.0, 256.0, geometry, column, 188.0))
+        .collect::<Vec<_>>();
+    for column in 0..3 {
+        assert_eq!(row_one[column].left(), row_two[column].left());
+        assert_eq!(row_one[column].width(), row_two[column].width());
+    }
+    assert_eq!(row_one[0].right() + geometry.gap, row_one[1].left());
+    assert_eq!(row_one[1].right() + geometry.gap, row_one[2].left());
+    assert!(row_one[2].right() <= 100.0 + geometry.content_width + 0.01);
+}
+
+#[test]
+fn final_two_card_row_uses_columns_one_and_two_and_leaves_three_empty() {
+    let geometry = home_grid_geometry(1_500.0);
+    let first = home_grid_cell_rect(0.0, 0.0, geometry, 0, 188.0);
+    let second = home_grid_cell_rect(0.0, 0.0, geometry, 1, 188.0);
+    let empty_third = home_grid_cell_rect(0.0, 0.0, geometry, 2, 188.0);
+    assert_eq!(first.left(), 0.0);
+    assert_eq!(second.left(), first.right() + geometry.gap);
+    assert_eq!(empty_third.left(), second.right() + geometry.gap);
+    assert!(empty_third.right() <= geometry.content_width + 0.01);
+}
+
+#[test]
+fn medium_and_narrow_cells_are_exact_peers_without_shrink_wrapping() {
+    for width in [1_000.0, 650.0] {
+        let geometry = home_grid_geometry(width);
+        let cells = (0..geometry.columns)
+            .map(|column| home_grid_cell_rect(12.0, 30.0, geometry, column, 188.0))
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), geometry.columns);
+        for cell in &cells {
+            assert_eq!(cell.width(), geometry.column_width);
+        }
+        if geometry.columns > 1 {
+            assert_eq!(cells[0].right() + geometry.gap, cells[1].left());
+        }
+    }
+}
+
+#[test]
+fn first_run_hero_uses_onboarding_language_without_inventing_counts() {
+    let view = build_home_view(&fresh_install_inputs());
+    let (output, _) = render(&view, 1100.0);
+    assert!(rendered_text_contains(&output, "Add your game library"));
+    assert!(rendered_text_contains(&output, "Add game folder"));
+    assert!(!rendered_text_contains(&output, "0 games"));
+}
+
 // --- Disappeared-config warning behaviour ---
 
 #[test]
@@ -581,7 +737,7 @@ fn primary_home_cards_carry_their_visual_identity() {
 }
 
 #[test]
-fn all_destinations_remain_and_six_are_primary() {
+fn all_destinations_remain_and_three_are_primary() {
     let checks = [passing_check("config file")];
     let view = build_home_view(&established_inputs(&checks));
     let mut all: Vec<HomeCard> = view.cards.iter().map(|c| c.card).collect();
@@ -606,7 +762,7 @@ fn all_destinations_remain_and_six_are_primary() {
             .iter()
             .filter(|c| c.tier == HomeCardTier::Primary)
             .count(),
-        10
+        3
     );
     assert!(
         view.cards
