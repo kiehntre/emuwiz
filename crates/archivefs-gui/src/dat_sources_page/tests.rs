@@ -4678,18 +4678,25 @@ fn fixture_recovery_transaction(
     state: TransactionState,
     human_summary: &str,
 ) -> RecoveryTransactionView {
-    RecoveryTransactionView {
+    let transaction = archivefs_core::dat::rename_apply::RenameTransaction {
         transaction_id: transaction_id.to_string(),
-        state,
-        applied_count: 1,
-        total_count: 1,
-        human_summary: human_summary.to_string(),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 1,
         source_scan_root: String::new(),
-        resolution: None,
-        exact_resume: ExactResumeStatusView::NeedsCurrentPlan,
-        resume_action_available: false,
-        cleanup: RecoveryCleanupClassification::Actionable,
-    }
+        state,
+        entries: vec![fixture_entry("old.bin", "New.bin")],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    let mut view = RecoveryTransactionView::from_transaction(
+        &transaction,
+        ExactResumeStatusView::NeedsCurrentPlan,
+    );
+    view.human_summary = human_summary.to_string();
+    view
 }
 
 /// Follow-up regression for the DAT Sources duplicate-widget-ID report:
@@ -5279,6 +5286,31 @@ fn recovery_human_state_label_collapses_every_non_settled_state_to_needs_attenti
     ] {
         assert_eq!(recovery_human_state_label(unsettled), "Needs attention");
     }
+}
+
+#[test]
+fn quick_rename_reuses_repair_history_transaction_presentation() {
+    let transaction = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "shared-presentation".to_string(),
+        plan_generation: 1,
+        classifier_version: None,
+        created_at_unix: 1,
+        source_scan_root: "/missing/root".to_string(),
+        state: TransactionState::Applied,
+        entries: vec![fixture_entry("old.bin", "New.bin")],
+        created_directories: Vec::new(),
+        recovery_resolution: None,
+        recovery_resolved_at_unix: None,
+        unknown: Default::default(),
+    };
+    let quick = RecoveryTransactionView::from_transaction(
+        &transaction,
+        ExactResumeStatusView::UnavailableLegacy,
+    );
+    let cleanup = classify_recovery_cleanup(&transaction);
+    let repair = crate::repair_history_page::presentation::classify(&transaction, cleanup);
+
+    assert_eq!(quick.presentation, repair);
 }
 
 #[test]

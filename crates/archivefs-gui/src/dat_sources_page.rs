@@ -108,6 +108,7 @@ use crate::dat_coverage_panel::{
     SourceCoverageEntry, is_arcade_ecosystem, project_arcade, project_canonical,
     show_coverage_section,
 };
+use crate::repair_history_page::presentation::{self, Tier};
 use crate::ui::{components as widgets, theme};
 
 /// Said once on the page, because a DAT audit is the one place a user might
@@ -1011,6 +1012,35 @@ pub(crate) struct RecoveryTransactionView {
     pub(crate) exact_resume: ExactResumeStatusView,
     pub(crate) resume_action_available: bool,
     pub(crate) cleanup: RecoveryCleanupClassification,
+    /// The shared Repair History presentation classification. Quick Rename
+    /// keeps its compact, folder-aware layout, but must not invent a second
+    /// meaning for the same journal state.
+    pub(crate) presentation: presentation::TransactionPresentation,
+}
+
+impl RecoveryTransactionView {
+    /// Builds the compact Quick Rename view from the same transaction facts
+    /// Repair History presents. Folder relevance and layout remain Quick
+    /// Rename concerns; tier and safe action meaning do not.
+    fn from_transaction(
+        transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+        exact_resume: ExactResumeStatusView,
+    ) -> Self {
+        let cleanup = classify_recovery_cleanup(transaction);
+        Self {
+            transaction_id: transaction.transaction_id.clone(),
+            state: transaction.state,
+            applied_count: transaction.applied_count(),
+            total_count: transaction.entries.len(),
+            human_summary: rename_transaction_human_summary(&transaction.entries),
+            source_scan_root: transaction.source_scan_root.clone(),
+            resolution: transaction.recovery_resolution,
+            resume_action_available: exact_resume == ExactResumeStatusView::Available,
+            exact_resume,
+            cleanup,
+            presentation: presentation::classify(transaction, cleanup),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5897,18 +5927,7 @@ impl DatSourcesPageState {
             .iter()
             .map(|transaction| {
                 let exact_resume = self.exact_resume_status(transaction);
-                RecoveryTransactionView {
-                    transaction_id: transaction.transaction_id.clone(),
-                    state: transaction.state,
-                    applied_count: transaction.applied_count(),
-                    total_count: transaction.entries.len(),
-                    human_summary: rename_transaction_human_summary(&transaction.entries),
-                    source_scan_root: transaction.source_scan_root.clone(),
-                    resolution: transaction.recovery_resolution,
-                    resume_action_available: exact_resume == ExactResumeStatusView::Available,
-                    exact_resume,
-                    cleanup: classify_recovery_cleanup(transaction),
-                }
+                RecoveryTransactionView::from_transaction(transaction, exact_resume)
             })
             .collect();
         let resume_result = self.resume_result.as_ref().map(|outcome| ResumeResultView {
@@ -7812,7 +7831,7 @@ pub(crate) fn show_quick_rename_page(
             // folder: only that combination genuinely still needs a
             // decision right now. An acknowledged "Leave untouched" moves
             // here regardless of folder, exactly like settled history.
-            if recovery.state.needs_recovery()
+            if recovery.presentation.tier == Tier::NeedsAttention
                 && recovery.resolution.is_none()
                 && current_root
                     .is_none_or(|root| transaction_targets_root(&recovery.source_scan_root, root))
@@ -7823,14 +7842,21 @@ pub(crate) fn show_quick_rename_page(
             }
         }
         if !blocking.is_empty() {
+            let undo_available = view
+                .rename_apply
+                .recovery
+                .iter()
+                .filter(|recovery| recovery.presentation.actions.undo)
+                .count();
             ui.add_space(10.0);
             widgets::banner(
                 ui,
-                "Recovery required",
+                "Action needed to finish a previous change",
                 &format!(
-                    "{} unresolved rename transaction{} must be resolved before Quick Rename can safely continue in this folder.",
+                    "Action needed: {} · Undo available: {}. Resolve the action-needed transaction{} before Quick Rename can safely continue in this folder.",
                     blocking.len(),
-                    if blocking.len() == 1 { "" } else { "s" }
+                    undo_available,
+                    if blocking.len() == 1 { "" } else { "s" },
                 ),
                 widgets::StatusTone::Warning,
             );
@@ -10511,6 +10537,7 @@ fn rename_transaction_human_summary(entries: &[TransactionEntry]) -> String {
 /// is unresolved and needs a person to look at it, not one of five
 /// different in-progress/failure words a normal user has no use for on
 /// the primary line.
+#[cfg(test)]
 fn recovery_human_state_label(state: TransactionState) -> &'static str {
     match state {
         TransactionState::Applied => "Applied",
@@ -10571,13 +10598,13 @@ fn show_recovery_transactions(
         for recovery in recoveries {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&recovery.human_summary).strong());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "({})",
-                        recovery_human_state_label(recovery.state)
-                    ))
-                    .color(theme::muted(ui)),
-                );
+                let tone = match recovery.presentation.tone {
+                    presentation::Tone::Warning => widgets::StatusTone::Warning,
+                    presentation::Tone::Info => widgets::StatusTone::Info,
+                    presentation::Tone::Muted => widgets::StatusTone::Pending,
+                    presentation::Tone::Technical => widgets::StatusTone::Blocked,
+                };
+                widgets::status_badge(ui, recovery.presentation.headline, tone);
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Recovery:").small());
@@ -10638,104 +10665,69 @@ fn show_recovery_transactions(
                         true,
                     );
                 });
-            } else if let Some(resolution) = recovery.resolution {
-                // Already resolved: `state` still truthfully says
-                // "interrupted" (never rewritten - see
-                // `RecoveryResolution`'s own doc), so this must never be
-                // presented as settled/Applied. The user is not asked to
-                // decide again, but rollback stays offered on exactly the
-                // same terms as it would for an unresolved interrupted
-                // transaction (matching `RenameTransaction::is_rollbackable`,
-                // which depends only on `state.needs_recovery()` here, never
-                // on `applied_count` or on whether a resolution exists) -
-                // acknowledging the prompt must never quietly take away the
-                // ability to undo it.
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Interrupted - {}",
-                        resolution.label().to_ascii_lowercase()
-                    ))
-                    .color(theme::muted(ui))
-                    .small(),
-                );
-                ui.add_space(4.0);
-                if widgets::action_button(
-                    ui,
-                    "Roll back transaction",
-                    widgets::ActionStyle::Destructive,
-                    !rollback_running,
-                )
-                .clicked()
-                {
-                    action = Some(DatSourcesPageAction::RecoveryChoice {
-                        id: recovery.transaction_id.clone(),
-                        choice: RecoveryChoice::RollBack,
-                    });
-                }
             } else {
-                let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
-                    (
-                        "A completed rename transaction is still applied and can be rolled \
-                             back.",
-                        "Roll back transaction",
-                    )
-                } else {
-                    (
-                        "An interrupted rename transaction was found. EmuWiz will never \
-                             resume it automatically.",
-                        "Roll back completed steps",
-                    )
-                };
                 ui.label(
-                    egui::RichText::new(explanation)
+                    egui::RichText::new(recovery.presentation.detail)
                         .color(theme::muted(ui))
                         .small(),
                 );
-                ui.horizontal_wrapped(|ui| {
-                    if recovery.resume_action_available
-                        && widgets::action_button(
-                            ui,
-                            if resume_running {
-                                "Resuming…"
+                if recovery.presentation.tier != Tier::TechnicalInvalid {
+                    ui.horizontal_wrapped(|ui| {
+                        if recovery.presentation.actions.resume
+                            && recovery.resume_action_available
+                            && widgets::action_button(
+                                ui,
+                                if resume_running {
+                                    "Resuming…"
+                                } else {
+                                    "Resume approved transaction"
+                                },
+                                widgets::ActionStyle::Primary,
+                                !resume_running && !rollback_running,
+                            )
+                            .clicked()
+                        {
+                            action = Some(DatSourcesPageAction::ResumeTransaction {
+                                id: recovery.transaction_id.clone(),
+                            });
+                        }
+                        if recovery.presentation.actions.undo {
+                            let rollback_label = if recovery.state == TransactionState::Applied {
+                                "Roll back transaction"
                             } else {
-                                "Resume approved transaction"
-                            },
-                            widgets::ActionStyle::Primary,
-                            !resume_running && !rollback_running,
-                        )
-                        .clicked()
-                    {
-                        action = Some(DatSourcesPageAction::ResumeTransaction {
-                            id: recovery.transaction_id.clone(),
-                        });
-                    }
-                    if widgets::action_button(
-                        ui,
-                        rollback_label,
-                        widgets::ActionStyle::Destructive,
-                        !rollback_running && !resume_running,
-                    )
-                    .clicked()
-                    {
-                        action = Some(DatSourcesPageAction::RecoveryChoice {
-                            id: recovery.transaction_id.clone(),
-                            choice: RecoveryChoice::RollBack,
-                        });
-                    }
-                    if widgets::action_button(
-                        ui,
-                        "Leave untouched",
-                        widgets::ActionStyle::Quiet,
-                        !rollback_running && !resume_running,
-                    )
-                    .clicked()
-                    {
-                        action = Some(DatSourcesPageAction::RecoveryChoice {
-                            id: recovery.transaction_id.clone(),
-                            choice: RecoveryChoice::LeaveUntouched,
-                        });
-                    }
-                });
+                                "Roll back completed steps"
+                            };
+                            if widgets::action_button(
+                                ui,
+                                rollback_label,
+                                widgets::ActionStyle::Destructive,
+                                !rollback_running && !resume_running,
+                            )
+                            .clicked()
+                            {
+                                action = Some(DatSourcesPageAction::RecoveryChoice {
+                                    id: recovery.transaction_id.clone(),
+                                    choice: RecoveryChoice::RollBack,
+                                });
+                            }
+                        }
+                        if recovery.presentation.tier == Tier::NeedsAttention
+                            && recovery.resolution.is_none()
+                            && widgets::action_button(
+                                ui,
+                                "Leave untouched",
+                                widgets::ActionStyle::Quiet,
+                                !rollback_running && !resume_running,
+                            )
+                            .clicked()
+                        {
+                            action = Some(DatSourcesPageAction::RecoveryChoice {
+                                id: recovery.transaction_id.clone(),
+                                choice: RecoveryChoice::LeaveUntouched,
+                            });
+                        }
+                    });
+                }
             }
             ui.add_space(6.0);
         }

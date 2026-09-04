@@ -328,4 +328,25 @@ mod tests {
         assert_eq!(row.tier, Tier::History);
         assert!(row.actions.undo);
     }
+
+    #[test]
+    fn legacy_with_optional_undo_is_history_with_undo_available() {
+        let mut transaction = tx(TransactionState::ApplyFailed, &[EntryState::Applied]);
+        transaction.recovery_resolution = Some(RecoveryResolution::LeaveUntouched);
+        let row = classify(&transaction, RecoveryCleanupClassification::Actionable);
+        assert_eq!(row.tier, Tier::History);
+        assert!(row.actions.undo);
+        assert!(!row.actions.resume);
+    }
+
+    #[test]
+    fn recoverable_rollback_failure_needs_attention() {
+        let row = classify(
+            &tx(TransactionState::RollbackFailed, &[EntryState::Applied]),
+            RecoveryCleanupClassification::Actionable,
+        );
+        assert_eq!(row.tier, Tier::NeedsAttention);
+        assert!(row.actions.undo);
+        assert!(!row.actions.resume);
+    }
 }
