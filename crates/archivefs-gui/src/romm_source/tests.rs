@@ -179,6 +179,8 @@ fn linkage_health_uses_plain_language_counts_and_is_read_only() {
     assert!(!operation.is_mutating());
     assert!(!operation.uses_network());
     assert!(!operation.reports_progress());
+    assert!(!RommOperation::PlanMappings.is_mutating());
+    assert!(!RommOperation::PlanMappings.uses_network());
 
     let summary = RommLinkageSummary {
         inspected: 100,
@@ -210,6 +212,29 @@ fn linkage_health_uses_plain_language_counts_and_is_read_only() {
     ] {
         assert!(labels.contains(expected), "missing {expected}: {labels}");
     }
+}
+
+#[test]
+fn mapping_preview_result_names_projection_and_requires_no_implicit_refresh() {
+    let plan = archivefs_core::identity_source::romm::mapping_plan::RommMappingPlan {
+        proposals: Vec::new(),
+        proposed_mappings: Vec::new(),
+        current_translatable: 12,
+        rescued_by_replacement: 8,
+        rescued_by_new_mapping: 3,
+        still_unmapped: 1,
+        unknown_platforms: 1,
+        ambiguous_or_conflicting: 0,
+    };
+    let result = build_result_view(
+        &RommOperation::PlanMappings,
+        Ok(&RommOperationOutcome::MappingPlan(Box::new(plan))),
+        false,
+    );
+    assert!(result.succeeded);
+    assert!(result.headline.contains("preview"));
+    assert!(result.notes.join(" ").contains("no configuration"));
+    assert_eq!(result.rows[1].value, "8");
 }
 
 #[test]

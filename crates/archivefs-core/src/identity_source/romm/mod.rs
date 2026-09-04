@@ -27,6 +27,7 @@ pub mod enrichment;
 pub mod import;
 pub mod linkage;
 pub mod manual;
+pub mod mapping_plan;
 pub mod media_mapping;
 pub mod normalise;
 

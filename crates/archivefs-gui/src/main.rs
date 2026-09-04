@@ -8013,6 +8013,10 @@ impl ArchiveFsApp {
                         },
                     );
                 }
+                RommCardRequest::ReviewMappings => {
+                    self.start_romm_operation(context.clone(), RommOperation::PlanMappings);
+                }
+                RommCardRequest::ApplyMappings => self.open_romm_mapping_plan(),
             }
         }
 
@@ -9114,6 +9118,9 @@ impl ArchiveFsApp {
         if let Ok(RommOperationOutcome::Linkage(report)) = &result {
             self.romm_ui.linkage_report = Some(report.clone());
         }
+        if let Ok(RommOperationOutcome::MappingPlan(plan)) = &result {
+            self.romm_ui.mapping_plan = Some(plan.clone());
+        }
         if operation.is_mutating() {
             // A failed connection test while imported identity is still being
             // served is the offline case working as intended: it must not
@@ -9387,6 +9394,27 @@ impl ArchiveFsApp {
             // is the only way it ever gets configured.
             None => RommConfigDraft::blank(),
         };
+        self.romm_config_draft = Some(Box::new(draft));
+        self.romm_preview = None;
+    }
+
+    /// Opens the existing safe configuration editor with only the reviewed
+    /// RomM mappings changed. The final Save button remains the explicit apply
+    /// confirmation and its worker validates the whole configuration again.
+    fn open_romm_mapping_plan(&mut self) {
+        if self.romm_config_draft.is_some() {
+            return;
+        }
+        let (Some(snapshot), Some(plan)) = (
+            self.romm_snapshot.as_deref(),
+            self.romm_ui.mapping_plan.as_deref(),
+        ) else {
+            return;
+        };
+        let mut proposed = snapshot.clone();
+        proposed.settings.source.mappings = plan.proposed_mappings.clone();
+        let mut draft = RommConfigDraft::from_snapshot(&proposed);
+        draft.dirty = true;
         self.romm_config_draft = Some(Box::new(draft));
         self.romm_preview = None;
     }
@@ -33384,6 +33412,21 @@ fn run_romm_operation(
     // before anything is validated - which is what makes "no request is made merely
     // by browsing" structural rather than a promise.
     match operation {
+        RommOperation::PlanMappings => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let current = archivefs_core::identity_source::path_map::PathMappings::validate(
+                &settings.source.mappings,
+                &[],
+                settings.source.provider_path_kind,
+            )
+            .map_err(|refusal| refusal.detail())?;
+            let roots = trusted_roots.as_deref().map_err(Clone::clone)?;
+            let plan =
+                archivefs_core::identity_source::romm::mapping_plan::plan_mapping_reconciliation(
+                    &cache, &current, roots,
+                );
+            return Ok(RommOperationOutcome::MappingPlan(Box::new(plan)));
+        }
         RommOperation::CheckLinks { local_paths } => {
             let cache = api.open_cache(None).ok();
             let trusted_roots = trusted_roots.as_deref().map_err(Clone::clone)?;
@@ -33832,7 +33875,8 @@ fn run_romm_operation(
         | RommOperation::ResolveGame { .. }
         | RommOperation::VerifyLocalFile { .. }
         | RommOperation::LoadCover { .. }
-        | RommOperation::CheckLinks { .. } => unreachable!("handled before this match"),
+        | RommOperation::CheckLinks { .. }
+        | RommOperation::PlanMappings => unreachable!("handled before this match"),
         RommOperation::LoadScreenshot { .. } => unreachable!("handled before this match"),
         RommOperation::OpenManual { .. } => unreachable!("handled before this match"),
     }

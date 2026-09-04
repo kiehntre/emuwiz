@@ -25,6 +25,7 @@ use archivefs_core::identity_source::artwork::ArtworkCacheStats;
 use archivefs_core::identity_source::romm::capability::RommCapabilityReport;
 use archivefs_core::identity_source::romm::import::{AdaptivePagination, ImportProgress};
 use archivefs_core::identity_source::romm::linkage::{RommLinkageReport, RommLinkageStatus};
+use archivefs_core::identity_source::romm::mapping_plan::{MappingProposalKind, RommMappingPlan};
 use archivefs_core::identity_source::settings::ProviderSettings;
 use archivefs_core::identity_source::status::{ProviderState, ProviderStatus};
 use eframe::egui;
@@ -54,6 +55,7 @@ pub(crate) enum RommOperation {
     CheckLinks {
         local_paths: Vec<PathBuf>,
     },
+    PlanMappings,
     ClearArtwork,
     /// Write the configuration. Validates again in the worker, and contacts nothing.
     SaveConfiguration(Box<archivefs_core::identity_source::settings::ProviderSettings>),
@@ -124,6 +126,7 @@ impl RommOperation {
                 | Self::LoadConflicts { .. }
                 | Self::StaleSummary
                 | Self::CheckLinks { .. }
+                | Self::PlanMappings
                 // Resolving reads the cache and metadata, and a cover fetch writes
                 // only into the artwork cache, which is derived data the card
                 // reports separately. Neither changes identity.
@@ -178,6 +181,7 @@ impl RommOperation {
             Self::FullImport => "Importing the RomM catalogue",
             Self::Refresh => "Refreshing from RomM",
             Self::CheckLinks { .. } => "Checking RomM links",
+            Self::PlanMappings => "Reviewing RomM path mappings",
             Self::ClearArtwork => "Clearing cover thumbnails",
             Self::SaveConfiguration(_) => "Saving the RomM configuration",
             Self::Preview { .. } => "Previewing path mappings",
@@ -219,6 +223,7 @@ pub(crate) enum RommOperationOutcome {
     Sample(Box<RommImportSummary>),
     Import(Box<RommImportSummary>),
     Linkage(Box<RommLinkageReport>),
+    MappingPlan(Box<RommMappingPlan>),
     Enabled(bool),
     ArtworkCleared {
         items: usize,
@@ -860,6 +865,7 @@ pub(crate) struct RommCardState {
     /// The last completed operation's result, kept until the next one starts.
     pub(crate) last_outcome: Option<RommResultView>,
     pub(crate) linkage_report: Option<Box<RommLinkageReport>>,
+    pub(crate) mapping_plan: Option<Box<RommMappingPlan>>,
 }
 
 /// A completed operation, reduced to what the result area draws.
@@ -980,6 +986,35 @@ pub(crate) fn build_result_view(
             rows: linkage_summary_rows(&report.summary),
             notes: vec![
                 "Read-only check: files, mappings, imports, hashes and RomM data were not changed."
+                    .to_string(),
+            ],
+            informational: false,
+        },
+        Ok(RommOperationOutcome::MappingPlan(plan)) => RommResultView {
+            succeeded: true,
+            headline: "RomM path mapping preview ready".to_string(),
+            rows: vec![
+                row(
+                    "Current translatable",
+                    plan.current_translatable.to_string(),
+                ),
+                row(
+                    "Rescued by replacement",
+                    plan.rescued_by_replacement.to_string(),
+                ),
+                row(
+                    "Rescued by new mappings",
+                    plan.rescued_by_new_mapping.to_string(),
+                ),
+                row("Still unmapped", plan.still_unmapped.to_string()),
+                row("Unknown platforms", plan.unknown_platforms.to_string()),
+                row(
+                    "Ambiguous / conflicting",
+                    plan.ambiguous_or_conflicting.to_string(),
+                ),
+            ],
+            notes: vec![
+                "Preview only: no configuration, cache, RomM data or local files were changed."
                     .to_string(),
             ],
             informational: false,
@@ -1393,6 +1428,18 @@ pub(crate) fn linkage_summary_rows(
     ]
 }
 
+fn mapping_proposal_label(kind: MappingProposalKind) -> &'static str {
+    match kind {
+        MappingProposalKind::ExactExisting => "Existing mapping is correct",
+        MappingProposalKind::StaleSourceRootReplacement => "Older library location",
+        MappingProposalKind::SafeNewMapping => "Safe new mapping",
+        MappingProposalKind::Ambiguous => "Ambiguous local folder",
+        MappingProposalKind::NoLocalFolder => "No local folder",
+        MappingProposalKind::UnknownPlatform => "Unknown platform",
+        MappingProposalKind::Conflict => "Mapping conflict",
+    }
+}
+
 /// One progress event from a worker.
 ///
 /// Lives beside the card rather than in `main` so the worker and the renderer agree
@@ -1424,6 +1471,8 @@ pub(crate) enum RommCardRequest {
     /// Open one of the browsing views.
     OpenBrowse(crate::romm_browse::BrowseView),
     CheckLinks,
+    ReviewMappings,
+    ApplyMappings,
 }
 
 /// Draws the card. Thin by design: every decision was made in
@@ -1530,6 +1579,71 @@ pub(crate) fn show_romm_source_card(
             }
         } else {
             ui.label("Run Check RomM links to inspect the current local library.");
+        }
+        if let Some(plan) = &state.mapping_plan {
+            ui.add_space(theme::SECTION_GAP / 2.0);
+            ui.heading("Proposed path mappings");
+            ui.label(
+                "These proposals use platform identity and existing folders only; review them before saving.",
+            );
+            for proposal in plan.proposals.iter().take(40) {
+                ui.group(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&proposal.provider_prefix);
+                        ui.label(mapping_proposal_label(proposal.kind));
+                        ui.label(format!("{} record(s)", proposal.record_count));
+                    });
+                    if proposal.kind == MappingProposalKind::StaleSourceRootReplacement {
+                        if let Some(current) = &proposal.current_mapping {
+                            ui.label(format!("Current: {}", current.archivefs_prefix.display()));
+                        }
+                        if let Some(candidate) = &proposal.proposed_destination {
+                            ui.label(format!("Proposed: {}", candidate.display()));
+                        }
+                        ui.label(format!(
+                            "Affected: {} RomM record(s)",
+                            proposal.record_count
+                        ));
+                    } else if let Some(candidate) = &proposal.candidate_local_folder {
+                        ui.label(format!("Candidate: {}", candidate.display()));
+                    }
+                    ui.label(&proposal.reason);
+                });
+            }
+            if plan.proposals.len() > 40 {
+                ui.label(format!(
+                    "Showing 40 of {} platform proposals.",
+                    plan.proposals.len()
+                ));
+            }
+            let has_changes = plan.proposals.iter().any(|proposal| {
+                matches!(
+                    proposal.kind,
+                    MappingProposalKind::StaleSourceRootReplacement
+                        | MappingProposalKind::SafeNewMapping
+                )
+            });
+            if has_changes
+                && widgets::action_button(
+                    ui,
+                    "Apply proposed mappings",
+                    widgets::ActionStyle::Primary,
+                    !view.busy,
+                )
+                .clicked()
+            {
+                request = Some(RommCardRequest::ApplyMappings);
+            }
+        } else if state.linkage_report.is_some()
+            && widgets::action_button(
+                ui,
+                "Review path mappings",
+                widgets::ActionStyle::Secondary,
+                !view.busy,
+            )
+            .clicked()
+        {
+            request = Some(RommCardRequest::ReviewMappings);
         }
 
         // Two collapsible blocks, so the card is not a wall of thirty numbers on a
