@@ -13,7 +13,12 @@
 //! extension, emulator metadata, or RetroArch core metadata to decide what a
 //! game is.
 
+use std::path::Path;
+
+use crate::dat::model::DatEcosystem;
+use crate::dat::set::SetResolution;
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
+use crate::launch::fbneo_command::{FbneoIdentityEvidence, FbneoSetEvidence};
 use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
     project_duckstation_launch_input, project_flycast_launch_input, project_hatari_launch_input,
@@ -30,11 +35,11 @@ use crate::launch::readiness::{
     rpcs3_firmware_readiness,
 };
 use crate::patch_manager::{
-    AmigaGameInspection, AmigaKickstartState, AmigaProfile, DuckStationBiosState,
-    DuckStationGameInspection, DuckStationProfile, FlycastGameInspection, FlycastProfile,
-    FlycastSystemFileState, HatariGameInspection, HatariProfile, MelonDsFirmwareState,
-    MelonDsProfile, Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2Profile, PpssppProfile,
-    Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
+    AmigaEmulatorKind, AmigaGameInspection, AmigaKickstartState, AmigaProfile, CemuProfile,
+    DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
+    FlycastProfile, FlycastSystemFileState, HatariGameInspection, HatariProfile,
+    MelonDsFirmwareState, MelonDsProfile, Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2Profile,
+    PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -100,6 +105,46 @@ pub enum DiscoveredStandaloneProfile<'a> {
     /// candidates - it never claims xemu itself needs no firmware.
     Xemu {
         profile: &'a XemuProfile,
+    },
+    /// A discovered Cemu profile - see [`crate::patch_manager::cemu_local`].
+    /// Cemu's own MLC/keys/layout evidence does not reduce to one shared
+    /// [`FirmwareReadiness`] value any more than xemu's does (see the
+    /// [`Self::Xemu`] doc comment above for the same reasoning): this only
+    /// tells the generic planner not to raise its own firmware blocker,
+    /// while [`crate::launch::cemu_command::build_cemu_command_plan`] is
+    /// still where the real MLC/keys/layout check happens.
+    Cemu {
+        profile: &'a CemuProfile,
+    },
+    /// A discovered Amiberry profile. Amiberry and FS-UAE are distinct
+    /// adapters sharing the same underlying [`AmigaProfile`]/
+    /// [`AmigaGameInspection`] discovery evidence
+    /// (see [`crate::patch_manager::amiga_whdload_local`]'s
+    /// [`AmigaEmulatorKind`]) - never merged into one candidate. Kept as its
+    /// own variant, not folded into [`Self::FsUae`], so a caller can never
+    /// accidentally hand an Amiberry profile to code that expects FS-UAE's
+    /// own launch handoff or vice versa.
+    Amiberry {
+        profile: &'a AmigaProfile,
+        inspection: &'a AmigaGameInspection,
+    },
+    /// A discovered MAME executable, together with the trusted MAME/DAT set
+    /// resolutions a caller already computed. `None`/empty means "no trusted
+    /// MAME identity for this content" - never inferred from the platform
+    /// alone (see [`crate::launch::mame_command`]).
+    Mame {
+        executable: Option<&'a Path>,
+        set_resolutions: &'a [SetResolution],
+    },
+    /// A discovered FBNeo executable, together with the trusted FBNeo-
+    /// specific set evidence a caller already computed. A MAME-only
+    /// identity (see [`FbneoIdentityEvidence::MameOnly`]) is deliberately
+    /// not enough - only [`FbneoIdentityEvidence::VerifiedDat`] against the
+    /// FBNeo ecosystem authorizes a candidate (see
+    /// [`crate::launch::fbneo_command`]).
+    Fbneo {
+        executable: Option<&'a Path>,
+        set: Option<&'a FbneoSetEvidence>,
     },
 }
 
@@ -175,6 +220,28 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn xemu(profile: &'a XemuProfile) -> Self {
         Self::Xemu { profile }
+    }
+
+    pub fn cemu(profile: &'a CemuProfile) -> Self {
+        Self::Cemu { profile }
+    }
+
+    pub fn amiberry(profile: &'a AmigaProfile, inspection: &'a AmigaGameInspection) -> Self {
+        Self::Amiberry {
+            profile,
+            inspection,
+        }
+    }
+
+    pub fn mame(executable: Option<&'a Path>, set_resolutions: &'a [SetResolution]) -> Self {
+        Self::Mame {
+            executable,
+            set_resolutions,
+        }
+    }
+
+    pub fn fbneo(executable: Option<&'a Path>, set: Option<&'a FbneoSetEvidence>) -> Self {
+        Self::Fbneo { executable, set }
     }
 }
 
@@ -366,6 +433,81 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Cemu { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "WiiU") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "cemu",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Amiberry {
+                profile,
+                inspection,
+            } if profile.emulator == AmigaEmulatorKind::Amiberry
+                && authorized(project_amiga_whdload_launch_input(
+                    input.verified_identity_facts,
+                )) =>
+            {
+                let firmware = match inspection.health.kickstart.state {
+                    AmigaKickstartState::PresentUnverified => FirmwareReadiness::PresentUnverified,
+                    AmigaKickstartState::Missing | AmigaKickstartState::NotConfigured => {
+                        FirmwareReadiness::Missing
+                    }
+                    AmigaKickstartState::Unreadable | AmigaKickstartState::Unknown => {
+                        FirmwareReadiness::Unknown
+                    }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "amiberry",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_root.clone()),
+                    eligible: profile.eligible,
+                    firmware,
+                })
+            }
+            DiscoveredStandaloneProfile::Mame {
+                executable: Some(executable),
+                set_resolutions,
+            } if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "Arcade")
+                && !set_resolutions.is_empty() =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "mame",
+                    profile_id: format!("mame:{}", executable.display()),
+                    profile_path: Some(executable.to_path_buf()),
+                    eligible: true,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Fbneo {
+                executable: Some(executable),
+                set,
+            } if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "Arcade")
+                && set.is_some_and(|set| {
+                    matches!(
+                        set.identity_evidence,
+                        FbneoIdentityEvidence::VerifiedDat {
+                            ecosystem: DatEcosystem::FBNeo,
+                            ..
+                        }
+                    )
+                }) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "fbneo",
+                    profile_id: format!("fbneo:{}", executable.display()),
+                    profile_path: Some(executable.to_path_buf()),
+                    eligible: true,
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }
@@ -593,6 +735,109 @@ mod tests {
             patches_state: crate::patch_manager::XeniaPatchesDirectoryState::Available,
             patches_warning: None,
             configuration_identity: None,
+        }
+    }
+
+    fn cemu_profile(eligible: bool) -> CemuProfile {
+        let root = PathBuf::from("/profiles/cemu");
+        CemuProfile {
+            profile_id: "cemu:/profiles/cemu".to_string(),
+            installation_type: crate::patch_manager::CemuInstallationType::Native,
+            configuration_path: root.clone(),
+            config_path: Some(root.join("settings.xml")),
+            eligible,
+            blocker: (!eligible).then(|| "no safe Cemu executable was discovered".to_string()),
+            executable_candidates: Vec::new(),
+            config: None,
+            keys: crate::patch_manager::CemuKeysEvidence {
+                path: None,
+                state: crate::patch_manager::CemuKeysState::NotConfigured,
+            },
+        }
+    }
+
+    fn amiga_profile(emulator: AmigaEmulatorKind, eligible: bool) -> AmigaProfile {
+        let root = PathBuf::from("/profiles/amiga");
+        AmigaProfile {
+            profile_id: format!("{emulator:?}:/profiles/amiga"),
+            emulator,
+            installation_type: crate::patch_manager::AmigaInstallationType::Native,
+            scope: crate::patch_manager::AmigaProfileScope::User,
+            configuration_root: root.clone(),
+            global_config_path: None,
+            profile_paths: Vec::new(),
+            executable_candidates: Vec::new(),
+            eligible,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Runs the real, existing WHDLoad inspection over a fixture profile,
+    /// rather than hand-constructing `AmigaGameInspection`'s many nested
+    /// fields - the same fixture pattern
+    /// `patch_manager::amiga_whdload_local`'s own tests already use.
+    fn amiga_inspection(profile: &AmigaProfile) -> AmigaGameInspection {
+        crate::patch_manager::inspect_amiga_whdload_game(
+            profile,
+            &crate::patch_manager::AmigaGameRequest::default(),
+        )
+    }
+
+    fn mame_set_resolution(state: crate::dat::set::SetState) -> SetResolution {
+        SetResolution {
+            identity: crate::dat::set::SetIdentity {
+                source_id: "mame".to_string(),
+                game_name: "pacman".to_string(),
+            },
+            archive_path: PathBuf::from("/library/pacman.zip"),
+            state,
+            members_required: Vec::new(),
+            members_verified: Vec::new(),
+            members_bad: Vec::new(),
+            members_optional: Vec::new(),
+            members_borrowed: Vec::new(),
+            disks_required: Vec::new(),
+            disks_verified: Vec::new(),
+            disks_parent_required: Vec::new(),
+            dependencies: crate::dat::dependency::SetDependencyReport {
+                state: crate::dat::dependency::DependencyState::NotApplicable,
+                requirements: Vec::new(),
+            },
+        }
+    }
+
+    fn fbneo_set_evidence(ecosystem: DatEcosystem) -> FbneoSetEvidence {
+        FbneoSetEvidence {
+            driver_name: "mslug".to_string(),
+            resolution: SetResolution {
+                identity: crate::dat::set::SetIdentity {
+                    source_id: "fbneo".to_string(),
+                    game_name: "mslug".to_string(),
+                },
+                archive_path: PathBuf::from("/library/mslug.zip"),
+                state: crate::dat::set::SetState::Complete,
+                members_required: Vec::new(),
+                members_verified: Vec::new(),
+                members_bad: Vec::new(),
+                members_optional: Vec::new(),
+                members_borrowed: Vec::new(),
+                disks_required: Vec::new(),
+                disks_verified: Vec::new(),
+                disks_parent_required: Vec::new(),
+                dependencies: crate::dat::dependency::SetDependencyReport {
+                    state: crate::dat::dependency::DependencyState::NotApplicable,
+                    requirements: Vec::new(),
+                },
+            },
+            identity_evidence: match ecosystem {
+                DatEcosystem::FBNeo => FbneoIdentityEvidence::VerifiedDat {
+                    source_id: "fbneo".to_string(),
+                    ecosystem: DatEcosystem::FBNeo,
+                },
+                _ => FbneoIdentityEvidence::MameOnly {
+                    source_id: "mame".to_string(),
+                },
+            },
         }
     }
 
@@ -978,5 +1223,350 @@ mod tests {
             }
         ));
         assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    }
+
+    // --- Cemu ---
+
+    #[test]
+    fn wiiu_with_discovered_cemu_profile_becomes_a_candidate() {
+        let identity = resolved("WiiU", "00050000101010ED");
+        let profile = cemu_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::cemu(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "cemu",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_wiiu_platform_never_produces_a_cemu_candidate() {
+        let identity = resolved("Wii", "GALE01");
+        let profile = cemu_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::cemu(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert!(!plan.candidates.iter().any(|candidate| matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "cemu",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn cemu_missing_setup_blocker_is_preserved() {
+        let identity = resolved("WiiU", "00050000101010ED");
+        let profile = cemu_profile(false);
+        let profiles = [DiscoveredStandaloneProfile::cemu(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::ProfileIneligible)
+        );
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    }
+
+    // --- Amiberry ---
+
+    #[test]
+    fn amiga_with_discovered_amiberry_profile_becomes_a_candidate() {
+        let identity = resolved("Amiga", "amiga-whdload-identity");
+        let profile = amiga_profile(AmigaEmulatorKind::Amiberry, true);
+        let inspection = amiga_inspection(&profile);
+        let profiles = [DiscoveredStandaloneProfile::amiberry(&profile, &inspection)];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::AmigaIdentity(
+                "amiga-whdload-identity".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "amiberry",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn amiberry_missing_kickstart_blocker_is_preserved() {
+        let identity = resolved("Amiga", "amiga-whdload-identity");
+        let profile = amiga_profile(AmigaEmulatorKind::Amiberry, true);
+        let inspection = amiga_inspection(&profile);
+        let profiles = [DiscoveredStandaloneProfile::amiberry(&profile, &inspection)];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::AmigaIdentity(
+                "amiga-whdload-identity".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        // No Kickstart was configured on the fixture profile, so the shared
+        // planner's own firmware condition must still surface it.
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::RequiredFirmwareMissing)
+                || plan.candidates[0]
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.kind
+                        == crate::launch::readiness::LaunchWarningKind::FirmwarePresentUnverified)
+        );
+    }
+
+    // --- FS-UAE (already-wired regression: stays a separate candidate) ---
+
+    #[test]
+    fn amiberry_and_fsuae_remain_separate_candidates_for_the_same_platform() {
+        let identity = resolved("Amiga", "amiga-whdload-identity");
+        let amiberry = amiga_profile(AmigaEmulatorKind::Amiberry, true);
+        let amiberry_inspection = amiga_inspection(&amiberry);
+        let fsuae = amiga_profile(AmigaEmulatorKind::FsUae, true);
+        let fsuae_inspection = amiga_inspection(&fsuae);
+        let profiles = [
+            DiscoveredStandaloneProfile::amiberry(&amiberry, &amiberry_inspection),
+            DiscoveredStandaloneProfile::fsuae(&fsuae, &fsuae_inspection),
+        ];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::AmigaIdentity(
+                "amiga-whdload-identity".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let adapter_ids: Vec<&str> = plan
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate.target {
+                LaunchTarget::Standalone { adapter_id, .. } => Some(adapter_id),
+                LaunchTarget::RetroArchCore { .. } => None,
+            })
+            .collect();
+        assert!(adapter_ids.contains(&"amiberry"));
+        assert!(adapter_ids.contains(&"fsuae"));
+        assert_eq!(adapter_ids.len(), 2);
+    }
+
+    // --- MAME ---
+
+    #[test]
+    fn arcade_with_trusted_mame_identity_becomes_a_candidate() {
+        let identity = resolved("Arcade", "pacman");
+        let executable = PathBuf::from("/usr/bin/mame");
+        let resolutions = [mame_set_resolution(crate::dat::set::SetState::Complete)];
+        let profiles = [DiscoveredStandaloneProfile::mame(
+            Some(&executable),
+            &resolutions,
+        )];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn arcade_with_no_trusted_mame_set_resolution_never_fakes_a_candidate() {
+        let identity = resolved("Arcade", "pacman");
+        let executable = PathBuf::from("/usr/bin/mame");
+        let profiles = [DiscoveredStandaloneProfile::mame(Some(&executable), &[])];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert!(!plan.candidates.iter().any(|candidate| matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        )));
+    }
+
+    // --- FBNeo ---
+
+    #[test]
+    fn arcade_with_trusted_fbneo_identity_becomes_a_candidate() {
+        let identity = resolved("Arcade", "mslug");
+        let executable = PathBuf::from("/usr/bin/fbneo");
+        let evidence = fbneo_set_evidence(DatEcosystem::FBNeo);
+        let profiles = [DiscoveredStandaloneProfile::fbneo(
+            Some(&executable),
+            Some(&evidence),
+        )];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "fbneo",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mame_only_identity_never_produces_a_fbneo_candidate() {
+        let identity = resolved("Arcade", "mslug");
+        let executable = PathBuf::from("/usr/bin/fbneo");
+        let evidence = fbneo_set_evidence(DatEcosystem::MAMEArcade);
+        let profiles = [DiscoveredStandaloneProfile::fbneo(
+            Some(&executable),
+            Some(&evidence),
+        )];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert!(!plan.candidates.iter().any(|candidate| matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "fbneo",
+                ..
+            }
+        )));
+    }
+
+    // --- Multi-adapter ---
+
+    #[test]
+    fn mame_and_fbneo_remain_separate_candidates_for_the_same_arcade_set() {
+        let identity = resolved("Arcade", "mslug");
+        let mame_executable = PathBuf::from("/usr/bin/mame");
+        let fbneo_executable = PathBuf::from("/usr/bin/fbneo");
+        let resolutions = [mame_set_resolution(crate::dat::set::SetState::Complete)];
+        let evidence = fbneo_set_evidence(DatEcosystem::FBNeo);
+        let profiles = [
+            DiscoveredStandaloneProfile::mame(Some(&mame_executable), &resolutions),
+            DiscoveredStandaloneProfile::fbneo(Some(&fbneo_executable), Some(&evidence)),
+        ];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let adapter_ids: Vec<&str> = plan
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate.target {
+                LaunchTarget::Standalone { adapter_id, .. } => Some(adapter_id),
+                LaunchTarget::RetroArchCore { .. } => None,
+            })
+            .collect();
+        assert!(adapter_ids.contains(&"mame"));
+        assert!(adapter_ids.contains(&"fbneo"));
+        assert_eq!(adapter_ids.len(), 2);
+    }
+
+    #[test]
+    fn cemu_selection_never_silently_substitutes_another_adapter() {
+        // No Cemu profile discovered at all: the shared planner must report
+        // "nothing installed", never silently promote a RetroArch core or
+        // any other adapter as if it were Cemu.
+        let identity = resolved("WiiU", "00050000101010ED");
+        let plan = plan(&identity, &[], &resolved_content(), &[], &empty_retroarch());
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "none",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+        );
+    }
+
+    #[test]
+    fn standalone_candidate_ordering_is_deterministic_by_input_order() {
+        let identity = resolved("Arcade", "mslug");
+        let mame_executable = PathBuf::from("/usr/bin/mame");
+        let fbneo_executable = PathBuf::from("/usr/bin/fbneo");
+        let resolutions = [mame_set_resolution(crate::dat::set::SetState::Complete)];
+        let evidence = fbneo_set_evidence(DatEcosystem::FBNeo);
+        let profiles = [
+            DiscoveredStandaloneProfile::mame(Some(&mame_executable), &resolutions),
+            DiscoveredStandaloneProfile::fbneo(Some(&fbneo_executable), Some(&evidence)),
+        ];
+        let first = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let second = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(first, second);
     }
 }

@@ -226,8 +226,14 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "Arcade",
-        standalone_adapters: &["mame"],
+        standalone_adapters: &["mame", "fbneo"],
         retroarch_core_hints: &["mame", "mame2003_plus", "fbneo"],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
+        platform_id: "WiiU",
+        standalone_adapters: &["cemu"],
+        retroarch_core_hints: &[],
         confidence: MappingConfidence::Exact,
     },
     // ScummVM's command and execution adapters are complete and require a
