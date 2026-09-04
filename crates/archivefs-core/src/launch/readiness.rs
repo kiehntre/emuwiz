@@ -220,6 +220,16 @@ pub enum LaunchBlockerKind {
     /// profile - see the blocker detail for the underlying
     /// [`crate::patch_manager::FlycastLaunchBlockerKind`].
     FlycastBindingUnavailable,
+    /// A melonDS command-plan request was given a non-melonDS candidate.
+    MelonDsCandidateRequired,
+    /// The canonical identity does not target Nintendo DS.
+    MelonDsPlatformMismatch,
+    /// The content is not a direct `.nds` file in the Phase 1 adapter.
+    MelonDsContentFormatUnsupported,
+    /// No verified upstream Nintendo DS identity key is available.
+    MelonDsGameKeyMissing,
+    /// The melonDS profile/executable binding could not be safely resolved.
+    MelonDsBindingUnavailable,
     /// A Xenia command-plan request was given a non-Xenia-standalone launch
     /// candidate.
     XeniaCandidateRequired,

@@ -63,6 +63,7 @@ mod gecko_document;
 mod hatari_local;
 mod import_safety;
 mod matching;
+mod melonds_local;
 mod pcengine_cd_firmware;
 mod pcsx2;
 mod pcsx2_firmware;
@@ -490,6 +491,14 @@ pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
     ImportSourceKind, ImportTrustState, LocalSafetyScanningState, UNKNOWN_CODE_POLICY,
     automatic_execution_allowed, classify_active_content, trust_after_inspection,
+};
+pub use melonds_local::{
+    MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,
+    MelonDsExecutable, MelonDsFirmwareEvidence, MelonDsFirmwareMode, MelonDsFirmwareState,
+    MelonDsGameRequest, MelonDsInstallationType, MelonDsLaunchBlocker, MelonDsLaunchBlockerKind,
+    MelonDsNativeLaunchBinding, MelonDsProfile, MelonDsProfileDiscovery,
+    MelonDsProfileDiscoveryRoots, discover_melonds_profiles, parse_melonds_version,
+    resolve_melonds_native_launch_binding,
 };
 pub use pcengine_cd_firmware::{
     KNOWN_SYSTEM_CARDS, KnownSystemCard, MAX_SYSTEM_CARD_BYTES, MAX_SYSTEM_CARD_CANDIDATES,

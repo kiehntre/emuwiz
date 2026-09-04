@@ -78,6 +78,8 @@ pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
 pub mod mame_execution;
+pub mod melonds_command;
+pub mod melonds_execution;
 pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;
@@ -162,9 +164,9 @@ pub use input_projection::{
     LaunchInputProjection, SegaCdGameRequest, VerifiedIdentityFact,
     project_amiga_whdload_launch_input, project_dolphin_gamecube_launch_input,
     project_dolphin_wii_launch_input, project_duckstation_launch_input,
-    project_flycast_launch_input, project_hatari_launch_input, project_pcsx2_launch_input,
-    project_ppsspp_launch_input, project_rpcs3_launch_input, project_sega_cd_launch_input,
-    project_xemu_launch_input, project_xenia_launch_input,
+    project_flycast_launch_input, project_hatari_launch_input, project_melonds_launch_input,
+    project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
+    project_sega_cd_launch_input, project_xemu_launch_input, project_xenia_launch_input,
 };
 pub use integration::{
     DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,
@@ -175,6 +177,14 @@ pub use mame_command::{
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
     preflight_and_launch_mame, preflight_mame_launch, spawn_mame,
+};
+pub use melonds_command::{
+    MELONDS_SUPPORTED_PLATFORM_ID, MelonDsCommand, MelonDsCommandPlan, MelonDsCommandSelection,
+    build_melonds_command_plan,
+};
+pub use melonds_execution::{
+    MelonDsLaunchPreflightError, MelonDsLaunchPreflightErrorKind, MelonDsLaunchRequest,
+    preflight_melonds_launch, spawn_melonds,
 };
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,

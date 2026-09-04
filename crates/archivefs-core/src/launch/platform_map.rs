@@ -135,6 +135,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "Nintendo DS",
+        standalone_adapters: &["melonds"],
+        retroarch_core_hints: &["melonds"],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "Sega CD",
         standalone_adapters: &[],
         retroarch_core_hints: &["genesis_plus_gx"],

@@ -101,6 +101,9 @@ pub enum VerifiedIdentityFact {
     /// A verified Amiga/WHDLoad identity string, matching
     /// [`crate::patch_manager::AmigaGameRequest::verified_amiga_identity`].
     AmigaIdentity(String),
+    /// A verified Nintendo DS identity key supplied by the upstream identity
+    /// layer. The adapter never constructs this from a filename or extension.
+    NintendoDsGameKey(String),
 }
 
 /// The minimal request carried by the Sega CD RetroArch projection. The
@@ -192,6 +195,13 @@ fn find_atari_st_title(facts: &[VerifiedIdentityFact]) -> Option<String> {
 fn find_amiga_identity(facts: &[VerifiedIdentityFact]) -> Option<String> {
     facts.iter().find_map(|fact| match fact {
         VerifiedIdentityFact::AmigaIdentity(value) => Some(value.clone()),
+        _ => None,
+    })
+}
+
+fn find_nintendo_ds_game_key(facts: &[VerifiedIdentityFact]) -> Option<String> {
+    facts.iter().find_map(|fact| match fact {
+        VerifiedIdentityFact::NintendoDsGameKey(value) => Some(value.clone()),
         _ => None,
     })
 }
@@ -399,6 +409,23 @@ pub fn project_amiga_whdload_launch_input(
         }),
         None => LaunchInputProjection::Unavailable {
             detail: "no verified Amiga identity among the supplied identity facts",
+        },
+    }
+}
+
+/// Projects a verified Nintendo DS identity key to the native melonDS
+/// request seam. No extension-only or emulator-derived fact can reach it.
+pub fn project_melonds_launch_input(
+    facts: &[VerifiedIdentityFact],
+) -> LaunchInputProjection<crate::patch_manager::MelonDsGameRequest> {
+    match find_nintendo_ds_game_key(facts) {
+        Some(game_key) => {
+            LaunchInputProjection::Authorized(crate::patch_manager::MelonDsGameRequest {
+                verified_game_key: Some(game_key),
+            })
+        }
+        None => LaunchInputProjection::Unavailable {
+            detail: "no verified Nintendo DS game key among the supplied identity facts",
         },
     }
 }

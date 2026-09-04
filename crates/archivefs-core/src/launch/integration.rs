@@ -16,8 +16,9 @@
 use crate::emulator_environment::retroarch::RetroArchEnvironmentReport;
 use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_duckstation_launch_input,
-    project_flycast_launch_input, project_pcsx2_launch_input, project_ppsspp_launch_input,
-    project_rpcs3_launch_input, project_xemu_launch_input, project_xenia_launch_input,
+    project_flycast_launch_input, project_melonds_launch_input, project_pcsx2_launch_input,
+    project_ppsspp_launch_input, project_rpcs3_launch_input, project_xemu_launch_input,
+    project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
@@ -29,8 +30,9 @@ use crate::launch::readiness::{
 };
 use crate::patch_manager::{
     DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
-    FlycastProfile, FlycastSystemFileState, Pcsx2BiosVerification, Pcsx2GameInspection,
-    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
+    FlycastProfile, FlycastSystemFileState, MelonDsFirmwareState, MelonDsProfile,
+    Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2Profile, PpssppProfile, Rpcs3GameInspection,
+    Rpcs3Profile, XemuProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -67,6 +69,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Flycast {
         profile: &'a FlycastProfile,
         bios: FlycastSystemFileState,
+    },
+    MelonDs {
+        profile: &'a MelonDsProfile,
     },
     Rpcs3 {
         profile: &'a Rpcs3Profile,
@@ -124,6 +129,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
             profile,
             bios: inspection.health.system.dreamcast_bios,
         }
+    }
+
+    pub fn melonds(profile: &'a MelonDsProfile) -> Self {
+        Self::MelonDs { profile }
     }
 
     pub fn rpcs3(profile: &'a Rpcs3Profile, inspection: &'a Rpcs3GameInspection) -> Self {
@@ -206,6 +215,38 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware: flycast_firmware_readiness(*bios),
+                })
+            }
+            DiscoveredStandaloneProfile::MelonDs { profile }
+                if authorized(project_melonds_launch_input(input.verified_identity_facts)) =>
+            {
+                let firmware = match profile.firmware.mode {
+                    crate::patch_manager::MelonDsFirmwareMode::DirectBoot => {
+                        FirmwareReadiness::NotRequired
+                    }
+                    crate::patch_manager::MelonDsFirmwareMode::ExternalFirmwareBoot => {
+                        if [
+                            profile.firmware.bios7,
+                            profile.firmware.bios9,
+                            profile.firmware.firmware,
+                        ]
+                        .contains(&MelonDsFirmwareState::Missing)
+                        {
+                            FirmwareReadiness::Missing
+                        } else {
+                            FirmwareReadiness::PresentUnverified
+                        }
+                    }
+                    crate::patch_manager::MelonDsFirmwareMode::Unknown => {
+                        FirmwareReadiness::Unknown
+                    }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "melonds",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware,
                 })
             }
             DiscoveredStandaloneProfile::Rpcs3 {
