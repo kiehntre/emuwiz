@@ -263,11 +263,18 @@ fn render_selected_stage(
         (inner_height - gamer_artwork::FEATURED_RESERVED_BELOW)
             .max(gamer_artwork::FEATURED_COVER_MIN_HEIGHT)
     };
-    let media_box = gamer_artwork::featured_cover_box(media_width, media_budget)
+    // A loaded cover is sized against the taller, wider real-cover budget; a
+    // still-loading, missing, or nonexistent cover gets the more restrained
+    // fallback budget instead - see `featured_cover_box`. Read here, before
+    // the box is sized, rather than inside `paint_media`, purely so both this
+    // function and the paint closure agree on the same cover state for one
+    // frame.
+    let cover = covers.slot_for(archive_path.as_path(), None).cloned();
+    let is_real_cover = matches!(cover, Some(gamer_artwork::CoverSlot::Ready { .. }));
+    let media_box = gamer_artwork::featured_cover_box(media_width, media_budget, is_real_cover)
         .unwrap_or_else(|| egui::vec2(media_width, media_width * 1.3));
 
     let paint_media = |ui: &mut egui::Ui, artwork_cache: &mut PlatformArtworkCache| {
-        let cover = covers.slot_for(archive_path.as_path(), None).cloned();
         let platform_asset = platform_asset_id(platform, unknown_platform);
         let platform_fallback = platform_fallback_asset_id(platform, unknown_platform);
         show_featured_cover(

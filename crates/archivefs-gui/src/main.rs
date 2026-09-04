@@ -4885,6 +4885,11 @@ struct ArchiveFsApp {
     /// Mirrors `gamer_cover_worker_allowed`: tests set this false so a
     /// `cargo test` run never opens the real per-user identity cache.
     game_metadata_worker_allowed: bool,
+    /// The Gamer View browsing rail's A-Z jump strip index - see
+    /// [`crate::gamer_view::AlphaJumpIndex`]. Persisted here (like
+    /// `gamer_covers`) because it caches a sort/bucket rebuild across
+    /// frames, rebuilding only when the visible result set changes.
+    gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -5213,6 +5218,7 @@ impl ArchiveFsApp {
             selected_game_metadata: None,
             game_metadata_worker: None,
             game_metadata_worker_allowed: true,
+            gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
         }
     }
 
@@ -18799,13 +18805,7 @@ impl ArchiveFsApp {
             // Decision 6 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): reached
             // through a small gear menu, not a permanent top-level control.
             egui::TopBottomPanel::top("gamer_top_bar").show(context, |ui| {
-                let search_width = gamer_search_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Search games...")
-                            .desired_width(search_width),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if loading || busy {
                             ui.spinner();
@@ -18949,7 +18949,9 @@ impl ArchiveFsApp {
             } else {
                 ui_layout::ContentWidth::Normal
             };
-            ui_layout::page(ui, width, main_view_uses_page_scroll(self.view), self.view, |ui| {
+            let page_scroll = main_view_uses_page_scroll(self.view)
+                || (self.ui_mode == GuiMode::GamerView && self.view == MainView::Library);
+            ui_layout::page(ui, width, page_scroll, self.view, |ui| {
                 self.reconcile_cheats_mods_context(context);
 
                 if self.tools_overlay != ToolsOverlay::None {
@@ -19160,7 +19162,7 @@ impl ArchiveFsApp {
                         ui,
                         data,
                         GamerViewViewState {
-                            filter: &self.filter,
+                            filter: &mut self.filter,
                             library_filters: &mut self.library_filters,
                             archive_context: &mut self.archive_context,
                             screen: &mut self.gamer_view_screen,
@@ -19184,6 +19186,7 @@ impl ArchiveFsApp {
                             dolphin_launch_state: &mut self.launch_dolphin,
                             pcsx2_launch_state: &mut self.launch_pcsx2,
                             standalone_launch_state: &mut self.launch_standalone,
+                            alpha_jump: &mut self.gamer_alpha_jump,
                         },
                     );
                     // Started only once the list has actually asked for something,

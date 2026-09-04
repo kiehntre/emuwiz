@@ -1245,6 +1245,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         // instance. Tests drive `gamer_covers` directly instead.
         gamer_cover_worker_allowed: false,
         gamer_cover_library: None,
+        gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
         selected_game_metadata: None,
         game_metadata_worker: None,
         // Never true in tests, for the same reason as `gamer_cover_worker_allowed`.

@@ -2467,6 +2467,103 @@ fn gamer_view_game_list_uses_the_remaining_height_not_two_or_three_rows() {
 }
 
 #[test]
+fn gamer_view_search_and_alpha_strip_fit_above_your_library_at_1100x720() {
+    // The agreed browsing controls (search field + A-Z jump strip) sit
+    // directly above "YOUR LIBRARY". At the real 1100x720 physical target
+    // this must not recreate the cramped-rail problem: both controls must
+    // actually render, and the grid below them must still show at least
+    // two complete rows - the same floor
+    // `gamer_view_game_list_uses_the_remaining_height_not_two_or_three_rows`
+    // holds at the shorter 1024x600 window.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::GamerView;
+    app.view = MainView::Library;
+    let mut labels = Vec::new();
+    let records: Vec<ArchiveRecord> = (0..30)
+        .map(|index| {
+            let path = format!("/roms/gamer-alpha-{index:02}.zip");
+            let mut rec = record(&path, MountState::Pending);
+            let title = format!("Game {index:02}");
+            rec.metadata.title = Some(title.clone());
+            rec.metadata.platform = Some("GameCube".to_string());
+            labels.push(title);
+            rec
+        })
+        .collect();
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1100.0, 720.0),
+        )),
+        ..Default::default()
+    };
+    run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
+    let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+    assert!(
+        rendered_text_contains(&output, "Search games..."),
+        "the search field's hint text must render above YOUR LIBRARY"
+    );
+    assert!(
+        rendered_text_contains(&output, "YOUR LIBRARY"),
+        "the library header must still render"
+    );
+    // Spot-check a few letters rather than all 27 - enough to know the
+    // strip actually drew buttons, not just the search field.
+    for letter in ["#", "Q", "M", "Z"] {
+        assert!(
+            rendered_text_contains(&output, letter),
+            "the jump strip must render the {letter} button"
+        );
+    }
+
+    let visible = fully_visible_exact_text_count(&output, &labels);
+    assert!(
+        visible >= 2,
+        "1100x720 must still show at least 2 complete Gamer View game rows \
+         alongside the new controls, showed {visible}"
+    );
+}
+
+#[test]
+fn gamer_view_alpha_strip_wraps_cleanly_on_a_narrow_window() {
+    // On a narrow window the 27-button strip cannot fit on one row; it must
+    // wrap rather than overflow or disappear - every letter, including the
+    // first (#) and last (Z), must still be reachable.
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::GamerView;
+    app.view = MainView::Library;
+    let mut rec = record("/roms/narrow-alpha.zip", MountState::Pending);
+    rec.metadata.title = Some("Narrow Window Game".to_string());
+    rec.metadata.platform = Some("GameCube".to_string());
+    app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", vec![rec])));
+
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(700.0, 720.0),
+        )),
+        ..Default::default()
+    };
+    run_settle_frames(&ctx, &mut app, &mut frame, &input, 3);
+    let output = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+
+    for letter in ["#", "Q", "M", "Z"] {
+        assert!(
+            rendered_text_contains(&output, letter),
+            "a narrow window must still render the {letter} button, wrapped or not"
+        );
+    }
+    assert!(rendered_text_contains(&output, "YOUR LIBRARY"));
+}
+
+#[test]
 fn summary_counter_labels_never_collapse_into_vertical_text() {
     fn text_row_count(shape: &egui::Shape, needle: &str) -> Option<usize> {
         match shape {

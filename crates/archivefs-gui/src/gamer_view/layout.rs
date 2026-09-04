@@ -55,8 +55,16 @@ impl GamerStageLayout {
     /// Vertical rhythm between the three regions.
     pub(crate) const REGION_GAP: f32 = 20.0;
     /// The rail keeps at least this much height on the shortest window; it
-    /// scrolls rather than pushing the stage smaller.
-    pub(crate) const RAIL_MIN_HEIGHT: f32 = 150.0;
+    /// scrolls rather than pushing the stage smaller. Raised from the
+    /// original 150px so that even a cramped 1100x720 physical window still
+    /// shows a couple of full card rows plus a hint of the next one, rather
+    /// than a sliver that barely reads as scrollable.
+    pub(crate) const RAIL_MIN_HEIGHT: f32 = 220.0;
+    /// Share of the stage+rail budget the stage is given before being
+    /// clamped into its min/max band. Tuned so the stage reads as dominant
+    /// without eating space the rail needs to be usable at the real 1100x720
+    /// physical target - see `physical_target_1100x720_...` below.
+    const STAGE_SHARE: f32 = 0.52;
     /// Target width one browsing-rail card wants. The column count is how many
     /// of these fit across the available width, clamped to a sane range.
     pub(crate) const RAIL_CARD_TARGET_WIDTH: f32 = 340.0;
@@ -82,17 +90,21 @@ impl GamerStageLayout {
         let region_gap = Self::REGION_GAP;
         let strip_height = Self::STRIP_HEIGHT;
 
-        // Space left for the stage and the rail together, after the strip and
-        // the two gaps that separate the three regions.
-        let remaining = (height - strip_height - region_gap * 2.0).max(180.0);
+        // `available` is the central panel's remaining space *after* the
+        // caller has already drawn the platform strip and its trailing gap
+        // (see the call site in `gamer_view.rs`, which captures
+        // `ui.available_height()` only once the shelf is behind it). So the
+        // only budget left to divide here is the stage, the rail, and the
+        // single gap between those two - not a second helping of the strip.
+        let remaining = (height - region_gap).max(180.0);
 
         // The stage takes the majority of that space so it is unmistakably the
         // primary region, then is clamped into a sensible band and finally
         // held back far enough to leave the rail its minimum height whenever
         // the window is tall enough to afford it.
-        let stage_height = (remaining * 0.6)
+        let stage_height = (remaining * Self::STAGE_SHARE)
             .clamp(Self::MIN_STAGE_HEIGHT, Self::MAX_STAGE_HEIGHT)
-            .min((remaining - Self::RAIL_MIN_HEIGHT).max(Self::MIN_STAGE_HEIGHT));
+            .min((remaining - Self::RAIL_MIN_HEIGHT).max(Self::MIN_STAGE_HEIGHT.min(remaining)));
 
         let rail_min_height = (remaining - stage_height).max(Self::RAIL_MIN_HEIGHT);
 
@@ -100,8 +112,16 @@ impl GamerStageLayout {
         let inner_height = (stage_height - Self::STAGE_INNER_PADDING).max(120.0);
         let stage_media_width = if stage_side_by_side {
             // A portrait plate sized off the stage height, never so wide it
-            // crowds the text column out on a modest window.
-            (inner_height * 0.72).clamp(150.0, 300.0).min(width * 0.4)
+            // crowds the text column out on a modest window. Raised from an
+            // 0.72/150-300 budget that under-supplied width relative to the
+            // stage's own height: `featured_cover_box` picks the smaller of
+            // this width-derived bound and the height budget, so a column
+            // narrower than `height_budget * cover_aspect` was silently
+            // capping a real cover below what the stage's height already
+            // allowed - the actual cause of covers reading as too small at
+            // the 1100x720 physical target once the stage/rail height split
+            // itself was correct.
+            (inner_height * 0.95).clamp(180.0, 420.0).min(width * 0.42)
         } else {
             (width - Self::STAGE_INNER_PADDING).clamp(150.0, 320.0)
         };
@@ -141,17 +161,34 @@ mod tests {
 
     #[test]
     fn physical_target_1100x720_puts_the_stage_in_the_majority_and_keeps_a_usable_rail() {
-        // The central panel sees a little less than the window after the app's
-        // own top chrome; ~680 high, ~1052 wide is representative.
+        // `compute` is called with `ui.available_height()` captured *after*
+        // the app has already drawn the search bar, the maintenance-action
+        // row, and the platform strip with its trailing gap (see the call
+        // site comment in `gamer_view.rs`), so it never sees the full 720px
+        // window - ~680 wide is representative of what is actually left at
+        // the real 1100x720 physical target.
         let l = layout(1052.0, 680.0);
         assert_eq!(l.strip_height, GamerStageLayout::STRIP_HEIGHT);
-        // Stage is the dominant region.
+        // Stage is the dominant region but no longer swallows space the rail
+        // needs: tuned to land near 330-350px rather than the ~390px a naive
+        // 60% share (plus the old double-counted strip subtraction) used to
+        // produce.
+        assert!(
+            (325.0..=355.0).contains(&l.stage_height),
+            "stage should land in the 330-350px band at the physical target, got {}",
+            l.stage_height
+        );
         assert!(
             l.stage_height > l.rail_min_height,
             "stage must dominate the rail"
         );
-        // Rail still gets real, scrollable room.
-        assert!(l.rail_min_height >= 120.0, "rail kept a usable height");
+        // Rail now gets a comfortably scrollable minimum - enough for two
+        // full card rows plus a hint of the next one - rather than a sliver.
+        assert!(
+            l.rail_min_height >= 220.0,
+            "rail should get at least ~220px at the physical target, got {}",
+            l.rail_min_height
+        );
         // Three columns around the real physical width.
         assert_eq!(l.rail_columns, 3);
         assert!(l.stage_side_by_side);
@@ -163,6 +200,32 @@ mod tests {
         assert!(l.stage_height <= GamerStageLayout::MAX_STAGE_HEIGHT);
         // The extra vertical space flows to the rail, not an ever-taller hero.
         assert!(l.rail_min_height > l.stage_height);
+    }
+
+    #[test]
+    fn window_1024x600_remains_usable() {
+        let l = layout(1024.0, 600.0);
+        assert!(l.stage_height >= GamerStageLayout::MIN_STAGE_HEIGHT - 8.0);
+        assert!(l.stage_height > l.rail_min_height, "stage stays dominant");
+        assert!(
+            l.rail_min_height >= 200.0,
+            "rail is still usable when short"
+        );
+        assert_eq!(l.rail_columns, 3);
+    }
+
+    #[test]
+    fn window_1440x900_stays_balanced_and_generous() {
+        let l = layout(1440.0, 900.0);
+        // The stage may grow again on a taller window, but stays capped.
+        assert!(l.stage_height <= GamerStageLayout::MAX_STAGE_HEIGHT);
+        // The rail is not capped and keeps growing with the window.
+        assert!(
+            l.rail_min_height > 380.0,
+            "rail should stay generous on a bigger window, got {}",
+            l.rail_min_height
+        );
+        assert_eq!(l.rail_columns, 4);
     }
 
     #[test]
@@ -183,10 +246,50 @@ mod tests {
     }
 
     #[test]
+    fn the_media_plate_is_wide_enough_for_a_real_cover_to_fill_its_height_budget() {
+        // The media column has to be at least `inner_height * cover_aspect`
+        // wide, or `featured_cover_box` clips the cover's height to fit the
+        // column instead of the stage's actual height budget - which is
+        // exactly what made real covers measure far smaller than the stage
+        // height allowed before this fix.
+        let l = layout(1052.0, 680.0);
+        let inner_height = l.stage_height - 48.0; // GamerStageLayout::STAGE_INNER_PADDING
+        let real_cover_aspect = 3.0 / 4.0; // gamer_artwork::FEATURED_COVER_ASPECT
+        assert!(
+            l.stage_media_width >= inner_height * real_cover_aspect,
+            "media column ({}) is narrower than a real cover at the stage's own \
+             height budget needs ({})",
+            l.stage_media_width,
+            inner_height * real_cover_aspect
+        );
+    }
+
+    #[test]
+    fn the_media_plate_grows_on_a_wider_window() {
+        let modest = layout(1052.0, 680.0).stage_media_width;
+        let wider = layout(1440.0, 900.0).stage_media_width;
+        assert!(
+            wider > modest,
+            "media plate did not grow on a wider window: {modest} -> {wider}"
+        );
+    }
+
+    #[test]
     fn the_shortest_supported_window_still_leaves_both_regions_present() {
         let l = layout(1052.0, 600.0);
         assert!(l.stage_height >= GamerStageLayout::MIN_STAGE_HEIGHT - 8.0);
-        assert!(l.rail_min_height >= 120.0);
+        assert!(l.rail_min_height >= 200.0);
+    }
+
+    #[test]
+    fn stage_height_never_drops_below_its_floor_on_a_degenerate_window() {
+        // `compute` clamps its inputs, so even a pathologically tiny window
+        // still gets a stage no smaller than what `MIN_STAGE_HEIGHT` and the
+        // available space can support - the rail-minimum subtraction must
+        // never push it below that floor.
+        let l = layout(50.0, 50.0);
+        assert!(l.stage_height > 0.0);
+        assert!(l.stage_height <= GamerStageLayout::MIN_STAGE_HEIGHT);
     }
 
     #[test]

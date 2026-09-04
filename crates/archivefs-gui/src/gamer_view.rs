@@ -8,10 +8,12 @@
 
 use super::*;
 
+pub(crate) mod alpha_jump;
 mod layout;
 mod rail;
 mod stage;
 
+pub(crate) use alpha_jump::AlphaJumpIndex;
 pub(crate) use layout::GamerStageLayout;
 
 /// Which of Gamer View's two screens is currently showing - the
@@ -63,19 +65,6 @@ pub(crate) fn gamer_identity_status_from_verdict(
     }
 }
 
-pub(crate) const GAMER_SEARCH_MIN_WIDTH: f32 = 320.0;
-pub(crate) const GAMER_SEARCH_MAX_WIDTH: f32 = 760.0;
-pub(crate) const GAMER_TOP_BAR_CONTROL_RESERVE: f32 = 64.0;
-
-/// Gives search the top bar's main share while reserving enough room for
-/// the settings menu (and the busy spinner when present). The final `min`
-/// keeps unusually small windows from pushing that control off-screen.
-pub(crate) fn gamer_search_width(available_width: f32) -> f32 {
-    let available_for_search = (available_width - GAMER_TOP_BAR_CONTROL_RESERVE).max(0.0);
-    available_for_search
-        .clamp(GAMER_SEARCH_MIN_WIDTH, GAMER_SEARCH_MAX_WIDTH)
-        .min(available_for_search)
-}
 /// Gamer View's own wording for the scan its "Add games" flow just
 /// chained - never the Advanced-View "Scan complete: N source(s)
 /// scanned, N archive(s) found" phrasing `source_action_success_message`
@@ -523,6 +512,35 @@ impl GamerLibrarySnapshot {
     }
 }
 
+/// Normalises the live search text into what `GamerLibrarySnapshot::build`
+/// matches against: trimmed of leading/trailing whitespace (so " mario "
+/// and "mario" behave identically - a person editing a search box rarely
+/// means the spaces) and lower-cased (matching `ArchiveRow::search_text`,
+/// which is stored lower-cased for the same reason).
+fn gamer_search_text(filter: &str) -> String {
+    filter.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod gamer_search_text_tests {
+    use super::*;
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace() {
+        assert_eq!(gamer_search_text("  mario  "), "mario");
+    }
+
+    #[test]
+    fn lower_cases_so_matching_is_case_insensitive() {
+        assert_eq!(gamer_search_text("MaRiO"), "mario");
+    }
+
+    #[test]
+    fn whitespace_only_becomes_an_empty_search() {
+        assert_eq!(gamer_search_text("   "), "");
+    }
+}
+
 /// Why the game list is empty, in the user's terms. Search and platform
 /// compose, so when both are narrowing the message says so rather than
 /// blaming whichever one the old `else if` chain happened to test first.
@@ -961,7 +979,11 @@ pub(crate) fn show_gamer_metadata_enrichment(ui: &mut egui::Ui, view: &GamerMeta
 }
 
 pub(crate) struct GamerViewViewState<'a> {
-    pub(crate) filter: &'a str,
+    /// The live search text. Mutable so the browsing rail's own search
+    /// field (drawn directly above "YOUR LIBRARY") can edit the exact same
+    /// text the top bar's search box does - either one narrows the same
+    /// result set, and clearing either clears both.
+    pub(crate) filter: &'a mut String,
     pub(crate) library_filters: &'a mut LibraryRowFilters,
     pub(crate) archive_context: &'a mut ArchiveContext,
     pub(crate) screen: &'a mut GamerViewScreen,
@@ -998,6 +1020,11 @@ pub(crate) struct GamerViewViewState<'a> {
     pub(crate) dolphin_launch_state: &'a mut launch_readiness_page::DolphinLaunchState,
     pub(crate) pcsx2_launch_state: &'a mut launch_readiness_page::Pcsx2LaunchState,
     pub(crate) standalone_launch_state: &'a mut launch_readiness_page::StandaloneLaunchState,
+    /// The A-Z jump strip's index - see [`AlphaJumpIndex`]. Persisted at the
+    /// app level (like `covers`) because it caches a sort/bucket rebuild
+    /// across frames; the browsing rail is the only thing that reads or
+    /// rebuilds it.
+    pub(crate) alpha_jump: &'a mut AlphaJumpIndex,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -1160,6 +1187,7 @@ pub(crate) fn show_gamer_view(
         dolphin_launch_state,
         pcsx2_launch_state,
         standalone_launch_state,
+        alpha_jump,
     } = view_state;
     let mut action = None;
 
@@ -1232,7 +1260,7 @@ pub(crate) fn show_gamer_view(
         return details_action;
     }
 
-    let search_text = filter.to_lowercase();
+    let search_text = gamer_search_text(filter);
     // One authoritative snapshot for this frame - see
     // `GamerLibrarySnapshot`. Everything below (shelf counts, the "All"
     // count, the game list, and the empty-state wording) reads from it,
@@ -1348,7 +1376,9 @@ pub(crate) fn show_gamer_view(
         // risking a stale selected-game panel for a game no longer in view.
         archive_context.clear_selection();
     }
-    ui.add_space(theme::SECTION_GAP);
+    // Keep the shelf close to its maintenance actions; the page itself now
+    // provides the vertical breathing room as it continues into the stage.
+    ui.add_space(theme::SPACE_SM);
 
     // ------------------------------------------------------------------
     // Regions 3 & 4: the dominant selected-game stage, then the
@@ -1358,6 +1388,13 @@ pub(crate) fn show_gamer_view(
     // ------------------------------------------------------------------
     let stage_layout =
         GamerStageLayout::compute(egui::vec2(ui.available_width(), ui.available_height()));
+    // Capture the selected-game stage's document-space rect before drawing
+    // it. The rail uses this stable page anchor only when a game card is
+    // explicitly activated; A-Z keeps its independent library-row target.
+    let selected_stage_rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), stage_layout.stage_height),
+    );
 
     let selected = selected_record(&data.records, archive_context.focused.as_deref());
     let selected_row = selected.and_then(|record| {
@@ -1416,6 +1453,9 @@ pub(crate) fn show_gamer_view(
             min_height: stage_layout.rail_min_height,
             searching: !search_text.is_empty(),
             platform_selected: library_filters.platform.is_some(),
+            filter,
+            alpha_jump,
+            selected_stage_rect,
         },
     ) {
         action = Some(rail_action);

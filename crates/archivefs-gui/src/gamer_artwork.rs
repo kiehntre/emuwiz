@@ -516,9 +516,21 @@ impl GamerCoverCache {
 /// without becoming a banner.
 pub(crate) const GAMER_FEATURED_CONTENT_MAX_WIDTH: f32 = 560.0;
 
-/// The tallest a featured cover is drawn, so a 1440p panel does not turn one
-/// thumbnail into a poster.
-pub(crate) const FEATURED_COVER_MAX_HEIGHT: f32 = 360.0;
+/// The tallest a *real* cover (an actual box-art image, not a fallback) is
+/// drawn, so a 1440p+ panel does not turn one loaded cover into a wall
+/// poster. Real covers get a taller ceiling than the fallback plate - see
+/// [`FEATURED_COVER_MAX_HEIGHT_FALLBACK`] - since a genuine cover is the
+/// presentation the hero exists to show off, and is worth letting grow
+/// further on a roomy window.
+pub(crate) const FEATURED_COVER_MAX_HEIGHT: f32 = 460.0;
+
+/// The tallest the *fallback* platform-art plate (drawn while a cover is
+/// still loading, has none, or none exists for this platform) is drawn.
+/// Deliberately kept below [`FEATURED_COVER_MAX_HEIGHT`]: hardware
+/// iconography was framed at a specific, modest scale, and blowing it up to
+/// match a real cover's ceiling would make placeholder art read as more
+/// important than it is.
+pub(crate) const FEATURED_COVER_MAX_HEIGHT_FALLBACK: f32 = 300.0;
 
 /// Below this there is not enough of an image left to be worth the space, and the
 /// artwork is dropped rather than the actions.
@@ -533,9 +545,16 @@ pub(crate) const FEATURED_COVER_MIN_HEIGHT: f32 = 72.0;
 /// cover only ever gets what is genuinely left over, however the title wrapped.
 pub(crate) const FEATURED_RESERVED_BELOW: f32 = 300.0;
 
-/// A cover's portrait shape. Boxes are reserved at this ratio; the image inside is
-/// fitted to it and letterboxed, never stretched or cropped.
-pub(crate) const FEATURED_COVER_ASPECT: f32 = 2.0 / 3.0;
+/// A *real* cover's portrait shape - width:height. Slightly wider than the
+/// fallback's (3:4 rather than 2:3) so a loaded cover reads as filling its
+/// column instead of a narrow strip in a wide gutter, while still reading as
+/// an unmistakably portrait box-art shape.
+pub(crate) const FEATURED_COVER_ASPECT: f32 = 3.0 / 4.0;
+
+/// The *fallback* platform-art plate's portrait shape - narrower than the
+/// real-cover ratio, preserving the tighter framing hardware/platform glyphs
+/// were designed around.
+pub(crate) const FEATURED_COVER_ASPECT_FALLBACK: f32 = 2.0 / 3.0;
 
 /// The box reserved for the featured cover, or `None` when there is not enough
 /// height to give it any.
@@ -545,17 +564,35 @@ pub(crate) const FEATURED_COVER_ASPECT: f32 = 2.0 / 3.0;
 /// subtraction belongs there rather than here: doing it in both places takes it
 /// twice, which shrinks the cover on a large window and hides it on a small one.
 ///
-/// The box is the same size whether the artwork has loaded, failed, or does not
-/// exist, which is what stops the actions beneath it moving.
-pub(crate) fn featured_cover_box(panel_width: f32, budget: f32) -> Option<egui::Vec2> {
+/// `is_real_cover` selects between the taller, wider real-cover budget and the
+/// more restrained fallback one (see [`FEATURED_COVER_ASPECT`],
+/// [`FEATURED_COVER_ASPECT_FALLBACK`], [`FEATURED_COVER_MAX_HEIGHT`] and
+/// [`FEATURED_COVER_MAX_HEIGHT_FALLBACK`]) - a loaded cover and the
+/// placeholder plate are never the same size on a window with room to spare.
+///
+/// The box is the same size across every frame a *given* cover state persists,
+/// which is what stops the actions beneath it moving from frame to frame.
+pub(crate) fn featured_cover_box(
+    panel_width: f32,
+    budget: f32,
+    is_real_cover: bool,
+) -> Option<egui::Vec2> {
+    let (aspect, max_height) = if is_real_cover {
+        (FEATURED_COVER_ASPECT, FEATURED_COVER_MAX_HEIGHT)
+    } else {
+        (
+            FEATURED_COVER_ASPECT_FALLBACK,
+            FEATURED_COVER_MAX_HEIGHT_FALLBACK,
+        )
+    };
     // Capped so a 1440p panel does not turn one thumbnail into a poster, and
     // clamped to fit across the panel at its portrait ratio.
-    let by_width = (panel_width - 2.0 * theme::PAGE_GUTTER).max(0.0) / FEATURED_COVER_ASPECT;
-    let height = budget.min(by_width).min(FEATURED_COVER_MAX_HEIGHT);
+    let by_width = (panel_width - 2.0 * theme::PAGE_GUTTER).max(0.0) / aspect;
+    let height = budget.min(by_width).min(max_height);
     if height < FEATURED_COVER_MIN_HEIGHT {
         return None;
     }
-    Some(egui::vec2(height * FEATURED_COVER_ASPECT, height))
+    Some(egui::vec2(height * aspect, height))
 }
 
 /// Fits an image inside the reserved box, preserving its aspect ratio.

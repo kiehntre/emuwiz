@@ -1667,15 +1667,6 @@ fn legacy_square_png_size_is_a_warning_not_a_rejection() {
     );
 }
 
-#[test]
-fn gamer_search_uses_the_top_bar_without_displacing_settings() {
-    assert_eq!(gamer_search_width(1024.0), GAMER_SEARCH_MAX_WIDTH);
-    assert_eq!(gamer_search_width(1600.0), GAMER_SEARCH_MAX_WIDTH);
-    assert_eq!(gamer_search_width(400.0), 336.0);
-    assert!(400.0 - gamer_search_width(400.0) >= GAMER_TOP_BAR_CONTROL_RESERVE);
-    assert_eq!(gamer_search_width(40.0), 0.0);
-}
-
 // --- Platform shelf horizontal navigation ----------------------------
 
 fn shelf_metrics(offset: f32, content: f32, viewport: f32) -> PlatformShelfMetrics {

@@ -1152,6 +1152,7 @@ fn the_featured_cover_is_a_readable_size_at_1920x1080() {
     let box_size = featured_cover_box(
         GAMER_FEATURED_CONTENT_MAX_WIDTH,
         budget(780.0, FEATURED_RESERVED_BELOW),
+        true,
     )
     .expect("1080p has room for a featured cover");
     assert!(
@@ -1168,7 +1169,7 @@ fn the_featured_cover_scales_down_rather_than_pushing_the_actions_off() {
     let mut previous = f32::MAX;
     for height in [1100.0_f32, 780.0, 540.0, 430.0, 360.0] {
         let available = budget(height, FEATURED_RESERVED_BELOW);
-        let box_size = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, available);
+        let box_size = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, available, true);
         let drawn = box_size.map(|size| size.y).unwrap_or(0.0);
         assert!(
             drawn <= previous,
@@ -1189,7 +1190,8 @@ fn a_panel_too_short_for_artwork_drops_the_artwork_not_the_actions() {
     assert!(
         featured_cover_box(
             GAMER_FEATURED_CONTENT_MAX_WIDTH,
-            budget(340.0, FEATURED_RESERVED_BELOW)
+            budget(340.0, FEATURED_RESERVED_BELOW),
+            true,
         )
         .is_none(),
         "a cramped panel still reserved space for a cover"
@@ -1200,8 +1202,8 @@ fn a_panel_too_short_for_artwork_drops_the_artwork_not_the_actions() {
 fn a_measured_action_block_taller_than_the_estimate_still_shrinks_the_cover() {
     // A wrapped title and a stacked action column make the block far taller than
     // the first-frame estimate. The cover has to give that space back.
-    let tight = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 420.0));
-    let roomy = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 240.0));
+    let tight = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 420.0), true);
+    let roomy = featured_cover_box(GAMER_FEATURED_CONTENT_MAX_WIDTH, budget(560.0, 240.0), true);
     let tight_height = tight.map(|size| size.y).unwrap_or(0.0);
     let roomy_height = roomy.map(|size| size.y).unwrap_or(0.0);
     assert!(
@@ -1213,13 +1215,60 @@ fn a_measured_action_block_taller_than_the_estimate_still_shrinks_the_cover() {
 #[test]
 fn the_featured_cover_never_exceeds_the_panel_width() {
     for width in [220.0_f32, 300.0, 460.0] {
-        if let Some(size) = featured_cover_box(width, 1200.0) {
+        if let Some(size) = featured_cover_box(width, 1200.0, true) {
             assert!(
                 size.x <= width,
                 "a {size:?} cover overflowed a {width}px panel"
             );
         }
     }
+}
+
+#[test]
+fn a_real_cover_is_noticeably_larger_than_the_1100x720_physical_target_used_to_produce() {
+    // Reproduces the stage's own inner-height budget at the real 1100x720
+    // physical target (see `GamerStageLayout` at ~1052x680, stage_height
+    // ~343, minus the stage's inner padding) with the panel width
+    // `GamerStageLayout::compute` now hands the media plate at that size.
+    // Before this fix a real cover measured about 164x247 there - too small
+    // relative to the hero space it sat in.
+    let panel_width = 280.0; // `GamerStageLayout::stage_media_width` at the target
+    let budget = 295.0; // the stage's inner height at the target
+    let real = featured_cover_box(panel_width, budget, true).expect("room for a real cover");
+    assert!(
+        real.x >= 200.0 && real.y >= 260.0,
+        "a real cover at the physical target measured only {real:?}"
+    );
+}
+
+#[test]
+fn a_real_cover_is_larger_than_the_fallback_plate_at_the_same_budget() {
+    let panel_width = 280.0;
+    let budget = 295.0;
+    let real = featured_cover_box(panel_width, budget, true).expect("room for a real cover");
+    let fallback =
+        featured_cover_box(panel_width, budget, false).expect("room for a fallback plate");
+    assert!(
+        real.y > fallback.y || real.x > fallback.x,
+        "a real cover ({real:?}) was not larger than the fallback plate ({fallback:?})"
+    );
+}
+
+#[test]
+fn the_fallback_plate_stays_bounded_even_on_a_generous_budget() {
+    // A tall/wide window gives the real cover far more room to grow (see
+    // `FEATURED_COVER_MAX_HEIGHT`), but the fallback platform-art plate keeps
+    // its own, more restrained ceiling regardless.
+    let fallback = featured_cover_box(600.0, 1000.0, false).expect("fallback still draws");
+    assert!(
+        fallback.y <= FEATURED_COVER_MAX_HEIGHT_FALLBACK + 0.01,
+        "the fallback plate grew past its restrained ceiling: {fallback:?}"
+    );
+    let real = featured_cover_box(600.0, 1000.0, true).expect("real cover still draws");
+    assert!(
+        real.y > fallback.y,
+        "a generous budget did not let the real cover outgrow the fallback ({real:?} vs {fallback:?})"
+    );
 }
 
 #[test]
