@@ -31,6 +31,7 @@ pub mod manual;
 pub mod mapping_plan;
 pub mod media_mapping;
 pub mod normalise;
+pub mod stale_report;
 
 #[cfg(test)]
 mod tests;
