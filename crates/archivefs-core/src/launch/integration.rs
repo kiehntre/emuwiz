@@ -787,6 +787,22 @@ mod tests {
         }
     }
 
+    fn vita3k_profile() -> crate::patch_manager::Vita3kProfile {
+        let root = PathBuf::from("/profiles/vita3k");
+        crate::patch_manager::Vita3kProfile {
+            profile_id: "vita3k-native".to_string(),
+            installation_type: crate::patch_manager::Vita3kInstallationType::Native,
+            configuration_path: root.clone(),
+            config_path: Some(root.join("config.yml")),
+            vita_fs_path: root.join("ux0"),
+            firmware: crate::patch_manager::Vita3kFirmwareState::PresentUnverified,
+            eligible: true,
+            blocker: None,
+            executable_candidates: Vec::new(),
+            config: None,
+        }
+    }
+
     fn xenia_profile() -> XeniaProfile {
         let root = PathBuf::from("/profiles/xenia");
         XeniaProfile {
@@ -1233,6 +1249,95 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
         );
+    }
+
+    // --- Vita3K ---
+
+    #[test]
+    fn vita3k_profile_projects_to_a_distinct_playstation_vita_candidate() {
+        let identity = resolved("PlayStation Vita", "PCSA00000");
+        let profile = vita3k_profile();
+        let profiles = [DiscoveredStandaloneProfile::Vita3k { profile: &profile }];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "vita3k",
+                ref profile_id,
+                ..
+            } if profile_id == "vita3k-native"
+        ));
+    }
+
+    #[test]
+    fn vita3k_does_not_match_psp_or_ps3_and_has_no_fallback() {
+        let profile = vita3k_profile();
+        let profiles = [DiscoveredStandaloneProfile::Vita3k { profile: &profile }];
+        for identity in [resolved("PSP", "ULUS-10000"), resolved("PS3", "BLUS00000")] {
+            let plan = plan(
+                &identity,
+                &[],
+                &resolved_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "vita3k",
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn missing_vita3k_profile_reports_no_installation_instead_of_substitution() {
+        let identity = resolved("PlayStation Vita", "PCSA00000");
+        let plan = plan(&identity, &[], &resolved_content(), &[], &empty_retroarch());
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "none",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+        );
+    }
+
+    #[test]
+    fn vita3k_candidate_generation_is_deterministic() {
+        let identity = resolved("PlayStation Vita", "PCSA00000");
+        let profile = vita3k_profile();
+        let profiles = [DiscoveredStandaloneProfile::Vita3k { profile: &profile }];
+        let first = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let second = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(first, second);
     }
 
     #[test]
