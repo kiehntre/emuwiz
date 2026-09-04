@@ -129,6 +129,10 @@ pub mod playing_library;
 /// Generic, read-only contract for auditing and planning source-root changes.
 pub mod source_root_migration;
 
+/// Read-only projection of persisted source-folder/database state into the
+/// generic source-root migration planner.
+pub mod source_folder_migration;
+
 pub mod disk_format;
 
 /// Pure content/container/media evidence, deliberately separate from

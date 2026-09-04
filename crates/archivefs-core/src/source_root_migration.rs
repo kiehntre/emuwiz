@@ -327,6 +327,9 @@ fn join_checked(root: &Path, suffix: &Path) -> Option<PathBuf> {
 }
 
 fn exists_without_symlink_escape(candidate: &Path, root: &Path) -> bool {
+    if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return false;
+    }
     if !candidate.exists() {
         return false;
     }
