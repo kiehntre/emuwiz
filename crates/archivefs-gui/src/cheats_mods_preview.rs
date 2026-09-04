@@ -327,6 +327,73 @@ pub(crate) fn show_cheat_candidate_stages(
     action
 }
 
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    fn output_contains_text(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().any(|shape| shape_contains(shape, needle))
+                }
+                _ => false,
+            }
+        }
+
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn responsive_breakpoints_keep_wide_toolbar_room_and_wrap_narrow() {
+        assert_eq!(cheats_mods_layout_for_width(1100.0), CheatsModsLayout::Wide);
+        assert_eq!(cheats_mods_layout_for_width(1440.0), CheatsModsLayout::Wide);
+        assert_eq!(
+            cheats_mods_layout_for_width(800.0),
+            CheatsModsLayout::Medium
+        );
+        assert_eq!(
+            cheats_mods_layout_for_width(679.0),
+            CheatsModsLayout::Narrow
+        );
+    }
+
+    #[test]
+    fn enhancement_sections_are_distinct_and_cheats_is_the_default() {
+        assert_ne!(EnhancementSection::Cheats, EnhancementSection::Mods);
+
+        let context = egui::Context::default();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(active_enhancement_section(ui), EnhancementSection::Cheats);
+            });
+        });
+    }
+
+    #[test]
+    fn no_selected_game_has_deliberate_context_and_no_fake_counts() {
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_selected_game_context(ui, None, CheatsModsLayout::Narrow);
+                show_enhancement_summary(ui, None);
+            });
+        });
+
+        assert!(output_contains_text(
+            &output,
+            "Select a game to view compatible cheats and mods."
+        ));
+        assert!(output_contains_text(&output, "Cheats · Select a game"));
+        assert!(!output_contains_text(&output, "0 cheats"));
+        assert!(!output_contains_text(&output, "0 mods"));
+    }
+}
+
 /// The stage-4 primary action. Extracted into its own function (rather
 /// than inlined at its one call site) so a test can render and click this
 /// exact widget directly - see `find_matching_cheat_files_button_*` below.
@@ -1126,7 +1193,189 @@ pub(crate) fn show_shared_transaction_readiness(
     action
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnhancementSection {
+    Cheats,
+    Mods,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheatsModsLayout {
+    Wide,
+    Medium,
+    Narrow,
+}
+
+/// Stable presentation breakpoints for the selected-game hero and task
+/// surfaces. Keeping this pure makes the responsive contract testable without
+/// constructing an application or touching backend state.
+fn cheats_mods_layout_for_width(width: f32) -> CheatsModsLayout {
+    if width >= 980.0 {
+        CheatsModsLayout::Wide
+    } else if width >= 680.0 {
+        CheatsModsLayout::Medium
+    } else {
+        CheatsModsLayout::Narrow
+    }
+}
+
+fn enhancement_section_id() -> egui::Id {
+    egui::Id::new("cheats-mods-enhancement-section")
+}
+
+fn active_enhancement_section(ui: &egui::Ui) -> EnhancementSection {
+    ui.data(|data| {
+        data.get_temp::<EnhancementSection>(enhancement_section_id())
+            .unwrap_or(EnhancementSection::Cheats)
+    })
+}
+
+fn show_enhancement_section_switch(ui: &mut egui::Ui) -> EnhancementSection {
+    let mut active = active_enhancement_section(ui);
+    widgets::section_header(
+        ui,
+        "Enhancements",
+        Some("Choose a cheat workflow or review larger game modifications."),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (section, label, description) in [
+            (
+                EnhancementSection::Cheats,
+                "Cheats",
+                "Targeted gameplay and runtime codes",
+            ),
+            (
+                EnhancementSection::Mods,
+                "Mods",
+                "Replacement files and community packages",
+            ),
+        ] {
+            let selected = active == section;
+            if ui
+                .selectable_label(selected, label)
+                .on_hover_text(description)
+                .clicked()
+            {
+                active = section;
+                ui.data_mut(|data| data.insert_temp(enhancement_section_id(), active));
+            }
+        }
+        ui.weak(match active {
+            EnhancementSection::Cheats => "Cheat workflow",
+            EnhancementSection::Mods => "Mod review workflow",
+        });
+    });
+    active
+}
+
+fn show_selected_game_context(
+    ui: &mut egui::Ui,
+    workflow: Option<&CheatWorkflowState>,
+    layout: CheatsModsLayout,
+) {
+    widgets::section_header(
+        ui,
+        "Game context",
+        Some("Every enhancement stays bound to this exact selected game."),
+    );
+    widgets::card(ui, |ui| {
+        if let Some(workflow) = workflow {
+            let identity_label = match &workflow.identity {
+                CheatStepResource::Ready(_) => "Identity checked",
+                CheatStepResource::Loading { .. } => "Checking identity",
+                CheatStepResource::Failed(_) => "Identity needs review",
+                CheatStepResource::NotLoaded => "Identity not checked",
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Selected game: {}", workflow.display_name));
+                widgets::status_badge(
+                    ui,
+                    workflow.platform.as_deref().unwrap_or("Platform unknown"),
+                    widgets::StatusTone::Info,
+                );
+                widgets::status_badge(
+                    ui,
+                    identity_label,
+                    if identity_label == "Identity checked" {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Warning
+                    },
+                );
+            });
+            let context_detail = match layout {
+                CheatsModsLayout::Wide => format!(
+                    "{}{}",
+                    workflow
+                        .region
+                        .as_deref()
+                        .map_or(String::new(), |region| format!("{region} · ")),
+                    workflow.archive_path.display()
+                ),
+                CheatsModsLayout::Medium => workflow
+                    .region
+                    .as_deref()
+                    .unwrap_or("Region not recorded")
+                    .to_string(),
+                CheatsModsLayout::Narrow => "Exact selected archive is kept in Details.".into(),
+            };
+            ui.label(context_detail);
+        } else {
+            ui.strong("Select a game to view compatible cheats and mods.");
+            ui.label(
+                "EmuWiz will keep the enhancement workflow tied to the exact selected archive.",
+            );
+        }
+    });
+}
+
+fn show_enhancement_summary(ui: &mut egui::Ui, workflow: Option<&CheatWorkflowState>) {
+    widgets::section_header(
+        ui,
+        "Availability",
+        Some("A concise view of what this selected game can use right now."),
+    );
+    ui.horizontal_wrapped(|ui| {
+        let (cheats, cheat_tone) = match workflow {
+            None => ("Select a game", widgets::StatusTone::Pending),
+            Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Unsupported => {
+                ("Not supported for this game", widgets::StatusTone::Warning)
+            }
+            Some(workflow) if matches!(workflow.identity, CheatStepResource::Failed(_)) => {
+                ("Needs identity review", widgets::StatusTone::Warning)
+            }
+            Some(_) => ("Workflow available", widgets::StatusTone::Info),
+        };
+        widgets::status_badge(ui, &format!("Cheats · {cheats}"), cheat_tone);
+
+        let (mods, mod_tone) = match workflow {
+            Some(workflow)
+                if matches!(
+                    workflow.adapter,
+                    CheatEmulatorAdapter::Pcsx2 | CheatEmulatorAdapter::Dolphin
+                ) =>
+            {
+                ("Review available", widgets::StatusTone::Info)
+            }
+            Some(_) => ("No supported mod flow", widgets::StatusTone::Pending),
+            None => ("Select a game", widgets::StatusTone::Pending),
+        };
+        widgets::status_badge(ui, &format!("Mods · {mods}"), mod_tone);
+
+        let (safety, safety_tone) = match workflow {
+            Some(workflow) if matches!(workflow.identity, CheatStepResource::Failed(_)) => {
+                ("Needs review", widgets::StatusTone::Warning)
+            }
+            Some(workflow) if workflow.adapter == CheatEmulatorAdapter::Unsupported => {
+                ("Unavailable", widgets::StatusTone::Warning)
+            }
+            Some(_) => ("Checked before apply", widgets::StatusTone::Success),
+            None => ("Waiting for game", widgets::StatusTone::Pending),
+        };
+        widgets::status_badge(ui, &format!("Safety · {safety}"), safety_tone);
+    });
+}
+
 pub(crate) fn show_cheats_mods_page(
     ui: &mut egui::Ui,
     workflow: Option<&mut CheatWorkflowState>,
@@ -1152,6 +1401,7 @@ pub(crate) fn show_cheats_mods_page(
     let dolphin_read_only = workflow
         .as_deref()
         .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin);
+    let layout = cheats_mods_layout_for_width(ui.available_width());
     // Every selected-game route starts in the gamer-facing presentation.
     // Adapter state and audit evidence remain available in Workflow
     // diagnostics instead of determining whether the page is approachable.
@@ -1166,22 +1416,16 @@ pub(crate) fn show_cheats_mods_page(
             "Find cheats, patches and game enhancements for a selected game."
         },
     );
-    // One restrained retro cheat-code motif - decoration, never the label.
-    ui.label(
-        egui::RichText::new(crate::ui::icons::CHEAT_CODE)
-            .color(theme::muted(ui))
-            .size(13.0),
-    );
+    let active_section = show_enhancement_section_switch(ui);
     ui.add_space(theme::SECTION_GAP / 2.0);
+
+    show_selected_game_context(ui, workflow.as_deref(), layout);
+    ui.add_space(theme::SECTION_GAP);
+    show_enhancement_summary(ui, workflow.as_deref());
+    ui.add_space(theme::SECTION_GAP);
 
     if beginner_route && let Some(workflow) = workflow.as_deref() {
         ui.horizontal_wrapped(|ui| {
-            ui.strong(format!("Selected game: {}", workflow.display_name));
-            widgets::status_badge(
-                ui,
-                workflow.platform.as_deref().unwrap_or("Unknown platform"),
-                widgets::StatusTone::Info,
-            );
             if widgets::action_button(ui, "Choose another game", widgets::ActionStyle::Quiet, true)
                 .clicked()
             {
@@ -1189,13 +1433,15 @@ pub(crate) fn show_cheats_mods_page(
             }
         });
         ui.add_space(theme::SECTION_GAP);
-        crate::local_mod_package_page::show_local_mod_package_panel(
-            ui,
-            local_mod_package,
-            &workflow.archive_path,
-            crate::ready_game_identity(workflow),
-        );
-        ui.add_space(theme::SECTION_GAP);
+        if active_section == EnhancementSection::Mods {
+            crate::local_mod_package_page::show_local_mod_package_panel(
+                ui,
+                local_mod_package,
+                &workflow.archive_path,
+                crate::ready_game_identity(workflow),
+            );
+            ui.add_space(theme::SECTION_GAP);
+        }
     }
 
     // --- Overview: current archive, its readiness, and availability
@@ -1273,6 +1519,22 @@ pub(crate) fn show_cheats_mods_page(
             Some(
                 "Profile, source, identity, preview, and installation state for the chosen system.",
             ),
+        );
+    } else {
+        widgets::section_header(
+            ui,
+            match active_section {
+                EnhancementSection::Cheats => "Cheat workflow",
+                EnhancementSection::Mods => "Mod workflow",
+            },
+            Some(match active_section {
+                EnhancementSection::Cheats => {
+                    "Review compatible codes and preview any change before applying it."
+                }
+                EnhancementSection::Mods => {
+                    "Review replacement packages and preview their changes before applying them."
+                }
+            }),
         );
     }
     if let Some(workflow) = workflow {
