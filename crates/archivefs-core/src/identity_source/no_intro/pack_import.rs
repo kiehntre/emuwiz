@@ -85,7 +85,7 @@ pub enum NoIntroPackImportStatus {
     Updated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RejectedNoIntroPackMember {
     pub member: String,
     pub reason: String,
@@ -326,6 +326,13 @@ pub fn import_no_intro_pack_at(
     prune_old_snapshots(storage_root, &snapshot_id);
 
     let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
+    let _ = super::managed_lifecycle::register_no_intro_pack_at(
+        storage_root,
+        &pack_sha256,
+        &snapshot_id,
+        &accepted,
+        &rejected,
+    )?;
     Ok(NoIntroPackImportReport {
         status: NoIntroPackImportStatus::Updated,
         pack_sha256,
@@ -670,18 +677,10 @@ fn snapshot_id(members: &[NoIntroPackStateMember]) -> String {
         .collect()
 }
 
-fn prune_old_snapshots(storage_root: &Path, current_sha256: &str) {
-    let snapshots = storage_root.join("snapshots");
-    let Ok(entries) = fs::read_dir(&snapshots) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) != Some(current_sha256) {
-            let _ = fs::remove_dir_all(path);
-        }
-    }
-}
+// Historical snapshots are deliberately retained. A later read-only
+// lifecycle classification may identify a safe prune candidate, but this
+// import path never deletes content-addressed evidence.
+fn prune_old_snapshots(_storage_root: &Path, _current_sha256: &str) {}
 
 fn validate_member_name(member: &str) -> Result<(), NoIntroPackImportError> {
     if member.is_empty() || member.len() > NO_INTRO_PACK_MAX_MEMBER_NAME_BYTES {

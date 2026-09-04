@@ -6,6 +6,7 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 use super::*;
+use crate::identity_source::no_intro::load_no_intro_pack_snapshots_at;
 
 const GB_DAT: &str = r#"<?xml version="1.0"?>
 <datafile><header><name>Nintendo - Game Boy</name><version>20250101</version><author>No-Intro</author></header>
@@ -160,6 +161,94 @@ fn traversal_member_is_refused() {
     );
     let error = import_no_intro_pack_at(&pack, &dir.path().join("store")).unwrap_err();
     assert!(matches!(error, NoIntroPackImportError::Traversal { .. }));
+}
+
+#[test]
+fn absolute_and_windows_style_member_paths_are_refused() {
+    for name in [
+        "/absolute/evil.dat",
+        "C:\\absolute\\evil.dat",
+        "../../evil.dat",
+    ] {
+        let dir = tempdir().unwrap();
+        let pack = write_zip(&dir.path().join("pack.zip"), &[(name, GB_DAT.as_bytes())]);
+        let error = import_no_intro_pack_at(&pack, &dir.path().join("store")).unwrap_err();
+        assert!(
+            matches!(error, NoIntroPackImportError::Traversal { .. }),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn oversized_zip_is_refused_before_archive_processing() {
+    let dir = tempdir().unwrap();
+    let pack = dir.path().join("oversized.zip");
+    let file = fs::File::create(&pack).unwrap();
+    file.set_len(NO_INTRO_PACK_MAX_BYTES + 1).unwrap();
+    let error = import_no_intro_pack_at(&pack, &dir.path().join("store")).unwrap_err();
+    assert!(matches!(
+        error,
+        NoIntroPackImportError::LimitExceeded { .. }
+    ));
+}
+
+#[test]
+fn oversized_member_name_is_refused() {
+    let dir = tempdir().unwrap();
+    let name = format!("{}.dat", "n".repeat(NO_INTRO_PACK_MAX_MEMBER_NAME_BYTES));
+    let pack = write_zip(&dir.path().join("pack.zip"), &[(&name, GB_DAT.as_bytes())]);
+    let error = import_no_intro_pack_at(&pack, &dir.path().join("store")).unwrap_err();
+    assert!(matches!(error, NoIntroPackImportError::Traversal { .. }));
+}
+
+#[test]
+fn oversized_dat_member_is_rejected_without_publication() {
+    let dir = tempdir().unwrap();
+    let bytes = vec![0_u8; (NO_INTRO_PACK_MAX_DAT_BYTES + 1) as usize];
+    let pack = write_zip(&dir.path().join("pack.zip"), &[("oversized.dat", &bytes)]);
+    let report = import_no_intro_pack_at(&pack, &dir.path().join("store")).unwrap();
+    assert!(report.accepted.is_empty());
+    assert_eq!(report.rejected.len(), 1);
+}
+
+#[test]
+fn directories_are_ignored_without_becoming_dat_members() {
+    let dir = tempdir().unwrap();
+    let pack_path = dir.path().join("pack.zip");
+    let file = fs::File::create(&pack_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    zip.add_directory("Nintendo/", SimpleFileOptions::default())
+        .unwrap();
+    zip.finish().unwrap();
+    let report = import_no_intro_pack_at(&pack_path, &dir.path().join("store")).unwrap();
+    assert!(report.accepted.is_empty());
+    assert!(report.rejected.is_empty());
+}
+
+#[test]
+fn identical_member_payload_reuses_content_addressed_snapshot() {
+    let dir = tempdir().unwrap();
+    let first_pack = write_zip(
+        &dir.path().join("first.zip"),
+        &[("first.dat", GB_DAT.as_bytes())],
+    );
+    let second_pack = write_zip(
+        &dir.path().join("second.zip"),
+        &[("second.dat", GB_DAT.as_bytes())],
+    );
+    let storage = dir.path().join("store");
+    let first = import_no_intro_pack_at(&first_pack, &storage).unwrap();
+    let second = import_no_intro_pack_at(&second_pack, &storage).unwrap();
+    assert_eq!(first.snapshot_path, second.snapshot_path);
+    let snapshots = fs::read_dir(storage.join("snapshots")).unwrap().count();
+    assert_eq!(snapshots, 1);
+    let lifecycle = load_no_intro_pack_snapshots_at(&storage).unwrap();
+    assert_eq!(lifecycle.len(), 2);
+    assert_eq!(
+        lifecycle[0].coverage[0].dat_member_identity,
+        lifecycle[1].coverage[0].dat_member_identity
+    );
 }
 
 #[test]

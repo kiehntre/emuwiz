@@ -37,11 +37,19 @@
 
 pub mod convert;
 pub mod import;
+pub mod managed_lifecycle;
 pub mod pack_import;
 pub mod registry;
 
 pub use convert::{claim_for_representation, lookup_no_intro, observations_from_no_intro_matches};
 pub use import::{ImportedNoIntroSource, NoIntroImportError, NoIntroVariant, import_no_intro_dat};
+pub use managed_lifecycle::{
+    NoIntroPackCoverage, NoIntroPackMemberEvidence, NoIntroPackResolution, NoIntroPackSnapshot,
+    NoIntroPackStatus, NoIntroRetention, NoIntroRetentionDecision, NoIntroRollbackPlan,
+    NoIntroStaleness, NoIntroStalenessReport, classify_no_intro_retention, lifecycle_path,
+    load_no_intro_pack_snapshots_at, no_intro_staleness, plan_no_intro_rollback,
+    register_no_intro_pack_at, resolve_no_intro_current,
+};
 pub use pack_import::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportError,
     NoIntroPackImportReport, NoIntroPackImportStatus, NoIntroPackInspection,
