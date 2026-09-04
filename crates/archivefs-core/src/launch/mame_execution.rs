@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use crate::dat::set::SetResolution;
 use crate::launch::mame_command::{MameCommand, build_mame_command_plan};
 use crate::launch::planning::CanonicalIdentityStatus;
-use crate::launch::process_spawn::{PreparedProcessCommand, WatchedProcess, spawn_watched_process};
+use crate::launch::process_spawn::{
+    CapturedFileIdentity, PreparedProcessCommand, WatchedProcess, spawn_watched_process,
+};
 use crate::launch::readiness::LaunchBlocker;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,12 @@ pub struct MameLaunchRequest {
     pub identity: CanonicalIdentityStatus,
     pub set_resolutions: Vec<SetResolution>,
     pub expected_executable: PathBuf,
+    /// Exact archive/ROM content selected by the user. MAME usually receives
+    /// the machine shortname instead of this path in argv.
+    pub selected_content: PathBuf,
+    /// Optional point-in-time identity captured with the selection. When
+    /// present, preflight rejects a replacement at the same path.
+    pub expected_content_identity: Option<CapturedFileIdentity>,
     pub rom_search_path_configured: bool,
 }
 
@@ -62,6 +70,50 @@ pub fn preflight_mame_launch(
             )],
         });
     }
+    let content_metadata =
+        fs::symlink_metadata(&request.selected_content).map_err(|_| MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable,
+                "the selected MAME archive/content is no longer available",
+            )],
+        })?;
+    if content_metadata.file_type().is_symlink()
+        || (!content_metadata.is_file() && !content_metadata.is_dir())
+    {
+        return Err(MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable,
+                "the selected MAME archive/content is not a regular file or directory",
+            )],
+        });
+    }
+    if let Some(expected) = request.expected_content_identity
+        && (!content_metadata.is_file()
+            || CapturedFileIdentity::capture(&content_metadata) != expected)
+    {
+        return Err(MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable,
+                "the selected MAME archive/content changed since it was authorized",
+            )],
+        });
+    }
+    let Some(resolution) = request.set_resolutions.first() else {
+        return Err(MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable,
+                "no current DAT-backed MAME set verdict is available",
+            )],
+        });
+    };
+    if request.set_resolutions.len() == 1 && resolution.archive_path != request.selected_content {
+        return Err(MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSetIdentityUnavailable,
+                "selected MAME content no longer matches the authorized set evidence",
+            )],
+        });
+    }
     let plan = build_mame_command_plan(
         &request.identity,
         &request.set_resolutions,
@@ -100,6 +152,11 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn request(executable: PathBuf) -> MameLaunchRequest {
+        let selected_content = executable.with_extension("zip");
+        std::fs::write(&selected_content, b"verified set placeholder").unwrap();
+        let expected_content_identity = Some(CapturedFileIdentity::capture(
+            &std::fs::symlink_metadata(&selected_content).unwrap(),
+        ));
         MameLaunchRequest {
             identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
                 platform_id: "Arcade".into(),
@@ -110,7 +167,7 @@ mod tests {
                     source_id: "mame".into(),
                     game_name: "test;set".into(),
                 },
-                archive_path: "/library/test.zip".into(),
+                archive_path: selected_content.clone(),
                 state: SetState::Complete,
                 members_required: Vec::new(),
                 members_verified: Vec::new(),
@@ -126,6 +183,8 @@ mod tests {
                 },
             }],
             expected_executable: executable,
+            selected_content,
+            expected_content_identity,
             rom_search_path_configured: true,
         }
     }
@@ -158,5 +217,53 @@ mod tests {
             std::fs::read_to_string(executable.with_extension("argv")).unwrap(),
             "test;set"
         );
+    }
+
+    #[test]
+    fn missing_selected_content_is_blocked_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-mame");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut request = request(executable);
+        request.selected_content = dir.path().join("gone.zip");
+        let error = preflight_mame_launch(&request).unwrap_err();
+        assert!(error.blockers.iter().any(|blocker| {
+            blocker.kind == crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable
+        }));
+    }
+
+    #[test]
+    fn selected_content_drift_is_blocked_without_changing_machine_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-mame");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut request = request(executable);
+        request.selected_content = dir.path().join("different.zip");
+        request.expected_content_identity = None;
+        std::fs::write(&request.selected_content, b"different").unwrap();
+        let error = preflight_mame_launch(&request).unwrap_err();
+        assert!(error.blockers.iter().any(|blocker| {
+            blocker.kind == crate::launch::readiness::LaunchBlockerKind::MameSetIdentityUnavailable
+        }));
+    }
+
+    #[test]
+    fn selected_content_replacement_at_the_same_path_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-mame");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let request = request(executable);
+        std::fs::write(
+            &request.selected_content,
+            b"replacement with a different size",
+        )
+        .unwrap();
+        let error = preflight_mame_launch(&request).unwrap_err();
+        assert!(error.blockers.iter().any(|blocker| {
+            blocker.kind == crate::launch::readiness::LaunchBlockerKind::MameSetVerdictUnavailable
+        }));
     }
 }

@@ -23,6 +23,9 @@ pub struct MameCommand {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub set_name: String,
+    /// Exact archive/ROM evidence associated with the selected set. MAME
+    /// launches by `set_name`; this path is deliberately not placed in argv.
+    pub selected_content: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +159,7 @@ pub fn build_mame_command_plan(
             arguments: vec![OsString::from(set_name.as_str())],
             working_directory: None,
             set_name,
+            selected_content: resolution.archive_path.clone(),
         }),
         blockers: Vec::new(),
     }
