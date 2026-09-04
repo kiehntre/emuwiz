@@ -23,6 +23,7 @@
 pub mod capability;
 pub mod client;
 pub mod config;
+pub mod duplicate_provider_report;
 pub mod enrichment;
 pub mod import;
 pub mod linkage;
