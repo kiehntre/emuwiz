@@ -176,6 +176,19 @@ pub fn resolve_scummvm_executable() -> Option<PathBuf> {
     })
 }
 
+/// Asks the locally installed ScummVM executable for its own version string,
+/// using the exact same bounded, timeout-protected subprocess machinery as
+/// detection (`run_detector`) - never a second invocation mechanism. `None`
+/// on any failure (not installed, times out, non-UTF-8, empty output): the
+/// caller shows readiness without a version rather than an error, since a
+/// version string is a nicety, not something detection depends on.
+pub fn scummvm_version(executable: &Path) -> Option<String> {
+    let output = run_detector(executable, &[OsString::from("--version")]).ok()?;
+    let text = std::str::from_utf8(&output).ok()?;
+    let first_line = text.lines().next()?.trim();
+    (!first_line.is_empty()).then(|| first_line.to_string())
+}
+
 fn isolated_config_path() -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -399,6 +412,31 @@ mod tests {
         let error =
             detect_scummvm_directory_with_executable(&game, Path::new("/bin/true")).unwrap_err();
         assert!(matches!(error, ScummVmDetectionError::UnsafeEntry(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_reads_the_first_line_of_the_detectors_own_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let detector = root.path().join("scummvm-fixture");
+        fs::write(
+            &detector,
+            b"#!/bin/sh\nprintf 'ScummVM 2.8.1\\nFeatures: x\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&detector, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(scummvm_version(&detector).as_deref(), Some("ScummVM 2.8.1"));
+    }
+
+    #[test]
+    fn version_is_none_when_the_executable_does_not_exist() {
+        assert_eq!(
+            scummvm_version(Path::new("/nonexistent/scummvm-binary")),
+            None
+        );
     }
 
     #[cfg(unix)]

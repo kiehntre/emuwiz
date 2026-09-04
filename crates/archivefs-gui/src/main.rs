@@ -4698,6 +4698,16 @@ struct ArchiveFsApp {
     /// always an explicit action, never automatic.
     identity_sources: identity_sources_page::IdentitySourcesState,
     identity_sources_generation: u64,
+    /// ScummVM Detection: whether the native ScummVM detector is present -
+    /// see `identity_sources_page::ScummVmReadinessState`'s own doc.
+    /// Probed once automatically (like `dolphin_local_profiles`), never
+    /// repeated, and never offers a download/install action.
+    scummvm_readiness: identity_sources_page::ScummVmReadinessState,
+    /// ScummVM Detection: the read-only "Check ScummVM games" job - see
+    /// `identity_sources_page::ScummVmCheckState`'s own doc. Starts `Idle`;
+    /// running it is always an explicit action, never automatic.
+    scummvm_check: identity_sources_page::ScummVmCheckState,
+    scummvm_check_generation: u64,
     /// GUI Batch C: the read-only "Plan Preview" for the selected file -
     /// see `plan_preview_page`'s own module doc. Starts `Idle`; loading is
     /// always an explicit action, never automatic.
@@ -5155,6 +5165,9 @@ impl ArchiveFsApp {
             )),
             identity_sources: identity_sources_page::IdentitySourcesState::Idle,
             identity_sources_generation: 0,
+            scummvm_readiness: identity_sources_page::ScummVmReadinessState::NotChecked,
+            scummvm_check: identity_sources_page::ScummVmCheckState::Idle,
+            scummvm_check_generation: 0,
             plan_preview: plan_preview_page::PlanPreviewState::Idle,
             plan_preview_generation: 0,
             romm_ui: RommCardState::default(),
@@ -11854,6 +11867,132 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Starts the one-time ScummVM readiness probe - see
+    /// [`identity_sources_page::ScummVmReadinessState`]'s own doc comment.
+    /// The same "NotScanned, run once, never repeat automatically"
+    /// convention as `start_dolphin_local_profile_scan`. Read-only: a
+    /// filesystem stat plus (only if that succeeds) one bounded `--version`
+    /// subprocess call, both already implemented in
+    /// `archivefs_core::scummvm_detection`.
+    fn start_scummvm_readiness_check(&mut self, context: egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.scummvm_readiness =
+            identity_sources_page::ScummVmReadinessState::Checking { receiver };
+        thread::spawn(move || {
+            let readiness = identity_sources_page::gather_scummvm_readiness();
+            let _ = sender.send(readiness);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_scummvm_readiness(&mut self) {
+        if let identity_sources_page::ScummVmReadinessState::Checking { receiver } =
+            &self.scummvm_readiness
+            && let Ok(readiness) = receiver.try_recv()
+        {
+            self.scummvm_readiness = identity_sources_page::ScummVmReadinessState::Ready(readiness);
+        }
+    }
+
+    /// GUI ScummVM Detection: starts a read-only detector check against
+    /// every already-configured ScummVM folder in the loaded library. Never
+    /// writes a file, renames anything, computes a hash, reads a DAT, or
+    /// makes a network call - it only invokes
+    /// `archivefs_core::scummvm_detection::detect_scummvm_directory_with_executable`,
+    /// unchanged, once per folder.
+    fn start_scummvm_check(&mut self, context: egui::Context, executable: PathBuf) {
+        let Some(data) = (match &self.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let candidates = identity_sources_page::scummvm_candidates_from_rows(&data.rows);
+        self.scummvm_check_generation += 1;
+        let generation = self.scummvm_check_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.scummvm_check = identity_sources_page::ScummVmCheckState::Checking {
+            generation,
+            receiver,
+            checked: 0,
+            total: candidates.len(),
+            current: None,
+        };
+        thread::spawn(move || {
+            let summary = identity_sources_page::check_scummvm_candidates(
+                &executable,
+                &candidates,
+                |checked, total, current| {
+                    let _ = sender.send((
+                        generation,
+                        identity_sources_page::ScummVmCheckMessage::Progress {
+                            checked,
+                            total,
+                            current: current.to_string(),
+                        },
+                    ));
+                },
+            );
+            let _ = sender.send((
+                generation,
+                identity_sources_page::ScummVmCheckMessage::Done(summary),
+            ));
+            context.request_repaint();
+        });
+    }
+
+    /// Applies the pure [`identity_sources_page::ScummVmAction`] the panel
+    /// returned this frame - the only thing it can ever ask for, and
+    /// read-only.
+    fn handle_scummvm_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<identity_sources_page::ScummVmAction>,
+    ) {
+        if let Some(identity_sources_page::ScummVmAction::Check { executable }) = action {
+            self.start_scummvm_check(context.clone(), executable);
+        }
+    }
+
+    /// Drains progress/completion messages from an in-flight ScummVM check,
+    /// discarding anything whose generation is no longer current - the same
+    /// stale-result guard `poll_identity_sources` uses.
+    fn poll_scummvm_check(&mut self) {
+        if let identity_sources_page::ScummVmCheckState::Checking {
+            generation,
+            receiver,
+            checked,
+            total,
+            current,
+        } = &mut self.scummvm_check
+        {
+            let generation = *generation;
+            while let Ok((message_generation, message)) = receiver.try_recv() {
+                if message_generation != generation {
+                    continue;
+                }
+                match message {
+                    identity_sources_page::ScummVmCheckMessage::Progress {
+                        checked: new_checked,
+                        total: new_total,
+                        current: new_current,
+                    } => {
+                        *checked = new_checked;
+                        *total = new_total;
+                        *current = Some(new_current);
+                    }
+                    identity_sources_page::ScummVmCheckMessage::Done(summary) => {
+                        self.scummvm_check = identity_sources_page::ScummVmCheckState::Ready {
+                            generation,
+                            summary,
+                        };
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// GUI Batch C: starts (or refreshes) the read-only "Plan Preview" load
     /// for the currently-ready selected-evidence report - see
     /// `plan_preview_page`'s own module doc. Explicit only (a button
@@ -13123,6 +13262,12 @@ impl ArchiveFsApp {
         if matches!(self.flycast_profiles, FlycastProfilesState::NotScanned) {
             self.start_flycast_profile_scan(context.clone());
         }
+        if matches!(
+            self.scummvm_readiness,
+            identity_sources_page::ScummVmReadinessState::NotChecked
+        ) {
+            self.start_scummvm_readiness_check(context.clone());
+        }
         let live = match &self.state {
             LoadState::Ready(data) => Some(data.as_ref()),
             _ => None,
@@ -13153,6 +13298,9 @@ impl ArchiveFsApp {
             LoadState::Ready(data) => Some(data.as_ref()),
             _ => None,
         };
+        let scummvm_candidate_count = live_for_launch_readiness
+            .map(|data| identity_sources_page::scummvm_candidates_from_rows(&data.rows).len())
+            .unwrap_or(0);
         match &self.flycast_profiles {
             FlycastProfilesState::Scanning { .. } => {
                 ui.label("Checking Flycast installation and Dreamcast BIOS readiness…");
@@ -13195,6 +13343,16 @@ impl ArchiveFsApp {
             &self.identity_sources,
         );
         self.handle_identity_sources_action(context, identity_sources_action);
+        ui.add_space(crate::ui::theme::SECTION_GAP);
+        self.poll_scummvm_readiness();
+        self.poll_scummvm_check();
+        let scummvm_action = identity_sources_page::show_scummvm_detection_panel(
+            ui,
+            &self.scummvm_readiness,
+            scummvm_candidate_count,
+            &self.scummvm_check,
+        );
+        self.handle_scummvm_action(context, scummvm_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
         let plan_preview_action = plan_preview_page::show_plan_preview_panel(
             ui,
