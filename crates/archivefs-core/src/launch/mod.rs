@@ -63,6 +63,7 @@
 //! module implements the first slice of.
 
 pub mod amiberry_cd_command;
+pub mod amiberry_cd_discovery;
 pub mod amiberry_cd_execution;
 pub mod amiberry_command;
 pub mod amiberry_execution;
@@ -124,6 +125,10 @@ mod tests;
 pub use amiberry_cd_command::{
     AmiberryCdCommand, AmiberryCdCommandPlan, AmiberryCdFileBinding, AmiberryCdLaunchRequest,
     build_amiberry_cd_command_plan,
+};
+pub use amiberry_cd_discovery::{
+    AmiberryCdDiscoveryStatus, AmiberryCdMediaDependency, AmiberryCdMediaDiscovery,
+    AmiberryCdProfileDiscovery, discover_amiberry_cd_media, discover_amiberry_cd_profile,
 };
 pub use amiberry_cd_execution::{
     AmiberryCdLaunchExecutionError, AmiberryCdLaunchExitReport, AmiberryCdLaunchPreflightError,
