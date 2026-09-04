@@ -89,6 +89,25 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
     },
+    /// A discovered Azahar executable/profile. Azahar's own Phase 1 scope
+    /// (loose `.3dsx` homebrew only - no retail formats, no installed-title
+    /// launch, no CIA install, no decryption; see
+    /// [`crate::patch_manager::azahar_local`]) is never re-implemented or
+    /// widened here: this only makes the adapter *discoverable* as a coarse
+    /// candidate. The real `.3dsx`/SMDH/config/key evidence check still
+    /// happens exclusively in
+    /// [`crate::launch::azahar_command::build_azahar_command_plan`] and
+    /// [`crate::launch::azahar_execution::preflight_azahar_launch`] - a
+    /// candidate reported `Ready` here is never authorization to launch
+    /// anything but a `.3dsx` file that adapter's own preflight has itself
+    /// revalidated. [`crate::patch_manager::azahar_local::AzaharProfile`]
+    /// has no `profile_id`/`eligible` field of its own (unlike every other
+    /// adapter's profile type) - both are synthesized in
+    /// [`project_standalone_profiles`] from the executable path, the same
+    /// way MAME/FBNeo's own executable-only evidence is projected.
+    Azahar {
+        profile: &'a crate::patch_manager::AzaharProfile,
+    },
     FsUae {
         profile: &'a AmigaProfile,
         inspection: &'a AmigaGameInspection,
@@ -209,6 +228,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
         Self::Vita3k { profile }
+    }
+
+    pub fn azahar(profile: &'a crate::patch_manager::AzaharProfile) -> Self {
+        Self::Azahar { profile }
     }
 
     pub fn fsuae(profile: &'a AmigaProfile, inspection: &'a AmigaGameInspection) -> Self {
@@ -398,6 +421,29 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: profile.config_path.clone(),
                     eligible: profile.eligible,
                     firmware,
+                })
+            }
+            DiscoveredStandaloneProfile::Azahar { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "Nintendo 3DS") =>
+            {
+                // AzaharProfile carries no profile_id/eligible of its own -
+                // synthesized here from the executable path, exactly like
+                // the MAME/FBNeo executable-only projection below. Only an
+                // existing-but-broken config blocks eligibility, never a
+                // config that was simply never written yet - the same rule
+                // every profile-having adapter in this file already applies.
+                let eligible = !matches!(
+                    profile.config_state,
+                    crate::patch_manager::AzaharEvidenceState::Unreadable
+                        | crate::patch_manager::AzaharEvidenceState::Oversized
+                );
+                Some(StandaloneProfileInput {
+                    adapter_id: "azahar",
+                    profile_id: format!("azahar:{}", profile.executable.display()),
+                    profile_path: profile.config.clone(),
+                    eligible,
+                    firmware: FirmwareReadiness::NotRequired,
                 })
             }
             DiscoveredStandaloneProfile::FsUae {
@@ -800,6 +846,16 @@ mod tests {
             blocker: None,
             executable_candidates: Vec::new(),
             config: None,
+        }
+    }
+
+    fn azahar_profile(
+        config_state: crate::patch_manager::AzaharEvidenceState,
+    ) -> crate::patch_manager::AzaharProfile {
+        crate::patch_manager::AzaharProfile {
+            executable: PathBuf::from("/opt/azahar"),
+            config: Some(PathBuf::from("/profiles/azahar/qt-config.ini")),
+            config_state,
         }
     }
 
@@ -1739,5 +1795,166 @@ mod tests {
             &empty_retroarch(),
         );
         assert_eq!(first, second);
+    }
+
+    // --- Azahar ---
+
+    #[test]
+    fn azahar_profile_projects_to_a_nintendo_3ds_candidate() {
+        let identity = resolved("Nintendo 3DS", "homebrew-title.3dsx");
+        let profile = azahar_profile(crate::patch_manager::AzaharEvidenceState::Present);
+        let profiles = [DiscoveredStandaloneProfile::azahar(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "azahar",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nintendo_ds_wiiu_and_switch_never_produce_an_azahar_candidate() {
+        let profile = azahar_profile(crate::patch_manager::AzaharEvidenceState::Present);
+        let profiles = [DiscoveredStandaloneProfile::azahar(&profile)];
+        for identity in [
+            resolved("Nintendo DS", "NTR-ABCE"),
+            resolved("WiiU", "00050000101010ED"),
+            resolved("Switch", "0100000000010000"),
+        ] {
+            let plan = plan(
+                &identity,
+                &[],
+                &resolved_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "azahar",
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn azahar_candidate_uses_the_exact_adapter_id() {
+        let identity = resolved("Nintendo 3DS", "homebrew-title.3dsx");
+        let profile = azahar_profile(crate::patch_manager::AzaharEvidenceState::Present);
+        let profiles = [DiscoveredStandaloneProfile::azahar(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let LaunchTarget::Standalone { adapter_id, .. } = plan.candidates[0].target else {
+            panic!("expected a standalone target");
+        };
+        assert_eq!(adapter_id, "azahar");
+    }
+
+    #[test]
+    fn azahar_candidate_generation_is_deterministic() {
+        let identity = resolved("Nintendo 3DS", "homebrew-title.3dsx");
+        let profile = azahar_profile(crate::patch_manager::AzaharEvidenceState::Present);
+        let profiles = [DiscoveredStandaloneProfile::azahar(&profile)];
+        let first = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let second = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn missing_azahar_profile_yields_no_installation_candidate_never_a_fallback() {
+        let identity = resolved("Nintendo 3DS", "homebrew-title.3dsx");
+        let plan = plan(&identity, &[], &resolved_content(), &[], &empty_retroarch());
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "none",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+        );
+    }
+
+    #[test]
+    fn unreadable_azahar_config_blocks_eligibility_but_never_falls_back() {
+        let identity = resolved("Nintendo 3DS", "homebrew-title.3dsx");
+        let profile = azahar_profile(crate::patch_manager::AzaharEvidenceState::Unreadable);
+        let profiles = [DiscoveredStandaloneProfile::azahar(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "azahar",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::ProfileIneligible)
+        );
+    }
+
+    #[test]
+    fn azahar_shared_candidate_carries_no_content_form_or_smdh_evidence() {
+        // The shared candidate layer must stay coarse: it only ever exposes
+        // adapter_id/profile_id/eligibility/firmware. Whether the selected
+        // content is actually a launchable .3dsx (vs. a .3ds/.cci/.cxi/.cia
+        // this build refuses) is never decided here - only
+        // `azahar_command::build_azahar_command_plan` and
+        // `azahar_execution::preflight_azahar_launch` inspect the file
+        // itself. This test exists to name that boundary: a `Ready`
+        // candidate here proves nothing about content-form eligibility.
+        let identity = resolved("Nintendo 3DS", "homebrew-title.3dsx");
+        let profile = azahar_profile(crate::patch_manager::AzaharEvidenceState::Present);
+        let profiles = [DiscoveredStandaloneProfile::azahar(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates[0].firmware, FirmwareReadiness::NotRequired);
     }
 }

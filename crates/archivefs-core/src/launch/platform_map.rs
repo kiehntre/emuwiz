@@ -111,6 +111,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "Nintendo 3DS",
+        standalone_adapters: &["azahar"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "Xbox",
         standalone_adapters: &["xemu"],
         retroarch_core_hints: &[],
