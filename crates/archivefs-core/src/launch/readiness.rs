@@ -440,6 +440,11 @@ pub enum LaunchBlockerKind {
     /// The content, executable, or configuration changed between planning
     /// and the final pre-spawn recheck.
     CemuDriftBeforeSpawn,
+    SameBoyPlatformMismatch,
+    SameBoyRomHeaderInvalid,
+    SameBoyIdentityConflict,
+    SameBoyBindingUnavailable,
+    SameBoyDriftBeforeSpawn,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].
@@ -480,6 +485,8 @@ pub enum LaunchWarningKind {
     /// never inspected (and never will be) - see
     /// [`crate::patch_manager::CemuKeysState::PresentUnverified`].
     CemuKeysPresentUnverified,
+    SameBoyRomHeaderChecksumInvalid,
+    SameBoyCustomBootRomUnavailable,
 }
 
 /// One non-blocking condition on a [`crate::launch::planning::LaunchCandidate`].

@@ -108,6 +108,8 @@ pub mod readiness;
 pub mod retroarch_command;
 pub mod rpcs3_command;
 pub mod rpcs3_execution;
+pub mod sameboy_command;
+pub mod sameboy_execution;
 pub mod scummvm_command;
 pub mod scummvm_execution;
 pub mod vita3k_command;
@@ -323,6 +325,17 @@ pub use rpcs3_execution::{
     Rpcs3LaunchExitReport, Rpcs3LaunchPreflightError, Rpcs3LaunchPreflightErrorKind,
     Rpcs3LaunchRequest, Rpcs3LaunchSpawnError, preflight_and_launch_rpcs3, preflight_rpcs3_launch,
     spawn_rpcs3,
+};
+pub use sameboy_command::{
+    SAMEBOY_SUPPORTED_PLATFORM_IDS, SameBoyCommand, SameBoyCommandPlan, SameBoyCommandSelection,
+    SameBoyContentForm, SameBoyLaunchRequest, SameBoyReadiness, build_sameboy_command_plan,
+    classify_sameboy_readiness, form_for_path as sameboy_form_for_path,
+};
+pub use sameboy_execution::{
+    LaunchedSameBoyProcess, SameBoyLaunchCommandFacts, SameBoyLaunchExecutionError,
+    SameBoyLaunchExitReport, SameBoyLaunchPreflightError, SameBoyLaunchPreflightErrorKind,
+    SameBoyLaunchSpawnError, SameBoyPreflightRequest, preflight_and_launch_sameboy,
+    preflight_sameboy_launch, spawn_sameboy,
 };
 pub use scummvm_command::{
     SCUMMVM_SUPPORTED_PLATFORM_ID, ScummVmCommand, ScummVmCommandPlan, ScummVmCommandSelection,

@@ -84,6 +84,7 @@ mod retroarch_cheat_setup;
 mod retroarch_inventory;
 mod retroarch_materialization;
 mod rpcs3_local;
+mod sameboy_local;
 mod shared_preview;
 mod shared_transaction;
 mod user_cheat_import;
@@ -649,6 +650,13 @@ pub use rpcs3_local::{
     Rpcs3ProfileDiscovery, Rpcs3ProfileDiscoveryRoots, Rpcs3ProfileScope, Rpcs3SaveTrophyInventory,
     Rpcs3Settings, Rpcs3UpdateInfo, discover_rpcs3_profiles, inspect_rpcs3_game,
     parse_rpcs3_version, resolve_rpcs3_native_launch_binding,
+};
+pub use sameboy_local::{
+    SAMEBOY_MAX_CONFIG_BYTES, SAMEBOY_MAX_PROFILES, SameBoyBootRomEvidence, SameBoyBootRomState,
+    SameBoyConfigInspection, SameBoyDiscoveryError, SameBoyExecutable, SameBoyInstallationType,
+    SameBoyLaunchBlocker, SameBoyLaunchBlockerKind, SameBoyNativeLaunchBinding, SameBoyProfile,
+    SameBoyProfileDiscovery, SameBoyProfileDiscoveryRoots, discover_sameboy_profiles,
+    parse_sameboy_version, resolve_sameboy_native_launch_binding,
 };
 pub use shared_preview::{
     PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,
