@@ -47,6 +47,28 @@ pub(crate) enum DoctorPageAction {
     CancelRepair,
 }
 
+/// The compact, pure projection used by the Doctor hero. Findings and
+/// coverage are counted separately: an unavailable or deferred check is
+/// unknown evidence, never a zero-valued healthy result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DoctorHealthSummary {
+    pub(crate) blocking: usize,
+    pub(crate) warnings: usize,
+    pub(crate) informational: usize,
+    pub(crate) unknown: usize,
+}
+
+impl DoctorHealthSummary {
+    pub(crate) fn from_scan(scan: &DoctorScan) -> Self {
+        Self {
+            blocking: scan.blocking_count(),
+            warnings: scan.count(DoctorSeverity::Warning),
+            informational: scan.count(DoctorSeverity::Info),
+            unknown: scan.unavailable_subsystems().len() + scan.deferred.len(),
+        }
+    }
+}
+
 /// The read-only Doctor dashboard.
 ///
 /// Shows severity counts, findings grouped by category, and an evidence
@@ -76,8 +98,16 @@ pub(crate) fn show_doctor_page(
     let running = state.is_running();
     let displayed = state.displayed();
 
-    widgets::card(ui, |ui| {
+    let health = displayed
+        .map(|outcome| DoctorHealthSummary::from_scan(&outcome.scan))
+        .unwrap_or(DoctorHealthSummary {
+            unknown: 1,
+            ..Default::default()
+        });
+
+    widgets::hero_card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("System Health").size(24.0).strong());
             match displayed {
                 Some(outcome) if outcome.scan.is_healthy() => {
                     widgets::status_badge(ui, "No problems found", widgets::StatusTone::Success)
@@ -89,6 +119,31 @@ pub(crate) fn show_doctor_page(
                 ),
                 None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
             }
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            doctor_health_metric(
+                ui,
+                "Blocking",
+                health.blocking,
+                widgets::StatusTone::Blocked,
+            );
+            doctor_health_metric(
+                ui,
+                "Warnings",
+                health.warnings,
+                widgets::StatusTone::Warning,
+            );
+            doctor_health_metric(
+                ui,
+                "Informational",
+                health.informational,
+                widgets::StatusTone::Info,
+            );
+            doctor_health_metric(ui, "Unknown", health.unknown, widgets::StatusTone::Pending);
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
             if widgets::action_button(
                 ui,
                 "Check for problems",
@@ -155,6 +210,18 @@ pub(crate) fn show_doctor_page(
     let scan = &outcome.scan;
     ui.add_space(theme::SECTION_GAP);
     if !scan.is_healthy() {
+        ui.add_space(theme::SECTION_GAP);
+        ui.label(egui::RichText::new("Needs Attention").size(20.0).strong());
+        ui.label(
+            egui::RichText::new(format!(
+                "{} blocking, {} warning{} require review.",
+                health.blocking,
+                health.warnings,
+                if health.warnings == 1 { "" } else { "s" }
+            ))
+            .color(theme::muted(ui)),
+        );
+        ui.add_space(theme::SPACE_SM);
         ui.horizontal_wrapped(|ui| {
             for (severity, count) in scan.counts() {
                 widgets::status_badge(
@@ -246,6 +313,16 @@ pub(crate) fn show_doctor_page(
     ui.add_space(theme::SECTION_GAP);
     show_doctor_coverage(ui, scan);
     action
+}
+
+fn doctor_health_metric(ui: &mut egui::Ui, label: &str, count: usize, tone: widgets::StatusTone) {
+    widgets::card(ui, |ui| {
+        ui.set_min_width(124.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(count.to_string()).size(22.0).strong());
+            widgets::status_badge(ui, label, tone);
+        });
+    });
 }
 
 /// One category's findings inside a collapsible section, shared by both view
