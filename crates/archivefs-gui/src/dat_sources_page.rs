@@ -563,6 +563,9 @@ pub(crate) struct DatSourcesPageView {
     /// One row per configured DAT source for the "Collection coverage"
     /// section. `load` is `NotOpened` until the user expands that source.
     pub(crate) coverage_sources: Vec<SourceCoverageEntry>,
+    /// Cached RomM aggregates supplied by app state. Verify must not walk the
+    /// provider catalogue while the page is repainting.
+    pub(crate) romm_summary: Option<crate::romm_source::VerifyRommSummary>,
 }
 
 impl DatSourcesPageView {
@@ -5454,6 +5457,13 @@ impl DatSourcesPageState {
     /// staleness, no clock beyond formatting a stored timestamp (and the
     /// running job's elapsed time, read from the instant the job started).
     pub(crate) fn view(&self) -> DatSourcesPageView {
+        self.view_with_romm_summary(None)
+    }
+
+    pub(crate) fn view_with_romm_summary(
+        &self,
+        romm_summary: Option<crate::romm_source::VerifyRommSummary>,
+    ) -> DatSourcesPageView {
         let rows: Vec<DatSourceRowView> = self
             .draft
             .sorted_all()
@@ -5547,6 +5557,7 @@ impl DatSourcesPageState {
             rename_plan: self.rename_plan_view(),
             rename_apply: self.rename_apply_view(),
             coverage_sources: self.coverage_sources_view(),
+            romm_summary,
             rows,
         }
     }

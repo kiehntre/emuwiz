@@ -1155,6 +1155,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             master_rom_root: None,
         }),
         romm_snapshot: None,
+        verify_romm_summary: None,
         romm_operation: None,
         romm_generation: 0,
         selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,

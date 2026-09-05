@@ -22,6 +22,7 @@
 use std::path::PathBuf;
 
 use archivefs_core::identity_source::artwork::ArtworkCacheStats;
+use archivefs_core::identity_source::model::IdentityImportCounts;
 use archivefs_core::identity_source::romm::capability::RommCapabilityReport;
 use archivefs_core::identity_source::romm::import::{AdaptivePagination, ImportProgress};
 use archivefs_core::identity_source::romm::linkage::{RommLinkageReport, RommLinkageStatus};
@@ -210,6 +211,48 @@ pub(crate) struct RommSnapshot {
     /// Why the token is unusable, already redacted by the core loader.
     pub(crate) token_problem: Option<String>,
     pub(crate) cache_format_version: Option<u32>,
+    /// Aggregate identity facts prepared with the snapshot, never recomputed
+    /// while Verify is repainting.
+    pub(crate) verify_summary: Option<VerifyRommSummary>,
+}
+
+/// The small RomM aggregate consumed by Verify. This contains only counts
+/// already produced by the authoritative cache/import path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VerifyRommSummary {
+    pub(crate) total: usize,
+    pub(crate) confirmed: usize,
+    pub(crate) strong: usize,
+    pub(crate) probable: usize,
+    pub(crate) ambiguous: usize,
+    pub(crate) stale: usize,
+    pub(crate) unmatched: usize,
+}
+
+impl VerifyRommSummary {
+    pub(crate) fn from_counts(counts: &IdentityImportCounts) -> Self {
+        Self {
+            total: counts.total,
+            confirmed: counts.confirmed,
+            strong: counts.strong,
+            probable: counts.probable,
+            ambiguous: counts.ambiguous,
+            stale: counts.stale,
+            unmatched: counts.unmatched,
+        }
+    }
+
+    pub(crate) fn from_import(summary: &RommImportSummary) -> Self {
+        Self {
+            total: summary.records,
+            confirmed: summary.confirmed,
+            strong: summary.strong,
+            probable: summary.probable,
+            ambiguous: summary.ambiguous,
+            stale: summary.stale,
+            unmatched: summary.unmatched,
+        }
+    }
 }
 
 /// What a completed operation produced, for the result area.

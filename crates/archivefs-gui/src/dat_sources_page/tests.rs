@@ -1710,6 +1710,27 @@ fn quick_rename_opens_without_scanning_or_writing() {
     assert!(!fixture.config_path.exists());
 }
 
+#[test]
+fn verify_renders_the_app_owned_romm_summary() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let mut view = page.view();
+    view.romm_summary = Some(crate::romm_source::VerifyRommSummary {
+        total: 94_000,
+        confirmed: 90_000,
+        strong: 2_000,
+        probable: 1_000,
+        ambiguous: 500,
+        stale: 250,
+        unmatched: 250,
+    });
+
+    let output = render(&view, &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(&output, "RomM identity summary"));
+    assert!(rendered_text_contains(&output, "94000"));
+    assert!(rendered_text_contains(&output, "92000 / 94000"));
+}
+
 /// Draws every disclosure body for assertions about information retained in
 /// the technical view. The normal `render` helper deliberately keeps those
 /// bodies closed so beginner-facing tests exercise the real default.

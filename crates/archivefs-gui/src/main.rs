@@ -217,7 +217,7 @@ use crate::romm_config::{
 };
 use crate::romm_source::{
     RommCardRequest, RommCardState, RommOperation, RommOperationOutcome, RommProgress,
-    RommProgressEvent, RommSnapshot,
+    RommProgressEvent, RommSnapshot, VerifyRommSummary,
 };
 use administration_pages::*;
 use sources_page::*;
@@ -4664,6 +4664,9 @@ struct ArchiveFsApp {
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
     romm_snapshot: Option<Box<RommSnapshot>>,
+    /// Cached RomM identity aggregates for Verify. Replaced only when the
+    /// authoritative snapshot/import changes, never while rendering.
+    verify_romm_summary: Option<VerifyRommSummary>,
     romm_operation: Option<RunningRommOperation>,
     romm_generation: u64,
     /// GUI Batch A: the Selected page's real, read-only identity/evidence
@@ -5157,6 +5160,7 @@ impl ArchiveFsApp {
             bsfree_ui: BsFreeGuiState::default(),
             gui_config,
             romm_snapshot: None,
+            verify_romm_summary: None,
             romm_operation: None,
             romm_generation: 0,
             selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
@@ -8188,7 +8192,7 @@ impl ArchiveFsApp {
         if page.poll() || page.is_busy() {
             ui.ctx().request_repaint();
         }
-        let view = page.view();
+        let view = page.view_with_romm_summary(self.verify_romm_summary);
         let action = if identify_rename {
             if self.quick_rename_mode {
                 dat_sources_page::show_quick_rename_page(ui, &view, &mut self.dat_sources_ui)
@@ -9319,6 +9323,9 @@ impl ArchiveFsApp {
         // changed. This is also what keeps a failed import from discarding a working
         // index.
         if matches!(&result, Ok(RommOperationOutcome::Import(summary)) if summary.published) {
+            if let Ok(RommOperationOutcome::Import(summary)) = &result {
+                self.verify_romm_summary = Some(VerifyRommSummary::from_import(summary));
+            }
             // Ready covers become `Revalidating`: their textures are kept so an
             // unchanged record costs no decode, but the placeholder is drawn until
             // the refreshed catalogue confirms the record, so a path whose provider
@@ -9344,6 +9351,7 @@ impl ArchiveFsApp {
             // Saved, so the dialog has served its purpose and the card is reloaded
             // from disk rather than from what was typed.
             self.close_romm_configuration();
+            self.verify_romm_summary = None;
             // This is a deliberate reload boundary. Rendering never reloads the
             // application configuration, and a failed reload retains the previous
             // usable snapshot instead of replacing it with an empty one.
@@ -9366,6 +9374,7 @@ impl ArchiveFsApp {
             // The one result that is not a user-visible outcome: it *is* the card's
             // state. A snapshot never overwrites a real result view.
             self.romm_snapshot = Some(snapshot.clone());
+            self.verify_romm_summary = snapshot.verify_summary;
             self.romm_ui.last_outcome = previous_outcome;
             return;
         }
@@ -33445,7 +33454,11 @@ fn load_romm_snapshot() -> Result<RommSnapshot, String> {
     )
     .load();
     let status = api.status(&settings.source, &hashes, false);
-    let cache_format_version = api.open_cache(None).ok().map(|cache| cache.format_version);
+    let cache = api.open_cache(None).ok();
+    let cache_format_version = cache.as_ref().map(|cache| cache.format_version);
+    let verify_summary = cache
+        .as_ref()
+        .map(|cache| VerifyRommSummary::from_counts(&cache.counts()));
     let server_id = status
         .server_id
         .clone()
@@ -33460,6 +33473,7 @@ fn load_romm_snapshot() -> Result<RommSnapshot, String> {
         // The core's own refusal text, which never quotes the token.
         token_problem: token.err().map(|refusal| refusal.detail()),
         cache_format_version,
+        verify_summary,
     })
 }
 

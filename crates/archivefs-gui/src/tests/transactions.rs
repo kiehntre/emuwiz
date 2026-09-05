@@ -87,6 +87,7 @@ mod romm_dispatch_tests {
             token_available: true,
             token_problem: None,
             cache_format_version: Some(1),
+            verify_summary: None,
         }
     }
 

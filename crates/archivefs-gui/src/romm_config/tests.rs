@@ -93,6 +93,7 @@ fn snapshot(configured: bool, kind: ProviderPathKind, mappings: Vec<PathMapping>
         token_available: configured,
         token_problem: None,
         cache_format_version: None,
+        verify_summary: None,
     }
 }
 

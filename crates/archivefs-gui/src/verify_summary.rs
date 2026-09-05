@@ -4,11 +4,6 @@
 //! It does not parse catalogues, walk the library, contact providers, or invent
 //! a denominator when the core has not produced one.
 //!
-//! RomM's `RommDuplicateProviderSummary` and `RommStaleSummary` are deliberately
-//! not composed here yet. Their cached, generation-aware state currently belongs
-//! to the Sources/RomM `main.rs` seam; duplicating report computation here would
-//! make Verify expensive and risk disagreeing with the existing RomM surface.
-
 use archivefs_core::identity_source::no_intro::{
     ManagedNoIntroStatusReport, NoIntroLifecycleHealth,
 };
@@ -16,6 +11,7 @@ use eframe::egui;
 
 use super::{DatHealthState, DatSourcesPageView};
 use crate::dat_coverage_panel::{CoverageLoad, CoverageUnitView, ExpectedStatusView};
+use crate::romm_source::VerifyRommSummary;
 use crate::ui::{components as widgets, theme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +23,7 @@ pub(crate) struct VerifyHealthView {
     pub(crate) coverage_count: usize,
     pub(crate) coverage_loaded: usize,
     pub(crate) no_intro: NoIntroHealthView,
+    pub(crate) romm: Option<VerifyRommSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +77,7 @@ pub(crate) fn build(view: &DatSourcesPageView) -> VerifyHealthView {
             view.no_intro_status.as_ref(),
             view.no_intro_status_error.is_some(),
         ),
+        romm: view.romm_summary,
     }
 }
 
@@ -198,6 +196,31 @@ pub(crate) fn show(ui: &mut egui::Ui, view: &DatSourcesPageView) {
 
     show_catalogue_status(ui, view);
     show_no_intro(ui, view);
+    if let Some(summary) = health.romm {
+        show_romm_summary(ui, summary);
+    }
+}
+
+fn show_romm_summary(ui: &mut egui::Ui, summary: VerifyRommSummary) {
+    widgets::section_header(
+        ui,
+        "RomM identity summary",
+        Some("Cached imported counts; refresh RomM to update them."),
+    );
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            metric(ui, "Records", summary.total, None);
+            metric(
+                ui,
+                "Verified",
+                summary.confirmed + summary.strong,
+                Some(summary.total),
+            );
+            metric(ui, "Ambiguous", summary.ambiguous, None);
+            metric(ui, "Stale", summary.stale, None);
+            metric(ui, "Unmatched", summary.unmatched, None);
+        });
+    });
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: usize, denominator: Option<usize>) {

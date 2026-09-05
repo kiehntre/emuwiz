@@ -113,6 +113,7 @@ fn snapshot(state: ProviderState, enabled: bool, configured: bool) -> RommSnapsh
         token_available: configured,
         token_problem: None,
         cache_format_version: ready.then_some(1),
+        verify_summary: None,
     }
 }
 
@@ -899,6 +900,39 @@ fn import_summary(published: bool, records: usize) -> RommImportSummary {
         previous_cache_usable: true,
         platform_enrichment: None,
     }
+}
+
+#[test]
+fn verify_summary_uses_import_aggregates_without_records() {
+    let summary = import_summary(true, 94_000);
+    let verify = VerifyRommSummary::from_import(&summary);
+
+    assert_eq!(verify.total, 94_000);
+    assert_eq!(verify.strong, 21);
+    assert_eq!(verify.probable, 3);
+    assert_eq!(verify.stale, 1);
+    assert_eq!(verify.ambiguous, 0);
+}
+
+#[test]
+fn verify_summary_empty_cache_is_explicitly_empty() {
+    let counts = IdentityImportCounts::default();
+    assert_eq!(
+        VerifyRommSummary::from_counts(&counts),
+        VerifyRommSummary::default()
+    );
+}
+
+#[test]
+fn verify_summary_replacement_is_deterministic() {
+    let first = import_summary(true, 10);
+    let second = import_summary(true, 20);
+
+    assert_ne!(
+        VerifyRommSummary::from_import(&first),
+        VerifyRommSummary::from_import(&second)
+    );
+    assert_eq!(VerifyRommSummary::from_import(&second).total, 20);
 }
 
 #[test]
