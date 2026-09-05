@@ -19718,6 +19718,13 @@ impl ArchiveFsApp {
                         .map(|workflow| {
                             local_cheat_install_context(workflow, &self.retroarch_profiles)
                         });
+                    let local_pcsx2_install_context = self
+                        .cheat_workflow
+                        .as_ref()
+                        .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2)
+                        .and_then(|workflow| {
+                            local_pcsx2_install_context(workflow, &self.pcsx2_profiles)
+                        });
                     let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
@@ -19730,6 +19737,7 @@ impl ArchiveFsApp {
                                     .as_ref()
                                     .map(|(id, title)| (id.as_str(), title.as_str())),
                                 local_cheat_install_context.as_ref(),
+                                local_pcsx2_install_context.as_ref(),
                             );
                             ui.add_space(theme::SECTION_GAP);
                             let cheatbase_action = cheatbase_page::show_cheatbase_page(
@@ -31078,6 +31086,32 @@ fn local_cheat_install_context(
     user_cheat_import_page::LocalCheatInstallContext { game, destination }
 }
 
+/// Binds the currently selected PCSX2 game into the identity and profile
+/// the local-`.pnach`-file install action needs, the same way
+/// `local_cheat_install_context` binds RetroArch's. `profile` is `None`
+/// when no eligible PCSX2 profile is selected yet - the install action
+/// stays disabled with that exact reason rather than guessing one.
+fn local_pcsx2_install_context(
+    workflow: &CheatWorkflowState,
+    profiles: &Pcsx2ProfilesState,
+) -> Option<user_cheat_import_page::LocalPcsx2InstallContext> {
+    let identity = pcsx2_identity_for_workflow(workflow)?;
+    let profile = workflow
+        .selected_pcsx2_profile_id
+        .as_deref()
+        .and_then(|selected| {
+            let Pcsx2ProfilesState::Ready(discovery) = profiles else {
+                return None;
+            };
+            discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .cloned()
+        });
+    Some(user_cheat_import_page::LocalPcsx2InstallContext { identity, profile })
+}
+
 /// The private directory generated cheat files are staged into before they
 /// enter the transaction pipeline. Kept beside the other managed roots so
 /// it is never a directory the user browses or an emulator reads.
@@ -31094,6 +31128,20 @@ pub(crate) fn default_generated_cheat_staging_root() -> Result<PathBuf, String> 
 /// The private directory staged Dolphin GameSettings files are written
 /// into before they enter the transaction pipeline - the Dolphin
 /// equivalent of `default_generated_cheat_staging_root`.
+/// The private directory a local PCSX2 `.pnach` install stages its merged
+/// output into before it enters the transaction pipeline - kept separate
+/// from every other adapter's staging root for the same reason as
+/// `default_generated_dolphin_staging_root`.
+pub(crate) fn default_generated_pcsx2_local_staging_root() -> Result<PathBuf, String> {
+    default_shared_backup_root()
+        .map(|root| {
+            root.parent()
+                .map(|parent| parent.join("generated-pcsx2-local"))
+                .unwrap_or_else(|| root.join("generated-pcsx2-local"))
+        })
+        .map_err(|error| format!("Staging root unavailable: {}", error.detail))
+}
+
 fn default_generated_dolphin_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
         .map(|root| {

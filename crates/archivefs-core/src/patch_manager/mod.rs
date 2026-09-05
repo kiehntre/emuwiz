@@ -65,6 +65,7 @@ mod gecko_document;
 mod hatari_local;
 mod import_safety;
 mod local_cheat_install;
+mod local_cheat_install_pcsx2;
 mod matching;
 mod melonds_local;
 mod mgba_local;
@@ -519,6 +520,10 @@ pub use import_safety::{
 pub use local_cheat_install::{
     LOCAL_CHEAT_SOURCE_NAME, LocalCheatFileDiscovery, LocalCheatFileError, LocalCheatFileLocation,
     discover_local_retroarch_cheat_file,
+};
+pub use local_cheat_install_pcsx2::{
+    LocalPcsx2Discovery, LocalPcsx2FileError, LocalPcsx2InstallState,
+    check_local_pcsx2_install_state, discover_local_pcsx2_pnach_file,
 };
 pub use melonds_local::{
     MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,

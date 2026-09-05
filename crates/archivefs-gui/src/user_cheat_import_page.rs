@@ -14,12 +14,17 @@ use archivefs_core::patch_manager::{
     CheatCandidateOptions, CheatDestinationRequest, CheatJourneyApplyApproval,
     CheatJourneyApplyOptions, CheatJourneyGameIdentity, CheatJourneyPreview,
     CheatJourneyPreviewAction, CheatJourneyUndoConfirmation, CheatJourneyUndoOptions,
-    CheatJourneyUndoPreview, SharedApplyStatus, UserCheatCandidate, UserCheatDiagnostic,
-    UserCheatFormat, UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame,
-    UserCheatMatchState, apply_cheat_journey, default_shared_backup_root,
-    default_shared_history_root, discover_local_retroarch_cheat_file, generate_shared_operation_id,
-    preview_cheat_journey, preview_cheat_journey_undo, scan_user_cheat_directory,
-    scan_user_cheat_file, select_cheat_journey_candidate, undo_cheat_journey,
+    CheatJourneyUndoPreview, LocalPcsx2InstallState, Pcsx2GameIdentity, Pcsx2InstallPreview,
+    Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
+    SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat,
+    UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState,
+    apply_cheat_journey, build_pcsx2_install_preview, build_shared_transaction_plan,
+    check_local_pcsx2_install_state, default_shared_backup_root, default_shared_history_root,
+    discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file, execute_shared_apply,
+    execute_shared_rollback, generate_shared_operation_id, preview_cheat_journey,
+    preview_cheat_journey_undo, preview_shared_rollback, scan_user_cheat_directory,
+    scan_user_cheat_file, select_cheat_journey_candidate, stage_pcsx2_pnach, undo_cheat_journey,
 };
 use eframe::egui;
 
@@ -75,6 +80,56 @@ impl Default for LocalInstallStage {
     }
 }
 
+/// The currently selected game's PCSX2 identity and resolved profile,
+/// bound by the caller exactly as `pcsx2_identity_for_workflow` already
+/// binds it for the GameHacking-catalogue journey.
+pub(crate) struct LocalPcsx2InstallContext {
+    pub identity: Pcsx2GameIdentity,
+    /// `None` when no eligible PCSX2 profile is selected yet; the install
+    /// action stays disabled with that exact reason rather than guessing
+    /// a destination.
+    pub profile: Option<Pcsx2Profile>,
+}
+
+/// One local `.pnach` install attempt's current stage, independent of
+/// `LocalInstallStage` (RetroArch) so the two formats never share state.
+enum LocalPcsx2InstallStage {
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    AlreadyInstalled {
+        source_path: PathBuf,
+    },
+    Preview {
+        source_path: PathBuf,
+        profile: Pcsx2Profile,
+        preview: Box<Pcsx2InstallPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        journal_path: PathBuf,
+        preview: Box<SharedRollbackPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Default for LocalPcsx2InstallStage {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 #[derive(Debug)]
 enum TaskResult {
     Scanned(Result<UserCheatImportReport, UserCheatImportError>),
@@ -108,6 +163,7 @@ pub(crate) struct UserCheatImportPageState {
     selected_candidate: Option<usize>,
     technical_details: bool,
     local_install: LocalInstallStage,
+    local_pcsx2_install: LocalPcsx2InstallStage,
 }
 
 impl UserCheatImportPageState {
@@ -196,6 +252,7 @@ impl UserCheatImportPageState {
         library: &[UserCheatLibraryGame],
         selected_game: Option<(&str, &str)>,
         local_install_context: Option<&LocalCheatInstallContext>,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
@@ -208,6 +265,11 @@ impl UserCheatImportPageState {
         );
         widgets::card(ui, |ui| {
             ui.label("Imported for review only. EmuWiz has not changed your emulator files.");
+            ui.label(
+                "Local install is available for RetroArch .cht and PCSX2 .pnach files. \
+                 Dolphin Gecko/Action Replay and Xenia .patch.toml local install are not \
+                 available in this build.",
+            );
             if let Some((_, title)) = selected_game {
                 widgets::status_badge(
                     ui,
@@ -295,12 +357,18 @@ impl UserCheatImportPageState {
                 }
                 ImportState::Ready { .. } => {
                     if let Some(report) = report.as_ref() {
-                        self.show_report(ui, report, local_install_context);
+                        self.show_report(
+                            ui,
+                            report,
+                            local_install_context,
+                            local_pcsx2_install_context,
+                        );
                     }
                 }
             }
         });
         self.show_local_install_panel(ui);
+        self.show_local_pcsx2_install_panel(ui);
     }
 
     fn show_report(
@@ -308,6 +376,7 @@ impl UserCheatImportPageState {
         ui: &mut egui::Ui,
         report: &UserCheatImportReport,
         local_install_context: Option<&LocalCheatInstallContext>,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
     ) {
         if self.report_context_key != self.context_key {
             widgets::banner(
@@ -355,24 +424,36 @@ impl UserCheatImportPageState {
                 widgets::StatusTone::Warning,
             );
         }
-        self.show_candidates(ui, report, "Matched", local_install_context, |candidate| {
-            matches!(
-                candidate.match_state,
-                UserCheatMatchState::Exact | UserCheatMatchState::Strong
-            )
-        });
-        self.show_candidates(ui, report, "Possible matches", None, |candidate| {
+        self.show_candidates(
+            ui,
+            report,
+            "Matched",
+            local_install_context,
+            local_pcsx2_install_context,
+            |candidate| {
+                matches!(
+                    candidate.match_state,
+                    UserCheatMatchState::Exact | UserCheatMatchState::Strong
+                )
+            },
+        );
+        self.show_candidates(ui, report, "Possible matches", None, None, |candidate| {
             candidate.match_state == UserCheatMatchState::Possible
         });
-        self.show_candidates(ui, report, "Ambiguous matches", None, |candidate| {
+        self.show_candidates(ui, report, "Ambiguous matches", None, None, |candidate| {
             candidate.match_state == UserCheatMatchState::Ambiguous
         });
-        self.show_candidates(ui, report, "Unmatched", None, |candidate| {
+        self.show_candidates(ui, report, "Unmatched", None, None, |candidate| {
             candidate.match_state == UserCheatMatchState::NoMatch
         });
-        self.show_candidates(ui, report, "Unsupported or rejected", None, |candidate| {
-            candidate.match_state == UserCheatMatchState::Unsupported
-        });
+        self.show_candidates(
+            ui,
+            report,
+            "Unsupported or rejected",
+            None,
+            None,
+            |candidate| candidate.match_state == UserCheatMatchState::Unsupported,
+        );
         if !report.duplicates.is_empty() {
             egui::CollapsingHeader::new(format!("Duplicate files ({})", report.duplicates.len()))
                 .default_open(false)
@@ -414,6 +495,7 @@ impl UserCheatImportPageState {
         report: &UserCheatImportReport,
         heading: &str,
         local_install_context: Option<&LocalCheatInstallContext>,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
         filter: F,
     ) where
         F: Fn(&UserCheatCandidate) -> bool,
@@ -456,10 +538,17 @@ impl UserCheatImportPageState {
                             ui.label("Individual cheat names are not exposed by the current bounded import API.");
                             ui.label("No files were installed or changed.");
                         }
-                        if candidate.format == UserCheatFormat::RetroarchCht {
-                            self.show_install_action(ui, candidate, local_install_context);
-                        } else {
-                            ui.label("Local install is only available for RetroArch .cht files in this build; PCSX2 PNACH stays review-only.");
+                        match candidate.format {
+                            UserCheatFormat::RetroarchCht => {
+                                self.show_install_action(ui, candidate, local_install_context);
+                            }
+                            UserCheatFormat::Pcsx2Pnach => {
+                                self.show_pcsx2_install_action(
+                                    ui,
+                                    candidate,
+                                    local_pcsx2_install_context,
+                                );
+                            }
                         }
                     });
                 }
@@ -957,6 +1046,486 @@ impl UserCheatImportPageState {
                     self.local_install = LocalInstallStage::Idle;
                 } else {
                     self.local_install = LocalInstallStage::Error { message };
+                }
+            }
+        }
+    }
+
+    /// The install action for exactly one matched PCSX2 `.pnach`
+    /// candidate. Everything downstream of the click - staging, preview,
+    /// apply, and rollback - is the same, unmodified PCSX2 install-plan
+    /// pipeline the GameHacking-catalogue flow already uses; this only
+    /// supplies the one file the user picked, resolved into the single
+    /// managed cheat it becomes.
+    fn show_pcsx2_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+    ) {
+        let Some(install_context) = local_pcsx2_install_context else {
+            ui.label("Select a PCSX2 game in Cheats & Mods to install this file.");
+            return;
+        };
+        let Some(profile) = install_context.profile.as_ref() else {
+            ui.label("Select an eligible PCSX2 profile (Stage 1) before installing a local file.");
+            return;
+        };
+        let path = candidate.provenance.original_path.clone();
+        if ui.button("Install this cheat file").clicked() {
+            self.start_local_pcsx2_install(path, &install_context.identity, profile.clone());
+        }
+    }
+
+    fn start_local_pcsx2_install(
+        &mut self,
+        source_path: PathBuf,
+        identity: &Pcsx2GameIdentity,
+        profile: Pcsx2Profile,
+    ) {
+        let discovery = match discover_local_pcsx2_pnach_file(&source_path, identity) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match check_local_pcsx2_install_state(&profile, &discovery) {
+            Ok(LocalPcsx2InstallState::AlreadyInstalled) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::AlreadyInstalled { source_path };
+                return;
+            }
+            Ok(LocalPcsx2InstallState::New) => {}
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        }
+        let staging_root = match crate::default_generated_pcsx2_local_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error { message };
+                return;
+            }
+        };
+        let staged = match stage_pcsx2_pnach(
+            &staging_root,
+            &profile,
+            discovery.detected_serial.as_deref(),
+            &discovery.detected_crc,
+            std::slice::from_ref(&discovery.cheat),
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match build_pcsx2_install_preview(&Pcsx2InstallPreviewRequest {
+            selected_archive: identity.archive_path.clone(),
+            profile: profile.clone(),
+            identity: identity.clone(),
+            staged,
+        }) {
+            Ok(preview) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Preview {
+                    source_path,
+                    profile,
+                    preview: Box::new(preview),
+                };
+            }
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn confirm_local_pcsx2_apply(&mut self) {
+        let LocalPcsx2InstallStage::Preview {
+            profile, preview, ..
+        } = std::mem::take(&mut self.local_pcsx2_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let replacement_required = preview
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.proposed_action == PreviewProposedAction::Replace);
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            &profile.profile_id,
+            "pcsx2-local-file",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: error.detail,
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let destination_root = profile.configuration_path.clone();
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved: replacement_required,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        if result.journal.status == SharedApplyStatus::Success {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                destination_root,
+                journal_path: result.journal_path,
+            };
+        } else {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+            };
+        }
+    }
+
+    fn start_local_pcsx2_undo(&mut self) {
+        let LocalPcsx2InstallStage::Applied {
+            destination_root,
+            journal_path,
+        } = std::mem::take(&mut self.local_pcsx2_install)
+        else {
+            return;
+        };
+        let Some(journal_path) = journal_path else {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                message: "No transaction journal was recorded for this apply.".to_string(),
+            };
+            return;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let preview = preview_shared_rollback(&journal_path, &destination_root, &backup_root);
+        self.local_pcsx2_install = LocalPcsx2InstallStage::UndoPreview {
+            destination_root,
+            journal_path,
+            preview: Box::new(preview),
+        };
+    }
+
+    fn confirm_local_pcsx2_undo(&mut self) {
+        let LocalPcsx2InstallStage::UndoPreview { preview, .. } =
+            std::mem::take(&mut self.local_pcsx2_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        );
+        if result.status == SharedApplyStatus::Success {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Done {
+                message: "The installed cheat file was removed and the prior state was restored."
+                    .to_string(),
+            };
+        } else {
+            self.local_pcsx2_install = LocalPcsx2InstallStage::Error {
+                message: format!("Undo did not fully succeed: {:?}", result.status),
+            };
+        }
+    }
+
+    /// Mirrors `show_local_install_panel`'s ownership dance for the same
+    /// reason: `self.local_pcsx2_install` is taken by value before
+    /// rendering so the action buttons' `&mut self` calls never conflict
+    /// with a live borrow of it.
+    fn show_local_pcsx2_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_pcsx2_install);
+        match stage {
+            LocalPcsx2InstallStage::Idle => {}
+            LocalPcsx2InstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::AlreadyInstalled { source_path } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Already installed",
+                    &format!(
+                        "{} is already installed for this game - installing it again would change nothing.",
+                        source_path.display()
+                    ),
+                    widgets::StatusTone::Info,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install =
+                        LocalPcsx2InstallStage::AlreadyInstalled { source_path };
+                }
+            }
+            LocalPcsx2InstallStage::Preview {
+                source_path,
+                profile,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review before installing");
+                    ui.label(format!("Source file: {}", source_path.display()));
+                    ui.label(format!(
+                        "Destination: {}",
+                        preview.staged.destination_path.display()
+                    ));
+                    ui.label(preview.plain_summary.clone());
+                    egui::CollapsingHeader::new("Technical details")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for line in &preview.technical_details {
+                                ui.label(line);
+                            }
+                        });
+                    egui::CollapsingHeader::new("Merged PNACH contents to be written")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.monospace(
+                                String::from_utf8_lossy(&preview.staged.contents).into_owned(),
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm install",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Preview {
+                        source_path,
+                        profile,
+                        preview,
+                    };
+                    self.confirm_local_pcsx2_apply();
+                } else if cancelled {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Preview {
+                        source_path,
+                        profile,
+                        preview,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::Applied {
+                destination_root,
+                journal_path,
+            } => {
+                ui.add_space(theme_gap());
+                let mut undo = false;
+                let mut dismissed = false;
+                widgets::card(ui, |ui| {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(journal_path) = journal_path.as_ref() {
+                        ui.label(format!("Transaction journal: {}", journal_path.display()));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo this install").clicked() {
+                            undo = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+                if undo {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                    self.start_local_pcsx2_undo();
+                } else if dismissed {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::UndoPreview {
+                destination_root,
+                journal_path,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Confirm undo");
+                    ui.label("This will remove the installed managed cheat block and restore any prior file content.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm undo",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                    self.confirm_local_pcsx2_undo();
+                } else if cancelled {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Applied {
+                        destination_root,
+                        journal_path: Some(journal_path),
+                    };
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                }
+            }
+            LocalPcsx2InstallStage::Done { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Done { message };
+                }
+            }
+            LocalPcsx2InstallStage::Error { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Local PCSX2 cheat install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
+                } else {
+                    self.local_pcsx2_install = LocalPcsx2InstallStage::Error { message };
                 }
             }
         }
