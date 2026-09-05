@@ -256,6 +256,71 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_system: "n64",
         es_de_fullname: "Nintendo 64",
     },
+    // --- Batch 1 additions (docs/ESDE_PARITY_AUDIT.md §10) -------------
+    // Every `es_de_system`/`es_de_fullname` pair below was read verbatim
+    // from ES-DE's own upstream `resources/systems/linux/es_systems.xml`
+    // (gitlab.com/es-de/emulationstation-de, `master` branch) - never
+    // guessed from a plausible-looking short name.
+    EsDeSystemMapping {
+        platform_id: "MasterSystem",
+        es_de_system: "mastersystem",
+        es_de_fullname: "Sega Master System",
+    },
+    EsDeSystemMapping {
+        platform_id: "GameGear",
+        es_de_system: "gamegear",
+        es_de_fullname: "Sega Game Gear",
+    },
+    EsDeSystemMapping {
+        platform_id: "Sega 32X",
+        es_de_system: "sega32x",
+        es_de_fullname: "Sega 32X",
+    },
+    EsDeSystemMapping {
+        platform_id: "Atari2600",
+        es_de_system: "atari2600",
+        es_de_fullname: "Atari 2600",
+    },
+    EsDeSystemMapping {
+        platform_id: "Atari5200",
+        es_de_system: "atari5200",
+        es_de_fullname: "Atari 5200",
+    },
+    EsDeSystemMapping {
+        platform_id: "Atari7800",
+        es_de_system: "atari7800",
+        es_de_fullname: "Atari 7800 ProSystem",
+    },
+    EsDeSystemMapping {
+        platform_id: "Atari Lynx",
+        es_de_system: "atarilynx",
+        es_de_fullname: "Atari Lynx",
+    },
+    EsDeSystemMapping {
+        platform_id: "Atari Jaguar",
+        es_de_system: "atarijaguar",
+        es_de_fullname: "Atari Jaguar",
+    },
+    EsDeSystemMapping {
+        platform_id: "ColecoVision",
+        es_de_system: "colecovision",
+        es_de_fullname: "Coleco ColecoVision",
+    },
+    EsDeSystemMapping {
+        platform_id: "Vectrex",
+        es_de_system: "vectrex",
+        es_de_fullname: "Vectrex",
+    },
+    EsDeSystemMapping {
+        platform_id: "Neo Geo Pocket",
+        es_de_system: "ngp",
+        es_de_fullname: "SNK Neo Geo Pocket",
+    },
+    EsDeSystemMapping {
+        platform_id: "Neo Geo Pocket Color",
+        es_de_system: "ngpc",
+        es_de_fullname: "SNK Neo Geo Pocket Color",
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.
@@ -447,7 +512,7 @@ mod tests {
     use super::*;
     use crate::launch::planning::{LaunchCandidate, LaunchPlanSummary, ResolvedIdentity};
     use crate::launch::readiness::FirmwareReadiness;
-    use crate::platform::platform_by_id;
+    use crate::platform::{platform_by_id, platform_for_alias};
 
     fn resolved(platform_id: &str) -> CanonicalIdentityStatus {
         CanonicalIdentityStatus::Resolved(ResolvedIdentity {
@@ -529,6 +594,18 @@ mod tests {
             "SNES",
             "MegaDrive",
             "N64",
+            "MasterSystem",
+            "GameGear",
+            "Sega 32X",
+            "Atari2600",
+            "Atari5200",
+            "Atari7800",
+            "Atari Lynx",
+            "Atari Jaguar",
+            "ColecoVision",
+            "Vectrex",
+            "Neo Geo Pocket",
+            "Neo Geo Pocket Color",
         ] {
             assert!(
                 es_de_system_for_platform(platform_id).is_some(),
@@ -556,6 +633,156 @@ mod tests {
     fn megadrive_maps_to_megadrive_not_genesis() {
         let mapping = es_de_system_for_platform("MegaDrive").unwrap();
         assert_eq!(mapping.es_de_system, "megadrive");
+    }
+
+    // --- Batch 1 (docs/ESDE_PARITY_AUDIT.md §10) -----------------------
+
+    /// (canonical platform id, expected ES-DE `<name>`, expected ES-DE
+    /// `<fullname>`) - every value read verbatim from ES-DE's own
+    /// `resources/systems/linux/es_systems.xml` (see the module doc
+    /// comment above `ES_DE_SYSTEM_MAP`), never guessed.
+    const BATCH_1: &[(&str, &str, &str)] = &[
+        ("MasterSystem", "mastersystem", "Sega Master System"),
+        ("GameGear", "gamegear", "Sega Game Gear"),
+        ("Sega 32X", "sega32x", "Sega 32X"),
+        ("Atari2600", "atari2600", "Atari 2600"),
+        ("Atari5200", "atari5200", "Atari 5200"),
+        ("Atari7800", "atari7800", "Atari 7800 ProSystem"),
+        ("Atari Lynx", "atarilynx", "Atari Lynx"),
+        ("Atari Jaguar", "atarijaguar", "Atari Jaguar"),
+        ("ColecoVision", "colecovision", "Coleco ColecoVision"),
+        ("Vectrex", "vectrex", "Vectrex"),
+        ("Neo Geo Pocket", "ngp", "SNK Neo Geo Pocket"),
+        ("Neo Geo Pocket Color", "ngpc", "SNK Neo Geo Pocket Color"),
+    ];
+
+    #[test]
+    fn batch_1_platforms_map_to_es_de_exactly() {
+        for (platform_id, system, fullname) in BATCH_1 {
+            let mapping = es_de_system_for_platform(platform_id)
+                .unwrap_or_else(|| panic!("missing ES-DE mapping for {platform_id}"));
+            assert_eq!(
+                mapping.es_de_system, *system,
+                "wrong es_de_system for {platform_id}"
+            );
+            assert_eq!(
+                mapping.es_de_fullname, *fullname,
+                "wrong es_de_fullname for {platform_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_1_resolved_identity_produces_a_ready_entry() {
+        for (platform_id, system, _) in BATCH_1 {
+            let outcome = build_es_de_entry_plan(&resolved(platform_id), &usable_content(), None);
+            let EsDeExportOutcome::Entry(plan) = outcome else {
+                panic!("expected an ES-DE entry for {platform_id}");
+            };
+            assert_eq!(plan.status, EsDeEntryStatus::Ready);
+            assert!(plan.path_usable);
+            assert_eq!(
+                plan.es_de_system, *system,
+                "wrong destination system for {platform_id}"
+            );
+        }
+    }
+
+    /// A known registry alias resolves to the same canonical platform, and
+    /// therefore the same ES-DE row, as the canonical id itself - proving
+    /// the ES-DE map is never a second, alias-unaware identity source.
+    #[test]
+    fn batch_1_known_aliases_resolve_to_the_same_es_de_row_as_the_canonical_id() {
+        for (platform_id, alias) in [
+            ("MasterSystem", "sms"),
+            ("GameGear", "gg"),
+            ("Sega 32X", "32x"),
+            ("Atari2600", "a2600"),
+            ("Atari5200", "a5200"),
+            ("Atari7800", "a7800"),
+            ("Atari Lynx", "lynx"),
+            ("Atari Jaguar", "jaguar"),
+            ("ColecoVision", "coleco"),
+            ("Vectrex", "gcevectrex"),
+            ("Neo Geo Pocket", "neogeopocket"),
+            ("Neo Geo Pocket Color", "neogeopocketcolor"),
+        ] {
+            let via_alias = platform_for_alias(alias)
+                .unwrap_or_else(|| panic!("{alias} did not resolve to a platform"));
+            assert_eq!(
+                via_alias.id, platform_id,
+                "alias {alias} resolved to the wrong platform"
+            );
+            let canonical_mapping = es_de_system_for_platform(platform_id).unwrap();
+            let alias_mapping = es_de_system_for_platform(via_alias.id).unwrap();
+            assert_eq!(
+                alias_mapping.es_de_system, canonical_mapping.es_de_system,
+                "alias {alias} must produce the same ES-DE system as {platform_id} itself"
+            );
+        }
+    }
+
+    /// A wrong/unknown platform name is refused outright - never coerced
+    /// into one of the Batch 1 rows or any other row by fuzzy matching.
+    #[test]
+    fn unrecognised_platform_names_are_never_mapped_to_a_batch_1_row() {
+        for bogus in [
+            "SegaMasterSystem2",
+            "MasterSystemPlus",
+            "not-a-real-platform",
+            "",
+        ] {
+            assert!(
+                es_de_system_for_platform(bogus).is_none(),
+                "{bogus:?} must not resolve to any ES-DE row"
+            );
+            assert!(
+                platform_for_alias(bogus).is_none(),
+                "{bogus:?} must not resolve to any canonical platform"
+            );
+        }
+    }
+
+    /// Still-unmapped neighbouring platforms (deliberately left for a later
+    /// batch) must keep failing closed rather than falling back to a
+    /// Batch 1 row that merely looks related.
+    #[test]
+    fn platforms_still_unmapped_after_batch_1_remain_refused() {
+        for platform_id in ["Switch", "PS4", "NeoGeo", "WonderSwan", "Intellivision"] {
+            assert!(
+                platform_by_id(platform_id).is_some(),
+                "{platform_id} should be a real registry id (fixture drift)"
+            );
+            assert!(
+                es_de_system_for_platform(platform_id).is_none(),
+                "{platform_id} must still be unmapped after Batch 1"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mapped_es_de_system_target_is_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in ES_DE_SYSTEM_MAP {
+            assert!(
+                seen.insert(entry.es_de_system),
+                "duplicate ES-DE system target {:?} (platform {})",
+                entry.es_de_system,
+                entry.platform_id
+            );
+        }
+    }
+
+    #[test]
+    fn no_platform_id_appears_twice_in_the_map() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in ES_DE_SYSTEM_MAP {
+            assert!(
+                seen.insert(entry.platform_id),
+                "platform {} has more than one ES-DE mapping row",
+                entry.platform_id
+            );
+        }
     }
 
     #[test]
