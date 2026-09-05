@@ -95,6 +95,8 @@ pub mod mame_command;
 pub mod mame_execution;
 pub mod melonds_command;
 pub mod melonds_execution;
+pub mod mesen_command;
+pub mod mesen_execution;
 pub mod mgba_command;
 pub mod mgba_execution;
 pub mod pcsx2_command;
@@ -269,6 +271,14 @@ pub use melonds_command::{
 pub use melonds_execution::{
     MelonDsLaunchPreflightError, MelonDsLaunchPreflightErrorKind, MelonDsLaunchRequest,
     preflight_melonds_launch, spawn_melonds,
+};
+pub use mesen_command::{
+    MESEN_DO_NOT_SAVE_SETTINGS, MESEN_SUPPORTED_PLATFORM_IDS, MesenCommand, MesenCommandPlan,
+    MesenCommandSelection, build_mesen_command_plan,
+};
+pub use mesen_execution::{
+    MesenLaunchPreflightError, MesenLaunchPreflightErrorKind, MesenLaunchRequest,
+    preflight_mesen_launch, spawn_mesen,
 };
 pub use mgba_command::{
     MGBA_SUPPORTED_PLATFORM_IDS, MgbaCommand, MgbaCommandPlan, MgbaCommandSelection,

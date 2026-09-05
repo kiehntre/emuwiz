@@ -69,6 +69,7 @@ mod local_cheat_install_dolphin;
 mod local_cheat_install_pcsx2;
 mod matching;
 mod melonds_local;
+mod mesen_local;
 mod mgba_local;
 mod pcengine_cd_firmware;
 mod pcsx2;
@@ -539,6 +540,12 @@ pub use melonds_local::{
     MelonDsNativeLaunchBinding, MelonDsProfile, MelonDsProfileDiscovery,
     MelonDsProfileDiscoveryRoots, discover_melonds_profiles, parse_melonds_version,
     resolve_melonds_native_launch_binding,
+};
+pub use mesen_local::{
+    MESEN_MAX_CONFIG_BYTES, MESEN_MAX_PROFILES, MesenConfigInspection, MesenDiscoveryError,
+    MesenExecutable, MesenInstallationType, MesenLaunchBlocker, MesenLaunchBlockerKind,
+    MesenNativeLaunchBinding, MesenProfile, MesenProfileDiscovery, MesenProfileDiscoveryRoots,
+    discover_mesen_profiles, parse_mesen_version, resolve_mesen_native_launch_binding,
 };
 pub use mgba_local::{
     MGBA_MAX_CONFIG_BYTES, MGBA_MAX_PROFILES, MgbaBiosState, MgbaConfigInspection,

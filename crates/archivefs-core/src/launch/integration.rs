@@ -41,8 +41,8 @@ use crate::patch_manager::{
     AmigaEmulatorKind, AmigaGameInspection, AmigaKickstartState, AmigaProfile, CemuProfile,
     DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
     FlycastProfile, FlycastSystemFileState, HatariGameInspection, HatariProfile,
-    MelonDsFirmwareState, MelonDsProfile, Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2Profile,
-    PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
+    MelonDsFirmwareState, MelonDsProfile, MesenProfile, Pcsx2BiosVerification, Pcsx2GameInspection,
+    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -93,6 +93,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     /// either.
     Rmg {
         profile: &'a crate::patch_manager::RmgProfile,
+    },
+    Mesen {
+        profile: &'a MesenProfile,
     },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
@@ -232,6 +235,9 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
         Self::Mgba { profile }
+    }
+    pub fn mesen(profile: &'a MesenProfile) -> Self {
+        Self::Mesen { profile }
     }
 
     pub fn rmg(profile: &'a crate::patch_manager::RmgProfile) -> Self {
@@ -412,7 +418,7 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }
-            DiscoveredStandaloneProfile::Rmg { profile }
+    DiscoveredStandaloneProfile::Rmg { profile }
                 if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
                     if identity.platform_id == "N64") =>
             {
@@ -421,6 +427,16 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_id: profile.profile_id.clone(),
                     profile_path: None,
                     eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Mesen { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if crate::launch::mesen_command::MESEN_SUPPORTED_PLATFORM_IDS.contains(&identity.platform_id.as_str())) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "mesen", profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()), eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }

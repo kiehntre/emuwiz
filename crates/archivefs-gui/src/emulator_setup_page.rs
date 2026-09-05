@@ -113,6 +113,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "melonds" => "melonDS",
         "hatari" => "Hatari",
         "mgba" => "mGBA",
+        "mesen" => "Mesen 2",
         "mame" => "MAME",
         "fbneo" => "FBNeo",
         "cemu" => "Cemu",
@@ -479,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn native_sameboy_and_mgba_candidates_are_distinct() {
+    fn native_game_boy_candidates_include_mesen_without_replacing_others() {
         let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, None, "");
         assert!(
             candidates
@@ -495,6 +496,16 @@ mod tests {
             candidates
                 .iter()
                 .any(|c| c.platform_id == "Game Boy Color" && c.adapter_id == "sameboy")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.platform_id == "Game Boy" && c.adapter_id == "mesen")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.platform_id == "Game Boy Color" && c.adapter_id == "mesen")
         );
     }
 

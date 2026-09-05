@@ -242,6 +242,14 @@ pub enum LaunchBlockerKind {
     MgbaPlatformMismatch,
     /// The content is not a direct extension matching the resolved platform.
     MgbaContentFormatUnsupported,
+    /// A command-plan request was given a non-Mesen standalone candidate.
+    MesenCandidateRequired,
+    /// The canonical platform is outside the explicitly reviewed Mesen scope.
+    MesenPlatformMismatch,
+    /// The selected content is not one direct canonical Mesen cartridge form.
+    MesenContentFormatUnsupported,
+    /// Mesen discovery could not produce one safe executable binding.
+    MesenBindingUnavailable,
     /// The mGBA profile/executable binding could not be safely resolved.
     MgbaBindingUnavailable,
     /// A Vita3K command-plan request was given a non-Vita3K candidate.
