@@ -1,0 +1,610 @@
+# EmuWiz physical QA and release-readiness plan
+
+## 1. Executive summary
+
+This checkpoint has strong automated confidence in core state machines, safety
+guards, mapping/publication contracts, persistence, and recovery branches. That
+is not the same as proving a coherent desktop application. The remaining proof
+is primarily an end-to-end desktop exercise: real display and input, real
+filesystem permissions, real source/DAT data, real emulator profiles and
+process handoff, real ES-DE, and restart or interruption at each write boundary.
+
+The release gate should be a disposable physical QA run with an ordinary
+desktop resolution (also check 1024x600), a copied existing-user profile, and
+fixtures that include both valid and deliberately ambiguous or malformed data.
+Never use the production ROM collection or an irreplaceable emulator profile.
+
+At the inspected HEAD (`544895eb`), ES-DE Batch 3 is present and MegaDrive is
+intentionally still a regional-policy partial. The physical plan treats ES-DE
+mapping coverage, publication, recovery/idempotency, and actual ES-DE launch as
+separate checks. It does not freeze parity counts from an older audit.
+
+## 2. Current automated confidence
+
+The following areas have meaningful automated coverage and should be used as
+preconditions, not as substitutes for physical QA:
+
+- onboarding state parsing, serialization, malformed-sidecar fallback, step
+  progression, skip, and restart semantics;
+- source/config persistence, bounded discovery projections, paged collection
+  rendering, library filtering, and restart-oriented state tests;
+- DAT parsing/registry/managed-source behavior, Verify projections, identity
+  evidence, and Doctor read-only/repair gating;
+- emulator profile discovery and readiness assessments, profile-kind selection,
+  launch planning, and refusal of ambiguous or unsafe candidates;
+- archive/library rename and Playing Library transaction planning, confirmation,
+  journals, rollback, and recovery review;
+- RomM configuration/source parsing, cache and error states, browser paging,
+  mapping decisions, and read-only import boundaries;
+- ES-DE export mappings, fail-closed unknown handling, publication preview,
+  atomic write, idempotency, rollback, restart recovery, malformed recovery
+  records, and path/name escaping;
+- RetroArch `.cht`, PCSX2 `.pnach`, Dolphin Gecko/Action Replay `.ini`, and
+  Xenia `.patch.toml` staging, identity gates, preview/apply/undo state, and
+  transaction error paths;
+- database/config recovery rules and GUI recovery-history action gating.
+
+The main confidence gap is integration. Unit and GUI tests do not prove that a
+real file picker, permissions boundary, window size, network timeout, emulator
+binary, ES-DE installation, or desktop process behaves as the model expects.
+
+## 3. P0 physical QA journeys
+
+P0 is the checkpoint gate. A failed P0 journey blocks release-readiness until
+the failure is understood and either fixed or explicitly accepted by the
+release owner. Ten P0 journeys are defined; the nominal hands-on total is about
+7 hours 45 minutes, excluding environment setup and reruns.
+
+### P0-1 — Fresh install, onboarding, and restart (45 minutes)
+
+Starting state: a disposable app data/config directory with no config, database,
+onboarding sidecar, source, DAT registry, emulator profile, or recovery journal.
+Use a copied test source, not a real collection.
+
+Steps: launch the exact candidate binary; wait for diagnostics; complete Welcome,
+Add source, optional DAT step, Emulator Setup, and Verify; exercise Back/Next,
+Skip setup on a second disposable profile, close during an in-progress step,
+relaunch, finish, then relaunch after completion.
+
+Expected: the overlay opens once for a genuine first run; the five steps use the
+real pages; source and optional DAT choices persist; emulator readiness is honest;
+Verify is a summary rather than an unrequested mutation; completion survives
+restart; Skip does not delete configuration; setup does not reopen for the
+completed or skipped user.
+
+Failure signs: blank or trapped overlay, duplicate scans, lost step, onboarding
+reopens unexpectedly, silent source mutation, a false “ready” result, or a
+crash on missing/unreadable sidecar.
+
+State/files: config, database, onboarding sidecar, DAT registry, and activity
+history may change; source content must not. Restore/delete only the disposable
+profile after collecting logs. Network is optional; emulator installation is
+not required for the first pass, though one known profile improves readiness
+proof. Recovery check: restart at every persisted boundary and verify the
+sidecar’s state is consistent with the visible step.
+
+### P0-2 — Source addition, scan, identity, Verify, and Doctor (60 minutes)
+
+Starting state: completed onboarding with a fixture source containing supported
+archives, direct images, duplicate content, unknown platform folders, a
+malformed sidecar, and one unreadable or permission-restricted item.
+
+Steps: add the source; scan it; inspect Sources and Discovery; select representative
+items in Gamer/selected-game view; open Verify; run Doctor; inspect findings;
+confirm a repair only on a copied fixture; restart and rescan.
+
+Expected: counts and rows converge; identity confidence is distinguished from
+filename guesses; unknown/ambiguous data remains visible; Verify is read-only;
+Doctor reports rather than silently repairs; explicit repair changes only the
+approved fixture and records outcome; the selected-game view does not lose or
+invent evidence.
+
+Failure signs: zero or inflated counts, wrong platform, a malformed sidecar
+blocking the whole source, synchronous UI freeze, Verify changing files, Doctor
+repairing without confirmation, or a row disappearing instead of becoming
+explicitly incomplete.
+
+State/files: database observations, source/config records, identity evidence,
+history, and any explicitly confirmed repair journal may change. Source files
+must remain byte-for-byte unchanged unless the specific repair was confirmed.
+Network is not required. No emulator installation is required. Recovery check:
+restart with the incomplete fixture and confirm it remains diagnosable.
+
+### P0-3 — Safe library mutation and rollback (60 minutes)
+
+Starting state: copied source and target Playing Library roots with a small
+fixture containing one planned rename, one duplicate, one collision, one
+symlink-sensitive path, and enough free space for the operation.
+
+Steps: build a reviewed rename/1G1R or canonical-organisation plan; inspect the
+preview; cancel once; re-open and confirm; interrupt only using a controlled
+process stop at a safe test point; reopen Recovery/History; preview rollback;
+rollback; compare source and target trees and database state.
+
+Expected: no write before confirmation; source/master ROMs are not silently
+changed; collision and unsafe-path cases are blocked; the transaction is
+recoverable after interruption; rollback restores the pre-change target and
+leaves a truthful history record; repeat preview/apply is idempotent.
+
+Failure signs: partial unjournalled mutation, source deletion, wrong link target,
+rollback offered after manual tampering, stale UI claiming success, or a second
+apply duplicating files/links.
+
+State/files: target links/copies, transaction journal, database projection,
+history, and recovery records. Network is not required. Emulator installation
+is not required. Recovery check is the purpose of this journey; retain before
+and after manifests and hashes.
+
+### P0-4 — Emulator readiness, launch planning, and handoff (60 minutes)
+
+Starting state: one disposable game with verified identity and at least two
+known emulator profile shapes where available: Native, Explicit, AppImage or
+Portable. Include a deliberately missing, non-executable, and ambiguous profile.
+
+Steps: run Emulator Setup/Doctor; inspect discovered profiles and readiness;
+open Gamer and launch planning; verify the selected platform/game; launch using
+one real emulator; repeat with an external profile kind; test the blocked and
+ambiguous cases.
+
+Expected: readiness names the actual blocker; no emulator is guessed when
+candidates conflict; launch uses the selected profile and content path; the
+emulator opens and receives the intended game; EmuWiz remains usable after the
+child exits; blocked cases explain remediation and do not spawn a process.
+
+Failure signs: wrong executable or content, shell-like quoting failure, silent
+launch no-op, launch of an unapproved candidate, false readiness, or GUI lockup.
+
+State/files: remembered profiles, activity history, and emulator process state
+may change; emulator configuration must not be rewritten without an explicit
+feature action. Network is not required. Emulator installation is required.
+Recovery check: remove/rename the profile or binary, restart, and confirm the
+state becomes blocked rather than retaining stale readiness.
+
+### P0-5 — ES-DE publication, recovery, idempotency, and launch (60 minutes)
+
+Starting state: a disposable ES-DE installation/profile and a small reviewed
+Playing Library projection. Include one supported Batch 3 platform, one unknown
+platform, and a MegaDrive case that demonstrates regional ambiguity.
+
+Steps: confirm ES-DE profile discovery; build the publication preview; verify the
+canonical platform and exact target system; cancel; rebuild and confirm; inspect
+the resulting `gamelist.xml`; repeat publication; restart between a controlled
+write interruption and recovery; recover the pending record; launch the published
+game from ES-DE.
+
+Expected: preview identifies the reviewed target and destination; unknown mapping
+fails closed; Arcade/MAME/FBNeo remains publication-neutral; Amiga, CD32, CDTV,
+DOS, ScummVM, Atari ST, and other distinct identities are not collapsed; existing
+bytes are preserved; repeat publication is unchanged; recovery restores or
+finalizes safely; ES-DE itself launches the intended entry using its own emulator
+configuration. MegaDrive remains PARTIAL until a regional policy exists.
+
+Failure signs: wrong system folder, duplicate XML entry, malformed escaping,
+truncated gamelist, publication selecting an emulator, stale recovery record,
+or ES-DE launching the wrong content/emulator.
+
+State/files: ES-DE `gamelist.xml`, recovery sidecar/journal, Playing Library
+projection, and history. Network is not required. Emulator installation is
+required for actual ES-DE launch. Recovery check is mandatory; preserve file
+hashes and byte snapshots before each write.
+
+### P0-6 — RetroArch local `.cht` install (30 minutes)
+
+Starting state: disposable RetroArch profile and verified game identity; a valid
+local `.cht`, an already-installed equivalent, and a wrong-identity `.cht`.
+
+Steps: discover/select the profile; choose the local file; inspect preview and
+exact destination; cancel once; explicitly confirm; inspect the resulting file
+and RetroArch directory; reapply; undo; repeat with wrong identity.
+
+Expected: preview is complete, confirmation is explicit, install is confined to
+the selected cheat root, reapply is idempotent, undo restores the prior state,
+and wrong identity is refused. No original ROM is changed.
+
+Failure signs: guessed identity, overwrite without preview/backup, duplicate
+entries, undo deleting a pre-existing file, or RetroArch not seeing the result.
+
+State/files: target `.cht`, transaction/history/backup state. Network is only
+needed if the selected path uses a remote catalogue; local install should work
+offline. RetroArch installation is required for activation proof. Recovery check:
+manually alter the target before undo and confirm rollback is blocked or explains
+the conflict.
+
+### P0-7 — PCSX2 local `.pnach` install (30 minutes)
+
+Starting state: disposable native or supported PCSX2 profile, verified PS2
+identity/CRC, valid `.pnach`, pre-existing equivalent, and wrong-identity file.
+
+Steps: discover/select the profile; inspect the PNACH preview; cancel; confirm;
+inspect the resolved `cheats`/`cheats_ws` destination and file contents; reapply;
+undo; test wrong identity and a profile that is discovered but ineligible.
+
+Expected: the current install path requires exact evidence and explicit
+confirmation; destination resolution is safe; reapply is idempotent; undo is
+available only when safe; wrong identity and ineligible profiles are refused.
+
+Failure signs: the UI still presents an install action for an unverified game,
+wrong CRC filename, silent directory creation, mutation of an unrelated profile,
+or inability to distinguish a pre-existing file during undo.
+
+State/files: PCSX2 PNACH file, backup/journal/history. Network is not required.
+PCSX2 installation is required. Recovery check: change the target externally and
+verify the rollback guard reports the conflict.
+
+### P0-8 — Dolphin Gecko/Action Replay `.ini` install (30 minutes)
+
+Starting state: disposable Dolphin profile with a verified GameCube/Wii identity,
+valid local GameSettings `.ini`, existing equivalent, and wrong Game ID.
+
+Steps: discover/select profile; preview exact sections/codes and destination;
+cancel; confirm; inspect `GameSettings`; reapply; undo; repeat with a candidate
+whose identity is only filename-level or incompatible.
+
+Expected: verified identity gates the write, preview lists exact changes, install
+is confined to the chosen profile, reapply is unchanged, undo restores prior
+bytes, and weak/wrong identity is blocked.
+
+Failure signs: filename evidence treated as verified, wrong Game ID, code
+execution/evaluation, unrelated INI modification, or rollback overwriting a
+user edit.
+
+State/files: Dolphin `GameSettings/*.ini`, backup/journal/history. Network is
+not required. Dolphin installation is required for activation proof. Recovery
+check: manually edit the destination before undo and verify safe refusal.
+
+### P0-9 — Xenia `.patch.toml` install (30 minutes)
+
+Starting state: disposable explicitly supplied Xenia Canary directory, verified
+Xbox 360 Title ID, valid patch TOML, a second candidate, existing patch, and
+wrong Title ID.
+
+Steps: type/select the Xenia directory; discover profiles; retrieve or use the
+local patch candidate; preview selected patches and exact target; cancel; confirm;
+inspect the target; reapply; undo; test incompatible and partially verified
+candidates.
+
+Expected: Xenia’s explicit-directory requirement is visible; candidate selection
+does not silently choose among multiple files; exact-compatible patches can be
+installed only after confirmation; reapply is idempotent; undo and conflict
+handling are safe; activation status remains honestly unknown where the adapter
+cannot verify it.
+
+Failure signs: guessed Xenia path, wrong Title ID, automatic multi-candidate
+selection, patch installation into an unrelated directory, or UI claiming the
+patch is active without evidence.
+
+State/files: Xenia patch TOML, backup/journal/history, remembered explicit path.
+Network is required only for provider refresh, not local staged install. Xenia
+installation is required for launch/activation proof. Recovery check: mutate the
+target before undo and verify conflict handling.
+
+### P0-10 — Existing-user upgrade and recovery continuity (60 minutes)
+
+Starting state: a copy of a real representative user profile made while the app
+is closed: config, database plus SQLite sidecars, source/DAT registry, emulator
+profiles, onboarding state, history, and a pending or completed recovery record.
+
+Steps: open with the candidate build; check migration and Home; navigate all
+major destinations; restart; perform a read-only scan/Doctor; inspect existing
+profiles and recovery history; resolve only a deliberately disposable pending
+transaction; compare state manifests to the pre-upgrade copy.
+
+Expected: existing configuration, sources, DATs, profiles, journals and history
+survive; onboarding does not unexpectedly reopen; startup does not scan, mount,
+download, or mutate source images; a pending journal remains usable and is not
+silently discarded. Downgrade is tested only by restoring the pre-upgrade copy,
+not in-place.
+
+Failure signs: reset configuration, missing rows, replayed destructive action,
+lost recovery option, migration loop, or a startup write outside the expected
+managed state.
+
+State/files: migration metadata and managed state may change; record exact diffs.
+Network is not required. Emulator installation is optional for continuity, but
+profiles must be present. Recovery check is mandatory.
+
+## 4. P1 physical QA journeys
+
+P1 is important operational confidence but does not block the next checkpoint if
+P0 is clean and the limitation is documented.
+
+### P1-1 — Full source/DAT lifecycle and degraded network (45 minutes)
+
+Use a disposable source and valid, duplicate, mismatched, malformed, and missing
+DAT fixtures. Register managed DATs, use the optional DAT path, refresh Verify,
+then disable or interrupt a network-backed catalogue operation. Expect cached
+state and errors to be explicit, no source mutation, no false identity, and no
+UI deadlock. Check managed registry and history diffs; restore the disposable
+state. Network is required for the online branch; no emulator is required.
+
+### P1-2 — Doctor findings and explicit repair matrix (45 minutes)
+
+Prepare missing paths, stale profiles, bad permissions, unsafe links, malformed
+sidecars, and a recoverable journal. Run Doctor and inspect each category,
+severity, remediation, and action gate. Confirm one safe repair and refuse one
+unsafe repair. Expect read-only scan behavior and truthful post-repair
+verification. Network is not required; emulator installation is useful but not
+mandatory.
+
+### P1-3 — Emulator Setup and adapter/profile matrix (75 minutes)
+
+Exercise native, explicit, Flatpak, AppImage, and Portable profiles supported by
+the machine, plus missing/non-executable paths. Check discovery, remembered
+profiles, readiness, launch planning, and restart persistence for RetroArch,
+PCSX2, Dolphin, and standalone/external adapters. The expected result is
+profile-specific readiness and no guessed executable. Network is not required;
+real installations are required for the profiles being tested.
+
+### P1-4 — RomM connect, browse, and read-only import (60 minutes)
+
+Use a disposable RomM account/server or controlled mock endpoint with valid
+credentials, empty results, pagination, an unresolved platform, a transient
+failure, and stale cache. Connect from Sources, browse, inspect detail, import or
+apply only the supported read-only projection, restart, and disconnect. Expect
+no upload or source mutation, bounded error messages, and honest unresolved
+identity. Network is required; no emulator is required. Preserve and remove
+only the disposable RomM config/cache.
+
+### P1-5 — Playing Library / 1G1R boundary cases (60 minutes)
+
+On a copied collection, plan 1G1R with regional duplicates, equal candidates,
+missing evidence, existing links, collisions, and a previously applied plan.
+Verify preview ordering, explicit policy choices, confirmation, idempotency,
+rollback, and restart. Expect source preservation and no silent choice where
+policy is ambiguous. Network is not required; no emulator is required.
+
+### P1-6 — Gamer and selected-game continuity (30 minutes)
+
+Use supported, unknown, ambiguous, archived, direct-image, and missing-path
+rows. Open Gamer from Home, select a game, inspect identity/evidence, navigate to
+Cheats, launch planning, Playing Library, and back. Expect selection and context
+to remain correct or be cleared explicitly when invalidated. Check no stale
+identity authorizes launch or apply. Network/emulator are optional.
+
+### P1-7 — ES-DE publication breadth (60 minutes)
+
+Using a disposable ES-DE tree, sample the current actual mapping report rather
+than a stale document count: one target from each recently promoted parity
+batch, Arcade, MAME/FBNeo aliases, Amiga/CD32/CDTV, DOS, ScummVM, Atari ST,
+unknown, and MegaDrive. Confirm previews are correct and neutral about emulator
+choice. This is mapping/publication coverage only; actual launch is P0-5.
+
+### P1-8 — Packaged/extracted release smoke test (45 minutes)
+
+Use the candidate release artifact on a clean desktop account or VM. Launch it
+from its intended extracted layout, confirm writable managed-state placement,
+file-picker behavior, restart, and one read-only source scan. Test at normal
+size and 1024x600. Expect no dependency on the repository checkout and no
+permission prompt hidden behind a blank page. No network is required; emulator
+installation is optional.
+
+## 5. P2 polish/deferred checks
+
+P2 does not gate the coherent-application checkpoint unless it exposes a safety
+or data-integrity defect.
+
+- resize, keyboard focus, scrolling, long names, high-DPI rendering, and
+  accessibility labels across all pages;
+- empty states and recovery wording for optional RomM, DAT, catalogue, and
+  emulator features;
+- repeated navigation and long idle sessions for stale cache or repaint drift;
+- catalogue refresh UX and offline cache freshness beyond the bounded P1 pass;
+- unsupported/general local mod imports and other providers not covered by the
+  four implemented local-install adapters (deferred, not silently supported);
+- ES-DE artwork/media behavior and broader regional policy; MegaDrive remains
+  partial and must not be “fixed” by selecting a region;
+- notification/background service, Android Auto, Chromecast, public access,
+  scheduled work, and other explicitly out-of-scope features.
+
+## 6. Fresh-install journey
+
+Use a temporary application-data root or clean VM. Do not delete a user’s real
+config. Capture a directory manifest before launch and after each step.
+
+1. Start with no config/database/onboarding sidecar, no source, no managed DAT,
+   no emulator profile, and no recovery journal.
+2. Launch and verify a friendly loading/diagnostic state, then the Welcome
+   overlay. Confirm no scan, mount, download, or source write occurs by merely
+   opening the app.
+3. Add a disposable source and confirm the source record, scan progress, counts,
+   and read-only source behavior.
+4. Take the optional DAT path with a valid managed fixture, then repeat once
+   with no DAT and confirm that “optional” does not block completion.
+5. Exercise emulator discovery with no emulator, then add one known profile and
+   rerun readiness. Confirm the first result is not falsely ready.
+6. Run Verify and inspect the summary; explicitly confirm any later repair or
+   mutation rather than treating Verify as permission.
+7. Finish onboarding, close, relaunch, and confirm state, sources, DAT registry,
+   and profile choices survive without onboarding reopening.
+8. In a copy, delete or corrupt `onboarding_state.txt` and remove a managed
+   sidecar. Relaunch and confirm safe `NotStarted`/missing-evidence behavior,
+   recovery wording, and no destructive repair.
+
+## 7. Existing-user upgrade journey
+
+Make a complete copy while the application is stopped. Include `library.sqlite3`
+and `-wal`/`-shm` sidecars when present, config, managed DAT registry, source
+definitions, remembered profiles, onboarding state, activity history, and one
+recoverable journal. Record hashes and file sizes.
+
+Open the copy with the candidate. Verify migration, Home, Sources, DATs,
+emulator profiles, Gamer selection, Playing Library history, Cheats & Mods
+history, ES-DE recovery, and restart. Compare manifests and database counts.
+The first open must not unexpectedly scan, mount, download, rename, rewrite a
+source, reopen completed onboarding, or discard a recovery option. If a pending
+transaction is present, use the documented preview/restore path and capture its
+result. Test downgrade only by replacing the entire copy with the pre-upgrade
+snapshot; never downgrade a live database in place.
+
+## 8. Source/DAT/Verify/Doctor journey
+
+This is one evidence chain: source discovery creates observations; DATs and
+identity evidence refine them; Verify summarizes; Doctor diagnoses health and
+only explicitly confirmed repairs write. Test it with a mixed fixture containing
+valid ZIP/7z/RAR, direct images, duplicate content, unknown folders, malformed
+metadata, missing files, unsafe links, and permission failures.
+
+The acceptance condition is honest degradation: uncertain identity stays
+uncertain, unsupported content stays visible with a bounded terminal reason,
+and a bad item does not hide the rest of the source. Check database rows,
+history, source bytes, and managed-state diffs after every operation.
+
+## 9. Emulator Setup and launch journey
+
+Exercise the real installed profiles, not only discovered labels. Cover Native,
+Explicit, AppImage, Portable, Flatpak where supported, and standalone/external
+launch profile kinds. Use one known-good game per adapter and one candidate that
+must be blocked. Confirm executable path, working directory, arguments,
+environment/portal constraints, content path, and child-process lifecycle.
+
+A pass requires the emulator to open the intended game and the GUI to remain
+responsive. A readiness card or automated profile test alone is insufficient.
+Do not allow this journey to alter emulator configuration unless a separate
+explicit user action is being tested.
+
+## 10. Gamer/RomM journey
+
+From Home, reach Gamer for a local selected game, inspect evidence and launch
+readiness, then browse RomM from Sources if configured. Verify local and RomM
+identity are not silently merged when evidence differs. For RomM, test login or
+connection failure, empty results, pagination, unresolved platform, stale cache,
+and reconnect. RomM is an optional/read-only source in this plan; no download,
+upload, or source mutation is implied by browsing.
+
+## 11. Playing Library / ES-DE journey
+
+Treat the Playing Library planner as the policy boundary and ES-DE as a later
+publication projection. Review the 1G1R decision, confirm the target library,
+publish a small set, inspect exact gamelist bytes, repeat, restart, recover, and
+then launch from ES-DE. Include a target already present and one conflicting
+entry.
+
+The ES-DE check has four independent results: current mapping coverage, preview
+target correctness, safe publication/recovery/idempotency, and actual ES-DE
+launch. Report them separately. Arcade/MAME/FBNeo publication remains neutral
+about emulator choice. Amiga variants and DOS/ScummVM remain distinct. Do not
+use physical QA to justify a guessed MegaDrive regional mapping.
+
+## 12. Cheats & Mods journey
+
+Run P0-6 through P0-9 with the same sequence for each adapter: valid install,
+preview, cancel, explicit confirmation, inspect resulting file/config, reapply,
+undo, wrong identity refusal, and external-edit rollback conflict. Record exact
+destination, original bytes, backup/journal/history records, and post-undo hash.
+
+Use only disposable emulator profiles. The local install should work offline
+when the source file is local; provider/catalogue refresh is a separate network
+branch. Verify activation by opening the emulator/profile where practical, but
+do not claim that file presence proves runtime activation when the adapter says
+activation is unknown. General arbitrary local/community mod importing remains
+deferred; do not expand this sequence into an unsupported feature claim.
+
+## 13. Recovery/rollback journey
+
+Build a recovery ledger before testing: database/config snapshot, source and
+target manifests, ES-DE gamelist bytes, cheat target bytes, journal names,
+history entries, and process IDs where applicable. Test cancellation before
+write, failure during staging, interrupted finalization, restart discovery,
+explicit recovery preview, successful restore, already-restored state, manual
+target modification, missing backup, permission denial, and duplicate retry.
+
+Expected behavior is copy-first, fail-closed, and diagnostic-led. A rollback must
+never overwrite a changed user file silently. Recovery state must be visible and
+actionable after restart. Restore the disposable fixture after each scenario;
+never use `git reset`, `git clean`, or an in-place production collection as a
+test recovery mechanism.
+
+## 14. Large-library performance checks
+
+Use a RomM snapshot or controlled fixture near 94,000 records, plus a small local
+source. This is a bounded pass, not a benchmark of every page.
+
+Measure by observation: time to open Sources/Discovery, first usable paint,
+scroll/page transitions, filter changes, selection changes, RomM reconnect, and
+return to Home. Watch CPU, memory, disk, network requests, and logs. Repeat
+after restart to expose cache invalidation problems.
+
+Pass criteria: no multi-second repaint stalls for ordinary paging/filtering, no
+full-record list rendered when a page is requested, no pathological repeated
+scan/network work on repaint, no unbounded memory growth, and no stale totals or
+selection after a cache refresh. Stop if the fixture causes uncontrolled disk or
+network activity; preserve logs and report the boundary.
+
+## 15. Test fixtures/data needed
+
+- clean and existing-user app-data snapshots, including SQLite WAL/SHM and
+  onboarding/recovery sidecars;
+- disposable source trees with supported containers, direct images, duplicates,
+  unknown/ambiguous names, malformed metadata, missing files, permission errors,
+  symlinks, collisions, and long Unicode names;
+- valid/mismatched DATs and managed-DAT registry entries;
+- at least one verified game for RetroArch, PS2, GameCube/Wii, Xbox 360, and a
+  representative ES-DE platform from each promoted batch;
+- disposable native/Explicit/AppImage/Portable/Flatpak profile fixtures and
+  real installed emulator binaries for launch proof;
+- valid and wrong-identity `.cht`, `.pnach`, Dolphin `.ini`, and Xenia
+  `.patch.toml` files, with pre-existing target variants;
+- a disposable ES-DE installation with writable gamelist, existing entries,
+  conflicting entries, and a way to interrupt/copy the publication boundary;
+- controlled RomM endpoint/account or captured test service with success, empty,
+  pagination, auth failure, malformed JSON, timeout, and stale-cache cases;
+- a near-94k RomM-record snapshot and log/resource observation tooling.
+
+## 16. Recommended execution order
+
+1. Freeze the candidate binary and record commit/artifact hashes; create clean
+   and existing-user copies.
+2. Run P0-1, P0-2, and P0-3 before connecting any real emulator or ES-DE.
+3. Run P0-4 with one native and one external profile kind.
+4. Run P0-6 through P0-9 with disposable emulator profiles.
+5. Run P0-5 publication and actual ES-DE launch.
+6. Run P0-10 upgrade/recovery continuity.
+7. Run P1 source/DAT/Doctor, RomM, 1G1R, profile matrix, ES-DE breadth, and
+   packaged smoke tests.
+8. Run the bounded large-library pass, then P2 usability/deferred checks.
+9. Preserve artifacts: logs, screenshots, manifests, hashes, failure replay
+   steps, and the exact environment/profile fixture identifiers.
+
+## 17. Checkpoint Definition of Done
+
+The checkpoint is physically release-ready when:
+
+- all ten P0 journeys pass on a real desktop, or every exception has a named
+  owner, reproducible evidence, and explicit release acceptance;
+- fresh install and existing-user upgrade both preserve the stated safety and
+  persistence boundaries;
+- at least one real emulator launch and one ES-DE launch open the intended game;
+- all four local-install adapters prove preview, confirmation, idempotent
+  reapply, undo, wrong-identity refusal, and external-edit protection;
+- source/DAT/Verify/Doctor behavior is honest for valid, missing, malformed,
+  ambiguous, and unsafe fixtures;
+- no rollback/recovery path silently loses data or overwrites a user edit;
+- the 94k RomM pass has no release-blocking stalls, runaway scans, or cache
+  corruption;
+- all artifacts and deviations are recorded against the exact build.
+
+| JOURNEY | AUTOMATED STATUS | PHYSICAL QA | PRIORITY | ESTIMATED TIME |
+|---|---|---|---|---:|
+| Fresh install/onboarding/restart | PARTIAL / DEGRADED | Required: real clean profile and desktop input | P0 | 45m |
+| Source scan/identity/Verify/Doctor | AUTOMATED VERIFIED for contracts | Required: mixed files, permissions, real UI | P0 | 60m |
+| Library mutation and rollback | AUTOMATED VERIFIED for transactions | Required: disposable filesystem and interruption | P0 | 60m |
+| Emulator Setup and launch handoff | AUTOMATED VERIFIED for planning | Required: installed emulators/process launch | P0 | 60m |
+| ES-DE publication/recovery/launch | AUTOMATED VERIFIED for contracts | Required: real ES-DE and gamelist launch | P0 | 60m |
+| RetroArch `.cht` install | AUTOMATED VERIFIED for state/adapter | Required: real profile and activation check | P0 | 30m |
+| PCSX2 `.pnach` install | AUTOMATED VERIFIED for state/adapter | Required: real profile and activation check | P0 | 30m |
+| Dolphin Gecko/AR `.ini` install | AUTOMATED VERIFIED for state/adapter | Required: real profile and activation check | P0 | 30m |
+| Xenia `.patch.toml` install | AUTOMATED VERIFIED for state/adapter | Required: explicit path and real profile | P0 | 30m |
+| Existing-user upgrade/recovery continuity | PARTIAL / DEGRADED | Required: copied real state and restart | P0 | 60m |
+| DAT managed lifecycle/offline degradation | AUTOMATED VERIFIED for parsing/state | Required: real files and network interruption | P1 | 45m |
+| Doctor repair matrix | AUTOMATED VERIFIED for gating | Required: permissions and real repair fixtures | P1 | 45m |
+| Emulator profile-kind matrix | AUTOMATED VERIFIED for discovery shapes | Required: installed Native/Flatpak/AppImage/Portable variants | P1 | 75m |
+| RomM connect/browse/import | AUTOMATED VERIFIED for state/projections | Required: controlled service and network failures | P1 | 60m |
+| Playing Library / 1G1R edge cases | AUTOMATED VERIFIED for planning | Required: copied collection and restart | P1 | 60m |
+| Gamer/selected-game continuity | AUTOMATED VERIFIED for projections | Required: real navigation and stale selections | P1 | 30m |
+| ES-DE mapping breadth | AUTOMATED VERIFIED for mapping contracts | Required: disposable target sampling | P1 | 60m |
+| Packaged/extracted desktop smoke | Not verified by unit tests | Required: clean desktop/account | P1 | 45m |
+| 94k RomM bounded performance | PARTIAL / DEGRADED | Required: large snapshot and resource watch | P1 | 60m |
+| Resize/focus/accessibility/long-session polish | PARTIAL / DEGRADED | Required: representative desktop sweep | P2 | 90m |
+| Unsupported general local mods/providers | DEFERRED | Not a current supported journey | P2 | — |
+| MegaDrive regional policy | PARTIAL / DEGRADED | Do not accept guessed mapping | P2 | — |
+
