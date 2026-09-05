@@ -100,6 +100,15 @@ pub(crate) enum CoverPriority {
     LookAhead,
 }
 
+/// The approved RomM media kind requested by the shared artwork worker.
+/// Screenshots use the same origin validation, response limits, decode checks,
+/// and on-disk cache as covers; the index is the screenshot's provider order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GamerArtworkKind {
+    Cover,
+    Screenshot(usize),
+}
+
 /// Why a row has no cover to draw.
 ///
 /// Every variant draws the same placeholder; the distinction exists so the reason
@@ -160,6 +169,7 @@ pub(crate) enum CoverAnswer {
 pub(crate) struct CoverJob {
     pub(crate) local_path: PathBuf,
     pub(crate) priority: CoverPriority,
+    pub(crate) kind: GamerArtworkKind,
     /// The cover key already decoded for this record, when one is being
     /// revalidated after an identity refresh. Lets the worker answer
     /// [`CoverAnswer::Unchanged`] instead of reading and decoding the thumbnail
@@ -179,6 +189,10 @@ pub(crate) struct CoverReply {
     /// The RomM record this answers for, or `None` when the path has no RomM
     /// identity at all.
     pub(crate) provider_game_id: Option<String>,
+    pub(crate) kind: GamerArtworkKind,
+    /// The exact screenshot count from the matched external record. It is
+    /// present for screenshot replies so the Details view can stop probing.
+    pub(crate) screenshot_count: Option<usize>,
     pub(crate) answer: CoverAnswer,
 }
 
@@ -389,6 +403,7 @@ impl GamerCoverCache {
             wanted.push(CoverJob {
                 local_path: path.to_path_buf(),
                 priority,
+                kind: GamerArtworkKind::Cover,
                 held_key,
             });
         };
@@ -426,6 +441,9 @@ impl GamerCoverCache {
     /// so is an answer for a record no longer tracked - both would otherwise hold a
     /// texture nothing will ever draw.
     pub(crate) fn absorb(&mut self, context: &egui::Context, reply: CoverReply) -> bool {
+        if !matches!(reply.kind, GamerArtworkKind::Cover) {
+            return false;
+        }
         if reply.generation != self.generation {
             return false;
         }
@@ -497,6 +515,133 @@ impl GamerCoverCache {
         for (_, path) in order.into_iter().take(excess) {
             self.slots.remove(&path);
             self.last_used.remove(&path);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// Selected-Details screenshot state. It is intentionally separate from the
+/// library cover slots so a screenshot can never occupy or evict a cover slot.
+/// The worker and core ArtworkCache remain shared with covers.
+#[derive(Default)]
+pub(crate) struct GamerScreenshotCache {
+    generation: u64,
+    screenshot_count: HashMap<PathBuf, usize>,
+    slots: HashMap<(PathBuf, usize), CoverSlot>,
+}
+
+pub(crate) const MAX_DETAILS_SCREENSHOTS: usize = 5;
+const MAX_TRACKED_SCREENSHOTS: usize = 32;
+
+impl GamerScreenshotCache {
+    pub(crate) fn library_changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.screenshot_count.clear();
+        self.slots.clear();
+    }
+
+    pub(crate) fn screenshot_count(&self, path: &Path) -> Option<usize> {
+        self.screenshot_count.get(path).copied()
+    }
+
+    /// Returns the bounded number of screenshot cells the Details view should
+    /// reserve, including the initial probe while RomM's screenshot count is
+    /// still being resolved. Once that probe reports no screenshots, the
+    /// section disappears instead of leaving an empty gallery behind.
+    pub(crate) fn section_count(&self, path: &Path) -> Option<usize> {
+        let count = self
+            .screenshot_count(path)
+            .map_or(1, |count| count.min(MAX_DETAILS_SCREENSHOTS));
+        (0..count)
+            .any(|index| {
+                matches!(
+                    self.slot_for(path, index),
+                    Some(
+                        CoverSlot::Loading
+                            | CoverSlot::Ready { .. }
+                            | CoverSlot::Revalidating { .. }
+                    )
+                )
+            })
+            .then_some(count)
+    }
+
+    /// Requests only the selected game's first screenshot until the imported
+    /// record tells us how many real references exist, then requests the bounded
+    /// visible subset in provider order.
+    pub(crate) fn visible(&mut self, path: &Path) -> Vec<CoverJob> {
+        let count = self
+            .screenshot_count(path)
+            .map_or(1, |count| count.min(MAX_DETAILS_SCREENSHOTS));
+        (0..count)
+            .filter_map(|index| {
+                let key = (path.to_path_buf(), index);
+                if self.slots.contains_key(&key) {
+                    return None;
+                }
+                self.slots.insert(key, CoverSlot::Loading);
+                self.evict();
+                Some(CoverJob {
+                    local_path: path.to_path_buf(),
+                    priority: CoverPriority::Selected,
+                    kind: GamerArtworkKind::Screenshot(index),
+                    held_key: None,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn slot_for(&self, path: &Path, index: usize) -> Option<&CoverSlot> {
+        self.slots.get(&(path.to_path_buf(), index))
+    }
+
+    pub(crate) fn absorb(&mut self, context: &egui::Context, reply: CoverReply) -> bool {
+        let GamerArtworkKind::Screenshot(index) = reply.kind else {
+            return false;
+        };
+        if reply.generation != self.generation {
+            return false;
+        }
+        let key = (reply.local_path.clone(), index);
+        if !self.slots.contains_key(&key) {
+            return false;
+        }
+        if let Some(count) = reply.screenshot_count {
+            self.screenshot_count
+                .insert(reply.local_path.clone(), count);
+        }
+        let slot = match reply.answer {
+            CoverAnswer::Ready(image) => {
+                let texture = context.load_texture(
+                    format!("gamer-screenshot-{}-{index}", image.key),
+                    image.image,
+                    egui::TextureOptions::LINEAR,
+                );
+                CoverSlot::Ready {
+                    texture,
+                    provider_game_id: reply.provider_game_id.unwrap_or_default(),
+                    key: image.key.clone(),
+                }
+            }
+            CoverAnswer::Unchanged { .. } => CoverSlot::None(NoCover::Failed),
+            CoverAnswer::None(reason) => CoverSlot::None(reason),
+        };
+        self.slots.insert(key, slot);
+        self.evict();
+        context.request_repaint();
+        true
+    }
+
+    fn evict(&mut self) {
+        while self.slots.len() > MAX_TRACKED_SCREENSHOTS {
+            let Some(key) = self.slots.keys().next().cloned() else {
+                break;
+            };
+            self.slots.remove(&key);
         }
     }
 
@@ -749,33 +894,65 @@ impl RommCoverSource {
         &mut self,
         generation: u64,
         local_path: &Path,
+        kind: GamerArtworkKind,
         held_key: Option<&str>,
     ) -> CoverReply {
         use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
 
-        let reply = |provider_game_id: Option<String>, answer: CoverAnswer| CoverReply {
+        let reply = |provider_game_id: Option<String>,
+                     screenshot_count: Option<usize>,
+                     answer: CoverAnswer| CoverReply {
             generation,
             local_path: local_path.to_path_buf(),
             provider_game_id,
+            kind,
+            screenshot_count,
             answer,
         };
 
         let Some(record) = self.by_path.get(local_path).cloned() else {
-            return reply(None, CoverAnswer::None(NoCover::NoRommIdentity));
+            return reply(None, None, CoverAnswer::None(NoCover::NoRommIdentity));
         };
         let game_id = record.provider_game_id.clone();
 
-        // The same rule the core enforces, checked before anything is asked for: a
-        // record whose only artwork is a public scraper URL produces a placeholder
-        // and no request at all.
-        match plan_for(&record) {
-            CoverPlan::Placeholder(reason) => {
-                return reply(Some(game_id), CoverAnswer::None(reason));
+        let screenshot_count = record
+            .artwork
+            .as_ref()
+            .map(|artwork| artwork.screenshots.len());
+        let request = match kind {
+            GamerArtworkKind::Cover => {
+                // The same rule the core enforces, checked before anything is
+                // asked for: public scraper URLs are provenance only.
+                match plan_for(&record) {
+                    CoverPlan::Placeholder(reason) => {
+                        return reply(Some(game_id), screenshot_count, CoverAnswer::None(reason));
+                    }
+                    CoverPlan::UseRommHostedCover => {}
+                }
+                ArtworkRequest::from_record(&record)
             }
-            CoverPlan::UseRommHostedCover => {}
-        }
-
-        let request = ArtworkRequest::from_record(&record);
+            GamerArtworkKind::Screenshot(index) => {
+                let Some(media) = record
+                    .artwork
+                    .as_ref()
+                    .and_then(|artwork| artwork.screenshots.get(index))
+                else {
+                    return reply(
+                        Some(game_id),
+                        screenshot_count,
+                        CoverAnswer::None(NoCover::NoArtwork),
+                    );
+                };
+                if media.hosted_reference.is_none() {
+                    return reply(
+                        Some(game_id),
+                        screenshot_count,
+                        CoverAnswer::None(NoCover::PublicOnly),
+                    );
+                }
+                ArtworkRequest::from_media(&record.provider_game_id, media)
+            }
+        };
         let key = ArtworkCache::key_for(&self.server_id, &request);
         if held_key == Some(key.as_str()) {
             // The key is a digest of the server, the provider game id and RomM's own
@@ -787,22 +964,42 @@ impl RommCoverSource {
                 .unwrap_or_default();
             // Kept warm in the eviction order even though nothing was read.
             self.artwork.touch(&self.server_id, &key, now);
-            return reply(Some(game_id), CoverAnswer::Unchanged { key });
+            return reply(
+                Some(game_id),
+                screenshot_count,
+                CoverAnswer::Unchanged { key },
+            );
         }
         if let Some(thumbnail) = self.artwork.lookup(&self.server_id, &request) {
             return match crate::romm_game::decode_thumbnail(&thumbnail, true) {
-                Ok(image) => reply(Some(game_id), CoverAnswer::Ready(Box::new(image))),
-                Err(_) => reply(Some(game_id), CoverAnswer::None(NoCover::Failed)),
+                Ok(image) => reply(
+                    Some(game_id),
+                    screenshot_count,
+                    CoverAnswer::Ready(Box::new(image)),
+                ),
+                Err(_) => reply(
+                    Some(game_id),
+                    screenshot_count,
+                    CoverAnswer::None(NoCover::Failed),
+                ),
             };
         }
 
         if self.validated_source().is_none() {
-            return reply(Some(game_id), CoverAnswer::None(NoCover::Unavailable));
+            return reply(
+                Some(game_id),
+                screenshot_count,
+                CoverAnswer::None(NoCover::Unavailable),
+            );
         }
         // Re-borrowed immutably now that validation is settled, so the fetch can
         // read the source alongside the cache and the transport.
         let Some(Ok(source)) = self.source.as_ref() else {
-            return reply(Some(game_id), CoverAnswer::None(NoCover::Unavailable));
+            return reply(
+                Some(game_id),
+                screenshot_count,
+                CoverAnswer::None(NoCover::Unavailable),
+            );
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -813,8 +1010,16 @@ impl RommCoverSource {
             .fetch(source, &self.transport, &request, now, None)
         {
             Ok(thumbnail) => match crate::romm_game::decode_thumbnail(&thumbnail, false) {
-                Ok(image) => reply(Some(game_id), CoverAnswer::Ready(Box::new(image))),
-                Err(_) => reply(Some(game_id), CoverAnswer::None(NoCover::Failed)),
+                Ok(image) => reply(
+                    Some(game_id),
+                    screenshot_count,
+                    CoverAnswer::Ready(Box::new(image)),
+                ),
+                Err(_) => reply(
+                    Some(game_id),
+                    screenshot_count,
+                    CoverAnswer::None(NoCover::Failed),
+                ),
             },
             Err(refusal) => {
                 use archivefs_core::identity_source::artwork::ArtworkRefusal;
@@ -822,7 +1027,7 @@ impl RommCoverSource {
                     ArtworkRefusal::Request(_) | ArtworkRefusal::Cancelled => NoCover::Unavailable,
                     _ => NoCover::Failed,
                 };
-                reply(Some(game_id), CoverAnswer::None(reason))
+                reply(Some(game_id), screenshot_count, CoverAnswer::None(reason))
             }
         }
     }
@@ -1076,6 +1281,7 @@ impl CoverWorker {
                     Some(source) => source.resolve(
                         queued.generation,
                         &queued.job.local_path,
+                        queued.job.kind,
                         queued.job.held_key.as_deref(),
                     ),
                     // The catalogue itself could not be opened - RomM has never been
@@ -1086,6 +1292,8 @@ impl CoverWorker {
                         generation: queued.generation,
                         local_path: queued.job.local_path,
                         provider_game_id: None,
+                        kind: queued.job.kind,
+                        screenshot_count: None,
                         answer: CoverAnswer::None(NoCover::Unavailable),
                     },
                 };

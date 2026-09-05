@@ -1240,6 +1240,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         platform_artwork_manager: PlatformArtworkManagerState::default(),
 
         gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
+        gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
         // No worker in tests: nothing here may open the real catalogue or
         // touch the network. Covers are driven through `absorb` instead.
         gamer_cover_worker: None,

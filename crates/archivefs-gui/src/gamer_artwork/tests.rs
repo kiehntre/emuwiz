@@ -9,6 +9,7 @@ use super::*;
 use archivefs_core::identity_source::cache::IdentityCache;
 use archivefs_core::identity_source::model::{
     ArtworkReference, ExternalIdentityRecord, ExternalVerification, IdentityProvider,
+    MediaReference,
 };
 
 const SERVER: &str = "https://romm.example";
@@ -74,6 +75,117 @@ fn path(id: &str) -> PathBuf {
     PathBuf::from(format!("/roms/{id}.sfc"))
 }
 
+#[test]
+fn selected_details_screenshot_requests_are_bounded_after_exact_path_resolution() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("42");
+    let first = cache.visible(&local_path);
+    assert_eq!(first.len(), 1, "probe only the first screenshot initially");
+    assert_eq!(first[0].kind, GamerArtworkKind::Screenshot(0));
+
+    let generation = cache.generation;
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("42".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(99),
+            answer: CoverAnswer::None(NoCover::Failed),
+        }
+    ));
+    let rest = cache.visible(&local_path);
+    assert_eq!(rest.len(), MAX_DETAILS_SCREENSHOTS - 1);
+    assert!(rest.iter().all(|job| matches!(
+        job.kind,
+        GamerArtworkKind::Screenshot(index) if (1..MAX_DETAILS_SCREENSHOTS).contains(&index)
+    )));
+    assert!(cache.tracked() <= MAX_DETAILS_SCREENSHOTS);
+}
+
+#[test]
+fn screenshot_section_is_visible_while_the_initial_probe_is_loading() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("probe");
+
+    cache.visible(&local_path);
+
+    assert_eq!(cache.screenshot_count(&local_path), None);
+    assert_eq!(cache.section_count(&local_path), Some(1));
+}
+
+#[test]
+fn screenshot_section_disappears_after_a_record_has_no_screenshots() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("none");
+    let generation = cache.generation;
+
+    cache.visible(&local_path);
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("none".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(0),
+            answer: CoverAnswer::None(NoCover::NoArtwork),
+        }
+    ));
+
+    assert_eq!(cache.section_count(&local_path), None);
+}
+
+#[test]
+fn screenshot_section_caps_real_records_at_the_display_limit() {
+    let mut cache = GamerScreenshotCache::default();
+    let local_path = path("many");
+    let generation = cache.generation;
+
+    cache.visible(&local_path);
+    assert!(cache.absorb(
+        &context(),
+        CoverReply {
+            generation,
+            local_path: local_path.clone(),
+            provider_game_id: Some("many".to_string()),
+            kind: GamerArtworkKind::Screenshot(0),
+            screenshot_count: Some(99),
+            answer: CoverAnswer::Ready(image("shot-0")),
+        }
+    ));
+
+    assert_eq!(
+        cache.section_count(&local_path),
+        Some(MAX_DETAILS_SCREENSHOTS)
+    );
+}
+
+#[test]
+fn imported_screenshot_reference_keeps_provider_order_and_is_not_a_public_cover() {
+    let mut artwork = romm_hosted();
+    artwork.screenshots = vec![
+        MediaReference {
+            hosted_reference: Some("/assets/romm/shot-1.png".to_string()),
+            public_reference: Some("https://public.example/shot-1.png".to_string()),
+        },
+        MediaReference {
+            hosted_reference: Some("/assets/romm/shot-2.png".to_string()),
+            public_reference: None,
+        },
+    ];
+    let imported = record("42", Some(artwork));
+    assert_eq!(imported.artwork.as_ref().unwrap().screenshots.len(), 2);
+    assert_eq!(
+        imported.artwork.as_ref().unwrap().screenshots[0]
+            .hosted_reference
+            .as_deref(),
+        Some("/assets/romm/shot-1.png")
+    );
+    assert!(matches!(plan_for(&imported), CoverPlan::UseRommHostedCover));
+}
+
 /// A decoded cover, as the worker would hand one over. Tiny: these tests are
 /// about which record it lands on, never about its pixels.
 fn image(key: &str) -> Box<crate::romm_game::CoverImage> {
@@ -96,6 +208,8 @@ fn ready(generation: u64, id: &str) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Ready(image(id)),
     }
 }
@@ -105,6 +219,8 @@ fn placeholder(generation: u64, id: &str, reason: NoCover) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::None(reason),
     }
 }
@@ -295,6 +411,8 @@ fn two_files_of_one_game_each_draw_that_games_cover() {
                 generation: cache.generation(),
                 local_path: local_path.clone(),
                 provider_game_id: Some("shared-game".to_string()),
+                kind: GamerArtworkKind::Cover,
+                screenshot_count: None,
                 answer: CoverAnswer::Ready(image("shared-key")),
             }
         ));
@@ -403,6 +521,8 @@ fn a_cover_with_no_record_to_attach_it_to_is_refused() {
         generation: cache.generation(),
         local_path: path("1"),
         provider_game_id: None,
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Ready(image("1")),
     };
     assert!(
@@ -566,6 +686,8 @@ fn unchanged(generation: u64, id: &str, key: &str) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Unchanged {
             key: key.to_string(),
         },
@@ -578,6 +700,8 @@ fn ready_with_key(generation: u64, id: &str, key: &str) -> CoverReply {
         generation,
         local_path: path(id),
         provider_game_id: Some(id.to_string()),
+        kind: GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: CoverAnswer::Ready(image(key)),
     }
 }
@@ -839,6 +963,7 @@ fn queued(priority: CoverPriority, id: &str, sequence: u64) -> QueuedJob {
         job: CoverJob {
             local_path: path(id),
             priority,
+            kind: GamerArtworkKind::Cover,
             held_key: None,
         },
         sequence,

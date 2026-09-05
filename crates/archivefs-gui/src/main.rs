@@ -4866,6 +4866,9 @@ struct ArchiveFsApp {
     /// for, what has been answered, and which library generation those
     /// answers belong to. Holds no thread of its own - see `gamer_cover_worker`.
     gamer_covers: crate::gamer_artwork::GamerCoverCache,
+    /// Selected-Details RomM screenshots, sharing the cover worker and
+    /// ArtworkCache security path while remaining separate from cover slots.
+    gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache,
     /// The thread that resolves those covers, started on the first frame that
     /// actually draws the list so a session that never opens Gamer View never
     /// opens the catalogue. `None` until then.
@@ -5225,6 +5228,7 @@ impl ArchiveFsApp {
             platform_artwork_manager: PlatformArtworkManagerState::default(),
 
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
+            gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
             gamer_cover_worker: None,
             gamer_cover_worker_allowed: true,
             gamer_cover_library: None,
@@ -9320,6 +9324,7 @@ impl ArchiveFsApp {
             // the refreshed catalogue confirms the record, so a path whose provider
             // id moved cannot show the old cover even for one frame.
             self.gamer_covers.identity_refreshed();
+            self.gamer_screenshots.library_changed();
             if let Some(worker) = self.gamer_cover_worker.as_ref() {
                 worker.reindex();
             }
@@ -19257,16 +19262,20 @@ impl ArchiveFsApp {
                     if self.gamer_cover_library != library {
                         self.gamer_cover_library = library;
                         self.gamer_covers.library_changed();
+                        self.gamer_screenshots.library_changed();
                     }
                     // Answers first, so a cover that arrived since the last frame
                     // is drawn in this one. Anything from a superseded generation
                     // is dropped inside `absorb`.
                     if let Some(worker) = self.gamer_cover_worker.as_ref() {
                         for reply in worker.drain() {
-                            self.gamer_covers.absorb(ui.ctx(), reply);
+                            if !self.gamer_covers.absorb(ui.ctx(), reply.clone()) {
+                                self.gamer_screenshots.absorb(ui.ctx(), reply);
+                            }
                         }
                     }
                     let mut cover_requests: Vec<crate::gamer_artwork::CoverJob> = Vec::new();
+                    let mut screenshot_requests: Vec<crate::gamer_artwork::CoverJob> = Vec::new();
                     // Enrichment (synopsis/genre/players/rating/release year):
                     // answers first, same as covers above, then a request only
                     // when the focused game actually changed - never once per
@@ -19333,7 +19342,9 @@ impl ArchiveFsApp {
                             artwork_directory: self.custom_platform_artwork_directory.as_deref(),
                             artwork_cache: &mut self.platform_artwork_cache,
                             covers: &mut self.gamer_covers,
+                            screenshots: &mut self.gamer_screenshots,
                             cover_requests: &mut cover_requests,
+                            screenshot_requests: &mut screenshot_requests,
                             game_metadata,
                             identity_status: gamer_identity_status,
                             prepared_member,
@@ -19351,7 +19362,9 @@ impl ArchiveFsApp {
                     // so a session that never opens Gamer View never opens the
                     // catalogue, and an empty or unfiltered-to-nothing list starts
                     // no thread at all.
-                    if !cover_requests.is_empty() && self.gamer_cover_worker_allowed {
+                    if (!cover_requests.is_empty() || !screenshot_requests.is_empty())
+                        && self.gamer_cover_worker_allowed
+                    {
                         let worker = self.gamer_cover_worker.get_or_insert_with(|| {
                             crate::gamer_artwork::CoverWorker::start(
                                 ui.ctx().clone(),
@@ -19360,6 +19373,9 @@ impl ArchiveFsApp {
                         });
                         let generation = self.gamer_covers.generation();
                         for job in cover_requests {
+                            worker.request(generation, job);
+                        }
+                        for job in screenshot_requests {
                             worker.request(generation, job);
                         }
                     }

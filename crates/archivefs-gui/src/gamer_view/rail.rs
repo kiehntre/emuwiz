@@ -120,16 +120,37 @@ pub(crate) fn show_browsing_rail(
                         .size(theme::SECTION_TITLE_SIZE)
                         .color(theme::SECONDARY_TEXT),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let width = (ui.available_width()).min(220.0).max(100.0);
-                    ui.add_sized(
-                        egui::vec2(width, 18.0),
-                        egui::TextEdit::singleline(filter).hint_text("Search games..."),
-                    );
-                });
             });
 
-            draw_alpha_strip(ui, alpha_jump)
+            let toolbar_width = ui.available_width();
+            let search_width = toolbar_width.min(220.0).max(150.0);
+            let jump_target = if toolbar_width >= 760.0 {
+                ui.horizontal_top(|ui| {
+                    let alpha_width = (ui.available_width() - search_width - 8.0).max(0.0);
+                    let target = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(alpha_width, 25.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| draw_alpha_strip(ui, alpha_jump),
+                        )
+                        .inner;
+                    ui.add_sized(
+                        egui::vec2(search_width.min(ui.available_width()), 22.0),
+                        egui::TextEdit::singleline(filter).hint_text("Search games..."),
+                    );
+                    target
+                })
+                .inner
+            } else {
+                let target = draw_alpha_strip(ui, alpha_jump);
+                ui.add_sized(
+                    egui::vec2(search_width.min(ui.available_width()), 22.0),
+                    egui::TextEdit::singleline(filter).hint_text("Search games..."),
+                );
+                target
+            };
+
+            jump_target
         })
         .inner;
 

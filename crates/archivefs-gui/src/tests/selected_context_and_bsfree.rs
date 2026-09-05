@@ -2623,6 +2623,8 @@ fn cover_reply(
         generation,
         local_path: PathBuf::from(local_path),
         provider_game_id: Some(romm_game_id.to_string()),
+        kind: crate::gamer_artwork::GamerArtworkKind::Cover,
+        screenshot_count: None,
         answer: crate::gamer_artwork::CoverAnswer::Ready(Box::new(crate::romm_game::CoverImage {
             key: romm_game_id.to_string(),
             width: 20,
@@ -2803,6 +2805,8 @@ fn a_failed_cover_leaves_the_row_exactly_as_it_was() {
             generation,
             local_path: PathBuf::from(featured_path(0)),
             provider_game_id: Some("101".to_string()),
+            kind: crate::gamer_artwork::GamerArtworkKind::Cover,
+            screenshot_count: None,
             answer: crate::gamer_artwork::CoverAnswer::None(crate::gamer_artwork::NoCover::Failed),
         },
     );
@@ -2937,6 +2941,8 @@ fn a_confirmed_record_gets_its_own_texture_back_without_a_new_upload() {
             generation: app.gamer_covers.generation(),
             local_path: PathBuf::from(featured_path(0)),
             provider_game_id: Some("101".to_string()),
+            kind: crate::gamer_artwork::GamerArtworkKind::Cover,
+            screenshot_count: None,
             answer: crate::gamer_artwork::CoverAnswer::Unchanged {
                 key: "101".to_string(),
             },
@@ -3347,6 +3353,8 @@ fn missing_artwork_keeps_the_panel_geometry_exactly() {
             generation,
             local_path: PathBuf::from(featured_path(0)),
             provider_game_id: Some("101".to_string()),
+            kind: crate::gamer_artwork::GamerArtworkKind::Cover,
+            screenshot_count: None,
             answer: crate::gamer_artwork::CoverAnswer::None(
                 crate::gamer_artwork::NoCover::NoArtwork,
             ),
@@ -3383,6 +3391,8 @@ fn a_failed_cover_keeps_the_panel_geometry_exactly() {
             generation,
             local_path: PathBuf::from(featured_path(0)),
             provider_game_id: Some("101".to_string()),
+            kind: crate::gamer_artwork::GamerArtworkKind::Cover,
+            screenshot_count: None,
             answer: crate::gamer_artwork::CoverAnswer::None(crate::gamer_artwork::NoCover::Failed),
         },
     );

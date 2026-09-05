@@ -104,6 +104,7 @@ fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
         });
     let ctx = egui::Context::default();
     let mut cover_requests = Vec::new();
+    let mut screenshot_requests = Vec::new();
     let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
     let base = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
@@ -136,7 +137,9 @@ fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
                         artwork_directory: None,
                         artwork_cache: &mut app.platform_artwork_cache,
                         covers: &mut app.gamer_covers,
+                        screenshots: &mut app.gamer_screenshots,
                         cover_requests: &mut cover_requests,
+                        screenshot_requests: &mut screenshot_requests,
                         game_metadata: None,
                         identity_status: None,
                         prepared_member: false,
@@ -206,6 +209,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
     ));
     let ctx = egui::Context::default();
     let mut cover_requests = Vec::new();
+    let mut screenshot_requests = Vec::new();
     let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
     let screen = egui::vec2(1400.0, 900.0);
     let base = egui::RawInput {
@@ -236,7 +240,9 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                         artwork_directory: None,
                         artwork_cache: &mut app.platform_artwork_cache,
                         covers: &mut app.gamer_covers,
+                        screenshots: &mut app.gamer_screenshots,
                         cover_requests: &mut cover_requests,
+                        screenshot_requests: &mut screenshot_requests,
                         game_metadata: None,
                         identity_status: None,
                         prepared_member: false,
@@ -322,6 +328,7 @@ fn render_gamer_card_with_launch_state(
 
     let ctx = egui::Context::default();
     let mut cover_requests = Vec::new();
+    let mut screenshot_requests = Vec::new();
     ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let LoadState::Ready(data) = &app.state else {
@@ -344,7 +351,9 @@ fn render_gamer_card_with_launch_state(
                     artwork_directory: None,
                     artwork_cache: &mut app.platform_artwork_cache,
                     covers: &mut app.gamer_covers,
+                    screenshots: &mut app.gamer_screenshots,
                     cover_requests: &mut cover_requests,
+                    screenshot_requests: &mut screenshot_requests,
                     game_metadata: None,
                     identity_status: None,
                     prepared_member: false,
@@ -537,6 +546,7 @@ fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
         ..Default::default()
     };
     let mut cover_requests = Vec::new();
+    let mut screenshot_requests = Vec::new();
     let mut launch_state = launch_readiness_page::RetroArchLaunchState::default();
 
     let mut frame = |input: egui::RawInput| -> (egui::FullOutput, Option<GamerViewAction>) {
@@ -563,7 +573,9 @@ fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
                         artwork_directory: None,
                         artwork_cache: &mut app.platform_artwork_cache,
                         covers: &mut app.gamer_covers,
+                        screenshots: &mut app.gamer_screenshots,
                         cover_requests: &mut cover_requests,
+                        screenshot_requests: &mut screenshot_requests,
                         game_metadata: None,
                         identity_status: None,
                         prepared_member: false,

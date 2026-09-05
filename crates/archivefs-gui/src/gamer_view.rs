@@ -998,11 +998,13 @@ pub(crate) struct GamerViewViewState<'a> {
     /// RomM covers already answered for, and the scheduling that decides what
     /// to ask about next.
     pub(crate) covers: &'a mut crate::gamer_artwork::GamerCoverCache,
+    pub(crate) screenshots: &'a mut crate::gamer_artwork::GamerScreenshotCache,
     /// Filled with the records this frame wants covers for. The view itself
     /// never sends anything: it reports what the visible window needs and the
     /// caller hands that to the worker, which keeps this function free of
     /// threads and testable without one.
     pub(crate) cover_requests: &'a mut Vec<crate::gamer_artwork::CoverJob>,
+    pub(crate) screenshot_requests: &'a mut Vec<crate::gamer_artwork::CoverJob>,
     /// Enrichment (synopsis/genre/players/rating/release year) already
     /// resolved for the currently focused game, if any - `None` until the
     /// caller's worker has answered, distinct from
@@ -1038,8 +1040,10 @@ pub(crate) fn show_gamer_details_panel(
     enrichment: Option<&crate::game_metadata::GameMetadataResult>,
     identity_status: Option<GamerIdentityStatus>,
     covers: &crate::gamer_artwork::GamerCoverCache,
+    screenshots: &mut crate::gamer_artwork::GamerScreenshotCache,
     artwork_cache: &mut PlatformArtworkCache,
     artwork_directory: Option<&Path>,
+    screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
 ) -> Option<GamerViewAction> {
     let view = GamerMetadataView::merge(&record.metadata, enrichment);
     let platform = record
@@ -1050,6 +1054,7 @@ pub(crate) fn show_gamer_details_panel(
         .unwrap_or("Unknown");
     let title = gamer_display_title(record);
     let archive_path = record.mount_plan.archive.path.as_path();
+    screenshot_requests.extend(screenshots.visible(archive_path));
     let cover = covers.slot_for(archive_path, None);
     let real_cover = matches!(cover, Some(crate::gamer_artwork::CoverSlot::Ready { .. }));
     let media_box = details_cover_box(real_cover);
@@ -1100,6 +1105,12 @@ pub(crate) fn show_gamer_details_panel(
             });
         }
     });
+
+    if let Some(count) = screenshots.section_count(archive_path) {
+        ui.add_space(theme::SECTION_GAP);
+        widgets::section_header(ui, "SCREENSHOTS", None);
+        show_gamer_screenshot_strip(ui, screenshots, archive_path, count);
+    }
 
     if let Some(synopsis) = view.synopsis {
         ui.add_space(theme::SECTION_GAP);
@@ -1154,9 +1165,65 @@ pub(crate) fn show_gamer_details_panel(
         if let Some(source) = record.metadata.source.as_deref() {
             detail_row(ui, "Metadata source", source);
         }
-        ui.label("RomM screenshot references are retained in the imported identity cache, but the Gamer record does not yet carry that identity linkage. The future media seam is the selected archive path to its external identity record; no screenshot is fetched here.");
+        ui.label("Screenshot references are read from the imported RomM identity matched to this exact archive path. Only RomM-hosted references are eligible for loading; public scraper references are retained as provenance and are not fetched.");
     });
     show_game_information_provenance(ui, enrichment)
+}
+
+fn show_gamer_screenshot_strip(
+    ui: &mut egui::Ui,
+    screenshots: &crate::gamer_artwork::GamerScreenshotCache,
+    archive_path: &Path,
+    count: usize,
+) {
+    let visible = count.min(crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS);
+    let columns = if ui.available_width() >= 1_200.0 {
+        4
+    } else {
+        3
+    };
+    ui.columns(columns, |columns| {
+        for (index, column) in columns.iter_mut().enumerate() {
+            if index >= visible {
+                break;
+            }
+            let width = (column.available_width() - 8.0).max(80.0);
+            let height = (width * 9.0 / 16.0).clamp(70.0, 150.0);
+            match screenshots.slot_for(archive_path, index) {
+                Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
+                    widgets::media_frame(column, egui::vec2(width, height), None, |ui, rect| {
+                        let drawn = crate::gamer_artwork::fit_within(
+                            egui::vec2(width, height),
+                            texture.size_vec2(),
+                        );
+                        ui.painter().image(
+                            texture.id(),
+                            egui::Rect::from_center_size(rect.center(), drawn),
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    });
+                }
+                Some(crate::gamer_artwork::CoverSlot::Loading) => {
+                    widgets::media_frame(
+                        column,
+                        egui::vec2(width, height),
+                        Some("Loading"),
+                        |_, _| {},
+                    );
+                }
+                Some(crate::gamer_artwork::CoverSlot::None(_)) | None => {}
+                Some(crate::gamer_artwork::CoverSlot::Revalidating { .. }) => {
+                    widgets::media_frame(
+                        column,
+                        egui::vec2(width, height),
+                        Some("Loading"),
+                        |_, _| {},
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn show_details_hero_text(
@@ -1303,7 +1370,9 @@ pub(crate) fn show_gamer_view(
         artwork_directory,
         artwork_cache,
         covers,
+        screenshots,
         cover_requests,
+        screenshot_requests,
         game_metadata,
         identity_status,
         prepared_member,
@@ -1382,8 +1451,10 @@ pub(crate) fn show_gamer_view(
                     game_metadata,
                     identity_status,
                     covers,
+                    screenshots,
                     artwork_cache,
                     artwork_directory,
+                    screenshot_requests,
                 ),
                 None => {
                     ui.label("Select a game to view its details.");
