@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EmuWiz
+Exec=emuwiz
+Icon=io.github.kiehntre.emuwiz
+Terminal=false
+Categories=Utility;Archiving;
+StartupWMClass=io.github.kiehntre.emuwiz
+SingleMainWindow=true

@@ -1,0 +1,7 @@
+#!/bin/sh
+# AppImage runtime entrypoint. Deliberately no HOME, XDG, PATH, or graphics
+# environment mutation: EmuWiz and its verified host-tool launches retain the
+# user's normal filesystem and runtime environment.
+set -eu
+
+exec "${APPDIR:?AppImage runtime did not set APPDIR}/usr/bin/emuwiz" "$@"

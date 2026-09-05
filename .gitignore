@@ -1,4 +1,5 @@
 /target
+/dist
 
 # Developer-selected GameHacking index cache roots must never become source or
 # release assets. The default cache lives outside the repository as well.
