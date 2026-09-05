@@ -58,39 +58,40 @@ use archivefs_core::patch_manager::{
     BsFreeWiiErrorKind, BsFreeWiiInstallPreviewRequest, BsFreeWiiMatch, BsFreeWiiSearchOutcome,
     BsFreeWiiSearchStatus, CheatCandidate, CheatCandidateArchive, CheatCandidateClassification,
     CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest,
-    CheatInstallPlanError, CheatInstallPreviewRequest, CheatProviderSourceState, CheatSelection,
-    CheatSourceCancellation, CheatSourceError, CheatSourceExclusionKind, CheatSourceFetchOptions,
-    CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList,
-    CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DesktopBrowserLauncher, DeviceFormatCompatibility,
-    DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
-    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
-    DolphinCatalogueUpdateCheck, DolphinDedupFinding, DolphinGameIniInventory,
-    DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
-    DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
-    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
-    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelectReason,
-    EmulatorProfileSelection, FlycastProfileDiscovery, FlycastProfileDiscoveryRoots,
-    GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY, GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE,
-    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
-    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
-    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
-    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
-    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
-    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
-    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
-    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
-    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
-    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
-    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
-    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState, PageRequest,
-    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
-    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewProposedAction, PreviewSourceItem, PreviewState,
-    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
+    CheatInstallPlanError, CheatInstallPreviewRequest, CheatJourneyGameIdentity,
+    CheatJourneyIdentityEvidence, CheatJourneyIdentityEvidenceKind, CheatJourneyIdentityState,
+    CheatProviderSourceState, CheatSelection, CheatSourceCancellation, CheatSourceError,
+    CheatSourceExclusionKind, CheatSourceFetchOptions, CheatSourceFetchResult,
+    CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList, CheatSourceListEntry,
+    CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
+    DesktopBrowserLauncher, DeviceFormatCompatibility, DolphinCatalogue, DolphinCatalogueError,
+    DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult,
+    DolphinCatalogueLoad, DolphinCatalogueUpdateCheck, DolphinDedupFinding,
+    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
+    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
+    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
+    EmulatorProfileSelectReason, EmulatorProfileSelection, FlycastProfileDiscovery,
+    FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
+    GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
+    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
+    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
+    GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
+    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
+    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
+    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
+    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
+    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
+    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
+    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
+    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
+    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
+    PreviewIdentityState, PreviewMatchStrength, PreviewProposedAction, PreviewSourceItem,
+    PreviewState, ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
     ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
     RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
@@ -19710,6 +19711,13 @@ impl ArchiveFsApp {
                             workflow.display_name.clone(),
                         )
                     });
+                    let local_cheat_install_context = self
+                        .cheat_workflow
+                        .as_ref()
+                        .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::RetroArch)
+                        .map(|workflow| {
+                            local_cheat_install_context(workflow, &self.retroarch_profiles)
+                        });
                     let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
@@ -19721,6 +19729,7 @@ impl ArchiveFsApp {
                                 user_cheat_selected
                                     .as_ref()
                                     .map(|(id, title)| (id.as_str(), title.as_str())),
+                                local_cheat_install_context.as_ref(),
                             );
                             ui.add_space(theme::SECTION_GAP);
                             let cheatbase_action = cheatbase_page::show_cheatbase_page(
@@ -31013,10 +31022,66 @@ fn build_cheat_candidate_request(
     ))
 }
 
+/// Binds the currently selected RetroArch game into the identity and
+/// destination the local-cheat-file install action needs - the same
+/// archive path, platform, region, and verified evidence
+/// `build_cheat_candidate_request` already binds for the trusted-catalogue
+/// journey, reused unchanged rather than re-derived.
+fn local_cheat_install_context(
+    workflow: &CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+) -> user_cheat_import_page::LocalCheatInstallContext {
+    let identity = ready_game_identity(workflow);
+    let mut evidence = vec![CheatJourneyIdentityEvidence {
+        kind: CheatJourneyIdentityEvidenceKind::CanonicalLibraryRecord,
+        value: workflow.archive_path.display().to_string(),
+    }];
+    if let Some(serial) = identity.and_then(|report| report.verified_value(IdentityKind::Ps2Serial))
+    {
+        evidence.push(CheatJourneyIdentityEvidence {
+            kind: CheatJourneyIdentityEvidenceKind::ProductCode,
+            value: serial.to_string(),
+        });
+    }
+    if let Some(hash) = identity.and_then(GameIdentityReport::verified_loose_rom_sha256) {
+        evidence.push(CheatJourneyIdentityEvidence {
+            kind: CheatJourneyIdentityEvidenceKind::ContentHash,
+            value: hash.to_string(),
+        });
+    }
+    let game = CheatJourneyGameIdentity {
+        state: CheatJourneyIdentityState::Verified,
+        selected_archive: workflow.archive_path.clone(),
+        identity_key: workflow.archive_path.display().to_string(),
+        archive: CheatCandidateArchive {
+            display_name: workflow.display_name.clone(),
+            platform: workflow.platform.clone(),
+            region: workflow.region.clone(),
+            serial: identity
+                .and_then(|report| report.verified_value(IdentityKind::Ps2Serial))
+                .map(str::to_owned),
+            content_hash: identity
+                .and_then(GameIdentityReport::verified_loose_rom_sha256)
+                .map(str::to_owned),
+            content_basename: cheat_content_basename(workflow),
+        },
+        evidence,
+    };
+    let destination =
+        selected_retroarch_cheat_root(workflow, profiles).map(|root| CheatDestinationRequest {
+            profile_cheat_root: root,
+            platform: workflow.platform.clone(),
+            content_basename: cheat_content_basename(workflow),
+            playlist_name: None,
+            catalogue_name: workflow.display_name.clone(),
+        });
+    user_cheat_import_page::LocalCheatInstallContext { game, destination }
+}
+
 /// The private directory generated cheat files are staged into before they
 /// enter the transaction pipeline. Kept beside the other managed roots so
 /// it is never a directory the user browses or an emulator reads.
-fn default_generated_cheat_staging_root() -> Result<PathBuf, String> {
+pub(crate) fn default_generated_cheat_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
         .map(|root| {
             root.parent()

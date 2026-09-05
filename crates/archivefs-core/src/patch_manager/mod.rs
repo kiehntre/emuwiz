@@ -64,6 +64,7 @@ mod gamehacking_wii_provider;
 mod gecko_document;
 mod hatari_local;
 mod import_safety;
+mod local_cheat_install;
 mod matching;
 mod melonds_local;
 mod mgba_local;
@@ -514,6 +515,10 @@ pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
     ImportSourceKind, ImportTrustState, LocalSafetyScanningState, UNKNOWN_CODE_POLICY,
     automatic_execution_allowed, classify_active_content, trust_after_inspection,
+};
+pub use local_cheat_install::{
+    LOCAL_CHEAT_SOURCE_NAME, LocalCheatFileDiscovery, LocalCheatFileError, LocalCheatFileLocation,
+    discover_local_retroarch_cheat_file,
 };
 pub use melonds_local::{
     MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,

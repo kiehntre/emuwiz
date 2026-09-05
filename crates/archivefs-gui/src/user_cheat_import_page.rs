@@ -9,14 +9,71 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
+use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::patch_manager::{
-    UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat, UserCheatImportError,
-    UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState, scan_user_cheat_directory,
-    scan_user_cheat_file,
+    CheatCandidateOptions, CheatDestinationRequest, CheatJourneyApplyApproval,
+    CheatJourneyApplyOptions, CheatJourneyGameIdentity, CheatJourneyPreview,
+    CheatJourneyPreviewAction, CheatJourneyUndoConfirmation, CheatJourneyUndoOptions,
+    CheatJourneyUndoPreview, SharedApplyStatus, UserCheatCandidate, UserCheatDiagnostic,
+    UserCheatFormat, UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame,
+    UserCheatMatchState, apply_cheat_journey, default_shared_backup_root,
+    default_shared_history_root, discover_local_retroarch_cheat_file, generate_shared_operation_id,
+    preview_cheat_journey, preview_cheat_journey_undo, scan_user_cheat_directory,
+    scan_user_cheat_file, select_cheat_journey_candidate, undo_cheat_journey,
 };
 use eframe::egui;
 
 use crate::ui::components as widgets;
+
+/// The currently selected game's identity and resolved RetroArch cheat
+/// destination, bound by the caller exactly as `build_cheat_candidate_request`
+/// binds it for the trusted-catalogue journey - this page never derives
+/// identity or a destination path on its own.
+pub(crate) struct LocalCheatInstallContext {
+    pub game: CheatJourneyGameIdentity,
+    /// `None` when no eligible RetroArch profile with a resolved cheat
+    /// directory is selected yet; the install action stays disabled with
+    /// that exact reason rather than guessing a destination.
+    pub destination: Option<CheatDestinationRequest>,
+}
+
+/// One local-file install attempt's current stage. Only one is ever active;
+/// starting a new one (a different file, or "Try again") replaces it.
+enum LocalInstallStage {
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    Preview {
+        source_path: PathBuf,
+        catalogue_root: PathBuf,
+        preview: Box<CheatJourneyPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+        transaction_id: String,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        journal_path: PathBuf,
+        transaction_id: String,
+        preview: Box<CheatJourneyUndoPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Default for LocalInstallStage {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
 
 #[derive(Debug)]
 enum TaskResult {
@@ -50,6 +107,7 @@ pub(crate) struct UserCheatImportPageState {
     last_source: Option<(PathBuf, bool)>,
     selected_candidate: Option<usize>,
     technical_details: bool,
+    local_install: LocalInstallStage,
 }
 
 impl UserCheatImportPageState {
@@ -137,6 +195,7 @@ impl UserCheatImportPageState {
         context: &egui::Context,
         library: &[UserCheatLibraryGame],
         selected_game: Option<(&str, &str)>,
+        local_install_context: Option<&LocalCheatInstallContext>,
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
@@ -236,14 +295,20 @@ impl UserCheatImportPageState {
                 }
                 ImportState::Ready { .. } => {
                     if let Some(report) = report.as_ref() {
-                        self.show_report(ui, report);
+                        self.show_report(ui, report, local_install_context);
                     }
                 }
             }
         });
+        self.show_local_install_panel(ui);
     }
 
-    fn show_report(&mut self, ui: &mut egui::Ui, report: &UserCheatImportReport) {
+    fn show_report(
+        &mut self,
+        ui: &mut egui::Ui,
+        report: &UserCheatImportReport,
+        local_install_context: Option<&LocalCheatInstallContext>,
+    ) {
         if self.report_context_key != self.context_key {
             widgets::banner(
                 ui,
@@ -290,22 +355,22 @@ impl UserCheatImportPageState {
                 widgets::StatusTone::Warning,
             );
         }
-        self.show_candidates(ui, report, "Matched", |candidate| {
+        self.show_candidates(ui, report, "Matched", local_install_context, |candidate| {
             matches!(
                 candidate.match_state,
                 UserCheatMatchState::Exact | UserCheatMatchState::Strong
             )
         });
-        self.show_candidates(ui, report, "Possible matches", |candidate| {
+        self.show_candidates(ui, report, "Possible matches", None, |candidate| {
             candidate.match_state == UserCheatMatchState::Possible
         });
-        self.show_candidates(ui, report, "Ambiguous matches", |candidate| {
+        self.show_candidates(ui, report, "Ambiguous matches", None, |candidate| {
             candidate.match_state == UserCheatMatchState::Ambiguous
         });
-        self.show_candidates(ui, report, "Unmatched", |candidate| {
+        self.show_candidates(ui, report, "Unmatched", None, |candidate| {
             candidate.match_state == UserCheatMatchState::NoMatch
         });
-        self.show_candidates(ui, report, "Unsupported or rejected", |candidate| {
+        self.show_candidates(ui, report, "Unsupported or rejected", None, |candidate| {
             candidate.match_state == UserCheatMatchState::Unsupported
         });
         if !report.duplicates.is_empty() {
@@ -348,6 +413,7 @@ impl UserCheatImportPageState {
         ui: &mut egui::Ui,
         report: &UserCheatImportReport,
         heading: &str,
+        local_install_context: Option<&LocalCheatInstallContext>,
         filter: F,
     ) where
         F: Fn(&UserCheatCandidate) -> bool,
@@ -390,10 +456,515 @@ impl UserCheatImportPageState {
                             ui.label("Individual cheat names are not exposed by the current bounded import API.");
                             ui.label("No files were installed or changed.");
                         }
+                        if candidate.format == UserCheatFormat::RetroarchCht {
+                            self.show_install_action(ui, candidate, local_install_context);
+                        } else {
+                            ui.label("Local install is only available for RetroArch .cht files in this build; PCSX2 PNACH stays review-only.");
+                        }
                     });
                 }
             });
     }
+
+    /// The install action for exactly one matched RetroArch `.cht`
+    /// candidate. Everything downstream of the click - discovery, matching,
+    /// preview, apply, and undo - is the same, unmodified `cheat_journey`
+    /// pipeline the trusted-catalogue flow already uses; this only supplies
+    /// the one file the user picked and the already-bound game identity.
+    fn show_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        local_install_context: Option<&LocalCheatInstallContext>,
+    ) {
+        let Some(install_context) = local_install_context else {
+            ui.label("Select a game in Cheats & Mods to install this file.");
+            return;
+        };
+        let Some(destination) = install_context.destination.as_ref() else {
+            ui.label(
+                "Select an eligible RetroArch profile with a resolved cheat directory (Stage 1) before installing a local file.",
+            );
+            return;
+        };
+        let path = candidate.provenance.original_path.clone();
+        if ui.button("Install this cheat file").clicked() {
+            self.start_local_install(path, &install_context.game, destination);
+        }
+    }
+
+    fn start_local_install(
+        &mut self,
+        source_path: PathBuf,
+        game: &CheatJourneyGameIdentity,
+        destination: &CheatDestinationRequest,
+    ) {
+        let found = match discover_local_retroarch_cheat_file(
+            &HostReadOnlyFilesystem,
+            &source_path,
+            game,
+            &CheatCandidateOptions::default(),
+        ) {
+            Ok(found) => found,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let Some(candidate) = found.candidate() else {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: "This file could not be read back as a supported cheat file.".to_string(),
+            };
+            return;
+        };
+        if !candidate.manually_selectable {
+            let evidence = candidate
+                .evidence
+                .iter()
+                .map(|entry| entry.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: format!(
+                    "Not installable for the selected game ({:?}). {evidence}",
+                    candidate.classification
+                ),
+            };
+            return;
+        }
+        let mut selection = match select_cheat_journey_candidate(
+            &found.discovery,
+            &found.location.catalogue_root,
+            &found.location.catalogue_relative_path,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        selection.cheat_selection.select_all();
+        if selection.cheat_selection.selected_count() == 0 {
+            self.local_install = LocalInstallStage::Blocked {
+                source_path,
+                message: "This file has no cheats that can be safely selected.".to_string(),
+            };
+            return;
+        }
+        match preview_cheat_journey(
+            &selection,
+            &found.location.catalogue_root,
+            destination.clone(),
+            "retroarch-main",
+            "local file",
+        ) {
+            Ok(preview) => {
+                self.local_install = LocalInstallStage::Preview {
+                    source_path,
+                    catalogue_root: found.location.catalogue_root,
+                    preview: Box::new(preview),
+                };
+            }
+            Err(error) => {
+                self.local_install = LocalInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn confirm_local_apply(&mut self) {
+        let LocalInstallStage::Preview {
+            catalogue_root,
+            preview,
+            ..
+        } = std::mem::take(&mut self.local_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let staging_root = match crate::default_generated_cheat_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_install = LocalInstallStage::Error { message };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let destination_root = preview.destination_request.profile_cheat_root.clone();
+        match apply_cheat_journey(
+            &preview,
+            &catalogue_root,
+            &CheatJourneyApplyApproval {
+                preview_id: preview.preview_id.clone(),
+                approved: true,
+                replacement_approved: matches!(
+                    preview.action,
+                    CheatJourneyPreviewAction::ReplaceExisting
+                ),
+            },
+            &CheatJourneyApplyOptions {
+                staging_root,
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        ) {
+            Ok(applied) => {
+                self.local_install = LocalInstallStage::Applied {
+                    destination_root,
+                    journal_path: applied.result.journal_path,
+                    transaction_id: applied.transaction_id,
+                };
+            }
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn start_local_undo(&mut self) {
+        let LocalInstallStage::Applied {
+            destination_root,
+            journal_path,
+            transaction_id,
+        } = std::mem::take(&mut self.local_install)
+        else {
+            return;
+        };
+        let Some(journal_path) = journal_path else {
+            self.local_install = LocalInstallStage::Error {
+                message: "No transaction journal was recorded for this apply.".to_string(),
+            };
+            return;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let preview = preview_cheat_journey_undo(
+            &transaction_id,
+            &journal_path,
+            &destination_root,
+            &backup_root,
+        );
+        self.local_install = LocalInstallStage::UndoPreview {
+            destination_root,
+            journal_path,
+            transaction_id,
+            preview: Box::new(preview),
+        };
+    }
+
+    fn confirm_local_undo(&mut self) {
+        let LocalInstallStage::UndoPreview { preview, .. } =
+            std::mem::take(&mut self.local_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        match undo_cheat_journey(
+            &preview,
+            &CheatJourneyUndoOptions {
+                confirmation: CheatJourneyUndoConfirmation {
+                    preview_id: preview.preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        ) {
+            Ok(result) if result.status == SharedApplyStatus::Success => {
+                self.local_install = LocalInstallStage::Done {
+                    message:
+                        "The installed cheat file was removed and the prior state was restored."
+                            .to_string(),
+                };
+            }
+            Ok(result) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: format!("Undo did not fully succeed: {:?}", result.status),
+                };
+            }
+            Err(error) => {
+                self.local_install = LocalInstallStage::Error {
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    /// Takes ownership of the current stage before rendering it so the
+    /// action buttons below (which need `&mut self` to advance the state
+    /// machine) never conflict with a live borrow of `self.local_install`.
+    /// Every arm puts a stage back before returning.
+    fn show_local_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_install);
+        match stage {
+            LocalInstallStage::Idle => {}
+            LocalInstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalInstallStage::Preview {
+                source_path,
+                catalogue_root,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review before installing");
+                    ui.label(format!("Source file: {}", source_path.display()));
+                    ui.label(format!(
+                        "Destination: {}",
+                        preview.destination.path.display()
+                    ));
+                    ui.label(match preview.action {
+                        CheatJourneyPreviewAction::InstallNew => {
+                            "This will create a new cheat file at the destination above.".to_string()
+                        }
+                        CheatJourneyPreviewAction::AlreadyInstalled => {
+                            "The exact same content is already installed at this destination - installing again changes nothing.".to_string()
+                        }
+                        CheatJourneyPreviewAction::ReplaceExisting => {
+                            "A different cheat file already exists at this destination. Installing will back it up and replace it.".to_string()
+                        }
+                    });
+                    egui::CollapsingHeader::new("Parsed contents to be written")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.monospace(preview.rendered_contents.as_str());
+                        });
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm install",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_install = LocalInstallStage::Preview {
+                        source_path,
+                        catalogue_root,
+                        preview,
+                    };
+                    self.confirm_local_apply();
+                } else if cancelled {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Preview {
+                        source_path,
+                        catalogue_root,
+                        preview,
+                    };
+                }
+            }
+            LocalInstallStage::Applied {
+                destination_root,
+                journal_path,
+                transaction_id,
+            } => {
+                ui.add_space(theme_gap());
+                let mut undo = false;
+                let mut dismissed = false;
+                widgets::card(ui, |ui| {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(journal_path) = journal_path.as_ref() {
+                        ui.label(format!("Transaction journal: {}", journal_path.display()));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo this install").clicked() {
+                            undo = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+                if undo {
+                    self.local_install = LocalInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                    };
+                    self.start_local_undo();
+                } else if dismissed {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                    };
+                }
+            }
+            LocalInstallStage::UndoPreview {
+                destination_root,
+                journal_path,
+                transaction_id,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Confirm undo");
+                    ui.label("This will remove the installed cheat file and restore any prior file that was backed up.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm undo",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_install = LocalInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                        preview,
+                    };
+                    self.confirm_local_undo();
+                } else if cancelled {
+                    self.local_install = LocalInstallStage::Applied {
+                        destination_root,
+                        journal_path: Some(journal_path),
+                        transaction_id,
+                    };
+                } else {
+                    self.local_install = LocalInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        transaction_id,
+                        preview,
+                    };
+                }
+            }
+            LocalInstallStage::Done { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if ui.button("Dismiss").clicked() {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Done { message };
+                }
+            }
+            LocalInstallStage::Error { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Local cheat install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_install = LocalInstallStage::Idle;
+                } else {
+                    self.local_install = LocalInstallStage::Error { message };
+                }
+            }
+        }
+    }
+}
+
+fn theme_gap() -> f32 {
+    crate::ui::theme::SECTION_GAP
 }
 
 fn format_label(format: UserCheatFormat) -> &'static str {
