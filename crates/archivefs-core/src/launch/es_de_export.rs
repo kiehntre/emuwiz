@@ -321,6 +321,56 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_system: "ngpc",
         es_de_fullname: "SNK Neo Geo Pocket Color",
     },
+    // --- Batch 3 additions (docs/ESDE_PARITY_AUDIT.md §10) -------------
+    // Every `es_de_system`/`es_de_fullname` pair below was read verbatim
+    // from ES-DE's own upstream `resources/systems/linux/es_systems.xml`
+    // (gitlab.com/es-de/emulationstation-de, `master` branch) - never
+    // guessed from a plausible-looking short name.
+    EsDeSystemMapping {
+        platform_id: "Virtual Boy",
+        es_de_system: "virtualboy",
+        es_de_fullname: "Nintendo Virtual Boy",
+    },
+    EsDeSystemMapping {
+        platform_id: "MSX",
+        es_de_system: "msx",
+        es_de_fullname: "MSX",
+    },
+    EsDeSystemMapping {
+        platform_id: "MSX2",
+        es_de_system: "msx2",
+        es_de_fullname: "MSX2",
+    },
+    EsDeSystemMapping {
+        platform_id: "Commodore 64",
+        es_de_system: "c64",
+        es_de_fullname: "Commodore 64",
+    },
+    EsDeSystemMapping {
+        platform_id: "ZX Spectrum",
+        es_de_system: "zxspectrum",
+        es_de_fullname: "Sinclair ZX Spectrum",
+    },
+    EsDeSystemMapping {
+        platform_id: "Intellivision",
+        es_de_system: "intellivision",
+        es_de_fullname: "Mattel Electronics Intellivision",
+    },
+    EsDeSystemMapping {
+        platform_id: "WonderSwan",
+        es_de_system: "wonderswan",
+        es_de_fullname: "Bandai WonderSwan",
+    },
+    EsDeSystemMapping {
+        platform_id: "WonderSwan Color",
+        es_de_system: "wonderswancolor",
+        es_de_fullname: "Bandai WonderSwan Color",
+    },
+    EsDeSystemMapping {
+        platform_id: "NeoGeo",
+        es_de_system: "neogeo",
+        es_de_fullname: "SNK Neo Geo",
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.
@@ -606,6 +656,15 @@ mod tests {
             "Vectrex",
             "Neo Geo Pocket",
             "Neo Geo Pocket Color",
+            "Virtual Boy",
+            "MSX",
+            "MSX2",
+            "Commodore 64",
+            "ZX Spectrum",
+            "Intellivision",
+            "WonderSwan",
+            "WonderSwan Color",
+            "NeoGeo",
         ] {
             assert!(
                 es_de_system_for_platform(platform_id).is_some(),
@@ -722,6 +781,122 @@ mod tests {
         }
     }
 
+    // --- Batch 3 (docs/ESDE_PARITY_AUDIT.md §10) -----------------------
+
+    /// (canonical platform id, expected ES-DE `<name>`, expected ES-DE
+    /// `<fullname>`) - every value read verbatim from ES-DE's own
+    /// `resources/systems/linux/es_systems.xml`, never guessed.
+    const BATCH_3: &[(&str, &str, &str)] = &[
+        ("Virtual Boy", "virtualboy", "Nintendo Virtual Boy"),
+        ("MSX", "msx", "MSX"),
+        ("MSX2", "msx2", "MSX2"),
+        ("Commodore 64", "c64", "Commodore 64"),
+        ("ZX Spectrum", "zxspectrum", "Sinclair ZX Spectrum"),
+        (
+            "Intellivision",
+            "intellivision",
+            "Mattel Electronics Intellivision",
+        ),
+        ("WonderSwan", "wonderswan", "Bandai WonderSwan"),
+        (
+            "WonderSwan Color",
+            "wonderswancolor",
+            "Bandai WonderSwan Color",
+        ),
+        ("NeoGeo", "neogeo", "SNK Neo Geo"),
+    ];
+
+    #[test]
+    fn batch_3_platforms_map_to_es_de_exactly() {
+        for (platform_id, system, fullname) in BATCH_3 {
+            let mapping = es_de_system_for_platform(platform_id)
+                .unwrap_or_else(|| panic!("missing ES-DE mapping for {platform_id}"));
+            assert_eq!(
+                mapping.es_de_system, *system,
+                "wrong es_de_system for {platform_id}"
+            );
+            assert_eq!(
+                mapping.es_de_fullname, *fullname,
+                "wrong es_de_fullname for {platform_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_3_resolved_identity_produces_a_ready_entry() {
+        for (platform_id, system, _) in BATCH_3 {
+            let outcome = build_es_de_entry_plan(&resolved(platform_id), &usable_content(), None);
+            let EsDeExportOutcome::Entry(plan) = outcome else {
+                panic!("expected an ES-DE entry for {platform_id}");
+            };
+            assert_eq!(plan.status, EsDeEntryStatus::Ready);
+            assert!(plan.path_usable);
+            assert_eq!(
+                plan.es_de_system, *system,
+                "wrong destination system for {platform_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_3_known_aliases_resolve_to_the_same_es_de_row_as_the_canonical_id() {
+        for (platform_id, alias) in [
+            ("Virtual Boy", "vb"),
+            ("MSX", "msx1"),
+            ("MSX2", "msx2plus"),
+            ("Commodore 64", "c64"),
+            ("ZX Spectrum", "speccy"),
+            ("Intellivision", "intv"),
+            ("WonderSwan", "bandaiwonderswan"),
+            ("WonderSwan Color", "wsc"),
+            ("NeoGeo", "neogeomvs"),
+        ] {
+            let via_alias = platform_for_alias(alias)
+                .unwrap_or_else(|| panic!("{alias} did not resolve to a platform"));
+            assert_eq!(
+                via_alias.id, platform_id,
+                "alias {alias} resolved to the wrong platform"
+            );
+            let canonical_mapping = es_de_system_for_platform(platform_id).unwrap();
+            let alias_mapping = es_de_system_for_platform(via_alias.id).unwrap();
+            assert_eq!(
+                alias_mapping.es_de_system, canonical_mapping.es_de_system,
+                "alias {alias} must produce the same ES-DE system as {platform_id} itself"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognised_platform_names_are_never_mapped_to_a_batch_3_row() {
+        for bogus in ["NeoGeoPlus", "MSX3", "not-a-real-platform", ""] {
+            assert!(
+                es_de_system_for_platform(bogus).is_none(),
+                "{bogus:?} must not resolve to any ES-DE row"
+            );
+            assert!(
+                platform_for_alias(bogus).is_none(),
+                "{bogus:?} must not resolve to any canonical platform"
+            );
+        }
+    }
+
+    /// Batch 3 must never disturb NeoGeo's neighbouring, distinctly-mapped
+    /// relatives (Neo Geo Pocket/Pocket Color, already Batch 1 rows) - each
+    /// keeps its own distinct ES-DE target rather than collapsing onto the
+    /// arcade `neogeo` row.
+    #[test]
+    fn neogeo_and_its_pocket_relatives_remain_distinctly_mapped() {
+        let neogeo = es_de_system_for_platform("NeoGeo").unwrap();
+        let ngp = es_de_system_for_platform("Neo Geo Pocket").unwrap();
+        let ngpc = es_de_system_for_platform("Neo Geo Pocket Color").unwrap();
+        assert_eq!(neogeo.es_de_system, "neogeo");
+        assert_eq!(ngp.es_de_system, "ngp");
+        assert_eq!(ngpc.es_de_system, "ngpc");
+        assert_ne!(neogeo.es_de_system, ngp.es_de_system);
+        assert_ne!(neogeo.es_de_system, ngpc.es_de_system);
+        assert_ne!(ngp.es_de_system, ngpc.es_de_system);
+    }
+
     /// A wrong/unknown platform name is refused outright - never coerced
     /// into one of the Batch 1 rows or any other row by fuzzy matching.
     #[test]
@@ -748,7 +923,12 @@ mod tests {
     /// Batch 1 row that merely looks related.
     #[test]
     fn platforms_still_unmapped_after_batch_1_remain_refused() {
-        for platform_id in ["Switch", "PS4", "NeoGeo", "WonderSwan", "Intellivision"] {
+        // NeoGeo/WonderSwan/Intellivision were the still-unmapped examples
+        // when this test was first written for Batch 1; Batch 3 has since
+        // mapped all three (see `batch_3_platforms_map_to_es_de_exactly`),
+        // so they moved out of this list rather than being asserted here
+        // and in a "now mapped" test simultaneously.
+        for platform_id in ["Switch", "PS4"] {
             assert!(
                 platform_by_id(platform_id).is_some(),
                 "{platform_id} should be a real registry id (fixture drift)"
