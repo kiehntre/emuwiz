@@ -735,11 +735,13 @@ pub use xenia_install_plan::{
     load_xenia_destination, stage_xenia_patch_file,
 };
 pub use xenia_local::{
+    LocalXeniaDiscovery, LocalXeniaFileError, LocalXeniaInstallState, MAX_LOCAL_XENIA_PATCH_BYTES,
     XENIA_MAX_PROFILES, XeniaDirectoryIdentity, XeniaInstallationType, XeniaLaunchBinding,
     XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaPatchesDirectoryState, XeniaProfile,
     XeniaProfileBlocker, XeniaProfileBlockerKind, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, XeniaProfileScope, discover_xenia_profiles,
-    resolve_xenia_launch_binding,
+    XeniaProfileDiscoveryRoots, XeniaProfileScope, check_local_xenia_install_state,
+    discover_local_xenia_patch_file, discover_xenia_profiles, load_local_xenia_destination,
+    resolve_xenia_launch_binding, stage_local_xenia_patch_file,
 };
 pub use xenia_patch_document::{
     MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,

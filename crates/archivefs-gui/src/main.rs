@@ -19732,6 +19732,11 @@ impl ArchiveFsApp {
                         .and_then(|workflow| {
                             local_dolphin_install_context(workflow, &self.dolphin_profiles)
                         });
+                    let local_xenia_install_context = self
+                        .cheat_workflow
+                        .as_ref()
+                        .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia)
+                        .map(|workflow| local_xenia_install_context(workflow, &self.xenia_profiles));
                     let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
@@ -19746,6 +19751,7 @@ impl ArchiveFsApp {
                                 local_cheat_install_context.as_ref(),
                                 local_pcsx2_install_context.as_ref(),
                                 local_dolphin_install_context.as_ref(),
+                                local_xenia_install_context.as_ref(),
                             );
                             ui.add_space(theme::SECTION_GAP);
                             let cheatbase_action = cheatbase_page::show_cheatbase_page(
@@ -31166,6 +31172,32 @@ fn local_dolphin_install_context(
         configuration_path,
         profile_id,
     })
+}
+
+/// Binds the local Xenia picker to the selected game's already-resolved XEX
+/// Title ID and the explicitly selected eligible Xenia profile. No provider
+/// lookup is performed: this context is entirely local and read-only.
+fn local_xenia_install_context(
+    workflow: &CheatWorkflowState,
+    profiles: &XeniaProfilesState,
+) -> user_cheat_import_page::LocalXeniaInstallContext {
+    let title_id = ready_game_identity(workflow)
+        .and_then(GameIdentityReport::verified_xex_title_id)
+        .map(str::to_string);
+    let profile = workflow
+        .selected_xenia_profile_id
+        .as_deref()
+        .and_then(|selected| {
+            let XeniaProfilesState::Ready(discovery) = profiles else {
+                return None;
+            };
+            discovery
+                .profiles
+                .iter()
+                .find(|profile| profile.eligible && profile.profile_id == selected)
+                .cloned()
+        });
+    user_cheat_import_page::LocalXeniaInstallContext { title_id, profile }
 }
 
 /// The private directory generated cheat files are staged into before they

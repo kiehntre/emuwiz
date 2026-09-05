@@ -15,20 +15,22 @@ use archivefs_core::patch_manager::{
     CheatJourneyApplyOptions, CheatJourneyGameIdentity, CheatJourneyPreview,
     CheatJourneyPreviewAction, CheatJourneyUndoConfirmation, CheatJourneyUndoOptions,
     CheatJourneyUndoPreview, DolphinCandidate, DolphinInstallPreview, DolphinInstallPreviewRequest,
-    LocalDolphinInstallState, LocalPcsx2InstallState, Pcsx2GameIdentity, Pcsx2InstallPreview,
-    Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
-    SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat,
-    UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState,
+    LocalDolphinInstallState, LocalPcsx2InstallState, LocalXeniaInstallState, Pcsx2GameIdentity,
+    Pcsx2InstallPreview, Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic,
+    UserCheatFormat, UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame,
+    UserCheatMatchState, XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile,
     apply_cheat_journey, build_dolphin_install_preview, build_pcsx2_install_preview,
-    build_shared_transaction_plan, check_local_dolphin_install_state,
-    check_local_pcsx2_install_state, default_shared_backup_root, default_shared_history_root,
-    discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
-    discover_local_retroarch_cheat_file, execute_shared_apply, execute_shared_rollback,
-    generate_shared_operation_id, load_dolphin_destination, preview_cheat_journey,
-    preview_cheat_journey_undo, preview_shared_rollback, scan_user_cheat_directory,
-    scan_user_cheat_file, select_cheat_journey_candidate, stage_local_dolphin_codes,
-    stage_pcsx2_pnach, undo_cheat_journey,
+    build_shared_transaction_plan, build_xenia_install_preview, check_local_dolphin_install_state,
+    check_local_pcsx2_install_state, check_local_xenia_install_state, default_shared_backup_root,
+    default_shared_history_root, discover_local_dolphin_cheat_file,
+    discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file,
+    discover_local_xenia_patch_file, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
+    preview_cheat_journey, preview_cheat_journey_undo, preview_shared_rollback,
+    scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
+    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach, undo_cheat_journey,
 };
 use eframe::egui;
 
@@ -148,6 +150,50 @@ pub(crate) struct LocalDolphinInstallContext {
     pub profile_id: String,
 }
 
+/// Xenia identity/profile binding supplied by Cheats & Mods. Optional fields
+/// let the UI explain unresolved or ambiguous state without guessing.
+pub(crate) struct LocalXeniaInstallContext {
+    pub title_id: Option<String>,
+    pub profile: Option<XeniaProfile>,
+}
+
+enum LocalXeniaInstallStage {
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    AlreadyInstalled {
+        source_path: PathBuf,
+    },
+    Preview {
+        source_path: PathBuf,
+        profile_id: String,
+        configuration_path: PathBuf,
+        preview: Box<XeniaInstallPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        preview: Box<SharedRollbackPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Default for LocalXeniaInstallStage {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 /// One local Dolphin `.ini` (Gecko/Action Replay) install attempt's
 /// current stage, independent of the RetroArch/PCSX2 stages so the three
 /// formats never share state. Unlike RetroArch/PCSX2, there is no
@@ -226,6 +272,7 @@ pub(crate) struct UserCheatImportPageState {
     local_install: LocalInstallStage,
     local_pcsx2_install: LocalPcsx2InstallStage,
     local_dolphin_install: LocalDolphinInstallStage,
+    local_xenia_install: LocalXeniaInstallStage,
 }
 
 impl UserCheatImportPageState {
@@ -316,6 +363,7 @@ impl UserCheatImportPageState {
         local_install_context: Option<&LocalCheatInstallContext>,
         local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
         local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+        local_xenia_install_context: Option<&LocalXeniaInstallContext>,
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
@@ -329,9 +377,8 @@ impl UserCheatImportPageState {
         widgets::card(ui, |ui| {
             ui.label("Imported for review only. EmuWiz has not changed your emulator files.");
             ui.label(
-                "Local install is available for RetroArch .cht, PCSX2 .pnach, and Dolphin \
-                 Gecko/Action Replay .ini files. Xenia .patch.toml local install is not \
-                 available in this build.",
+                "Local install is available for RetroArch .cht, PCSX2 .pnach, Dolphin \
+                 Gecko/Action Replay .ini files, and Xenia .patch.toml files.",
             );
             if let Some((_, title)) = selected_game {
                 widgets::status_badge(
@@ -434,6 +481,8 @@ impl UserCheatImportPageState {
         self.show_local_install_panel(ui);
         self.show_local_pcsx2_install_panel(ui);
         self.show_local_dolphin_install_panel(ui);
+        self.show_local_xenia_install_picker(ui, local_xenia_install_context);
+        self.show_local_xenia_install_panel(ui);
     }
 
     /// Dolphin's local-file entry point: unlike RetroArch/PCSX2, Dolphin
@@ -2099,6 +2148,395 @@ impl UserCheatImportPageState {
             }
         }
     }
+}
+
+impl UserCheatImportPageState {
+    fn show_local_xenia_install_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: Option<&LocalXeniaInstallContext>,
+    ) {
+        ui.add_space(theme_gap());
+        widgets::card(ui, |ui| {
+            ui.strong("Install a local Xenia patch file (.patch.toml)");
+            ui.label("The file is parsed by Xenia's existing strict patch parser and bound to the selected game's verified Title ID. No network access is used.");
+            let Some(context) = context else {
+                ui.label("Select an Xbox 360/Xenia game in Cheats & Mods first.");
+                return;
+            };
+            if context.title_id.is_none() {
+                ui.label("Blocked: the selected game's Xenia Title ID is unresolved or ambiguous.");
+            }
+            if context.profile.is_none() {
+                ui.label("Blocked: select one eligible Xenia profile first.");
+            }
+            let enabled = context.title_id.is_some()
+                && context.profile.is_some()
+                && matches!(self.local_xenia_install, LocalXeniaInstallStage::Idle);
+            if widgets::action_button(
+                ui,
+                "Choose a Xenia .patch.toml file…",
+                widgets::ActionStyle::Primary,
+                enabled,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Xenia patches", &["patch.toml"])
+                    .pick_file()
+            {
+                let profile = context.profile.clone().expect("enabled picker has profile");
+                self.start_local_xenia_install(path, context.title_id.clone(), profile);
+            }
+        });
+    }
+
+    fn start_local_xenia_install(
+        &mut self,
+        source_path: PathBuf,
+        title_id: Option<String>,
+        profile: XeniaProfile,
+    ) {
+        let discovery = match discover_local_xenia_patch_file(&source_path, title_id.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let destination =
+            match load_local_xenia_destination(&profile.configuration_path, &file_name) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                        source_path,
+                        message: error.to_string(),
+                    };
+                    return;
+                }
+            };
+        if check_local_xenia_install_state(&destination, &discovery)
+            == LocalXeniaInstallState::AlreadyInstalled
+        {
+            self.local_xenia_install = LocalXeniaInstallStage::AlreadyInstalled { source_path };
+            return;
+        }
+        let staging_root = match crate::default_generated_xenia_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Error { message };
+                return;
+            }
+        };
+        let staged = match stage_local_xenia_patch_file(
+            &staging_root,
+            &file_name,
+            &discovery,
+            destination.document.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match build_xenia_install_preview(&XeniaInstallPreviewRequest {
+            selected_archive: source_path.clone(),
+            configuration_path: profile.configuration_path.clone(),
+            title_id: discovery.candidate.title_id.clone(),
+            compatibility: discovery.candidate.compatibility,
+            staged,
+        }) {
+            Ok(preview) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Preview {
+                    source_path,
+                    profile_id: profile.profile_id,
+                    configuration_path: profile.configuration_path,
+                    preview: Box::new(preview),
+                }
+            }
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn confirm_local_xenia_apply(&mut self) {
+        let LocalXeniaInstallStage::Preview {
+            profile_id,
+            configuration_path,
+            preview,
+            ..
+        } = std::mem::take(&mut self.local_xenia_install)
+        else {
+            return;
+        };
+        let (Ok(history_root), Ok(backup_root)) =
+            (default_shared_history_root(), default_shared_backup_root())
+        else {
+            self.local_xenia_install = LocalXeniaInstallStage::Error {
+                message: "Shared history/backup roots are unavailable.".to_string(),
+            };
+            return;
+        };
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            &profile_id,
+            "xenia-local-file",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.local_xenia_install = LocalXeniaInstallStage::Error {
+                    message: format!("{error:?}"),
+                };
+                return;
+            }
+        };
+        let replacement = plan
+            .entries
+            .iter()
+            .any(|entry| entry.proposed_action == PreviewProposedAction::Replace);
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved: replacement,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: now_unix_seconds(),
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        if result.journal.status == SharedApplyStatus::Success {
+            self.local_xenia_install = LocalXeniaInstallStage::Applied {
+                destination_root: configuration_path,
+                journal_path: result.journal_path,
+            };
+        } else {
+            self.local_xenia_install = LocalXeniaInstallStage::Error {
+                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+            };
+        }
+    }
+
+    fn show_local_xenia_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_xenia_install);
+        match stage {
+            LocalXeniaInstallStage::Idle => {}
+            LocalXeniaInstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install = LocalXeniaInstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::AlreadyInstalled { source_path } => {
+                widgets::banner(
+                    ui,
+                    "Already installed",
+                    &format!("{} is already installed unchanged.", source_path.display()),
+                    widgets::StatusTone::Info,
+                );
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install =
+                        LocalXeniaInstallStage::AlreadyInstalled { source_path };
+                }
+            }
+            LocalXeniaInstallStage::Preview {
+                source_path,
+                profile_id,
+                configuration_path,
+                preview,
+            } => {
+                let mut confirm = false;
+                let mut cancel = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review local Xenia patch before installing");
+                    ui.label(format!("Source path: {}", source_path.display()));
+                    ui.label(format!(
+                        "Selected Xenia Title ID: {}",
+                        preview
+                            .report
+                            .entries
+                            .first()
+                            .and_then(|entry| entry.verified_identity.clone())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ));
+                    ui.label(format!("Destination: {}", preview.staged.path.display()));
+                    ui.label(format!(
+                        "Parsed patch entries: {}",
+                        preview.staged.selected_patch_count
+                    ));
+                    for entry in &preview.report.entries {
+                        ui.label(format!(
+                            "Mutation: {:?} ({:?})",
+                            entry.proposed_action, entry.destination_state
+                        ));
+                    }
+                    egui::CollapsingHeader::new("Exact mutation contents")
+                        .default_open(false)
+                        .show(ui, |ui| ui.monospace(&preview.staged.contents));
+                    if widgets::action_button(
+                        ui,
+                        "Confirm install",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if confirm {
+                    self.local_xenia_install = LocalXeniaInstallStage::Preview {
+                        source_path,
+                        profile_id,
+                        configuration_path,
+                        preview,
+                    };
+                    self.confirm_local_xenia_apply();
+                } else if !cancel {
+                    self.local_xenia_install = LocalXeniaInstallStage::Preview {
+                        source_path,
+                        profile_id,
+                        configuration_path,
+                        preview,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::Applied {
+                destination_root,
+                journal_path,
+            } => {
+                widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                if let Some(path) = journal_path.as_ref() {
+                    ui.label(format!("Transaction journal: {}", path.display()));
+                }
+                if ui.button("Undo this install").clicked() {
+                    if let Some(path) = journal_path {
+                        self.local_xenia_install = LocalXeniaInstallStage::UndoPreview {
+                            destination_root: destination_root.clone(),
+                            preview: Box::new(preview_shared_rollback(
+                                &path,
+                                &destination_root,
+                                &default_shared_backup_root().unwrap_or_default(),
+                            )),
+                        };
+                    }
+                } else {
+                    self.local_xenia_install = LocalXeniaInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::UndoPreview {
+                destination_root,
+                preview,
+            } => {
+                let mut confirm = false;
+                if widgets::action_button(ui, "Confirm undo", widgets::ActionStyle::Primary, true)
+                    .clicked()
+                {
+                    confirm = true;
+                }
+                if confirm {
+                    let (Ok(history_root), Ok(backup_root)) =
+                        (default_shared_history_root(), default_shared_backup_root())
+                    else {
+                        self.local_xenia_install = LocalXeniaInstallStage::Error {
+                            message: "Shared history/backup roots unavailable.".to_string(),
+                        };
+                        return;
+                    };
+                    let result = execute_shared_rollback(
+                        &preview,
+                        &SharedRollbackOptions {
+                            confirmation: SharedRollbackConfirmation {
+                                preview_id: preview.preview_id.clone(),
+                                approved: true,
+                            },
+                            rollback_operation_id: generate_shared_operation_id(),
+                            timestamp_unix_seconds: now_unix_seconds(),
+                            history_root,
+                            backup_root,
+                        },
+                    );
+                    self.local_xenia_install = if result.status == SharedApplyStatus::Success {
+                        LocalXeniaInstallStage::Done {
+                            message: "Xenia patch install undone and prior state restored."
+                                .to_string(),
+                        }
+                    } else {
+                        LocalXeniaInstallStage::Error {
+                            message: format!("Undo did not fully succeed: {:?}", result.status),
+                        }
+                    };
+                } else {
+                    self.local_xenia_install = LocalXeniaInstallStage::UndoPreview {
+                        destination_root,
+                        preview,
+                    };
+                }
+            }
+            LocalXeniaInstallStage::Done { message } => {
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install = LocalXeniaInstallStage::Done { message };
+                }
+            }
+            LocalXeniaInstallStage::Error { message } => {
+                widgets::banner(
+                    ui,
+                    "Local Xenia install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if !ui.button("Dismiss").clicked() {
+                    self.local_xenia_install = LocalXeniaInstallStage::Error { message };
+                }
+            }
+        }
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
 }
 
 fn theme_gap() -> f32 {

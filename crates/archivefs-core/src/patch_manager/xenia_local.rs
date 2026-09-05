@@ -18,7 +18,8 @@
 //! This module never starts Xenia and has no write or network capability.
 
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -36,6 +37,295 @@ use crate::emulator_environment::EncodedPath;
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyFailureReason, validate_destination_root,
 };
+use super::xenia_install_plan::{
+    LoadedXeniaDestination, StagedXeniaPatchFile, XeniaCandidate, XeniaCandidateCompatibility,
+    XeniaInstallPlanError, XeniaPatchSelection, build_xenia_candidates, load_xenia_destination,
+    stage_xenia_patch_file,
+};
+use super::xenia_patch_document::{XeniaPatchDocument, parse_xenia_patch_toml};
+
+/// Bound for a user-selected local Xenia patch file. It is deliberately the
+/// same order of magnitude as the existing parser bound, with a separate
+/// local adapter check so unsafe sources are rejected before parsing.
+pub const MAX_LOCAL_XENIA_PATCH_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalXeniaFileError {
+    NotFound { path: PathBuf, detail: String },
+    IsDirectory { path: PathBuf },
+    IsSymlink { path: PathBuf },
+    NotRegularFile { path: PathBuf },
+    UnsupportedExtension { path: PathBuf },
+    TooLarge { path: PathBuf },
+    Malformed { path: PathBuf, detail: String },
+    NoPatchesFound { path: PathBuf },
+    IdentityUnavailable { detail: String },
+    IdentityConflict { detail: String },
+    PartialIdentityVerification { detail: String },
+    Plan(XeniaInstallPlanError),
+}
+
+impl std::fmt::Display for LocalXeniaFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { path, detail } => write!(formatter, "{}: {detail}", path.display()),
+            Self::IsDirectory { path } => write!(formatter, "{} is a directory", path.display()),
+            Self::IsSymlink { path } => write!(
+                formatter,
+                "{} is a symlink and is not followed",
+                path.display()
+            ),
+            Self::NotRegularFile { path } => {
+                write!(formatter, "{} is not a regular file", path.display())
+            }
+            Self::UnsupportedExtension { path } => {
+                write!(formatter, "{} is not a .patch.toml file", path.display())
+            }
+            Self::TooLarge { path } => write!(
+                formatter,
+                "{} exceeds the local Xenia patch size limit",
+                path.display()
+            ),
+            Self::Malformed { path, detail } => write!(formatter, "{}: {detail}", path.display()),
+            Self::NoPatchesFound { path } => write!(
+                formatter,
+                "{} contains no valid patch entries",
+                path.display()
+            ),
+            Self::IdentityUnavailable { detail } => formatter.write_str(detail),
+            Self::IdentityConflict { detail } => formatter.write_str(detail),
+            Self::PartialIdentityVerification { detail } => formatter.write_str(detail),
+            Self::Plan(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LocalXeniaFileError {}
+
+impl From<XeniaInstallPlanError> for LocalXeniaFileError {
+    fn from(error: XeniaInstallPlanError) -> Self {
+        Self::Plan(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalXeniaDiscovery {
+    pub source_path: PathBuf,
+    pub source_sha256: String,
+    pub document: XeniaPatchDocument,
+    pub candidate: XeniaCandidate,
+}
+
+/// Inspects one user-selected `.patch.toml` and binds it to the already
+/// resolved selected game's exact Xenia Title ID. This function has no
+/// network path and refuses unsafe sources before parsing.
+pub fn discover_local_xenia_patch_file(
+    source_path: &Path,
+    selected_title_id: Option<&str>,
+) -> Result<LocalXeniaDiscovery, LocalXeniaFileError> {
+    let selected_title_id = selected_title_id
+        .filter(|value| value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| LocalXeniaFileError::IdentityUnavailable {
+            detail: "selected game's verified Xenia Title ID is unresolved or ambiguous"
+                .to_string(),
+        })?;
+    let metadata =
+        fs::symlink_metadata(source_path).map_err(|error| LocalXeniaFileError::NotFound {
+            path: source_path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(LocalXeniaFileError::IsSymlink {
+            path: source_path.to_path_buf(),
+        });
+    }
+    if metadata.is_dir() {
+        return Err(LocalXeniaFileError::IsDirectory {
+            path: source_path.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(LocalXeniaFileError::NotRegularFile {
+            path: source_path.to_path_buf(),
+        });
+    }
+    let valid_extension = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".patch.toml"));
+    if !valid_extension {
+        return Err(LocalXeniaFileError::UnsupportedExtension {
+            path: source_path.to_path_buf(),
+        });
+    }
+    if metadata.len() > MAX_LOCAL_XENIA_PATCH_BYTES {
+        return Err(LocalXeniaFileError::TooLarge {
+            path: source_path.to_path_buf(),
+        });
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(source_path)
+        .map_err(|error| LocalXeniaFileError::NotFound {
+            path: source_path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOCAL_XENIA_PATCH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| LocalXeniaFileError::Malformed {
+            path: source_path.to_path_buf(),
+            detail: format!("could not be read: {error}"),
+        })?;
+    if bytes.len() as u64 > MAX_LOCAL_XENIA_PATCH_BYTES {
+        return Err(LocalXeniaFileError::TooLarge {
+            path: source_path.to_path_buf(),
+        });
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| LocalXeniaFileError::Malformed {
+        path: source_path.to_path_buf(),
+        detail: "Xenia patch file is not valid UTF-8".to_string(),
+    })?;
+    let document = parse_xenia_patch_toml(text);
+    if document.is_fatally_malformed() || document.has_rewrite_blocking_warnings() {
+        return Err(LocalXeniaFileError::Malformed {
+            path: source_path.to_path_buf(),
+            detail: document
+                .warnings
+                .first()
+                .map(|warning| warning.detail.clone())
+                .unwrap_or_else(|| {
+                    "Xenia patch TOML contains unsupported or malformed entries".to_string()
+                }),
+        });
+    }
+    if document.selectable_patch_count() == 0 {
+        return Err(LocalXeniaFileError::NoPatchesFound {
+            path: source_path.to_path_buf(),
+        });
+    }
+    if document.title_id != selected_title_id {
+        return Err(LocalXeniaFileError::IdentityConflict {
+            detail: format!(
+                "{} declares Xenia Title ID {}, not selected game's verified {}",
+                source_path.display(),
+                document.title_id,
+                selected_title_id
+            ),
+        });
+    }
+    let provider = super::xenia_provider::XeniaProviderResult {
+        provider_id: "local_xenia_patch_file".to_string(),
+        provider_display_name: "Local Xenia .patch.toml file".to_string(),
+        source_repository: "local file".to_string(),
+        source_commit: "local".to_string(),
+        retrieved_at_unix_seconds: 0,
+        title_id: document.title_id.clone(),
+        documents: vec![super::xenia_provider::XeniaProviderDocument {
+            source_path: source_path.display().to_string(),
+            document: document.clone(),
+        }],
+        attribution: "User-selected local file".to_string(),
+        license: "User-provided".to_string(),
+        warnings: Vec::new(),
+    };
+    let outcome = build_xenia_candidates(&provider, Some(selected_title_id), None);
+    let candidate =
+        outcome
+            .candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| LocalXeniaFileError::Malformed {
+                path: source_path.to_path_buf(),
+                detail: "local Xenia patch did not produce a valid candidate".to_string(),
+            })?;
+    if candidate.compatibility == XeniaCandidateCompatibility::Incompatible {
+        return Err(LocalXeniaFileError::IdentityConflict {
+            detail: "local Xenia patch is incompatible with the selected game".to_string(),
+        });
+    }
+    Ok(LocalXeniaDiscovery {
+        source_path: source_path.to_path_buf(),
+        source_sha256: hex_sha256(&bytes),
+        document,
+        candidate,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalXeniaInstallState {
+    New,
+    AlreadyInstalled,
+}
+
+#[must_use]
+pub fn check_local_xenia_install_state(
+    destination: &LoadedXeniaDestination,
+    discovery: &LocalXeniaDiscovery,
+) -> LocalXeniaInstallState {
+    let Some(existing) = destination.document.as_ref() else {
+        return LocalXeniaInstallState::New;
+    };
+    let unchanged = discovery.document.patches.iter().all(|patch| {
+        let mut expected = patch.clone();
+        expected.enabled_by_default = true;
+        existing.patches.iter().any(|candidate| {
+            candidate.name == patch.name && candidate == &expected && candidate.enabled_by_default
+        })
+    });
+    if unchanged {
+        LocalXeniaInstallState::AlreadyInstalled
+    } else {
+        LocalXeniaInstallState::New
+    }
+}
+
+pub fn load_local_xenia_destination(
+    configuration_path: &Path,
+    file_name: &str,
+) -> Result<LoadedXeniaDestination, LocalXeniaFileError> {
+    load_xenia_destination(&configuration_path.join("patches"), file_name).map_err(Into::into)
+}
+
+pub fn stage_local_xenia_patch_file(
+    staging_root: &Path,
+    file_name: &str,
+    discovery: &LocalXeniaDiscovery,
+    existing: Option<&XeniaPatchDocument>,
+) -> Result<StagedXeniaPatchFile, LocalXeniaFileError> {
+    let mut selected = XeniaPatchSelection::from_candidate(&discovery.candidate, existing);
+    selected.select_all();
+    // Selecting a concrete local file is the local-workflow equivalent of
+    // the existing Xenia picker acknowledgement: the preview still exposes
+    // the Strong/partially-verified evidence and confirmation is required
+    // before the shared transaction can mutate the profile.
+    selected.partial_verification_acknowledged = true;
+    stage_xenia_patch_file(
+        staging_root,
+        file_name,
+        &discovery.candidate,
+        existing,
+        &selected.resolve_names()?,
+    )
+    .map_err(Into::into)
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 pub const XENIA_MAX_PROFILES: usize = 16;
 
