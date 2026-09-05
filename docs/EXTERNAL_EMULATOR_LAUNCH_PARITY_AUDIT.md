@@ -87,7 +87,7 @@ Discovery is not the gap.
 | Profile kind | Launch implemented? | File / line |
 |---|---|---|
 | RetroArch Native | DONE | `crates/archivefs-core/src/launch/execution.rs` (full preflight+spawn pipeline); spawn at `process_spawn.rs:157-185` via `execution.rs:601-617` |
-| RetroArch AppImage | PARTIAL | Command-plan construction already resolves an exact, confidence-`Exact`, executable-bit-verified AppImage path (`launch/retroarch_command.rs:170-178`), but `preflight_retroarch_launch` refuses the request before that plan is ever reached: gate at `launch/execution.rs:293-302`. GUI never offers the button: gate at `crates/archivefs-gui/src/launch_readiness_page.rs:1362-1364`. |
+| RetroArch AppImage | DONE | The GUI binds a launch request to one exact, lossless AppImage path from the reviewed discovery report. RetroArch preflight freshly rediscovers that same path, requires `Exact` identity and executable-bit evidence, rebuilds the existing exact argv plan, and rechecks the regular-file/non-symlink/executable contract immediately before spawn. |
 | RetroArch Flatpak | MISSING | Command-plan construction deliberately returns no executable candidates and cannot produce a plan at all (`launch/retroarch_command.rs:179-183`), independent of and in addition to the same two gates as AppImage. |
 | PCSX2 Native | DONE | `crates/archivefs-core/src/launch/pcsx2_execution.rs` (full pipeline); binding resolver at `patch_manager/pcsx2_local.rs:805-830` |
 | PCSX2 `NativeAlternate`/Portable/FlatpakUser/FlatpakSystem | MISSING | Explicit blocker in `resolve_pcsx2_native_launch_binding`: `patch_manager/pcsx2_local.rs:815-828` (`Pcsx2LaunchBlockerKind::UnsupportedInstallationType`); no AppImage-specific command-plan path exists for PCSX2 at all (unlike RetroArch) — PCSX2's managed AppImage is only ever spawned by the bootstrap module, never by real game launch. GUI eligibility gate: `launch_readiness_page.rs:1179` region (`Launch PCSX2` eligibility). |
@@ -447,19 +447,11 @@ instead of `Vec::new()`.
 
 ## 9. Recommended implementation slices (ordered, smallest-safe-first)
 
-1. **RetroArch AppImage launch parity.** Relax the gate at
-   `launch/execution.rs:293-302` to accept `ProfileKind::AppImage` (as well
-   as `Native`), and relax the matching GUI gate at
-   `launch_readiness_page.rs:1362-1364`. No change needed to
-   `retroarch_command.rs` — `executable_paths()` already produces a correct
-   AppImage executable candidate. Add one new preflight recheck path
-   mirroring `recheck_executable`/`recheck_core_library` if the AppImage
-   path itself needs an equivalent immediate-before-spawn re-check beyond
-   what `build_retroarch_command_plan` already re-derives fresh each time
-   (it does re-derive fresh from a freshly rediscovered environment, so
-   this may already be covered — verify during implementation, don't
-   assume). This is the smallest possible slice: one gate relaxed in core,
-   one gate relaxed in GUI, zero new argv-construction code.
+1. **RetroArch AppImage launch parity.** **DONE.** The implementation keeps
+   authorization RetroArch-specific and binds the GUI request to the exact
+   reviewed AppImage path. Fresh preflight requires the same path's exact
+   identity and executable evidence, uses the existing `retroarch_command`
+   argv plan unchanged, and rechecks the executable immediately before spawn.
 2. **Dolphin AppImage launch parity.** Add an `AppImage`-accepting arm to
    `resolve_dolphin_native_launch_binding`'s match
    (`dolphin_local.rs:2208-2217`) that performs the equivalent of

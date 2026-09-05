@@ -1811,6 +1811,7 @@ mod game_metadata_enrichment_tests {
                 scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
             },
             core_stem: "pcsx2".to_string(),
+            expected_appimage_executable: None,
         };
         launch_readiness_page::GamerPlayAction::Launch(Box::new(
             launch_readiness_page::TypedLaunchRequest::RetroArch(request),

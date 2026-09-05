@@ -203,6 +203,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
             scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
         },
         core_stem: "gambatte".to_string(),
+        expected_appimage_executable: None,
     };
     let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
         launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone()),
@@ -385,6 +386,7 @@ fn gamer_card_ready_launch_shows_ready_to_play_and_the_play_button() {
                     scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
                 },
                 core_stem: "gambatte".to_string(),
+                expected_appimage_executable: None,
             },
         ),
     ));
@@ -407,6 +409,7 @@ fn gamer_card_polls_and_surfaces_the_existing_executor_preflight_failure() {
             scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
         },
         core_stem: "gambatte".to_string(),
+        expected_appimage_executable: None,
     };
     let play_action = launch_readiness_page::GamerPlayAction::Launch(Box::new(
         launch_readiness_page::TypedLaunchRequest::RetroArch(request.clone()),
@@ -490,6 +493,7 @@ fn gamer_card_media_blocked_shows_needs_attention_and_no_play() {
                     scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
                 },
                 core_stem: "gambatte".to_string(),
+                expected_appimage_executable: None,
             },
         ),
     ));
@@ -658,6 +662,7 @@ fn gamer_readiness_never_yields_ready_from_mount_state_alone() {
                     scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
                 },
                 core_stem: "gambatte".to_string(),
+                expected_appimage_executable: None,
             },
         ),
     ));

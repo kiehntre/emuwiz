@@ -187,6 +187,7 @@ fn build_wired(label: &str, extra_cores: &[&str]) -> Wired {
         expected_game_key: plan.game_key.clone().unwrap(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        expected_appimage_executable: None,
     };
 
     Wired {

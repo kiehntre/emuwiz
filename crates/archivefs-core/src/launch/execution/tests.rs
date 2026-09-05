@@ -84,6 +84,7 @@ impl Drop for Fixture {
 struct ReadyFixture {
     fixture: Fixture,
     request: RetroArchLaunchRequest,
+    environment: DiscoveryEnvironment,
 }
 
 fn build_ready_fixture(label: &str) -> ReadyFixture {
@@ -127,16 +128,70 @@ fn build_ready_fixture_with_content(
             scope: ProfileScope::User,
         },
         core_stem: "genesis_plus_gx".to_string(),
+        expected_appimage_executable: None,
     };
-    ReadyFixture { fixture, request }
+    let environment = fixture.env();
+    ReadyFixture {
+        fixture,
+        request,
+        environment,
+    }
+}
+
+fn build_ready_appimage_fixture(label: &str) -> ReadyFixture {
+    let fixture = Fixture::new(label);
+    let appimage =
+        fixture.write_executable("Applications/RetroArch.AppImage", b"#!/bin/sh\nexit 0\n");
+    let cores_dir = fixture.path("cores");
+    let info_dir = fixture.path("info");
+    fixture.write(
+        "Applications/RetroArch.AppImage.config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+            cores_dir.display(),
+            info_dir.display()
+        )
+        .as_bytes(),
+    );
+    fixture.write("cores/genesis_plus_gx_libretro.so", b"stub core");
+    fixture.write("info/genesis_plus_gx.info", b"systemname = \"megadrive\"\n");
+    let content = fixture.write("content/game.md", b"synthetic mega drive rom bytes");
+    fixture.write(
+        "desktop/retroarch.desktop",
+        format!(
+            "[Desktop Entry]\nType=Application\nName=RetroArch\nExec={}\n",
+            appimage.display()
+        )
+        .as_bytes(),
+    );
+    let identity_report = inspect_catalogued_game_identity(&content, Some("MegaDrive"));
+    let expected_game_key = identity_report
+        .verified_loose_rom_sha256()
+        .expect("fixture content must be a verifiable loose Mega Drive ROM")
+        .to_string();
+    let mut environment = fixture.env();
+    environment.app_image_search_roots = vec![fixture.path("Applications")];
+    environment.desktop_file_roots = vec![fixture.path("desktop")];
+    let request = RetroArchLaunchRequest {
+        selected_content_path: content,
+        expected_platform_id: "MegaDrive".to_string(),
+        expected_game_key,
+        profile: ProfileRef {
+            profile_kind: ProfileKind::AppImage,
+            scope: ProfileScope::User,
+        },
+        core_stem: "genesis_plus_gx".to_string(),
+        expected_appimage_executable: Some(appimage),
+    };
+    ReadyFixture {
+        fixture,
+        request,
+        environment,
+    }
 }
 
 fn preflight(ready: &ReadyFixture) -> Result<RetroArchCommand, LaunchPreflightError> {
-    preflight_retroarch_launch(
-        &ready.request,
-        &HostReadOnlyFilesystem,
-        &ready.fixture.env(),
-    )
+    preflight_retroarch_launch(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
 }
 
 // --- native direct-content Ready candidate passes preflight ------------------
@@ -405,14 +460,100 @@ fn flatpak_profile_kind_is_rejected() {
     assert_eq!(error.kind, LaunchPreflightErrorKind::UnsupportedProfileKind);
 }
 
-// --- AppImage rejected for Phase 1 -----------------------------------------------------
+// --- verified AppImage profile ----------------------------------------------------------
 
 #[test]
-fn appimage_profile_kind_is_rejected() {
-    let mut ready = build_ready_fixture("appimage-profile");
-    ready.request.profile.profile_kind = ProfileKind::AppImage;
+fn verified_appimage_profile_passes_preflight_with_its_exact_argv() {
+    let ready = build_ready_appimage_fixture("appimage-ready");
+    let command = preflight(&ready).expect("a verified AppImage profile must preflight cleanly");
+    assert_eq!(
+        command.executable,
+        ready.request.expected_appimage_executable.clone().unwrap(),
+        "the exact reviewed AppImage path, never a native fallback"
+    );
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("-L"),
+            ready
+                .fixture
+                .path("cores/genesis_plus_gx_libretro.so")
+                .into_os_string(),
+            ready.request.selected_content_path.clone().into_os_string(),
+        ]
+    );
+    assert_eq!(command.working_directory, None);
+}
+
+#[test]
+fn appimage_request_without_the_exact_discovered_path_is_refused_without_fallback() {
+    let mut ready = build_ready_appimage_fixture("appimage-no-fallback");
+    ready.request.expected_appimage_executable =
+        Some(ready.fixture.path("Applications/other.AppImage"));
     let error = preflight(&ready).unwrap_err();
-    assert_eq!(error.kind, LaunchPreflightErrorKind::UnsupportedProfileKind);
+    assert_eq!(error.kind, LaunchPreflightErrorKind::AppImageMissing);
+}
+
+#[test]
+fn missing_appimage_is_refused() {
+    let ready = build_ready_appimage_fixture("appimage-missing");
+    fs::remove_file(ready.request.expected_appimage_executable.as_ref().unwrap()).unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::AppImageMissing);
+}
+
+#[test]
+fn non_regular_appimage_is_refused() {
+    let ready = build_ready_appimage_fixture("appimage-directory");
+    let executable = ready.request.expected_appimage_executable.as_ref().unwrap();
+    fs::remove_file(executable).unwrap();
+    fs::create_dir(executable).unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::AppImageUnsafe);
+}
+
+#[test]
+fn non_executable_appimage_is_refused_without_chmod() {
+    let ready = build_ready_appimage_fixture("appimage-not-executable");
+    fs::set_permissions(
+        ready.request.expected_appimage_executable.as_ref().unwrap(),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::AppImageNotExecutable);
+}
+
+#[test]
+fn appimage_identity_evidence_that_goes_stale_is_refused() {
+    let ready = build_ready_appimage_fixture("appimage-stale-evidence");
+    fs::write(
+        ready.fixture.path("desktop/retroarch.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Unrelated\nExec={}\n",
+            ready
+                .request
+                .expected_appimage_executable
+                .as_ref()
+                .unwrap()
+                .display()
+        ),
+    )
+    .unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(
+        error.kind,
+        LaunchPreflightErrorKind::AppImageVerificationStale
+    );
+}
+
+#[test]
+fn appimage_final_pre_spawn_recheck_refuses_a_removed_executable() {
+    let ready = build_ready_appimage_fixture("appimage-final-recheck");
+    let executable = ready.request.expected_appimage_executable.as_ref().unwrap();
+    fs::remove_file(executable).unwrap();
+    let error = recheck_selected_executable(executable, ProfileKind::AppImage).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::AppImageMissing);
 }
 
 // --- executable disappears before spawn -> rejected -------------------------------------

@@ -1,11 +1,12 @@
 //! First supported slice of real RetroArch launch execution: safely
-//! revalidating and spawning exactly one native RetroArch process for one
-//! direct, loose, regular content file.
+//! revalidating and spawning exactly one native or verified AppImage
+//! RetroArch process for one direct, loose, regular content file.
 //!
 //! # Scope (Phase 1)
 //!
-//! - Native RetroArch profiles only ([`ProfileKind::Native`]) - Flatpak and
-//!   AppImage are refused outright, never attempted.
+//! - Native or verified AppImage RetroArch profiles ([`ProfileKind::Native`]
+//!   and [`ProfileKind::AppImage`]) - Flatpak is refused outright, never
+//!   attempted.
 //! - One direct loose regular content file
 //!   ([`LaunchContainerKind::PlainFile`], `requires_mount == false`) - no
 //!   archive members, no mounted content, no CUE/BIN multi-file handling.
@@ -41,7 +42,8 @@ use std::path::{Path, PathBuf};
 
 use crate::emulator_environment::ReadOnlyHostFilesystem;
 use crate::emulator_environment::retroarch::{
-    DiscoveryEnvironment, DiscoveryError, ProfileKind, ProfileRef, discover_retroarch_environment,
+    AppImageIdentificationConfidence, DiscoveryEnvironment, DiscoveryError, ExecutableState,
+    ProfileKind, ProfileRef, RetroArchEnvironmentReport, discover_retroarch_environment,
 };
 use crate::game_identity::inspect_catalogued_game_identity;
 use crate::launch::evidence_bridge::canonical_identity_from_game_report;
@@ -92,6 +94,10 @@ pub struct RetroArchLaunchRequest {
     /// Which discovered core (by its `.info`/library stem) the candidate
     /// must use.
     pub core_stem: String,
+    /// The exact AppImage executable selected from the reviewed discovery
+    /// report. Native requests leave this unset. An AppImage request without
+    /// this binding is refused rather than selecting a replacement path.
+    pub expected_appimage_executable: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,10 +136,20 @@ pub enum LaunchPreflightErrorKind {
     /// (zip/7z/rar) - an outer archive path is never a runnable content
     /// path in this module, exactly like the rest of the launch pipeline.
     ContentRequiresMount,
-    /// Only [`ProfileKind::Native`] is supported in this phase - both
-    /// Flatpak and AppImage profiles are refused here, before any plan is
-    /// even built.
+    /// The requested profile kind is not explicitly supported by the
+    /// RetroArch executor. Flatpak remains refused; AppImage is authorized
+    /// only by this RetroArch-specific preflight path.
     UnsupportedProfileKind,
+    /// The selected AppImage is no longer present in fresh discovery.
+    AppImageMissing,
+    /// The selected AppImage no longer has exact RetroArch identity evidence,
+    /// or fresh discovery resolves its profile to a different executable.
+    AppImageVerificationStale,
+    /// The selected AppImage is a symlink or is no longer a regular file.
+    AppImageUnsafe,
+    /// The selected AppImage no longer has an execute bit. EmuWiz never
+    /// changes permissions automatically.
+    AppImageNotExecutable,
     /// Fresh re-inspection produced `Unknown` or `Conflicting` identity -
     /// never resolved to one trustworthy answer.
     IdentityUnresolved,
@@ -248,8 +264,9 @@ impl From<LaunchSpawnError> for LaunchExecutionError {
 ///    a mount-input [`crate::ArchiveKind`]).
 /// 3. A [`LaunchContentIdentity`] is captured from the content's current
 ///    metadata.
-/// 4. `request.profile.profile_kind` must be [`ProfileKind::Native`] -
-///    Flatpak and AppImage are refused here, before any plan exists.
+/// 4. `request.profile.profile_kind` must be Native or a freshly verified,
+///    exact-path-bound AppImage profile. Flatpak is refused before any plan
+///    exists.
 /// 5. The content is freshly re-identified via [`inspect_game_identity`]
 ///    (never the caller's old report) and converted through
 ///    [`canonical_identity_from_game_report`]; the result must be
@@ -290,12 +307,15 @@ pub fn preflight_retroarch_launch(
     }
     let content_identity = inspect_and_capture_content_identity(content_path)?;
 
-    // --- 4: profile kind gate (Flatpak/AppImage refused outright) ---
-    if request.profile.profile_kind != ProfileKind::Native {
+    // --- 4: RetroArch-specific profile kind gate ---
+    if !matches!(
+        request.profile.profile_kind,
+        ProfileKind::Native | ProfileKind::AppImage
+    ) {
         return Err(preflight_error(
             LaunchPreflightErrorKind::UnsupportedProfileKind,
             format!(
-                "only native RetroArch profiles are supported in this phase, got {:?}",
+                "RetroArch launch does not support {:?} profiles",
                 request.profile.profile_kind
             ),
         ));
@@ -310,6 +330,14 @@ pub fn preflight_retroarch_launch(
             preflight_error(LaunchPreflightErrorKind::DiscoveryFailed, error.to_string())
         },
     )?;
+
+    if request.profile.profile_kind == ProfileKind::AppImage {
+        revalidate_appimage_profile(
+            &fresh_environment,
+            request.profile,
+            request.expected_appimage_executable.as_deref(),
+        )?;
+    }
 
     // --- 7: rebuild the plan, find the exact requested candidate ---
     let content_ref = LaunchContentRef {
@@ -383,7 +411,15 @@ pub fn preflight_retroarch_launch(
     })?;
 
     // --- 10: recheck immediately before spawn ---
-    recheck_executable(&command.executable)?;
+    if request.profile.profile_kind == ProfileKind::AppImage
+        && request.expected_appimage_executable.as_deref() != Some(command.executable.as_path())
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::AppImageVerificationStale,
+            "fresh RetroArch command planning selected a different AppImage executable",
+        ));
+    }
+    recheck_selected_executable(&command.executable, request.profile.profile_kind)?;
     recheck_core_library(&command.selection.core_library)?;
     let current_identity = inspect_and_capture_content_identity(&command.selection.content_path)?;
     if current_identity != content_identity {
@@ -394,6 +430,63 @@ pub fn preflight_retroarch_launch(
     }
 
     Ok(command)
+}
+
+fn revalidate_appimage_profile(
+    environment: &RetroArchEnvironmentReport,
+    requested_profile: ProfileRef,
+    expected_executable: Option<&Path>,
+) -> Result<(), LaunchPreflightError> {
+    let expected_executable = expected_executable.ok_or_else(|| {
+        preflight_error(
+            LaunchPreflightErrorKind::AppImageVerificationStale,
+            "AppImage launch request has no exact executable binding",
+        )
+    })?;
+    let profiles: Vec<_> = environment
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile.profile_kind == requested_profile.profile_kind
+                && profile.scope == requested_profile.scope
+        })
+        .collect();
+    let [profile] = profiles.as_slice() else {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::AppImageMissing,
+            "the selected RetroArch AppImage profile is no longer discovered",
+        ));
+    };
+    let matching: Vec<_> = profile
+        .app_images
+        .iter()
+        .filter(|candidate| {
+            !candidate.path.lossy && Path::new(&candidate.path.display) == expected_executable
+        })
+        .collect();
+    let [candidate] = matching.as_slice() else {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::AppImageMissing,
+            "the selected RetroArch AppImage is no longer present at its verified path",
+        ));
+    };
+    if candidate.confidence != AppImageIdentificationConfidence::Exact {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::AppImageVerificationStale,
+            "the selected RetroArch AppImage no longer has exact identity evidence",
+        ));
+    }
+    match candidate.executable {
+        Some(ExecutableState::Executable) => Ok(()),
+        Some(ExecutableState::NotExecutable) => Err(preflight_error(
+            LaunchPreflightErrorKind::AppImageNotExecutable,
+            "the selected RetroArch AppImage is not executable; restore its execute permission and try again",
+        )),
+        None => Err(preflight_error(
+            LaunchPreflightErrorKind::AppImageUnsafe,
+            "the selected RetroArch AppImage is no longer a regular, non-symlink file",
+        )),
+    }
 }
 
 fn inspect_and_capture_content_identity(
@@ -492,6 +585,35 @@ fn recheck_executable(path: &Path) -> Result<(), LaunchPreflightError> {
         }
     }
     Ok(())
+}
+
+fn recheck_selected_executable(
+    path: &Path,
+    profile_kind: ProfileKind,
+) -> Result<(), LaunchPreflightError> {
+    recheck_executable(path).map_err(|error| {
+        if profile_kind != ProfileKind::AppImage {
+            return error;
+        }
+        match error.kind {
+            LaunchPreflightErrorKind::ExecutableMissing => preflight_error(
+                LaunchPreflightErrorKind::AppImageMissing,
+                format!("verified RetroArch AppImage is no longer present: {}", error.detail),
+            ),
+            LaunchPreflightErrorKind::ExecutableUnsafe => preflight_error(
+                LaunchPreflightErrorKind::AppImageUnsafe,
+                format!("verified RetroArch AppImage is unsafe: {}", error.detail),
+            ),
+            LaunchPreflightErrorKind::ExecutableNotExecutable => preflight_error(
+                LaunchPreflightErrorKind::AppImageNotExecutable,
+                format!(
+                    "verified RetroArch AppImage is no longer executable; restore its execute permission and try again: {}",
+                    error.detail
+                ),
+            ),
+            _ => error,
+        }
+    })
 }
 
 fn recheck_core_library(path: &Path) -> Result<(), LaunchPreflightError> {

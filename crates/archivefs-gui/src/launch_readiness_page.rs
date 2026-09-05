@@ -29,7 +29,7 @@
 //!   [`archivefs_core::launch::evidence_bridge`] for where those honest
 //!   fail-closed rules actually live; this module only renders whatever
 //!   that bridge already decided.
-//! - It never launches a Flatpak/AppImage candidate, archive/mounted
+//! - It never launches a Flatpak candidate, archive/mounted
 //!   content, or a `ReadyWithWarnings`/`Blocked` candidate. Standalone
 //!   candidates are limited to adapters with an existing typed GUI executor.
 //! - It never exposes a Stop/Kill action and never automatically relaunches
@@ -42,7 +42,8 @@ use std::thread;
 use archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord;
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
-    DiscoveryEnvironment, ProfileKind, ProfileRef,
+    AppImageIdentificationConfidence, DiscoveryEnvironment, ExecutableState, ProfileKind,
+    ProfileRef, RetroArchEnvironmentReport,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -99,6 +100,7 @@ pub(crate) enum LaunchReadinessInput {
     /// Identity was resolved and a real [`LaunchPlan`] was built.
     Plan {
         plan: LaunchPlan,
+        retroarch: Option<RetroArchLaunchContext>,
         /// Whether the RetroArch environment was actually discovered. An
         /// unscanned RetroArch lane must not hide a ready standalone lane.
         retroarch_scanned: bool,
@@ -132,6 +134,54 @@ pub(crate) enum LaunchReadinessInput {
         xemu: Option<XemuLaunchContext>,
         xenia: Option<XeniaLaunchContext>,
     },
+}
+
+/// Exact AppImage paths selected from the same RetroArch discovery report as
+/// the launch plan. This binds an AppImage request to one reviewed executable;
+/// it is not a generic AppImage launcher.
+pub(crate) struct RetroArchLaunchContext {
+    appimage_executables: Vec<(ProfileRef, PathBuf)>,
+}
+
+pub(crate) fn retroarch_launch_context(
+    environment: &RetroArchEnvironmentReport,
+) -> RetroArchLaunchContext {
+    let mut appimage_executables = Vec::new();
+    for profile in &environment.profiles {
+        if profile.profile_kind != ProfileKind::AppImage {
+            continue;
+        }
+        let profile_ref = ProfileRef {
+            profile_kind: profile.profile_kind,
+            scope: profile.scope,
+        };
+        for candidate in &profile.app_images {
+            if candidate.confidence == AppImageIdentificationConfidence::Exact
+                && candidate.executable == Some(ExecutableState::Executable)
+                && !candidate.path.lossy
+            {
+                appimage_executables.push((profile_ref, PathBuf::from(&candidate.path.display)));
+            }
+        }
+    }
+    RetroArchLaunchContext {
+        appimage_executables,
+    }
+}
+
+impl RetroArchLaunchContext {
+    fn exact_appimage_executable(&self, profile: ProfileRef) -> Option<PathBuf> {
+        let matches: Vec<_> = self
+            .appimage_executables
+            .iter()
+            .filter(|(candidate_profile, _)| *candidate_profile == profile)
+            .map(|(_, executable)| executable.clone())
+            .collect();
+        match matches.as_slice() {
+            [executable] => Some(executable.clone()),
+            [] | [_, _, ..] => None,
+        }
+    }
 }
 
 /// One exact adapter request selected by the shared launch plan. Gamer View
@@ -245,6 +295,7 @@ pub(crate) enum GamerPlayAction {
 pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction {
     let LaunchReadinessInput::Plan {
         plan,
+        retroarch,
         retroarch_scanned,
         standalone_scans_complete,
         dolphin,
@@ -300,6 +351,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             typed_launch_request(
                 plan,
                 candidate,
+                retroarch.as_ref(),
                 dolphin.as_ref(),
                 pcsx2.as_ref(),
                 duckstation.as_ref(),
@@ -552,6 +604,7 @@ struct RetroArchLaunchKey {
     content_path: PathBuf,
     profile: ProfileRef,
     core_stem: String,
+    expected_appimage_executable: Option<PathBuf>,
 }
 
 impl RetroArchLaunchKey {
@@ -560,6 +613,7 @@ impl RetroArchLaunchKey {
             content_path: request.selected_content_path.clone(),
             profile: request.profile,
             core_stem: request.core_stem.clone(),
+            expected_appimage_executable: request.expected_appimage_executable.clone(),
         }
     }
 }
@@ -1329,13 +1383,15 @@ fn pcsx2_launch_error_message(error: &Pcsx2LaunchExecutionError) -> (&'static st
 /// exact facts sent to core when it is clicked - one function so the button
 /// can never show for a request core's own preflight would refuse. `Some`
 /// only when every Phase-1 condition holds: [`LaunchTarget::RetroArchCore`],
-/// [`ProfileKind::Native`], strictly [`LaunchReadiness::Ready`] (never
+/// [`ProfileKind::Native`] or an exact, verified RetroArch
+/// [`ProfileKind::AppImage`], strictly [`LaunchReadiness::Ready`] (never
 /// `ReadyWithWarnings`), direct loose/plain content
 /// ([`LaunchContainerKind::PlainFile`], `requires_mount == false`), no
 /// blockers, no warnings, and a resolved plan-level platform/game key.
 fn retroarch_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
 ) -> Option<RetroArchLaunchRequest> {
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
         return None;
@@ -1359,15 +1415,18 @@ fn retroarch_launch_request(
     else {
         return None;
     };
-    if profile.profile_kind != ProfileKind::Native {
-        return None;
-    }
+    let expected_appimage_executable = match profile.profile_kind {
+        ProfileKind::Native => None,
+        ProfileKind::AppImage => retroarch?.exact_appimage_executable(*profile),
+        ProfileKind::Flatpak => return None,
+    };
     Some(RetroArchLaunchRequest {
         selected_content_path: content_path,
         expected_platform_id: platform_id.clone(),
         expected_game_key: game_key.clone(),
         profile: *profile,
         core_stem: core_stem.clone(),
+        expected_appimage_executable,
     })
 }
 
@@ -1393,7 +1452,19 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
                     "This game's identity changed since it was last checked."
                 }
                 LaunchPreflightErrorKind::UnsupportedProfileKind => {
-                    "The selected RetroArch profile is no longer a supported native install."
+                    "The selected RetroArch profile is not supported for launch."
+                }
+                LaunchPreflightErrorKind::AppImageMissing => {
+                    "The selected RetroArch AppImage is no longer available."
+                }
+                LaunchPreflightErrorKind::AppImageVerificationStale => {
+                    "The selected RetroArch AppImage can no longer be verified."
+                }
+                LaunchPreflightErrorKind::AppImageUnsafe => {
+                    "The selected RetroArch AppImage is not a safe regular file."
+                }
+                LaunchPreflightErrorKind::AppImageNotExecutable => {
+                    "The selected RetroArch AppImage is not executable. Restore its execute permission and try again."
                 }
                 LaunchPreflightErrorKind::DiscoveryFailed => {
                     "RetroArch could not be re-checked on this machine."
@@ -1475,6 +1546,7 @@ pub(crate) fn show_launch_readiness_panel(
         }
         LaunchReadinessInput::Plan {
             plan,
+            retroarch,
             dolphin,
             pcsx2,
             duckstation,
@@ -1486,6 +1558,7 @@ pub(crate) fn show_launch_readiness_panel(
         } => show_plan(
             ui,
             plan,
+            retroarch.as_ref(),
             dolphin.as_ref(),
             pcsx2.as_ref(),
             duckstation.as_ref(),
@@ -1507,6 +1580,7 @@ pub(crate) fn show_launch_readiness_panel(
 fn show_plan(
     ui: &mut egui::Ui,
     plan: &LaunchPlan,
+    retroarch: Option<&RetroArchLaunchContext>,
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
     duckstation: Option<&DuckStationLaunchContext>,
@@ -1534,6 +1608,7 @@ fn show_plan(
             ui,
             plan,
             candidate,
+            retroarch,
             dolphin,
             pcsx2,
             duckstation,
@@ -1754,6 +1829,7 @@ fn standalone_launch_request(
 fn typed_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
     duckstation: Option<&DuckStationLaunchContext>,
@@ -1762,7 +1838,7 @@ fn typed_launch_request(
     xemu: Option<&XemuLaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
 ) -> Option<TypedLaunchRequest> {
-    if let Some(request) = retroarch_launch_request(plan, candidate) {
+    if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
         return Some(TypedLaunchRequest::RetroArch(request));
     }
     if let Some(context) = dolphin
@@ -1968,6 +2044,7 @@ fn show_candidate(
     ui: &mut egui::Ui,
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
     duckstation: Option<&DuckStationLaunchContext>,
@@ -2029,7 +2106,7 @@ fn show_candidate(
             detail_label(ui, "Content provenance", &candidate.content.provenance);
         });
 
-        if let Some(request) = retroarch_launch_request(plan, candidate) {
+        if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
             ui.add_space(6.0);
             show_launch_action(ui, retroarch_launch_state, request);
         }

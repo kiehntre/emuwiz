@@ -42,6 +42,7 @@ static NEXT_PCSX2_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
+        retroarch: None,
         retroarch_scanned: true,
         standalone_scans_complete: true,
         dolphin: None,
@@ -57,6 +58,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
 fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
+        retroarch: None,
         retroarch_scanned: true,
         standalone_scans_complete: true,
         dolphin: Some(context),
@@ -72,6 +74,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
 fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchReadinessInput {
     LaunchReadinessInput::Plan {
         plan,
+        retroarch: None,
         retroarch_scanned: true,
         standalone_scans_complete: true,
         dolphin: None,
@@ -392,6 +395,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
     )]);
     let input = LaunchReadinessInput::Plan {
         plan,
+        retroarch: None,
         retroarch_scanned: false,
         standalone_scans_complete: true,
         dolphin: None,
@@ -418,6 +422,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
     );
     let input = LaunchReadinessInput::Plan {
         plan,
+        retroarch: None,
         retroarch_scanned: false,
         standalone_scans_complete: true,
         dolphin: Some(ready.context),
@@ -446,6 +451,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
     let plan = pcsx2_plan_with(vec![candidate]);
     let action = gamer_play_action(&LaunchReadinessInput::Plan {
         plan,
+        retroarch: None,
         retroarch_scanned: false,
         standalone_scans_complete: true,
         dolphin: None,
@@ -473,6 +479,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
     ));
     let action = gamer_play_action(&LaunchReadinessInput::Plan {
         plan: pcsx2_plan_with(vec![candidate]),
+        retroarch: None,
         retroarch_scanned: false,
         standalone_scans_complete: true,
         dolphin: None,
@@ -820,7 +827,7 @@ fn flatpak_profile_candidate_has_no_launch_button() {
 }
 
 #[test]
-fn appimage_profile_candidate_has_no_launch_button() {
+fn appimage_profile_candidate_needs_an_exact_executable_binding() {
     let mut candidate = ready_candidate();
     candidate.target = LaunchTarget::RetroArchCore {
         profile: ProfileRef {
@@ -831,8 +838,23 @@ fn appimage_profile_candidate_has_no_launch_button() {
         platform_id: "PSX",
     };
     let plan = plan_with(vec![candidate]);
-    let output = render(&plan_input(plan));
-    assert!(!rendered_text_contains(&output, "Launch RetroArch"));
+    let candidate = &plan.candidates[0];
+    assert!(retroarch_launch_request(&plan, candidate, None).is_none());
+    let context = RetroArchLaunchContext {
+        appimage_executables: vec![(
+            ProfileRef {
+                profile_kind: ProfileKind::AppImage,
+                scope: ProfileScope::User,
+            },
+            PathBuf::from("/Applications/RetroArch.AppImage"),
+        )],
+    };
+    let request = retroarch_launch_request(&plan, candidate, Some(&context))
+        .expect("one exact verified AppImage binding enables this RetroArch request");
+    assert_eq!(
+        request.expected_appimage_executable,
+        Some(PathBuf::from("/Applications/RetroArch.AppImage"))
+    );
 }
 
 #[test]
@@ -863,8 +885,8 @@ fn mounted_archive_content_candidate_has_no_launch_button() {
 fn eligible_candidate_yields_the_exact_expected_retroarch_launch_request_facts() {
     let plan = plan_with(vec![ready_candidate()]);
     let candidate = &plan.candidates[0];
-    let request =
-        retroarch_launch_request(&plan, candidate).expect("this candidate is Phase-1 eligible");
+    let request = retroarch_launch_request(&plan, candidate, None)
+        .expect("this candidate is Phase-1 eligible");
 
     assert_eq!(
         request.selected_content_path,
@@ -882,11 +904,11 @@ fn ineligible_candidates_never_yield_a_launch_request() {
 
     let mut ready_with_warnings = ready_candidate();
     ready_with_warnings.readiness = LaunchReadiness::ReadyWithWarnings;
-    assert!(retroarch_launch_request(&plan, &ready_with_warnings).is_none());
+    assert!(retroarch_launch_request(&plan, &ready_with_warnings, None).is_none());
 
     let mut mounted = ready_candidate();
     mounted.content = unresolved_archive_content();
-    assert!(retroarch_launch_request(&plan, &mounted).is_none());
+    assert!(retroarch_launch_request(&plan, &mounted, None).is_none());
 
     let mut flatpak = ready_candidate();
     flatpak.target = LaunchTarget::RetroArchCore {
@@ -897,7 +919,7 @@ fn ineligible_candidates_never_yield_a_launch_request() {
         core_stem: "mednafen_psx_hw".to_string(),
         platform_id: "PSX",
     };
-    assert!(retroarch_launch_request(&plan, &flatpak).is_none());
+    assert!(retroarch_launch_request(&plan, &flatpak, None).is_none());
 }
 
 // --- Starting disables a duplicate click -------------------------------------
@@ -906,7 +928,7 @@ fn ineligible_candidates_never_yield_a_launch_request() {
 fn starting_stage_shows_a_starting_label_and_no_active_launch_button() {
     let plan = plan_with(vec![ready_candidate()]);
     let candidate = &plan.candidates[0];
-    let request = retroarch_launch_request(&plan, candidate).unwrap();
+    let request = retroarch_launch_request(&plan, candidate, None).unwrap();
     let key = RetroArchLaunchKey::from_request(&request);
     let (_sender, receiver) = mpsc::channel();
     let mut state = RetroArchLaunchState {
@@ -924,7 +946,7 @@ fn starting_stage_shows_a_starting_label_and_no_active_launch_button() {
 fn running_stage_shows_running_status_and_pid() {
     let plan = plan_with(vec![ready_candidate()]);
     let candidate = &plan.candidates[0];
-    let request = retroarch_launch_request(&plan, candidate).unwrap();
+    let request = retroarch_launch_request(&plan, candidate, None).unwrap();
     let key = RetroArchLaunchKey::from_request(&request);
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let pid = process.pid;
@@ -945,7 +967,7 @@ fn running_stage_shows_running_status_and_pid() {
 fn clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
     let plan = plan_with(vec![ready_candidate()]);
     let candidate = &plan.candidates[0];
-    let request = retroarch_launch_request(&plan, candidate).unwrap();
+    let request = retroarch_launch_request(&plan, candidate, None).unwrap();
     let key = RetroArchLaunchKey::from_request(&request);
     let mut process = spawn_test_process("/bin/true", &[]);
     wait_until_exited(&mut process);
@@ -966,7 +988,7 @@ fn clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
 fn non_zero_exit_shows_bounded_stderr_behind_technical_details() {
     let plan = plan_with(vec![ready_candidate()]);
     let candidate = &plan.candidates[0];
-    let request = retroarch_launch_request(&plan, candidate).unwrap();
+    let request = retroarch_launch_request(&plan, candidate, None).unwrap();
     let key = RetroArchLaunchKey::from_request(&request);
     let mut process = spawn_test_process(
         "/bin/sh",
@@ -1005,7 +1027,7 @@ fn preflight_failure_enters_failed_with_a_gamer_facing_message_never_no_emulator
     let mut candidate = ready_candidate();
     candidate.content = resolved_content("/nonexistent/launch-readiness-test-fixture-9f31.bin");
     let plan = plan_with(vec![candidate]);
-    let request = retroarch_launch_request(&plan, &plan.candidates[0]).unwrap();
+    let request = retroarch_launch_request(&plan, &plan.candidates[0], None).unwrap();
     let key = RetroArchLaunchKey::from_request(&request);
 
     let mut state = RetroArchLaunchState::default();
@@ -1034,7 +1056,8 @@ fn changing_selected_candidate_never_shows_another_selections_running_process_as
     let mut other_candidate = ready_candidate();
     other_candidate.content = resolved_content("/library/OtherGame.bin");
     let other_plan = plan_with(vec![other_candidate]);
-    let other_request = retroarch_launch_request(&other_plan, &other_plan.candidates[0]).unwrap();
+    let other_request =
+        retroarch_launch_request(&other_plan, &other_plan.candidates[0], None).unwrap();
     let other_key = RetroArchLaunchKey::from_request(&other_request);
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let mut state = RetroArchLaunchState {

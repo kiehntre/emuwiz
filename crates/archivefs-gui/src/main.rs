@@ -7856,6 +7856,14 @@ impl ArchiveFsApp {
         );
         LaunchReadinessInput::Plan {
             plan,
+            retroarch: match &self.retroarch_profiles {
+                RetroArchProfilesState::Ready(discovery) => Some(
+                    launch_readiness_page::retroarch_launch_context(&discovery.environment),
+                ),
+                RetroArchProfilesState::NotScanned
+                | RetroArchProfilesState::Scanning { .. }
+                | RetroArchProfilesState::Error(_) => None,
+            },
             retroarch_scanned,
             standalone_scans_complete,
             dolphin: dolphin_context,
