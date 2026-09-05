@@ -130,6 +130,21 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_fullname: "Sony PlayStation Portable",
     },
     EsDeSystemMapping {
+        platform_id: "PlayStation Vita",
+        es_de_system: "psvita",
+        es_de_fullname: "Sony PlayStation Vita",
+    },
+    EsDeSystemMapping {
+        platform_id: "Nintendo 3DS",
+        es_de_system: "3ds",
+        es_de_fullname: "Nintendo 3DS",
+    },
+    EsDeSystemMapping {
+        platform_id: "Nintendo DS",
+        es_de_system: "nds",
+        es_de_fullname: "Nintendo DS",
+    },
+    EsDeSystemMapping {
         platform_id: "Xbox",
         es_de_system: "xbox",
         es_de_fullname: "Microsoft Xbox",
@@ -148,6 +163,11 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         platform_id: "Wii",
         es_de_system: "wii",
         es_de_fullname: "Nintendo Wii",
+    },
+    EsDeSystemMapping {
+        platform_id: "WiiU",
+        es_de_system: "wiiu",
+        es_de_fullname: "Nintendo Wii U",
     },
     EsDeSystemMapping {
         platform_id: "Dreamcast",
@@ -173,6 +193,31 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         platform_id: "Amiga",
         es_de_system: "amiga",
         es_de_fullname: "Commodore Amiga",
+    },
+    EsDeSystemMapping {
+        platform_id: "AmigaCD32",
+        es_de_system: "amigacd32",
+        es_de_fullname: "Commodore Amiga CD32",
+    },
+    EsDeSystemMapping {
+        platform_id: "Commodore CDTV",
+        es_de_system: "cdtv",
+        es_de_fullname: "Commodore CDTV",
+    },
+    EsDeSystemMapping {
+        platform_id: "Arcade",
+        es_de_system: "arcade",
+        es_de_fullname: "Arcade",
+    },
+    EsDeSystemMapping {
+        platform_id: "DOS",
+        es_de_system: "dos",
+        es_de_fullname: "DOS",
+    },
+    EsDeSystemMapping {
+        platform_id: "ScummVM",
+        es_de_system: "scummvm",
+        es_de_fullname: "ScummVM",
     },
     EsDeSystemMapping {
         platform_id: "Game Boy",
@@ -459,15 +504,24 @@ mod tests {
             "PS2",
             "PS3",
             "PSP",
+            "PlayStation Vita",
+            "Nintendo 3DS",
+            "Nintendo DS",
             "Xbox",
             "Xbox360",
             "GameCube",
             "Wii",
+            "WiiU",
             "Dreamcast",
             "Saturn",
             "Sega CD",
             "AtariST",
             "Amiga",
+            "AmigaCD32",
+            "Commodore CDTV",
+            "Arcade",
+            "DOS",
+            "ScummVM",
             "Game Boy",
             "Game Boy Color",
             "Game Boy Advance",
@@ -516,6 +570,80 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing ES-DE mapping for {platform_id}"));
             assert_eq!(mapping.es_de_system, system);
             assert_eq!(mapping.es_de_fullname, fullname);
+        }
+    }
+
+    #[test]
+    fn parity_batch_maps_to_one_verified_es_de_system_each() {
+        for (platform_id, system, fullname) in [
+            ("PlayStation Vita", "psvita", "Sony PlayStation Vita"),
+            ("Nintendo 3DS", "3ds", "Nintendo 3DS"),
+            ("Nintendo DS", "nds", "Nintendo DS"),
+            ("WiiU", "wiiu", "Nintendo Wii U"),
+            ("DOS", "dos", "DOS"),
+            ("ScummVM", "scummvm", "ScummVM"),
+            ("Arcade", "arcade", "Arcade"),
+            ("AmigaCD32", "amigacd32", "Commodore Amiga CD32"),
+            ("Commodore CDTV", "cdtv", "Commodore CDTV"),
+        ] {
+            let matches: Vec<_> = ES_DE_SYSTEM_MAP
+                .iter()
+                .filter(|entry| entry.platform_id == platform_id)
+                .collect();
+            assert_eq!(matches.len(), 1, "expected one row for {platform_id}");
+            assert_eq!(matches[0].es_de_system, system);
+            assert_eq!(matches[0].es_de_fullname, fullname);
+        }
+    }
+
+    #[test]
+    fn parity_batch_aliases_resolve_to_canonical_rows_without_extra_targets() {
+        for (alias, platform_id) in [
+            ("psvita", "PlayStation Vita"),
+            ("N3DS", "Nintendo 3DS"),
+            ("ds", "Nintendo DS"),
+            ("Nintendo Wii U", "WiiU"),
+            ("ms-dos", "DOS"),
+            ("scumm", "ScummVM"),
+            ("fbneo", "Arcade"),
+            ("cd32", "AmigaCD32"),
+            ("amigacdtv", "Commodore CDTV"),
+        ] {
+            let canonical = crate::platform::platform_for_alias(alias)
+                .unwrap_or_else(|| panic!("alias {alias} did not resolve"));
+            assert_eq!(canonical.id, platform_id);
+            assert!(es_de_system_for_platform(canonical.id).is_some());
+        }
+    }
+
+    #[test]
+    fn unknown_platforms_remain_fail_closed_and_map_has_no_duplicate_systems() {
+        assert!(es_de_system_for_platform("not-a-platform").is_none());
+        for (left_index, left) in ES_DE_SYSTEM_MAP.iter().enumerate() {
+            assert!(
+                ES_DE_SYSTEM_MAP[left_index + 1..]
+                    .iter()
+                    .all(|right| right.platform_id != left.platform_id),
+                "duplicate platform mapping for {}",
+                left.platform_id
+            );
+            assert!(
+                ES_DE_SYSTEM_MAP[left_index + 1..]
+                    .iter()
+                    .all(|right| right.es_de_system != left.es_de_system),
+                "duplicate ES-DE system mapping for {}",
+                left.es_de_system
+            );
+        }
+    }
+
+    #[test]
+    fn multi_emulator_platforms_are_mapped_by_platform_not_emulator() {
+        for platform_id in ["Arcade", "AmigaCD32", "Commodore CDTV"] {
+            let mapping = es_de_system_for_platform(platform_id).unwrap();
+            assert!(!mapping.es_de_system.contains("mame"));
+            assert!(!mapping.es_de_system.contains("fbneo"));
+            assert!(!mapping.es_de_system.contains("amiberry"));
         }
     }
 
