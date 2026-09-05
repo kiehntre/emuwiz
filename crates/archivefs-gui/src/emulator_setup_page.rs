@@ -114,6 +114,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "hatari" => "Hatari",
         "mgba" => "mGBA",
         "mesen" => "Mesen 2",
+        "snes9x" => "Snes9x",
         "mame" => "MAME",
         "fbneo" => "FBNeo",
         "cemu" => "Cemu",
@@ -507,6 +508,24 @@ mod tests {
                 .iter()
                 .any(|c| c.platform_id == "Game Boy Color" && c.adapter_id == "mesen")
         );
+    }
+
+    #[test]
+    fn snes9x_and_retroarch_are_distinct_snes_candidates_with_no_auto_winner() {
+        let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, Some("SNES"), "");
+        let snes9x = candidates
+            .iter()
+            .find(|c| c.platform_id == "SNES" && c.adapter_id == "snes9x")
+            .expect("standalone Snes9x candidate");
+        let retroarch = candidates
+            .iter()
+            .find(|c| c.platform_id == "SNES" && c.adapter_id == "retroarch")
+            .expect("RetroArch candidate");
+        // Two separate rows, neither collapsed into the other and neither
+        // marked as the chosen one.
+        assert_eq!(snes9x.name, "Snes9x");
+        assert_eq!(retroarch.name, "RetroArch");
+        assert_ne!(snes9x.adapter_id, retroarch.adapter_id);
     }
 
     #[test]

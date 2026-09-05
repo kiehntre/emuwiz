@@ -97,6 +97,13 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Mesen {
         profile: &'a MesenProfile,
     },
+    /// A discovered standalone Snes9x executable/profile. Snes9x (Super
+    /// Nintendo / Super Famicom) is a wholly independent candidate from the
+    /// RetroArch `snes9x` core for the same `SNES` platform - both are
+    /// surfaced, neither is auto-preferred. Needs no firmware/BIOS.
+    Snes9x {
+        profile: &'a crate::patch_manager::Snes9xProfile,
+    },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
     },
@@ -242,6 +249,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn rmg(profile: &'a crate::patch_manager::RmgProfile) -> Self {
         Self::Rmg { profile }
+    }
+
+    pub fn snes9x(profile: &'a crate::patch_manager::Snes9xProfile) -> Self {
+        Self::Snes9x { profile }
     }
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
@@ -437,6 +448,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                 Some(StandaloneProfileInput {
                     adapter_id: "mesen", profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.configuration_path.clone()), eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Snes9x { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "SNES") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "snes9x",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }
@@ -775,6 +798,60 @@ mod tests {
                         system_name: Some("PlayStation".to_string()),
                         supported_extensions: Vec::new(),
                         core_name: Some("mednafen_psx".to_string()),
+                        manufacturer: None,
+                        categories: None,
+                        database: None,
+                        firmware: Vec::new(),
+                    },
+                }],
+                playlists: RetroArchPlaylistInventory {
+                    directory: None,
+                    playlists: Vec::new(),
+                    diagnostics: Vec::new(),
+                    complete: true,
+                },
+                app_images: Vec::new(),
+                diagnostics: Vec::new(),
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn retroarch_with_snes9x_core() -> RetroArchEnvironmentReport {
+        let config_dir = EncodedPath::from_path(&PathBuf::from("/retroarch"));
+        RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: vec![RetroArchProfile {
+                profile_kind: ProfileKind::Native,
+                scope: ProfileScope::User,
+                evidence: Evidence {
+                    executables: Vec::new(),
+                    flatpak_metadata_found: false,
+                    config_directory_found: true,
+                    config_file_found: true,
+                },
+                config_directory: DirectoryProbeFinding {
+                    path: config_dir.clone(),
+                    probe: FsProbe::PresentDirectory,
+                },
+                config_file: ConfigFileFinding {
+                    path: EncodedPath::from_path(&PathBuf::from("/retroarch/retroarch.cfg")),
+                    probe: FsProbe::PresentFile,
+                    read: ConfigReadOutcome::NotAttempted,
+                },
+                paths: Vec::new(),
+                cores: vec![CoreFinding {
+                    file_name: EncodedPath::from_path(&PathBuf::from("snes9x_libretro.so")),
+                    full_path: EncodedPath::from_path(&PathBuf::from(
+                        "/retroarch/cores/snes9x_libretro.so",
+                    )),
+                    core_stem: "snes9x".to_string(),
+                    info: CoreInfoFinding::Found {
+                        display_name: None,
+                        display_version: None,
+                        system_name: Some("Nintendo - SNES / SFC".to_string()),
+                        supported_extensions: Vec::new(),
+                        core_name: Some("snes9x".to_string()),
                         manufacturer: None,
                         categories: None,
                         database: None,
@@ -1869,6 +1946,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn snes9x_profile() -> crate::patch_manager::Snes9xProfile {
+        crate::patch_manager::Snes9xProfile {
+            profile_id: "snes9x:/usr/bin/snes9x-gtk".to_string(),
+            installation_type: crate::patch_manager::Snes9xInstallationType::Native,
+            executable: PathBuf::from("/usr/bin/snes9x-gtk"),
+            eligible: true,
+            blocker: None,
+            version: Some("1.63".to_string()),
+        }
+    }
+
+    #[test]
+    fn snes9x_profile_projects_to_a_snes_candidate_separate_from_retroarch() {
+        let identity = resolved("SNES", "verified-snes-key");
+        let profile = snes9x_profile();
+        let profiles = [DiscoveredStandaloneProfile::snes9x(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &retroarch_with_snes9x_core(),
+        );
+        let standalone = plan.candidates.iter().any(|candidate| {
+            matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "snes9x",
+                    ..
+                }
+            )
+        });
+        let retroarch = plan
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }));
+        assert!(standalone, "standalone Snes9x is projected for SNES");
+        assert!(
+            retroarch,
+            "the RetroArch snes9x core stays its own candidate"
+        );
+        assert_eq!(plan.candidates.len(), 2);
+        assert!(
+            plan.candidates.iter().all(|candidate| {
+                candidate.preference != crate::launch::CandidatePreference::Remembered
+            }),
+            "no automatic winner between the two SNES candidates"
+        );
+    }
+
+    #[test]
+    fn non_snes_identity_never_produces_a_snes9x_candidate() {
+        let profile = snes9x_profile();
+        let profiles = [DiscoveredStandaloneProfile::snes9x(&profile)];
+        for identity in [
+            resolved("NES", "nes-key"),
+            resolved("Game Boy", "gb-key"),
+            resolved("N64", "n64-key"),
+        ] {
+            let plan = plan(
+                &identity,
+                &[],
+                &resolved_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "snes9x",
+                    ..
+                }
+            )));
+        }
     }
 
     #[test]

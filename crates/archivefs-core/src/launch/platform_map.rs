@@ -190,7 +190,7 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "SNES",
-        standalone_adapters: &["mesen"],
+        standalone_adapters: &["mesen", "snes9x"],
         retroarch_core_hints: &["snes9x"],
         confidence: MappingConfidence::StronglyKnown,
     },
@@ -523,6 +523,14 @@ mod tests {
     }
 
     #[test]
+    fn snes_registers_snes9x_as_a_standalone_adapter_alongside_its_retroarch_hint() {
+        let entry = launch_compatibility_for_platform("SNES").unwrap();
+        assert_eq!(entry.standalone_adapters, &["mesen", "snes9x"]);
+        assert_eq!(entry.retroarch_core_hints, &["snes9x"]);
+        assert_eq!(platforms_for_standalone_adapter("snes9x"), vec!["SNES"]);
+    }
+
+    #[test]
     fn dolphin_serves_both_gamecube_and_wii() {
         assert!(platforms_for_standalone_adapter("dolphin").contains(&"GameCube"));
         assert!(platforms_for_standalone_adapter("dolphin").contains(&"Wii"));
@@ -555,8 +563,14 @@ mod tests {
                 assert_eq!(row.standalone_adapters, &["mgba", "mesen"], "{platform_id}");
             } else if platform_id == "N64" {
                 assert_eq!(row.standalone_adapters, &["rmg"], "{platform_id}");
-            } else if matches!(platform_id, "NES" | "SNES") {
+            } else if platform_id == "NES" {
                 assert_eq!(row.standalone_adapters, &["mesen"], "{platform_id}");
+            } else if platform_id == "SNES" {
+                assert_eq!(
+                    row.standalone_adapters,
+                    &["mesen", "snes9x"],
+                    "{platform_id}"
+                );
             } else {
                 assert!(row.standalone_adapters.is_empty(), "{platform_id}");
             }

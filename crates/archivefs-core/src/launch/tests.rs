@@ -933,3 +933,126 @@ fn a_blocked_standalone_with_no_retroarch_core_never_invents_a_fallback() {
         "a blocked standalone with no core yields no runnable launch - fail closed"
     );
 }
+
+// ---------------------------------------------------------------------
+// Snes9x standalone SNES adapter - shared registration and coexistence
+// ---------------------------------------------------------------------
+
+fn snes_cartridge_content() -> LaunchContentRef {
+    LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(PathBuf::from("/library/snes/Chrono Trigger.sfc")),
+        requires_mount: false,
+        provenance: "direct SNES cartridge image".to_string(),
+    }
+}
+
+#[test]
+fn snes9x_standalone_profile_is_registered_as_a_snes_candidate() {
+    let plan = build_launch_plan(
+        &resolved("SNES"),
+        &snes_cartridge_content(),
+        &[eligible_standalone(
+            "snes9x",
+            FirmwareReadiness::NotRequired,
+        )],
+        &empty_retroarch_environment(),
+        &[],
+    );
+    let standalone = plan
+        .candidates
+        .iter()
+        .find(|candidate| {
+            matches!(
+                &candidate.target,
+                LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "snes9x"
+            )
+        })
+        .expect("Snes9x standalone candidate is registered for SNES");
+    assert_eq!(standalone.readiness, LaunchReadiness::Ready);
+    // Normal Snes9x launch needs no BIOS/firmware - none is invented.
+    assert_eq!(standalone.firmware, FirmwareReadiness::NotRequired);
+    assert!(standalone.blockers.is_empty());
+}
+
+#[test]
+fn snes9x_and_retroarch_coexist_as_separate_snes_candidates_with_no_auto_winner() {
+    let plan = build_launch_plan(
+        &resolved("SNES"),
+        &snes_cartridge_content(),
+        &[eligible_standalone(
+            "snes9x",
+            FirmwareReadiness::NotRequired,
+        )],
+        &retroarch_environment_with_cores(vec![core_finding(
+            "snes9x",
+            Some("Nintendo - SNES / SFC"),
+            None,
+        )]),
+        &[],
+    );
+
+    let has_standalone = plan.candidates.iter().any(|candidate| {
+        matches!(
+            &candidate.target,
+            LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "snes9x"
+        )
+    });
+    let has_retroarch = plan
+        .candidates
+        .iter()
+        .any(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }));
+    assert!(has_standalone, "standalone Snes9x stays its own candidate");
+    assert!(has_retroarch, "RetroArch stays its own separate candidate");
+    assert_eq!(plan.candidates.len(), 2, "neither profile is collapsed");
+
+    // No mechanism silently anoints one of them: nothing was remembered, so
+    // no candidate is marked `Remembered`.
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|candidate| candidate.preference != CandidatePreference::Remembered),
+        "no automatic winner is selected between Snes9x and RetroArch"
+    );
+}
+
+#[test]
+fn remembering_snes9x_keeps_retroarch_listed_as_a_separate_choice() {
+    let profiles = [eligible_standalone(
+        "snes9x",
+        FirmwareReadiness::NotRequired,
+    )];
+    let remembered = [RememberedPreference {
+        adapter_id: "snes9x".to_string(),
+        profile_id: profiles[0].profile_id.clone(),
+    }];
+    let plan = build_launch_plan(
+        &resolved("SNES"),
+        &snes_cartridge_content(),
+        &profiles,
+        &retroarch_environment_with_cores(vec![core_finding(
+            "snes9x",
+            Some("Nintendo - SNES / SFC"),
+            None,
+        )]),
+        &remembered,
+    );
+    let standalone = plan
+        .candidates
+        .iter()
+        .find(|candidate| {
+            matches!(
+                &candidate.target,
+                LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "snes9x"
+            )
+        })
+        .expect("standalone Snes9x candidate");
+    assert_eq!(standalone.preference, CandidatePreference::Remembered);
+    assert!(
+        plan.candidates
+            .iter()
+            .any(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. })),
+        "RetroArch remains a separate, still-listed choice after remembering Snes9x"
+    );
+}

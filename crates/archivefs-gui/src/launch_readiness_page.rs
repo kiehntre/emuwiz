@@ -1971,6 +1971,7 @@ fn gamer_blocker_for_plan(
                 "xemu" => "xemu",
                 "xenia" => "Xenia",
                 "dolphin" => "Dolphin",
+                "snes9x" => "Snes9x",
                 adapter => adapter,
             };
             return GamerBlocker::for_emulator(

@@ -92,6 +92,7 @@ mod rpcs3_local;
 mod sameboy_local;
 mod shared_preview;
 mod shared_transaction;
+mod snes9x_local;
 mod user_cheat_import;
 mod vita3k_local;
 mod xemu_local;
@@ -713,6 +714,12 @@ pub use shared_transaction::{
     discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback,
     require_dolphin_managed_gamehacking_verification, require_local_mod_package_verification,
+};
+pub use snes9x_local::{
+    SNES9X_MAX_PROFILES, SNES9X_NATIVE_BINARY_NAMES, Snes9xExecutable, Snes9xInstallationType,
+    Snes9xLaunchBlocker, Snes9xLaunchBlockerKind, Snes9xNativeLaunchBinding, Snes9xProfile,
+    Snes9xProfileDiscovery, Snes9xProfileDiscoveryRoots, discover_snes9x_profiles,
+    parse_snes9x_version, resolve_snes9x_native_launch_binding,
 };
 pub use user_cheat_import::{
     USER_CHEAT_MAX_CHEATS_PER_FILE, USER_CHEAT_MAX_DEPTH, USER_CHEAT_MAX_FILE_BYTES,

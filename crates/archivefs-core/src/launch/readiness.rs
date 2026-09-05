@@ -252,6 +252,15 @@ pub enum LaunchBlockerKind {
     MesenBindingUnavailable,
     /// The mGBA profile/executable binding could not be safely resolved.
     MgbaBindingUnavailable,
+    /// A command-plan request was given a non-Snes9x candidate.
+    Snes9xCandidateRequired,
+    /// The canonical identity does not target `SNES`, the only platform this
+    /// native launch slice supports.
+    Snes9xPlatformMismatch,
+    /// The content is not a direct, non-mounted `.sfc`/`.smc` file.
+    Snes9xContentFormatUnsupported,
+    /// The Snes9x profile/executable binding could not be safely resolved.
+    Snes9xBindingUnavailable,
     /// A Vita3K command-plan request was given a non-Vita3K candidate.
     Vita3kCandidateRequired,
     /// The canonical identity does not target PlayStation Vita.

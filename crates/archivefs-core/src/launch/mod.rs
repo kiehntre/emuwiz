@@ -116,6 +116,8 @@ pub mod sameboy_command;
 pub mod sameboy_execution;
 pub mod scummvm_command;
 pub mod scummvm_execution;
+pub mod snes9x_command;
+pub mod snes9x_execution;
 pub mod vita3k_command;
 pub mod vita3k_execution;
 pub mod xemu_command;
@@ -366,6 +368,14 @@ pub use scummvm_execution::{
     LaunchedScummVmProcess, ScummVmLaunchExecutionError, ScummVmLaunchPreflightError,
     ScummVmLaunchPreflightErrorKind, ScummVmLaunchRequest, ScummVmLaunchSpawnError,
     preflight_and_launch_scummvm, preflight_scummvm_launch, spawn_scummvm,
+};
+pub use snes9x_command::{
+    SNES9X_SUPPORTED_PLATFORM_IDS, Snes9xCommand, Snes9xCommandPlan, Snes9xCommandSelection,
+    build_snes9x_command_plan,
+};
+pub use snes9x_execution::{
+    Snes9xLaunchPreflightError, Snes9xLaunchPreflightErrorKind, Snes9xLaunchRequest,
+    preflight_snes9x_launch, spawn_snes9x,
 };
 pub use vita3k_command::{
     VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,
