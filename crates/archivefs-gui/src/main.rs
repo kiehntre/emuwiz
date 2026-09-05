@@ -7993,6 +7993,9 @@ impl ArchiveFsApp {
                         },
                     );
                 }
+                SourcesPageAction::ViewScanDetails => {
+                    self.navigate_to_sources_tab(SourcesTab::Discovery);
+                }
                 SourcesPageAction::ViewInLibrary(path) => {
                     self.navigate_to_library_tab(LibraryTab::Archives);
                     self.library_source_filter = Some(Some(path));
@@ -23012,20 +23015,6 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
                 kept_definition: *keep_definition,
             })
             .map_err(|error| error.to_string()),
-    }
-}
-
-/// Mirrors the CLI's `format_source_availability` wording exactly (see
-/// `crates/archivefs-cli/src/main.rs`) so the two never disagree - kept
-/// as its own small presentation-layer function rather than shared code,
-/// exactly like `RowOrigin::label()` already is for library rows.
-fn source_availability_label(availability: SourceAvailability) -> &'static str {
-    match availability {
-        SourceAvailability::Available => "Available",
-        SourceAvailability::Unavailable => "Unavailable",
-        SourceAvailability::PermissionDenied => "Permission denied",
-        SourceAvailability::Disabled => "Disabled",
-        SourceAvailability::ScanFailed => "Scan failed",
     }
 }
 

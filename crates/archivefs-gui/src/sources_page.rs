@@ -127,6 +127,9 @@ pub(super) enum SourcesPageAction {
         path: PathBuf,
         keep_catalogue: bool,
     },
+    /// Navigation only: hand the user to the existing Sources -> Discovery
+    /// tab. The detailed scan results stay owned by that one page.
+    ViewScanDetails,
     /// From the Sources row context menu's "Show archives from this
     /// source" - navigates to the Library page filtered to exactly this
     /// source, reusing the same `library_source_filter` the Library
@@ -1100,9 +1103,17 @@ pub(super) fn show_sources_overview(
         Some("Configured source folders and cheat database readiness at a glance."),
     );
     widgets::card(ui, |ui| {
-        let available = sources
+        let last_scan_succeeded = sources
             .iter()
-            .filter(|source| source.availability == SourceAvailability::Available)
+            .filter(|source| {
+                source.enabled
+                    && source.availability == SourceAvailability::Available
+                    && source.last_scan_status == Some(archivefs_core::SourceScanStatus::Success)
+            })
+            .count();
+        let not_scanned_yet = sources
+            .iter()
+            .filter(|source| source.enabled && source.last_scan_status.is_none())
             .count();
         let disabled = sources.iter().filter(|source| !source.enabled).count();
         let blocked = sources
@@ -1126,9 +1137,15 @@ pub(super) fn show_sources_overview(
             ui.weak("Catalogue unavailable; scan history and archive counts could not be loaded.");
         }
         let mut items: Vec<(String, widgets::StatusTone)> = vec![(
-            format!("{available} available"),
+            format!("{last_scan_succeeded} last scan succeeded"),
             widgets::StatusTone::Success,
         )];
+        if not_scanned_yet > 0 {
+            items.push((
+                format!("{not_scanned_yet} not scanned yet"),
+                widgets::StatusTone::Pending,
+            ));
+        }
         if disabled > 0 {
             items.push((format!("{disabled} disabled"), widgets::StatusTone::Pending));
         }
@@ -1144,6 +1161,69 @@ pub(super) fn show_sources_overview(
             .collect();
         widgets::status_strip(ui, &item_refs);
     });
+}
+
+/// A friendly local display label, deliberately derived from the configured
+/// path rather than persisted as a second source identity.
+fn game_folder_title(path: &Path) -> String {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Game folder".to_string())
+}
+
+/// The page has no live reachability probe. These labels describe only the
+/// configured state and the last known scan result already in SourceFolderView.
+pub(super) fn game_source_status(
+    view: &SourceFolderView,
+) -> (
+    &'static str,
+    widgets::StatusTone,
+    &'static str,
+    &'static str,
+) {
+    if !view.enabled {
+        return (
+            "Disabled",
+            widgets::StatusTone::Pending,
+            "This folder is paused. Its previous library entries are kept.",
+            "Enable and scan",
+        );
+    }
+    match view.availability {
+        SourceAvailability::Available if view.last_scan_status.is_none() => (
+            "Not scanned yet",
+            widgets::StatusTone::Pending,
+            "This folder is configured, but EmuWiz has not scanned it yet.",
+            "Scan now",
+        ),
+        SourceAvailability::Available => (
+            "Last scan succeeded",
+            widgets::StatusTone::Success,
+            "This is the last known scan result; opening this page does not check the folder again.",
+            "Rescan",
+        ),
+        SourceAvailability::Unavailable => (
+            "Folder unavailable at last scan",
+            widgets::StatusTone::Blocked,
+            "Connect or mount this folder, then try again. Your previous library entries are kept.",
+            "Try again",
+        ),
+        SourceAvailability::PermissionDenied => (
+            "Permission needed",
+            widgets::StatusTone::Blocked,
+            "EmuWiz could not read this folder. Check its permissions, then try again. Your previous library entries are kept.",
+            "Try again",
+        ),
+        SourceAvailability::ScanFailed => (
+            "Scan needs attention",
+            widgets::StatusTone::Blocked,
+            "The last scan could not finish. Try again; scan details are available if it continues.",
+            "Try again",
+        ),
+        SourceAvailability::Disabled => unreachable!("disabled sources return above"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1211,8 +1291,10 @@ pub(super) fn show_sources_page_with_mount_root(
     // just without the now-redundant page-level heading repeating.
     widgets::section_header(
         ui,
-        "Configured sources",
-        Some("Manage the configured folders EmuWiz scans for archives."),
+        "Game sources",
+        Some(
+            "A game source is a folder where your games already live. EmuWiz reads it to build your library; it never moves, renames, or deletes your files.",
+        ),
     );
 
     if !catalogue_available {
@@ -1224,23 +1306,29 @@ pub(super) fn show_sources_page_with_mount_root(
 
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            if widgets::action_button(ui, "Add folder", widgets::ActionStyle::Primary, !busy)
+            if widgets::action_button(ui, "Add game folder", widgets::ActionStyle::Primary, !busy)
                 .clicked()
             {
                 *add_dialog = Some(SourcesAddDialogState::default());
             }
-            if widgets::action_button(
-                ui,
-                "Scan all enabled",
-                widgets::ActionStyle::Secondary,
-                !busy,
-            )
-            .clicked()
+            if sources.iter().filter(|source| source.enabled).count() >= 2
+                && widgets::action_button(
+                    ui,
+                    "Scan all enabled",
+                    widgets::ActionStyle::Secondary,
+                    !busy,
+                )
+                .clicked()
             {
                 action = Some(SourcesPageAction::ScanAll);
             }
-            if widgets::action_button(ui, "Refresh status", widgets::ActionStyle::Quiet, !busy)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                "Reload saved status",
+                widgets::ActionStyle::Quiet,
+                !busy,
+            )
+            .clicked()
             {
                 action = Some(SourcesPageAction::RefreshStatus);
             }
@@ -1252,9 +1340,9 @@ pub(super) fn show_sources_page_with_mount_root(
     if sources.is_empty() {
         if widgets::empty_state(
             ui,
-            "No source folders",
-            "Add an existing readable directory, then scan it to build the catalogue.",
-            Some("Add folder"),
+            "Add your first game folder",
+            "Choose the existing readable folder where your games live. EmuWiz will add it without reorganising or changing any files; then you can scan it to build your library.",
+            Some("Add game folder"),
         ) {
             *add_dialog = Some(SourcesAddDialogState::default());
         }
@@ -1265,145 +1353,88 @@ pub(super) fn show_sources_page_with_mount_root(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for view in sources {
-                    let group_response = ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                if widgets::path_value(ui, "Source", &view.path) {
+                    widgets::card(ui, |ui| {
+                        ui.strong(format!("Game folder: {}", game_folder_title(&view.path)));
+                        let (status, status_tone, guidance, primary_action) =
+                            game_source_status(view);
+                        widgets::status_strip(
+                            ui,
+                            &[(status, status_tone), ("Configured", widgets::StatusTone::Info)],
+                        );
+                        ui.label(guidance);
+                        ui.add_space(4.0);
+                        ui.weak("Folder path");
+                        if widgets::path_value(ui, "Path", &view.path) {
                                     let _ = clipboard.set_text(view.path.display().to_string());
-                                }
-                                let availability_tone = match view.availability {
-                                    SourceAvailability::Available => widgets::StatusTone::Success,
-                                    SourceAvailability::Disabled => widgets::StatusTone::Pending,
-                                    SourceAvailability::Unavailable
-                                    | SourceAvailability::PermissionDenied
-                                    | SourceAvailability::ScanFailed => {
-                                        widgets::StatusTone::Blocked
-                                    }
-                                };
-                                widgets::status_strip(
-                                    ui,
-                                    &[
-                                        (
-                                            if view.enabled { "Enabled" } else { "Disabled" },
-                                            if view.enabled {
-                                                widgets::StatusTone::Active
-                                            } else {
-                                                widgets::StatusTone::Pending
-                                            },
-                                        ),
-                                        (
-                                            source_availability_label(view.availability),
-                                            availability_tone,
-                                        ),
-                                    ],
+                        }
+                        ui.add_space(4.0);
+                        egui::Grid::new(("source_facts_grid", &view.path))
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Archive entries found:");
+                                ui.label(
+                                    view.last_archive_count
+                                        .map(|count| count.to_string())
+                                        .unwrap_or_else(|| "No scan results yet".to_string()),
                                 );
-                                // A compact label/value grid rather than one
-                                // long horizontal sentence: each fact gets
-                                // its own row, grouped right beside the
-                                // source path instead of spread across the
-                                // card's full width. Row spacing is
-                                // deliberately roomier than a dense table's
-                                // (6px, not 2px) so the three facts read
-                                // comfortably rather than feeling crammed
-                                // together, without making the card itself
-                                // enormous.
-                                ui.add_space(4.0);
-                                egui::Grid::new(("source_facts_grid", &view.path))
-                                    .num_columns(2)
-                                    .spacing([12.0, 6.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Archives:");
-                                        ui.label(
-                                            view.last_archive_count
-                                                .map(|count| count.to_string())
-                                                .unwrap_or_else(|| "never scanned".to_string()),
-                                        );
-                                        ui.end_row();
-
-                                        ui.label("Platform:");
-                                        // `source_platform_value_label` returns
-                                        // only the value - this "Platform:"
-                                        // label above is the row's sole label,
-                                        // never duplicated.
-                                        ui.label(source_platform_value_label(
-                                            &source_platform_state(view, archives),
-                                        ));
-                                        ui.end_row();
-
-                                        ui.label("Last scan:");
-                                        ui.label(view.last_scan_at.as_deref().unwrap_or("never"));
-                                        ui.end_row();
-                                    });
-                                // Reviewed for the Sources cleanup and
-                                // deliberately left as a plain inline
-                                // label, not routed through
-                                // `widgets::failure_summary` or
-                                // `widgets::banner`: this is the full,
-                                // already-short error text for exactly
-                                // this one source folder's last scan, and
-                                // a source list can show many of these
-                                // rows at once. Collapsing it behind
-                                // `technical_details` (as `failure_summary`
-                                // would) is exactly the "would make
-                                // recovery harder" case this milestone was
-                                // told to avoid - the user needs to see
-                                // *which* folder failed and *why* without
-                                // an extra click, right where the folder
-                                // itself is listed. `banner`'s heavier
-                                // card-like treatment was also judged too
-                                // much visual weight to repeat once per
-                                // failing source in a scrollable list.
-                                if let Some(error) = &view.last_scan_error {
-                                    ui.colored_label(ui.visuals().error_fg_color, error);
+                                ui.end_row();
+                                ui.label("Last scan:");
+                                ui.label(view.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
+                                ui.end_row();
+                                if view.assigned_platform.is_some() {
+                                    ui.label("Platform:");
+                                    ui.label(source_platform_value_label(&source_platform_state(view, archives)));
+                                    ui.end_row();
                                 }
                             });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if widgets::action_button(
-                                        ui,
-                                        "Remove",
-                                        widgets::ActionStyle::Destructive,
-                                        !busy,
-                                    )
-                                    .clicked()
-                                    {
-                                        *remove_dialog = Some(SourcesRemoveDialogState {
-                                            path: view.path.clone(),
-                                            last_archive_count: view.last_archive_count,
-                                            keep_catalogue: true,
-                                        });
-                                    }
-                                    let enable_label =
-                                        if view.enabled { "Disable" } else { "Enable" };
-                                    if widgets::action_button(
-                                        ui,
-                                        enable_label,
-                                        widgets::ActionStyle::Quiet,
-                                        !busy,
-                                    )
-                                    .clicked()
-                                    {
-                                        action = Some(SourcesPageAction::SetEnabled {
-                                            path: view.path.clone(),
-                                            enabled: !view.enabled,
-                                        });
-                                    }
-                                    if widgets::action_button(
-                                        ui,
-                                        "Scan / detect",
-                                        widgets::ActionStyle::Secondary,
-                                        !busy,
-                                    )
-                                    .clicked()
-                                    {
-                                        action =
-                                            Some(SourcesPageAction::ScanOne(view.path.clone()));
-                                    }
-                                    ui.menu_button("Assign platform", |ui| {
-                                        ui.label(format!(
-                                            "Preview: up to {} Unknown entries can be updated on rescan.",
-                                            view.unknown_archive_count
+                        if view.last_archive_count == Some(0)
+                            && view.last_scan_status
+                                == Some(archivefs_core::SourceScanStatus::Success)
+                        {
+                            ui.label("The scan finished, but found no supported game items here. Check that this is the folder containing your games, then view scan details or choose another folder.");
+                        }
+                        if let Some(error) = &view.last_scan_error {
+                            widgets::technical_details(ui, ("source_scan_error", &view.path), |ui| {
+                                ui.label(error);
+                            });
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if widgets::action_button(ui, primary_action, widgets::ActionStyle::Primary, !busy).clicked() {
+                                if view.enabled {
+                                    action = Some(SourcesPageAction::ScanOne(view.path.clone()));
+                                } else {
+                                    action = Some(SourcesPageAction::SetEnabled { path: view.path.clone(), enabled: true });
+                                }
+                            }
+                            if widgets::action_button(ui, "View scan details", widgets::ActionStyle::Secondary, true).clicked() {
+                                action = Some(SourcesPageAction::ViewScanDetails);
+                            }
+                            if view.enabled
+                                && widgets::action_button(ui, "Disable", widgets::ActionStyle::Quiet, !busy).clicked()
+                            {
+                                action = Some(SourcesPageAction::SetEnabled { path: view.path.clone(), enabled: false });
+                            }
+                            if widgets::action_button(ui, "Remove from EmuWiz", widgets::ActionStyle::Destructive, !busy).clicked() {
+                                *remove_dialog = Some(SourcesRemoveDialogState {
+                                    path: view.path.clone(),
+                                    last_archive_count: view.last_archive_count,
+                                    keep_catalogue: true,
+                                });
+                            }
+                            ui.menu_button("More", |ui| {
+                                if ui.button("View items in library").clicked() {
+                                    action = Some(SourcesPageAction::ViewInLibrary(view.path.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("Copy folder path").clicked() {
+                                    let _ = clipboard.set_text(view.path.display().to_string());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                ui.label(format!(
+                                    "Preview: up to {} Unknown entries can be updated on rescan.",
+                                    view.unknown_archive_count
                                         ));
                                         if let Some(current) = &view.assigned_platform {
                                             ui.label(format!("Current: {current}"));
@@ -1423,53 +1454,7 @@ pub(super) fn show_sources_page_with_mount_root(
                                         }
                                         ui.small("Incompatible direct images remain Unknown.");
                                     });
-                                },
-                            );
                         });
-                    });
-                    group_response.response.context_menu(|ui| {
-                        if ui
-                            .add_enabled(!busy, egui::Button::new("Re-run platform detection"))
-                            .clicked()
-                        {
-                            action = Some(SourcesPageAction::ScanOne(view.path.clone()));
-                            ui.close();
-                        }
-                        let enable_label = if view.enabled {
-                            "Disable source"
-                        } else {
-                            "Enable source"
-                        };
-                        if ui
-                            .add_enabled(!busy, egui::Button::new(enable_label))
-                            .clicked()
-                        {
-                            action = Some(SourcesPageAction::SetEnabled {
-                                path: view.path.clone(),
-                                enabled: !view.enabled,
-                            });
-                            ui.close();
-                        }
-                        if ui.button("Show archives from this source").clicked() {
-                            action = Some(SourcesPageAction::ViewInLibrary(view.path.clone()));
-                            ui.close();
-                        }
-                        if ui.button("Copy source path").clicked() {
-                            let _ = clipboard.set_text(view.path.display().to_string());
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(!busy, egui::Button::new("Remove source"))
-                            .clicked()
-                        {
-                            *remove_dialog = Some(SourcesRemoveDialogState {
-                                path: view.path.clone(),
-                                last_archive_count: view.last_archive_count,
-                                keep_catalogue: true,
-                            });
-                            ui.close();
-                        }
                     });
                 }
             });

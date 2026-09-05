@@ -231,18 +231,21 @@ fn sources_page_shows_every_configured_source_with_its_full_state_and_actions() 
     });
 
     for expected in [
-        "Configured sources",
+        "Game sources",
+        "A game source is a folder where your games already live.",
+        "Add game folder",
+        "Game folder: Archives",
+        "Folder path",
         "/home/davedap/Archives",
         "/mnt/usbdrive/retro",
-        "/mnt/nvme2/collections",
-        "Available",
-        "Unavailable",
-        "Disabled",
+        "Last scan succeeded",
+        "Folder unavailable at last scan",
         "1242",
-        "No such file or directory (os error 2)",
-        "Add folder",
         "Scan all enabled",
-        "Refresh status",
+        "Reload saved status",
+        "Rescan",
+        "View scan details",
+        "Remove from EmuWiz",
         "Mount root",
         "/mnt/archivefs",
         "Temporary game preparation folder",
@@ -510,7 +513,7 @@ fn sources_overview_reports_configured_counts_and_catalogue_readiness() {
     for expected in [
         "Overview",
         "3 configured source folders",
-        "1 available",
+        "1 last scan succeeded",
         "1 disabled",
     ] {
         assert!(
@@ -598,7 +601,12 @@ fn sources_recent_activity_empty_state_is_truthful() {
 fn sources_page_actions_are_reachable_via_real_clicks() {
     let ctx = egui::Context::default();
     let sources = three_source_views();
-    for target in ["Add folder", "Scan all enabled", "Refresh status"] {
+    for target in [
+        "Add game folder",
+        "Scan all enabled",
+        "Reload saved status",
+        "View scan details",
+    ] {
         let mut add_dialog = None;
         let mut remove_dialog = None;
         let mut clipboard = InMemoryClipboard::default();
@@ -646,7 +654,7 @@ fn sources_page_actions_are_reachable_via_real_clicks() {
         };
         simulate_row_click(&ctx, target_pos, egui::Modifiers::default(), render);
 
-        if target == "Add folder" {
+        if target == "Add game folder" {
             // AddFolder isn't a SourcesPageAction returned by a single
             // click - clicking it opens the dialog (add_dialog is set)
             // rather than producing an action directly. Confirmed
@@ -657,9 +665,13 @@ fn sources_page_actions_are_reachable_via_real_clicks() {
             "Scan all enabled" => {
                 matches!(*clicked_action.borrow(), Some(SourcesPageAction::ScanAll))
             }
-            "Refresh status" => matches!(
+            "Reload saved status" => matches!(
                 *clicked_action.borrow(),
                 Some(SourcesPageAction::RefreshStatus)
+            ),
+            "View scan details" => matches!(
+                *clicked_action.borrow(),
+                Some(SourcesPageAction::ViewScanDetails)
             ),
             _ => unreachable!(),
         };
@@ -707,7 +719,138 @@ fn sources_page_with_no_configured_sources_shows_empty_state_not_an_error() {
             );
         });
     });
-    assert!(rendered_text_contains(&output, "No source folders"));
+    for expected in [
+        "Add your first game folder",
+        "Add game folder",
+        "without reorganising or changing any files",
+        "then you can scan it to build your library",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "empty state must explain the first safe action: {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn sources_cards_use_last_known_scan_status_and_plain_recovery_guidance() {
+    let ctx = egui::Context::default();
+    let mut sources = three_source_views();
+    sources[0].last_scan_status = None;
+    sources[0].last_scan_at = None;
+    sources[0].last_archive_count = None;
+    let mut scan_failure = sources[1].clone();
+    scan_failure.availability = SourceAvailability::ScanFailed;
+    scan_failure.last_scan_error = Some("input/output error".to_string());
+    scan_failure.last_archive_count = Some(0);
+    scan_failure.last_scan_status = Some(SourceScanStatus::Success);
+    sources.truncate(1);
+
+    let before = sources.clone();
+    let mut add_dialog = None;
+    let mut remove_dialog = None;
+    let mut clipboard = InMemoryClipboard::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_sources_page(
+                ui,
+                &sources,
+                &[],
+                None,
+                false,
+                &mut add_dialog,
+                &mut remove_dialog,
+                &mut clipboard,
+            );
+        });
+    });
+
+    for expected in [
+        "Not scanned yet",
+        "Scan now",
+        "No scan results yet",
+        "View scan details",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "card guidance must include {expected:?}"
+        );
+    }
+    assert_eq!(
+        sources, before,
+        "rendering Sources must not mutate source state or start a scan"
+    );
+    let mut failure_add_dialog = None;
+    let mut failure_remove_dialog = None;
+    let mut failure_clipboard = InMemoryClipboard::default();
+    let failure_output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_sources_page(
+                ui,
+                &[scan_failure.clone()],
+                &[],
+                None,
+                false,
+                &mut failure_add_dialog,
+                &mut failure_remove_dialog,
+                &mut failure_clipboard,
+            );
+        });
+    });
+    for expected in [
+        "Scan needs attention",
+        "The last scan could not finish.",
+        "found no supported game items here",
+        "Try again",
+    ] {
+        assert!(
+            rendered_text_contains(&failure_output, expected),
+            "failure card guidance must include {expected:?}"
+        );
+    }
+    let (status, _, guidance, action) = sources_page::game_source_status(&SourceFolderView {
+        availability: SourceAvailability::PermissionDenied,
+        ..scan_failure
+    });
+    assert_eq!(status, "Permission needed");
+    assert!(guidance.contains("Check its permissions"));
+    assert_eq!(action, "Try again");
+}
+
+#[test]
+fn sources_cards_keep_actions_reachable_in_a_narrow_viewport() {
+    let ctx = egui::Context::default();
+    let sources = three_source_views();
+    let mut add_dialog = None;
+    let mut remove_dialog = None;
+    let mut clipboard = InMemoryClipboard::default();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(360.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let output = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_sources_page(
+                ui,
+                &sources,
+                &[],
+                None,
+                false,
+                &mut add_dialog,
+                &mut remove_dialog,
+                &mut clipboard,
+            );
+        });
+    });
+    for expected in ["Rescan", "View scan details", "Remove from EmuWiz"] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "narrow layout must retain {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -737,7 +880,7 @@ fn sources_page_keeps_configured_sources_visible_when_catalogue_is_unavailable()
         });
     });
 
-    assert!(rendered_text_contains(&output, "Configured sources"));
+    assert!(rendered_text_contains(&output, "Game sources"));
     assert!(rendered_text_contains(&output, "Catalogue unavailable"));
     assert!(rendered_text_contains(&output, "/home/davedap/Archives"));
     assert!(!rendered_text_contains(&output, "0 archives"));
@@ -805,7 +948,7 @@ fn sources_page_renders_without_panicking_while_a_source_action_is_running() {
             );
         });
     });
-    assert!(rendered_text_contains(&output, "Available"));
+    assert!(rendered_text_contains(&output, "Last scan succeeded"));
 }
 
 #[test]
@@ -3757,7 +3900,7 @@ fn sources_libraries_tab_still_renders_source_folder_controls() {
     assert!(rendered_text_contains(&output, "Cheats"));
     assert!(rendered_text_contains(&output, "Discovery"));
     assert!(
-        rendered_text_contains(&output, "Add folder"),
+        rendered_text_contains(&output, "Add game folder"),
         "source-folder configuration must still render"
     );
 }
