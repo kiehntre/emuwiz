@@ -86,6 +86,14 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Mgba {
         profile: &'a crate::patch_manager::MgbaProfile,
     },
+    /// A discovered RMG (Rosalie's Mupen GUI) profile. RMG needs no
+    /// BIOS/firmware for N64 cartridge play (see
+    /// `crate::patch_manager::rmg_local`'s own module doc comment), exactly
+    /// like [`Self::Mgba`] - so this variant carries no firmware state
+    /// either.
+    Rmg {
+        profile: &'a crate::patch_manager::RmgProfile,
+    },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
     },
@@ -224,6 +232,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
         Self::Mgba { profile }
+    }
+
+    pub fn rmg(profile: &'a crate::patch_manager::RmgProfile) -> Self {
+        Self::Rmg { profile }
     }
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
@@ -396,6 +408,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     adapter_id: "mgba",
                     profile_id: profile.profile_id.clone(),
                     profile_path: profile.config_path.clone(),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Rmg { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "N64") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "rmg",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
                 })
@@ -846,6 +870,16 @@ mod tests {
             blocker: None,
             executable_candidates: Vec::new(),
             config: None,
+        }
+    }
+
+    fn rmg_profile(eligible: bool) -> crate::patch_manager::RmgProfile {
+        crate::patch_manager::RmgProfile {
+            profile_id: "rmg:native".to_string(),
+            installation_type: crate::patch_manager::RmgInstallationType::Native,
+            eligible,
+            blocker: (!eligible).then(|| "no safe RMG executable was discovered".to_string()),
+            executable_candidates: Vec::new(),
         }
     }
 
@@ -1956,5 +1990,226 @@ mod tests {
             &empty_retroarch(),
         );
         assert_eq!(plan.candidates[0].firmware, FirmwareReadiness::NotRequired);
+    }
+
+    // --- RMG (Nintendo 64) ---
+
+    #[test]
+    fn n64_rmg_profile_becomes_a_ready_candidate_without_firmware() {
+        let identity = resolved("N64", "z64sha");
+        let profile = rmg_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::rmg(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "rmg",
+                ..
+            }
+        ));
+        assert_eq!(plan.candidates[0].firmware, FirmwareReadiness::NotRequired);
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn rmg_does_not_match_an_unrelated_platform_and_has_no_fallback() {
+        let profile = rmg_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::rmg(&profile)];
+        for identity in [resolved("PSX", "SLUS-12345"), resolved("Game Boy", "gbsha")] {
+            let plan = plan(
+                &identity,
+                &[],
+                &resolved_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "rmg",
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn ineligible_rmg_profile_blocks_but_never_falls_back_to_retroarch() {
+        let identity = resolved("N64", "z64sha");
+        let profile = rmg_profile(false);
+        let profiles = [DiscoveredStandaloneProfile::rmg(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "rmg",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::ProfileIneligible)
+        );
+    }
+
+    #[test]
+    fn missing_rmg_profile_reports_no_installation_instead_of_substitution() {
+        let identity = resolved("N64", "z64sha");
+        let plan = plan(&identity, &[], &resolved_content(), &[], &empty_retroarch());
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "none",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+        );
+    }
+
+    /// RMG and a discovered RetroArch N64 core must coexist as two distinct
+    /// candidates for the same platform - never merged, and neither one
+    /// automatically preferred over the other. The GUI/user still chooses.
+    #[test]
+    fn rmg_and_retroarch_coexist_as_separate_n64_candidates() {
+        let identity = resolved("N64", "z64sha");
+        let profile = rmg_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::rmg(&profile)];
+        let retroarch_with_n64_core = {
+            let config_dir = EncodedPath::from_path(&PathBuf::from("/retroarch"));
+            RetroArchEnvironmentReport {
+                format_version: 1,
+                profiles: vec![RetroArchProfile {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                    evidence: Evidence {
+                        executables: Vec::new(),
+                        flatpak_metadata_found: false,
+                        config_directory_found: true,
+                        config_file_found: true,
+                    },
+                    config_directory: DirectoryProbeFinding {
+                        path: config_dir.clone(),
+                        probe: FsProbe::PresentDirectory,
+                    },
+                    config_file: ConfigFileFinding {
+                        path: EncodedPath::from_path(&PathBuf::from("/retroarch/retroarch.cfg")),
+                        probe: FsProbe::PresentFile,
+                        read: ConfigReadOutcome::NotAttempted,
+                    },
+                    paths: Vec::new(),
+                    cores: vec![CoreFinding {
+                        file_name: EncodedPath::from_path(&PathBuf::from(
+                            "mupen64plus_next_libretro.so",
+                        )),
+                        full_path: EncodedPath::from_path(&PathBuf::from(
+                            "/retroarch/cores/mupen64plus_next_libretro.so",
+                        )),
+                        core_stem: "mupen64plus_next".to_string(),
+                        info: CoreInfoFinding::Found {
+                            display_name: None,
+                            display_version: None,
+                            system_name: Some("Nintendo - Nintendo 64".to_string()),
+                            supported_extensions: Vec::new(),
+                            core_name: Some("mupen64plus_next".to_string()),
+                            manufacturer: None,
+                            categories: None,
+                            database: None,
+                            firmware: Vec::new(),
+                        },
+                    }],
+                    playlists: RetroArchPlaylistInventory {
+                        directory: None,
+                        playlists: Vec::new(),
+                        diagnostics: Vec::new(),
+                        complete: true,
+                    },
+                    app_images: Vec::new(),
+                    diagnostics: Vec::new(),
+                }],
+                diagnostics: Vec::new(),
+            }
+        };
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &retroarch_with_n64_core,
+        );
+        assert_eq!(plan.candidates.len(), 2, "{:?}", plan.candidates);
+        assert!(plan.candidates.iter().any(|c| matches!(
+            c.target,
+            LaunchTarget::Standalone {
+                adapter_id: "rmg",
+                ..
+            }
+        )));
+        assert!(plan.candidates.iter().any(|c| matches!(
+            c.target,
+            LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "mupen64plus_next"
+        )));
+        // Neither candidate is discarded, hidden, or silently merged into the
+        // other - both remain in `plan.candidates` with their own
+        // independent readiness/preference (the reviewed single-hint
+        // RetroArch core legitimately reports `SoleEligible` *among RetroArch
+        // cores* - see `apply_preference`'s own doc comment - which is not
+        // the same thing as RMG being displaced; RMG's own candidate is
+        // still present and still `Ready`). Nothing here ever picks one
+        // target over the other automatically - that choice is left to the
+        // caller/GUI.
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.readiness != LaunchReadiness::Blocked),
+            "{:?}",
+            plan.candidates
+                .iter()
+                .map(|c| c.readiness)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rmg_candidate_generation_is_deterministic() {
+        let identity = resolved("N64", "z64sha");
+        let profile = rmg_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::rmg(&profile)];
+        let first = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let second = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(first, second);
     }
 }

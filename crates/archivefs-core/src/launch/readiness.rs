@@ -445,6 +445,16 @@ pub enum LaunchBlockerKind {
     SameBoyIdentityConflict,
     SameBoyBindingUnavailable,
     SameBoyDriftBeforeSpawn,
+    /// A command-plan request was given a non-RMG candidate.
+    RmgCandidateRequired,
+    /// The canonical identity does not target `N64` - the only platform
+    /// this native RMG launch slice supports.
+    RmgPlatformMismatch,
+    /// The content is not a direct `.z64`/`.n64`/`.v64` cartridge file.
+    RmgContentFormatUnsupported,
+    /// [`crate::patch_manager::resolve_rmg_native_launch_binding`] itself
+    /// refused to produce a launch binding for the candidate's profile.
+    RmgBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].

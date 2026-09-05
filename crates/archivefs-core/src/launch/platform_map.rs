@@ -220,7 +220,7 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "N64",
-        standalone_adapters: &[],
+        standalone_adapters: &["rmg"],
         retroarch_core_hints: &["mupen64plus_next"],
         confidence: MappingConfidence::StronglyKnown,
     },
@@ -491,6 +491,13 @@ mod tests {
     }
 
     #[test]
+    fn n64_maps_to_rmg_exactly() {
+        let entry = launch_compatibility_for_platform("N64").unwrap();
+        assert_eq!(entry.standalone_adapters, &["rmg"]);
+        assert!(platforms_for_standalone_adapter("rmg").contains(&"N64"));
+    }
+
+    #[test]
     fn psx_maps_to_duckstation_exactly() {
         let entry = launch_compatibility_for_platform("PSX").unwrap();
         assert_eq!(entry.standalone_adapters, &["duckstation"]);
@@ -528,6 +535,8 @@ mod tests {
                 "Game Boy" | "Game Boy Color" | "Game Boy Advance"
             ) {
                 assert_eq!(row.standalone_adapters, &["mgba"], "{platform_id}");
+            } else if platform_id == "N64" {
+                assert_eq!(row.standalone_adapters, &["rmg"], "{platform_id}");
             } else {
                 assert!(row.standalone_adapters.is_empty(), "{platform_id}");
             }

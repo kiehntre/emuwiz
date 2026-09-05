@@ -106,6 +106,8 @@ pub mod ppsspp_execution;
 pub mod process_spawn;
 pub mod readiness;
 pub mod retroarch_command;
+pub mod rmg_command;
+pub mod rmg_execution;
 pub mod rpcs3_command;
 pub mod rpcs3_execution;
 pub mod sameboy_command;
@@ -315,6 +317,14 @@ pub use readiness::{
 };
 pub use retroarch_command::{
     RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
+};
+pub use rmg_command::{
+    RMG_SUPPORTED_PLATFORM_ID, RmgCommand, RmgCommandPlan, RmgCommandSelection,
+    build_rmg_command_plan,
+};
+pub use rmg_execution::{
+    RmgLaunchPreflightError, RmgLaunchPreflightErrorKind, RmgLaunchRequest, preflight_rmg_launch,
+    spawn_rmg,
 };
 pub use rpcs3_command::{
     RPCS3_SUPPORTED_PLATFORM_ID, Rpcs3Command, Rpcs3CommandPlan, Rpcs3CommandSelection,

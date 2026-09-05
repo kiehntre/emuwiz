@@ -86,6 +86,7 @@ mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
 mod retroarch_materialization;
+mod rmg_local;
 mod rpcs3_local;
 mod sameboy_local;
 mod shared_preview;
@@ -654,6 +655,12 @@ pub use retroarch_materialization::{
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, RetroArchMaterializedSource,
     materialize_retroarch_shared_preview,
+};
+pub use rmg_local::{
+    RMG_MAX_EXPLICIT_EXECUTABLES, RmgExecutable, RmgInstallationType, RmgLaunchBlocker,
+    RmgLaunchBlockerKind, RmgNativeLaunchBinding, RmgProfile, RmgProfileDiscovery,
+    RmgProfileDiscoveryRoots, discover_rmg_profiles, parse_rmg_version,
+    resolve_rmg_native_launch_binding,
 };
 pub use rpcs3_local::{
     RPCS3_MAX_DLC_ENTRIES, RPCS3_MAX_ENTRIES_VISITED, RPCS3_MAX_PATCH_ENTRIES, RPCS3_MAX_PROFILES,
