@@ -12,6 +12,12 @@ use crate::playing_library::model::{
     PlayingLibraryPlan, PlayingLibraryPolicy,
 };
 
+fn minimal_systems_xml(system: &str, fullname: &str) -> String {
+    format!(
+        "<systemList>\n    <system>\n        <name>{system}</name>\n        <fullname>{fullname}</fullname>\n        <path>%ROMPATH%/{system}</path>\n        <extension>.zip .chd</extension>\n        <command>retroarch %ROM%</command>\n        <platform>{system}</platform>\n        <theme>{system}</theme>\n    </system>\n</systemList>"
+    )
+}
+
 const MINIMAL_PSX_SYSTEMS_XML: &str = r#"<systemList>
     <system>
         <name>psx</name>
@@ -28,12 +34,17 @@ const MINIMAL_PSX_SYSTEMS_XML: &str = r#"<systemList>
 /// hand-built literal) over a temporary `~/ES-DE`-shaped home directory
 /// declaring one `psx` system through `custom_systems/es_systems.xml`.
 fn profile_with_psx_system(home: &std::path::Path) -> EsDeProfile {
+    profile_with_system(home, "psx", "Sony PlayStation", MINIMAL_PSX_SYSTEMS_XML)
+}
+
+fn profile_with_system(
+    home: &std::path::Path,
+    system: &str,
+    fullname: &str,
+    systems_xml: &str,
+) -> EsDeProfile {
     std::fs::create_dir_all(home.join("custom_systems")).unwrap();
-    std::fs::write(
-        home.join("custom_systems/es_systems.xml"),
-        MINIMAL_PSX_SYSTEMS_XML,
-    )
-    .unwrap();
+    std::fs::write(home.join("custom_systems/es_systems.xml"), systems_xml).unwrap();
 
     let environment = DiscoveryEnvironment {
         home: Some(std::ffi::OsString::from(
@@ -54,12 +65,11 @@ fn profile_with_psx_system(home: &std::path::Path) -> EsDeProfile {
         .profiles
         .into_iter()
         .find(|profile| {
-            profile
-                .systems
-                .iter()
-                .any(|s| s.name.as_deref() == Some("psx"))
+            profile.systems.iter().any(|s| {
+                s.name.as_deref() == Some(system) && s.fullname.as_deref() == Some(fullname)
+            })
         })
-        .expect("a profile with the psx system must be discovered")
+        .expect("a profile with the requested system must be discovered")
 }
 
 fn plan_with_operations(
@@ -149,6 +159,26 @@ fn unmapped_platform_is_refused_not_guessed() {
         error,
         EsDePublicationError::PlatformUnmapped { .. }
     ));
+}
+
+#[test]
+fn batch_two_publication_preview_uses_the_reviewed_arcade_target() {
+    let home = tempdir().unwrap();
+    let arcade_xml = minimal_systems_xml("arcade", "Arcade");
+    let profile = profile_with_system(home.path(), "arcade", "Arcade", &arcade_xml);
+    let destination_root = home.path().join("playing/arcade");
+    let plan = plan_with_operations(
+        destination_root.clone(),
+        &[("Pac-Man", destination_root.join("pacman.zip"))],
+    );
+
+    let publication = plan_es_de_gamelist_publication(&plan, "Arcade", &profile).unwrap();
+    assert_eq!(publication.es_de_system, "arcade");
+    assert_eq!(
+        publication.gamelist_path,
+        home.path().join("gamelists/arcade/gamelist.xml")
+    );
+    assert_eq!(publication.added.len(), 1);
 }
 
 #[test]
