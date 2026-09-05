@@ -121,6 +121,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "scummvm" => "ScummVM",
         "sameboy" => "SameBoy",
         "dosbox" => "DOSBox",
+        "stella" => "Stella",
         _ => "Supported emulator",
     }
 }
@@ -526,6 +527,36 @@ mod tests {
         assert_eq!(snes9x.name, "Snes9x");
         assert_eq!(retroarch.name, "RetroArch");
         assert_ne!(snes9x.adapter_id, retroarch.adapter_id);
+    }
+
+    #[test]
+    fn atari2600_stella_and_retroarch_candidates_coexist_with_no_automatic_winner() {
+        let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, None, "");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.platform_id == "Atari2600" && c.adapter_id == "stella"),
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.platform_id == "Atari2600" && c.adapter_id == "retroarch"),
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|c| c.platform_id == "Atari2600")
+                .count(),
+            2,
+            "Stella and RetroArch must both surface as separate candidates, never merged"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|c| c.platform_id == "Atari2600" && c.adapter_id == "stella")
+                .map(|c| c.name),
+            Some("Stella")
+        );
     }
 
     #[test]

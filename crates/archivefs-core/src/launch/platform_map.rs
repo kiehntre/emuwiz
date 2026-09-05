@@ -250,7 +250,7 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "Atari2600",
-        standalone_adapters: &[],
+        standalone_adapters: &["stella"],
         retroarch_core_hints: &["stella"],
         confidence: MappingConfidence::StronglyKnown,
     },
@@ -516,6 +516,17 @@ mod tests {
     }
 
     #[test]
+    fn atari2600_maps_to_stella_exactly() {
+        let entry = launch_compatibility_for_platform("Atari2600").unwrap();
+        assert_eq!(entry.standalone_adapters, &["stella"]);
+        assert!(platforms_for_standalone_adapter("stella").contains(&"Atari2600"));
+        // RetroArch remains a completely separate candidate: the libretro
+        // core hint is unchanged and does not collapse into the standalone
+        // adapter list.
+        assert_eq!(entry.retroarch_core_hints, &["stella"]);
+    }
+
+    #[test]
     fn psx_maps_to_duckstation_exactly() {
         let entry = launch_compatibility_for_platform("PSX").unwrap();
         assert_eq!(entry.standalone_adapters, &["duckstation"]);
@@ -571,6 +582,8 @@ mod tests {
                     &["mesen", "snes9x"],
                     "{platform_id}"
                 );
+            } else if platform_id == "Atari2600" {
+                assert_eq!(row.standalone_adapters, &["stella"], "{platform_id}");
             } else {
                 assert!(row.standalone_adapters.is_empty(), "{platform_id}");
             }

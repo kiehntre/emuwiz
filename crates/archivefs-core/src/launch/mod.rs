@@ -118,6 +118,8 @@ pub mod scummvm_command;
 pub mod scummvm_execution;
 pub mod snes9x_command;
 pub mod snes9x_execution;
+pub mod stella_command;
+pub mod stella_execution;
 pub mod vita3k_command;
 pub mod vita3k_execution;
 pub mod xemu_command;
@@ -376,6 +378,14 @@ pub use snes9x_command::{
 pub use snes9x_execution::{
     Snes9xLaunchPreflightError, Snes9xLaunchPreflightErrorKind, Snes9xLaunchRequest,
     preflight_snes9x_launch, spawn_snes9x,
+};
+pub use stella_command::{
+    STELLA_SUPPORTED_PLATFORM_ID, StellaCommand, StellaCommandPlan, StellaCommandSelection,
+    build_stella_command_plan,
+};
+pub use stella_execution::{
+    StellaLaunchPreflightError, StellaLaunchPreflightErrorKind, StellaLaunchRequest,
+    preflight_stella_launch, spawn_stella,
 };
 pub use vita3k_command::{
     VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,

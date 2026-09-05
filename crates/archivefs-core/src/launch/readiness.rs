@@ -472,6 +472,16 @@ pub enum LaunchBlockerKind {
     /// [`crate::patch_manager::resolve_rmg_native_launch_binding`] itself
     /// refused to produce a launch binding for the candidate's profile.
     RmgBindingUnavailable,
+    /// A command-plan request was given a non-Stella candidate.
+    StellaCandidateRequired,
+    /// The canonical identity does not target `Atari2600` - the only
+    /// platform this native Stella launch slice supports.
+    StellaPlatformMismatch,
+    /// The content is not a direct `.a26` cartridge file.
+    StellaContentFormatUnsupported,
+    /// [`crate::patch_manager::resolve_stella_native_launch_binding`] itself
+    /// refused to produce a launch binding for the candidate's profile.
+    StellaBindingUnavailable,
 }
 
 /// One blocking condition on a [`crate::launch::planning::LaunchCandidate`].

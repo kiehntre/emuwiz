@@ -93,6 +93,7 @@ mod sameboy_local;
 mod shared_preview;
 mod shared_transaction;
 mod snes9x_local;
+mod stella_local;
 mod user_cheat_import;
 mod vita3k_local;
 mod xemu_local;
@@ -720,6 +721,12 @@ pub use snes9x_local::{
     Snes9xLaunchBlocker, Snes9xLaunchBlockerKind, Snes9xNativeLaunchBinding, Snes9xProfile,
     Snes9xProfileDiscovery, Snes9xProfileDiscoveryRoots, discover_snes9x_profiles,
     parse_snes9x_version, resolve_snes9x_native_launch_binding,
+};
+pub use stella_local::{
+    STELLA_MAX_EXPLICIT_EXECUTABLES, StellaExecutable, StellaInstallationType, StellaLaunchBlocker,
+    StellaLaunchBlockerKind, StellaNativeLaunchBinding, StellaProfile, StellaProfileDiscovery,
+    StellaProfileDiscoveryRoots, discover_stella_profiles, parse_stella_version,
+    resolve_stella_native_launch_binding,
 };
 pub use user_cheat_import::{
     USER_CHEAT_MAX_CHEATS_PER_FILE, USER_CHEAT_MAX_DEPTH, USER_CHEAT_MAX_FILE_BYTES,

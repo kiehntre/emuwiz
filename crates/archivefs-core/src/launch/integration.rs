@@ -94,6 +94,18 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Rmg {
         profile: &'a crate::patch_manager::RmgProfile,
     },
+    /// A discovered Stella (Atari 2600 emulator) profile. Stella needs no
+    /// BIOS/firmware for standard Atari 2600 cartridge play (see
+    /// `crate::patch_manager::stella_local`'s own module doc comment),
+    /// exactly like [`Self::Rmg`] - so this variant carries no firmware
+    /// state either. Stella and RetroArch remain separate candidates on
+    /// the same `Atari2600` row - see
+    /// [`crate::launch::platform_map::LAUNCH_COMPATIBILITY`]'s Atari2600
+    /// entry, which lists `"stella"` as its own standalone adapter
+    /// alongside a completely independent `retroarch_core_hints` entry.
+    Stella {
+        profile: &'a crate::patch_manager::StellaProfile,
+    },
     Mesen {
         profile: &'a MesenProfile,
     },
@@ -253,6 +265,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn snes9x(profile: &'a crate::patch_manager::Snes9xProfile) -> Self {
         Self::Snes9x { profile }
+    }
+
+    pub fn stella(profile: &'a crate::patch_manager::StellaProfile) -> Self {
+        Self::Stella { profile }
     }
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
@@ -435,6 +451,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
             {
                 Some(StandaloneProfileInput {
                     adapter_id: "rmg",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Stella { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "Atari2600") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "stella",
                     profile_id: profile.profile_id.clone(),
                     profile_path: None,
                     eligible: profile.eligible,
@@ -972,6 +1000,16 @@ mod tests {
             installation_type: crate::patch_manager::RmgInstallationType::Native,
             eligible,
             blocker: (!eligible).then(|| "no safe RMG executable was discovered".to_string()),
+            executable_candidates: Vec::new(),
+        }
+    }
+
+    fn stella_profile(eligible: bool) -> crate::patch_manager::StellaProfile {
+        crate::patch_manager::StellaProfile {
+            profile_id: "stella:native".to_string(),
+            installation_type: crate::patch_manager::StellaInstallationType::Native,
+            eligible,
+            blocker: (!eligible).then(|| "no safe Stella executable was discovered".to_string()),
             executable_candidates: Vec::new(),
         }
     }
@@ -2365,6 +2403,221 @@ mod tests {
         let identity = resolved("N64", "z64sha");
         let profile = rmg_profile(true);
         let profiles = [DiscoveredStandaloneProfile::rmg(&profile)];
+        let first = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let second = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(first, second);
+    }
+
+    // --- Stella (Atari 2600) ---
+
+    #[test]
+    fn atari2600_stella_profile_becomes_a_ready_candidate_without_firmware() {
+        let identity = resolved("Atari2600", "a26sha");
+        let profile = stella_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::stella(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "stella",
+                ..
+            }
+        ));
+        assert_eq!(plan.candidates[0].firmware, FirmwareReadiness::NotRequired);
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn stella_does_not_match_an_unrelated_platform_and_has_no_fallback() {
+        let profile = stella_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::stella(&profile)];
+        for identity in [resolved("Atari5200", "a5200sha"), resolved("N64", "z64sha")] {
+            let plan = plan(
+                &identity,
+                &[],
+                &resolved_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "stella",
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn ineligible_stella_profile_blocks_but_never_falls_back_to_retroarch() {
+        let identity = resolved("Atari2600", "a26sha");
+        let profile = stella_profile(false);
+        let profiles = [DiscoveredStandaloneProfile::stella(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "stella",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::ProfileIneligible)
+        );
+    }
+
+    #[test]
+    fn missing_stella_profile_reports_no_installation_instead_of_substitution() {
+        let identity = resolved("Atari2600", "a26sha");
+        let plan = plan(&identity, &[], &resolved_content(), &[], &empty_retroarch());
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "none",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+        );
+    }
+
+    /// Stella and a discovered RetroArch Atari 2600 core must coexist as two
+    /// distinct candidates for the same platform - never merged, and
+    /// neither one automatically preferred over the other. The GUI/user
+    /// still chooses.
+    #[test]
+    fn stella_and_retroarch_coexist_as_separate_atari2600_candidates() {
+        let identity = resolved("Atari2600", "a26sha");
+        let profile = stella_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::stella(&profile)];
+        let retroarch_with_atari2600_core = {
+            let config_dir = EncodedPath::from_path(&PathBuf::from("/retroarch"));
+            RetroArchEnvironmentReport {
+                format_version: 1,
+                profiles: vec![RetroArchProfile {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                    evidence: Evidence {
+                        executables: Vec::new(),
+                        flatpak_metadata_found: false,
+                        config_directory_found: true,
+                        config_file_found: true,
+                    },
+                    config_directory: DirectoryProbeFinding {
+                        path: config_dir.clone(),
+                        probe: FsProbe::PresentDirectory,
+                    },
+                    config_file: ConfigFileFinding {
+                        path: EncodedPath::from_path(&PathBuf::from("/retroarch/retroarch.cfg")),
+                        probe: FsProbe::PresentFile,
+                        read: ConfigReadOutcome::NotAttempted,
+                    },
+                    paths: Vec::new(),
+                    cores: vec![CoreFinding {
+                        file_name: EncodedPath::from_path(&PathBuf::from("stella_libretro.so")),
+                        full_path: EncodedPath::from_path(&PathBuf::from(
+                            "/retroarch/cores/stella_libretro.so",
+                        )),
+                        core_stem: "stella".to_string(),
+                        info: CoreInfoFinding::Found {
+                            display_name: None,
+                            display_version: None,
+                            system_name: Some("Atari - 2600".to_string()),
+                            supported_extensions: Vec::new(),
+                            core_name: Some("stella".to_string()),
+                            manufacturer: None,
+                            categories: None,
+                            database: None,
+                            firmware: Vec::new(),
+                        },
+                    }],
+                    playlists: RetroArchPlaylistInventory {
+                        directory: None,
+                        playlists: Vec::new(),
+                        diagnostics: Vec::new(),
+                        complete: true,
+                    },
+                    app_images: Vec::new(),
+                    diagnostics: Vec::new(),
+                }],
+                diagnostics: Vec::new(),
+            }
+        };
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &retroarch_with_atari2600_core,
+        );
+        assert_eq!(plan.candidates.len(), 2, "{:?}", plan.candidates);
+        assert!(plan.candidates.iter().any(|c| matches!(
+            c.target,
+            LaunchTarget::Standalone {
+                adapter_id: "stella",
+                ..
+            }
+        )));
+        assert!(plan.candidates.iter().any(|c| matches!(
+            c.target,
+            LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "stella"
+        )));
+        // Neither candidate is discarded, hidden, or silently merged into the
+        // other - both remain in `plan.candidates` with their own
+        // independent readiness/preference, exactly like the RMG/RetroArch
+        // N64 coexistence test above. No automatic winner is picked here.
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.readiness != LaunchReadiness::Blocked),
+            "{:?}",
+            plan.candidates
+                .iter()
+                .map(|c| c.readiness)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stella_candidate_generation_is_deterministic() {
+        let identity = resolved("Atari2600", "a26sha");
+        let profile = stella_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::stella(&profile)];
         let first = plan(
             &identity,
             &[],
