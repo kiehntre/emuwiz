@@ -371,6 +371,72 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_system: "neogeo",
         es_de_fullname: "SNK Neo Geo",
     },
+    // --- Batch 4 additions (docs/ESDE_BATCH4_MAPPING_PLAN.md §5) ------
+    // Every `es_de_system`/`es_de_fullname` pair below was read verbatim
+    // from ES-DE's current upstream
+    // `resources/systems/linux/es_systems.xml`, never guessed from an
+    // emulator command label or an EmuWiz alias. In particular, ES-DE's
+    // system names are `pcengine` and `pcenginecd`, not `pce`/`pcecd`.
+    EsDeSystemMapping {
+        platform_id: "3DO",
+        es_de_system: "3do",
+        es_de_fullname: "3DO Interactive Multiplayer",
+    },
+    EsDeSystemMapping {
+        platform_id: "Acorn Archimedes",
+        es_de_system: "archimedes",
+        es_de_fullname: "Acorn Archimedes",
+    },
+    EsDeSystemMapping {
+        platform_id: "Acorn Electron",
+        es_de_system: "electron",
+        es_de_fullname: "Acorn Electron",
+    },
+    EsDeSystemMapping {
+        platform_id: "Amstrad CPC",
+        es_de_system: "amstradcpc",
+        es_de_fullname: "Amstrad CPC",
+    },
+    EsDeSystemMapping {
+        platform_id: "Apple II",
+        es_de_system: "apple2",
+        es_de_fullname: "Apple II",
+    },
+    EsDeSystemMapping {
+        platform_id: "BBC Micro",
+        es_de_system: "bbcmicro",
+        es_de_fullname: "Acorn Computers BBC Micro",
+    },
+    EsDeSystemMapping {
+        platform_id: "FM Towns",
+        es_de_system: "fmtowns",
+        es_de_fullname: "Fujitsu FM Towns",
+    },
+    EsDeSystemMapping {
+        platform_id: "Macintosh",
+        es_de_system: "macintosh",
+        es_de_fullname: "Apple Macintosh",
+    },
+    EsDeSystemMapping {
+        platform_id: "NEC PC-8801",
+        es_de_system: "pc88",
+        es_de_fullname: "NEC PC-8800 Series",
+    },
+    EsDeSystemMapping {
+        platform_id: "NGage",
+        es_de_system: "ngage",
+        es_de_fullname: "Nokia N-Gage",
+    },
+    EsDeSystemMapping {
+        platform_id: "PC Engine",
+        es_de_system: "pcengine",
+        es_de_fullname: "NEC PC Engine",
+    },
+    EsDeSystemMapping {
+        platform_id: "PC Engine CD",
+        es_de_system: "pcenginecd",
+        es_de_fullname: "NEC PC Engine CD",
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.
@@ -665,6 +731,18 @@ mod tests {
             "WonderSwan",
             "WonderSwan Color",
             "NeoGeo",
+            "3DO",
+            "Acorn Archimedes",
+            "Acorn Electron",
+            "Amstrad CPC",
+            "Apple II",
+            "BBC Micro",
+            "FM Towns",
+            "Macintosh",
+            "NEC PC-8801",
+            "NGage",
+            "PC Engine",
+            "PC Engine CD",
         ] {
             assert!(
                 es_de_system_for_platform(platform_id).is_some(),
@@ -805,6 +883,102 @@ mod tests {
         ),
         ("NeoGeo", "neogeo", "SNK Neo Geo"),
     ];
+
+    /// (canonical platform id, expected ES-DE `<name>`, expected ES-DE
+    /// `<fullname>`) read verbatim from the current ES-DE Linux systems
+    /// file, as recorded in `docs/ESDE_BATCH4_MAPPING_PLAN.md`.
+    const BATCH_4: &[(&str, &str, &str)] = &[
+        ("3DO", "3do", "3DO Interactive Multiplayer"),
+        ("Acorn Archimedes", "archimedes", "Acorn Archimedes"),
+        ("Acorn Electron", "electron", "Acorn Electron"),
+        ("Amstrad CPC", "amstradcpc", "Amstrad CPC"),
+        ("Apple II", "apple2", "Apple II"),
+        ("BBC Micro", "bbcmicro", "Acorn Computers BBC Micro"),
+        ("FM Towns", "fmtowns", "Fujitsu FM Towns"),
+        ("Macintosh", "macintosh", "Apple Macintosh"),
+        ("NEC PC-8801", "pc88", "NEC PC-8800 Series"),
+        ("NGage", "ngage", "Nokia N-Gage"),
+        ("PC Engine", "pcengine", "NEC PC Engine"),
+        ("PC Engine CD", "pcenginecd", "NEC PC Engine CD"),
+    ];
+
+    #[test]
+    fn batch_4_platforms_map_to_es_de_exactly() {
+        for (platform_id, system, fullname) in BATCH_4 {
+            let mapping = es_de_system_for_platform(platform_id)
+                .unwrap_or_else(|| panic!("missing ES-DE mapping for {platform_id}"));
+            assert_eq!(mapping.es_de_system, *system);
+            assert_eq!(mapping.es_de_fullname, *fullname);
+        }
+    }
+
+    #[test]
+    fn batch_4_resolved_identity_produces_a_ready_entry() {
+        for (platform_id, system, _) in BATCH_4 {
+            let outcome = build_es_de_entry_plan(&resolved(platform_id), &usable_content(), None);
+            let EsDeExportOutcome::Entry(plan) = outcome else {
+                panic!("expected an ES-DE entry for {platform_id}");
+            };
+            assert_eq!(plan.status, EsDeEntryStatus::Ready);
+            assert!(plan.path_usable);
+            assert_eq!(plan.es_de_system, *system);
+        }
+    }
+
+    #[test]
+    fn batch_4_aliases_normalize_to_the_same_canonical_row() {
+        for (platform_id, alias) in [
+            ("3DO", "threedo"),
+            ("Acorn Archimedes", "archie"),
+            ("Acorn Electron", "elk"),
+            ("Amstrad CPC", "cpc"),
+            ("Apple II", "apple2"),
+            ("BBC Micro", "bbcb"),
+            ("FM Towns", "towns"),
+            ("Macintosh", "mac"),
+            ("NEC PC-8801", "pc88"),
+            ("NGage", "nokiangage"),
+            ("PC Engine", "pce"),
+            ("PC Engine CD", "pcecd"),
+        ] {
+            for spelling in [alias.to_string(), alias.to_ascii_uppercase()] {
+                let canonical = platform_for_alias(&spelling)
+                    .unwrap_or_else(|| panic!("{spelling} did not resolve to a platform"));
+                assert_eq!(canonical.id, platform_id);
+                assert_eq!(
+                    es_de_system_for_platform(canonical.id),
+                    es_de_system_for_platform(platform_id),
+                    "{spelling} did not resolve to {platform_id}'s ES-DE row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_4_pc_engine_targets_and_neighbours_remain_distinct() {
+        let pcengine = es_de_system_for_platform("PC Engine").unwrap();
+        let pcenginecd = es_de_system_for_platform("PC Engine CD").unwrap();
+        assert_eq!(pcengine.es_de_system, "pcengine");
+        assert_eq!(pcenginecd.es_de_system, "pcenginecd");
+        assert_ne!(pcengine.es_de_system, pcenginecd.es_de_system);
+
+        for platform_id in ["TurboGrafx-16", "PC-FX", "PC-98", "NEC PC-9801"] {
+            assert!(
+                es_de_system_for_platform(platform_id).is_none(),
+                "{platform_id} must remain deferred rather than borrowing a Batch 4 target"
+            );
+        }
+        assert_ne!(
+            es_de_system_for_platform("Acorn Electron")
+                .unwrap()
+                .es_de_system,
+            es_de_system_for_platform("BBC Micro").unwrap().es_de_system
+        );
+        assert_ne!(
+            es_de_system_for_platform("Apple II").unwrap().es_de_system,
+            es_de_system_for_platform("Macintosh").unwrap().es_de_system
+        );
+    }
 
     #[test]
     fn batch_3_platforms_map_to_es_de_exactly() {

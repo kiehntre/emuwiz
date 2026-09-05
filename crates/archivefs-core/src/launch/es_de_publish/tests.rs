@@ -182,6 +182,45 @@ fn batch_two_publication_preview_uses_the_reviewed_arcade_target() {
 }
 
 #[test]
+fn batch_4_publication_previews_use_each_verified_system_target() {
+    for (platform_id, system, fullname) in [
+        ("3DO", "3do", "3DO Interactive Multiplayer"),
+        ("Acorn Archimedes", "archimedes", "Acorn Archimedes"),
+        ("Acorn Electron", "electron", "Acorn Electron"),
+        ("Amstrad CPC", "amstradcpc", "Amstrad CPC"),
+        ("Apple II", "apple2", "Apple II"),
+        ("BBC Micro", "bbcmicro", "Acorn Computers BBC Micro"),
+        ("FM Towns", "fmtowns", "Fujitsu FM Towns"),
+        ("Macintosh", "macintosh", "Apple Macintosh"),
+        ("NEC PC-8801", "pc88", "NEC PC-8800 Series"),
+        ("NGage", "ngage", "Nokia N-Gage"),
+        ("PC Engine", "pcengine", "NEC PC Engine"),
+        ("PC Engine CD", "pcenginecd", "NEC PC Engine CD"),
+    ] {
+        let home = tempdir().unwrap();
+        let systems_xml = minimal_systems_xml(system, fullname);
+        let profile = profile_with_system(home.path(), system, fullname, &systems_xml);
+        let destination_root = home.path().join("playing").join(system);
+        let plan = plan_with_operations(
+            destination_root.clone(),
+            &[("Game", destination_root.join("game.rom"))],
+        );
+
+        let publication = plan_es_de_gamelist_publication(&plan, platform_id, &profile)
+            .unwrap_or_else(|error| panic!("{platform_id} preview failed: {error}"));
+        assert_eq!(publication.es_de_system, system);
+        assert_eq!(
+            publication.gamelist_path,
+            home.path()
+                .join("gamelists")
+                .join(system)
+                .join("gamelist.xml")
+        );
+        assert_eq!(publication.added.len(), 1);
+    }
+}
+
+#[test]
 fn system_not_configured_in_the_profile_is_refused() {
     let home = tempdir().unwrap();
     // No custom_systems/es_systems.xml at all - "snes" is never discovered.
