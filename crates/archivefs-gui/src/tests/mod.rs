@@ -245,6 +245,7 @@ mod health_and_platform_actions;
 mod library_views_and_sources;
 mod missing_library_fixit;
 mod mounts_and_history;
+mod onboarding_flow;
 mod platform_shelf_and_library_shell;
 mod selected;
 mod selected_context_and_bsfree;
@@ -1062,6 +1063,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         shared_history: SharedHistoryState::NotLoaded,
         shared_history_operation: None,
         shared_rollback: SharedRollbackState::Idle,
+        onboarding_state: onboarding::OnboardingState::NotStarted,
+        onboarding_auto_open_checked: false,
         retroarch_profiles: RetroArchProfilesState::NotScanned,
         retroarch_core_directory_override: None,
         retroarch_core_folder_rejected_pick: None,

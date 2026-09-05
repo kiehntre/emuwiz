@@ -143,6 +143,7 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 mod administration_pages;
 mod cheats_mods_preview;
+mod onboarding;
 use cheats_mods_preview::*;
 mod cheatbase_page;
 mod emulator_download_page;
@@ -3913,6 +3914,11 @@ enum ToolsOverlay {
     DatabaseStatus,
     DoctorChecks,
     ArchiveInspector,
+    /// First-run onboarding (`onboarding.rs`): a thin step tracker that
+    /// takes over the central panel exactly like `Diagnostics` does, but
+    /// dispatches its body per-step to the real Sources/DAT Sources/
+    /// Emulator Setup page methods rather than one fixed renderer.
+    Onboarding,
 }
 
 /// The Archive Inspector's column/sort choices - path (its exact stored
@@ -4470,6 +4476,15 @@ struct ArchiveFsApp {
     /// and must never be presented with the same reassuring "you have not
     /// configured this yet" framing as a fresh install.
     config_previously_confirmed: bool,
+    /// First-run onboarding: loaded once at startup from
+    /// `onboarding_state.txt` (see `onboarding.rs`), advanced only through
+    /// `onboarding::*` helper methods, and persisted back on every
+    /// transition. Never duplicates source/DAT/emulator state - it only
+    /// tracks which step of the guided tour the user is on.
+    onboarding_state: onboarding::OnboardingState,
+    /// One-shot: whether the auto-open check (first genuine run only, see
+    /// `maybe_auto_open_onboarding`) has already run this session.
+    onboarding_auto_open_checked: bool,
     /// Doctor Stage 1A: the current read-only diagnostic scan. Entirely
     /// separate from `self.state`/`self.refresh`, so running Doctor never
     /// reloads the application.
@@ -5106,6 +5121,8 @@ impl ArchiveFsApp {
             cleanup_after_unmount: false,
             diagnostics: start_diagnostics(context.clone(), generation),
             config_previously_confirmed: false,
+            onboarding_state: onboarding::load_onboarding_state(),
+            onboarding_auto_open_checked: false,
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             rpcs3_status: rpcs3_page::Rpcs3State::Idle,
@@ -6154,6 +6171,7 @@ impl ArchiveFsApp {
                     self.config_previously_confirmed = true;
                 }
                 self.diagnostics = DiagnosticsState::Ready { generation, report };
+                self.maybe_auto_open_onboarding();
             }
             Some(PollResult::Disconnected(generation)) if generation == self.refresh_generation => {
                 let message = "The diagnostics worker stopped unexpectedly. Run diagnostics again."
@@ -19246,6 +19264,9 @@ impl ArchiveFsApp {
                                 self.tools_overlay = ToolsOverlay::None;
                             }
                         }
+                        ToolsOverlay::Onboarding => {
+                            self.show_onboarding_overlay(ui, context);
+                        }
                         ToolsOverlay::None => unreachable!(),
                     }
                     return;
@@ -20422,6 +20443,9 @@ impl ArchiveFsApp {
                         }
                         Some(SettingsPageAction::RescanRetroArchProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
+                        }
+                        Some(SettingsPageAction::RunFirstTimeSetupAgain) => {
+                            self.restart_onboarding();
                         }
                         Some(SettingsPageAction::PlatformArtwork(action)) => {
                             self.start_platform_artwork_task(context.clone(), action);
@@ -32577,6 +32601,10 @@ enum SettingsPageAction {
     OpenDiagnostics,
     RescanRetroArchProfiles,
     PlatformArtwork(PlatformArtworkManagerAction),
+    /// "Run first-time setup again": re-enters the onboarding overlay
+    /// (`onboarding::restart_onboarding`) without touching source folders,
+    /// DAT registrations, or any other configured state.
+    RunFirstTimeSetupAgain,
 }
 
 enum PlatformArtworkManagerAction {

@@ -2144,6 +2144,16 @@ pub(super) fn show_settings_page(
         {
             action = Some(SettingsPageAction::OpenConfigFolder);
         }
+        if widgets::action_button(
+            ui,
+            "Run first-time setup again",
+            widgets::ActionStyle::Quiet,
+            true,
+        )
+        .clicked()
+        {
+            action = Some(SettingsPageAction::RunFirstTimeSetupAgain);
+        }
     });
 
     ui.add_space(theme::SECTION_GAP);
