@@ -145,6 +145,7 @@ mod cheats_mods_preview;
 use cheats_mods_preview::*;
 mod cheatbase_page;
 mod emulator_download_page;
+mod emulator_setup_page;
 mod gamer_platform_shelf;
 mod user_cheat_import_page;
 use gamer_platform_shelf::*;
@@ -4366,6 +4367,8 @@ struct ArchiveFsApp {
     /// with `take()` on the first frame so later frames and manual
     /// scrolling are untouched. `None` for sidebar/Home navigation.
     emulator_setup_focus: Option<EmulatorSetupFocus>,
+    /// Local presentation state for the candidate-first Emulator Setup page.
+    emulator_setup_page: emulator_setup_page::EmulatorSetupPageState,
     /// Read-only PCSX2 profile discovery shared by every PS2 archive
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
@@ -5065,6 +5068,7 @@ impl ArchiveFsApp {
             retroarch_core_directory_override: load_retroarch_core_directory_override(),
             retroarch_core_folder_rejected_pick: None,
             emulator_setup_focus: None,
+            emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
@@ -6762,12 +6766,32 @@ impl ArchiveFsApp {
              for each one. This page keeps library diagnostics out of the way.",
         );
         ui.add_space(theme::SECTION_GAP);
-        let check_emulators = show_emulator_setup_summary(
-            ui,
-            self.doctor_scan.displayed(),
-            self.doctor_scan.is_running(),
-            &self.retroarch_profiles,
-            focus_emulator.as_deref(),
+        let check_emulators = matches!(
+            emulator_setup_page::show(
+                ui,
+                &mut self.emulator_setup_page,
+                self.doctor_scan
+                    .displayed()
+                    .map(|outcome| outcome.scan.findings.as_slice()),
+                self.doctor_scan.is_running(),
+                match &self.retroarch_profiles {
+                    RetroArchProfilesState::NotScanned =>
+                        emulator_setup_page::RetroArchSetupStatus::NotChecked,
+                    RetroArchProfilesState::Scanning { .. } =>
+                        emulator_setup_page::RetroArchSetupStatus::Checking,
+                    RetroArchProfilesState::Error(_) =>
+                        emulator_setup_page::RetroArchSetupStatus::Blocked,
+                    RetroArchProfilesState::Ready(discovery) => {
+                        if discovery.profiles.iter().any(|profile| profile.eligible) {
+                            emulator_setup_page::RetroArchSetupStatus::Ready
+                        } else {
+                            emulator_setup_page::RetroArchSetupStatus::NeedsSetup
+                        }
+                    }
+                },
+                focus_emulator.as_deref(),
+            ),
+            Some(emulator_setup_page::EmulatorSetupAction::CheckEmulators)
         );
         if check_emulators {
             self.start_doctor_scan(context.clone());
@@ -6786,6 +6810,7 @@ impl ArchiveFsApp {
         ui.add_space(theme::SECTION_GAP);
         self.show_retroarch_core_folder_card(ui, context, focus_retroarch);
         ui.add_space(theme::SECTION_GAP);
+        #[cfg(any())]
         fn show_emulator_setup_summary(
             ui: &mut egui::Ui,
             outcome: Option<&DoctorScanOutcome>,
