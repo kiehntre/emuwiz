@@ -1385,7 +1385,9 @@ fn section_kind(value: &str) -> Option<(DolphinCodeKind, bool)> {
     }
 }
 
-fn parse_game_identity(stem: &std::ffi::OsStr) -> (Option<String>, Option<u16>, Option<String>) {
+pub(crate) fn parse_game_identity(
+    stem: &std::ffi::OsStr,
+) -> (Option<String>, Option<u16>, Option<String>) {
     let Some(stem) = stem.to_str() else {
         return (None, None, None);
     };

@@ -14,17 +14,21 @@ use archivefs_core::patch_manager::{
     CheatCandidateOptions, CheatDestinationRequest, CheatJourneyApplyApproval,
     CheatJourneyApplyOptions, CheatJourneyGameIdentity, CheatJourneyPreview,
     CheatJourneyPreviewAction, CheatJourneyUndoConfirmation, CheatJourneyUndoOptions,
-    CheatJourneyUndoPreview, LocalPcsx2InstallState, Pcsx2GameIdentity, Pcsx2InstallPreview,
+    CheatJourneyUndoPreview, DolphinCandidate, DolphinInstallPreview, DolphinInstallPreviewRequest,
+    LocalDolphinInstallState, LocalPcsx2InstallState, Pcsx2GameIdentity, Pcsx2InstallPreview,
     Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
     SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat,
     UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState,
-    apply_cheat_journey, build_pcsx2_install_preview, build_shared_transaction_plan,
+    apply_cheat_journey, build_dolphin_install_preview, build_pcsx2_install_preview,
+    build_shared_transaction_plan, check_local_dolphin_install_state,
     check_local_pcsx2_install_state, default_shared_backup_root, default_shared_history_root,
-    discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file, execute_shared_apply,
-    execute_shared_rollback, generate_shared_operation_id, preview_cheat_journey,
+    discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
+    discover_local_retroarch_cheat_file, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, load_dolphin_destination, preview_cheat_journey,
     preview_cheat_journey_undo, preview_shared_rollback, scan_user_cheat_directory,
-    scan_user_cheat_file, select_cheat_journey_candidate, stage_pcsx2_pnach, undo_cheat_journey,
+    scan_user_cheat_file, select_cheat_journey_candidate, stage_local_dolphin_codes,
+    stage_pcsx2_pnach, undo_cheat_journey,
 };
 use eframe::egui;
 
@@ -130,6 +134,63 @@ impl Default for LocalPcsx2InstallStage {
     }
 }
 
+/// The currently selected game's already-resolved Dolphin candidate
+/// (exact game ID, and when applicable exact disc revision, already
+/// matched against the selected profile) plus the profile's own
+/// configuration root - bound by the caller exactly as the existing
+/// Dolphin Gecko provider workflow binds them, never re-derived here.
+pub(crate) struct LocalDolphinInstallContext {
+    pub candidate: DolphinCandidate,
+    pub configuration_path: PathBuf,
+    /// The selected Dolphin profile's own ID, exactly the string
+    /// `build_shared_transaction_plan` already scopes every other Dolphin
+    /// apply's journal/backup entries under.
+    pub profile_id: String,
+}
+
+/// One local Dolphin `.ini` (Gecko/Action Replay) install attempt's
+/// current stage, independent of the RetroArch/PCSX2 stages so the three
+/// formats never share state. Unlike RetroArch/PCSX2, there is no
+/// directory-wide scan to pick a candidate from - the user picks the file
+/// directly, so this starts from a file path rather than a report row.
+enum LocalDolphinInstallStage {
+    Idle,
+    Blocked {
+        source_path: PathBuf,
+        message: String,
+    },
+    AlreadyInstalled {
+        source_path: PathBuf,
+    },
+    Preview {
+        source_path: PathBuf,
+        configuration_path: PathBuf,
+        profile_id: String,
+        preview: Box<DolphinInstallPreview>,
+    },
+    Applied {
+        destination_root: PathBuf,
+        journal_path: Option<PathBuf>,
+    },
+    UndoPreview {
+        destination_root: PathBuf,
+        journal_path: PathBuf,
+        preview: Box<SharedRollbackPreview>,
+    },
+    Done {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Default for LocalDolphinInstallStage {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 #[derive(Debug)]
 enum TaskResult {
     Scanned(Result<UserCheatImportReport, UserCheatImportError>),
@@ -164,6 +225,7 @@ pub(crate) struct UserCheatImportPageState {
     technical_details: bool,
     local_install: LocalInstallStage,
     local_pcsx2_install: LocalPcsx2InstallStage,
+    local_dolphin_install: LocalDolphinInstallStage,
 }
 
 impl UserCheatImportPageState {
@@ -253,6 +315,7 @@ impl UserCheatImportPageState {
         selected_game: Option<(&str, &str)>,
         local_install_context: Option<&LocalCheatInstallContext>,
         local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
@@ -266,8 +329,8 @@ impl UserCheatImportPageState {
         widgets::card(ui, |ui| {
             ui.label("Imported for review only. EmuWiz has not changed your emulator files.");
             ui.label(
-                "Local install is available for RetroArch .cht and PCSX2 .pnach files. \
-                 Dolphin Gecko/Action Replay and Xenia .patch.toml local install are not \
+                "Local install is available for RetroArch .cht, PCSX2 .pnach, and Dolphin \
+                 Gecko/Action Replay .ini files. Xenia .patch.toml local install is not \
                  available in this build.",
             );
             if let Some((_, title)) = selected_game {
@@ -366,9 +429,56 @@ impl UserCheatImportPageState {
                     }
                 }
             }
+            self.show_dolphin_local_install_picker(ui, context, local_dolphin_install_context);
         });
         self.show_local_install_panel(ui);
         self.show_local_pcsx2_install_panel(ui);
+        self.show_local_dolphin_install_panel(ui);
+    }
+
+    /// Dolphin's local-file entry point: unlike RetroArch/PCSX2, Dolphin
+    /// cheat files are never scanned or matched from a directory listing
+    /// here - the file the user picks *is* the one installed, bound to the
+    /// already-resolved [`LocalDolphinInstallContext`] for the selected
+    /// game. A dedicated `.ini` file picker keeps this fully independent
+    /// of the generic multi-format import review above.
+    fn show_dolphin_local_install_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        _context: &egui::Context,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+    ) {
+        ui.add_space(theme_gap());
+        widgets::card(ui, |ui| {
+            ui.strong("Install a local Dolphin cheat file (.ini)");
+            ui.label(
+                "The file must declare a [Gecko] and/or [ActionReplay] section, exactly like \
+                 a Dolphin GameSettings file - the same sections Dolphin itself reads.",
+            );
+            let Some(install_context) = local_dolphin_install_context else {
+                ui.label("Select a Dolphin game and an eligible profile in Cheats & Mods to install a local file.");
+                return;
+            };
+            let can_start = matches!(self.local_dolphin_install, LocalDolphinInstallStage::Idle);
+            if widgets::action_button(
+                ui,
+                "Choose a Dolphin cheat file…",
+                widgets::ActionStyle::Primary,
+                can_start,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Dolphin GameSettings", &["ini"])
+                    .pick_file()
+            {
+                self.start_local_dolphin_install(
+                    path,
+                    install_context.candidate.clone(),
+                    install_context.configuration_path.clone(),
+                    install_context.profile_id.clone(),
+                );
+            }
+        });
     }
 
     fn show_report(
@@ -1526,6 +1636,465 @@ impl UserCheatImportPageState {
                     self.local_pcsx2_install = LocalPcsx2InstallStage::Idle;
                 } else {
                     self.local_pcsx2_install = LocalPcsx2InstallStage::Error { message };
+                }
+            }
+        }
+    }
+
+    /// Discovers, checks for an already-installed identical state, stages,
+    /// and previews - everything downstream of this is the same,
+    /// unmodified Dolphin install-plan pipeline
+    /// (`build_dolphin_install_preview`) the provider-driven Gecko flow
+    /// already uses; this only supplies the one file the user picked,
+    /// merged into the codes it becomes.
+    fn start_local_dolphin_install(
+        &mut self,
+        source_path: PathBuf,
+        candidate: DolphinCandidate,
+        configuration_path: PathBuf,
+        profile_id: String,
+    ) {
+        let discovery = match discover_local_dolphin_cheat_file(&source_path, &candidate) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        let destination = match load_dolphin_destination(&configuration_path, &candidate.game_id) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        if check_local_dolphin_install_state(&destination, &discovery)
+            == LocalDolphinInstallState::AlreadyInstalled
+        {
+            self.local_dolphin_install = LocalDolphinInstallStage::AlreadyInstalled { source_path };
+            return;
+        }
+        let staging_root = match crate::default_generated_dolphin_local_staging_root() {
+            Ok(root) => root,
+            Err(message) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error { message };
+                return;
+            }
+        };
+        let staged = match stage_local_dolphin_codes(&staging_root, &destination, &discovery) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+                return;
+            }
+        };
+        match build_dolphin_install_preview(&DolphinInstallPreviewRequest {
+            selected_archive: candidate.path.clone(),
+            configuration_path: configuration_path.clone(),
+            game_id: candidate.game_id.clone(),
+            revision: candidate.revision,
+            staged,
+        }) {
+            Ok(preview) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Preview {
+                    source_path,
+                    configuration_path,
+                    profile_id,
+                    preview: Box::new(preview),
+                };
+            }
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                    source_path,
+                    message: error.to_string(),
+                };
+            }
+        }
+    }
+
+    fn confirm_local_dolphin_apply(&mut self) {
+        let LocalDolphinInstallStage::Preview {
+            configuration_path,
+            profile_id,
+            preview,
+            ..
+        } = std::mem::take(&mut self.local_dolphin_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let replacement_required = preview
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.proposed_action == PreviewProposedAction::Replace);
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            &profile_id,
+            "dolphin-local-file",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: error.detail,
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let destination_root = configuration_path.clone();
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved: replacement_required,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        if result.journal.status == SharedApplyStatus::Success {
+            self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                destination_root,
+                journal_path: result.journal_path,
+            };
+        } else {
+            self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                message: format!("Apply did not fully succeed: {:?}", result.journal.status),
+            };
+        }
+    }
+
+    fn start_local_dolphin_undo(&mut self) {
+        let LocalDolphinInstallStage::Applied {
+            destination_root,
+            journal_path,
+        } = std::mem::take(&mut self.local_dolphin_install)
+        else {
+            return;
+        };
+        let Some(journal_path) = journal_path else {
+            self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                message: "No transaction journal was recorded for this apply.".to_string(),
+            };
+            return;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let preview = preview_shared_rollback(&journal_path, &destination_root, &backup_root);
+        self.local_dolphin_install = LocalDolphinInstallStage::UndoPreview {
+            destination_root,
+            journal_path,
+            preview: Box::new(preview),
+        };
+    }
+
+    fn confirm_local_dolphin_undo(&mut self) {
+        let LocalDolphinInstallStage::UndoPreview { preview, .. } =
+            std::mem::take(&mut self.local_dolphin_install)
+        else {
+            return;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("History root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                    message: format!("Backup root unavailable: {}", error.detail),
+                };
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        );
+        if result.status == SharedApplyStatus::Success {
+            self.local_dolphin_install = LocalDolphinInstallStage::Done {
+                message: "The installed cheat file was removed and the prior state was restored."
+                    .to_string(),
+            };
+        } else {
+            self.local_dolphin_install = LocalDolphinInstallStage::Error {
+                message: format!("Undo did not fully succeed: {:?}", result.status),
+            };
+        }
+    }
+
+    /// Mirrors `show_local_pcsx2_install_panel`'s ownership dance for the
+    /// same reason: `self.local_dolphin_install` is taken by value before
+    /// rendering so the action buttons' `&mut self` calls never conflict
+    /// with a live borrow of it.
+    fn show_local_dolphin_install_panel(&mut self, ui: &mut egui::Ui) {
+        let stage = std::mem::take(&mut self.local_dolphin_install);
+        match stage {
+            LocalDolphinInstallStage::Idle => {}
+            LocalDolphinInstallStage::Blocked {
+                source_path,
+                message,
+            } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    &format!("Cannot install {}", source_path.display()),
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Blocked {
+                        source_path,
+                        message,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::AlreadyInstalled { source_path } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Already installed",
+                    &format!(
+                        "{} is already installed, unchanged, for this game - installing it again would change nothing.",
+                        source_path.display()
+                    ),
+                    widgets::StatusTone::Info,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install =
+                        LocalDolphinInstallStage::AlreadyInstalled { source_path };
+                }
+            }
+            LocalDolphinInstallStage::Preview {
+                source_path,
+                configuration_path,
+                profile_id,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Review before installing");
+                    ui.label(format!("Source file: {}", source_path.display()));
+                    ui.label(format!("Destination: {}", preview.staged.path.display()));
+                    ui.label(format!(
+                        "{} code(s) merged in this install.",
+                        preview.staged.selected_code_count
+                    ));
+                    for entry in &preview.report.entries {
+                        ui.label(format!("{:?}", entry.proposed_action));
+                    }
+                    egui::CollapsingHeader::new("Merged GameSettings contents to be written")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.monospace(preview.staged.contents.clone());
+                        });
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm install",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Preview {
+                        source_path,
+                        configuration_path,
+                        profile_id: profile_id.clone(),
+                        preview,
+                    };
+                    self.confirm_local_dolphin_apply();
+                } else if cancelled {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Preview {
+                        source_path,
+                        configuration_path,
+                        profile_id: profile_id.clone(),
+                        preview,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::Applied {
+                destination_root,
+                journal_path,
+            } => {
+                ui.add_space(theme_gap());
+                let mut undo = false;
+                let mut dismissed = false;
+                widgets::card(ui, |ui| {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(journal_path) = journal_path.as_ref() {
+                        ui.label(format!("Transaction journal: {}", journal_path.display()));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Undo this install").clicked() {
+                            undo = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+                if undo {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                    self.start_local_dolphin_undo();
+                } else if dismissed {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                        destination_root,
+                        journal_path,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::UndoPreview {
+                destination_root,
+                journal_path,
+                preview,
+            } => {
+                ui.add_space(theme_gap());
+                let mut confirmed = false;
+                let mut cancelled = false;
+                widgets::card(ui, |ui| {
+                    ui.strong("Confirm undo");
+                    ui.label("This will remove the installed managed codes and restore any prior file content.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Confirm undo",
+                            widgets::ActionStyle::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+                if confirmed {
+                    self.local_dolphin_install = LocalDolphinInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                    self.confirm_local_dolphin_undo();
+                } else if cancelled {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Applied {
+                        destination_root,
+                        journal_path: Some(journal_path),
+                    };
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::UndoPreview {
+                        destination_root,
+                        journal_path,
+                        preview,
+                    };
+                }
+            }
+            LocalDolphinInstallStage::Done { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(ui, "Undo complete", &message, widgets::StatusTone::Info);
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Done { message };
+                }
+            }
+            LocalDolphinInstallStage::Error { message } => {
+                ui.add_space(theme_gap());
+                widgets::banner(
+                    ui,
+                    "Local Dolphin cheat install error",
+                    &message,
+                    widgets::StatusTone::Blocked,
+                );
+                if ui.button("Dismiss").clicked() {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Idle;
+                } else {
+                    self.local_dolphin_install = LocalDolphinInstallStage::Error { message };
                 }
             }
         }

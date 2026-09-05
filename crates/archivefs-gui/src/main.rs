@@ -64,15 +64,15 @@ use archivefs_core::patch_manager::{
     CheatSourceExclusionKind, CheatSourceFetchOptions, CheatSourceFetchResult,
     CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList, CheatSourceListEntry,
     CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
-    DesktopBrowserLauncher, DeviceFormatCompatibility, DolphinCatalogue, DolphinCatalogueError,
-    DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult,
-    DolphinCatalogueLoad, DolphinCatalogueUpdateCheck, DolphinDedupFinding,
-    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
-    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
-    EmulatorProfileSelectReason, EmulatorProfileSelection, FlycastProfileDiscovery,
-    FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
+    DesktopBrowserLauncher, DeviceFormatCompatibility, DolphinCandidate, DolphinCatalogue,
+    DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
+    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinCatalogueUpdateCheck,
+    DolphinDedupFinding, DolphinGameIniInventory, DolphinGeckoLookupResult,
+    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
     GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
     GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
     GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
@@ -19725,6 +19725,13 @@ impl ArchiveFsApp {
                         .and_then(|workflow| {
                             local_pcsx2_install_context(workflow, &self.pcsx2_profiles)
                         });
+                    let local_dolphin_install_context = self
+                        .cheat_workflow
+                        .as_ref()
+                        .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin)
+                        .and_then(|workflow| {
+                            local_dolphin_install_context(workflow, &self.dolphin_profiles)
+                        });
                     let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
                         .id_salt("cheats_mods_workspace_scroll")
                         .auto_shrink([false, false])
@@ -19738,6 +19745,7 @@ impl ArchiveFsApp {
                                     .map(|(id, title)| (id.as_str(), title.as_str())),
                                 local_cheat_install_context.as_ref(),
                                 local_pcsx2_install_context.as_ref(),
+                                local_dolphin_install_context.as_ref(),
                             );
                             ui.add_space(theme::SECTION_GAP);
                             let cheatbase_action = cheatbase_page::show_cheatbase_page(
@@ -31112,6 +31120,54 @@ fn local_pcsx2_install_context(
     Some(user_cheat_import_page::LocalPcsx2InstallContext { identity, profile })
 }
 
+/// Binds the currently selected Dolphin game into the already-resolved
+/// candidate and profile the local-`.ini`-file install action needs -
+/// exactly the same verified game ID/revision resolution
+/// `dolphin_gamehacking_request_key` already uses (network-free: no
+/// provider fetch required), pointed at the selected profile's own
+/// configuration root. `None` when no verified Dolphin identity or no
+/// eligible profile is selected yet; the install action stays disabled
+/// with that exact reason rather than guessing either one.
+fn local_dolphin_install_context(
+    workflow: &CheatWorkflowState,
+    profiles: &DolphinProfilesState,
+) -> Option<user_cheat_import_page::LocalDolphinInstallContext> {
+    let report = ready_game_identity(workflow)?;
+    let game_id = report.verified_dolphin_game_id()?.to_string();
+    let is_wii = workflow.platform.as_deref() == Some("Wii");
+    let revision = if is_wii {
+        wii_identity_for_workflow(workflow)?.candidate_revision
+    } else {
+        report.verified_dolphin_revision()
+    };
+    let profile_id = workflow.selected_dolphin_profile_id.clone()?;
+    let DolphinProfilesState::Ready(discovery) = profiles else {
+        return None;
+    };
+    let profile = discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.eligible && profile.profile_id == profile_id)?;
+    let configuration_path = profile.configuration_path.clone();
+    let candidate = DolphinCandidate {
+        game_id: game_id.clone(),
+        region: None,
+        revision,
+        path: configuration_path
+            .join("GameSettings")
+            .join(format!("{game_id}.ini")),
+        cheat_count: 0,
+        enabled_count: 0,
+        evidence: Vec::new(),
+        installable: true,
+    };
+    Some(user_cheat_import_page::LocalDolphinInstallContext {
+        candidate,
+        configuration_path,
+        profile_id,
+    })
+}
+
 /// The private directory generated cheat files are staged into before they
 /// enter the transaction pipeline. Kept beside the other managed roots so
 /// it is never a directory the user browses or an emulator reads.
@@ -31138,6 +31194,21 @@ pub(crate) fn default_generated_pcsx2_local_staging_root() -> Result<PathBuf, St
             root.parent()
                 .map(|parent| parent.join("generated-pcsx2-local"))
                 .unwrap_or_else(|| root.join("generated-pcsx2-local"))
+        })
+        .map_err(|error| format!("Staging root unavailable: {}", error.detail))
+}
+
+/// The private directory a local Dolphin `.ini` install stages its merged
+/// GameSettings output into before it enters the transaction pipeline -
+/// kept separate from the provider-driven `generated-dolphin` staging
+/// root for the same reason `generated-pcsx2-local` is kept separate from
+/// PCSX2's own provider staging root.
+pub(crate) fn default_generated_dolphin_local_staging_root() -> Result<PathBuf, String> {
+    default_shared_backup_root()
+        .map(|root| {
+            root.parent()
+                .map(|parent| parent.join("generated-dolphin-local"))
+                .unwrap_or_else(|| root.join("generated-dolphin-local"))
         })
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }

@@ -65,6 +65,7 @@ mod gecko_document;
 mod hatari_local;
 mod import_safety;
 mod local_cheat_install;
+mod local_cheat_install_dolphin;
 mod local_cheat_install_pcsx2;
 mod matching;
 mod melonds_local;
@@ -520,6 +521,11 @@ pub use import_safety::{
 pub use local_cheat_install::{
     LOCAL_CHEAT_SOURCE_NAME, LocalCheatFileDiscovery, LocalCheatFileError, LocalCheatFileLocation,
     discover_local_retroarch_cheat_file,
+};
+pub use local_cheat_install_dolphin::{
+    LocalDolphinCodeKind, LocalDolphinDiscovery, LocalDolphinFileError, LocalDolphinInstallState,
+    MAX_LOCAL_DOLPHIN_INI_BYTES, check_local_dolphin_install_state,
+    discover_local_dolphin_cheat_file, stage_local_dolphin_codes,
 };
 pub use local_cheat_install_pcsx2::{
     LocalPcsx2Discovery, LocalPcsx2FileError, LocalPcsx2InstallState,
