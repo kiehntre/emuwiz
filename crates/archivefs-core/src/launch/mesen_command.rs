@@ -172,6 +172,7 @@ pub fn build_mesen_command_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
     use crate::launch::planning::{
         CandidatePreference, LaunchContainerKind, LaunchContentKind, LaunchContentRef,
         ResolvedIdentity,
@@ -246,9 +247,13 @@ mod tests {
                 .is_none()
         );
         let wrong = LaunchCandidate {
-            target: LaunchTarget::RetroArch {
-                core_path: "/x".into(),
+            target: LaunchTarget::RetroArchCore {
+                profile: ProfileRef {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                },
                 core_stem: "x".into(),
+                platform_id: "NES",
             },
             ..c("/x.nes")
         };

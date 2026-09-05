@@ -552,9 +552,11 @@ mod tests {
                 platform_id,
                 "Game Boy" | "Game Boy Color" | "Game Boy Advance"
             ) {
-                assert_eq!(row.standalone_adapters, &["mgba"], "{platform_id}");
+                assert_eq!(row.standalone_adapters, &["mgba", "mesen"], "{platform_id}");
             } else if platform_id == "N64" {
                 assert_eq!(row.standalone_adapters, &["rmg"], "{platform_id}");
+            } else if matches!(platform_id, "NES" | "SNES") {
+                assert_eq!(row.standalone_adapters, &["mesen"], "{platform_id}");
             } else {
                 assert!(row.standalone_adapters.is_empty(), "{platform_id}");
             }

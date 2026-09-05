@@ -273,8 +273,12 @@ mod tests {
         fs::create_dir_all(d.path().join("profile")).unwrap();
         fs::write(d.path().join("profile/settings.json"), b"{}").unwrap();
         let x = discover_mesen_profiles(&roots(d.path(), vec![e]));
-        assert!(x.profiles[0].eligible);
-        assert!(resolve_mesen_native_launch_binding(&x.profiles[0]).is_ok());
+        let usable = x
+            .profiles
+            .iter()
+            .find(|p| p.eligible)
+            .expect("a usable Mesen profile is discovered");
+        assert!(resolve_mesen_native_launch_binding(usable).is_ok());
     }
     #[test]
     fn no_executable_is_found_but_unusable_profile_is_reported() {
