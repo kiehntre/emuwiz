@@ -437,6 +437,44 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_system: "pcenginecd",
         es_de_fullname: "NEC PC Engine CD",
     },
+    // --- Batch 5 additions (docs/ESDE_FINAL_PARITY_PLAN.md §6) --------
+    // Exact, one-to-one upstream ES-DE systems only. Policy-bearing regional,
+    // equivalent-canonical, and no-target platforms deliberately remain absent.
+    EsDeSystemMapping {
+        platform_id: "VIC-20",
+        es_de_system: "vic20",
+        es_de_fullname: "Commodore VIC-20",
+    },
+    EsDeSystemMapping {
+        platform_id: "Neo Geo CD",
+        es_de_system: "neogeocd",
+        es_de_fullname: "SNK Neo Geo CD",
+    },
+    EsDeSystemMapping {
+        platform_id: "Switch",
+        es_de_system: "switch",
+        es_de_fullname: "Nintendo Switch",
+    },
+    EsDeSystemMapping {
+        platform_id: "PC-FX",
+        es_de_system: "pcfx",
+        es_de_fullname: "NEC PC-FX",
+    },
+    EsDeSystemMapping {
+        platform_id: "Philips CD-i",
+        es_de_system: "cdimono1",
+        es_de_fullname: "Philips CD-i",
+    },
+    EsDeSystemMapping {
+        platform_id: "PS4",
+        es_de_system: "ps4",
+        es_de_fullname: "Sony PlayStation 4",
+    },
+    EsDeSystemMapping {
+        platform_id: "Sharp X68000",
+        es_de_system: "x68000",
+        es_de_fullname: "Sharp X68000",
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.
@@ -743,6 +781,13 @@ mod tests {
             "NGage",
             "PC Engine",
             "PC Engine CD",
+            "VIC-20",
+            "Neo Geo CD",
+            "Switch",
+            "PC-FX",
+            "Philips CD-i",
+            "PS4",
+            "Sharp X68000",
         ] {
             assert!(
                 es_de_system_for_platform(platform_id).is_some(),
@@ -902,6 +947,109 @@ mod tests {
         ("PC Engine CD", "pcenginecd", "NEC PC Engine CD"),
     ];
 
+    /// Batch 5 is intentionally only the seven direct, one-to-one mappings
+    /// approved in `docs/ESDE_FINAL_PARITY_PLAN.md`.
+    const BATCH_5: &[(&str, &str, &str)] = &[
+        ("VIC-20", "vic20", "Commodore VIC-20"),
+        ("Neo Geo CD", "neogeocd", "SNK Neo Geo CD"),
+        ("Switch", "switch", "Nintendo Switch"),
+        ("PC-FX", "pcfx", "NEC PC-FX"),
+        ("Philips CD-i", "cdimono1", "Philips CD-i"),
+        ("PS4", "ps4", "Sony PlayStation 4"),
+        ("Sharp X68000", "x68000", "Sharp X68000"),
+    ];
+
+    #[test]
+    fn batch_5_platforms_map_to_es_de_exactly() {
+        for (platform_id, system, fullname) in BATCH_5 {
+            let mapping = es_de_system_for_platform(platform_id)
+                .unwrap_or_else(|| panic!("missing ES-DE mapping for {platform_id}"));
+            assert_eq!(mapping.es_de_system, *system);
+            assert_eq!(mapping.es_de_fullname, *fullname);
+        }
+    }
+
+    #[test]
+    fn batch_5_resolved_identity_produces_a_ready_entry() {
+        for (platform_id, system, _) in BATCH_5 {
+            let outcome = build_es_de_entry_plan(&resolved(platform_id), &usable_content(), None);
+            let EsDeExportOutcome::Entry(plan) = outcome else {
+                panic!("expected an ES-DE entry for {platform_id}");
+            };
+            assert_eq!(plan.status, EsDeEntryStatus::Ready);
+            assert!(plan.path_usable);
+            assert_eq!(plan.es_de_system, *system);
+        }
+    }
+
+    #[test]
+    fn batch_5_aliases_normalize_to_the_same_canonical_row() {
+        for (platform_id, alias) in [
+            ("VIC-20", "vic"),
+            ("Neo Geo CD", "ngcd"),
+            ("Switch", "nintendoswitch"),
+            ("PC-FX", "necpcfx"),
+            ("Philips CD-i", "cdi"),
+            ("PS4", "playstation4"),
+            ("Sharp X68000", "x68k"),
+        ] {
+            for spelling in [alias.to_string(), alias.to_ascii_uppercase()] {
+                let canonical = platform_for_alias(&spelling)
+                    .unwrap_or_else(|| panic!("{spelling} did not resolve to a platform"));
+                assert_eq!(canonical.id, platform_id);
+                assert_eq!(
+                    es_de_system_for_platform(canonical.id),
+                    es_de_system_for_platform(platform_id),
+                    "{spelling} did not resolve to {platform_id}'s ES-DE row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_5_distinct_neighbours_and_deferred_platforms_remain_safe() {
+        let neogeocd = es_de_system_for_platform("Neo Geo CD").unwrap();
+        assert_eq!(neogeocd.es_de_system, "neogeocd");
+        for platform_id in ["NeoGeo", "Neo Geo Pocket", "Neo Geo Pocket Color"] {
+            assert_ne!(
+                neogeocd.es_de_system,
+                es_de_system_for_platform(platform_id).unwrap().es_de_system,
+                "Neo Geo CD must remain distinct from {platform_id}"
+            );
+        }
+        let pcfx = es_de_system_for_platform("PC-FX").unwrap();
+        assert_ne!(
+            pcfx.es_de_system,
+            es_de_system_for_platform("PC Engine").unwrap().es_de_system
+        );
+        assert_ne!(
+            pcfx.es_de_system,
+            es_de_system_for_platform("PC Engine CD")
+                .unwrap()
+                .es_de_system
+        );
+        let cdi = es_de_system_for_platform("Philips CD-i").unwrap();
+        assert_ne!(
+            cdi.es_de_system,
+            es_de_system_for_platform("Arcade").unwrap().es_de_system
+        );
+        for platform_id in [
+            "Atari 8-bit",
+            "Commodore 128",
+            "NeoGeo64",
+            "PC",
+            "PC-98",
+            "NEC PC-9801",
+            "TurboGrafx-16",
+            "not-a-real-platform",
+        ] {
+            assert!(
+                es_de_system_for_platform(platform_id).is_none(),
+                "{platform_id} must remain refused until its policy is resolved"
+            );
+        }
+    }
+
     #[test]
     fn batch_4_platforms_map_to_es_de_exactly() {
         for (platform_id, system, fullname) in BATCH_4 {
@@ -962,7 +1110,7 @@ mod tests {
         assert_eq!(pcenginecd.es_de_system, "pcenginecd");
         assert_ne!(pcengine.es_de_system, pcenginecd.es_de_system);
 
-        for platform_id in ["TurboGrafx-16", "PC-FX", "PC-98", "NEC PC-9801"] {
+        for platform_id in ["TurboGrafx-16", "PC-98", "NEC PC-9801"] {
             assert!(
                 es_de_system_for_platform(platform_id).is_none(),
                 "{platform_id} must remain deferred rather than borrowing a Batch 4 target"
@@ -1092,24 +1240,31 @@ mod tests {
         }
     }
 
-    /// Still-unmapped neighbouring platforms (deliberately left for a later
-    /// batch) must keep failing closed rather than falling back to a
-    /// Batch 1 row that merely looks related.
+    /// Still-unmapped policy/no-target platforms must keep failing closed
+    /// rather than falling back to a merely related Batch 1--5 row.
     #[test]
-    fn platforms_still_unmapped_after_batch_1_remain_refused() {
+    fn platforms_still_unmapped_after_batch_5_remain_refused() {
         // NeoGeo/WonderSwan/Intellivision were the still-unmapped examples
         // when this test was first written for Batch 1; Batch 3 has since
         // mapped all three (see `batch_3_platforms_map_to_es_de_exactly`),
         // so they moved out of this list rather than being asserted here
         // and in a "now mapped" test simultaneously.
-        for platform_id in ["Switch", "PS4"] {
+        for platform_id in [
+            "Atari 8-bit",
+            "Commodore 128",
+            "NeoGeo64",
+            "PC",
+            "PC-98",
+            "NEC PC-9801",
+            "TurboGrafx-16",
+        ] {
             assert!(
                 platform_by_id(platform_id).is_some(),
                 "{platform_id} should be a real registry id (fixture drift)"
             );
             assert!(
                 es_de_system_for_platform(platform_id).is_none(),
-                "{platform_id} must still be unmapped after Batch 1"
+                "{platform_id} must still be unmapped after Batch 5"
             );
         }
     }

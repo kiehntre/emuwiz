@@ -182,6 +182,40 @@ fn batch_two_publication_preview_uses_the_reviewed_arcade_target() {
 }
 
 #[test]
+fn batch_five_publication_previews_use_the_exact_reviewed_system_targets() {
+    for (platform_id, system, fullname) in [
+        ("VIC-20", "vic20", "Commodore VIC-20"),
+        ("Neo Geo CD", "neogeocd", "SNK Neo Geo CD"),
+        ("Switch", "switch", "Nintendo Switch"),
+        ("PC-FX", "pcfx", "NEC PC-FX"),
+        ("Philips CD-i", "cdimono1", "Philips CD-i"),
+        ("PS4", "ps4", "Sony PlayStation 4"),
+        ("Sharp X68000", "x68000", "Sharp X68000"),
+    ] {
+        let home = tempdir().unwrap();
+        let systems_xml = minimal_systems_xml(system, fullname);
+        let profile = profile_with_system(home.path(), system, fullname, &systems_xml);
+        let destination_root = home.path().join("playing").join(system);
+        let plan = plan_with_operations(
+            destination_root.clone(),
+            &[("Verified Game", destination_root.join("Verified Game.chd"))],
+        );
+
+        let publication = plan_es_de_gamelist_publication(&plan, platform_id, &profile)
+            .unwrap_or_else(|error| panic!("{platform_id} preview was refused: {error}"));
+        assert_eq!(publication.es_de_system, system);
+        assert_eq!(
+            publication.gamelist_path,
+            home.path()
+                .join("gamelists")
+                .join(system)
+                .join("gamelist.xml")
+        );
+        assert!(!publication.is_unchanged());
+    }
+}
+
+#[test]
 fn batch_4_publication_previews_use_each_verified_system_target() {
     for (platform_id, system, fullname) in [
         ("3DO", "3do", "3DO Interactive Multiplayer"),
