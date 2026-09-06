@@ -8,6 +8,10 @@ OUTPUT_DIR="$REPO_ROOT/dist"
 TARGET_DIR=""
 APPIMAGETOOL="${APPIMAGETOOL:-}"
 RUNTIME_FILE="${APPIMAGE_RUNTIME_FILE:-}"
+TOOLING_MANIFEST="$SCRIPT_DIR/tooling.lock"
+TOOLING_CACHE="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/emuwiz/appimage-tools"
+PRINT_TOOLING=0
+VERIFY_TOOLING=0
 
 die() {
     printf 'appimage build: error: %s\n' "$*" >&2
@@ -27,6 +31,8 @@ Options:
   --target-dir DIR      Cargo target directory for an isolated build.
   --appimagetool PATH   Pinned/approved host appimagetool executable.
   --runtime-file PATH   Pinned AppImage type-2 runtime file.
+  --print-tooling       Print pinned provenance and exit without building.
+  --verify-tooling      Verify explicitly supplied tools and exit.
   -h, --help            Show this help.
 
 Requirements: bash, cargo, git, install, sha256sum, appimagetool, and an
@@ -58,6 +64,14 @@ while (($#)); do
             RUNTIME_FILE=$2
             shift 2
             ;;
+        --print-tooling)
+            PRINT_TOOLING=1
+            shift
+            ;;
+        --verify-tooling)
+            VERIFY_TOOLING=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -65,6 +79,47 @@ while (($#)); do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+[[ -f "$TOOLING_MANIFEST" ]] || die "tooling manifest missing: $TOOLING_MANIFEST"
+manifest_value() {
+    local key=$1 value
+    value="$(awk -F= -v wanted="$key" '$0 !~ /^[[:space:]]*#/ && $1 == wanted {print substr($0, index($0, "=") + 1); exit}' "$TOOLING_MANIFEST")"
+    [[ -n "$value" && "$value" != *[!A-Za-z0-9_./:+@%,-]* ]] || die "invalid or missing $key in $TOOLING_MANIFEST"
+    printf '%s' "$value"
+}
+APPIMAGETOOL_VERSION="$(manifest_value APPIMAGETOOL_VERSION)"
+APPIMAGETOOL_URL="$(manifest_value APPIMAGETOOL_URL)"
+APPIMAGETOOL_SHA256="$(manifest_value APPIMAGETOOL_SHA256)"
+APPIMAGE_RUNTIME_VERSION="$(manifest_value APPIMAGE_RUNTIME_VERSION)"
+APPIMAGE_RUNTIME_URL="$(manifest_value APPIMAGE_RUNTIME_URL)"
+APPIMAGE_RUNTIME_SHA256="$(manifest_value APPIMAGE_RUNTIME_SHA256)"
+[[ "$APPIMAGETOOL_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "invalid appimagetool SHA256 in manifest"
+[[ "$APPIMAGE_RUNTIME_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "invalid runtime SHA256 in manifest"
+
+print_tooling() {
+    printf 'appimagetool version: %s\nappimagetool source: %s\nappimagetool SHA256: %s\nruntime version: %s\nruntime source: %s\nruntime SHA256: %s\ncache directory: %s\n' \
+        "$APPIMAGETOOL_VERSION" "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA256" \
+        "$APPIMAGE_RUNTIME_VERSION" "$APPIMAGE_RUNTIME_URL" "$APPIMAGE_RUNTIME_SHA256" "$TOOLING_CACHE"
+}
+if ((PRINT_TOOLING)); then
+    print_tooling
+    exit 0
+fi
+if ((VERIFY_TOOLING)); then
+    [[ -n "$APPIMAGETOOL" ]] || die "--verify-tooling requires --appimagetool PATH"
+    [[ -n "$RUNTIME_FILE" ]] || die "--verify-tooling requires --runtime-file PATH"
+    APPIMAGETOOL="$(realpath -e -- "$APPIMAGETOOL")" || die "appimagetool path does not exist"
+    RUNTIME_FILE="$(realpath -e -- "$RUNTIME_FILE")" || die "runtime path does not exist"
+    [[ -f "$APPIMAGETOOL" ]] || die "appimagetool is not a regular file: $APPIMAGETOOL"
+    [[ -f "$RUNTIME_FILE" && ! -L "$RUNTIME_FILE" ]] || die "runtime file is not a regular non-symlink: $RUNTIME_FILE"
+    APPIMAGETOOL_ACTUAL="$(sha256sum -- "$APPIMAGETOOL" | awk '{print $1}')"
+    RUNTIME_ACTUAL="$(sha256sum -- "$RUNTIME_FILE" | awk '{print $1}')"
+    [[ "$APPIMAGETOOL_ACTUAL" == "$APPIMAGETOOL_SHA256" ]] || die "appimagetool checksum mismatch: expected $APPIMAGETOOL_SHA256, got $APPIMAGETOOL_ACTUAL"
+    [[ "$RUNTIME_ACTUAL" == "$APPIMAGE_RUNTIME_SHA256" ]] || die "runtime checksum mismatch: expected $APPIMAGE_RUNTIME_SHA256, got $RUNTIME_ACTUAL"
+    print_tooling
+    printf 'tooling verification: OK\n'
+    exit 0
+fi
 
 for command in cargo git install mktemp python3 realpath sha256sum; do
     command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
@@ -87,12 +142,24 @@ print(versions.pop())
 if [[ -z "$APPIMAGETOOL" ]]; then
     APPIMAGETOOL="$(command -v appimagetool || true)"
 fi
-[[ -n "$APPIMAGETOOL" ]] || die "appimagetool is required; install an approved host tool or pass --appimagetool PATH"
+[[ -n "$APPIMAGETOOL" ]] || APPIMAGETOOL="$(command -v appimagetool || true)"
+if [[ -z "$APPIMAGETOOL" ]]; then
+    APPIMAGETOOL="$TOOLING_CACHE/appimagetool-x86_64.AppImage"
+    [[ -e "$APPIMAGETOOL" ]] || die "appimagetool $APPIMAGETOOL_VERSION is required; download the pinned artifact from $APPIMAGETOOL_URL into $TOOLING_CACHE or pass --appimagetool PATH"
+fi
 APPIMAGETOOL="$(realpath -e -- "$APPIMAGETOOL")"
 [[ -f "$APPIMAGETOOL" && -x "$APPIMAGETOOL" ]] || die "appimagetool is not executable: $APPIMAGETOOL"
-[[ -n "$RUNTIME_FILE" ]] || die "a pinned type-2 runtime is required; pass --runtime-file PATH"
+APPIMAGETOOL_ACTUAL="$(sha256sum -- "$APPIMAGETOOL" | awk '{print $1}')"
+[[ "$APPIMAGETOOL_ACTUAL" == "$APPIMAGETOOL_SHA256" ]] || die "appimagetool checksum mismatch: expected $APPIMAGETOOL_SHA256, got $APPIMAGETOOL_ACTUAL"
+if [[ -z "$RUNTIME_FILE" ]]; then
+    RUNTIME_FILE="$TOOLING_CACHE/runtime-x86_64"
+    [[ -e "$RUNTIME_FILE" ]] || die "type-2 runtime $APPIMAGE_RUNTIME_VERSION is required; download the pinned artifact from $APPIMAGE_RUNTIME_URL into $TOOLING_CACHE or pass --runtime-file PATH"
+fi
 RUNTIME_FILE="$(realpath -e -- "$RUNTIME_FILE")"
 [[ -f "$RUNTIME_FILE" && ! -L "$RUNTIME_FILE" ]] || die "runtime file must be a regular non-symlink: $RUNTIME_FILE"
+RUNTIME_ACTUAL="$(sha256sum -- "$RUNTIME_FILE" | awk '{print $1}')"
+[[ "$RUNTIME_ACTUAL" == "$APPIMAGE_RUNTIME_SHA256" ]] || die "runtime checksum mismatch: expected $APPIMAGE_RUNTIME_SHA256, got $RUNTIME_ACTUAL"
+print_tooling
 
 if [[ "$OUTPUT_DIR" != /* ]]; then
     OUTPUT_DIR="$PWD/$OUTPUT_DIR"

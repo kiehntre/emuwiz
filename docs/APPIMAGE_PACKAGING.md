@@ -1,7 +1,7 @@
 # EmuWiz AppImage packaging
 
 Build the V1 x86_64 AppImage from a clean Linux worktree with an approved host
-`appimagetool`, a pinned type-2 runtime file, Rust/Cargo, Bash, `install`,
+`appimagetool` 1.9.1, the pinned type-2 runtime 20251108, Rust/Cargo, Bash, `install`,
 `sha256sum`, and `realpath`:
 
 ```sh
@@ -14,6 +14,33 @@ CARGO_BUILD_JOBS=2 packaging/appimage/build-appimage.sh \
 The output is `EmuWiz-x86_64.AppImage` and its `.sha256` companion. The
 existing tarball plus `install.sh` release path remains supported and is not
 replaced.
+
+## Packaging-tool provenance
+
+The canonical x86_64 inputs are recorded in
+[`packaging/appimage/tooling.lock`](../packaging/appimage/tooling.lock):
+
+- `appimagetool` 1.9.1 from the official AppImage release, SHA-256
+  `ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0`.
+- type-2 runtime 20251108 from the official AppImage release, SHA-256
+  `2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d`.
+
+Both use immutable tagged release URLs, never `latest` or `continuous`. The
+hashes were independently computed from the downloaded official assets. Print
+the exact provenance used by the builder with:
+
+```sh
+packaging/appimage/build-appimage.sh --print-tooling
+```
+
+The preferred local cache is
+`$XDG_CACHE_HOME/emuwiz/appimage-tools` (or
+`$HOME/.cache/emuwiz/appimage-tools`) with `appimagetool-x86_64.AppImage` and
+`runtime-x86_64`. The cache is not committed. Manual restoration uses the URLs
+in `tooling.lock`; either cached file may be used automatically or supplied
+explicitly with `--appimagetool`/`--runtime-file`. Supplied or cached files are refused unless their SHA-256
+matches the lock file. Future pin changes require a deliberate lock-file
+update, independent hash verification, and QA review.
 
 The AppDir contains only `emuwiz`, the `emuwiz-cli` support companion, desktop
 metadata, and EmuWiz icons. It intentionally contains no graphics/display
@@ -51,4 +78,5 @@ packaging/appimage/verify-appimage.sh \
 
 The builder uses both `appimagetool` and its type-2 runtime as explicit host
 build dependencies rather than downloading or vendoring executable packaging
-inputs. Supply approved, checksum-verified, pinned paths in release automation.
+inputs. It may use the documented cache or explicitly supplied paths, but never
+a different or unpinned tool.

@@ -1,5 +1,14 @@
 # AppImage Fresh-Install QA
 
+## Current packaging-tool contract
+
+Current builds must use the immutable x86_64 pins in
+`packaging/appimage/tooling.lock` (`appimagetool` 1.9.1 and type-2 runtime
+20251108). The builder verifies SHA-256 before invoking either input and prints
+the provenance with `packaging/appimage/build-appimage.sh --print-tooling`.
+Missing or mismatched tooling is a packaging-preflight failure; do not replace
+it with a `latest`/`continuous` download.
+
 ## Environment
 
 - Authoritative HEAD inspected: `48140d054f24b7ea346a031dac9463ae84835687`
