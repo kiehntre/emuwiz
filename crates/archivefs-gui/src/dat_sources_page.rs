@@ -6875,6 +6875,9 @@ pub(crate) struct DatSourcesPageUi {
     /// open. It is transient UI only and never starts a scan by itself.
     pub(crate) open_combined_audit_picker: bool,
     pub(crate) quick_review_open: bool,
+    /// Quick Rename keeps large recovery histories compact until explicitly
+    /// expanded by the user.
+    pub(crate) quick_recovery_expanded: bool,
     /// Whether Quick Rename's success summary is showing the itemized
     /// per-file "View details" disclosure. Reset whenever a new apply
     /// outcome replaces the one it was open for.
@@ -6929,6 +6932,7 @@ impl DatSourcesPageUi {
         self.open_audit_picker = None;
         self.open_combined_audit_picker = false;
         self.quick_review_open = false;
+        self.quick_recovery_expanded = false;
         self.quick_success_details_open = false;
         self.confirm_remove = None;
         self.managed_mame_name.clear();
@@ -8068,6 +8072,7 @@ pub(crate) fn show_quick_rename_page(
         }
         if action.is_none() && !other.is_empty() {
             ui.add_space(10.0);
+            let recovery_total = other.len();
             egui::CollapsingHeader::new(format!("View recovery/history ({})", other.len()))
                 .id_salt("quick_rename_history")
                 .default_open(false)
@@ -8088,9 +8093,36 @@ pub(crate) fn show_quick_rename_page(
                     {
                         action = Some(DatSourcesPageAction::HideSettledRecoveryHistory);
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!(
+                            "{} previous change{} need attention",
+                            recovery_total,
+                            if recovery_total == 1 { "" } else { "s" }
+                        ));
+                        let undo_count = other
+                            .iter()
+                            .filter(|recovery| recovery.presentation.actions.undo)
+                            .count();
+                        if undo_count > 0 {
+                            ui.label(format!("{undo_count} can be undone"));
+                        }
+                    });
+                    let visible_count = if ui_state.quick_recovery_expanded {
+                        recovery_total
+                    } else {
+                        recovery_total.min(3)
+                    };
+                    let toggle_label = if ui_state.quick_recovery_expanded {
+                        "Show fewer".to_string()
+                    } else {
+                        format!("Show all {recovery_total}")
+                    };
+                    if recovery_total > 3 && ui.button(toggle_label).clicked() {
+                        ui_state.quick_recovery_expanded = !ui_state.quick_recovery_expanded;
+                    }
                     if let Some(recovery_action) = show_recovery_transactions(
                         ui,
-                        &other,
+                        &other[..visible_count],
                         view.rename_apply.rollback_running,
                         view.rename_apply.resume_running,
                     ) {
