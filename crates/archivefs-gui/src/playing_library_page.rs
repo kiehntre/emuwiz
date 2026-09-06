@@ -1152,6 +1152,11 @@ pub(crate) fn show_playing_library_page(
     );
     ui.add_space(8.0);
 
+    widgets::section_header(
+        ui,
+        "Inputs",
+        Some("Choose the catalogue and the folders used for this preview."),
+    );
     widgets::card(ui, |ui| {
         if state.catalogue_picker.poll() || state.catalogue_picker.loading {
             ui.ctx().request_repaint();
@@ -1171,12 +1176,12 @@ pub(crate) fn show_playing_library_page(
         );
         ui.add_space(6.0);
 
-        ui.label("Source:");
-        ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Source library").strong());
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.source_root_draft)
                     .id(egui::Id::new(SOURCE_ROOT_FIELD_ID))
-                    .desired_width(ui.available_width() - 90.0),
+                    .desired_width(ui.available_width().max(240.0) - 90.0),
             );
             if ui.button("Browse…").clicked()
                 && let Some(path) = rfd::FileDialog::new()
@@ -1191,12 +1196,12 @@ pub(crate) fn show_playing_library_page(
         }
         ui.add_space(6.0);
 
-        ui.label("Destination:");
-        ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Playing Library destination").strong());
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.destination_root_draft)
                     .id(egui::Id::new(DESTINATION_ROOT_FIELD_ID))
-                    .desired_width(ui.available_width() - 90.0),
+                    .desired_width(ui.available_width().max(240.0) - 90.0),
             );
             if ui.button("Browse…").clicked()
                 && let Some(path) = rfd::FileDialog::new()
@@ -1214,7 +1219,11 @@ pub(crate) fn show_playing_library_page(
     });
 
     ui.add_space(8.0);
-    widgets::section_header(ui, "Choose which version to keep", None);
+    widgets::section_header(
+        ui,
+        "Preferences",
+        Some("Set the existing 1G1R election preferences."),
+    );
     ui.label(
         egui::RichText::new(
             "1G1R means 1 Game, 1 ROM: EmuWiz picks one preferred verified release for each game. These are the 1G1R selection rules.",
@@ -1247,7 +1256,7 @@ pub(crate) fn show_playing_library_page(
         ui.add_space(6.0);
 
         ui.label("Exclude:");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut state.exclude_beta, "Beta");
             ui.checkbox(&mut state.exclude_proto, "Proto");
             ui.checkbox(&mut state.exclude_demo, "Demo");
@@ -1259,6 +1268,7 @@ pub(crate) fn show_playing_library_page(
     let ready = state.has_catalogue_selection()
         && !state.source_root_draft.trim().is_empty()
         && !state.destination_root_draft.trim().is_empty();
+    widgets::section_header(ui, "Plan and preview", None);
     if widgets::action_button(
         ui,
         "Preview 1G1R Library",
@@ -1289,6 +1299,7 @@ pub(crate) fn show_playing_library_page(
 
     if let Some(plan) = state.plan() {
         ui.add_space(10.0);
+        widgets::section_header(ui, "Apply", Some("Review the plan before creating links."));
         show_preview_summary(ui, plan, state, &mut action);
         ui.add_space(10.0);
         show_romm_projection_summary(ui, state, &mut action);
@@ -1725,14 +1736,42 @@ fn show_preview_summary(
     action: &mut Option<PlayingLibraryPageAction>,
 ) {
     widgets::card(ui, |ui| {
-        ui.label(format!("{} verified releases", plan.archives_examined));
-        ui.label(format!("{} game families", plan.families_examined));
-        ui.label(format!(
-            "{} selected for playing library",
-            plan.elected_games.len()
-        ));
-        ui.label(format!("{} unresolved", plan.unresolved_groups.len()));
-        ui.label(format!("{} destination conflicts", plan.conflicts.len()));
+        ui.label(egui::RichText::new("Preview summary").strong());
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("{} verified releases", plan.archives_examined),
+                widgets::StatusTone::Info,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} game families", plan.families_examined),
+                widgets::StatusTone::Info,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} selected for playing library", plan.elected_games.len()),
+                widgets::StatusTone::Success,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} unresolved", plan.unresolved_groups.len()),
+                if plan.unresolved_groups.is_empty() {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Warning
+                },
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} conflicts", plan.conflicts.len()),
+                if plan.conflicts.is_empty() {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+        });
 
         ui.add_space(6.0);
         if plan.elected_games.is_empty() {
@@ -1775,7 +1814,7 @@ fn show_preview_summary(
 
         ui.add_space(8.0);
         for elected in &plan.elected_games {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(&elected.dat_entry_name);
                 let selected = state.selected_family() == Some(elected.dat_entry_name.as_str());
                 let label = if selected { "Hide" } else { "Why this one?" };
@@ -1842,7 +1881,7 @@ fn show_preview_summary(
                 ));
                 ui.label(egui::RichText::new(&state.confirm_text).monospace());
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Destructive, true)
                     .clicked()
                 {
