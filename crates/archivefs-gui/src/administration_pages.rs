@@ -830,6 +830,7 @@ pub(super) fn show_about_contents(
     let mount_root = mount_root.map(|path| path.display().to_string());
 
     widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("About this installation").strong());
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(
                 ui,
@@ -2112,48 +2113,51 @@ pub(super) fn show_settings_page(
             ("Failed", message.as_str(), widgets::StatusTone::Blocked)
         }
     };
-    widgets::banner(ui, validation_title, validation_detail, validation_tone);
-    ui.horizontal_wrapped(|ui| {
-        if widgets::action_button(
-            ui,
-            "Validate configuration",
-            widgets::ActionStyle::Primary,
-            !busy,
-        )
-        .clicked()
-        {
-            action = Some(SettingsPageAction::ValidateConfiguration);
-        }
-        if widgets::action_button(
-            ui,
-            "Open diagnostics",
-            widgets::ActionStyle::Secondary,
-            true,
-        )
-        .clicked()
-        {
-            action = Some(SettingsPageAction::OpenDiagnostics);
-        }
-        if widgets::action_button(
-            ui,
-            "Open configuration folder",
-            widgets::ActionStyle::Quiet,
-            !busy,
-        )
-        .clicked()
-        {
-            action = Some(SettingsPageAction::OpenConfigFolder);
-        }
-        if widgets::action_button(
-            ui,
-            "Run first-time setup again",
-            widgets::ActionStyle::Quiet,
-            true,
-        )
-        .clicked()
-        {
-            action = Some(SettingsPageAction::RunFirstTimeSetupAgain);
-        }
+    widgets::card(ui, |ui| {
+        widgets::banner(ui, validation_title, validation_detail, validation_tone);
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Validate configuration",
+                widgets::ActionStyle::Primary,
+                !busy,
+            )
+            .clicked()
+            {
+                action = Some(SettingsPageAction::ValidateConfiguration);
+            }
+            if widgets::action_button(
+                ui,
+                "Open diagnostics",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(SettingsPageAction::OpenDiagnostics);
+            }
+            if widgets::action_button(
+                ui,
+                "Open configuration folder",
+                widgets::ActionStyle::Quiet,
+                !busy,
+            )
+            .clicked()
+            {
+                action = Some(SettingsPageAction::OpenConfigFolder);
+            }
+            if widgets::action_button(
+                ui,
+                "Run first-time setup again",
+                widgets::ActionStyle::Quiet,
+                true,
+            )
+            .clicked()
+            {
+                action = Some(SettingsPageAction::RunFirstTimeSetupAgain);
+            }
+        });
     });
 
     ui.add_space(theme::SECTION_GAP);
@@ -2177,7 +2181,7 @@ pub(super) fn show_settings_page(
             }
         }
         RetroArchProfilesState::Scanning { .. } => {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label("Scanning for RetroArch profiles...");
             });
