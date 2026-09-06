@@ -752,3 +752,64 @@ production-path filesystem safety evidence.
   existing Cheats & Mods GUI.
 - No real emulator config, game library, ES-DE state, onboarding work, DAT GUI
   work, or LBC content was read or modified.
+
+## 20. Execution record: firmware / BIOS readiness Wave 4
+
+**Run:** 2026-09-06 against authoritative commit
+`6ad241dc2b8f024cdfd7cea56d7230316e65cad1`, clean
+`feature/archivefs-unified-platform` checkout.
+
+### Disposable environment and production path
+
+- Root: `/tmp/emuwiz-firmware-qa-BqoWjF`, used as `TMPDIR` for existing
+  PCSX2, DuckStation, and PC Engine CD firmware tests. It contained only
+  empty disposable game fixtures and a sentinel; SHA-256 values were checked
+  before and after all scans.
+- The exercised path is the existing no-follow firmware discovery/hash matcher
+  (`FirmwareIdentityRecord` evidence through the adapter inspector), then
+  `FirmwareReadiness`, `LaunchBlockerKind::RequiredFirmwareMissing`, and the
+  launch-readiness GUI projection. No QA evaluator or BIOS content was added.
+
+### Results
+
+| Case | Result |
+| --- | --- |
+| Required verified | PASS — matching PCSX2/DuckStation evidence becomes `Verified`; the GUI projects `Ready` and says EmuWiz recognised required firmware by hash. |
+| Present, wrong/unverified | PASS — plausible names with CRC/MD5/SHA-1/size mismatch remain unverified/unknown and are never promoted to Ready. |
+| Required missing | PASS — absent required firmware produces `Missing` and only the real `RequiredFirmwareMissing` blocker yields the blocking “Required firmware missing” wording and Doctor action. |
+| Optional/non-blocking missing | PASS — missing firmware without that blocker projects the non-blocking “Firmware missing” state; no blocker is fabricated from readiness alone. |
+| Not required | PASS — Stella, VICE, and PPSSPP command/readiness coverage retains `NotRequired`, with no firmware warning or blocker. |
+| Wrong path/name/unsafe path | PASS — directory and symlink BIOS candidates are unsafe/refused; wrong hash or plausible filename never verifies; missing directories remain missing. |
+| Multiple candidates | PASS — one verified candidate is selected deterministically; conflicting verified candidates are ambiguous, and several unverified candidates do not create a false verified result. |
+
+The 70-test GUI launch-readiness suite passed and covers plain-language
+firmware summaries, the `RequiredFirmwareMissing`-only blocking distinction,
+NotRequired presentation, and the `OpenDoctor` action rather than a DAT-source
+route. The summary explicitly retains the no-download boundary: EmuWiz
+verifies firmware but does not supply BIOS or system ROM files.
+
+Focused commands ran sequentially with `CARGO_BUILD_JOBS=2`:
+
+```text
+cargo test -p archivefs-core pcsx2_firmware -- --test-threads=1
+cargo test -p archivefs-core duckstation_firmware -- --test-threads=1
+cargo test -p archivefs-core pcengine_cd_firmware -- --test-threads=1
+cargo test -p archivefs-gui launch_readiness -- --test-threads=1
+cargo test -p archivefs-core stella_command -- --test-threads=1
+cargo test -p archivefs-core vice_command -- --test-threads=1
+cargo test -p archivefs-core ppsspp_never_requires_firmware -- --test-threads=1
+```
+
+All passed. No `DISPLAY`/`WAYLAND_DISPLAY` session exists here, so the
+interactive GUI cases (Ready, Found not verified, Required firmware missing,
+and Not required) remain **NOT TESTABLE on a desktop**, not failures. They are
+a P1 desktop follow-up; the production filesystem/hash and projection paths
+were verified in disposable tests.
+
+### Findings
+
+- **P0 defects:** none.
+- **P1 follow-up:** one desktop GUI/Doctor navigation sweep with a disposable
+  emulator profile and legal synthetic test firmware evidence.
+- No real BIOS collection, emulator configuration, game library, onboarding
+  work, DAT GUI, ES-DE, Cheats & Mods, or LBC content was accessed or changed.
