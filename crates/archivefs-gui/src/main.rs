@@ -14613,7 +14613,7 @@ impl ArchiveFsApp {
         let identity = gamecube_identity_for_workflow(workflow).ok_or_else(|| {
             (
                 "Local game identity incomplete".to_string(),
-                "ArchiveFS needs this GameCube game's verified Dolphin Game ID before it can check an imported page against it.".to_string(),
+                "EmuWiz needs this GameCube game's verified Dolphin Game ID before it can check an imported page against it.".to_string(),
             )
         })?;
         let local = BrowserImportLocalIdentity::from_gamecube(&identity)
@@ -14665,7 +14665,7 @@ impl ArchiveFsApp {
         let identity = pcsx2_identity_for_workflow(workflow).ok_or_else(|| {
             (
                 "Local game identity incomplete".to_string(),
-                "ArchiveFS needs this PS2 game's verified PCSX2 executable CRC before it can check an imported export against it.".to_string(),
+                "EmuWiz needs this PS2 game's verified PCSX2 executable CRC before it can check an imported export against it.".to_string(),
             )
         })?;
         let local = BrowserImportLocalIdentity::from_ps2(&identity)
@@ -14775,7 +14775,7 @@ impl ArchiveFsApp {
                     BrowserImportErrorKind::ClipboardUnavailable
                         .headline()
                         .to_string(),
-                    format!("ArchiveFS could not write to the clipboard on this system: {reason}"),
+                    format!("EmuWiz could not write to the clipboard on this system: {reason}"),
                 ))
             }
         }
@@ -14804,7 +14804,7 @@ impl ArchiveFsApp {
                 BrowserImportErrorKind::ClipboardUnavailable
                     .headline()
                     .to_string(),
-                format!("ArchiveFS could not read the clipboard on this system: {reason}"),
+                format!("EmuWiz could not read the clipboard on this system: {reason}"),
             ),
         }
     }
@@ -29194,7 +29194,7 @@ fn show_browser_import(
                 .strong(),
         );
         ui.label(
-            "ArchiveFS never pretends to be a browser. Open the page yourself, then hand the saved page or its Text export back here.",
+            "EmuWiz never pretends to be a browser. Open the page yourself, then hand the saved page or its Text export back here.",
         );
         ui.add_space(6.0);
         ui.label(format!("Platform: {}", state.plan.platform_label));

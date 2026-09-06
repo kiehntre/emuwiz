@@ -121,7 +121,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("archivefs: {error}");
+            eprintln!("emuwiz-cli: {error}");
             ExitCode::FAILURE
         }
     }
@@ -186,7 +186,7 @@ fn config_confirmed_missing(path: &std::path::Path) -> bool {
 ///
 /// Every command below `config-check` and `doctor` needs a config the same
 /// way they do, but until now only those two gave an actionable message -
-/// everything else surfaced the bare OS error (e.g. "archivefs:
+/// everything else surfaced the bare OS error (e.g. "emuwiz-cli:
 /// /home/user/.config/archivefs/config.toml: No such file or directory (os
 /// error 2)") with no indication of what to do next. This appends the same
 /// guidance those two already give, without changing the underlying error
