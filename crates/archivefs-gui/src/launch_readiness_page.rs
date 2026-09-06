@@ -136,6 +136,16 @@ pub(crate) enum LaunchReadinessInput {
     },
 }
 
+/// A navigation request from the read-only launch-readiness presentation.
+///
+/// The panel does not run a firmware check or a Doctor scan itself. It can
+/// only direct a person to the existing diagnostics workflow when already
+/// computed firmware evidence needs attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchReadinessPageAction {
+    OpenDoctor,
+}
+
 /// Exact AppImage paths selected from the same RetroArch discovery report as
 /// the launch plan. This binds an AppImage request to one reviewed executable;
 /// it is not a generic AppImage launcher.
@@ -1506,7 +1516,8 @@ pub(crate) fn show_launch_readiness_panel(
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
-) {
+) -> Option<LaunchReadinessPageAction> {
+    let mut action = None;
     widgets::section_header(
         ui,
         "Play / Launch readiness",
@@ -1555,23 +1566,29 @@ pub(crate) fn show_launch_readiness_panel(
             xemu,
             xenia,
             ..
-        } => show_plan(
-            ui,
-            plan,
-            retroarch.as_ref(),
-            dolphin.as_ref(),
-            pcsx2.as_ref(),
-            duckstation.as_ref(),
-            ppsspp.as_ref(),
-            rpcs3.as_ref(),
-            xemu.as_ref(),
-            xenia.as_ref(),
-            retroarch_launch_state,
-            dolphin_launch_state,
-            pcsx2_launch_state,
-            standalone_launch_state,
-        ),
+        } => {
+            if show_plan(
+                ui,
+                plan,
+                retroarch.as_ref(),
+                dolphin.as_ref(),
+                pcsx2.as_ref(),
+                duckstation.as_ref(),
+                ppsspp.as_ref(),
+                rpcs3.as_ref(),
+                xemu.as_ref(),
+                xenia.as_ref(),
+                retroarch_launch_state,
+                dolphin_launch_state,
+                pcsx2_launch_state,
+                standalone_launch_state,
+            ) {
+                action = Some(LaunchReadinessPageAction::OpenDoctor);
+            }
+        }
     }
+
+    action
 }
 
 // This is the UI boundary for the complete launch plan and its per-adapter
@@ -1592,7 +1609,8 @@ fn show_plan(
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
-) {
+) -> bool {
+    let mut open_doctor = false;
     if plan.candidates.is_empty() {
         widgets::empty_state(
             ui,
@@ -1600,11 +1618,11 @@ fn show_plan(
             "No installed RetroArch core is a candidate for this game's platform yet.",
             None,
         );
-        return;
+        return false;
     }
     for candidate in &plan.candidates {
         ui.add_space(6.0);
-        show_candidate(
+        open_doctor |= show_candidate(
             ui,
             plan,
             candidate,
@@ -1622,6 +1640,7 @@ fn show_plan(
             standalone_launch_state,
         );
     }
+    open_doctor
 }
 
 fn readiness_label_and_tone(readiness: LaunchReadiness) -> (&'static str, widgets::StatusTone) {
@@ -1640,16 +1659,93 @@ fn preference_label(preference: CandidatePreference) -> &'static str {
     }
 }
 
-fn firmware_label_and_tone(firmware: FirmwareReadiness) -> (&'static str, widgets::StatusTone) {
+/// Plain-language firmware presentation, projected solely from the existing
+/// shared readiness value and the existing launch blockers. It deliberately
+/// does not derive a requirement from an emulator name, a filename, or a
+/// filesystem probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FirmwareSummary {
+    status: &'static str,
+    description: &'static str,
+    tone: widgets::StatusTone,
+    show_doctor_action: bool,
+}
+
+fn firmware_summary(firmware: FirmwareReadiness, blockers: &[LaunchBlocker]) -> FirmwareSummary {
+    let launch_blocked_by_missing_firmware = blockers
+        .iter()
+        .any(|blocker| blocker.kind == LaunchBlockerKind::RequiredFirmwareMissing);
+
     match firmware {
-        FirmwareReadiness::Verified => ("Verified", widgets::StatusTone::Success),
-        FirmwareReadiness::PresentUnverified => {
-            ("Present but unverified", widgets::StatusTone::Warning)
-        }
-        FirmwareReadiness::Missing => ("Missing", widgets::StatusTone::Blocked),
-        FirmwareReadiness::Unknown => ("Unknown", widgets::StatusTone::Pending),
-        FirmwareReadiness::NotRequired => ("Not required", widgets::StatusTone::Info),
+        FirmwareReadiness::Verified => FirmwareSummary {
+            status: "Ready",
+            description: "EmuWiz recognised the required firmware by hash.",
+            tone: widgets::StatusTone::Success,
+            show_doctor_action: false,
+        },
+        FirmwareReadiness::PresentUnverified => FirmwareSummary {
+            status: "Found, not verified",
+            description: "Firmware was found, but EmuWiz could not verify its contents.",
+            tone: widgets::StatusTone::Warning,
+            show_doctor_action: true,
+        },
+        FirmwareReadiness::Missing if launch_blocked_by_missing_firmware => FirmwareSummary {
+            status: "Required firmware missing",
+            description: "This emulator needs firmware before it can launch.",
+            tone: widgets::StatusTone::Blocked,
+            show_doctor_action: true,
+        },
+        FirmwareReadiness::Missing => FirmwareSummary {
+            status: "Firmware missing",
+            description: "EmuWiz could not find firmware this emulator expects.",
+            tone: widgets::StatusTone::Blocked,
+            show_doctor_action: true,
+        },
+        FirmwareReadiness::Unknown => FirmwareSummary {
+            status: "Firmware needs attention",
+            description: "EmuWiz could not determine whether the required firmware is ready.",
+            tone: widgets::StatusTone::Pending,
+            show_doctor_action: true,
+        },
+        FirmwareReadiness::NotRequired => FirmwareSummary {
+            status: "Not required",
+            description: "This launch option does not need separate firmware.",
+            tone: widgets::StatusTone::Info,
+            show_doctor_action: false,
+        },
     }
+}
+
+/// Draws a concise, read-only firmware summary. Exact expected firmware
+/// records remain in the adapter-specific diagnostic seams: a launch
+/// candidate only carries the shared readiness projection, so this UI never
+/// invents filenames or hashes it was not given.
+fn show_firmware_summary(ui: &mut egui::Ui, candidate: &LaunchCandidate) -> bool {
+    let summary = firmware_summary(candidate.firmware, &candidate.blockers);
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Firmware").strong());
+        widgets::status_badge(ui, summary.status, summary.tone);
+    });
+    ui.label(
+        egui::RichText::new(summary.description)
+            .small()
+            .color(theme::muted(ui)),
+    );
+
+    if summary.show_doctor_action {
+        ui.label(
+            egui::RichText::new(
+                "EmuWiz verifies firmware; it does not supply BIOS or system ROM files.",
+            )
+            .small()
+            .color(theme::muted(ui)),
+        );
+        return widgets::action_button(ui, "Open Doctor", widgets::ActionStyle::Secondary, true)
+            .clicked();
+    }
+
+    false
 }
 
 /// `(name, profile description)` for one candidate's target - never the
@@ -2057,7 +2153,8 @@ fn show_candidate(
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
-) {
+) -> bool {
+    let mut open_doctor = false;
     widgets::card(ui, |ui| {
         let (name, profile) = target_labels(&candidate.target);
         let (readiness_label, readiness_tone) = readiness_label_and_tone(candidate.readiness);
@@ -2080,11 +2177,7 @@ fn show_candidate(
             .color(theme::muted(ui)),
         );
 
-        let (firmware_label, firmware_tone) = firmware_label_and_tone(candidate.firmware);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Firmware/BIOS:").small());
-            widgets::status_badge(ui, firmware_label, firmware_tone);
-        });
+        open_doctor = show_firmware_summary(ui, candidate);
 
         for blocker in &candidate.blockers {
             show_blocker(ui, blocker);
@@ -2135,6 +2228,7 @@ fn show_candidate(
             show_standalone_launch_action(ui, standalone_launch_state, request);
         }
     });
+    open_doctor
 }
 
 fn show_standalone_launch_action(

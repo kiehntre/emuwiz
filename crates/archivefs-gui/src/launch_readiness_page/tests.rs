@@ -176,6 +176,53 @@ fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         .any(|clipped| shape_contains(&clipped.shape, needle))
 }
 
+#[test]
+fn firmware_summary_uses_plain_language_and_only_offers_doctor_for_attention_states() {
+    let not_required = firmware_summary(FirmwareReadiness::NotRequired, &[]);
+    assert_eq!(not_required.status, "Not required");
+    assert!(!not_required.show_doctor_action);
+
+    let verified = firmware_summary(FirmwareReadiness::Verified, &[]);
+    assert_eq!(verified.status, "Ready");
+    assert!(verified.description.contains("by hash"));
+    assert!(!verified.show_doctor_action);
+
+    let found_unverified = firmware_summary(FirmwareReadiness::PresentUnverified, &[]);
+    assert_eq!(found_unverified.status, "Found, not verified");
+    assert!(found_unverified.show_doctor_action);
+
+    let missing = firmware_summary(
+        FirmwareReadiness::Missing,
+        &[LaunchBlocker::new(
+            LaunchBlockerKind::RequiredFirmwareMissing,
+            "fixture only",
+        )],
+    );
+    assert_eq!(missing.status, "Required firmware missing");
+    assert_eq!(
+        missing.description,
+        "This emulator needs firmware before it can launch."
+    );
+    assert!(missing.show_doctor_action);
+
+    let unknown = firmware_summary(FirmwareReadiness::Unknown, &[]);
+    assert_eq!(unknown.status, "Firmware needs attention");
+    assert!(unknown.show_doctor_action);
+
+    for summary in [not_required, verified, found_unverified, missing, unknown] {
+        assert!(!summary.status.contains("FirmwareReadiness"));
+        assert!(!summary.description.contains("FirmwareReadiness"));
+    }
+}
+
+#[test]
+fn missing_firmware_only_claims_launch_is_blocked_when_the_existing_blocker_says_so() {
+    let summary = firmware_summary(FirmwareReadiness::Missing, &[]);
+    assert_eq!(summary.status, "Firmware missing");
+    assert!(!summary.description.contains("before it can launch"));
+    assert!(summary.show_doctor_action);
+}
+
 fn render(input: &LaunchReadinessInput) -> egui::FullOutput {
     render_with_states(
         input,
@@ -668,7 +715,7 @@ fn typed_launch_request_keeps_adapter_dispatch_typed_without_shell_text() {
 // --- firmware-blocked candidate ----------------------------------------------
 
 #[test]
-fn firmware_blocked_candidate_shows_missing_firmware_and_blocked_status() {
+fn firmware_blocked_candidate_shows_required_firmware_missing_and_blocked_status() {
     let mut candidate = ready_candidate();
     candidate.firmware = FirmwareReadiness::Missing;
     candidate.readiness = LaunchReadiness::Blocked;
@@ -680,7 +727,11 @@ fn firmware_blocked_candidate_shows_missing_firmware_and_blocked_status() {
     let plan = plan_with(vec![candidate]);
     let output = render(&plan_input(plan));
     assert!(rendered_text_contains(&output, "Blocked"));
-    assert!(rendered_text_contains(&output, "Missing"));
+    assert!(rendered_text_contains(&output, "Required firmware missing"));
+    assert!(rendered_text_contains(
+        &output,
+        "This emulator needs firmware before it can launch."
+    ));
     assert!(rendered_text_contains(
         &output,
         "required firmware is missing"
@@ -1099,7 +1150,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
             &mut DolphinLaunchState,
             &mut Pcsx2LaunchState,
             &mut StandaloneLaunchState,
-        ),
+        ) -> Option<LaunchReadinessPageAction>,
     ) {
     }
     assert_signature(show_launch_readiness_panel);

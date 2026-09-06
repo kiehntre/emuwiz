@@ -13397,7 +13397,7 @@ impl ArchiveFsApp {
         if self.launch_standalone.poll() || self.launch_standalone.is_active() {
             ui.ctx().request_repaint();
         }
-        launch_readiness_page::show_launch_readiness_panel(
+        let launch_readiness_action = launch_readiness_page::show_launch_readiness_panel(
             ui,
             &launch_readiness_input,
             &mut self.launch_retroarch,
@@ -13405,6 +13405,12 @@ impl ArchiveFsApp {
             &mut self.launch_pcsx2,
             &mut self.launch_standalone,
         );
+        if matches!(
+            launch_readiness_action,
+            Some(launch_readiness_page::LaunchReadinessPageAction::OpenDoctor)
+        ) {
+            self.navigate_to_main_view(MainView::Doctor);
+        }
         ui.add_space(crate::ui::theme::SECTION_GAP);
         let identity_sources_action = identity_sources_page::show_identity_sources_panel(
             ui,
