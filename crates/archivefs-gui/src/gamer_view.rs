@@ -1272,54 +1272,86 @@ fn show_gamer_screenshot_strip(
     archive_path: &Path,
     count: usize,
 ) {
-    let visible = count.min(crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS);
-    let columns = if ui.available_width() >= 1_200.0 {
-        4
-    } else {
-        3
-    };
-    ui.columns(columns, |columns| {
-        for (index, column) in columns.iter_mut().enumerate() {
-            if index >= visible {
-                break;
-            }
-            let width = (column.available_width() - 8.0).max(80.0);
-            let height = (width * 9.0 / 16.0).clamp(70.0, 150.0);
-            match screenshots.slot_for(archive_path, index) {
-                Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
-                    widgets::media_frame(column, egui::vec2(width, height), None, |ui, rect| {
-                        let drawn = crate::gamer_artwork::fit_within(
+    let layout = screenshot_gallery_layout(ui.available_width(), count);
+    for row in 0..layout.rows {
+        let first_index = row * layout.columns;
+        ui.columns(layout.columns, |columns| {
+            for (column_index, column) in columns.iter_mut().enumerate() {
+                let index = first_index + column_index;
+                if index >= layout.visible {
+                    break;
+                }
+                let width = (column.available_width() - 8.0).max(80.0);
+                let height = (width * 9.0 / 16.0).clamp(70.0, 150.0);
+                match screenshots.slot_for(archive_path, index) {
+                    Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
+                        widgets::media_frame(
+                            column,
                             egui::vec2(width, height),
-                            texture.size_vec2(),
+                            None,
+                            |ui, rect| {
+                                let drawn = crate::gamer_artwork::fit_within(
+                                    egui::vec2(width, height),
+                                    texture.size_vec2(),
+                                );
+                                ui.painter().image(
+                                    texture.id(),
+                                    egui::Rect::from_center_size(rect.center(), drawn),
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            },
                         );
-                        ui.painter().image(
-                            texture.id(),
-                            egui::Rect::from_center_size(rect.center(), drawn),
-                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
+                    }
+                    Some(crate::gamer_artwork::CoverSlot::Loading) => {
+                        widgets::media_frame(
+                            column,
+                            egui::vec2(width, height),
+                            Some("Loading"),
+                            |_, _| {},
                         );
-                    });
-                }
-                Some(crate::gamer_artwork::CoverSlot::Loading) => {
-                    widgets::media_frame(
-                        column,
-                        egui::vec2(width, height),
-                        Some("Loading"),
-                        |_, _| {},
-                    );
-                }
-                Some(crate::gamer_artwork::CoverSlot::None(_)) | None => {}
-                Some(crate::gamer_artwork::CoverSlot::Revalidating { .. }) => {
-                    widgets::media_frame(
-                        column,
-                        egui::vec2(width, height),
-                        Some("Loading"),
-                        |_, _| {},
-                    );
+                    }
+                    Some(crate::gamer_artwork::CoverSlot::None(_)) | None => {}
+                    Some(crate::gamer_artwork::CoverSlot::Revalidating { .. }) => {
+                        widgets::media_frame(
+                            column,
+                            egui::vec2(width, height),
+                            Some("Loading"),
+                            |_, _| {},
+                        );
+                    }
                 }
             }
+        });
+        if row + 1 < layout.rows {
+            ui.add_space(theme::SPACE_SM);
         }
-    });
+    }
+}
+
+/// Keeps the Details gallery compact while ensuring the bounded set of loaded
+/// screenshots is all visible. The old one-row `ui.columns` implementation
+/// correctly requested five images but silently painted only the first three
+/// or four. The final row deliberately retains the same cell width rather
+/// than stretching a lone last screenshot across the entire details panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScreenshotGalleryLayout {
+    visible: usize,
+    columns: usize,
+    rows: usize,
+}
+
+fn screenshot_gallery_layout(available_width: f32, count: usize) -> ScreenshotGalleryLayout {
+    let visible = count.min(crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS);
+    let columns = if available_width >= 1_200.0 { 4 } else { 3 };
+    ScreenshotGalleryLayout {
+        visible,
+        columns,
+        rows: (visible + columns.saturating_sub(1)) / columns,
+    }
 }
 
 fn show_details_hero_text(
@@ -1806,6 +1838,46 @@ mod game_metadata_enrichment_tests {
         assert!(real.x / real.y > 0.6 && real.x / real.y < 0.8);
         assert!(real.y > fallback.y);
         assert!(DETAILS_HERO_HORIZONTAL_MIN_WIDTH > 900.0);
+    }
+
+    #[test]
+    fn screenshot_gallery_keeps_all_bounded_screenshots_visible_on_desktop() {
+        assert_eq!(
+            screenshot_gallery_layout(1_100.0, crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS),
+            ScreenshotGalleryLayout {
+                visible: 5,
+                columns: 3,
+                rows: 2,
+            }
+        );
+        assert_eq!(
+            screenshot_gallery_layout(1_920.0, crate::gamer_artwork::MAX_DETAILS_SCREENSHOTS),
+            ScreenshotGalleryLayout {
+                visible: 5,
+                columns: 4,
+                rows: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_gallery_keeps_small_or_empty_sets_to_one_or_zero_rows() {
+        assert_eq!(
+            screenshot_gallery_layout(900.0, 1),
+            ScreenshotGalleryLayout {
+                visible: 1,
+                columns: 3,
+                rows: 1,
+            }
+        );
+        assert_eq!(
+            screenshot_gallery_layout(900.0, 0),
+            ScreenshotGalleryLayout {
+                visible: 0,
+                columns: 3,
+                rows: 0,
+            }
+        );
     }
 
     #[test]
