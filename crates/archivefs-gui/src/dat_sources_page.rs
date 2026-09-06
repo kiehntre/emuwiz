@@ -4180,6 +4180,11 @@ impl DatSourcesPageState {
             Ok(report) => {
                 self.no_intro_import_status = Some(report.status);
                 self.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
+                // Refresh the read-only managed lifecycle projection immediately so the
+                // result of this import is visible without reopening DAT Sources.
+                let (status, status_error) = load_no_intro_lifecycle_status();
+                self.no_intro_status = status;
+                self.no_intro_status_error = status_error;
                 self.no_intro_inspection = None;
                 let old_pack_ids: Vec<String> = self
                     .draft
@@ -7450,6 +7455,7 @@ fn show_evidence_acquisition_section(
                     action = Some(DatSourcesPageAction::InspectNoIntroPack);
                 }
             }
+            show_no_intro_lifecycle_status(ui, view);
         });
 
         widgets::card(&mut columns[1], |ui| {
@@ -7598,6 +7604,104 @@ fn show_evidence_acquisition_section(
         });
     }
     action
+}
+
+/// Compact projection of the managed No-Intro lifecycle.  This deliberately
+/// reports imported state, not remote freshness: EmuWiz does not query
+/// DAT-o-MATIC and cannot honestly claim that a source is "up to date".
+fn show_no_intro_lifecycle_status(ui: &mut egui::Ui, view: &DatSourcesPageView) {
+    let Some(report) = &view.no_intro_status else {
+        if let Some(error) = &view.no_intro_status_error {
+            ui.label(
+                egui::RichText::new(format!("Managed status unavailable: {error}"))
+                    .color(widgets::StatusTone::Warning.color(ui))
+                    .small(),
+            );
+        }
+        return;
+    };
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Managed No-Intro sources").strong());
+    if report.platforms.is_empty() {
+        ui.label(
+            egui::RichText::new("No imported snapshot yet.")
+                .color(theme::muted(ui))
+                .small(),
+        );
+    }
+    for platform in &report.platforms {
+        let (label, tone) = match platform.health {
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Healthy => {
+                ("Current imported snapshot", widgets::StatusTone::Success)
+            }
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Conflict => {
+                ("Needs review / conflict", widgets::StatusTone::Warning)
+            }
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Invalid => {
+                ("Invalid snapshot", widgets::StatusTone::Blocked)
+            }
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::NoCurrent => {
+                ("No current snapshot", widgets::StatusTone::Pending)
+            }
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Stale => {
+                ("Superseded snapshot", widgets::StatusTone::Warning)
+            }
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Unknown => {
+                ("Status unknown", widgets::StatusTone::Pending)
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                platform
+                    .canonical_platform
+                    .as_deref()
+                    .unwrap_or(&platform.platform_key),
+            );
+            widgets::status_badge(ui, label, tone);
+        });
+        if let Some(imported) = platform.imported_at_unix_seconds {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Imported {} · variant details available in inspection",
+                    format_unix_timestamp(imported)
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
+        if let Some(hash) = &platform.current_pack_sha256 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Snapshot {}…",
+                    hash.chars().take(12).collect::<String>()
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
+        for coverage in &platform.coverage {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {}",
+                    coverage.family,
+                    coverage.variant.label()
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
+    }
+    if let Some(status) = view.no_intro_import_status {
+        let message = match status {
+            NoIntroPackImportStatus::Unchanged => "Already imported — no changes.",
+            NoIntroPackImportStatus::Updated => "Updated to the newly imported snapshot.",
+        };
+        ui.label(
+            egui::RichText::new(message)
+                .color(widgets::StatusTone::Success.color(ui))
+                .small(),
+        );
+    }
 }
 
 fn choose_no_intro_pack() -> Option<PathBuf> {
