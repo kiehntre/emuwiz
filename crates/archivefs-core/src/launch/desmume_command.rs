@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind};
-use crate::patch_manager::{DesmumeLaunchBlocker, DesmumeNativeLaunchBinding};
+use crate::launch::{DesmumeLaunchBlocker, DesmumeNativeLaunchBinding};
 
 pub const DESMUME_SUPPORTED_PLATFORM_ID: &str = "Nintendo DS";
 

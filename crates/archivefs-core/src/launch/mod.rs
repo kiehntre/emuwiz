@@ -73,6 +73,7 @@ pub mod cemu_command;
 pub mod cemu_execution;
 pub mod desmume_command;
 pub mod desmume_execution;
+pub mod desmume_profile;
 pub mod dolphin_command;
 pub mod dolphin_execution;
 pub mod dosbox_command;
@@ -180,6 +181,12 @@ pub use desmume_command::{
 pub use desmume_execution::{
     DesmumeLaunchPreflightError, DesmumeLaunchPreflightErrorKind, DesmumeLaunchRequest,
     preflight_desmume_launch, spawn_desmume,
+};
+pub use desmume_profile::{
+    DESMUME_MAX_EXPLICIT_EXECUTABLES, DesmumeExecutable, DesmumeInstallationType,
+    DesmumeLaunchBlocker, DesmumeLaunchBlockerKind, DesmumeNativeLaunchBinding, DesmumeProfile,
+    DesmumeProfileDiscovery, DesmumeProfileDiscoveryRoots, discover_desmume_profiles,
+    parse_desmume_version, resolve_desmume_native_launch_binding,
 };
 pub use dolphin_command::{
     DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, DolphinCommandPlan, DolphinCommandSelection,

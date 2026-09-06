@@ -87,7 +87,7 @@ pub enum DiscoveredStandaloneProfile<'a> {
     /// requirement: upstream defaults to HLE unless a user explicitly opts
     /// into external BIOS/firmware paths, which EmuWiz never supplies.
     Desmume {
-        profile: &'a crate::patch_manager::DesmumeProfile,
+        profile: &'a crate::launch::DesmumeProfile,
     },
     Mgba {
         profile: &'a crate::patch_manager::MgbaProfile,
@@ -268,7 +268,7 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
         Self::MelonDs { profile }
     }
 
-    pub fn desmume(profile: &'a crate::patch_manager::DesmumeProfile) -> Self {
+    pub fn desmume(profile: &'a crate::launch::DesmumeProfile) -> Self {
         Self::Desmume { profile }
     }
 

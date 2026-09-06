@@ -40,7 +40,6 @@ mod cheat_source_registry;
 mod cheat_sources;
 mod cheatbase;
 mod cht_document;
-mod desmume_local;
 mod destination_safety;
 mod dolphin_cheat_catalogue;
 mod dolphin_code;
@@ -314,12 +313,6 @@ pub use cht_document::{
     MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_EXTRA_FIELDS_PER_ENTRY,
     MAX_CHT_FIELD_BYTES, MAX_CHT_GLOBAL_FIELDS, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes,
     parse_cht_text, render_cht_file,
-};
-pub use desmume_local::{
-    DESMUME_MAX_EXPLICIT_EXECUTABLES, DesmumeExecutable, DesmumeInstallationType,
-    DesmumeLaunchBlocker, DesmumeLaunchBlockerKind, DesmumeNativeLaunchBinding, DesmumeProfile,
-    DesmumeProfileDiscovery, DesmumeProfileDiscoveryRoots, discover_desmume_profiles,
-    parse_desmume_version, resolve_desmume_native_launch_binding,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,

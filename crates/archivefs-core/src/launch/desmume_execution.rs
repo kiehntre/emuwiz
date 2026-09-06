@@ -5,7 +5,7 @@ use crate::launch::planning::CanonicalIdentityStatus;
 use crate::launch::process_spawn::{
     self, CapturedFileIdentity, PreparedProcessCommand, WatchedProcess,
 };
-use crate::patch_manager::{
+use crate::launch::{
     DesmumeProfileDiscoveryRoots, discover_desmume_profiles, resolve_desmume_native_launch_binding,
 };
 use std::fs;
