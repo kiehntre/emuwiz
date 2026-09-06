@@ -882,6 +882,46 @@ accessed or modified. **P0 defects: none.**
 
 ## 22. Current V1 release-readiness summary (audit at `4763dd3`)
 
+## 23. Execution record: Playing Library / 1G1R Wave 7
+
+**Run:** 2026-09-06 at `38aefe1da03ef2baeb538afffb6b99964a9c174c`.
+Disposable-only root: `/tmp/emuwiz-playing-library-qa-20260906-063100` (with
+`source`, `destination`, `dat`, sentinels, and durable transaction state).
+No real ROM, RomM, ES-DE, or mounted-game path was read or written.
+
+The run used a generated, real Logiqx XML DAT parsed through
+`parse_dat_file`, and production whole-file SHA-1 matching through
+`match_loose_files_against_dat`. It contained Game A (USA/Europe/Japan), Game
+B (Europe/Japan), Game C and E (USA Rev 1/Rev 2), Game D (retail/Beta), one
+unmatched file, one one-file/two-DAT-game SHA-1 ambiguity, and unrelated
+content. The matcher returned 11 verified matches; it correctly omitted the
+unmatched and ambiguous candidates. The Beta was explicitly excluded.
+
+With Europe > USA > Japan, the production planner elected A Europe, B Europe,
+C Rev 2, D retail, and E Rev 2. Its own `ElectionExplanation` reported
+preferred-region decisions for A/B, verified-revision decisions for C/E, and
+the sole eligible release for D. With USA > Europe > Japan, only Game A
+changed (to USA); B remained the Europe fallback and revision/exclusion
+results were unchanged. Planning left source SHA-256 values and the
+destination sentinel unchanged.
+
+The five planned operations required `CREATE 5 LINKS` (the established typed
+confirmation threshold remains greater than 8). The real
+`build_playing_library_transaction` plus shared journaled `rename_apply`
+executor created five exact symlinks to the elected source files, without
+copying, moving, or altering sources. A fresh harness process reloaded the
+journal and performed production rollback: only those links disappeared and
+the unrelated destination sentinel remained. A collision introduced after
+planning was rejected by `AbortAll` preflight before any mutation. This also
+confirms persisted recovery is not dependent on in-memory state.
+
+The automated core contracts remain the authority for destination/source
+symlink escapes, malformed/non-directory components, stale confirmation,
+threshold wording, idempotent reapply, and multi-file atomicity. No graphical
+desktop (`DISPLAY`/`WAYLAND_DISPLAY`) was available for the Library
+Organisation click-through; that is a P1 desktop follow-up, not a filesystem
+defect. No P0/P1 defect was found in the exercised production path.
+
 Read-only reconciliation of everything above against current source, run
 2026-09-06 at authoritative commit
 `4763dd34b8d5f4a02b2f5927dbdd995d7b41d7ce`. This section is the single current
