@@ -4612,6 +4612,39 @@ fn fixture_rename_plan_row(source_path: &str, basename: &str) -> RenamePlanRowVi
     }
 }
 
+#[test]
+fn rename_plan_row_presents_long_current_and_proposed_paths_in_from_to_order() {
+    let source = "/roms/a-library-with-a-deliberately-long-path/Disc 1/Before Name (Europe).bin";
+    let proposed = "After Name (Europe).bin";
+    let row = RenamePlanRowView {
+        proposed_basename: Some(proposed.to_string()),
+        ..fixture_rename_plan_row(source, "Before Name (Europe).bin")
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut action = None;
+                show_rename_plan_row(ui, &row, &mut action);
+            });
+        },
+    );
+
+    for expected in ["From", "To", source, proposed, "Copy name", "Accept"] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "the rename preview must retain its {expected} presentation"
+        );
+    }
+}
+
 /// Root-cause regression for the widespread duplicate-widget-ID warning on
 /// DAT Sources: `show_content_technical_details`'s "Technical
 /// classification details" `CollapsingHeader` used to have no `id_salt`,

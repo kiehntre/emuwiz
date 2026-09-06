@@ -7781,6 +7781,16 @@ pub(crate) fn show_identify_rename_page(
             whdload_enabled,
             &format!("{whdload_enabled} enabled WHDLoad catalogue(s)"),
         );
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Choose what to identify").strong());
+        ui.label(
+            egui::RichText::new(
+                "Choose one configured library folder or a regular file. The audit is read-only.",
+            )
+            .color(theme::muted(ui))
+            .small(),
+        );
         ui.add_space(4.0);
         // TOSEC and WHDLoad are valid audit inputs too. Keep the gate aligned
         // with `combined_audit_sources`, otherwise a user who has enabled
@@ -11604,6 +11614,13 @@ fn show_rename_plan_section(
 
     ui.add_space(8.0);
     widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Proposed changes",
+            Some(
+                "Review each current name and proposed destination before selecting anything for apply.",
+            ),
+        );
         let visible: Vec<&RenamePlanRowView> = plan
             .rows
             .iter()
@@ -11618,7 +11635,7 @@ fn show_rename_plan_section(
         let (start, end, page_count) = rename_plan_page_bounds(visible.len(), ui_state.plan_page);
         ui_state.plan_page = ui_state.plan_page.min(page_count - 1);
         if page_count > 1 {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let at_first_page = ui_state.plan_page == 0;
                 if ui
                     .add_enabled(!at_first_page, egui::Button::new("← Previous page"))
@@ -11648,8 +11665,8 @@ fn show_rename_plan_section(
             .id_salt("dat-rename-plan-rows")
             .show(ui, |ui| {
                 for row in &visible[start..end] {
-                    show_rename_plan_row(ui, row, &mut action);
-                    ui.add_space(4.0);
+                    widgets::card(ui, |ui| show_rename_plan_row(ui, row, &mut action));
+                    ui.add_space(6.0);
                 }
             });
     });
@@ -11721,173 +11738,174 @@ fn show_rename_plan_row(
     row: &RenamePlanRowView,
     action: &mut Option<DatSourcesPageAction>,
 ) {
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                widgets::status_badge(ui, row.state.label(), plan_state_tone(row.state));
-                if row.state == ProposalState::Suggested {
-                    ui.label(
-                        egui::RichText::new(row.current_basename.clone())
-                            .monospace()
-                            .strong(),
-                    );
-                } else {
-                    ui.label(egui::RichText::new(row.current_basename.clone()).monospace());
-                }
-            });
-            match &row.proposed_basename {
-                Some(proposed) => {
-                    ui.label(
-                        egui::RichText::new(format!("→ {proposed}"))
-                            .monospace()
-                            .color(theme::muted(ui)),
-                    );
-                    if row.extension_preserved {
-                        ui.label(
-                            egui::RichText::new("extension preserved")
-                                .color(theme::muted(ui))
-                                .small(),
-                        );
-                    }
-                }
-                None => {
-                    ui.label(
-                        egui::RichText::new("no proposed name")
-                            .color(theme::muted(ui))
-                            .small(),
-                    );
-                }
-            }
-            if let Some(platform) = &row.platform_display {
-                ui.label(
-                    egui::RichText::new(format!("{platform} · {}", row.source_display_name))
-                        .color(theme::muted(ui))
-                        .small(),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new(row.source_display_name.clone())
-                        .color(theme::muted(ui))
-                        .small(),
-                );
-            }
-            if let Some(game) = &row.game_name {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Matched: {game}{} · {}",
-                        row.rom_name
-                            .as_deref()
-                            .filter(|rom| *rom != game)
-                            .map(|rom| format!(" ({rom})"))
-                            .unwrap_or_default(),
-                        row.verdict_label
-                    ))
-                    .color(theme::muted(ui))
-                    .small(),
-                );
-            }
-            show_content_technical_details(
-                ui,
-                ("rename_plan_row_technical_details", &row.source_path),
-                &row.content,
-            );
-            if !row.explanations.is_empty() {
-                ui.add_space(2.0);
-                for line in &row.explanations {
-                    ui.label(
-                        egui::RichText::new(format!("• {line}"))
-                            .color(theme::muted(ui))
-                            .small(),
-                    );
-                }
-            }
-            if let Some(reason) = &row.ambiguity_reason {
-                ui.label(
-                    egui::RichText::new(format!("Ambiguous: {reason}"))
-                        .color(theme::WARNING)
-                        .small(),
-                );
-            }
-            if let Some(detail) = &row.collision_detail {
-                ui.label(
-                    egui::RichText::new(format!("Conflict: {detail}"))
-                        .color(theme::WARNING)
-                        .small(),
-                );
-            }
-            for blocker in &row.blockers {
-                ui.label(
-                    egui::RichText::new(format!("Blocked: {blocker}"))
-                        .color(theme::DANGER)
-                        .small(),
-                );
-            }
-            for note in &row.sanitisation_notes {
-                ui.label(
-                    egui::RichText::new(note.clone())
-                        .color(theme::muted(ui))
-                        .small(),
-                );
-            }
-            if let Some(decision) = row.decision {
-                ui.label(
-                    egui::RichText::new(format!("Your decision: {}", decision.label()))
-                        .color(theme::SUCCESS)
-                        .small(),
-                );
-            }
+    ui.horizontal_wrapped(|ui| {
+        widgets::status_badge(ui, row.state.label(), plan_state_tone(row.state));
+        let current = egui::RichText::new(row.current_basename.clone()).monospace();
+        ui.label(if row.state == ProposalState::Suggested {
+            current.strong()
+        } else {
+            current
         });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            if let Some(proposed) = &row.proposed_basename
-                && ui
-                    .add(egui::Button::new("Copy name").small())
-                    .on_hover_text("Copy the proposed filename to the clipboard")
-                    .clicked()
-            {
+    });
+    ui.add_space(4.0);
+    if widgets::path_value(ui, "From", &row.source_path) {
+        ui.ctx().copy_text(row.source_path.display().to_string());
+    }
+    match &row.proposed_basename {
+        Some(proposed) => {
+            if let Some(parent) = row.source_path.parent() {
+                let destination = parent.join(proposed);
+                if widgets::path_value(ui, "To", &destination) {
+                    ui.ctx().copy_text(destination.display().to_string());
+                }
+            } else if widgets::copyable_value(ui, "To", proposed) {
                 ui.ctx().copy_text(proposed.clone());
             }
-            if ui
-                .add(egui::Button::new("Needs review").small())
-                .on_hover_text("Mark this proposal as needing manual review")
+            if row.extension_preserved {
+                ui.label(
+                    egui::RichText::new("extension preserved")
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+        }
+        None => {
+            ui.label(
+                egui::RichText::new("no proposed name")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    }
+    if let Some(platform) = &row.platform_display {
+        ui.label(
+            egui::RichText::new(format!("{platform} · {}", row.source_display_name))
+                .color(theme::muted(ui))
+                .small(),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new(row.source_display_name.clone())
+                .color(theme::muted(ui))
+                .small(),
+        );
+    }
+    if let Some(game) = &row.game_name {
+        ui.label(
+            egui::RichText::new(format!(
+                "Matched: {game}{} · {}",
+                row.rom_name
+                    .as_deref()
+                    .filter(|rom| *rom != game)
+                    .map(|rom| format!(" ({rom})"))
+                    .unwrap_or_default(),
+                row.verdict_label
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
+    }
+    show_content_technical_details(
+        ui,
+        ("rename_plan_row_technical_details", &row.source_path),
+        &row.content,
+    );
+    if !row.explanations.is_empty() {
+        ui.add_space(2.0);
+        for line in &row.explanations {
+            ui.label(
+                egui::RichText::new(format!("• {line}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    }
+    if let Some(reason) = &row.ambiguity_reason {
+        ui.label(
+            egui::RichText::new(format!("Ambiguous: {reason}"))
+                .color(theme::WARNING)
+                .small(),
+        );
+    }
+    if let Some(detail) = &row.collision_detail {
+        ui.label(
+            egui::RichText::new(format!("Conflict: {detail}"))
+                .color(theme::WARNING)
+                .small(),
+        );
+    }
+    for blocker in &row.blockers {
+        ui.label(
+            egui::RichText::new(format!("Blocked: {blocker}"))
+                .color(theme::DANGER)
+                .small(),
+        );
+    }
+    for note in &row.sanitisation_notes {
+        ui.label(
+            egui::RichText::new(note.clone())
+                .color(theme::muted(ui))
+                .small(),
+        );
+    }
+    if let Some(decision) = row.decision {
+        ui.label(
+            egui::RichText::new(format!("Your decision: {}", decision.label()))
+                .color(theme::SUCCESS)
+                .small(),
+        );
+    }
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        if let Some(proposed) = &row.proposed_basename
+            && ui
+                .add(egui::Button::new("Copy name").small())
+                .on_hover_text("Copy the proposed filename to the clipboard")
                 .clicked()
-            {
-                *action = Some(DatSourcesPageAction::SetReviewDecision {
-                    path: row.source_path.to_string_lossy().into_owned(),
-                    decision: Some(ReviewDecision::NeedsManualReview),
-                });
-            }
-            if ui
-                .add(egui::Button::new("Ignore").small())
-                .on_hover_text("Ignore this proposal for now")
+        {
+            ui.ctx().copy_text(proposed.clone());
+        }
+        if ui
+            .add(egui::Button::new("Needs review").small())
+            .on_hover_text("Mark this proposal as needing manual review")
+            .clicked()
+        {
+            *action = Some(DatSourcesPageAction::SetReviewDecision {
+                path: row.source_path.to_string_lossy().into_owned(),
+                decision: Some(ReviewDecision::NeedsManualReview),
+            });
+        }
+        if ui
+            .add(egui::Button::new("Ignore").small())
+            .on_hover_text("Ignore this proposal for now")
+            .clicked()
+        {
+            *action = Some(DatSourcesPageAction::SetReviewDecision {
+                path: row.source_path.to_string_lossy().into_owned(),
+                decision: Some(ReviewDecision::Ignored),
+            });
+        }
+        if ui
+            .add(egui::Button::new("Accept").small())
+            .on_hover_text("Keep this proposal for a future review/apply stage")
+            .clicked()
+        {
+            *action = Some(DatSourcesPageAction::SetReviewDecision {
+                path: row.source_path.to_string_lossy().into_owned(),
+                decision: Some(ReviewDecision::AcceptedForReview),
+            });
+        }
+        if row.decision.is_some()
+            && ui
+                .add(egui::Button::new("Clear").small())
+                .on_hover_text("Clear your decision; nothing on disk changes")
                 .clicked()
-            {
-                *action = Some(DatSourcesPageAction::SetReviewDecision {
-                    path: row.source_path.to_string_lossy().into_owned(),
-                    decision: Some(ReviewDecision::Ignored),
-                });
-            }
-            if ui
-                .add(egui::Button::new("Accept").small())
-                .on_hover_text("Keep this proposal for a future review/apply stage")
-                .clicked()
-            {
-                *action = Some(DatSourcesPageAction::SetReviewDecision {
-                    path: row.source_path.to_string_lossy().into_owned(),
-                    decision: Some(ReviewDecision::AcceptedForReview),
-                });
-            }
-            if row.decision.is_some()
-                && ui
-                    .add(egui::Button::new("Clear").small())
-                    .on_hover_text("Clear your decision; nothing on disk changes")
-                    .clicked()
-            {
-                *action = Some(DatSourcesPageAction::SetReviewDecision {
-                    path: row.source_path.to_string_lossy().into_owned(),
-                    decision: None,
-                });
-            }
-        });
+        {
+            *action = Some(DatSourcesPageAction::SetReviewDecision {
+                path: row.source_path.to_string_lossy().into_owned(),
+                decision: None,
+            });
+        }
     });
 }
 
