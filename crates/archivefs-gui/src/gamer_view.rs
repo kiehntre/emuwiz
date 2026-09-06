@@ -1167,7 +1167,44 @@ pub(crate) fn show_gamer_details_panel(
         }
         ui.label("Screenshot references are read from the imported RomM identity matched to this exact archive path. Only RomM-hosted references are eligible for loading; public scraper references are retained as provenance and are not fetched.");
     });
-    show_game_information_provenance(ui, enrichment)
+    let game_info_action = show_game_information_provenance(ui, enrichment);
+    show_retroachievements(ui, archive_path);
+    game_info_action
+}
+
+/// Optional cache-only RetroAchievements summary.  It is deliberately a
+/// separate section from RomM enrichment: no network request is made while
+/// browsing and absence of a cache never affects playability or identity.
+fn show_retroachievements(ui: &mut egui::Ui, archive_path: &Path) {
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "RetroAchievements",
+        Some("Optional public achievement metadata."),
+    );
+    let entry = archivefs_core::app_dirs::data_dir()
+        .ok()
+        .map(|root| archivefs_core::retroachievements::cache_path(&root))
+        .and_then(|path| archivefs_core::retroachievements::load_cache(&path).ok())
+        .and_then(|entries| {
+            archivefs_core::retroachievements::cached_for_path(&entries, archive_path).cloned()
+        });
+    if let Some(game) = entry {
+        ui.horizontal(|ui| {
+            widgets::status_badge(ui, "Cached", widgets::StatusTone::Info);
+            ui.label(format!(
+                "{} achievements · {} points",
+                game.achievement_count, game.total_points
+            ));
+        });
+        ui.label(
+            egui::RichText::new("Source: RetroAchievements · public metadata only")
+                .color(theme::muted(ui))
+                .small(),
+        );
+    } else {
+        ui.label(egui::RichText::new("Not linked").color(theme::muted(ui)));
+    }
 }
 
 fn show_gamer_screenshot_strip(
