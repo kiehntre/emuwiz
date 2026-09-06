@@ -268,6 +268,26 @@ mod tests {
     }
 
     #[test]
+    fn names_colliding_after_portable_sanitisation_are_both_refused() {
+        let sanitised = |name: &str| {
+            let crate::dat::rename_plan::derive::DeriveOutcome::Ok(derived) =
+                crate::dat::rename_plan::derive::derive_proposed_basename(name, "old.zip")
+            else {
+                panic!("expected a derived name for {name}");
+            };
+            derived.proposed_basename
+        };
+        let mut proposals = vec![
+            proposal("/roms/a.zip", &sanitised("foo\u{1}.zip")),
+            proposal("/roms/b.zip", &sanitised("foo\u{2}.zip")),
+        ];
+        assert_eq!(proposals[0].proposed_basename.as_deref(), Some("foo_.zip"));
+        assert_eq!(proposals[1].proposed_basename.as_deref(), Some("foo_.zip"));
+        detect_proposal_collisions(&mut proposals);
+        assert!(proposals.iter().all(|p| p.state == ProposalState::Conflict));
+    }
+
+    #[test]
     fn two_proposals_one_target_are_all_flagged() {
         let mut proposals = vec![
             proposal("/roms/a.bin", "Game.bin"),

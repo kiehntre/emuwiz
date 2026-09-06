@@ -38,6 +38,7 @@ pub mod collisions;
 pub mod derive;
 pub mod model;
 pub mod plan;
+pub mod portability;
 
 pub use collisions::{DirSiblings, detect_proposal_collisions, detect_target_collision};
 pub use derive::{DeriveOutcome, DerivedName, derive_proposed_basename};
@@ -46,3 +47,7 @@ pub use model::{
     RenameProposal, ReviewDecision, SourceObjectKind,
 };
 pub use plan::{RenamePlanContext, RenamePlanError, build_rename_plan, plan_matches_generation};
+pub use portability::{
+    MAX_COMPONENT_BYTES, PortabilityAssessment, PortabilityIssue, PortabilityTarget,
+    assess_component, assess_component_for_targets, case_insensitive_key,
+};
