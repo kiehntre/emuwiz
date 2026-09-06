@@ -9233,7 +9233,11 @@ fn show_source_row(
     let busy_elsewhere = view.background_busy;
 
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        // Keep the source identity and its state at the top of the card. The
+        // path and parser details are useful, but they should not compete with
+        // the answer to “what is this, and can I use it?”. Wrapping also keeps
+        // the header usable at the narrowest supported desktop width.
+        ui.horizontal_wrapped(|ui| {
             let mut enabled = row.enabled;
             if ui.checkbox(&mut enabled, "").changed() {
                 action = Some(DatSourcesPageAction::SetEnabled {
@@ -9253,8 +9257,16 @@ fn show_source_row(
 
         widgets::technical_details(ui, ("local_dat_source", row.id.as_str()), |ui| {
             ui.label(egui::RichText::new(format!("Source ID: {}", row.id)).monospace());
-            ui.label(format!("Type: {}", row.kind_label));
-            ui.label(format!("Path: {}", row.path));
+            ui.label(egui::RichText::new(format!("Type: {}", row.kind_label)).small());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Location: {}", row.path))
+                        .color(theme::muted(ui))
+                        .small()
+                        .monospace(),
+                )
+                .wrap(),
+            );
             let format_line = if row.formats.is_empty() {
                 "Parser format: not checked yet".to_string()
             } else {
@@ -9305,7 +9317,7 @@ fn show_source_row(
         }
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if widgets::action_button(
                 ui,
                 "Validate",
@@ -9971,10 +9983,23 @@ fn show_inspect(ui: &mut egui::Ui, row: &DatSourceRowView) {
             rows.push(("Last checked", when.clone()));
         }
         for (label, value) in rows {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("{label}:")).color(theme::muted(ui)));
-                ui.label(value);
-            });
+            if label == "Path" {
+                ui.label(egui::RichText::new("Path:").color(theme::muted(ui)));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(value)
+                            .color(theme::muted(ui))
+                            .small()
+                            .monospace(),
+                    )
+                    .wrap(),
+                );
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("{label}:")).color(theme::muted(ui)));
+                    ui.label(value);
+                });
+            }
         }
         if !row.health_state.is_checked() {
             ui.add_space(4.0);
