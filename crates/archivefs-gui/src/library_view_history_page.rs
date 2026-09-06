@@ -116,7 +116,7 @@ pub(crate) fn show_library_view_history_page(
     );
 
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, true)
                 .clicked()
             {
@@ -194,20 +194,23 @@ fn show_history_record(ui: &mut egui::Ui, record: &LibraryViewHistoryRecord) {
             .color(theme::muted(ui)),
         );
 
-        ui.label(
-            egui::RichText::new(format!(
-                "Created {} · Repaired {} · Removed {} · Unchanged {} · Failed {}{}",
-                record.created,
-                record.repaired,
-                record.removed,
-                record.unchanged,
-                record.failed,
-                record
-                    .skipped_or_collision
-                    .map(|count| format!(" · Skipped/collision {count}"))
-                    .unwrap_or_default(),
-            ))
-            .small(),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "Created {} · Repaired {} · Removed {} · Unchanged {} · Failed {}{}",
+                    record.created,
+                    record.repaired,
+                    record.removed,
+                    record.unchanged,
+                    record.failed,
+                    record
+                        .skipped_or_collision
+                        .map(|count| format!(" · Skipped/collision {count}"))
+                        .unwrap_or_default(),
+                ))
+                .small(),
+            )
+            .wrap(),
         );
 
         if !record.warnings.is_empty() {

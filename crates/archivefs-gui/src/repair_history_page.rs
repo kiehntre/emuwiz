@@ -753,7 +753,7 @@ pub(crate) fn show_repair_history_page(
     show_archive_confirmation_dialog(ui, state);
 
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, true)
                 .clicked()
             {
@@ -817,13 +817,32 @@ pub(crate) fn show_repair_history_page(
     let summary = state.presentation.summary.clone();
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Recovery and history").strong());
-        ui.label(format!("Needs attention: {}", summary.needs_attention));
-        ui.label(format!("Undo available: {}", summary.undo_available));
-        ui.label(format!("Historical transactions: {}", summary.historical));
-        ui.label(format!(
-            "Technical journal issues: {}",
-            summary.technical_issues
-        ));
+        ui.horizontal_wrapped(|ui| {
+            for (label, value, tone) in [
+                (
+                    "Needs attention",
+                    summary.needs_attention,
+                    widgets::StatusTone::Warning,
+                ),
+                (
+                    "Undo available",
+                    summary.undo_available,
+                    widgets::StatusTone::Info,
+                ),
+                (
+                    "Historical transactions",
+                    summary.historical,
+                    widgets::StatusTone::Pending,
+                ),
+                (
+                    "Technical journal issues",
+                    summary.technical_issues,
+                    widgets::StatusTone::Blocked,
+                ),
+            ] {
+                widgets::status_badge(ui, format!("{label}: {value}"), tone);
+            }
+        });
         let stale_count = state.stale_transaction_ids().len();
         if stale_count > 0 {
             ui.horizontal_wrapped(|ui| {
@@ -1114,7 +1133,7 @@ fn show_transaction_row(
             );
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let details_open = state.details_id.as_deref() == Some(&transaction.transaction_id);
             if widgets::action_button(
                 ui,
