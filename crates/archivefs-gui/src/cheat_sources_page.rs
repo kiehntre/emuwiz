@@ -816,7 +816,7 @@ pub(crate) fn show_cheat_sources_page(
 fn show_save_bar(ui: &mut egui::Ui, view: &CheatSourcesPageView) -> Option<CheatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if view.dirty {
                 widgets::status_badge(ui, "Unsaved changes", widgets::StatusTone::Warning);
             } else {
@@ -898,7 +898,7 @@ fn show_source_health(ui: &mut egui::Ui, health: &Option<CheatSourceHealth>) {
         );
         return;
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         widgets::status_badge(
             ui,
             health_state_label(health.state),
@@ -993,7 +993,7 @@ fn show_source_row(
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut enabled = row.enabled;
             if ui.checkbox(&mut enabled, "").changed() {
                 action = Some(CheatSourcesPageAction::SetEnabled {
