@@ -321,16 +321,28 @@ pub(super) fn show_library_views_page(
         ui.add_space(4.0);
     }
 
+    widgets::section_header(
+        ui,
+        "Saved views",
+        Some("Preview, apply, or adjust each view without changing its definition unexpectedly."),
+    );
     if ui
         .add_enabled(!busy, egui::Button::new("Add View"))
         .clicked()
     {
         *form_dialog = Some(LibraryViewFormDialogState::default());
     }
-    ui.separator();
+    ui.add_space(6.0);
 
     if views.is_empty() {
-        ui.label("No library views are configured yet. Click \"Add View\" to create one.");
+        widgets::card(ui, |ui| {
+            widgets::empty_state(
+                ui,
+                "No library views are configured yet.",
+                "Click \"Add View\" above to create a saved view.",
+                None,
+            );
+        });
     } else {
         egui::ScrollArea::vertical()
             .id_salt("library_views_list")
@@ -359,34 +371,71 @@ pub(super) fn show_library_views_page(
                         previewed == view && plan.is_safe_to_apply()
                     });
                     let group_response = ui.group(|ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.strong(&view.name);
+                            widgets::status_badge(
+                                ui,
+                                if view.enabled { "Enabled" } else { "Disabled" },
+                                if view.enabled {
+                                    widgets::StatusTone::Success
+                                } else {
+                                    widgets::StatusTone::Pending
+                                },
+                            );
                             if !view.enabled {
                                 ui.weak("(disabled)");
                             }
                         });
-                        ui.label(format!("Destination: {}", view.destination_root.display()));
-                        ui.label(format!(
-                            "Sources: {}",
-                            if view.source_folders.is_empty() {
-                                "all configured sources".to_string()
-                            } else {
-                                view.source_folders
-                                    .iter()
-                                    .map(|path| path.display().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            }
-                        ));
-                        ui.label(format!(
-                            "Platforms: {}",
-                            if view.platforms.is_empty() {
-                                "all known platforms".to_string()
-                            } else {
-                                view.platforms.join(", ")
-                            }
-                        ));
-                        ui.label(format!("Layout: {}", view.layout_template.label()));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Destination: {}",
+                                    view.destination_root.display()
+                                ))
+                                .monospace()
+                                .color(theme::muted(ui)),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Sources: {}",
+                                    if view.source_folders.is_empty() {
+                                        "all configured sources".to_string()
+                                    } else {
+                                        view.source_folders
+                                            .iter()
+                                            .map(|path| path.display().to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    }
+                                ))
+                                .color(theme::muted(ui)),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Platforms: {}",
+                                    if view.platforms.is_empty() {
+                                        "all known platforms".to_string()
+                                    } else {
+                                        view.platforms.join(", ")
+                                    }
+                                ))
+                                .color(theme::muted(ui)),
+                            )
+                            .wrap(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Layout: {}",
+                                view.layout_template.label()
+                            ))
+                            .color(theme::muted(ui)),
+                        );
 
                         ui.horizontal_wrapped(|ui| {
                             if ui
