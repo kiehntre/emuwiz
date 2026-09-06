@@ -19780,10 +19780,12 @@ impl ArchiveFsApp {
                         .as_ref()
                         .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia)
                         .map(|workflow| local_xenia_install_context(workflow, &self.xenia_profiles));
-                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = egui::ScrollArea::vertical()
-                        .id_salt("cheats_mods_workspace_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = ui_layout::page(
+                        ui,
+                        ui_layout::ContentWidth::Wide,
+                        true,
+                        "cheats_mods_workspace_scroll",
+                        |ui| {
                             self.user_cheat_import_page.show(
                                 ui,
                                 &ui.ctx().clone(),
@@ -19880,8 +19882,7 @@ impl ArchiveFsApp {
                                 )
                             }).flatten();
                             (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action)
-                        })
-                        .inner;
+                        });
                     let picker_rows = live
                         .map(|data| {
                             build_display_rows(
