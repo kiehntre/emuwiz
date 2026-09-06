@@ -903,32 +903,53 @@ produce it.
   doc is stale on those two rows; not edited here per this audit's
   documentation-only scope, but the recommendations are no longer open work.
 
-### Home P0 — CONFIRMED STILL OPEN (`P0_OPEN`)
+### Home P0 — CLOSED (`P0_CLOSED`)
 
-Evidence, most recent first:
-- `4763dd3` (this repo, today): "the current source still has the documented
-  same-session onboarding completion → Home 'Loading your games…' P0: no
-  corrective commit or regression test was present."
-- No commit anywhere in `git log --all` touches this defect (searched for
-  onboarding/Home-load/refresh-generation fix commits; none exist).
-- No worktree or branch in this environment is dedicated to this fix (the
-  `/tmp/onboarding_*.log` files present on this host are ordinary onboarding
-  *unit* test runs from unrelated earlier work — they exercise
-  `onboarding::tests`/`tests::onboarding_flow` sidecar persistence, not the
-  GUI same-session load hang — and contain no evidence of a fix attempt for
-  this specific defect).
-- Original finding: `docs/APPIMAGE_FRESH_INSTALL_QA.md` (commit `e909efe`) —
-  a fresh onboarding completion in one running session left Home stuck on
-  "Loading your games…" indefinitely (10+ min, zero CPU, no error), with the
-  background load thread already exited (`/proc/<pid>/task/*/wchan` showed
-  both threads idling in `do_poll`) — i.e. a `refresh_generation`/state-
-  machine mismatch in `poll_load`/`start_load`, not a slow computation. A
-  fresh process relaunch against the identical on-disk state loaded
-  instantly, isolating the defect to the onboarding-finish → first-load
-  transition specifically.
+**Update (this promotion):** fixed and promoted onto authority as commit
+`c379183c0d3add8fa24d98ef3f52b12e7c62bac5` (`fix(gui): complete Home load
+after onboarding`, cherry-picked from `ecae382286d539a0c9b7449362b1e6fac0b94661`).
+Root cause was two related invariant violations, both confirmed by direct
+code inspection before any fix was written:
 
-**Classification: `P0_OPEN`.** This is the single confirmed release blocker
-in the entire audited surface.
+1. `ArchiveFsApp::new()`'s very first archive-snapshot load runs before
+   onboarding ever adds a source or writes a config file, so it resolves -
+   once, terminally - before the user finishes onboarding, and nothing in
+   the onboarding flow ever called `self.refresh(context)` afterward
+   (adding a source only reloads the separate `database_state`, used by
+   Advanced View's Library tab, never Gamer View's own snapshot).
+2. Gamer View's `data: Option<&LoadedData>` collapsed `LoadState::Error`
+   (a worker that already finished, terminally, with a failure) and
+   `LoadState::Loading` (genuinely still in flight) into the same `None` -
+   a fresh install's missing config file produced a hard `Err`, exactly
+   the terminal state (1) then left frozen, directly contradicting
+   `create_starter_config`'s own comment that "a fresh install with zero
+   sources loads normally."
+
+Fix: `onboarding_advance_from`/`onboarding_skip_entirely` now call the
+existing `self.refresh(context)` exactly once, only on their two terminal
+transitions, reusing the same "state changed, reload now" pattern every
+other completion call site already used - no new state machine, no timer,
+no polling loop, and `poll_load`'s stale-generation rejection is untouched.
+`load_read_only_snapshot` now treats a missing (not merely unreadable)
+config file as the empty library a freshly-written starter config would
+produce, narrowly scoped to `io::ErrorKind::NotFound`; any other read
+failure still fails closed exactly as before.
+
+Both new regression tests
+(`finishing_onboarding_in_the_same_session_retries_the_stale_archive_load`,
+`skipping_onboarding_entirely_also_retries_the_stale_archive_load`,
+`read_only_snapshot_resolves_to_an_empty_library_when_no_config_file_exists_yet`)
+were verified to fail on the pre-fix code before being proven green
+against the fix. Re-verified again at promotion time: `onboarding`
+(26/26), `home_page` (40/40), `gamer_view` (103/103), and core
+`read_only_snapshot` (3/3) all pass; `cargo check -p archivefs-gui`,
+`cargo fmt --all -- --check`, and `git diff --check` are all clean; the
+release build succeeds.
+
+**Classification: `P0_CLOSED`.** The AppImage artifact remains stale and
+still requires a rebuild (see below) before this fix is reflected in a
+packaged artifact and re-verified end-to-end via the fresh-install QA
+harness - that rebuild/retest pass is the next, now-unblocked step.
 
 ### AppImage artifact — `STALE_ARTIFACT`, additionally `BLOCKED_BY_HOME_P0`
 
@@ -942,15 +963,20 @@ in the entire audited surface.
   executable nor the required pinned type-2 runtime file
   (`docs/APPIMAGE_PACKAGING.md` requires both as explicit host inputs; the
   build script fails closed rather than substituting an unapproved tool).
-- Even if packaging tools were available, rebuilding now would still ship a
-  build with the open Home P0 inside it, so a rebuild is not useful until
-  that defect is closed or explicitly accepted.
+- **Update (this promotion):** the Home P0 that previously blocked a
+  meaningful rebuild is now fixed on authority (`c379183`, see above). The
+  artifact itself has **not** been rebuilt by this promotion (no AppImage
+  packaging was performed, per this task's own scope) and remains the same
+  stale `c16f486` build.
 
-**Classification: `STALE_ARTIFACT` (provenance) and `BLOCKED_BY_HOME_P0`
-(rebuild would not resolve release-readiness on its own).** Do not reuse the
-existing artifact as evidence of current-authority behavior for anything
-beyond the packaging/AppRun-mechanism findings already recorded in
-`docs/APPIMAGE_FRESH_INSTALL_QA.md`.
+**Classification: `STALE_ARTIFACT` (provenance only; the Home P0 blocker on
+a *meaningful* rebuild is now cleared).** A rebuild is no longer blocked by
+an unresolved defect, only by provenance staleness and this host's missing
+`appimagetool`/pinned runtime inputs. Do not reuse the existing artifact as
+evidence of current-authority behavior for anything beyond the
+packaging/AppRun-mechanism findings already recorded in
+`docs/APPIMAGE_FRESH_INSTALL_QA.md`. Rebuilding and re-running the
+fresh-install QA harness against the new artifact remains the next step.
 
 ### Remaining desktop-smoke items (no `DISPLAY`/`WAYLAND_DISPLAY` in any QA
 environment used so far)
@@ -1049,8 +1075,8 @@ read-only scope; worth a one-line fix in a future GUI-only pass.
 
 | AREA | STATUS | EVIDENCE | SEVERITY | RELEASE BLOCKER? | NEXT ACTION |
 | --- | --- | --- | --- | --- | --- |
-| Home same-session load hang | OPEN | `4763dd3`; original finding in `APPIMAGE_FRESH_INSTALL_QA.md` (`e909efe`) | P0 | **YES** | Fix `poll_load`/`start_load` generation handling; add a regression test; retest |
-| AppImage artifact currency | OPEN | `4763dd3`; artifact from `c16f486`, 15 commits stale | P0 | **YES** (as a packaging gate; blocked on Home P0 + missing tools) | Once Home P0 closes and `appimagetool`/runtime are available, rebuild and rerun the fresh-install harness |
+| Home same-session load hang | CLOSED | `c379183` (cherry-picked from `ecae382`); onboarding/home_page/gamer_view/read_only_snapshot suites re-verified green at promotion | NONE | No | none |
+| AppImage artifact currency | OPEN | artifact still from `c16f486`, now 17+ commits stale (includes the Home P0 fix) | P1 | No (packaging gate only; the P0 defect blocking a *meaningful* rebuild is closed) | Once `appimagetool`/pinned runtime are available on a build host, rebuild and rerun the fresh-install harness |
 | DAT Identity GUI P0 | CLOSED | `00713a2`; 23 focused + 191 re-verified GUI tests | NONE | No | none |
 | Doctor/Emulator Setup regressions | CLOSED | `76aff27`; re-run 124/124 green, test-only diff | NONE | No | none |
 | ES-DE final safe gaps (TG-16, PC-98) | CLOSED | `48140d0`; live export-table assertion | NONE | No | none |
@@ -1077,17 +1103,22 @@ read-only scope; worth a one-line fix in a future GUI-only pass.
 
 ### Shortest true critical path
 
-Derived strictly from the evidence above — two items gate release, both
-already precisely diagnosed:
+**Update (this promotion):** item 1 below is now closed (`c379183`). The
+remaining critical path is packaging-only:
 
-1. **Fix the Home same-session "Loading your games…" hang.** Root cause is
-   already isolated to `poll_load`/`start_load`'s `refresh_generation`
-   matching around the onboarding-finish transition (see finding above). Add
-   a regression test that exercises finish-onboarding-in-one-session, not
-   only a fresh relaunch (the existing 23 onboarding tests all pass today
-   precisely because none of them reproduce the same-session transition).
-2. **Rebuild the AppImage** once (1) is closed and an approved
-   `appimagetool` + pinned type-2 runtime are available on the build host.
+1. ~~Fix the Home same-session "Loading your games…" hang.~~ **Closed** -
+   `onboarding_advance_from`/`onboarding_skip_entirely` now call
+   `self.refresh(context)` on their terminal transitions, and
+   `load_read_only_snapshot` treats a missing config file as an empty
+   library rather than a terminal error. Regression tests
+   (`finishing_onboarding_in_the_same_session_retries_the_stale_archive_load`,
+   `skipping_onboarding_entirely_also_retries_the_stale_archive_load`,
+   `read_only_snapshot_resolves_to_an_empty_library_when_no_config_file_exists_yet`,
+   `advancing_through_a_non_final_onboarding_step_does_not_reload_the_archive_snapshot`)
+   are on authority and green.
+2. **Rebuild the AppImage** once an approved `appimagetool` + pinned
+   type-2 runtime are available on the build host (no longer blocked by
+   an open defect, only by tool availability).
 3. **Re-run the fresh-install QA harness** (`packaging/appimage/
    test-fresh-home.sh` plus the manual onboarding-completion walk in
    `docs/APPIMAGE_FRESH_INSTALL_QA.md`) against the new artifact, confirming
