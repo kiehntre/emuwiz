@@ -43,7 +43,11 @@ pub(crate) struct GamerStageLayout {
 
 impl GamerStageLayout {
     /// Smallest the stage is ever drawn - below this the selected game stops
-    /// reading as a presentation surface.
+    /// reading as a presentation surface. Held at 264px so the shortest
+    /// supported window (1024x600) keeps every pixel it currently gives the
+    /// browsing rail; the extra breathing room on normal windows comes from
+    /// the raised [`Self::STAGE_SHARE`] instead, which only bites once the
+    /// window is tall enough to afford it.
     pub(crate) const MIN_STAGE_HEIGHT: f32 = 264.0;
     /// Largest the stage is drawn, so a tall 1440p/4K window does not turn one
     /// cover into a wall-sized poster with acres of empty card around it.
@@ -61,10 +65,15 @@ impl GamerStageLayout {
     /// than a sliver that barely reads as scrollable.
     pub(crate) const RAIL_MIN_HEIGHT: f32 = 220.0;
     /// Share of the stage+rail budget the stage is given before being
-    /// clamped into its min/max band. Tuned so the stage reads as dominant
-    /// without eating space the rail needs to be usable at the real 1100x720
-    /// physical target - see `physical_target_1100x720_...` below.
-    const STAGE_SHARE: f32 = 0.52;
+    /// clamped into its min/max band. Raised from 0.52 so the selected-game
+    /// details and actions get visibly more room on a modest window (the
+    /// real 1100x720 physical target lands the stage near ~375px rather than
+    /// ~343px) while the rail still keeps a comfortably scrollable minimum
+    /// and the stage stays dominant - see `physical_target_1100x720_...`.
+    /// The shortest supported window pins the stage to
+    /// [`Self::MIN_STAGE_HEIGHT`] regardless of this, so its rail is
+    /// untouched.
+    const STAGE_SHARE: f32 = 0.57;
     /// Target width one browsing-rail card wants. The column count is how many
     /// of these fit across the available width, clamped to a sane range.
     pub(crate) const RAIL_CARD_TARGET_WIDTH: f32 = 340.0;
@@ -169,18 +178,26 @@ mod tests {
         // the real 1100x720 physical target.
         let l = layout(1052.0, 680.0);
         assert_eq!(l.strip_height, GamerStageLayout::STRIP_HEIGHT);
-        // Stage is the dominant region but no longer swallows space the rail
-        // needs: tuned to land near 330-350px rather than the ~390px a naive
-        // 60% share (plus the old double-counted strip subtraction) used to
-        // produce.
+        // Stage is the dominant region and gets a bit more room for the
+        // selected-game details + actions after the 0.57 share bump: it now
+        // lands in the ~365-400px band at the physical target (was ~330-350),
+        // still short of a full-screen takeover and still leaving the rail a
+        // scrollable minimum.
         assert!(
-            (325.0..=355.0).contains(&l.stage_height),
-            "stage should land in the 330-350px band at the physical target, got {}",
+            (365.0..=400.0).contains(&l.stage_height),
+            "stage should land in the ~365-400px band at the physical target, got {}",
             l.stage_height
         );
         assert!(
             l.stage_height > l.rail_min_height,
             "stage must dominate the rail"
+        );
+        // The bump is real: the stage is now taller than the old design's
+        // whole upper bound at this window.
+        assert!(
+            l.stage_height > 355.0,
+            "stage should be visibly taller than the previous ~330-350px band, got {}",
+            l.stage_height
         );
         // Rail now gets a comfortably scrollable minimum - enough for two
         // full card rows plus a hint of the next one - rather than a sliver.
