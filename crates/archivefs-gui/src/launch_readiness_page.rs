@@ -1964,6 +1964,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "xemu" => Some("xemu"),
             "xenia" => Some("Xenia"),
             "dolphin" => Some("Dolphin"),
+            "scummvm" => Some("ScummVM"),
             _ => None,
         },
         LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),

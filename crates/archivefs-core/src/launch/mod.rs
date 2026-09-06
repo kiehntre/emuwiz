@@ -276,7 +276,8 @@ pub use input_projection::{
     project_dolphin_wii_launch_input, project_duckstation_launch_input,
     project_flycast_launch_input, project_hatari_launch_input, project_melonds_launch_input,
     project_pcsx2_launch_input, project_ppsspp_launch_input, project_rpcs3_launch_input,
-    project_sega_cd_launch_input, project_xemu_launch_input, project_xenia_launch_input,
+    project_scummvm_launch_input, project_sega_cd_launch_input, project_xemu_launch_input,
+    project_xenia_launch_input,
 };
 pub use integration::{
     DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,

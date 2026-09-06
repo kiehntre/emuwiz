@@ -206,6 +206,13 @@ fn find_nintendo_ds_game_key(facts: &[VerifiedIdentityFact]) -> Option<String> {
     })
 }
 
+fn find_scummvm_game_id(facts: &[VerifiedIdentityFact]) -> Option<String> {
+    facts.iter().find_map(|fact| match fact {
+        VerifiedIdentityFact::ScummVmGameId(value) => Some(value.clone()),
+        _ => None,
+    })
+}
+
 /// The outcome of projecting verified identity facts onto one adapter's
 /// request shape. `Unavailable` is the fail-closed default: it is what
 /// every projector returns when none of the supplied facts is the one
@@ -223,6 +230,19 @@ pub enum LaunchInputProjection<T> {
     /// never populated from another platform's identity or from
     /// emulator/filename/extension context.
     Unavailable { detail: &'static str },
+}
+
+/// Projects the verified ScummVM `engine:game` identity used by the native
+/// ScummVM command planner. No folder name or filename can authorize this.
+pub fn project_scummvm_launch_input(
+    facts: &[VerifiedIdentityFact],
+) -> LaunchInputProjection<String> {
+    match find_scummvm_game_id(facts) {
+        Some(game_id) => LaunchInputProjection::Authorized(game_id),
+        None => LaunchInputProjection::Unavailable {
+            detail: "no verified ScummVM engine:game ID among the supplied identity facts",
+        },
+    }
 }
 
 /// Projects onto [`PpssppGameRequest`] via the existing

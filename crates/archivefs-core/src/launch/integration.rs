@@ -26,7 +26,8 @@ use crate::launch::input_projection::{
     LaunchInputProjection, VerifiedIdentityFact, project_amiga_whdload_launch_input,
     project_duckstation_launch_input, project_flycast_launch_input, project_hatari_launch_input,
     project_melonds_launch_input, project_pcsx2_launch_input, project_ppsspp_launch_input,
-    project_rpcs3_launch_input, project_xemu_launch_input, project_xenia_launch_input,
+    project_rpcs3_launch_input, project_scummvm_launch_input, project_xemu_launch_input,
+    project_xenia_launch_input,
 };
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, RememberedPreference,
@@ -37,6 +38,7 @@ use crate::launch::readiness::{
     hatari_firmware_readiness, pcsx2_firmware_readiness, ppsspp_firmware_readiness,
     rpcs3_firmware_readiness,
 };
+use crate::launch::scummvm_command::ScummVmNativeLaunchBinding;
 use crate::patch_manager::{
     AmigaEmulatorKind, AmigaGameInspection, AmigaKickstartState, AmigaProfile, CemuProfile,
     DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
@@ -138,6 +140,13 @@ pub enum DiscoveredStandaloneProfile<'a> {
     },
     OpenMsx {
         profile: &'a crate::patch_manager::OpenMsxProfile,
+    },
+    /// A discovered native ScummVM binding. The verified engine:game ID is
+    /// projected from identity facts; the binding itself is revalidated by
+    /// ScummVM preflight before execution.
+    ScummVm {
+        binding: &'a ScummVmNativeLaunchBinding,
+        eligible: bool,
     },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
@@ -309,6 +318,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn openmsx(profile: &'a crate::patch_manager::OpenMsxProfile) -> Self {
         Self::OpenMsx { profile }
+    }
+
+    pub fn scummvm(binding: &'a ScummVmNativeLaunchBinding, eligible: bool) -> Self {
+        Self::ScummVm { binding, eligible }
     }
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
@@ -579,6 +592,17 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }
+            DiscoveredStandaloneProfile::ScummVm { binding, eligible }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "ScummVM")
+                    && authorized(project_scummvm_launch_input(input.verified_identity_facts))
+            => Some(StandaloneProfileInput {
+                adapter_id: "scummvm",
+                profile_id: binding.executable.display().to_string(),
+                profile_path: Some(binding.executable.clone()),
+                eligible: *eligible,
+                firmware: FirmwareReadiness::NotRequired,
+            }),
             DiscoveredStandaloneProfile::Vita3k { profile }
                 if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
                     if identity.platform_id == "PlayStation Vita") =>
@@ -1290,6 +1314,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn verified_scummvm_game_projects_as_a_standalone_candidate() {
+        let identity = resolved("ScummVM", "scumm:monkey");
+        let binding = ScummVmNativeLaunchBinding {
+            executable: PathBuf::from("/usr/games/scummvm"),
+        };
+        let profiles = [DiscoveredStandaloneProfile::scummvm(&binding, true)];
+        let plan = plan(
+            &identity,
+            &[VerifiedIdentityFact::ScummVmGameId(
+                "scumm:monkey".to_string(),
+            )],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "scummvm",
+                ..
+            }
+        ));
+        assert_eq!(plan.candidates[0].firmware, FirmwareReadiness::NotRequired);
+    }
+
+    #[test]
+    fn scummvm_without_verified_game_id_is_not_projected() {
+        let identity = resolved("ScummVM", "scumm:monkey");
+        let binding = ScummVmNativeLaunchBinding {
+            executable: PathBuf::from("/usr/games/scummvm"),
+        };
+        let profiles = [DiscoveredStandaloneProfile::scummvm(&binding, true)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert!(plan.candidates.iter().all(|candidate| {
+            !matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "scummvm",
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
