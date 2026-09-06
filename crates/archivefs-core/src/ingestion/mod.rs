@@ -41,6 +41,7 @@ pub mod content_registry;
 pub mod cue_bin;
 pub mod discovery;
 pub mod gdi;
+pub mod structural_probe;
 
 #[cfg(test)]
 mod tests;

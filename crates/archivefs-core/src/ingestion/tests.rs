@@ -48,6 +48,11 @@ fn minimal_crt() -> Vec<u8> {
     image
 }
 
+fn minimal_zx_tap() -> Vec<u8> {
+    // One two-byte data block: flag and checksum XOR to zero.
+    vec![2, 0, 0xff, 0xff]
+}
+
 fn minimal_d64() -> Vec<u8> {
     let mut image = vec![0; 174_848];
     let sectors_on_track = |track: u8| match track {
@@ -382,6 +387,31 @@ fn a_lone_bin_without_a_cue_is_flagged_missing_paired_file_not_silently_dropped(
         Some(SkipReason::MissingPairedFile)
     );
     assert!(!report.items[0].explanation.is_empty());
+}
+
+#[test]
+fn structurally_valid_zx_tap_overrides_a_misleading_bin_extension() {
+    let dir = source_dir("structural-zx-tap-bin");
+    std::fs::write(dir.path().join("game.bin"), minimal_zx_tap()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::TapeImage));
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert!(item.explanation.contains("ZX Spectrum TAP"));
+}
+
+#[test]
+fn structurally_valid_zx_tap_is_found_without_an_extension() {
+    let dir = source_dir("structural-zx-tap-extensionless");
+    std::fs::write(dir.path().join("unknown-media"), minimal_zx_tap()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::TapeImage));
+    assert_eq!(item.platform_hint.as_deref(), Some("ZX Spectrum"));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
 }
 
 #[test]

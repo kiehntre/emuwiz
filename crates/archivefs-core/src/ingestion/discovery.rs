@@ -669,6 +669,9 @@ fn discover_direct_file(
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
 ) -> GameDiscovery {
     let Some(extension) = extension_lowercase(path) else {
+        if let Some(discovery) = discover_structural_fallback(path, source_root) {
+            return discovery;
+        }
         return skipped(
             path.to_path_buf(),
             ContainerKind::DirectFile,
@@ -740,6 +743,12 @@ fn discover_direct_file(
     }
 
     let Some(content) = content_kind_for_extension(&extension) else {
+        // A misleading extension is only a weak filename hint. Let the
+        // bounded registry reuse existing byte-level parsers before treating
+        // it as an unsupported type (including a lone `.bin`).
+        if let Some(discovery) = discover_structural_fallback(path, source_root) {
+            return discovery;
+        }
         if extension == "bin" {
             return skipped(
                 path.to_path_buf(),
@@ -778,6 +787,72 @@ fn discover_direct_file(
             explanation,
             skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
         },
+    }
+}
+
+/// Applies the small, shared structural fallback only after all stronger
+/// extension-specific inspectors above have had their chance. It can identify
+/// a media *format* but never upgrades a filename into a game/DAT identity.
+fn discover_structural_fallback(path: &Path, source_root: &Path) -> Option<GameDiscovery> {
+    let report = super::structural_probe::probe_unknown_file(path);
+    if report.matches.is_empty() {
+        if report.malformed.is_empty() {
+            return None;
+        }
+        return Some(skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            None,
+            SkipReason::InvalidContent(report.malformed.join("; ")),
+            format!(
+                "This file has a recognised media signature, but its bounded structure did not validate: {}.",
+                report.malformed.join("; ")
+            ),
+        ));
+    }
+
+    let formats: Vec<&str> = report.matches.iter().map(|item| item.format).collect();
+    let content = report.matches[0].content;
+    if report.is_ambiguous() {
+        return Some(skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(content),
+            SkipReason::AmbiguousPlatform,
+            format!(
+                "Unknown extension; more than one structural probe matched ({}) - EmuWiz did not choose one.",
+                formats.join(", ")
+            ),
+        ));
+    }
+
+    let probe = &report.matches[0];
+    let mut identity = identity_for(path, source_root);
+    if let (Some(platform), Some(summary)) = (probe.platform_hint, identity.as_mut()) {
+        // A parsed format's own platform-family marker outranks a weak
+        // extension/path hint, but remains structural media evidence only.
+        summary.platform = Some(platform.to_string());
+    }
+    let explanation = format!("Unknown extension; {}. {}.", probe.format, probe.evidence);
+    if probe.platform_hint.is_some() {
+        Some(accepted(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            probe.content,
+            identity,
+            explanation,
+        ))
+    } else {
+        Some(GameDiscovery {
+            path: path.to_path_buf(),
+            container: ContainerKind::DirectFile,
+            content: Some(probe.content),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation,
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        })
     }
 }
 
