@@ -6636,28 +6636,56 @@ pub fn load_read_only_snapshot_default() -> Result<ArchiveSnapshot> {
 }
 
 /// Loads one read-only view of a library without creating mount directories.
+///
+/// A config file that does not exist yet is not an error here: a fresh
+/// install genuinely has none until the user's first source/config action
+/// creates one, and `create_starter_config`'s own written comment already
+/// documents this as the intended, normal state ("a fresh install with zero
+/// sources loads normally"). This resolves to the same empty library a
+/// freshly-written starter config would produce - without writing anything,
+/// since this function is read-only by contract - using the exact "missing
+/// {path}" wording `run_doctor_with_mount_root_creation` already uses for
+/// the same condition, so Doctor's existing Finding adapter
+/// (`doctor_check_severity`) keeps reporting it as Info, never Error. A
+/// config file that exists but cannot be read for another reason (permission
+/// denied, not a regular file, etc.) is unaffected and still fails closed.
 pub fn load_read_only_snapshot(config_path: impl AsRef<Path>) -> Result<ArchiveSnapshot> {
     let config_path = config_path.as_ref().to_path_buf();
-    let contents = fs::read_to_string(&config_path)
-        .map_err(|source| ArchiveFsError::io(config_path.clone(), source))?;
-    let config = parse_config(&contents)?;
-    let identity = config_identity(&config_path, Some(&contents));
-    let records = current_archive_records(&config)?;
-    let stats = summarize_archive_records(&records);
-    let statuses = archive_statuses_from_records(&records);
-    let mut doctor = empty_doctor_report(config_path.clone());
-    doctor.pass("config file", format!("found {}", config_path.display()));
-    doctor.pass("config parses", "configuration parsed successfully");
-    complete_doctor_report(&mut doctor, &config, false, Some((&records, &statuses)));
+    match fs::read_to_string(&config_path) {
+        Ok(contents) => {
+            let config = parse_config(&contents)?;
+            let identity = config_identity(&config_path, Some(&contents));
+            let records = current_archive_records(&config)?;
+            let stats = summarize_archive_records(&records);
+            let statuses = archive_statuses_from_records(&records);
+            let mut doctor = empty_doctor_report(config_path.clone());
+            doctor.pass("config file", format!("found {}", config_path.display()));
+            doctor.pass("config parses", "configuration parsed successfully");
+            complete_doctor_report(&mut doctor, &config, false, Some((&records, &statuses)));
 
-    Ok(ArchiveSnapshot {
-        mount_root: config.mount_root.clone(),
-        records,
-        stats,
-        statuses,
-        doctor,
-        config_identity: identity,
-    })
+            Ok(ArchiveSnapshot {
+                mount_root: config.mount_root.clone(),
+                records,
+                stats,
+                statuses,
+                doctor,
+                config_identity: identity,
+            })
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            let mut doctor = empty_doctor_report(config_path.clone());
+            doctor.fail("config file", format!("missing {}", config_path.display()));
+            Ok(ArchiveSnapshot {
+                mount_root: PathBuf::from("/path/to/archivefs-mounts"),
+                records: Vec::new(),
+                stats: summarize_archive_records(&[]),
+                statuses: Vec::new(),
+                doctor,
+                config_identity: config_identity(&config_path, None),
+            })
+        }
+        Err(source) => Err(ArchiveFsError::io(config_path.clone(), source)),
+    }
 }
 
 pub fn select_archive_record(records: &[ArchiveRecord], input: &str) -> Result<ArchiveRecord> {
@@ -12838,6 +12866,58 @@ mod tests {
             snapshot.doctor.mounted_archives,
             expected_doctor.mounted_archives
         );
+    }
+
+    #[test]
+    fn read_only_snapshot_resolves_to_an_empty_library_when_no_config_file_exists_yet() {
+        // A genuinely fresh install has no config file until the user's
+        // first source/config action creates one - `create_starter_config`'s
+        // own written comment already documents this as the intended,
+        // normal state ("a fresh install with zero sources loads normally").
+        // This must resolve the same way a freshly-written starter config
+        // would, not fail closed as a hard error.
+        let root = test_root("read_only_snapshot_missing_config");
+        let config_path = root.join("does-not-exist").join("config.toml");
+        assert!(!config_path.exists());
+
+        let snapshot = load_read_only_snapshot(&config_path).unwrap();
+
+        assert_eq!(snapshot.records.len(), 0);
+        assert_eq!(snapshot.stats.total_archives, 0);
+        assert!(snapshot.statuses.is_empty());
+        assert_eq!(snapshot.config_identity.config_path, Some(config_path));
+        // No content digest was computed - there was no file to hash.
+        assert!(snapshot.config_identity.content_digest.is_none());
+        // Never actually created anything: this function is read-only by
+        // contract, even for the "no config yet" case.
+        assert!(!root.join("does-not-exist").exists());
+        // Reuses the exact "missing {path}" wording
+        // `run_doctor_with_mount_root_creation` already uses for the same
+        // condition, so Doctor's existing Finding adapter
+        // (`doctor_check_severity`) keeps reporting this as Info, never
+        // Error - this is a normal fresh-install state, not a failure.
+        assert!(
+            snapshot
+                .doctor
+                .checks
+                .iter()
+                .any(|check| check.name == "config file" && check.detail.starts_with("missing "))
+        );
+    }
+
+    #[test]
+    fn read_only_snapshot_still_fails_closed_when_the_config_path_is_unreadable_for_another_reason()
+    {
+        // Only a genuinely absent file is treated as "fresh install, no
+        // config yet". A config path that exists but cannot be read for a
+        // different reason (here: it is a directory, not a file) must keep
+        // failing closed exactly as before - this fix narrowly targets
+        // `io::ErrorKind::NotFound` only.
+        let root = test_root("read_only_snapshot_unreadable_config");
+        let config_path = root.join("config.toml");
+        fs::create_dir_all(&config_path).unwrap();
+
+        assert!(load_read_only_snapshot(&config_path).is_err());
     }
 
     #[test]

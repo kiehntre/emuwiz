@@ -133,7 +133,8 @@ fn skipping_the_source_step_advances_without_fabricating_a_source() {
     assert!(!app.onboarding_has_source());
     app.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::AddSource);
-    app.onboarding_advance_from(onboarding::OnboardingStep::AddSource);
+    let context = egui::Context::default();
+    app.onboarding_advance_from(&context, onboarding::OnboardingStep::AddSource);
     assert_eq!(
         app.onboarding_state,
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::DatSetup)
@@ -158,7 +159,8 @@ fn finish_persists_completion_and_closes_the_overlay() {
     app.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Verify);
     app.tools_overlay = ToolsOverlay::Onboarding;
-    app.onboarding_advance_from(onboarding::OnboardingStep::Verify);
+    let context = egui::Context::default();
+    app.onboarding_advance_from(&context, onboarding::OnboardingStep::Verify);
     assert_eq!(app.onboarding_state, onboarding::OnboardingState::Completed);
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
 }
@@ -196,7 +198,122 @@ fn skipping_setup_entirely_persists_skipped_and_closes_the_overlay() {
     app.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome);
     app.tools_overlay = ToolsOverlay::Onboarding;
-    app.onboarding_skip_entirely();
+    let context = egui::Context::default();
+    app.onboarding_skip_entirely(&context);
     assert_eq!(app.onboarding_state, onboarding::OnboardingState::Skipped);
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
+}
+
+// --- P0 regression: same-session Home load after onboarding completion ----
+//
+// Reproduces the exact real defect (see docs/APPIMAGE_FRESH_INSTALL_QA.md's
+// "restart/persistence result" finding): `ArchiveFsApp::new()`'s very first
+// archive-snapshot load runs before onboarding ever writes a config file, so
+// it resolves - once, terminally - before the user finishes onboarding.
+// Nothing else in the onboarding flow ever reloads that snapshot (adding a
+// source only reloads the separate `database_state`, used by Advanced
+// View's Library tab, never Gamer View's own snapshot), so the stale
+// terminal result stayed in place forever, and Gamer/Home View cannot tell
+// a terminal `Error` apart from one still in flight - both render the
+// permanent "Loading your games..." spinner. A fresh process relaunch
+// against the identical on-disk state loaded instantly because `new()`'s
+// *own* first load then succeeded (the config now exists) - this is what
+// made it a same-session-only, no-restart-required defect.
+//
+// These tests seed exactly that pre-condition (a stale, already-resolved
+// `LoadState`, never a `Loading` in flight) and call the real
+// `onboarding_advance_from`/`onboarding_skip_entirely` production methods -
+// no restart is simulated and no state is manually forced to `Ready`.
+
+#[test]
+fn finishing_onboarding_in_the_same_session_retries_the_stale_archive_load() {
+    let mut app = app_for_operation_tests();
+    // The exact real pre-condition: the first, pre-onboarding load already
+    // finished (its worker thread has already exited) with an error, because
+    // no config file existed yet at that moment.
+    app.state = LoadState::Error("configuration file is missing".to_string());
+    app.onboarding_state =
+        onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Verify);
+    app.tools_overlay = ToolsOverlay::Onboarding;
+    let generation_before = app.refresh_generation;
+
+    let context = egui::Context::default();
+    app.onboarding_advance_from(&context, onboarding::OnboardingStep::Verify);
+
+    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Completed);
+    assert_eq!(app.tools_overlay, ToolsOverlay::None);
+    match &app.state {
+        LoadState::Loading { generation, .. } => {
+            assert_ne!(
+                *generation, generation_before,
+                "finishing onboarding must start a genuinely new load, not \
+                 leave the stale pre-onboarding attempt in place"
+            );
+            assert_eq!(
+                *generation, app.refresh_generation,
+                "the freshly-started load's generation must be the one \
+                 poll_load will actually accept when its result arrives"
+            );
+        }
+        LoadState::Ready(_) => panic!(
+            "expected a fresh Loading state (a new worker was just spawned), \
+             not an already-resolved Ready value"
+        ),
+        LoadState::Error(message) => panic!(
+            "onboarding completion left the stale terminal Error in place \
+             instead of retrying the load: {message}"
+        ),
+    }
+}
+
+#[test]
+fn skipping_onboarding_entirely_also_retries_the_stale_archive_load() {
+    let mut app = app_for_operation_tests();
+    app.state = LoadState::Error("configuration file is missing".to_string());
+    app.onboarding_state =
+        onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome);
+    app.tools_overlay = ToolsOverlay::Onboarding;
+    let generation_before = app.refresh_generation;
+
+    let context = egui::Context::default();
+    app.onboarding_skip_entirely(&context);
+
+    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Skipped);
+    assert_eq!(app.tools_overlay, ToolsOverlay::None);
+    match &app.state {
+        LoadState::Loading { generation, .. } => {
+            assert_ne!(*generation, generation_before);
+            assert_eq!(*generation, app.refresh_generation);
+        }
+        _ => panic!("skipping onboarding entirely must also retry the stale load"),
+    }
+}
+
+#[test]
+fn advancing_through_a_non_final_onboarding_step_does_not_reload_the_archive_snapshot() {
+    // The fix must be scoped to the two terminal transitions only - every
+    // intermediate "Continue"/"Skip for now" must behave exactly as before,
+    // with no duplicate/extra worker spawned while the user is still
+    // browsing the wizard.
+    let mut app = app_for_operation_tests();
+    app.state = LoadState::Ready(Box::new(empty_loaded_data("/mount")));
+    app.onboarding_state =
+        onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome);
+    let generation_before = app.refresh_generation;
+
+    let context = egui::Context::default();
+    app.onboarding_advance_from(&context, onboarding::OnboardingStep::Welcome);
+
+    assert_eq!(
+        app.onboarding_state,
+        onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::AddSource)
+    );
+    assert_eq!(
+        app.refresh_generation, generation_before,
+        "an intermediate step change must never trigger a reload"
+    );
+    assert!(
+        matches!(&app.state, LoadState::Ready(_)),
+        "an intermediate step change must never disturb the current snapshot"
+    );
 }

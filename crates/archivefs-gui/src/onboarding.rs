@@ -196,7 +196,12 @@ impl ArchiveFsApp {
         self.tools_overlay = ToolsOverlay::Onboarding;
     }
 
-    pub(crate) fn onboarding_advance_from(&mut self, step: OnboardingStep) {
+    pub(crate) fn onboarding_advance_from(
+        &mut self,
+        context: &egui::Context,
+        step: OnboardingStep,
+    ) {
+        let finished = step.next().is_none();
         self.onboarding_state = match step.next() {
             Some(next) => OnboardingState::InProgress(next),
             None => {
@@ -205,12 +210,34 @@ impl ArchiveFsApp {
             }
         };
         save_onboarding_state(self.onboarding_state);
+        if finished {
+            // The very first archive-snapshot load (`ArchiveFsApp::new`'s
+            // own `start_load`) ran before onboarding ever added a source
+            // or wrote a config file, so its already-resolved result can
+            // never reflect what onboarding just configured. Nothing else
+            // in the onboarding flow ever calls `refresh` (adding a source
+            // only reloads the separate `database_state`, used by Advanced
+            // View's Library, not Gamer View's own snapshot), so without
+            // this the archive snapshot would stay on that stale first
+            // result forever - Gamer View cannot tell a terminal result
+            // apart from one still in flight, so it renders this as a
+            // permanent "Loading your games..." rather than the real
+            // (by-then-current) library. This mirrors every other
+            // "state changed, reload now" call site in `main.rs` (mount
+            // root set, mount/unmount success, Diagnostics "Continue"):
+            // one deterministic `refresh`, no timer, no polling loop.
+            self.refresh(context);
+        }
     }
 
-    pub(crate) fn onboarding_skip_entirely(&mut self) {
+    pub(crate) fn onboarding_skip_entirely(&mut self, context: &egui::Context) {
         self.onboarding_state = OnboardingState::Skipped;
         save_onboarding_state(self.onboarding_state);
         self.tools_overlay = ToolsOverlay::None;
+        // Same reasoning as the completion branch of `onboarding_advance_from`:
+        // this is also a terminal exit from onboarding, and the archive
+        // snapshot has never been reloaded since app startup.
+        self.refresh(context);
     }
 
     pub(crate) fn onboarding_has_source(&self) -> bool {
@@ -251,22 +278,27 @@ impl ArchiveFsApp {
             });
         });
         if skip_entirely_clicked {
-            self.onboarding_skip_entirely();
+            self.onboarding_skip_entirely(context);
             return;
         }
         ui.add_space(4.0);
         ui.strong(step.title());
         ui.add_space(8.0);
         match step {
-            OnboardingStep::Welcome => self.show_onboarding_welcome_step(ui, step),
+            OnboardingStep::Welcome => self.show_onboarding_welcome_step(ui, context, step),
             OnboardingStep::AddSource => self.show_onboarding_add_source_step(ui, context, step),
-            OnboardingStep::DatSetup => self.show_onboarding_dat_step(ui, step),
+            OnboardingStep::DatSetup => self.show_onboarding_dat_step(ui, context, step),
             OnboardingStep::EmulatorSetup => self.show_onboarding_emulator_step(ui, context, step),
-            OnboardingStep::Verify => self.show_onboarding_verify_step(ui, step),
+            OnboardingStep::Verify => self.show_onboarding_verify_step(ui, context, step),
         }
     }
 
-    fn show_onboarding_welcome_step(&mut self, ui: &mut egui::Ui, step: OnboardingStep) {
+    fn show_onboarding_welcome_step(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        step: OnboardingStep,
+    ) {
         ui.label(
             "EmuWiz will never do the following without an explicit, reviewed confirmation step:",
         );
@@ -283,7 +315,7 @@ impl ArchiveFsApp {
         );
         ui.add_space(12.0);
         if ui.button("Continue").clicked() {
-            self.onboarding_advance_from(step);
+            self.onboarding_advance_from(context, step);
         }
     }
 
@@ -306,15 +338,20 @@ impl ArchiveFsApp {
                 .add_enabled(has_source, egui::Button::new("Continue"))
                 .clicked()
             {
-                self.onboarding_advance_from(step);
+                self.onboarding_advance_from(context, step);
             }
             if ui.button("Skip for now").clicked() {
-                self.onboarding_advance_from(step);
+                self.onboarding_advance_from(context, step);
             }
         });
     }
 
-    fn show_onboarding_dat_step(&mut self, ui: &mut egui::Ui, step: OnboardingStep) {
+    fn show_onboarding_dat_step(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        step: OnboardingStep,
+    ) {
         ui.label(
             "A DAT is a trusted list of known-good game files, used only to verify your \
              collection - it is entirely optional. Adding one never requires a provider \
@@ -325,10 +362,10 @@ impl ArchiveFsApp {
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.button("Continue").clicked() {
-                self.onboarding_advance_from(step);
+                self.onboarding_advance_from(context, step);
             }
             if ui.button("Skip for now").clicked() {
-                self.onboarding_advance_from(step);
+                self.onboarding_advance_from(context, step);
             }
         });
     }
@@ -348,11 +385,16 @@ impl ArchiveFsApp {
         self.show_emulator_setup_page(ui, context);
         ui.add_space(12.0);
         if ui.button("Continue").clicked() {
-            self.onboarding_advance_from(step);
+            self.onboarding_advance_from(context, step);
         }
     }
 
-    fn show_onboarding_verify_step(&mut self, ui: &mut egui::Ui, step: OnboardingStep) {
+    fn show_onboarding_verify_step(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        step: OnboardingStep,
+    ) {
         if self.onboarding_dat_source_count() > 0 {
             ui.label(
                 "Verify compares your library against the DAT catalogue(s) you added - it only \
@@ -369,7 +411,7 @@ impl ArchiveFsApp {
             ui.add_space(12.0);
         }
         if ui.button("Finish").clicked() {
-            self.onboarding_advance_from(step);
+            self.onboarding_advance_from(context, step);
         }
     }
 }
