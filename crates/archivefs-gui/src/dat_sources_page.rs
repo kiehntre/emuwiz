@@ -52,8 +52,8 @@ use archivefs_core::dat::classification::{
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::managed_sources::{
     ManagedDatSources, default_managed_dat_sources_config_path, load_managed_dat_sources_from,
-    resolve_managed_dat_sources, resolve_redump_bios_sources, resolve_redump_games_sources,
-    save_managed_dat_sources_to,
+    resolve_fbneo_source, resolve_managed_dat_sources, resolve_redump_bios_sources,
+    resolve_redump_games_sources, save_managed_dat_sources_to,
 };
 use archivefs_core::dat::model::DatFormat;
 use archivefs_core::dat::parser::DiagnosticSeverity;
@@ -91,8 +91,8 @@ use archivefs_core::dat::updates::{
     HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
     ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState, ManagedDatUpdateFailureKind,
     ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy, RedumpBiosSystem,
-    RedumpGameSystem, check_managed_dat_update, managed_dat_root, rollback_managed_dat_to_previous,
-    update_managed_dat,
+    RedumpGameSystem, check_managed_dat_update, import_managed_fbneo_dat, managed_dat_root,
+    rollback_managed_dat_to_previous, update_managed_dat,
 };
 use archivefs_core::identity_source::no_intro::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
@@ -512,6 +512,7 @@ pub(crate) struct DatSourcesPageView {
     /// The deliberately closed set of ordinary Redump game/disc datasets.
     /// Unconfigured systems remain visible so configuration is explicit.
     pub(crate) redump_game_rows: Vec<ManagedDatSourceRowView>,
+    pub(crate) fbneo_rows: Vec<ManagedDatSourceRowView>,
     pub(crate) managed_load_error: Option<String>,
     pub(crate) managed_action_error: Option<String>,
     pub(crate) tosec_packs: Vec<TosecPackView>,
@@ -1670,6 +1671,11 @@ pub(crate) enum DatSourcesPageAction {
     },
     RemoveManagedRedumpGames {
         system: RedumpGameSystem,
+    },
+    AddManagedFbneo,
+    RemoveManagedFbneo,
+    ImportManagedFbneo {
+        path: PathBuf,
     },
     CheckManagedDat {
         source_id: ManagedDatSourceId,
@@ -3548,6 +3554,9 @@ impl DatSourcesPageState {
             DatSourcesPageAction::RemoveManagedRedumpGames { system } => {
                 self.remove_managed_redump_games(system);
             }
+            DatSourcesPageAction::AddManagedFbneo => self.add_managed_fbneo(),
+            DatSourcesPageAction::RemoveManagedFbneo => self.remove_managed_fbneo(),
+            DatSourcesPageAction::ImportManagedFbneo { path } => self.import_managed_fbneo(path),
             DatSourcesPageAction::CheckManagedDat { source_id } => {
                 self.start_managed_dat_operation(source_id, ManagedDatOperation::Check);
             }
@@ -4393,6 +4402,67 @@ impl DatSourcesPageState {
         self.managed_statuses
             .remove(&managed_source_key(&source_id));
         self.save_managed_sources(next);
+    }
+
+    fn add_managed_fbneo(&mut self) {
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if let Err(error) = next.add_fbneo(ManagedDatUpdatePolicy::Manual) {
+            self.managed_action_error = Some(error.to_string());
+            return;
+        }
+        self.save_managed_sources(next);
+    }
+
+    fn remove_managed_fbneo(&mut self) {
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let mut next = self.managed_sources.clone();
+        if next.remove_fbneo().is_none() {
+            return;
+        }
+        self.managed_statuses.remove(&managed_source_key(
+            &ManagedDatSourceDescriptor::fbneo()
+                .unwrap()
+                .source_id()
+                .clone(),
+        ));
+        self.save_managed_sources(next);
+    }
+
+    fn import_managed_fbneo(&mut self, path: PathBuf) {
+        self.managed_action_error = None;
+        if !self.can_change_managed_sources() {
+            return;
+        }
+        let Some(config) = self.managed_sources.fbneo_entry() else {
+            self.managed_action_error = Some("FBNeo managed source is not configured".to_string());
+            return;
+        };
+        let descriptor = match config.descriptor() {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                self.managed_action_error = Some(error.to_string());
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let options = ManagedDatUpdateOptions::new(self.managed_root.clone(), now);
+        match import_managed_fbneo_dat(&descriptor, &options, &path) {
+            Ok(outcome) => {
+                self.managed_statuses.insert(
+                    managed_source_key(descriptor.source_id()),
+                    managed_dat_status_from_outcome(outcome),
+                );
+            }
+            Err(error) => self.managed_action_error = Some(error.to_string()),
+        }
     }
 
     /// Imports a user-selected, already-extracted release-pack directory.
@@ -5448,6 +5518,17 @@ impl DatSourcesPageState {
                 ));
             }
         }
+        let mut fbneo_sources = ManagedDatSources::new();
+        if let Some(config) = self.managed_sources.fbneo_entry()
+            && fbneo_sources.add_fbneo(config.update_policy).is_ok()
+            && let Ok(Some((_config, _descriptor, _state, Some(source), _previous))) =
+                resolve_fbneo_source(&fbneo_sources, &self.managed_root)
+        {
+            sources.push(combined_source_from_managed(
+                source,
+                "FBNeo managed DAT".to_string(),
+            ));
+        }
         sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         sources
     }
@@ -5480,6 +5561,7 @@ impl DatSourcesPageState {
             managed_rows: self.managed_rows_view(),
             redump_bios_rows: self.redump_bios_rows_view(),
             redump_game_rows: self.redump_game_rows_view(),
+            fbneo_rows: self.fbneo_rows_view(),
             managed_load_error: self.managed_load_error.clone(),
             managed_action_error: self.managed_action_error.clone(),
             tosec_packs: self.tosec_packs_view(),
@@ -5876,6 +5958,57 @@ impl DatSourcesPageState {
             None,
             None,
         )
+    }
+
+    fn fbneo_rows_view(&self) -> Vec<ManagedDatSourceRowView> {
+        let descriptor = ManagedDatSourceDescriptor::fbneo()
+            .expect("the fixed FBNeo descriptor must remain valid");
+        let configured = self.managed_sources.fbneo_entry();
+        if configured.is_none() {
+            return vec![self.managed_row_from_parts(
+                descriptor,
+                ManagedDatProvider::Fbneo,
+                "Local FBNeo DAT".to_string(),
+                false,
+                ManagedDatUpdatePolicy::Manual,
+                None,
+                None,
+                None,
+                None,
+            )];
+        }
+        let mut sources = ManagedDatSources::new();
+        let policy = configured.expect("checked above").update_policy;
+        if sources.add_fbneo(policy).is_err() {
+            return Vec::new();
+        }
+        match resolve_fbneo_source(&sources, &self.managed_root) {
+            Ok(Some((_config, descriptor, state, current, previous))) => {
+                vec![self.managed_row_from_parts(
+                    descriptor,
+                    ManagedDatProvider::Fbneo,
+                    "Local FBNeo DAT".to_string(),
+                    true,
+                    policy,
+                    state.as_ref(),
+                    current.as_ref(),
+                    previous.as_ref(),
+                    None,
+                )]
+            }
+            Ok(None) => Vec::new(),
+            Err(error) => vec![self.managed_row_from_parts(
+                ManagedDatSourceDescriptor::fbneo().expect("fixed FBNeo descriptor"),
+                ManagedDatProvider::Fbneo,
+                "Local FBNeo DAT".to_string(),
+                true,
+                policy,
+                None,
+                None,
+                None,
+                Some(format!("Managed state could not be resolved: {error}")),
+            )],
+        }
     }
 
     fn tosec_packs_view(&self) -> Vec<TosecPackView> {
@@ -8397,11 +8530,13 @@ fn show_managed_dat_sources_section(
         ui,
         "Managed DAT Sources",
         Some(
-            "Built-in MAME and Redump sources. Checks and downloads happen only after you click an action.",
+            "Managed MAME, Redump, and FBNeo sources. Checks and imports happen only after you click an action.",
         ),
     );
-    let managed_count =
-        view.managed_rows.len() + view.redump_bios_rows.len() + view.redump_game_rows.len();
+    let managed_count = view.managed_rows.len()
+        + view.redump_bios_rows.len()
+        + view.redump_game_rows.len()
+        + view.fbneo_rows.len();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{managed_count} source(s)")).strong());
         if ui.button("Expand all").clicked() {
@@ -8462,6 +8597,30 @@ fn show_managed_dat_sources_section(
         });
     });
     ui.add_space(8.0);
+
+    widgets::section_header(
+        ui,
+        "FBNeo DAT",
+        Some(
+            "Import an explicit local FBNeo DAT. EmuWiz does not download or poll an FBNeo provider.",
+        ),
+    );
+    for row in &view.fbneo_rows {
+        let open = ui_state
+            .managed_sources_expanded
+            .unwrap_or(managed_count < 10);
+        egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
+            .id_salt(("managed-dat-source", row.source_id.clone()))
+            .default_open(open)
+            .show(ui, |ui| {
+                if action.is_none()
+                    && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
+                {
+                    action = Some(row_action);
+                }
+            });
+        ui.add_space(8.0);
+    }
 
     for row in &view.managed_rows {
         let open = ui_state
@@ -8651,6 +8810,19 @@ fn show_managed_dat_source_row(
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            if row.provider == ManagedDatProvider::Fbneo
+                && widgets::action_button(
+                    ui,
+                    "Import FBNeo DAT…",
+                    widgets::ActionStyle::Primary,
+                    !busy,
+                )
+                .clicked()
+                && action.is_none()
+                && let Some(path) = choose_local_dat_file("Choose an FBNeo DAT")
+            {
+                action = Some(DatSourcesPageAction::ImportManagedFbneo { path });
+            }
             if widgets::action_button(
                 ui,
                 "Check",
@@ -8817,6 +8989,7 @@ fn managed_provider_label(provider: ManagedDatProvider) -> &'static str {
         ManagedDatProvider::MameSoftwareList => "MAME software list",
         ManagedDatProvider::RedumpBios => "Redump BIOS DAT",
         ManagedDatProvider::RedumpGames => "Redump game/disc DAT",
+        ManagedDatProvider::Fbneo => "FBNeo DAT",
     }
 }
 
@@ -8825,6 +8998,7 @@ fn managed_provider_short_label(provider: ManagedDatProvider) -> &'static str {
         ManagedDatProvider::MameSoftwareList => "MAME source",
         ManagedDatProvider::RedumpBios => "BIOS source",
         ManagedDatProvider::RedumpGames => "game/disc source",
+        ManagedDatProvider::Fbneo => "FBNeo source",
     }
 }
 
@@ -8838,6 +9012,7 @@ fn managed_update_policy_label(policy: ManagedDatUpdatePolicy) -> &'static str {
 fn managed_add_action(row: &ManagedDatSourceRowView) -> Option<DatSourcesPageAction> {
     match row.provider {
         ManagedDatProvider::MameSoftwareList => None,
+        ManagedDatProvider::Fbneo => Some(DatSourcesPageAction::AddManagedFbneo),
         ManagedDatProvider::RedumpBios => redump_bios_from_source_key(&row.source_id.source_key)
             .map(|system| DatSourcesPageAction::AddManagedRedumpBios { system }),
         ManagedDatProvider::RedumpGames => redump_game_from_source_key(&row.source_id.source_key)
@@ -8856,6 +9031,7 @@ fn managed_remove_action(row: &ManagedDatSourceRowView) -> Option<DatSourcesPage
             .map(|system| DatSourcesPageAction::RemoveManagedRedumpBios { system }),
         ManagedDatProvider::RedumpGames => redump_game_from_source_key(&row.source_id.source_key)
             .map(|system| DatSourcesPageAction::RemoveManagedRedumpGames { system }),
+        ManagedDatProvider::Fbneo => Some(DatSourcesPageAction::RemoveManagedFbneo),
     }
 }
 

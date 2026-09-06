@@ -1,9 +1,9 @@
 //! Persistent configuration for explicitly managed DAT sources.
 //!
 //! This is intentionally separate from `dat_sources.toml`: that file remains
-//! wholly user-local paths.  The only persisted authority here is a MAME
-//! software-list's authoritative name plus its Disabled/Manual policy.  URLs,
-//! repositories, provider names, and transport settings are not configurable.
+//! wholly user-local paths. Persisted authority is limited to typed MAME and
+//! Redump sources plus the explicit local FBNeo source. URLs, repositories,
+//! provider names, and transport settings are not configurable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,9 @@ use crate::{ArchiveFsError, Result};
 pub const MANAGED_DAT_SOURCES_CONFIG_FILE: &str = "managed_dat_sources.toml";
 
 /// The complete managed-DAT configuration.  A named table is used rather than
-/// a provider discriminator: MAME software lists and Redump's fixed BIOS
-/// datasets are the only supported entry types, so no free-text provider,
-/// URL, or endpoint string can ever be supplied or reinterpreted later.
+/// a provider discriminator: MAME software lists, Redump's fixed datasets,
+/// and the single local FBNeo source are the only supported entry types, so
+/// no free-text provider, URL, or endpoint string can ever be supplied later.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedDatSourcesConfig {
@@ -37,6 +37,22 @@ pub struct ManagedDatSourcesConfig {
     /// never a URL or endpoint. See [`ManagedRedumpGamesConfigEntry`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redump_games: Vec<ManagedRedumpGamesConfigEntry>,
+    /// The single typed FBNeo source accepts only explicit local imports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fbneo: Option<ManagedFbneoConfigEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedFbneoConfigEntry {
+    #[serde(default)]
+    pub update_policy: ManagedDatUpdatePolicy,
+}
+
+impl ManagedFbneoConfigEntry {
+    pub fn descriptor(&self) -> Result<ManagedDatSourceDescriptor> {
+        Ok(ManagedDatSourceDescriptor::fbneo()?.with_update_policy(self.update_policy))
+    }
 }
 
 /// One explicitly configured MAME software list.  `authoritative_name` is
@@ -101,6 +117,7 @@ pub struct ManagedDatSources {
     entries: Vec<ManagedMameSoftwareListConfigEntry>,
     redump_bios_entries: Vec<ManagedRedumpBiosConfigEntry>,
     redump_games_entries: Vec<ManagedRedumpGamesConfigEntry>,
+    fbneo_entry: Option<ManagedFbneoConfigEntry>,
 }
 
 impl ManagedDatSources {
@@ -119,6 +136,9 @@ impl ManagedDatSources {
         for entry in config.redump_games {
             sources.add_redump_games(entry.system, entry.update_policy)?;
         }
+        if let Some(entry) = config.fbneo {
+            sources.add_fbneo(entry.update_policy)?;
+        }
         Ok(sources)
     }
 
@@ -127,6 +147,7 @@ impl ManagedDatSources {
             mame_software_lists: self.entries.clone(),
             redump_bios: self.redump_bios_entries.clone(),
             redump_games: self.redump_games_entries.clone(),
+            fbneo: self.fbneo_entry,
         }
     }
 
@@ -140,6 +161,27 @@ impl ManagedDatSources {
 
     pub fn redump_games_entries(&self) -> &[ManagedRedumpGamesConfigEntry] {
         &self.redump_games_entries
+    }
+
+    pub fn fbneo_entry(&self) -> Option<ManagedFbneoConfigEntry> {
+        self.fbneo_entry
+    }
+
+    pub fn add_fbneo(&mut self, update_policy: ManagedDatUpdatePolicy) -> Result<()> {
+        ManagedDatSourceDescriptor::fbneo()?
+            .with_update_policy(update_policy)
+            .validate()?;
+        if self.fbneo_entry.is_some() {
+            return Err(ArchiveFsError::Config(
+                "FBNeo source is already configured".to_string(),
+            ));
+        }
+        self.fbneo_entry = Some(ManagedFbneoConfigEntry { update_policy });
+        Ok(())
+    }
+
+    pub fn remove_fbneo(&mut self) -> Option<ManagedFbneoConfigEntry> {
+        self.fbneo_entry.take()
     }
 
     /// Adds only a source constructible through the typed MAME descriptor.
@@ -272,7 +314,7 @@ impl ManagedDatSources {
         Some(self.redump_games_entries.remove(index))
     }
 
-    /// Produces typed descriptors for every configured source of all three
+    /// Produces typed descriptors for every configured source of all four
     /// providers, preserving each source's explicit policy.
     pub fn descriptors(&self) -> Result<Vec<ManagedDatSourceDescriptor>> {
         let mame = self.entries.iter().map(|entry| entry.descriptor());
@@ -284,7 +326,14 @@ impl ManagedDatSources {
             .redump_games_entries
             .iter()
             .map(|entry| entry.descriptor());
-        mame.chain(redump_bios).chain(redump_games).collect()
+        let mut descriptors = mame
+            .chain(redump_bios)
+            .chain(redump_games)
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(entry) = self.fbneo_entry {
+            descriptors.push(entry.descriptor()?);
+        }
+        Ok(descriptors)
     }
 }
 
@@ -348,7 +397,7 @@ pub fn save_managed_dat_sources_to(
     crate::atomic_write_text(
         path.as_ref(),
         &format!(
-            "# EmuWiz managed DAT source configuration\n# Only typed MAME software-list names and fixed Redump BIOS systems are accepted.\n\n{body}"
+            "# EmuWiz managed DAT source configuration\n# Only typed MAME/Redump sources and the explicit local FBNeo source are accepted.\n\n{body}"
         ),
     )
 }
@@ -547,10 +596,48 @@ pub fn resolve_redump_games_sources_default(
     resolve_redump_games_sources(sources, &managed_dat_root()?)
 }
 
+/// Resolves the explicitly configured FBNeo source against local managed
+/// state. No filesystem mutation or network operation is performed.
+pub fn resolve_fbneo_source(
+    sources: &ManagedDatSources,
+    managed_root: &Path,
+) -> Result<
+    Option<(
+        ManagedFbneoConfigEntry,
+        ManagedDatSourceDescriptor,
+        Option<ManagedDatState>,
+        Option<ManagedDatReadOnlySource>,
+        Option<ManagedDatReadOnlySource>,
+    )>,
+> {
+    let Some(config) = sources.fbneo_entry() else {
+        return Ok(None);
+    };
+    let descriptor = config.descriptor()?;
+    let state = match load_managed_dat_state(managed_root, &descriptor) {
+        Ok(state) => Some(state),
+        Err(ArchiveFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(state) = state else {
+        return Ok(Some((config, descriptor, None, None, None)));
+    };
+    let current = Some(resolve_current_managed_dat_source(managed_root, &state)?);
+    let previous = state
+        .previous_snapshot
+        .as_ref()
+        .map(|snapshot| resolve_managed_dat_snapshot_source(managed_root, &state, snapshot))
+        .transpose()?;
+    Ok(Some((config, descriptor, Some(state), current, previous)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dat::limits::DatLimits;
+    use crate::dat::model::DatEcosystem;
     use crate::dat::parsers::parse_dat_file;
     use crate::dat::sources::{DatSourceEntry, DatSourceKind};
     use crate::dat::updates::{ManagedDatSnapshot, ManagedDatState, save_managed_dat_state};
@@ -637,6 +724,26 @@ mod tests {
             reloaded.entries()[1].update_policy,
             ManagedDatUpdatePolicy::Manual
         );
+    }
+
+    #[test]
+    fn fbneo_configuration_round_trips_as_one_typed_local_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("managed_dat_sources.toml");
+        let mut sources = ManagedDatSources::new();
+        sources.add_fbneo(ManagedDatUpdatePolicy::Manual).unwrap();
+        save_managed_dat_sources_to(&config, &sources).unwrap();
+        let mut reloaded = load_managed_dat_sources_from(&config).unwrap();
+        assert_eq!(reloaded, sources);
+        assert_eq!(
+            reloaded.fbneo_entry().unwrap().update_policy,
+            ManagedDatUpdatePolicy::Manual
+        );
+        assert_eq!(
+            reloaded.descriptors().unwrap()[0].expected_ecosystem(),
+            DatEcosystem::FBNeo
+        );
+        assert!(reloaded.remove_fbneo().is_some());
     }
 
     #[test]

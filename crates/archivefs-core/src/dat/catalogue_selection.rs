@@ -158,6 +158,7 @@ fn managed_provider_token(provider: ManagedDatProvider) -> &'static str {
         ManagedDatProvider::MameSoftwareList => "mame",
         ManagedDatProvider::RedumpBios => "redump-bios",
         ManagedDatProvider::RedumpGames => "redump-games",
+        ManagedDatProvider::Fbneo => "fbneo",
     }
 }
 
@@ -667,6 +668,11 @@ fn managed_descriptors(
         ManagedDatProvider::RedumpBios => managed_sources
             .redump_bios_entries()
             .iter()
+            .map(|c| map(c.descriptor()))
+            .collect(),
+        ManagedDatProvider::Fbneo => managed_sources
+            .fbneo_entry()
+            .into_iter()
             .map(|c| map(c.descriptor()))
             .collect(),
     }

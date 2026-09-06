@@ -6,6 +6,11 @@ use super::{
     FBNeoImportError, import_fbneo_dat, lookup_fbneo, lookup_fbneo_disk_sha1,
     observations_from_fbneo_disk_matches, observations_from_fbneo_matches,
 };
+use crate::dat::managed_sources::{ManagedDatSources, resolve_fbneo_source};
+use crate::dat::updates::{
+    ManagedDatSnapshot, ManagedDatUpdateFailureKind, ManagedDatUpdateOptions,
+    ManagedDatUpdateOutcome, import_managed_fbneo_dat, rollback_managed_dat_to_previous,
+};
 use crate::dat::{
     classification::DatContentClass,
     identity::{DatPlatformIdentity, identify_dat_source},
@@ -59,6 +64,103 @@ fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
 fn source() -> super::ImportedFBNeoSource {
     let dir = tempdir().unwrap();
     import_fbneo_dat(&write(dir.path(), "catalogue.dat", FBNEO_XML)).unwrap()
+}
+
+fn managed_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    ManagedDatUpdateOptions,
+) {
+    let dir = tempdir().unwrap();
+    let input = write(dir.path(), "fbneo.dat", FBNEO_XML);
+    let root = dir.path().join("managed-dats");
+    let options = ManagedDatUpdateOptions::new(root, 100);
+    (dir, input, options)
+}
+
+#[test]
+fn managed_fbneo_import_is_atomic_typed_and_idempotent() {
+    let (_dir, input, options) = managed_fixture();
+    let descriptor = crate::dat::updates::ManagedDatSourceDescriptor::fbneo().unwrap();
+    let first = import_managed_fbneo_dat(&descriptor, &options, &input).unwrap();
+    assert!(matches!(first, ManagedDatUpdateOutcome::Updated { .. }));
+    let second = import_managed_fbneo_dat(&descriptor, &options, &input).unwrap();
+    assert!(matches!(second, ManagedDatUpdateOutcome::UpToDate { .. }));
+    let mut sources = ManagedDatSources::new();
+    sources
+        .add_fbneo(crate::dat::updates::ManagedDatUpdatePolicy::Manual)
+        .unwrap();
+    let resolved = resolve_fbneo_source(&sources, &options.managed_root)
+        .unwrap()
+        .unwrap();
+    let state = resolved.2.unwrap();
+    assert_eq!(
+        state.source_id.provider,
+        crate::dat::updates::ManagedDatProvider::Fbneo
+    );
+    assert_eq!(state.parsed_ecosystem, DatEcosystem::FBNeo);
+    assert_eq!(state.retrieved_at_unix_seconds, Some(100));
+    assert!(
+        state
+            .validation_summary
+            .as_deref()
+            .unwrap()
+            .contains("FBNeo")
+    );
+    assert!(resolved.3.is_some());
+}
+
+#[test]
+fn managed_fbneo_rejects_wrong_and_malformed_inputs_without_state() {
+    let (dir, _input, options) = managed_fixture();
+    let wrong = write(
+        dir.path(),
+        "wrong.dat",
+        "<datafile><header><name>No-Intro</name></header></datafile>",
+    );
+    let malformed = write(dir.path(), "broken.dat", "not xml");
+    let descriptor = crate::dat::updates::ManagedDatSourceDescriptor::fbneo().unwrap();
+    for path in [wrong, malformed] {
+        let result = import_managed_fbneo_dat(&descriptor, &options, &path).unwrap();
+        assert!(matches!(
+            result,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::WrongEcosystem
+                    | ManagedDatUpdateFailureKind::Parser,
+                ..
+            }
+        ));
+    }
+    let state_path = options
+        .managed_root
+        .join(
+            crate::dat::updates::ManagedDatSourceDescriptor::fbneo()
+                .unwrap()
+                .source_id()
+                .storage_relative_path(),
+        )
+        .join("state.json");
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn managed_fbneo_import_retains_previous_and_rolls_back() {
+    let (dir, input, options) = managed_fixture();
+    let descriptor = crate::dat::updates::ManagedDatSourceDescriptor::fbneo().unwrap();
+    import_managed_fbneo_dat(&descriptor, &options, &input).unwrap();
+    let newer = write(
+        dir.path(),
+        "newer.dat",
+        &FBNEO_XML.replace("test-1", "test-2"),
+    );
+    import_managed_fbneo_dat(&descriptor, &options, &newer).unwrap();
+    let state =
+        crate::dat::updates::load_managed_dat_state(&options.managed_root, &descriptor).unwrap();
+    assert!(state.previous_snapshot.is_some());
+    let rolled = rollback_managed_dat_to_previous(&options.managed_root, &descriptor).unwrap();
+    assert_eq!(rolled.current_snapshot, state.previous_snapshot.unwrap());
+    assert!(rolled.previous_snapshot.is_some());
+    let _ = ManagedDatSnapshot::new(rolled.current_snapshot.sha256).unwrap();
 }
 
 #[test]

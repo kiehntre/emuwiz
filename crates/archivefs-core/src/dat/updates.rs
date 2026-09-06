@@ -65,6 +65,8 @@ pub enum ManagedDatProvider {
     /// family (see [`RedumpGameSystem::fixed_url`]'s own doc comment) - but
     /// only systems this codebase has actual evidence for are ever added.
     RedumpGames,
+    /// Explicitly imported local FBNeo DATs; no network endpoint is implied.
+    Fbneo,
 }
 
 impl ManagedDatProvider {
@@ -73,6 +75,7 @@ impl ManagedDatProvider {
             Self::MameSoftwareList => "mame-software-list",
             Self::RedumpBios => "redump-bios",
             Self::RedumpGames => "redump-games",
+            Self::Fbneo => "fbneo",
         }
     }
 }
@@ -202,6 +205,13 @@ pub struct ManagedDatSourceId {
 }
 
 impl ManagedDatSourceId {
+    pub fn fbneo() -> Self {
+        Self {
+            provider: ManagedDatProvider::Fbneo,
+            source_key: "fbneo".to_string(),
+        }
+    }
+
     /// Creates the stable ID for one authoritative MAME software-list name.
     pub fn mame_software_list(source_key: impl Into<String>) -> Result<Self> {
         let source_key = source_key.into();
@@ -250,6 +260,12 @@ impl ManagedDatSourceId {
                     return Err(config_error(
                         "Redump game DAT source key must name one of the fixed supported systems",
                     ));
+                }
+                Ok(())
+            }
+            ManagedDatProvider::Fbneo => {
+                if self.source_key != "fbneo" {
+                    return Err(config_error("FBNeo source key must be fbneo"));
                 }
                 Ok(())
             }
@@ -304,6 +320,8 @@ enum ManagedDatRemote {
     /// versioned DAT link. The resolver accepts exactly one system-matching
     /// `https://redump.info/static/bios/*.dat` link before fetching it.
     RedumpBiosDownloadsPage,
+    /// The user supplies the DAT; it is copied only after validation.
+    LocalImport,
 }
 
 /// Which authoritative dataset a downloaded DAT's parsed header must
@@ -322,6 +340,7 @@ enum ExpectedDataset {
     /// matching, and an explicit rejection of anything that looks like a
     /// BIOS dataset instead.
     RedumpGames(RedumpGameSystem),
+    FBNeo,
 }
 
 /// A built-in, validated future source contract.
@@ -402,6 +421,20 @@ impl ManagedDatSourceDescriptor {
         Ok(descriptor)
     }
 
+    /// Constructs the typed local-import contract for FBNeo DATs.
+    pub fn fbneo() -> Result<Self> {
+        let descriptor = Self {
+            source_id: ManagedDatSourceId::fbneo(),
+            remote: ManagedDatRemote::LocalImport,
+            expected_ecosystem: DatEcosystem::FBNeo,
+            expected_dataset: ExpectedDataset::FBNeo,
+            max_payload_size: DEFAULT_MAX_FILE_SIZE,
+            update_policy: ManagedDatUpdatePolicy::Manual,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
     pub fn source_id(&self) -> &ManagedDatSourceId {
         &self.source_id
     }
@@ -411,9 +444,9 @@ impl ManagedDatSourceDescriptor {
     pub fn repository(&self) -> Option<&'static str> {
         match &self.remote {
             ManagedDatRemote::GithubCommitPinned { repository, .. } => Some(repository),
-            ManagedDatRemote::DirectHttps { .. } | ManagedDatRemote::RedumpBiosDownloadsPage => {
-                None
-            }
+            ManagedDatRemote::DirectHttps { .. }
+            | ManagedDatRemote::RedumpBiosDownloadsPage
+            | ManagedDatRemote::LocalImport => None,
         }
     }
 
@@ -425,9 +458,9 @@ impl ManagedDatSourceDescriptor {
                 repository_relative_path,
                 ..
             } => Some(repository_relative_path),
-            ManagedDatRemote::DirectHttps { .. } | ManagedDatRemote::RedumpBiosDownloadsPage => {
-                None
-            }
+            ManagedDatRemote::DirectHttps { .. }
+            | ManagedDatRemote::RedumpBiosDownloadsPage
+            | ManagedDatRemote::LocalImport => None,
         }
     }
 
@@ -441,7 +474,9 @@ impl ManagedDatSourceDescriptor {
     pub fn expected_softwarelist_name(&self) -> &str {
         match &self.expected_dataset {
             ExpectedDataset::MameSoftwareList(name) => name,
-            ExpectedDataset::RedumpBios(_) | ExpectedDataset::RedumpGames(_) => "",
+            ExpectedDataset::RedumpBios(_)
+            | ExpectedDataset::RedumpGames(_)
+            | ExpectedDataset::FBNeo => "",
         }
     }
 
@@ -450,7 +485,9 @@ impl ManagedDatSourceDescriptor {
     pub fn redump_bios_system(&self) -> Option<RedumpBiosSystem> {
         match &self.expected_dataset {
             ExpectedDataset::RedumpBios(system) => Some(*system),
-            ExpectedDataset::MameSoftwareList(_) | ExpectedDataset::RedumpGames(_) => None,
+            ExpectedDataset::MameSoftwareList(_)
+            | ExpectedDataset::RedumpGames(_)
+            | ExpectedDataset::FBNeo => None,
         }
     }
 
@@ -459,7 +496,9 @@ impl ManagedDatSourceDescriptor {
     pub fn redump_games_system(&self) -> Option<RedumpGameSystem> {
         match &self.expected_dataset {
             ExpectedDataset::RedumpGames(system) => Some(*system),
-            ExpectedDataset::MameSoftwareList(_) | ExpectedDataset::RedumpBios(_) => None,
+            ExpectedDataset::MameSoftwareList(_)
+            | ExpectedDataset::RedumpBios(_)
+            | ExpectedDataset::FBNeo => None,
         }
     }
 
@@ -476,6 +515,7 @@ impl ManagedDatSourceDescriptor {
                 system.firmware_system().redump_dataset_label().to_string()
             }
             ExpectedDataset::RedumpGames(system) => system.dataset_label().to_string(),
+            ExpectedDataset::FBNeo => "FBNeo".to_string(),
         }
     }
 
@@ -550,6 +590,15 @@ impl ManagedDatSourceDescriptor {
                 {
                     return Err(config_error(
                         "managed DAT descriptor is not a fixed Redump game contract",
+                    ));
+                }
+            }
+            (ManagedDatProvider::Fbneo, ManagedDatRemote::LocalImport, ExpectedDataset::FBNeo) => {
+                if self.source_id.source_key != "fbneo"
+                    || self.expected_ecosystem != DatEcosystem::FBNeo
+                {
+                    return Err(config_error(
+                        "managed DAT descriptor is not the fixed FBNeo local-import contract",
                     ));
                 }
             }
@@ -832,6 +881,7 @@ fn descriptor_from_source_id(source_id: &ManagedDatSourceId) -> Result<ManagedDa
             })?;
             ManagedDatSourceDescriptor::redump_games(system)
         }
+        ManagedDatProvider::Fbneo => ManagedDatSourceDescriptor::fbneo(),
     }
 }
 
@@ -1457,6 +1507,7 @@ pub fn check_managed_dat_update(
         ManagedDatProvider::RedumpGames => {
             check_redump_games_update(descriptor, options, transport)
         }
+        ManagedDatProvider::Fbneo => Ok(ManagedDatUpdateOutcome::Offline),
     }
 }
 
@@ -1515,7 +1566,117 @@ pub fn update_managed_dat(
         ManagedDatProvider::MameSoftwareList => update_mame_dat(descriptor, options, transport),
         ManagedDatProvider::RedumpBios => update_redump_bios(descriptor, options, transport),
         ManagedDatProvider::RedumpGames => update_redump_games(descriptor, options, transport),
+        ManagedDatProvider::Fbneo => Ok(ManagedDatUpdateOutcome::Offline),
     }
+}
+
+/// Imports one explicitly selected FBNeo DAT into the managed object store.
+/// The input is never treated as a managed object until the shared parser has
+/// confirmed its ecosystem and the resulting bytes have been content-hashed.
+/// No network, provider URL, or background polling is involved.
+pub fn import_managed_fbneo_dat(
+    descriptor: &ManagedDatSourceDescriptor,
+    options: &ManagedDatUpdateOptions,
+    input: &Path,
+) -> Result<ManagedDatUpdateOutcome> {
+    descriptor.validate()?;
+    if descriptor.source_id().provider != ManagedDatProvider::Fbneo {
+        return Err(config_error(
+            "FBNeo import requires the FBNeo managed descriptor",
+        ));
+    }
+    let metadata = fs::symlink_metadata(input)
+        .map_err(|error| ArchiveFsError::io(input.to_path_buf(), error))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::Parser,
+            detail: "FBNeo import requires a regular DAT file".to_string(),
+        });
+    }
+    if metadata.len() > descriptor.max_payload_size() {
+        return Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::DownloadTooLarge,
+            detail: "FBNeo DAT exceeds the configured size limit".to_string(),
+        });
+    }
+
+    let existing = load_optional_managed_dat_state(&options.managed_root, descriptor)?;
+    let source_dir = create_managed_source_dir(&options.managed_root, descriptor.source_id())
+        .map(|()| managed_source_dir(&options.managed_root, descriptor.source_id()))??;
+    let staging = create_private_staging_file(&options.managed_root, &source_dir)?;
+    let _cleanup = ManagedDatStagingCleanup(staging.path.clone());
+    fs::copy(input, &staging.path)
+        .map_err(|error| ArchiveFsError::io(input.to_path_buf(), error))?;
+    let parsed = match crate::dat::parsers::parse_dat_file(
+        &staging.path,
+        crate::dat::limits::DatLimits::default(),
+    ) {
+        Ok(outcome) => outcome.dat,
+        Err(error) => {
+            return Ok(ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::Parser,
+                detail: error.to_string(),
+            });
+        }
+    };
+    if parsed.source.ecosystem != DatEcosystem::FBNeo {
+        return Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::WrongEcosystem,
+            detail: format!(
+                "expected FinalBurn Neo, received {}",
+                parsed.source.ecosystem.label()
+            ),
+        });
+    }
+    if parsed.games.is_empty() || parsed.source.entry_count == 0 {
+        return Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::EmptyCatalogue,
+            detail: "FBNeo DAT contains no game records".to_string(),
+        });
+    }
+    let sha256 = sha256_file(&staging.path)?;
+    if existing
+        .as_ref()
+        .is_some_and(|state| state.current_snapshot.sha256 == sha256)
+    {
+        let revision = parsed
+            .source
+            .version
+            .clone()
+            .unwrap_or_else(|| sha256.clone());
+        return mark_up_to_date(
+            existing,
+            options,
+            ResolvedRevisionMeta {
+                label: revision,
+                etag: None,
+                last_modified: None,
+                not_modified: false,
+            },
+        );
+    }
+    let revision = parsed
+        .source
+        .version
+        .clone()
+        .unwrap_or_else(|| sha256.clone());
+    publish_validated_snapshot(
+        descriptor,
+        options,
+        existing,
+        ResolvedRevisionMeta {
+            label: revision,
+            etag: None,
+            last_modified: None,
+            not_modified: false,
+        },
+        sha256,
+        staging.path,
+        format!(
+            "validated FBNeo DAT with {} records",
+            parsed.source.entry_count
+        ),
+    )
 }
 
 fn update_mame_dat(
