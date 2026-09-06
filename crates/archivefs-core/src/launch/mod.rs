@@ -120,6 +120,8 @@ pub mod snes9x_command;
 pub mod snes9x_execution;
 pub mod stella_command;
 pub mod stella_execution;
+pub mod vice_command;
+pub mod vice_execution;
 pub mod vita3k_command;
 pub mod vita3k_execution;
 pub mod xemu_command;
@@ -386,6 +388,14 @@ pub use stella_command::{
 pub use stella_execution::{
     StellaLaunchPreflightError, StellaLaunchPreflightErrorKind, StellaLaunchRequest,
     preflight_stella_launch, spawn_stella,
+};
+pub use vice_command::{
+    VICE_ATTACH_CRT, VICE_AUTOSTART, VICE_DISABLE_SAVE_RESOURCES, VICE_SUPPORTED_PLATFORM_ID,
+    ViceCommand, ViceCommandPlan, ViceCommandSelection, build_vice_command_plan,
+};
+pub use vice_execution::{
+    ViceLaunchPreflightError, ViceLaunchPreflightErrorKind, ViceLaunchRequest,
+    preflight_vice_launch, spawn_vice,
 };
 pub use vita3k_command::{
     VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,

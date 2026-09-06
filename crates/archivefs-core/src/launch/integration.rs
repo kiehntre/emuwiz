@@ -116,6 +116,13 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Snes9x {
         profile: &'a crate::patch_manager::Snes9xProfile,
     },
+    /// A discovered VICE C64 executable/profile (`x64sc` or `x64`, kept as
+    /// distinct exact profiles - never silently substituted for each
+    /// other). Needs no firmware/BIOS: VICE resolves its own C64 system ROM
+    /// files through its normal installed search path.
+    Vice {
+        profile: &'a crate::patch_manager::ViceProfile,
+    },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
     },
@@ -269,6 +276,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn stella(profile: &'a crate::patch_manager::StellaProfile) -> Self {
         Self::Stella { profile }
+    }
+
+    pub fn vice(profile: &'a crate::patch_manager::ViceProfile) -> Self {
+        Self::Vice { profile }
     }
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
@@ -485,6 +496,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
             {
                 Some(StandaloneProfileInput {
                     adapter_id: "snes9x",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Vice { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "Commodore 64") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "vice",
                     profile_id: profile.profile_id.clone(),
                     profile_path: None,
                     eligible: profile.eligible,
@@ -1011,6 +1034,24 @@ mod tests {
             eligible,
             blocker: (!eligible).then(|| "no safe Stella executable was discovered".to_string()),
             executable_candidates: Vec::new(),
+        }
+    }
+
+    fn vice_profile(eligible: bool) -> crate::patch_manager::ViceProfile {
+        crate::patch_manager::ViceProfile {
+            profile_id: "vice:native:/usr/bin/x64sc".to_string(),
+            installation_type: crate::patch_manager::ViceInstallationType::Native,
+            eligible,
+            blocker: (!eligible).then(|| {
+                "VICE requires an exact regular executable named x64sc or x64 with an execute bit"
+                    .to_string()
+            }),
+            executable: eligible.then(|| crate::patch_manager::ViceExecutable {
+                path: "/usr/bin/x64sc".into(),
+                installation_type: crate::patch_manager::ViceInstallationType::Native,
+                kind: crate::patch_manager::ViceC64ExecutableKind::X64sc,
+                version: None,
+            }),
         }
     }
 
@@ -2618,6 +2659,224 @@ mod tests {
         let identity = resolved("Atari2600", "a26sha");
         let profile = stella_profile(true);
         let profiles = [DiscoveredStandaloneProfile::stella(&profile)];
+        let first = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        let second = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(first, second);
+    }
+
+    // --- VICE (Commodore 64) ---
+
+    #[test]
+    fn c64_vice_profile_becomes_a_ready_candidate_without_firmware() {
+        let identity = resolved("Commodore 64", "c64sha");
+        let profile = vice_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::vice(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "vice",
+                ..
+            }
+        ));
+        assert_eq!(plan.candidates[0].firmware, FirmwareReadiness::NotRequired);
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn vice_does_not_match_an_unrelated_platform_and_has_no_fallback() {
+        let profile = vice_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::vice(&profile)];
+        for identity in [
+            resolved("Commodore 128", "c128sha"),
+            resolved("VIC-20", "vic20sha"),
+        ] {
+            let plan = plan(
+                &identity,
+                &[],
+                &resolved_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "vice",
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn ineligible_vice_profile_blocks_but_never_falls_back_to_retroarch() {
+        let identity = resolved("Commodore 64", "c64sha");
+        let profile = vice_profile(false);
+        let profiles = [DiscoveredStandaloneProfile::vice(&profile)];
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "vice",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::ProfileIneligible)
+        );
+    }
+
+    #[test]
+    fn missing_vice_profile_reports_no_installation_instead_of_substitution() {
+        let identity = resolved("Commodore 64", "c64sha");
+        let plan = plan(&identity, &[], &resolved_content(), &[], &empty_retroarch());
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(
+            plan.candidates[0].target,
+            LaunchTarget::Standalone {
+                adapter_id: "none",
+                ..
+            }
+        ));
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == LaunchBlockerKind::NoInstallationCandidate)
+        );
+    }
+
+    /// VICE and a discovered RetroArch Commodore 64 core must coexist as two
+    /// distinct candidates for the same platform - never merged, and
+    /// neither one automatically preferred over the other. The GUI/user
+    /// still chooses.
+    #[test]
+    fn vice_and_retroarch_coexist_as_separate_c64_candidates() {
+        let identity = resolved("Commodore 64", "c64sha");
+        let profile = vice_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::vice(&profile)];
+        let retroarch_with_c64_core = {
+            let config_dir = EncodedPath::from_path(&PathBuf::from("/retroarch"));
+            RetroArchEnvironmentReport {
+                format_version: 1,
+                profiles: vec![RetroArchProfile {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                    evidence: Evidence {
+                        executables: Vec::new(),
+                        flatpak_metadata_found: false,
+                        config_directory_found: true,
+                        config_file_found: true,
+                    },
+                    config_directory: DirectoryProbeFinding {
+                        path: config_dir.clone(),
+                        probe: FsProbe::PresentDirectory,
+                    },
+                    config_file: ConfigFileFinding {
+                        path: EncodedPath::from_path(&PathBuf::from("/retroarch/retroarch.cfg")),
+                        probe: FsProbe::PresentFile,
+                        read: ConfigReadOutcome::NotAttempted,
+                    },
+                    paths: Vec::new(),
+                    cores: vec![CoreFinding {
+                        file_name: EncodedPath::from_path(&PathBuf::from("vice_x64sc_libretro.so")),
+                        full_path: EncodedPath::from_path(&PathBuf::from(
+                            "/retroarch/cores/vice_x64sc_libretro.so",
+                        )),
+                        core_stem: "vice_x64sc".to_string(),
+                        info: CoreInfoFinding::Found {
+                            display_name: None,
+                            display_version: None,
+                            system_name: Some("Commodore 64".to_string()),
+                            supported_extensions: Vec::new(),
+                            core_name: Some("vice_x64sc".to_string()),
+                            manufacturer: None,
+                            categories: None,
+                            database: None,
+                            firmware: Vec::new(),
+                        },
+                    }],
+                    playlists: RetroArchPlaylistInventory {
+                        directory: None,
+                        playlists: Vec::new(),
+                        diagnostics: Vec::new(),
+                        complete: true,
+                    },
+                    app_images: Vec::new(),
+                    diagnostics: Vec::new(),
+                }],
+                diagnostics: Vec::new(),
+            }
+        };
+        let plan = plan(
+            &identity,
+            &[],
+            &resolved_content(),
+            &profiles,
+            &retroarch_with_c64_core,
+        );
+        assert_eq!(plan.candidates.len(), 2, "{:?}", plan.candidates);
+        assert!(plan.candidates.iter().any(|c| matches!(
+            c.target,
+            LaunchTarget::Standalone {
+                adapter_id: "vice",
+                ..
+            }
+        )));
+        assert!(plan.candidates.iter().any(|c| matches!(
+            c.target,
+            LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "vice_x64sc"
+        )));
+        // Neither candidate is discarded, hidden, or silently merged into the
+        // other - both remain in `plan.candidates` with their own
+        // independent readiness/preference, exactly like the Stella/RMG
+        // coexistence tests above. No automatic winner is picked here.
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.readiness != LaunchReadiness::Blocked),
+            "{:?}",
+            plan.candidates
+                .iter()
+                .map(|c| c.readiness)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vice_candidate_generation_is_deterministic() {
+        let identity = resolved("Commodore 64", "c64sha");
+        let profile = vice_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::vice(&profile)];
         let first = plan(
             &identity,
             &[],

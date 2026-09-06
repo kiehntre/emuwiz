@@ -122,6 +122,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "sameboy" => "SameBoy",
         "dosbox" => "DOSBox",
         "stella" => "Stella",
+        "vice" => "VICE",
         _ => "Supported emulator",
     }
 }
@@ -556,6 +557,36 @@ mod tests {
                 .find(|c| c.platform_id == "Atari2600" && c.adapter_id == "stella")
                 .map(|c| c.name),
             Some("Stella")
+        );
+    }
+
+    #[test]
+    fn c64_vice_and_retroarch_candidates_coexist_with_no_automatic_winner() {
+        let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, None, "");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.platform_id == "Commodore 64" && c.adapter_id == "vice"),
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.platform_id == "Commodore 64" && c.adapter_id == "retroarch"),
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|c| c.platform_id == "Commodore 64")
+                .count(),
+            2,
+            "VICE and RetroArch must both surface as separate candidates, never merged"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|c| c.platform_id == "Commodore 64" && c.adapter_id == "vice")
+                .map(|c| c.name),
+            Some("VICE")
         );
     }
 

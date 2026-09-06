@@ -95,6 +95,7 @@ mod shared_transaction;
 mod snes9x_local;
 mod stella_local;
 mod user_cheat_import;
+mod vice_local;
 mod vita3k_local;
 mod xemu_local;
 mod xenia_install_plan;
@@ -736,6 +737,12 @@ pub use user_cheat_import::{
     UserCheatImportLimits, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatch,
     UserCheatMatchState, UserCheatProvenance, UserCheatSourceOrigin, scan_user_cheat_directory,
     scan_user_cheat_directory_with_limits, scan_user_cheat_file, scan_user_cheat_file_with_limits,
+};
+pub use vice_local::{
+    VICE_MAX_EXPLICIT_EXECUTABLES, ViceC64ExecutableKind, ViceExecutable, ViceInstallationType,
+    ViceLaunchBlocker, ViceLaunchBlockerKind, ViceNativeLaunchBinding, ViceProfile,
+    ViceProfileDiscovery, ViceProfileDiscoveryRoots, discover_vice_profiles, parse_vice_version,
+    resolve_vice_native_launch_binding,
 };
 pub use vita3k_local::{
     VITA3K_MAX_CONFIG_BYTES, VITA3K_MAX_PROFILES, VITA3K_MAX_SFO_BYTES, Vita3kConfigInspection,
