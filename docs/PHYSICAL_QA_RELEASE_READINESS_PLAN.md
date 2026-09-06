@@ -608,3 +608,67 @@ The checkpoint is physically release-ready when:
 | Unsupported general local mods/providers | DEFERRED | Not a current supported journey | P2 | — |
 | MegaDrive regional policy | PARTIAL / DEGRADED | Do not accept guessed mapping | P2 | — |
 
+## 18. Execution record: ES-DE publication and recovery Wave 2
+
+**Run:** 2026-09-06 against authoritative commit
+`76aff27d413363f8a981e0eb13697de071e13d19`, clean
+`feature/archivefs-unified-platform` checkout.
+
+### Disposable environment
+
+- Root: `/tmp/emuwiz-esde-qa-K9l0pB`.
+- Synthetic source placeholders covered SNES, MegaDrive, TurboGrafx-16, PC
+  Engine, PC Engine CD, PC-98, Dreamcast, and PlayStation 2. They were
+  ordinary empty files used only as bounded path fixtures; no real ROMs or
+  user library paths were read or written.
+- The root also contained an unrelated sentinel and an unrelated ES-DE-home
+  fragment. SHA-256 verification after the run confirmed both were unchanged.
+- The actual production path was exercised over temporary ES-DE-home-shaped
+  directories beneath that root: `discover_es_de_environment` constructs an
+  `EsDeProfile`; `plan_es_de_gamelist_publication` creates the preview;
+  `apply_es_de_gamelist_publication`,
+  `rollback_es_de_gamelist_publication`, and
+  `recover_es_de_gamelist_publication` perform real filesystem operations.
+
+### Results
+
+| Check | Result |
+| --- | --- |
+| Preview/no-write boundary | PASS — preview captured exact target bytes and entries before apply. |
+| Exact mappings | PASS — `tg16`, `pcengine`, `pcenginecd`, and `pc98` were verified; PC-98 and NEC PC-9801 share only the approved `pc98` export target. Export coverage also retained SNES, MegaDrive, Dreamcast, and PS2 mappings. |
+| Deferred/unknown refusal | PASS — unmapped/unknown platforms fail closed; no target is fabricated. |
+| Existing content | PASS — existing gamelist bytes, comments, and unrelated entries are preserved byte-for-byte apart from the appended owned game entry. |
+| Apply/idempotence | PASS — a second identical plan reports the existing destination as already present and produces no duplicate XML. |
+| Rollback/recovery | PASS — rollback restores exact previous bytes; restart-style recovery restores prior bytes or removes a newly-created gamelist, then clears the sidecar. |
+| Failure injection | PASS — simulated interruption leaves the durable sidecar and blocks a second plan/apply until recovery; corrupt/mismatched records fail closed. |
+| Path safety | PASS for supported boundary — symlinked or directory recovery targets, malformed and oversized gamelists, and unconfigured systems are refused without mutation. Parent-directory symlink traversal remains explicitly outside this helper's scope because profiles provide the parent chain. |
+
+The focused commands were run sequentially with `CARGO_BUILD_JOBS=2`:
+
+```text
+cargo test -p archivefs-core es_de_publish -- --test-threads=1
+cargo test -p archivefs-core es_de_export -- --test-threads=1
+```
+
+Both passed. The publication suite uses the real atomic writer and disposable
+filesystem, rather than a mocked executor. It covers generated XML escaping,
+pre-existing-user-content preservation, fresh-file removal on rollback,
+unresolved/corrupt recovery refusal, and final-component symlink refusal.
+
+### Remaining physical boundary
+
+No `es-de` executable, `DISPLAY`, or `WAYLAND_DISPLAY` was available in this
+environment. Therefore actual ES-DE process launch and click-through GUI
+confirmation/recovery presentation are **NOT TESTABLE here**, not failures.
+The disposable production-path filesystem checks above do not modify a real
+ES-DE profile and do not prove ES-DE itself consumes the resulting list; that
+remaining desktop check is still the P0-5 real-frontend step in this plan.
+
+### Findings
+
+- **P0 defects:** none.
+- **P1 follow-up:** run one real ES-DE GUI publication/launch against a
+  disposable `--home` profile when an ES-DE desktop session is available.
+- **P2 policy:** unchanged. MegaDrive remains the intentional deterministic
+  partial mapping; Atari 8-bit, Commodore 128, Hyper Neo Geo 64, and generic
+  PC remain unmapped/deferred by current policy.
