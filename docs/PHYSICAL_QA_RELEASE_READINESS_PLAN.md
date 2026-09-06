@@ -672,3 +672,83 @@ remaining desktop check is still the P0-5 real-frontend step in this plan.
 - **P2 policy:** unchanged. MegaDrive remains the intentional deterministic
   partial mapping; Atari 8-bit, Commodore 128, Hyper Neo Geo 64, and generic
   PC remain unmapped/deferred by current policy.
+
+## 19. Execution record: local cheat install and rollback Wave 3
+
+**Run:** 2026-09-06 against authoritative commit
+`d1c0d1f3db4176dc7170771d1ff935bb77ae6a08`, clean
+`feature/archivefs-unified-platform` checkout.
+
+### Disposable environment and production paths
+
+- Root: `/tmp/emuwiz-cheat-qa-IR4Liw`, used as `TMPDIR` for the existing
+  real-filesystem end-to-end suites. It held isolated RetroArch, PCSX2,
+  Dolphin, Xenia, source-game, journal, and sentinel folders; no host emulator
+  config or game path was supplied to the tests.
+- Each installer used its existing local-import planner and the shared,
+  journal-backed apply/rollback executor. No QA-only writer or identity path
+  was introduced.
+- SHA-256 checks before and after covered all four disposable source-game
+  fixtures plus every seeded unrelated emulator file and sentinel. Every digest
+  matched after preview/apply/rollback coverage.
+
+### Results
+
+| Family | Physical disposable-filesystem result |
+| --- | --- |
+| RetroArch `.cht` | PASS — selected cheats reached the real RetroArch browse destination, preserved enabled state, were idempotent on identical repeat, and restored replaced bytes through rollback. Cross-platform/no-match/malformed inputs never became install candidates. |
+| PCSX2 `.pnach` | PASS — local PNACH was staged to the CRC-derived target with journal/rollback; existing content and zero-byte targets were handled safely. Wrong CRC, unresolved identity, malformed input, source symlink, and unwritable profile all refused before writes. |
+| Dolphin Gecko | PASS — selected Gecko code used the real `GameSettings/<game-id>.ini` destination; existing sections and unrelated files survived, rollback restored prior bytes, and wrong game/revision identity never reached apply. |
+| Dolphin Action Replay | PASS — the existing local-Dolphin parser/stager accepted only valid AR syntax, keeps Gecko and AR sections distinct, preserves unrelated codes, and stages mixed Gecko/AR files without relabelling either family. Malformed AR input is rejected as a whole. |
+| Xenia `.patch.toml` | PASS — verified local Title-ID patch preview/apply/undo is atomic; existing patch bytes and pre-existing directories survive rollback. Mismatched/missing identity, oversized source, replacement without approval, and symlinked destinations fail closed. |
+
+### Safety and recovery evidence
+
+- **Preview immutability:** the shared journey proves planning/confirmation is
+  read-only; `cheat_installer` also proves dry runs create neither destination
+  nor journal.
+- **User-content preservation:** existing `.cht`, `.pnach`, Dolphin INI, and
+  Xenia patch cases preserve unrelated bytes/sections; older journal rollback
+  cannot destroy a later operation or externally changed destination.
+- **Identity refusal:** ambiguity, stale or missing identity, wrong Dolphin
+  game/revision, wrong PNACH CRC, malformed local input, and mismatched Xenia
+  identity were all blocked before the write path. Filename resemblance is not
+  accepted as a substitute for bound identity.
+- **Failure/restart recovery:** journal-backed replacement failure retains the
+  original or verified backup; failed verification is surfaced; repeated
+  rollback is safe; rollback restores the recorded prior state rather than
+  relying on preview-only state. These are exercised through the real shared
+  executor and fresh journal reads in the end-to-end suites.
+- **Source immutability:** source-game fixture SHA-256 values were unchanged;
+  the PCSX2 unwritable-profile path additionally proves a refused apply does
+  not touch the ROM or create a PNACH.
+
+Focused commands were run sequentially with `CARGO_BUILD_JOBS=2`:
+
+```text
+cargo test -p archivefs-core --test local_cheat_install_journey --test retroarch_cheat_install_end_to_end -- --test-threads=1
+cargo test -p archivefs-core --test pcsx2_local_pnach_install_journey --test pcsx2_pnach_install_end_to_end -- --test-threads=1
+cargo test -p archivefs-core --test dolphin_gecko_install_end_to_end -- --test-threads=1
+cargo test -p archivefs-core local_cheat_install_dolphin -- --test-threads=1
+cargo test -p archivefs-core --test xenia_local_patch_install_journey --test xenia_patch_install_end_to_end -- --test-threads=1
+cargo test -p archivefs-core --test cheat_journey_orchestration -- --test-threads=1
+cargo test -p archivefs-core cheat_installer -- --test-threads=1
+```
+
+All passed. The selected end-to-end counts were RetroArch 3+12, PCSX2 6+9,
+Dolphin Gecko 14 plus 19 local-Dolphin parser/stager tests, Xenia 3+9, shared
+journey 3, and shared installer 30.
+
+No `DISPLAY`/`WAYLAND_DISPLAY` session was available, so an interactive Cheats
+& Mods GUI apply/rollback is **NOT TESTABLE here**, not a defect. The remaining
+desktop check is confirmation wording, result visibility, and recovery-action
+discoverability over one disposable local cheat; it does not block the passed
+production-path filesystem safety evidence.
+
+### Findings
+
+- **P0 defects:** none.
+- **P1 follow-up:** one desktop-session confirmation/rollback pass for the
+  existing Cheats & Mods GUI.
+- No real emulator config, game library, ES-DE state, onboarding work, DAT GUI
+  work, or LBC content was read or modified.
