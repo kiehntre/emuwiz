@@ -1,5 +1,22 @@
 # AppImage Fresh-Install QA
 
+## Current artifact harness checkpoint (2026-09-06)
+
+- Authority: `ce33fdf42ea61b4a0fb696de314d7bca3ca91f94`.
+- Current artifact: `dist/EmuWiz-x86_64.AppImage`, SHA-256
+  `8ad5517c8b29e5248164da6502ffb3c26262b751bfb849779f202502c8cd0981`.
+- The host has no usable FUSE device, so normal AppImage execution reports
+  `fuse: device not found`. The fresh-home harness now recognises only
+  explicit FUSE-unavailable failures, reports the limitation, and continues
+  with `APPIMAGE_EXTRACT_AND_RUN=1`; unrelated normal-mode failures still
+  fail hard.
+- The current harness passed in extract-and-run mode: checksum, version
+  (`emuwiz 0.8.1-alpha`), clean disposable HOME/XDG state, host-tool
+  visibility, and AppRun environment preservation.
+- Interactive fresh-desktop acceptance (including same-session Home after
+  onboarding) remains required; this command-line harness does not claim to
+  exercise GUI navigation.
+
 ## Current packaging-tool contract
 
 Current builds must use the immutable x86_64 pins in

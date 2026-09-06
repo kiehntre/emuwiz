@@ -1,5 +1,10 @@
 # EmuWiz physical QA and release-readiness plan
 
+> Current AppImage note (2026-09-06): the fresh-home command-line harness
+> supports hosts without FUSE by explicitly switching to extract-and-run only
+> after a recognised FUSE-environment failure. This does not replace the P0-1
+> interactive same-session onboarding/Home acceptance below.
+
 ## 1. Executive summary
 
 This checkpoint has strong automated confidence in core state machines, safety

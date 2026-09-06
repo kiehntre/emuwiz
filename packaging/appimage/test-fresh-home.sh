@@ -55,8 +55,34 @@ run_clean() {
         "$@"
 }
 
+is_fuse_unavailable() {
+    grep -Eqi 'fuse: device not found|appimages require fuse|failed to open /dev/fuse|no suitable fusermount binary found' "$1"
+}
+
+APPIMAGE_MODE=normal
+run_appimage() {
+    if [[ "$APPIMAGE_MODE" == extract ]]; then
+        run_clean env APPIMAGE_EXTRACT_AND_RUN=1 "$ARTIFACT" "$@"
+    else
+        run_clean "$ARTIFACT" "$@"
+    fi
+}
+
 info "checking --version (normal AppImage mode)..."
-VERSION_OUTPUT="$(run_clean "$ARTIFACT" --version)" || die "--version failed in normal mode"
+NORMAL_ERROR="$TEMP_ROOT/normal-appimage.stderr"
+if VERSION_OUTPUT="$(run_clean "$ARTIFACT" --version 2>"$NORMAL_ERROR")"; then
+    info "  -> $VERSION_OUTPUT"
+else
+    if is_fuse_unavailable "$NORMAL_ERROR"; then
+        info "NORMAL APPIMAGE MODE UNAVAILABLE: FUSE NOT PRESENT"
+        info "CONTINUING WITH APPIMAGE_EXTRACT_AND_RUN=1"
+        APPIMAGE_MODE=extract
+        VERSION_OUTPUT="$(run_appimage --version)" || die "--version failed under APPIMAGE_EXTRACT_AND_RUN"
+    else
+        cat "$NORMAL_ERROR" >&2
+        die "--version failed in normal mode for a reason other than unavailable FUSE"
+    fi
+fi
 info "  -> $VERSION_OUTPUT"
 
 info "checking --version (APPIMAGE_EXTRACT_AND_RUN=1)..."
