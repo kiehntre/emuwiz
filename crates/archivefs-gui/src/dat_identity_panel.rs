@@ -18,6 +18,7 @@ use archivefs_core::dat::library_identity_summary::{
     DatProvenanceFreshness, DatSetDependencySummary, DatVerificationState,
     LibraryDatIdentitySummary,
 };
+use archivefs_core::dat::model::DatEcosystem;
 use archivefs_core::dat::set::{BadMetadataReason, NeedsReviewReason, SetState};
 use eframe::egui;
 
@@ -218,10 +219,15 @@ pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentit
         .map(|ecosystem| ecosystem.label().to_string());
     let checked_against =
         (!summary.source.source_name.is_empty()).then(|| summary.source.source_name.clone());
-    let variant = summary
-        .source
-        .variant
-        .map(|variant| variant.label().to_string());
+    // Variant is No-Intro catalogue provenance, not a generic DAT fact. An
+    // ambiguous/conflicting result deliberately names no resolved variant:
+    // candidate provenance can disagree and this compact panel must not pick
+    // one merely to fill a row.
+    let variant = (summary.source.ecosystem == Some(DatEcosystem::NoIntro)
+        && !summary.is_ambiguous())
+    .then(|| summary.source.variant)
+    .flatten()
+    .map(|variant| variant.label().to_string());
     let match_basis = summary
         .hash_evidence
         .matched_algorithm
@@ -703,15 +709,74 @@ mod tests {
     }
 
     #[test]
-    fn presentation_shows_known_variant_without_changing_verified_status() {
+    fn presentation_shows_all_no_intro_variant_labels_without_changing_verified_status() {
+        let mut summary = summary(DatVerificationState::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        summary.source.ecosystem = Some(DatEcosystem::NoIntro);
+        for (variant, label) in [
+            (
+                archivefs_core::identity_source::no_intro::NoIntroVariant::Headered,
+                "Headered",
+            ),
+            (
+                archivefs_core::identity_source::no_intro::NoIntroVariant::Headerless,
+                "Headerless",
+            ),
+            (
+                archivefs_core::identity_source::no_intro::NoIntroVariant::Aftermarket,
+                "Aftermarket",
+            ),
+            (
+                archivefs_core::identity_source::no_intro::NoIntroVariant::Bios,
+                "BIOS",
+            ),
+            (
+                archivefs_core::identity_source::no_intro::NoIntroVariant::Unknown,
+                "Unknown",
+            ),
+        ] {
+            summary.source.variant = Some(variant);
+            let presentation = present_summary(&summary);
+            assert_eq!(presentation.status, DatIdentityStatus::Verified);
+            assert_eq!(presentation.variant.as_deref(), Some(label));
+            assert!(!presentation.variant.unwrap().contains("NoIntroVariant"));
+        }
+    }
+
+    #[test]
+    fn variant_is_omitted_for_other_ecosystems_and_ambiguous_results() {
         let mut summary = summary(DatVerificationState::VerifiedSingleMatch {
             algorithm: "SHA-1".into(),
         });
         summary.source.variant =
             Some(archivefs_core::identity_source::no_intro::NoIntroVariant::Headerless);
-        let presentation = present_summary(&summary);
+        summary.source.ecosystem = Some(DatEcosystem::Redump);
+        assert!(present_summary(&summary).variant.is_none());
 
-        assert_eq!(presentation.status, DatIdentityStatus::Verified);
+        summary.source.ecosystem = Some(DatEcosystem::NoIntro);
+        summary.verification_state = DatVerificationState::AmbiguousMultipleCandidates {
+            algorithm: "SHA-1".into(),
+            candidate_count: 2,
+        };
+        assert_eq!(
+            present_summary(&summary).status,
+            DatIdentityStatus::NeedsReview
+        );
+        assert!(present_summary(&summary).variant.is_none());
+    }
+
+    #[test]
+    fn stale_verified_no_intro_variant_remains_stale() {
+        let mut summary = summary(DatVerificationState::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        summary.source.ecosystem = Some(DatEcosystem::NoIntro);
+        summary.source.variant =
+            Some(archivefs_core::identity_source::no_intro::NoIntroVariant::Headerless);
+        summary.provenance_freshness = DatProvenanceFreshness::Stale;
+        let presentation = present_summary(&summary);
+        assert_eq!(presentation.status, DatIdentityStatus::VerifiedNeedsRecheck);
         assert_eq!(presentation.variant.as_deref(), Some("Headerless"));
     }
 
