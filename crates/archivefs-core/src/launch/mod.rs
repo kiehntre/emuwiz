@@ -99,6 +99,7 @@ pub mod mesen_command;
 pub mod mesen_execution;
 pub mod mgba_command;
 pub mod mgba_execution;
+pub mod openmsx_command;
 pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;

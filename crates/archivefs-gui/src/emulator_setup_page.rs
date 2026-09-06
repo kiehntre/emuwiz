@@ -124,6 +124,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "dosbox" => "DOSBox",
         "stella" => "Stella",
         "vice" => "VICE",
+        "openmsx" => "openMSX",
         _ => "Supported emulator",
     }
 }

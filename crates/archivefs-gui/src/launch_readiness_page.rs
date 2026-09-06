@@ -2068,6 +2068,7 @@ fn gamer_blocker_for_plan(
                 "xenia" => "Xenia",
                 "dolphin" => "Dolphin",
                 "snes9x" => "Snes9x",
+                "openmsx" => "openMSX",
                 adapter => adapter,
             };
             return GamerBlocker::for_emulator(

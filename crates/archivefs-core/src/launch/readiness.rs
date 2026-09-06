@@ -482,6 +482,10 @@ pub enum LaunchBlockerKind {
     /// [`crate::patch_manager::resolve_stella_native_launch_binding`] itself
     /// refused to produce a launch binding for the candidate's profile.
     StellaBindingUnavailable,
+    OpenMsxCandidateRequired,
+    OpenMsxPlatformMismatch,
+    OpenMsxContentFormatUnsupported,
+    OpenMsxBindingUnavailable,
     /// A command-plan request was given a non-VICE candidate.
     ViceCandidateRequired,
     /// The canonical identity does not target `Commodore 64` - the only

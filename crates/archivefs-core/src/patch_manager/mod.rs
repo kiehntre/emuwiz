@@ -71,6 +71,7 @@ mod matching;
 mod melonds_local;
 mod mesen_local;
 mod mgba_local;
+mod openmsx_local;
 mod pcengine_cd_firmware;
 mod pcsx2;
 mod pcsx2_firmware;
@@ -556,6 +557,10 @@ pub use mgba_local::{
     MgbaLaunchBlockerKind, MgbaNativeLaunchBinding, MgbaProfile, MgbaProfileDiscovery,
     MgbaProfileDiscoveryRoots, discover_mgba_profiles, parse_mgba_version,
     resolve_mgba_native_launch_binding,
+};
+pub use openmsx_local::{
+    OpenMsxExecutable, OpenMsxInstallationType, OpenMsxProfile, OpenMsxProfileDiscovery,
+    OpenMsxProfileDiscoveryRoots, discover_openmsx_profiles,
 };
 pub use pcengine_cd_firmware::{
     KNOWN_SYSTEM_CARDS, KnownSystemCard, MAX_SYSTEM_CARD_BYTES, MAX_SYSTEM_CARD_CANDIDATES,

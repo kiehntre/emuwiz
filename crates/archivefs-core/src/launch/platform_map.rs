@@ -81,6 +81,18 @@ pub struct LaunchCompatibility {
 /// [`retroarch_platform_candidate`], independent of this table).
 pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     LaunchCompatibility {
+        platform_id: "MSX",
+        standalone_adapters: &["openmsx"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
+        platform_id: "MSX2",
+        standalone_adapters: &["openmsx"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "Commodore 64",
         standalone_adapters: &["vice"],
         retroarch_core_hints: &["vice_x64sc"],

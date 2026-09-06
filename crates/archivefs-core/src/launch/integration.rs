@@ -123,6 +123,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Vice {
         profile: &'a crate::patch_manager::ViceProfile,
     },
+    OpenMsx {
+        profile: &'a crate::patch_manager::OpenMsxProfile,
+    },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
     },
@@ -280,6 +283,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn vice(profile: &'a crate::patch_manager::ViceProfile) -> Self {
         Self::Vice { profile }
+    }
+
+    pub fn openmsx(profile: &'a crate::patch_manager::OpenMsxProfile) -> Self {
+        Self::OpenMsx { profile }
     }
 
     pub fn vita3k(profile: &'a crate::patch_manager::Vita3kProfile) -> Self {
@@ -510,6 +517,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     adapter_id: "vice",
                     profile_id: profile.profile_id.clone(),
                     profile_path: None,
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::OpenMsx { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if matches!(identity.platform_id.as_str(), "MSX" | "MSX2")) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "openmsx",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.executable.path.clone()),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
                 })
