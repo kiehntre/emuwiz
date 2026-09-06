@@ -42,7 +42,8 @@ use crate::patch_manager::{
     DuckStationBiosState, DuckStationGameInspection, DuckStationProfile, FlycastGameInspection,
     FlycastProfile, FlycastSystemFileState, HatariGameInspection, HatariProfile,
     MelonDsFirmwareState, MelonDsProfile, MesenProfile, Pcsx2BiosVerification, Pcsx2GameInspection,
-    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, XemuProfile, XeniaProfile,
+    Pcsx2Profile, PpssppProfile, Rpcs3GameInspection, Rpcs3Profile, SameBoyProfile, XemuProfile,
+    XeniaProfile,
 };
 
 /// One profile from an existing adapter discovery, together with only the
@@ -91,6 +92,12 @@ pub enum DiscoveredStandaloneProfile<'a> {
     },
     Mgba {
         profile: &'a crate::patch_manager::MgbaProfile,
+    },
+    /// A discovered native SameBoy profile. Its adapter keeps the final
+    /// cartridge-header and executable revalidation at execution time; this
+    /// projection only makes it a separate Game Boy/Color planner candidate.
+    SameBoy {
+        profile: &'a SameBoyProfile,
     },
     /// A discovered RMG (Rosalie's Mupen GUI) profile. RMG needs no
     /// BIOS/firmware for N64 cartridge play (see
@@ -275,6 +282,11 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
     pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
         Self::Mgba { profile }
     }
+
+    pub fn sameboy(profile: &'a SameBoyProfile) -> Self {
+        Self::SameBoy { profile }
+    }
+
     pub fn mesen(profile: &'a MesenProfile) -> Self {
         Self::Mesen { profile }
     }
@@ -481,6 +493,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     adapter_id: "mgba",
                     profile_id: profile.profile_id.clone(),
                     profile_path: profile.config_path.clone(),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::SameBoy { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if crate::launch::sameboy_command::SAMEBOY_SUPPORTED_PLATFORM_IDS.contains(&identity.platform_id.as_str())) =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "sameboy",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
                 })
@@ -2077,6 +2101,109 @@ mod tests {
             blocker: None,
             version: Some("1.63".to_string()),
         }
+    }
+
+    fn sameboy_profile(eligible: bool) -> SameBoyProfile {
+        let root = PathBuf::from("/profiles/sameboy");
+        SameBoyProfile {
+            profile_id: "sameboy:/profiles/sameboy".to_string(),
+            installation_type: crate::patch_manager::SameBoyInstallationType::Native,
+            configuration_path: root.clone(),
+            config: crate::patch_manager::SameBoyConfigInspection {
+                path: root.join("prefs.bin"),
+                exists: false,
+                readable: false,
+                oversized: false,
+            },
+            eligible,
+            blocker: (!eligible).then(|| "no safe SameBoy executable was discovered".to_string()),
+            executable_candidates: Vec::new(),
+            boot_rom: crate::patch_manager::SameBoyBootRomEvidence {
+                directory: None,
+                state: crate::patch_manager::SameBoyBootRomState::NotConfigured,
+            },
+        }
+    }
+
+    fn game_boy_content(extension: &str) -> LaunchContentRef {
+        LaunchContentRef {
+            kind: Some(LaunchContentKind::Cartridge),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from(format!("/library/game.{extension}"))),
+            requires_mount: false,
+            provenance: "direct Game Boy cartridge".to_string(),
+        }
+    }
+
+    #[test]
+    fn sameboy_projects_for_game_boy_and_color_as_a_separate_candidate() {
+        let profile = sameboy_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::sameboy(&profile)];
+        for (platform_id, extension) in [("Game Boy", "gb"), ("Game Boy Color", "gbc")] {
+            let launch_plan = plan(
+                &resolved(platform_id, "verified-gb-key"),
+                &[],
+                &game_boy_content(extension),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(launch_plan.candidates.iter().any(|candidate| matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "sameboy",
+                    ..
+                }
+            )));
+            assert!(
+                launch_plan.candidates.iter().all(|candidate| {
+                    candidate.preference != crate::launch::CandidatePreference::Remembered
+                }),
+                "registration does not select SameBoy automatically"
+            );
+        }
+    }
+
+    #[test]
+    fn sameboy_refuses_unrelated_platforms_and_propagates_profile_readiness() {
+        let eligible = sameboy_profile(true);
+        let profiles = [DiscoveredStandaloneProfile::sameboy(&eligible)];
+        let unrelated = plan(
+            &resolved("Game Boy Advance", "gba-key"),
+            &[],
+            &game_boy_content("gb"),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert!(!unrelated.candidates.iter().any(|candidate| matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "sameboy",
+                ..
+            }
+        )));
+
+        let ineligible = sameboy_profile(false);
+        let profiles = [DiscoveredStandaloneProfile::sameboy(&ineligible)];
+        let blocked = plan(
+            &resolved("Game Boy", "gb-key"),
+            &[],
+            &game_boy_content("gb"),
+            &profiles,
+            &empty_retroarch(),
+        );
+        assert!(blocked.candidates.iter().any(|candidate| {
+            matches!(
+                candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "sameboy",
+                    ..
+                }
+            ) && candidate.readiness == LaunchReadiness::Blocked
+                && candidate
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.kind == LaunchBlockerKind::ProfileIneligible)
+        }));
     }
 
     #[test]

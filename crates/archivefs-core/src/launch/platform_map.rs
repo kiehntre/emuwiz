@@ -214,13 +214,13 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "Game Boy",
-        standalone_adapters: &["mgba", "mesen"],
+        standalone_adapters: &["mgba", "mesen", "sameboy"],
         retroarch_core_hints: &["gambatte"],
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
         platform_id: "Game Boy Color",
-        standalone_adapters: &["mgba", "mesen"],
+        standalone_adapters: &["mgba", "mesen", "sameboy"],
         retroarch_core_hints: &["gambatte"],
         confidence: MappingConfidence::StronglyKnown,
     },
@@ -608,7 +608,12 @@ mod tests {
                 platform_id,
                 "Game Boy" | "Game Boy Color" | "Game Boy Advance"
             ) {
-                assert_eq!(row.standalone_adapters, &["mgba", "mesen"], "{platform_id}");
+                let expected = if platform_id == "Game Boy Advance" {
+                    &["mgba", "mesen"][..]
+                } else {
+                    &["mgba", "mesen", "sameboy"][..]
+                };
+                assert_eq!(row.standalone_adapters, expected, "{platform_id}");
             } else if platform_id == "N64" {
                 assert_eq!(row.standalone_adapters, &["rmg"], "{platform_id}");
             } else if platform_id == "NES" {

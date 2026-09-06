@@ -1,14 +1,12 @@
 //! Read-only native SameBoy command planning for direct `.gb`/`.gbc` files.
 //!
-//! Self-contained, like [`crate::launch::fbneo_command`] and
-//! [`crate::launch::cemu_command`]: not wired into
-//! [`crate::launch::integration::DiscoveredStandaloneProfile`] or the shared
-//! [`crate::launch::planning`] candidate matrix. mGBA (Game Boy/Color/
-//! Advance) remains completely independent - this module never reads, calls,
-//! or otherwise touches [`crate::launch::mgba_command`], and nothing here
-//! changes mGBA's own discovery, command, or readiness behavior. The two are
-//! meant to become separate, simultaneously-available candidates for the
-//! same platform once a future shared-planner slice wires both in.
+//! The existing adapter is projected through
+//! [`crate::launch::integration::DiscoveredStandaloneProfile`] into the
+//! shared candidate matrix. mGBA (Game Boy/Color/Advance) remains completely
+//! independent - this module never reads, calls, or otherwise touches
+//! [`crate::launch::mgba_command`], and nothing here changes mGBA's own
+//! discovery, command, or readiness behavior. The two remain separate,
+//! simultaneously available candidates for Game Boy and Game Boy Color.
 //!
 //! Argv is exactly `sameboy <rom path>` - verified from `LIJI32/SameBoy`'s
 //! `SDL/main.c: int main`, which refuses (usage + exit 1) any invocation

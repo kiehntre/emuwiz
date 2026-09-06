@@ -6,9 +6,7 @@
 //! preflight remains the authority for launching a particular game.
 
 use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, Finding};
-use archivefs_core::launch::{
-    LAUNCH_COMPATIBILITY, LaunchCompatibility, SAMEBOY_SUPPORTED_PLATFORM_IDS,
-};
+use archivefs_core::launch::{LAUNCH_COMPATIBILITY, LaunchCompatibility};
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
@@ -193,59 +191,6 @@ fn candidate_from_mapping(
     }
 }
 
-fn unintegrated_candidate(
-    platform_id: &'static str,
-    adapter_id: &'static str,
-    name: &'static str,
-    findings: Option<&[Finding]>,
-) -> EmulatorSetupCandidate {
-    let Some(findings) = findings else {
-        return EmulatorSetupCandidate {
-            platform_id,
-            adapter_id,
-            name,
-            state: CandidateState::NotChecked,
-            reason: "Run an emulator check to inspect this candidate.".to_string(),
-            evidence: Vec::new(),
-        };
-    };
-    let Some(finding) = finding_for(findings, adapter_id, name) else {
-        return EmulatorSetupCandidate {
-            platform_id,
-            adapter_id,
-            name,
-            state: CandidateState::NeedsSetup,
-            reason: "The adapter is supported, but no setup evidence was found yet.".to_string(),
-            evidence: vec![
-                "This adapter is not yet part of the shared selected-game candidate plan."
-                    .to_string(),
-            ],
-        };
-    };
-    let state = if finding.severity.is_blocking() {
-        CandidateState::Blocked
-    } else if finding.severity == DoctorSeverity::Warning {
-        CandidateState::Warnings
-    } else if finding.severity == DoctorSeverity::Info
-        && finding
-            .title
-            .to_ascii_lowercase()
-            .contains("ready to launch")
-    {
-        CandidateState::Ready
-    } else {
-        CandidateState::NeedsSetup
-    };
-    EmulatorSetupCandidate {
-        platform_id,
-        adapter_id,
-        name,
-        state,
-        reason: finding.explanation.clone(),
-        evidence: finding.evidence.clone(),
-    }
-}
-
 pub(crate) fn build_candidates(
     findings: Option<&[Finding]>,
     retroarch: RetroArchSetupStatus,
@@ -286,18 +231,6 @@ pub(crate) fn build_candidates(
                     .map(|hint| format!("Reviewed core candidate: {hint}"))
                     .collect(),
             };
-            if matches_search(&candidate) {
-                candidates.push(candidate);
-            }
-        }
-    }
-    // SameBoy has a complete native command/readiness module but is
-    // intentionally not yet wired into core's shared selected-game matrix.
-    // Showing them as explicit setup candidates is useful and honest: they
-    // remain Needs setup until that shared authorization seam exists.
-    for &platform_id in SAMEBOY_SUPPORTED_PLATFORM_IDS {
-        if matches_filter(platform_id) {
-            let candidate = unintegrated_candidate(platform_id, "sameboy", "SameBoy", findings);
             if matches_search(&candidate) {
                 candidates.push(candidate);
             }
@@ -515,22 +448,30 @@ mod tests {
     }
 
     #[test]
-    fn native_game_boy_candidates_include_mesen_without_replacing_others() {
+    fn native_game_boy_candidates_include_sameboy_from_shared_registration() {
         let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, None, "");
         assert!(
             candidates
                 .iter()
                 .any(|c| c.platform_id == "Game Boy" && c.adapter_id == "mgba")
         );
-        assert!(
-            candidates
-                .iter()
-                .any(|c| c.platform_id == "Game Boy" && c.adapter_id == "sameboy")
-        );
+        let sameboy = candidates
+            .iter()
+            .find(|c| c.platform_id == "Game Boy" && c.adapter_id == "sameboy")
+            .expect("Game Boy SameBoy candidate");
+        assert_eq!(sameboy.name, "SameBoy");
         assert!(
             candidates
                 .iter()
                 .any(|c| c.platform_id == "Game Boy Color" && c.adapter_id == "sameboy")
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|c| c.platform_id == "Game Boy" && c.adapter_id == "sameboy")
+                .count(),
+            1,
+            "SameBoy is derived once from the shared compatibility registration"
         );
         assert!(
             candidates
