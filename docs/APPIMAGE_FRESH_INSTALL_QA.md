@@ -1,5 +1,39 @@
 # AppImage Fresh-Install QA
 
+## Current AppImage rebuild + fresh-install QA Wave 6 (2026-09-06)
+
+- Authority: `b06cda8` (`feat(launch): add openMSX cartridge adapter`) on
+  `feature/archivefs-unified-platform`; the source checkout contained
+  unrelated launch/patch-manager work, so the official packaging scripts were
+  run from a disposable clean worktree at this exact HEAD. Those unrelated
+  changes were not staged or altered.
+- Home P0: **present and closed**. `c379183` is an ancestor and the onboarding
+  regression suite includes same-session finish/skip stale-load tests; the
+  focused onboarding run passed 16 tests per GUI target.
+- Fresh artifact: `dist/EmuWiz-x86_64.AppImage`, 83,720,696 bytes, SHA-256
+  `98b111302330fb4a614fc439ecde07bfdb3b0d9af5890608653601cf27b05e0b`,
+  built by `packaging/appimage/build-appimage.sh --output-dir .../dist` with
+  the pinned appimagetool/runtime.
+- Both version checks report `emuwiz 0.8.1-alpha`. Normal AppImage mounting is
+  unavailable on this host (`/dev/fuse`/`fusermount`), while
+  `APPIMAGE_EXTRACT_AND_RUN=1` passes. The official fresh-home harness passed
+  checksum, clean disposable state, host-tool visibility, and AppRun
+  environment checks.
+- Interactive GUI onboarding, same-session Home navigation, Sources/DAT/
+  firmware screens, source immutability, emulator inventory, and viewport
+  checks were **not physically executable** on this host because no display
+  server is available (`DISPLAY`/`WAYLAND_DISPLAY` unset). Automated onboarding
+  coverage and packaging harness coverage passed; physical GUI acceptance
+  remains follow-up.
+- Packaging content inspection found only EmuWiz GUI/CLI, desktop metadata,
+  and branding icons; no emulator binaries, credentials, user config, temp
+  files, or LBC content were bundled. The original user configuration and game/
+  BIOS paths were not touched.
+- A synthetic NES fixture was inspected with the extracted `emuwiz-cli` and
+  remained byte-identical (SHA-256
+  `798dbd7823338efdfe4683661aacc2b99831df85d81cb25e3a75d38807feb93b`) before
+  and after the read-only platform-detection command.
+
 ## Current artifact harness checkpoint (2026-09-06)
 
 - Authority: `ce33fdf42ea61b4a0fb696de314d7bca3ca91f94`.
