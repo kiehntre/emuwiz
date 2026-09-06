@@ -1267,18 +1267,21 @@ pub(super) fn show_active_mounts_page(
                     widgets::StatusTone::Active
                 },
             );
-            if mounted.len() == 1 {
-                ui.label("1 mounted archive.");
+            ui.strong(if mounted.len() == 1 {
+                "1 mounted archive"
             } else {
-                ui.label(format!("{} mounted archives.", mounted.len()));
-            }
-            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, !busy)
-                .clicked()
-            {
-                action = Some(ActiveMountsPageAction::Refresh);
-            }
-        })
-        .inner
+                "Mounted archives"
+            });
+        });
+        ui.weak(if mounted.len() == 1 {
+            "Review its destination, then unmount it normally when you are finished."
+        } else {
+            "Review destinations, then unmount archives normally when you are finished."
+        });
+        ui.add_space(8.0);
+        if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Secondary, !busy).clicked() {
+            action = Some(ActiveMountsPageAction::Refresh);
+        }
     });
     if mounted.is_empty() {
         widgets::empty_state(
@@ -1333,37 +1336,39 @@ pub(super) fn show_active_mounts_page(
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(&item.display_name).size(17.0).strong());
                         widgets::status_badge(ui, "Mounted", widgets::StatusTone::Active);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::action_button(
-                                ui,
-                                "Unmount",
-                                widgets::ActionStyle::Destructive,
-                                !busy,
-                            )
-                            .clicked()
-                            {
-                                *confirm_unmount = Some(item.archive_path.clone());
-                            }
-                            if widgets::action_button(
-                                ui,
-                                "Open in Library",
-                                widgets::ActionStyle::Quiet,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action = Some(ActiveMountsPageAction::OpenInLibrary(
-                                    item.archive_path.clone(),
-                                ));
-                            }
-                        });
                     });
+                    ui.add_space(6.0);
                     if widgets::path_value(ui, "Destination", &item.mount_path) {
                         ui.ctx().copy_text(item.mount_path.display().to_string());
                     }
                     if widgets::path_value(ui, "Archive", &item.archive_path) {
                         ui.ctx().copy_text(item.archive_path.display().to_string());
                     }
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Open in Library",
+                            widgets::ActionStyle::Quiet,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            action = Some(ActiveMountsPageAction::OpenInLibrary(
+                                item.archive_path.clone(),
+                            ));
+                        }
+                        if widgets::action_button(
+                            ui,
+                            "Unmount",
+                            widgets::ActionStyle::Destructive,
+                            !busy,
+                        )
+                        .clicked()
+                        {
+                            *confirm_unmount = Some(item.archive_path.clone());
+                        }
+                    });
                 });
                 ui.add_space(6.0);
             }

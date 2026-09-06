@@ -770,6 +770,18 @@ fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
         !rendered_text_contains(&output, "/roms/pending.zip"),
         "only mounted archives are listed"
     );
+    for expected in [
+        "1 mounted archive",
+        "Destination",
+        "Archive",
+        "Open in Library",
+        "Unmount",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "the Active Mounts card must retain its {expected} presentation"
+        );
+    }
     assert!(confirm.is_none());
 
     let mut stale = Some(PathBuf::from("/roms/pending.zip"));
@@ -799,6 +811,31 @@ fn active_mounts_page_lists_only_mounted_archives_and_requires_confirmation() {
     });
     assert!(rendered_text_contains(&output, "Unmount now"));
     assert!(live_confirm.is_some());
+}
+
+#[test]
+fn active_mounts_empty_state_keeps_refresh_and_next_step_visible() {
+    let ctx = egui::Context::default();
+    let mut confirm = None;
+    let mut cleanup = false;
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_active_mounts_page(ui, Some(&[]), &mut confirm, &mut cleanup, None, false);
+        });
+    });
+
+    for expected in [
+        "0 active",
+        "Mounted archives",
+        "Refresh",
+        "Nothing is mounted",
+        "Mounted archives will appear here with their destinations and normal unmount controls.",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "the empty Active Mounts presentation must retain {expected}"
+        );
+    }
 }
 
 #[test]

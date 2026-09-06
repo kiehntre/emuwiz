@@ -4087,7 +4087,6 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Mount
         | MainView::Selected
         | MainView::CheatsMods
-        | MainView::ActiveMounts
         | MainView::Library
         | MainView::RecentlyFound
         | MainView::Health
@@ -4108,7 +4107,8 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::DatSources
         | MainView::Doctor
         | MainView::Settings
-        | MainView::About => ui_layout::ContentWidth::Normal,
+        | MainView::About
+        | MainView::ActiveMounts => ui_layout::ContentWidth::Normal,
         MainView::Problems => ui_layout::ContentWidth::Wide,
     }
 }
