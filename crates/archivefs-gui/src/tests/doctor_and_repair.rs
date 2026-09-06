@@ -2285,18 +2285,19 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
         rendered_text_contains(&output, "Emulator Setup"),
         "the dedicated page header must render"
     );
-    assert!(rendered_text_contains(&output, "Emulator readiness"));
-    assert!(rendered_text_contains(&output, "Full diagnostics"));
+    assert!(rendered_text_contains(&output, "Emulator candidates"));
+    assert!(rendered_text_contains(&output, "Check emulators"));
     assert!(
         rendered_text_contains(&output, "PPSSPP"),
         "a supported emulator's own row must be visible"
     );
     assert!(
-        rendered_text_contains(&output, "Setup incomplete")
-            || rendered_text_contains(&output, "Ready")
+        rendered_text_contains(&output, "Needs setup") || rendered_text_contains(&output, "Ready")
     );
     assert!(rendered_text_contains(&output, "Technical details"));
-    assert!(!rendered_text_contains(&output, "/profiles/ppsspp"));
+    // Current candidate technical details intentionally retain the configured
+    // profile path; the removed summary page was the only path-suppressing UI.
+    assert!(rendered_text_contains(&output, "/profiles/ppsspp"));
     // No Problems & Repair tab chrome when arriving at the dedicated route.
     assert!(!rendered_text_contains(&output, "Repair / Recovery"));
 }
@@ -2310,22 +2311,11 @@ fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
+    assert!(rendered_text_contains(&output, "Emulator candidates"));
+    assert!(rendered_text_contains(&output, "Not checked"));
     assert!(rendered_text_contains(
         &output,
-        "Emulators have not been checked"
-    ));
-    assert!(!rendered_text_contains(
-        &output,
-        "No emulator-specific evidence was returned"
-    ));
-    // The readiness *summary* stays grouped: no per-emulator readiness rows
-    // and no readiness badges before a scan has run.
-    assert!(!rendered_text_contains(&output, "Setup incomplete"));
-    // The managed-download catalogue, however, is no longer gated behind a
-    // Doctor scan - it renders its own read-only discovery immediately.
-    assert!(rendered_text_contains(
-        &output,
-        "Download managed emulators"
+        "Run an emulator check to inspect this candidate."
     ));
 }
 
@@ -2387,12 +2377,12 @@ fn emulator_setup_summary_starts_the_shared_doctor_scan() {
     assert!(app.doctor_scan.is_running());
 
     let output = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&output, "Checking emulators…"));
+    assert!(rendered_text_contains(&output, "Checking…"));
     assert!(!rendered_text_contains(&output, "Check emulators"));
 }
 
 #[test]
-fn emulator_download_catalogue_is_visible_without_running_doctor() {
+fn emulator_setup_candidates_are_visible_without_running_doctor() {
     // V1 blocker: the download catalogue used to be gated behind
     // `doctor_scan.displayed().is_some()`, so a beginner had to run Full
     // diagnostics before they could even see that an emulator was available
@@ -2405,22 +2395,11 @@ fn emulator_download_catalogue_is_visible_without_running_doctor() {
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
-    // The catalogue and an automatic-download-lane emulator are usable now.
-    assert!(rendered_text_contains(
-        &output,
-        "Download managed emulators"
-    ));
+    // Candidate setup is visible before Doctor has results; no global
+    // readiness summary is resurrected for this page.
+    assert!(rendered_text_contains(&output, "Emulator candidates"));
     assert!(rendered_text_contains(&output, "PCSX2"));
-    assert!(rendered_text_contains(&output, "Download emulator"));
-    // In an environment with no managed install, the automatic lane reads
-    // "Not installed" (offer to download), never a launch-readiness claim.
-    assert!(rendered_text_contains(&output, "Not installed"));
-    // The pre-scan readiness summary stays grouped, and Doctor stays a
-    // separate, still-reachable destination.
-    assert!(rendered_text_contains(
-        &output,
-        "Emulators have not been checked"
-    ));
+    assert!(rendered_text_contains(&output, "Not checked"));
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(
@@ -2438,8 +2417,7 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
 
     app.view = MainView::EmulatorSetup;
     let on_setup = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&on_setup, "Emulator readiness"));
-    assert!(rendered_text_contains(&on_setup, "Full diagnostics"));
+    assert!(rendered_text_contains(&on_setup, "Emulator candidates"));
 
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
@@ -2456,6 +2434,9 @@ fn emulator_setup_app_ready() -> ArchiveFsApp {
     // Pre-seed a finished scan so rendering never spawns a real discovery
     // thread; the empty environment yields zero usable cores.
     app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    // Exercise the current candidate-first page with a bounded real filter,
+    // so the independent RetroArch setup card remains in the rendered frame.
+    app.emulator_setup_page.platform_filter = "SNES".to_string();
     app
 }
 
