@@ -1110,58 +1110,49 @@ advertised to a user as "physically verified" anywhere in the GUI (readiness
 language is honestly sourced from discovery/hash evidence only, never from
 an unrun physical test).
 
-### openMSX / shared machine-profile seam
+### Historical openMSX / shared machine-profile seam note
 
-Confirmed still deferred per `docs/OPENMSX_STANDALONE_ADAPTER_AUDIT.md`'s own
-Definition of Done — no machine-profile seam exists yet, no `openmsx`
-adapter code exists anywhere in `crates/`. **P1/P2 post-V1**, matching the
-existing roadmap; not a release blocker.
+This point-in-time note is superseded. `b06cda8` added the reviewed openMSX
+MSX/MSX2 cartridge adapter and it is now registered in the shared selected-game
+candidate path. It is not an open or deferred release-readiness item. The older
+audit remains useful as the original scope record, not as current status.
 
 ### DAT backend/GUI deferred items
 
-Per `docs/DAT_GUI_WIRING_AUDIT.md` §"P0 / P1 / P2" (P0 already promoted,
-confirmed above): P1 items remaining open are an all-library aggregate
-count, carrying parsed-catalogue-variant into selected-game provenance, and
-a separate BIOS/firmware readiness view (the last one is now effectively
-superseded by the firmware/BIOS GUI work, `d478e47`, though the audit doc
-itself was not edited to reflect that — a stale-doc note, not a functional
-gap). P2 items (candidate/source comparison, raw DAT graph browsing,
-evidence export, saved filters, durable cross-evidence conflict model)
-remain untouched and unnecessary for V1. **None is release-blocking.**
+The catalogue/variant provenance P1 is closed by `9888bd5`; firmware/BIOS
+presentation is closed by `d478e47`. Current DAT work is instead explicitly
+owned: persisted active-source/snapshot arbitration and coverage/expected-
+inventory work are active in their dedicated worktrees, as is disk-only set
+reconciliation. P2 browsing/reporting ideas remain non-blocking. **None is a
+free release-readiness implementation task.**
 
 ### Version/tag state
 
 - Workspace version in `Cargo.toml`: `0.8.1-alpha` (shared via
   `version.workspace = true` across all three crates).
 - Latest tag reachable from HEAD: `v0.8.2` (`git merge-base --is-ancestor
-  v0.8.2 HEAD` succeeds; HEAD is 40 commits ahead of that tag).
+  v0.8.2 HEAD` succeeds; current authority is not tagged).
 - No tag exists at or after current HEAD. The workspace version string
   (`0.8.1-alpha`) predates even the `v0.8.2` tag it is already behind, and a
-  further 40 commits of adapter/GUI/QA work have landed since that tag with
-  no version bump.
+  further adapter/GUI/QA work has landed since that tag with no version bump.
 - **Not resolved here by design** (this audit does not force a version
   decision): whichever version a release actually ships as, the current
   `Cargo.toml` value does not reflect it, and this will need a real decision
   (e.g. `0.8.3-alpha` or `0.9.0-alpha`) at release-cut time, separate from
   the Home P0 fix.
 
-### One newly-observed small polish item (not fixed here — read-only audit)
+### Historical RMG label note
 
-`crates/archivefs-gui/src/emulator_setup_page.rs`'s `adapter_name()` has no
-match arm for `"rmg"` (confirmed live: `platform_map.rs` registers
-`standalone_adapters: &["rmg"]` for N64), so an RMG candidate row would
-currently render the generic fallback label "Supported emulator" instead of
-"RMG" in Emulator Setup. **Classification: P2 polish** (cosmetic label gap
-only; readiness/launch behavior for the RMG adapter itself is unaffected and
-already covered by its own green test suite). Left unfixed per this audit's
-read-only scope; worth a one-line fix in a future GUI-only pass.
+Superseded by `99e511d`, which added the reviewed `RMG` display mapping. It
+is no longer a GUI-polish backlog item.
 
 ### Authoritative release-readiness matrix
 
 | AREA | STATUS | EVIDENCE | SEVERITY | RELEASE BLOCKER? | NEXT ACTION |
 | --- | --- | --- | --- | --- | --- |
 | Home same-session load hang | CLOSED | `c379183` (cherry-picked from `ecae382`); onboarding/home_page/gamer_view/read_only_snapshot suites re-verified green at promotion | NONE | No | none |
-| AppImage artifact currency | OPEN | artifact still from `c16f486`, now 17+ commits stale (includes the Home P0 fix) | P1 | No (packaging gate only; the P0 defect blocking a *meaningful* rebuild is closed) | Once `appimagetool`/pinned runtime are available on a build host, rebuild and rerun the fresh-install harness |
+| AppImage tooling / FUSE fallback | CLOSED | `ce33fdf`, `d36e304`; pinned inputs are verified and only explicit FUSE absence selects extract-and-run | NONE | No | none |
+| Current AppImage interactive acceptance | MANUAL_PENDING | current-artifact fresh-user acceptance is not recorded end-to-end | P0 release-owner gate | Yes | run against the current artifact on the real desktop before a cut |
 | DAT Identity GUI P0 | CLOSED | `00713a2`; 23 focused + 191 re-verified GUI tests | NONE | No | none |
 | Doctor/Emulator Setup regressions | CLOSED | `76aff27`; re-run 124/124 green, test-only diff | NONE | No | none |
 | ES-DE final safe gaps (TG-16, PC-98) | CLOSED | `48140d0`; live export-table assertion | NONE | No | none |
@@ -1178,18 +1169,22 @@ read-only scope; worth a one-line fix in a future GUI-only pass.
 | RetroArch AppImage physical launch | DEFERRED | `PHYSICAL_QA_LAUNCH_WAVE1.md`; no AppImage installed | P1 | No | run when one is installed on a QA host |
 | ES-DE intentional gaps (Atari 8-bit, C128, NeoGeo64, PC) | DEFERRED | `ESDE_FINAL_GAP_DECISIONS.md`; live export-table confirms exactly these 4 unmapped | P2 | No | policy decision only, not a defect |
 | MegaDrive regional PARTIAL | DEFERRED | `ESDE_FINAL_GAP_DECISIONS.md` | P2 | No | do not accept a guessed mapping |
-| openMSX adapter | DEFERRED | `OPENMSX_STANDALONE_ADAPTER_AUDIT.md`; no seam, no code | P2 | No | sequence after a machine-profile seam exists |
-| DAT P1 items (aggregate count, catalogue-variant provenance) | DEFERRED | `DAT_GUI_WIRING_AUDIT.md` | P1 | No | separate GUI-only follow-up pass |
+| openMSX adapter | CLOSED | `b06cda8`; reviewed MSX/MSX2 cartridge adapter is in shared selected-game planning | NONE | No | none |
+| DeSmuME adapter | CLOSED | `38aefe1`, `ad18fb8`; Nintendo DS standalone candidate remains separate from melonDS/RetroArch | NONE | No | none |
+| SameBoy shared integration | CLOSED | `f93a7cd`; Game Boy/Color projection, compatibility rows, and Emulator Setup derive from shared registration | NONE | No | none |
+| DAT catalogue/variant provenance | CLOSED | `9888bd5` | NONE | No | none |
+| DAT arbitration/coverage and disk-only reconciliation | ACTIVE | dedicated DAT worktrees own the persistence/coverage and disk-only seams | ACTIVE | No | do not assign outside their owners |
 | DAT P2 items | DEFERRED | `DAT_GUI_WIRING_AUDIT.md` | P2 | No | none planned for V1 |
-| 94k RomM bounded performance pass | NOT_REQUIRED for this audit's scope | original plan §17 row, unchanged | P1 | No | run when a large snapshot + resource-watch environment is available |
+| 94k RomM bounded performance pass | CLOSED | `7ac525a`; generated 94k cache/load and browser-projection guard | NONE | No | none |
 | Resize/focus/accessibility/long-session polish | DEFERRED | original plan §17 row, unchanged | P2 | No | representative desktop sweep, post-V1 acceptable |
-| RMG `adapter_name()` fallback label | OPEN (newly observed) | `emulator_setup_page.rs`, no `"rmg"` arm | P2 | No | one-line GUI fix in a future pass |
+| RMG `adapter_name()` fallback label | CLOSED | `99e511d` | NONE | No | none |
 | Recalbox audit's two "P0" items | CLOSED (doc stale) | onboarding feature + `d478e47` | NONE | No | optionally refresh `RECALBOX_COMPETITIVE_AUDIT.md`'s status column (not done here) |
 
 ### Shortest true critical path
 
-**Update (this promotion):** item 1 below is now closed (`c379183`). The
-remaining critical path is packaging-only:
+**Current-head update:** Home P0, tooling provenance, and FUSE-less handling
+are closed. The remaining critical path is release-owner acceptance and a
+versioned final artifact, not packaging implementation:
 
 1. ~~Fix the Home same-session "Loading your games…" hang.~~ **Closed** -
    `onboarding_advance_from`/`onboarding_skip_entirely` now call
@@ -1201,25 +1196,23 @@ remaining critical path is packaging-only:
    `read_only_snapshot_resolves_to_an_empty_library_when_no_config_file_exists_yet`,
    `advancing_through_a_non_final_onboarding_step_does_not_reload_the_archive_snapshot`)
    are on authority and green.
-2. **Rebuild the AppImage** once an approved `appimagetool` + pinned
-   type-2 runtime are available on the build host (no longer blocked by
-   an open defect, only by tool availability).
-3. **Re-run the fresh-install QA harness** (`packaging/appimage/
-   test-fresh-home.sh` plus the manual onboarding-completion walk in
-   `docs/APPIMAGE_FRESH_INSTALL_QA.md`) against the new artifact, confirming
-   the Home hang no longer reproduces in the exact repro steps already
-   documented.
-4. **Perform the four desktop-smoke passes** (ES-DE, Cheats & Mods,
-   Firmware/BIOS GUI, Playing Library) opportunistically wherever a
-   `DISPLAY`/`WAYLAND_DISPLAY` session becomes available — P1, not gating,
-   but cheap to close out given every backend contract is already green.
+2. **Complete current-artifact interactive fresh-user acceptance** on the
+   real desktop, including the same-session Home check immediately after
+   onboarding Finish.
+3. **Choose the release version** under the existing release-engineering
+   policy, then bump it consistently in a dedicated change.
+4. **Rebuild and verify the final AppImage** from that versioned authority,
+   then create the release tag only after the final hash/version checks pass.
+5. **Perform the four desktop-smoke passes** (ES-DE, Cheats & Mods,
+   Firmware/BIOS GUI, Playing Library) as P1 confidence work; they are not
+   substitutes for the fresh-user acceptance gate.
 
 Everything else audited in this pass (DAT GUI, Doctor/Emulator Setup, ES-DE
 mapping ceiling, five newest adapters' physical launch, openMSX, version/tag
 housekeeping) is confirmed closed, correctly deferred, or a non-blocking
 P1/P2 — none of it belongs on the critical path to V1.
 
-## Final release-cut reconciliation (2026-09-06, `7ac525a`)
+## Final release-cut reconciliation (2026-09-06, `f93a7cd`)
 
 This section supersedes the older point-in-time matrix and critical-path notes
 above where they describe pre-closure AppImage tooling, the DAT variant gap,
@@ -1239,6 +1232,35 @@ evidence; they are not a statement of the current release-cut state.
 - DAT catalogue/variant provenance: `9888bd5`.
 - RMG fallback label: `99e511d`.
 - Generated 94k RomM cache/load and browser-projection guard: `7ac525a`.
+- PS2 CHD identity: `e5d6f22`; DOSBox Staging selected-game integration:
+  `5f9fa7b`.
+- Bounded RAR/7z member evidence: `e8a3ede`.
+- SameBoy shared selected-game integration: `f93a7cd`.
+- Set-completeness/member vocabulary and durable set results: `29b3ba2`,
+  `85bafb5`, and `14f082b`.
+- Collection-health coverage rollup: `af66936`; local TOSEC lifecycle:
+  `6d8847f`; onboarding DAT/emulator guidance: `e3c5f47`.
+
+### Implementation open (unowned)
+
+- **ScummVM selected-game candidate projection.** The reviewed command,
+  execution preflight, platform mapping, and Emulator Setup naming exist, but
+  shared `DiscoveredStandaloneProfile` projection has no ScummVM arm yet.
+- **FBNeo managed-provider lifecycle.** Existing FBNeo evidence and launch
+  support do not constitute a managed DAT update/check/rollback provider.
+
+### Active / owned work
+
+- DAT active-source/snapshot arbitration, coverage/expected inventory, and
+  disk-only set reconciliation are owned by current DAT worktrees.
+- Naming portability is an active `dat/rename_plan` lane; its current dirty
+  implementation is owned work, not a free backlog item.
+- The non-cheat mod foundation is owned by its current core worktree.
+- ScummVM/Gamer View and typed-launch continuity work are owned Gamer lanes.
+- VICE and FS-UAE standalone-adapter work is owned by separate launch lanes.
+
+These are deliberately not recommendations for a new lane until their owners
+finish or release the relevant files.
 
 ### Manual-pending release gates
 
@@ -1262,14 +1284,15 @@ ES-DE, and disposable filesystem environment is available.
 - ES-DE V1 policy gaps remain intentionally unsupported: Atari 8-bit,
   Commodore 128, NeoGeo64, and generic PC; MegaDrive remains intentionally
   partial rather than guessing a region.
-- `openMSX` is deferred post-V1/P2: no adapter and no shared machine-profile
-  seam exists. It is greenfield multi-file adapter work, not a small existing
-  seam.
+- FBNeo managed-provider lifecycle remains an unowned future implementation
+  gap, separate from the completed FBNeo evidence/launch adapter. Naming
+  portability is active owned work, not a free task.
 - Physical launches for optional standalone adapters, desktop smoke sweeps,
   resize/focus/accessibility/long-session polish, and optional RomM resource
   watching are P1/P2 confidence follow-ups, not release blockers.
-- DAT aggregate count and other P2 browsing/reporting ideas are non-blocking;
-  catalogue/variant provenance is no longer in that list.
+- DAT P2 browsing/reporting ideas are non-blocking; active-source/snapshot
+  arbitration, coverage/expected inventory, and disk-only reconciliation are
+  currently owned work, not free backlog.
 
 ### Release-cut actions not yet performed
 
@@ -1283,7 +1306,7 @@ ES-DE, and disposable filesystem environment is available.
 5. Create the release tag only after the final artifact/version checks pass.
 
 Current tag state: `v0.8.2` points at `db8092d`; current authority is not
-tagged (`git describe --tags` is `v0.8.2-48-g7ac525a`). CLI and GUI version
+tagged (`git describe --tags` is `v0.8.2-81-gf93a7cd`). CLI and GUI version
 output both derive from `env!("CARGO_PKG_VERSION")`, so no independent source
 version string was found.
 

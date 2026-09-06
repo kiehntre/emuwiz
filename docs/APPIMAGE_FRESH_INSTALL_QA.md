@@ -19,12 +19,15 @@
   `APPIMAGE_EXTRACT_AND_RUN=1` passes. The official fresh-home harness passed
   checksum, clean disposable state, host-tool visibility, and AppRun
   environment checks.
-- Interactive GUI onboarding, same-session Home navigation, Sources/DAT/
-  firmware screens, source immutability, emulator inventory, and viewport
-  checks were **not physically executable** on this host because no display
-  server is available (`DISPLAY`/`WAYLAND_DISPLAY` unset). Automated onboarding
-  coverage and packaging harness coverage passed; physical GUI acceptance
-  remains follow-up.
+- This particular shell-only run did not exercise interactive GUI onboarding,
+  same-session Home navigation, Sources/DAT/firmware screens, source
+  immutability, emulator inventory, or viewport checks because its execution
+  environment had no display variables. That was a session limitation, not a
+  claim that Saltbox lacks a desktop: the later `c7a068a` spot check proved
+  `DISPLAY=:0`, `/home/davedap/.Xauthority`, and
+  `XDG_RUNTIME_DIR=/run/user/1000` work against the real Xorg/XFCE Sunshine /
+  Moonlight session. Current-artifact interactive acceptance remains a
+  release-owner follow-up.
 - Packaging content inspection found only EmuWiz GUI/CLI, desktop metadata,
   and branding icons; no emulator binaries, credentials, user config, temp
   files, or LBC content were bundled. The original user configuration and game/
