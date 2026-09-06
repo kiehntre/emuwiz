@@ -14,6 +14,7 @@ use archivefs_core::identity_source::model::{
     IdentityProvider, MetadataProviderId,
 };
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 const SERVER: &str = "http://172.19.0.20:8080";
 
@@ -70,6 +71,62 @@ fn cache(records: Vec<ExternalIdentityRecord>) -> IdentityCache {
         unknown_platforms: Vec::new(),
         server_reported_total: Some(0),
     }
+}
+
+fn large_cache_94k() -> IdentityCache {
+    let records = (0..94_000)
+        .map(|index| {
+            let mut row = record(
+                &format!("{index:06}"),
+                &format!("Game {index} Edition {}", index % 7),
+                &format!("p{}/game-{index}.rom", index % 23),
+            );
+            row.provider_platform_id = Some((index % 23).to_string());
+            row.platform_candidate = (index % 17 != 0).then(|| format!("Platform {}", index % 23));
+            row.provider_platform_name = Some(format!("platform-{}", index % 23));
+            row.title = (index % 13 != 0).then(|| format!("Game {index} Edition {}", index % 7));
+            row.regions = if index % 19 == 0 {
+                Vec::new()
+            } else {
+                vec![if index % 2 == 0 { "USA" } else { "Europe" }.to_string()]
+            };
+            row.archivefs_path = (index % 11 != 0)
+                .then(|| PathBuf::from(format!("/mnt/games/p{}/game-{index}.rom", index % 23)));
+            row
+        })
+        .collect();
+    cache(records)
+}
+
+#[test]
+fn a_94k_romm_cache_projects_deterministically_without_per_record_probes() {
+    let cache = large_cache_94k();
+    let filters = RecordFilters::default();
+    let calls = std::cell::Cell::new(0usize);
+    let started = Instant::now();
+    let first = build_record_page(&cache, &filters, 0, DEFAULT_PAGE_SIZE, &|_| {
+        calls.set(calls.get() + 1);
+        LocalPresence::File
+    });
+    let first_projection = started.elapsed();
+    let repeated_started = Instant::now();
+    let repeated = build_record_page(&cache, &filters, 0, DEFAULT_PAGE_SIZE, &|_| {
+        LocalPresence::File
+    });
+    let repeated_projection = repeated_started.elapsed();
+
+    assert_eq!(first.total_in_cache, 94_000);
+    assert_eq!(first.matching, 94_000);
+    assert_eq!(first.rows.len(), DEFAULT_PAGE_SIZE);
+    assert_eq!(first.rows, repeated.rows);
+    assert_eq!(first.canonical_platforms, repeated.canonical_platforms);
+    assert_eq!(calls.get(), 0, "default browsing must not stat 94k paths");
+    assert!(first_projection < Duration::from_secs(30));
+    assert!(repeated_projection < Duration::from_secs(30));
+    eprintln!(
+        "94k RomM page projection: first={first_projection:?}, repeated={repeated_projection:?}, platforms={}",
+        first.canonical_platforms.len()
+    );
 }
 
 /// A catalogue with one record per verdict, plus variety to filter on.

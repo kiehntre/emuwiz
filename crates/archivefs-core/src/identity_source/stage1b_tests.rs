@@ -19,7 +19,7 @@ use crate::safe_read::TrustedRoots;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // --- Fixtures -------------------------------------------------------------
 
@@ -1020,6 +1020,64 @@ fn record_for(server: &str, id: &str, path: Option<PathBuf>) -> ExternalIdentity
         rating: None,
         release_year: None,
     }
+}
+
+/// A generated, realistic upper-bound catalogue. It deliberately stays in
+/// test code: release-readiness coverage must not add a huge fixture to the
+/// repository or require a user's RomM cache.
+fn large_romm_cache() -> IdentityCache {
+    const RECORDS: usize = 94_000;
+    let records = (0..RECORDS)
+        .map(|index| {
+            let mut record = record_for(
+                "http://romm:8080",
+                &format!("{index:06}"),
+                (index % 11 != 0)
+                    .then(|| PathBuf::from(format!("/library/p{}/game-{index}.zip", index % 23))),
+            );
+            record.provider_platform_id = Some((index % 23).to_string());
+            record.provider_platform_name = Some(format!("platform-{}", index % 23));
+            record.platform_candidate =
+                (index % 17 != 0).then(|| format!("Platform {}", index % 23));
+            record.title =
+                (index % 13 != 0).then(|| format!("Game {index} (Edition {})", index % 7));
+            record.regions = if index % 19 == 0 {
+                Vec::new()
+            } else {
+                vec![if index % 2 == 0 { "USA" } else { "Europe" }.to_string()]
+            };
+            record.file_size_bytes = (index % 29 != 0).then_some(1024 + index as u64);
+            record
+        })
+        .collect();
+    cache_with(records, "http://romm:8080")
+}
+
+#[test]
+fn a_94k_romm_cache_loads_without_losing_or_reordering_records() {
+    let tree = Tree::new("cache-94k-performance");
+    let location = IdentityCacheLocation::new(&tree.identity(), IdentityProvider::Romm);
+    let cache = large_romm_cache();
+    publish_cache(&location, &cache).expect("published large cache");
+
+    let started = Instant::now();
+    let loaded = load_cache(&location, Some("http://romm:8080")).expect("loaded large cache");
+    let first_load = started.elapsed();
+    let repeated_started = Instant::now();
+    let repeated = load_cache(&location, Some("http://romm:8080")).expect("reloaded large cache");
+    let repeated_load = repeated_started.elapsed();
+
+    assert_eq!(loaded.records.len(), 94_000);
+    assert_eq!(loaded.records, cache.records);
+    assert_eq!(repeated.records, loaded.records);
+    // A deliberately generous guard against a catastrophic parse/validation
+    // regression, not a machine-specific performance target.
+    assert!(first_load < Duration::from_secs(30));
+    assert!(repeated_load < Duration::from_secs(30));
+    eprintln!(
+        "94k RomM cache load: first={first_load:?}, repeated={repeated_load:?}, bytes={}",
+        location.cache_size_bytes().unwrap_or_default()
+    );
 }
 
 /// Test 89: the first publication creates the cache, and it reads back.

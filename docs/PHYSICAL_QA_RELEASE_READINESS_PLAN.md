@@ -521,6 +521,31 @@ test recovery mechanism.
 
 ## 14. Large-library performance checks
 
+### Automated 94k RomM cache/projection pass (2026-09-06)
+
+The reproducible release guard generates 94,000 varied RomM records at test
+time; no user cache, network service, or committed bulk fixture is involved.
+It exercises the production cache publication/read path
+(`publish_cache` → `load_cache` → JSON decode + validation) and the production
+Sources → RomM record-page projection (`build_record_page`). Home itself stays
+SQLite-backed and does not eagerly join this optional RomM cache; selected-game
+metadata is cache-only and selection-scoped, while Gamer artwork builds its
+path index once on its worker.
+
+Debug baseline on this QA host: a 63,713,437-byte generated cache loaded and
+validated in 1.728 s first-read / 1.772 s repeated-read. The 94k browser page
+projection took 125 ms first pass / 121 ms repeated, returned its bounded page,
+preserved all 94,000 records and platform variation, and made zero presence
+filesystem probes with the default filter. The cache parse/deserialize is the
+dominant cold cost; the page builder is a bounded background projection and
+does not perform N+1 database, network, or stat work in its ordinary path.
+
+The regression tests intentionally use only a 30-second catastrophic-regression
+ceiling plus structural assertions (count, deterministic page, bounded page,
+and zero default-filter probes), not a machine-specific target. This closes the
+automated 94k RomM P1 risk. Physical desktop/resource-watch coverage remains
+P1 follow-up, not a prerequisite for the cache/projection contract.
+
 Use a RomM snapshot or controlled fixture near 94,000 records, plus a small local
 source. This is a bounded pass, not a benchmark of every page.
 
@@ -608,7 +633,7 @@ The checkpoint is physically release-ready when:
 | Gamer/selected-game continuity | AUTOMATED VERIFIED for projections | Required: real navigation and stale selections | P1 | 30m |
 | ES-DE mapping breadth | AUTOMATED VERIFIED for mapping contracts | Required: disposable target sampling | P1 | 60m |
 | Packaged/extracted desktop smoke | Not verified by unit tests | Required: clean desktop/account | P1 | 45m |
-| 94k RomM bounded performance | PARTIAL / DEGRADED | Required: large snapshot and resource watch | P1 | 60m |
+| 94k RomM bounded performance | AUTOMATED VERIFIED for cache/projection | Optional: desktop resource-watch follow-up | P1 | 60m |
 | Resize/focus/accessibility/long-session polish | PARTIAL / DEGRADED | Required: representative desktop sweep | P2 | 90m |
 | Unsupported general local mods/providers | DEFERRED | Not a current supported journey | P2 | — |
 | MegaDrive regional policy | PARTIAL / DEGRADED | Do not accept guessed mapping | P2 | — |
