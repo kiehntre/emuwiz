@@ -7919,39 +7919,41 @@ impl ArchiveFsApp {
             LoadState::Loading { .. } | LoadState::Error(_) => None,
         };
 
-        show_sources_overview(
-            ui,
-            sources,
-            source_state.catalogue_available,
-            &self.catalogue_manager,
-            self.catalogue_retrieval.as_ref(),
-        );
-        ui.add_space(theme::SECTION_GAP);
+        let sources_action = sources_page::sources_content_column(ui, |ui| {
+            show_sources_overview(
+                ui,
+                sources,
+                source_state.catalogue_available,
+                &self.catalogue_manager,
+                self.catalogue_retrieval.as_ref(),
+            );
+            ui.add_space(theme::SECTION_GAP);
 
-        if let Some(last_scan) = &self.sources_last_scan
-            && show_sources_last_scan_banner(ui, last_scan)
-        {
-            self.show_skipped_files = true;
-            self.skipped_files_filter = None;
-        }
-        ui.add_space(theme::SECTION_GAP);
+            if let Some(last_scan) = &self.sources_last_scan
+                && show_sources_last_scan_banner(ui, last_scan)
+            {
+                self.show_skipped_files = true;
+                self.skipped_files_filter = None;
+            }
+            ui.add_space(theme::SECTION_GAP);
 
-        let sources_action = show_sources_page_with_mount_root(
-            ui,
-            sources,
-            archives,
-            mount_root,
-            source_state.catalogue_available,
-            self.source_action.is_some(),
-            &mut self.mount_root_draft,
-            self.setup_action.is_some()
-                || self.source_action.is_some()
-                || self.database_state.is_loading(),
-            self.mount_root_feedback.as_ref(),
-            &mut self.sources_add_dialog,
-            &mut self.sources_remove_dialog,
-            &mut self.clipboard,
-        );
+            show_sources_page_with_mount_root(
+                ui,
+                sources,
+                archives,
+                mount_root,
+                source_state.catalogue_available,
+                self.source_action.is_some(),
+                &mut self.mount_root_draft,
+                self.setup_action.is_some()
+                    || self.source_action.is_some()
+                    || self.database_state.is_loading(),
+                self.mount_root_feedback.as_ref(),
+                &mut self.sources_add_dialog,
+                &mut self.sources_remove_dialog,
+                &mut self.clipboard,
+            )
+        });
         if let Some(sources_action) = sources_action {
             match sources_action {
                 SourcesPageAction::AddFolder(path) => {

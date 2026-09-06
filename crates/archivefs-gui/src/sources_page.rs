@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// Sources configuration and scan review are text-led workflows. Keep their
+/// cards on one readable column even though the parent Sources view also hosts
+/// wider specialist tabs such as DAT sources and RomM.
+pub(super) fn sources_content_width(available_width: f32) -> f32 {
+    available_width.max(0.0).min(theme::CONTENT_MAX_WIDTH)
+}
+
+pub(super) fn sources_content_column<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let width = sources_content_width(ui.available_width());
+    let gutter = ((ui.available_width() - width) * 0.5).max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.add_space(gutter);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            add_contents,
+        )
+        .inner
+    })
+    .inner
+}
+
 /// Renders the Sources page's compact echo of its most recently completed
 /// scan (see [`SourcesLastScan`]) directly on the page, next to the
 /// source/action it belongs to - not only reachable via the separate
@@ -1347,46 +1372,43 @@ pub(super) fn show_sources_page_with_mount_root(
             *add_dialog = Some(SourcesAddDialogState::default());
         }
     } else {
-        egui::ScrollArea::vertical()
-            .id_salt("sources_list")
-            .max_height(320.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for view in sources {
-                    widgets::card(ui, |ui| {
-                        ui.strong(format!("Game folder: {}", game_folder_title(&view.path)));
+        // The containing Sources page already owns the vertical scrollbar.
+        // Keeping this list in that shared flow avoids a short nested scroll
+        // viewport that hid later source cards while the page still had room.
+        ui.vertical(|ui| {
+            for view in sources {
+                widgets::card(ui, |ui| {
                         let (status, status_tone, guidance, primary_action) =
                             game_source_status(view);
+                        ui.strong(format!("Game folder: {}", game_folder_title(&view.path)));
                         widgets::status_strip(
                             ui,
                             &[(status, status_tone), ("Configured", widgets::StatusTone::Info)],
                         );
-                        ui.label(guidance);
                         ui.add_space(4.0);
                         ui.weak("Folder path");
                         if widgets::path_value(ui, "Path", &view.path) {
                                     let _ = clipboard.set_text(view.path.display().to_string());
                         }
+                        ui.label(egui::RichText::new(guidance).color(theme::muted(ui)));
                         ui.add_space(4.0);
                         egui::Grid::new(("source_facts_grid", &view.path))
                             .num_columns(2)
                             .spacing([12.0, 6.0])
                             .show(ui, |ui| {
-                                ui.label("Archive entries found:");
+                                ui.weak("Archive entries found:");
                                 ui.label(
                                     view.last_archive_count
                                         .map(|count| count.to_string())
                                         .unwrap_or_else(|| "No scan results yet".to_string()),
                                 );
                                 ui.end_row();
-                                ui.label("Last scan:");
+                                ui.weak("Last scan:");
                                 ui.label(view.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
                                 ui.end_row();
-                                if view.assigned_platform.is_some() {
-                                    ui.label("Platform:");
-                                    ui.label(source_platform_value_label(&source_platform_state(view, archives)));
-                                    ui.end_row();
-                                }
+                                ui.label("Platform:");
+                                ui.label(source_platform_value_label(&source_platform_state(view, archives)));
+                                ui.end_row();
                             });
                         if view.last_archive_count == Some(0)
                             && view.last_scan_status
@@ -1399,6 +1421,9 @@ pub(super) fn show_sources_page_with_mount_root(
                                 ui.label(error);
                             });
                         }
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
                             if widgets::action_button(ui, primary_action, widgets::ActionStyle::Primary, !busy).clicked() {
                                 if view.enabled {
@@ -1455,9 +1480,10 @@ pub(super) fn show_sources_page_with_mount_root(
                                         ui.small("Incompatible direct images remain Unknown.");
                                     });
                         });
-                    });
-                }
-            });
+                });
+                ui.add_space(theme::SPACE_SM);
+            }
+        });
     }
 
     ui.add_space(theme::SECTION_GAP);
@@ -1467,6 +1493,7 @@ pub(super) fn show_sources_page_with_mount_root(
         Some("Choose where EmuWiz temporarily prepares archived games."),
     );
     widgets::card(ui, |ui| {
+        ui.strong("Temporary game preparation folder");
         if let Some(root) = mount_root {
             if widgets::path_value(ui, "Mount root", root) {
                 let _ = clipboard.set_text(root.display().to_string());
@@ -1474,9 +1501,11 @@ pub(super) fn show_sources_page_with_mount_root(
         } else {
             ui.label("Mount root: unknown");
         }
-        ui.label("Temporary game preparation folder");
         ui.label(
-            "EmuWiz temporarily makes archived games available here while you play. It does not rewrite your original game files.",
+            egui::RichText::new(
+                "EmuWiz temporarily makes archived games available here while you play. It does not rewrite your original game files.",
+            )
+            .color(theme::muted(ui)),
         );
         ui.label(
             egui::RichText::new(
@@ -2371,29 +2400,45 @@ pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Optio
 /// data it reads are unchanged - only the routing mechanism moved from an
 /// overlay to a Sources tab.
 pub(super) fn show_sources_discovery_tab(ui: &mut egui::Ui, database_state: &DatabaseState) {
-    widgets::section_header(
-        ui,
-        "Collection Discovery",
-        Some(
-            "A plain-language summary of the most recent scan's universal ingestion results: what was found, what needs attention, and what to do about it.",
-        ),
-    );
-    let summary = match database_state {
-        DatabaseState::Ready {
-            last_scan_summary, ..
-        } => last_scan_summary.as_ref(),
-        _ => None,
-    };
-    // Prefer the persisted database's own record of the most recent
-    // *completed* scan over the session-local `last_scan_summary` - this
-    // run id survives an app restart, so paging keeps working even when
-    // the summary above is `None` (nothing scanned yet this session).
-    let discovery_run = match database_state {
-        DatabaseState::Ready { snapshot, .. } => snapshot
-            .last_completed_scan
-            .as_ref()
-            .map(|scan| (snapshot.database_path.as_path(), scan.scan_run_id)),
-        _ => None,
-    };
-    collection_discovery_page::show_collection_discovery_panel(ui, summary, discovery_run);
+    sources_content_column(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Collection Discovery",
+            Some(
+                "A plain-language summary of the most recent scan's universal ingestion results: what was found, what needs attention, and what to do about it.",
+            ),
+        );
+        let summary = match database_state {
+            DatabaseState::Ready {
+                last_scan_summary, ..
+            } => last_scan_summary.as_ref(),
+            _ => None,
+        };
+        // Prefer the persisted database's own record of the most recent
+        // *completed* scan over the session-local `last_scan_summary` - this
+        // run id survives an app restart, so paging keeps working even when
+        // the summary above is `None` (nothing scanned yet this session).
+        let discovery_run = match database_state {
+            DatabaseState::Ready { snapshot, .. } => snapshot
+                .last_completed_scan
+                .as_ref()
+                .map(|scan| (snapshot.database_path.as_path(), scan.scan_run_id)),
+            _ => None,
+        };
+        collection_discovery_page::show_collection_discovery_panel(ui, summary, discovery_run);
+    });
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn sources_content_column_is_readable_on_desktop_without_clipping_narrow_views() {
+        assert_eq!(sources_content_width(600.0), 600.0);
+        assert_eq!(sources_content_width(1_024.0), 1_024.0);
+        assert_eq!(sources_content_width(1_100.0), theme::CONTENT_MAX_WIDTH);
+        assert_eq!(sources_content_width(1_440.0), theme::CONTENT_MAX_WIDTH);
+        assert_eq!(sources_content_width(1_920.0), theme::CONTENT_MAX_WIDTH);
+    }
 }

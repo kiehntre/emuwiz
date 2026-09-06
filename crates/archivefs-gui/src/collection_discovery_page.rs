@@ -766,8 +766,14 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
                     let (tone, status) = status_tone_for_row(row);
                     ui.horizontal(|ui| {
                         widgets::status_badge(ui, &status, tone);
-                        ui.label(egui::RichText::new(discovery_detail_filename(row)).strong())
-                            .on_hover_text(row.path.display().to_string());
+                        ui.add_sized(
+                            [ui.available_width(), ui.spacing().interact_size.y],
+                            egui::Label::new(
+                                egui::RichText::new(discovery_detail_filename(row)).strong(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(row.path.display().to_string());
                     });
                     ui.label(
                         egui::RichText::new(discovery_detail_kind_label(row))
