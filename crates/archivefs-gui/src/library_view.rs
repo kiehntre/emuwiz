@@ -93,22 +93,42 @@ pub(crate) fn show_loaded_data(
     }
     if let Some(recent) = recent_scan {
         widgets::card(ui, |ui| {
-            ui.strong("Latest scan");
-            ui.label(format!(
-                "Found {} new game{} and updated {} existing entr{}.",
-                recent.scan.archives_added,
-                if recent.scan.archives_added == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                recent.scan.archives_updated,
-                if recent.scan.archives_updated == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Latest scan");
+                widgets::status_badge(
+                    ui,
+                    if recent.scan.errors_count > 0 {
+                        "Completed with warnings"
+                    } else {
+                        "Completed"
+                    },
+                    if recent.scan.errors_count > 0 {
+                        widgets::StatusTone::Warning
+                    } else {
+                        widgets::StatusTone::Success
+                    },
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "Found {} new game{} and updated {} existing entr{}.",
+                    recent.scan.archives_added,
+                    if recent.scan.archives_added == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    recent.scan.archives_updated,
+                    if recent.scan.archives_updated == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                ));
+                if let Some(finished_at) = recent.scan.finished_at.as_deref() {
+                    ui.weak(format!("Completed {finished_at}"));
+                }
+            });
             if recent.scan.errors_count > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -131,6 +151,12 @@ pub(crate) fn show_loaded_data(
                 );
             }
         });
+        widgets::section_header(
+            ui,
+            "New additions",
+            Some("Items discovered by the most recent completed scan."),
+        );
+        ui.add_space(4.0);
     }
 
     // The moved-library "fix it here" card. Shown on the ordinary Library
