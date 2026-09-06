@@ -18,6 +18,7 @@ fn base_outcome() -> DatAuditOutcome {
         catalogue_author: Some("No-Intro".to_string()),
         catalogue_homepage: Some("No-Intro".to_string()),
         catalogue_ecosystem: Some(DatEcosystem::NoIntro),
+        catalogue_variant: Some(crate::identity_source::no_intro::NoIntroVariant::Unknown),
         unreadable_catalogues: Vec::new(),
         report: AuditReport {
             entries: Vec::new(),

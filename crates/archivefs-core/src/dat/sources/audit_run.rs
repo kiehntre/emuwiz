@@ -73,6 +73,7 @@ use crate::dat::policy::candidate::candidate_for_rom;
 use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
 use crate::dat::set::{SetResolution, classify_archive_sets, classify_disk_only_sets};
 use crate::identity_source::hashing::{HashRefusal, hash_file_reporting};
+use crate::identity_source::no_intro::NoIntroVariant;
 use crate::safe_read::TrustedRoots;
 
 /// How deep the scan descends below the chosen folder.
@@ -159,6 +160,14 @@ pub struct DatAuditEvidenceSource {
     pub source_id: String,
     pub source_display_name: String,
     pub platform: Option<String>,
+    /// Parsed catalogue facts for this exact contributing source.  These are
+    /// per-source because a combined audit must never attribute a candidate
+    /// to the synthetic aggregate catalogue.
+    pub catalogue_ecosystem: Option<DatEcosystem>,
+    pub catalogue_variant: Option<NoIntroVariant>,
+    pub catalogue_revision: Option<String>,
+    pub catalogue_names: Vec<String>,
+    pub dat_path: String,
     pub game_name: String,
     pub rom_name: String,
     pub algorithm: String,
@@ -287,6 +296,12 @@ pub struct DatAuditOutcome {
     /// text heuristic. `None` for a combined multi-source audit.
     #[serde(default)]
     pub catalogue_ecosystem: Option<DatEcosystem>,
+    /// A No-Intro representation stated by the DAT header and classified by
+    /// the existing importer. `None` means this is not a No-Intro catalogue;
+    /// `Some(Unknown)` is an inspected No-Intro catalogue whose header did
+    /// not state a known representation.
+    #[serde(default)]
+    pub catalogue_variant: Option<NoIntroVariant>,
     /// Orthogonal content classification. It never changes `report` or its
     /// counts; it controls only downstream selection eligibility.
     pub content: DatAuditContentOutcome,
@@ -628,6 +643,7 @@ pub fn run_dat_audit_with_cache(
     let catalogue_author = catalogue.source.author.clone();
     let catalogue_homepage = catalogue.source.homepage.clone();
     let catalogue_ecosystem = Some(catalogue.source.ecosystem);
+    let catalogue_variant = no_intro_variant_for_catalogue(&catalogue);
     let content_selection = request
         .policy
         .as_ref()
@@ -782,6 +798,7 @@ pub fn run_dat_audit_with_cache(
         catalogue_author,
         catalogue_homepage,
         catalogue_ecosystem,
+        catalogue_variant,
         content: DatAuditContentOutcome {
             selection: content_selection,
             catalogue: catalogue_content,
@@ -1110,6 +1127,7 @@ pub fn run_combined_dat_audit_with_cache(
         catalogue_author: None,
         catalogue_homepage: None,
         catalogue_ecosystem: None,
+        catalogue_variant: None,
         content: DatAuditContentOutcome {
             selection: ContentSelectionPolicy::AllEntries,
             catalogue: DatContentSummary::default(),
@@ -1142,6 +1160,9 @@ struct LoadedCombinedCatalogue {
     names: Vec<String>,
     entries: usize,
     roms: usize,
+    ecosystem: DatEcosystem,
+    variant: Option<NoIntroVariant>,
+    revision: Option<String>,
     /// Whether this catalogue could supply the legacy, internal-slave LHA
     /// evidence path.  This is only a performance gate; every positive match
     /// is still cryptographically checked by `merge_combined_evidence`.
@@ -1209,10 +1230,18 @@ fn load_combined_catalogue(
         source: source.clone(),
         entries: parsed.source.entry_count,
         roms: parsed.source.rom_count,
+        ecosystem: parsed.source.ecosystem,
+        variant: no_intro_variant_for_catalogue(&parsed),
+        revision: parsed.source.version.clone(),
         index: DatIndex::build(&parsed),
         names,
         may_match_lha_slave,
     })
+}
+
+fn no_intro_variant_for_catalogue(catalogue: &ParsedDat) -> Option<NoIntroVariant> {
+    (catalogue.source.ecosystem == DatEcosystem::NoIntro)
+        .then(|| NoIntroVariant::detect(&catalogue.source.name, &catalogue.source.description))
 }
 
 /// Builds the `index` [`RarArchiveSource::open`] needs to resolve each
@@ -1289,11 +1318,17 @@ fn merge_combined_evidence(
         }
     }
     if !source_ambiguities.is_empty() {
+        let evidence = exact
+            .iter()
+            .map(|(source, game, rom, algorithm)| {
+                evidence_source(source, known, game, rom, algorithm)
+            })
+            .collect();
         return CombinedEvidenceResult {
             verdict: AuditVerdict::Ambiguous {
                 detail: source_ambiguities.join("; "),
             },
-            evidence: Vec::new(),
+            evidence,
             content: None,
         };
     }
@@ -1364,15 +1399,7 @@ fn merge_combined_evidence(
     }
     let evidence = exact
         .iter()
-        .map(|(source, game, rom, algorithm)| DatAuditEvidenceSource {
-            local_path: known.filepath.clone(),
-            source_id: source.source.source_id.clone(),
-            source_display_name: source.source.source_display_name.clone(),
-            platform: source.source.platform.clone(),
-            game_name: game.clone(),
-            rom_name: rom.clone(),
-            algorithm: (*algorithm).to_string(),
-        })
+        .map(|(source, game, rom, algorithm)| evidence_source(source, known, game, rom, algorithm))
         .collect();
     let content = combined_content_match(known, first_source, first_game, first_rom);
     CombinedEvidenceResult {
@@ -1383,6 +1410,29 @@ fn merge_combined_evidence(
         },
         evidence,
         content,
+    }
+}
+
+fn evidence_source(
+    source: &LoadedCombinedCatalogue,
+    known: &KnownFileEvidence,
+    game_name: &str,
+    rom_name: &str,
+    algorithm: &str,
+) -> DatAuditEvidenceSource {
+    DatAuditEvidenceSource {
+        local_path: known.filepath.clone(),
+        source_id: source.source.source_id.clone(),
+        source_display_name: source.source.source_display_name.clone(),
+        platform: source.source.platform.clone(),
+        catalogue_ecosystem: Some(source.ecosystem),
+        catalogue_variant: source.variant,
+        catalogue_revision: source.revision.clone(),
+        catalogue_names: source.names.clone(),
+        dat_path: source.source.dat_path.to_string_lossy().into_owned(),
+        game_name: game_name.to_string(),
+        rom_name: rom_name.to_string(),
+        algorithm: algorithm.to_string(),
     }
 }
 

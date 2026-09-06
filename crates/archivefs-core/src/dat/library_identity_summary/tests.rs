@@ -21,6 +21,7 @@ fn base_outcome() -> DatAuditOutcome {
         catalogue_author: Some("No-Intro".to_string()),
         catalogue_homepage: Some("No-Intro".to_string()),
         catalogue_ecosystem: Some(DatEcosystem::NoIntro),
+        catalogue_variant: Some(crate::identity_source::no_intro::NoIntroVariant::Unknown),
         unreadable_catalogues: Vec::new(),
         report: AuditReport {
             entries: Vec::new(),
@@ -108,6 +109,34 @@ fn verified_single_match_is_marked_verified_with_its_algorithm() {
 }
 
 #[test]
+fn no_intro_variant_is_preserved_without_changing_verification() {
+    let mut outcome = base_outcome();
+    outcome.catalogue_variant = Some(crate::identity_source::no_intro::NoIntroVariant::Headerless);
+    let verdict = exact("Super Mario Bros. (World)");
+    let audited = hashes();
+    let summary = summarize_library_dat_identity(&query(&outcome, &verdict, &audited, None));
+
+    assert_eq!(
+        summary.source.variant,
+        Some(crate::identity_source::no_intro::NoIntroVariant::Headerless)
+    );
+    assert!(summary.is_verified());
+}
+
+#[test]
+fn unknown_no_intro_variant_stays_unknown() {
+    let outcome = base_outcome();
+    let verdict = exact("Super Mario Bros. (World)");
+    let audited = hashes();
+    let summary = summarize_library_dat_identity(&query(&outcome, &verdict, &audited, None));
+
+    assert_eq!(
+        summary.source.variant,
+        Some(crate::identity_source::no_intro::NoIntroVariant::Unknown)
+    );
+}
+
+#[test]
 fn no_match_is_reported_without_a_canonical_name_or_hash_evidence() {
     let outcome = base_outcome();
     let audited = hashes();
@@ -170,6 +199,71 @@ fn multiple_cryptographic_candidates_are_ambiguous_and_list_the_names() {
         vec!["Game (USA)".to_string(), "Game (Europe)".to_string()]
     );
     assert_eq!(summary.canonical.canonical_dat_name, None);
+}
+
+#[test]
+fn aggregate_candidates_keep_the_catalogue_that_supplied_each_one() {
+    let mut outcome = base_outcome();
+    outcome.source_id = crate::dat::sources::audit_run::COMBINED_AUDIT_SOURCE_ID.to_string();
+    outcome.evidence_sources = vec![
+        crate::dat::sources::audit_run::DatAuditEvidenceSource {
+            local_path: "/roms/game.rom".into(),
+            source_id: "headered".into(),
+            source_display_name: "No-Intro Headered".into(),
+            platform: None,
+            catalogue_ecosystem: Some(DatEcosystem::NoIntro),
+            catalogue_variant: Some(crate::identity_source::no_intro::NoIntroVariant::Headered),
+            catalogue_revision: Some("2026-09".into()),
+            catalogue_names: vec!["Game Headered".into()],
+            dat_path: "/dats/headered.dat".into(),
+            game_name: "Game (Headered)".into(),
+            rom_name: "game.rom".into(),
+            algorithm: "SHA-1".into(),
+        },
+        crate::dat::sources::audit_run::DatAuditEvidenceSource {
+            local_path: "/roms/game.rom".into(),
+            source_id: "headerless".into(),
+            source_display_name: "No-Intro Headerless".into(),
+            platform: None,
+            catalogue_ecosystem: Some(DatEcosystem::NoIntro),
+            catalogue_variant: Some(crate::identity_source::no_intro::NoIntroVariant::Headerless),
+            catalogue_revision: Some("2026-09".into()),
+            catalogue_names: vec!["Game Headerless".into()],
+            dat_path: "/dats/headerless.dat".into(),
+            game_name: "Game (Headerless)".into(),
+            rom_name: "game.rom".into(),
+            algorithm: "SHA-1".into(),
+        },
+    ];
+    let verdict = AuditVerdict::ExactMultipleCandidates {
+        algorithm: "SHA-1",
+        count: 2,
+        game_names: vec!["Game (Headered)".into(), "Game (Headerless)".into()],
+    };
+    let audited = hashes();
+    let summary = summarize_library_dat_identity(&query(&outcome, &verdict, &audited, None));
+
+    assert_eq!(
+        summary.verification_state,
+        DatVerificationState::AmbiguousMultipleCandidates {
+            algorithm: "SHA-1".into(),
+            candidate_count: 2,
+        }
+    );
+    assert_eq!(summary.candidate_provenance.len(), 2);
+    assert_eq!(summary.candidate_provenance[0].source.source_id, "headered");
+    assert_eq!(
+        summary.candidate_provenance[0].source.variant,
+        Some(crate::identity_source::no_intro::NoIntroVariant::Headered)
+    );
+    assert_eq!(
+        summary.candidate_provenance[1].source.source_id,
+        "headerless"
+    );
+    assert_eq!(
+        summary.candidate_provenance[1].source.variant,
+        Some(crate::identity_source::no_intro::NoIntroVariant::Headerless)
+    );
 }
 
 #[test]

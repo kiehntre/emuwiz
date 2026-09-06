@@ -93,6 +93,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         catalogue_author: None,
         catalogue_homepage: None,
         catalogue_ecosystem: None,
+        catalogue_variant: None,
         unreadable_catalogues: Vec::new(),
         report: AuditReport {
             entries: vec![AuditEntry {

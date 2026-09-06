@@ -30,9 +30,22 @@ pub enum NoIntroVariant {
 }
 
 impl NoIntroVariant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Headered => "Headered",
+            Self::Headerless => "Headerless",
+            Self::Aftermarket => "Aftermarket",
+            Self::Bios => "BIOS",
+            Self::Unknown => "Unknown",
+        }
+    }
+
     /// Conservative variant detection from a DAT's own name/description
     /// text. Never consults the filename.
-    fn detect(name: &Option<String>, description: &Option<String>) -> Self {
+    /// Classifies only the already-parsed No-Intro header fields.  This is
+    /// intentionally public within the crate so later provenance projections
+    /// reuse the importer’s validated rule instead of reinterpreting paths.
+    pub(crate) fn detect(name: &Option<String>, description: &Option<String>) -> Self {
         let haystack = format!(
             "{} {}",
             name.as_deref().unwrap_or(""),

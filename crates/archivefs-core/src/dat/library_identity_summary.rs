@@ -34,6 +34,7 @@ use crate::dat::index::DatRomRef;
 use crate::dat::model::DatEcosystem;
 use crate::dat::set::{SetResolution, SetState};
 use crate::dat::sources::audit_run::DatAuditOutcome;
+use crate::identity_source::no_intro::NoIntroVariant;
 
 /// The item hashes EmuWiz already holds for a library item. Mirrors the hash
 /// fields of [`crate::dat::audit::KnownFileEvidence`]; nothing here hashes a
@@ -164,6 +165,11 @@ pub struct DatSourceProvenance {
     /// The DAT publisher family, already classified at parse time. `None`
     /// for a combined multi-source audit.
     pub ecosystem: Option<DatEcosystem>,
+    /// The exact No-Intro representation recorded by the catalogue header.
+    /// `None` means this source is not a No-Intro catalogue; `Unknown` is a
+    /// real inspected No-Intro value and is never promoted to a guess.
+    #[serde(default)]
+    pub variant: Option<NoIntroVariant>,
     /// The catalogue `<version>` header - the closest thing most publishers
     /// carry to a source revision. `None` when the DAT had none or for a
     /// combined audit.
@@ -182,10 +188,36 @@ impl DatSourceProvenance {
             source_id: outcome.source_id.clone(),
             source_name: outcome.source_display_name.clone(),
             ecosystem: outcome.catalogue_ecosystem,
+            variant: outcome.catalogue_variant,
             source_revision: outcome.catalogue_version.clone(),
             author: outcome.catalogue_author.clone(),
             catalogue_names: outcome.catalogue_names.clone(),
             dat_path: outcome.dat_path.clone(),
+        }
+    }
+}
+
+/// Provenance for one candidate in an ambiguous aggregate DAT result.
+/// Candidate names remain separate from confidence: this only answers which
+/// local catalogue supplied the already-existing candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatCandidateProvenance {
+    pub game_name: String,
+    pub rom_name: Option<String>,
+    pub source: DatSourceProvenance,
+}
+
+impl DatSourceProvenance {
+    fn from_evidence(evidence: &crate::dat::sources::audit_run::DatAuditEvidenceSource) -> Self {
+        Self {
+            source_id: evidence.source_id.clone(),
+            source_name: evidence.source_display_name.clone(),
+            ecosystem: evidence.catalogue_ecosystem,
+            variant: evidence.catalogue_variant,
+            source_revision: evidence.catalogue_revision.clone(),
+            author: None,
+            catalogue_names: evidence.catalogue_names.clone(),
+            dat_path: evidence.dat_path.clone(),
         }
     }
 }
@@ -356,6 +388,9 @@ pub struct LibraryDatIdentitySummary {
     /// so a person can see what the audit could not decide between. Empty
     /// for every other state.
     pub ambiguous_candidates: Vec<String>,
+    /// Per-candidate source provenance for an aggregate or ambiguous result.
+    /// Empty only when the audit itself retained no candidate attribution.
+    pub candidate_provenance: Vec<DatCandidateProvenance>,
     pub set_dependency: DatSetDependencySummary,
 }
 
@@ -506,7 +541,7 @@ pub fn summarize_library_dat_identity(
 
     let canonical = DatCanonicalIdentity {
         canonical_dat_name: game_name.clone(),
-        canonical_rom_name: rom_name,
+        canonical_rom_name: rom_name.clone(),
         region: dat_region.or(name_region),
         revision: name_revision,
     };
@@ -544,15 +579,77 @@ pub fn summarize_library_dat_identity(
             .collect(),
     };
 
+    let source = query
+        .outcome
+        .evidence_sources
+        .iter()
+        .find(|evidence| {
+            game_name.as_deref() == Some(evidence.game_name.as_str())
+                && rom_name.as_deref() == Some(evidence.rom_name.as_str())
+        })
+        .map(DatSourceProvenance::from_evidence)
+        .unwrap_or_else(|| DatSourceProvenance::from_outcome(query.outcome));
+    let candidate_provenance = candidate_provenance(query.outcome, &ambiguous_candidates);
+
     LibraryDatIdentitySummary {
         verification_state,
-        source: DatSourceProvenance::from_outcome(query.outcome),
+        source,
         canonical,
         hash_evidence,
         provenance_freshness: freshness(query.audited_hashes, query.current_hashes),
         ambiguous_candidates,
+        candidate_provenance,
         set_dependency: set_dependency_summary(query.outcome, game_name.as_deref()),
     }
+}
+
+fn candidate_provenance(
+    outcome: &DatAuditOutcome,
+    candidates: &[String],
+) -> Vec<DatCandidateProvenance> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut provenance: Vec<_> = outcome
+        .evidence_sources
+        .iter()
+        .filter(|evidence| {
+            candidates
+                .iter()
+                .any(|candidate| candidate == &evidence.game_name)
+        })
+        .map(|evidence| DatCandidateProvenance {
+            game_name: evidence.game_name.clone(),
+            rom_name: Some(evidence.rom_name.clone()),
+            source: DatSourceProvenance::from_evidence(evidence),
+        })
+        .collect();
+    if provenance.is_empty()
+        && outcome.source_id != crate::dat::sources::audit_run::COMBINED_AUDIT_SOURCE_ID
+    {
+        let source = DatSourceProvenance::from_outcome(outcome);
+        provenance = candidates
+            .iter()
+            .map(|game_name| DatCandidateProvenance {
+                game_name: game_name.clone(),
+                rom_name: None,
+                source: source.clone(),
+            })
+            .collect();
+    }
+    provenance.sort_by(|a, b| {
+        (&a.game_name, &a.source.source_id, &a.rom_name).cmp(&(
+            &b.game_name,
+            &b.source.source_id,
+            &b.rom_name,
+        ))
+    });
+    provenance.dedup_by(|a, b| {
+        a.game_name == b.game_name
+            && a.rom_name == b.rom_name
+            && a.source.source_id == b.source.source_id
+    });
+    provenance
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +688,10 @@ pub struct PersistedLibraryDatIdentity {
     /// Competing DAT entry names for an ambiguous / conflicting match,
     /// preserved verbatim - never collapsed into one winner.
     pub ambiguous_candidates: Vec<String>,
+    /// Candidate attribution captured at audit time. Older stored rows have
+    /// no such detail and deserialize as an honest empty list.
+    #[serde(default)]
+    pub candidate_provenance: Vec<DatCandidateProvenance>,
     /// A durable, minimal reference to each matched catalogue entry: enough
     /// to name it and to preserve ambiguity, never enough (or needed) to
     /// reparse the DAT.
@@ -682,6 +783,7 @@ impl PersistedLibraryDatIdentity {
             canonical: summary.canonical.clone(),
             hash_evidence: summary.hash_evidence.clone(),
             ambiguous_candidates: summary.ambiguous_candidates.clone(),
+            candidate_provenance: summary.candidate_provenance.clone(),
             matched_entries,
             audited_hashes: audited_hashes.clone(),
             audited_at: audited_at.into(),
@@ -754,6 +856,7 @@ impl PersistedLibraryDatIdentity {
             hash_evidence: self.hash_evidence.clone(),
             provenance_freshness,
             ambiguous_candidates: self.ambiguous_candidates.clone(),
+            candidate_provenance: self.candidate_provenance.clone(),
             set_dependency: DatSetDependencySummary::Pending {
                 reason: "a persisted Arcade set / dependency verdict is not yet linked into \
                          per-item identity persistence"

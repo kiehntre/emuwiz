@@ -98,6 +98,9 @@ pub(crate) struct DatIdentityPresentation {
     /// "Checked against" - the specific configured source this result came
     /// from.
     pub(crate) checked_against: Option<String>,
+    /// The No-Intro representation only when the audited catalogue stated
+    /// one.  It is explanatory provenance, never a confidence signal.
+    pub(crate) variant: Option<String>,
     /// A short supporting sentence about whether this result is still
     /// current, when there is anything worth saying beyond the headline.
     pub(crate) freshness_note: Option<String>,
@@ -215,6 +218,10 @@ pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentit
         .map(|ecosystem| ecosystem.label().to_string());
     let checked_against =
         (!summary.source.source_name.is_empty()).then(|| summary.source.source_name.clone());
+    let variant = summary
+        .source
+        .variant
+        .map(|variant| variant.label().to_string());
     let match_basis = summary
         .hash_evidence
         .matched_algorithm
@@ -236,6 +243,7 @@ pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentit
         catalogue,
         match_basis,
         checked_against,
+        variant,
         freshness_note: freshness_note(summary.provenance_freshness),
         show_verify_action,
     }
@@ -258,6 +266,7 @@ pub(crate) fn present_missing() -> DatIdentityPresentation {
         catalogue: None,
         match_basis: None,
         checked_against: None,
+        variant: None,
         freshness_note: None,
         show_verify_action: true,
     }
@@ -278,6 +287,9 @@ fn render_presentation(ui: &mut egui::Ui, presentation: &DatIdentityPresentation
     }
     if let Some(value) = presentation.checked_against.as_deref() {
         rows.push(("Checked against", value));
+    }
+    if let Some(value) = presentation.variant.as_deref() {
+        rows.push(("Variant", value));
     }
     for (label, value) in rows {
         ui.horizontal_wrapped(|ui| {
@@ -530,7 +542,19 @@ fn show_summary(
     if !summary.ambiguous_candidates.is_empty() {
         ui.collapsing("Candidate DAT names", |ui| {
             for candidate in &summary.ambiguous_candidates {
-                ui.label(candidate);
+                ui.strong(candidate);
+                for provenance in summary
+                    .candidate_provenance
+                    .iter()
+                    .filter(|provenance| provenance.game_name == *candidate)
+                {
+                    let mut detail = provenance.source.source_name.clone();
+                    if let Some(variant) = provenance.source.variant {
+                        detail.push_str(" · ");
+                        detail.push_str(variant.label());
+                    }
+                    ui.label(detail);
+                }
             }
         });
     }
@@ -652,6 +676,7 @@ mod tests {
                 source_id: "source".into(),
                 source_name: "No-Intro".into(),
                 ecosystem: None,
+                variant: None,
                 source_revision: Some("rev".into()),
                 author: None,
                 catalogue_names: vec![],
@@ -670,10 +695,24 @@ mod tests {
             },
             provenance_freshness: DatProvenanceFreshness::Current,
             ambiguous_candidates: vec!["Other".into()],
+            candidate_provenance: Vec::new(),
             set_dependency: DatSetDependencySummary::Pending {
                 reason: "not retained".into(),
             },
         }
+    }
+
+    #[test]
+    fn presentation_shows_known_variant_without_changing_verified_status() {
+        let mut summary = summary(DatVerificationState::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        summary.source.variant =
+            Some(archivefs_core::identity_source::no_intro::NoIntroVariant::Headerless);
+        let presentation = present_summary(&summary);
+
+        assert_eq!(presentation.status, DatIdentityStatus::Verified);
+        assert_eq!(presentation.variant.as_deref(), Some("Headerless"));
     }
 
     fn collect_text(output: &egui::FullOutput) -> String {

@@ -12420,6 +12420,7 @@ mod tests {
             catalogue_author: None,
             catalogue_homepage: None,
             catalogue_ecosystem: None,
+            catalogue_variant: None,
             unreadable_catalogues: Vec::new(),
             report: AuditReport {
                 entries: vec![AuditEntry {
@@ -12497,6 +12498,7 @@ mod tests {
             catalogue_author: None,
             catalogue_homepage: None,
             catalogue_ecosystem: Some(DatEcosystem::MAMEArcade),
+            catalogue_variant: None,
             unreadable_catalogues: Vec::new(),
             report: AuditReport {
                 entries: Vec::new(),
@@ -12632,6 +12634,7 @@ mod tests {
             catalogue_author: Some("No-Intro".to_string()),
             catalogue_homepage: None,
             catalogue_ecosystem: Some(crate::dat::model::DatEcosystem::NoIntro),
+            catalogue_variant: Some(crate::identity_source::no_intro::NoIntroVariant::Unknown),
             unreadable_catalogues: Vec::new(),
             report: AuditReport {
                 summary: AuditSummary::default(),
@@ -13801,6 +13804,7 @@ mod tests {
                 source_id: id.into(),
                 source_name: format!("{id} display"),
                 ecosystem: Some(ecosystem),
+                variant: None,
                 source_revision: revision.map(str::to_string),
                 author: Some("Publisher".into()),
                 catalogue_names: vec![format!("{id} catalogue")],
@@ -13832,6 +13836,7 @@ mod tests {
                     available_algorithms: vec!["SHA-1".into(), "MD5".into(), "CRC32".into()],
                 },
                 ambiguous_candidates: Vec::new(),
+                candidate_provenance: Vec::new(),
                 matched_entries: vec![DurableDatEntryRef {
                     source_id: source_id.into(),
                     game_name: game_name.into(),
@@ -13861,6 +13866,7 @@ mod tests {
                     available_algorithms: vec!["SHA-1".into()],
                 },
                 ambiguous_candidates: Vec::new(),
+                candidate_provenance: Vec::new(),
                 matched_entries: Vec::new(),
                 audited_hashes: hashes(),
                 audited_at: "2026-06-01T00:00:00Z".into(),
@@ -14883,6 +14889,7 @@ mod tests {
                 },
                 provenance_freshness: DatProvenanceFreshness::Current,
                 ambiguous_candidates: Vec::new(),
+                candidate_provenance: Vec::new(),
                 set_dependency: DatSetDependencySummary::Pending {
                     reason: "n/a".into(),
                 },
