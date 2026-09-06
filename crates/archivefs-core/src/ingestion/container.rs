@@ -6,8 +6,14 @@
 //! or extracts a file.
 
 use super::content_registry::content_kind_for_extension;
+use crate::dat::archive::limits::ArchiveLimits;
+use crate::dat::archive::rar::RarProvider;
+use crate::dat::archive::sevenz::SevenZArchiveSource;
+use crate::safe_read::TrustedRoots;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 /// The archive format a [`ContainerKind::Archive`] wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,18 +145,12 @@ pub struct ArchiveEntryName(pub String);
 /// discovery, to bound work on pathological archives.
 const MAX_LISTED_ENTRIES: usize = 50_000;
 
-/// List entry names for the archive formats discovery can inspect cheaply
-/// without a subprocess: ZIP and TAR are both pure-Rust, name-listing-only
-/// reads here (ZIP via `by_index_raw`, never inflating a member; TAR via
-/// its streaming header reader, never unpacking).
-///
-/// RAR and 7-Zip are recognised as containers (see [`ArchiveFormat`]) but
-/// are not listed here: RAR requires shelling out to an external tool
-/// (see [`crate::dat::archive::rar`]) and 7-Zip's reader is built around
-/// full member verification, not name-only listing. Both are deliberately
-/// out of scope for this pass - see the ingestion module docs. Discovery
-/// still reports them as recognised archive containers; it just cannot
-/// say what content is inside one yet.
+/// List entry names for the archive formats discovery can inspect without
+/// extracting anything. ZIP/TAR use their native metadata readers. RAR uses
+/// the already-reviewed optional 7-Zip provider and 7z uses the existing
+/// preflighted in-process reader; both paths only enumerate bounded metadata.
+/// Provider absence, malformed/encrypted input, or a safety refusal remains an
+/// honest `None`, so discovery never falls back to unsafe extraction.
 pub fn list_archive_entry_names(
     path: &Path,
     format: ArchiveFormat,
@@ -158,8 +158,40 @@ pub fn list_archive_entry_names(
     match format {
         ArchiveFormat::Zip => list_zip_entry_names(path),
         ArchiveFormat::Tar => list_tar_entry_names(path),
-        ArchiveFormat::Rar | ArchiveFormat::SevenZip => None,
+        ArchiveFormat::Rar => list_rar_entry_names(path),
+        ArchiveFormat::SevenZip => list_sevenz_entry_names(path),
     }
+}
+
+const MEMBER_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_MEMBER_NAME_BYTES: usize = 4096;
+
+fn bounded_member_name(name: &str) -> Option<ArchiveEntryName> {
+    if name.is_empty() || name.len() > MAX_MEMBER_NAME_BYTES {
+        return None;
+    }
+    Some(ArchiveEntryName(name.to_string()))
+}
+
+fn list_rar_entry_names(path: &Path) -> Option<Vec<ArchiveEntryName>> {
+    let provider = RarProvider::discover(MEMBER_LIST_TIMEOUT).ok()?;
+    let session = provider.open(path, MEMBER_LIST_TIMEOUT).ok()?;
+    session
+        .members
+        .iter()
+        .map(|member| bounded_member_name(&member.path))
+        .collect()
+}
+
+fn list_sevenz_entry_names(path: &Path) -> Option<Vec<ArchiveEntryName>> {
+    let parent = path.parent()?.canonicalize().ok()?;
+    let trusted = TrustedRoots::from_paths([parent]);
+    let cancel = AtomicBool::new(false);
+    let source = SevenZArchiveSource::open(path, &trusted, ArchiveLimits::default(), &cancel).ok()?;
+    source
+        .member_metadata()
+        .map(|(name, _size)| bounded_member_name(name))
+        .collect()
 }
 
 fn list_zip_entry_names(path: &Path) -> Option<Vec<ArchiveEntryName>> {

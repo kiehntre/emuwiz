@@ -587,7 +587,8 @@ fn discover_extracted_folder(path: &Path) -> GameDiscovery {
 fn discover_archive(path: &Path, format: ArchiveFormat, source_root: &Path) -> GameDiscovery {
     let container = ContainerKind::Archive(format);
     let Some(entries) = list_archive_entry_names(path, format) else {
-        // RAR/7z are recognised but not listed - see container.rs docs.
+        // Provider absence or a bounded safety refusal is reported without
+        // attempting extraction; see container.rs for the format policy.
         return GameDiscovery {
             path: path.to_path_buf(),
             container,
@@ -596,8 +597,8 @@ fn discover_archive(path: &Path, format: ArchiveFormat, source_root: &Path) -> G
             identity_candidate: None,
             validation_state: ValidationState::Skipped,
             explanation: format!(
-                "{} - contents are not yet inspected for this format, so EmuWiz can \
-                 see the archive but not what's inside it.",
+                "{} - member listing was unavailable or refused safely, so EmuWiz \
+                 preserves the archive without guessing its contents.",
                 format.label()
             ),
             skip_reason: None,

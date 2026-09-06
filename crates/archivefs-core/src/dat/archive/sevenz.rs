@@ -157,6 +157,15 @@ impl std::fmt::Debug for SevenZArchiveSource {
 }
 
 impl SevenZArchiveSource {
+    /// Returns bounded member metadata without decoding member bytes.  This
+    /// is used by universal ingestion to expose archive-member provenance;
+    /// the same preflight and structural limits as verification still apply.
+    pub fn member_metadata(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.members
+            .iter()
+            .map(|member| (member.name.as_str(), member.logical_size))
+    }
+
     /// Opens `path` under `trusted`, preflights the header, and validates the
     /// archive up to decode.
     ///
