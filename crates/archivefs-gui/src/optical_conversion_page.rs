@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use crate::ui::{components as widgets, theme};
 use archivefs_core::repair::{
     ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode, ChdConversionTransaction,
     build_chd_conversion_plan, execute_chd_conversion, rollback_chd_conversion,
@@ -165,37 +166,58 @@ pub(crate) fn show_optical_conversion_page(
 ) {
     ui.heading("Convert Disc Images");
     ui.label("Create a CHD only from a verified single-track MODE1/2048 CUE/BIN source. The staged CHD is independently fingerprint-verified before finalization.");
-    ui.horizontal(|ui| {
-        ui.label("Source folder:");
-        ui.text_edit_singleline(&mut state.source_root_draft);
-        if ui.button("Choose folder").clicked()
-            && let Some(path) = rfd::FileDialog::new().pick_folder()
-        {
-            state.source_root_draft = path.display().to_string();
-        }
-        if ui.button("Scan").clicked() {
-            state.scan();
-        }
+    ui.add_space(8.0);
+    widgets::card(ui, |ui| {
+        ui.heading("Source");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Source folder:");
+            ui.add_sized(
+                [ui.available_width().min(520.0).max(220.0), 24.0],
+                egui::TextEdit::singleline(&mut state.source_root_draft),
+            );
+            if ui.button("Choose folder").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                state.source_root_draft = path.display().to_string();
+            }
+            if ui.button("Scan").clicked() {
+                state.scan();
+            }
+        });
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(state.source_root_draft.as_str())
+                    .monospace()
+                    .color(theme::muted(ui)),
+            )
+            .wrap(),
+        );
     });
-    let mut quarantine = state.source_mode == ChdConversionSourceMode::QuarantineSource;
-    if ui
-        .checkbox(
-            &mut quarantine,
-            "Quarantine originals after verified conversion",
-        )
-        .changed()
-    {
-        state.source_mode = if quarantine {
-            ChdConversionSourceMode::QuarantineSource
-        } else {
-            ChdConversionSourceMode::KeepSource
-        };
-    }
-    if state.source_mode == ChdConversionSourceMode::KeepSource {
-        ui.label("Keep originals (default)");
-    } else {
-        ui.label("Quarantine originals after verified conversion");
-    }
+    ui.add_space(theme::SECTION_GAP);
+    widgets::card(ui, |ui| {
+        ui.heading("Output and safety");
+        let mut quarantine = state.source_mode == ChdConversionSourceMode::QuarantineSource;
+        if ui
+            .checkbox(
+                &mut quarantine,
+                "Quarantine originals after verified conversion",
+            )
+            .changed()
+        {
+            state.source_mode = if quarantine {
+                ChdConversionSourceMode::QuarantineSource
+            } else {
+                ChdConversionSourceMode::KeepSource
+            };
+        }
+        ui.label(
+            if state.source_mode == ChdConversionSourceMode::KeepSource {
+                "Keep originals (default)"
+            } else {
+                "Quarantine originals after verified conversion"
+            },
+        );
+    });
     if let Some(error) = &state.error {
         ui.colored_label(egui::Color32::RED, error);
     }
@@ -207,7 +229,7 @@ pub(crate) fn show_optical_conversion_page(
         let plan = state.candidates[index].plan.clone();
         let reason = state.candidates[index].reason.clone();
         let eligible = plan.is_some();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(
                     state.selected == Some(index),
@@ -231,12 +253,24 @@ pub(crate) fn show_optical_conversion_page(
         if state.selected == Some(index)
             && let Some(plan) = &plan
         {
-            ui.label(format!("Target: {}", plan.target_path.display()));
-            ui.label(format!(
-                "{} sectors · canonical SHA-256 {}",
-                plan.source_fingerprint.structure.logical_sector_count,
-                plan.source_fingerprint.canonical_sha256
-            ));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Target: {}", plan.target_path.display()))
+                        .monospace(),
+                )
+                .wrap(),
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "{} sectors · canonical SHA-256 {}",
+                        plan.source_fingerprint.structure.logical_sector_count,
+                        plan.source_fingerprint.canonical_sha256
+                    ))
+                    .monospace(),
+                )
+                .wrap(),
+            );
             if !state.confirm {
                 if ui.button("Confirm conversion").clicked() {
                     state.confirm = true;
@@ -247,20 +281,29 @@ pub(crate) fn show_optical_conversion_page(
         }
     }
     if let Some(result) = &state.result {
+        let target_path = result.target_path.display().to_string();
+        let transaction_id = result.transaction_id.clone();
+        let source_quarantined = result.source_quarantined;
         ui.separator();
-        ui.label(format!(
-            "Verified CHD created: {}",
-            result.target_path.display()
-        ));
-        ui.label(format!("Transaction: {}", result.transaction_id));
-        ui.label(if result.source_quarantined {
-            "Originals quarantined after verification."
-        } else {
-            "Originals kept."
+        widgets::card(ui, |ui| {
+            ui.heading("Result");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Verified CHD created: {}", target_path))
+                        .monospace(),
+                )
+                .wrap(),
+            );
+            ui.label(format!("Transaction: {transaction_id}"));
+            ui.label(if source_quarantined {
+                "Originals quarantined after verification."
+            } else {
+                "Originals kept."
+            });
+            if ui.button("Undo conversion").clicked() {
+                state.rollback();
+            }
         });
-        if ui.button("Undo conversion").clicked() {
-            state.rollback();
-        }
     }
 }
 
