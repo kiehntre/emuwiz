@@ -144,6 +144,49 @@ pub struct TzxBlock {
     pub kind: TzxBlockKind,
     pub length: usize,
     pub metadata_index: Option<usize>,
+    /// Bounded timing/length facts for common data blocks. Payload bytes are
+    /// intentionally not retained.
+    pub details: TzxBlockDetails,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TzxBlockDetails {
+    #[default]
+    None,
+    Standard {
+        pause_ms: u16,
+        data_len: u16,
+    },
+    Turbo {
+        pilot: u16,
+        sync1: u16,
+        sync2: u16,
+        zero: u16,
+        one: u16,
+        pilot_count: u16,
+        used_bits: u8,
+        pause_ms: u16,
+        data_len: u32,
+    },
+    PureTone {
+        pulse: u16,
+        count: u16,
+    },
+    PulseSequence {
+        count: u8,
+        min: u16,
+        max: u16,
+    },
+    PureData {
+        zero: u16,
+        one: u16,
+        used_bits: u8,
+        pause_ms: u16,
+        data_len: u32,
+    },
+    Pause {
+        duration_ms: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +515,7 @@ pub fn parse_tzx(data: &[u8]) -> Result<TzxObservation, TapeParseError> {
             kind,
             length,
             metadata_index,
+            details: tzx_details(kind, data, start),
         });
     }
     if blocks.is_empty() {
@@ -484,6 +528,97 @@ pub fn parse_tzx(data: &[u8]) -> Result<TzxObservation, TapeParseError> {
         metadata,
         group_depth_max,
     })
+}
+
+fn tzx_details(kind: TzxBlockKind, data: &[u8], start: usize) -> TzxBlockDetails {
+    let p = start.saturating_add(1);
+    let u16at = |i: usize| data.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u24at = |i: usize| {
+        data.get(i..i + 3)
+            .map(|b| u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16))
+    };
+    match kind {
+        TzxBlockKind::StandardData => match (u16at(p), u16at(p + 2)) {
+            (Some(pause_ms), Some(data_len)) => TzxBlockDetails::Standard { pause_ms, data_len },
+            _ => TzxBlockDetails::None,
+        },
+        TzxBlockKind::TurboData => match (
+            u16at(p),
+            u16at(p + 2),
+            u16at(p + 4),
+            u16at(p + 6),
+            u16at(p + 8),
+            u16at(p + 10),
+            data.get(p + 12).copied(),
+            u16at(p + 13),
+            u24at(p + 15),
+        ) {
+            (
+                Some(pilot),
+                Some(sync1),
+                Some(sync2),
+                Some(zero),
+                Some(one),
+                Some(pilot_count),
+                Some(used_bits),
+                Some(pause_ms),
+                Some(data_len),
+            ) => TzxBlockDetails::Turbo {
+                pilot,
+                sync1,
+                sync2,
+                zero,
+                one,
+                pilot_count,
+                used_bits,
+                pause_ms,
+                data_len,
+            },
+            _ => TzxBlockDetails::None,
+        },
+        TzxBlockKind::PureTone => match (u16at(p), u16at(p + 2)) {
+            (Some(pulse), Some(count)) => TzxBlockDetails::PureTone { pulse, count },
+            _ => TzxBlockDetails::None,
+        },
+        TzxBlockKind::PulseSequence => {
+            let count = data.get(p).copied().unwrap_or(0);
+            let mut min = u16::MAX;
+            let mut max = 0;
+            for i in 0..usize::from(count) {
+                if let Some(v) = u16at(p + 1 + i * 2) {
+                    min = min.min(v);
+                    max = max.max(v);
+                }
+            }
+            TzxBlockDetails::PulseSequence {
+                count,
+                min: if count == 0 { 0 } else { min },
+                max,
+            }
+        }
+        TzxBlockKind::PureData => match (
+            u16at(p),
+            u16at(p + 2),
+            data.get(p + 4).copied(),
+            u16at(p + 5),
+            u24at(p + 7),
+        ) {
+            (Some(zero), Some(one), Some(used_bits), Some(pause_ms), Some(data_len)) => {
+                TzxBlockDetails::PureData {
+                    zero,
+                    one,
+                    used_bits,
+                    pause_ms,
+                    data_len,
+                }
+            }
+            _ => TzxBlockDetails::None,
+        },
+        TzxBlockKind::Pause => u16at(p).map_or(TzxBlockDetails::None, |duration_ms| {
+            TzxBlockDetails::Pause { duration_ms }
+        }),
+        _ => TzxBlockDetails::None,
+    }
 }
 
 pub fn parse_cdt(data: &[u8]) -> Result<TzxObservation, TapeParseError> {

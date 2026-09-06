@@ -5,7 +5,7 @@
 use crate::commodore_tape::{
     COMMODORE_TAP_HEADER_BYTES, T64_READ_BYTES, parse_commodore_tap, parse_t64,
 };
-use crate::tape_identity::{ZxTapBlockKind, parse_tzx, parse_zx_tap};
+use crate::tape_identity::{TzxBlockDetails, ZxTapBlockKind, parse_tzx, parse_zx_tap};
 
 pub const MAX_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ANALYSIS_ENTRIES: usize = 256;
@@ -51,6 +51,9 @@ pub struct TapeAnalysis {
     pub loader: Option<&'static str>,
     pub checksum: ChecksumState,
     pub warnings: Vec<String>,
+    pub semantic_blocks: Vec<String>,
+    pub logical_segments: usize,
+    pub unsupported_blocks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +83,17 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
             loader: None,
             checksum: ChecksumState::NotApplicable,
             warnings: Vec::new(),
+            semantic_blocks: observation
+                .blocks
+                .iter()
+                .map(|b| format_tzx_detail(&b.details))
+                .collect(),
+            logical_segments: observation.group_depth_max.max(1),
+            unsupported_blocks: observation
+                .blocks
+                .iter()
+                .filter(|b| matches!(b.details, TzxBlockDetails::None))
+                .count(),
         });
     }
     if bytes.starts_with(b"C64-TAPE-RAW") {
@@ -99,6 +113,9 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
             warnings: vec![
                 "Pulse data is present; no program name is encoded in the TAP header.".into(),
             ],
+            semantic_blocks: Vec::new(),
+            logical_segments: 1,
+            unsupported_blocks: 0,
         });
     }
     if bytes.starts_with(b"C64S tape image file") {
@@ -119,6 +136,7 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
                 checksum: ChecksumState::NotPresent,
             })
             .collect::<Vec<_>>();
+        let entry_count = entries.len();
         return Ok(TapeAnalysis {
             format: TapeFormat::T64,
             platform: Some("Commodore 64"),
@@ -128,6 +146,9 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
             loader: None,
             checksum: ChecksumState::NotApplicable,
             warnings: Vec::new(),
+            semantic_blocks: Vec::new(),
+            logical_segments: entry_count.max(1),
+            unsupported_blocks: 0,
         });
     }
     let obs = parse_zx_tap(bytes).map_err(|e| TapeAnalysisError::Malformed(e.to_string()))?;
@@ -160,6 +181,7 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
     } else {
         Vec::new()
     };
+    let entry_count = entries.len();
     Ok(TapeAnalysis {
         format: TapeFormat::ZxTap,
         platform: Some("ZX Spectrum"),
@@ -169,7 +191,48 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
         loader,
         checksum,
         warnings,
+        semantic_blocks: Vec::new(),
+        logical_segments: entry_count.max(1),
+        unsupported_blocks: 0,
     })
+}
+
+fn format_tzx_detail(detail: &TzxBlockDetails) -> String {
+    match detail {
+        TzxBlockDetails::Standard { pause_ms, data_len } => {
+            format!("standard data: {data_len} bytes, pause {pause_ms} ms")
+        }
+        TzxBlockDetails::Turbo {
+            pilot,
+            sync1,
+            sync2,
+            zero,
+            one,
+            pilot_count,
+            used_bits,
+            pause_ms,
+            data_len,
+        } => format!(
+            "turbo data: {data_len} bytes, pilot {pilot}, sync {sync1}/{sync2}, bits {zero}/{one}, pilot count {pilot_count}, final bits {used_bits}, pause {pause_ms} ms"
+        ),
+        TzxBlockDetails::PureTone { pulse, count } => {
+            format!("pure tone: pulse {pulse}, count {count}")
+        }
+        TzxBlockDetails::PulseSequence { count, min, max } => {
+            format!("pulse sequence: {count} pulses, range {min}..{max}")
+        }
+        TzxBlockDetails::PureData {
+            zero,
+            one,
+            used_bits,
+            pause_ms,
+            data_len,
+        } => format!(
+            "pure data: {data_len} bytes, bits {zero}/{one}, final bits {used_bits}, pause {pause_ms} ms"
+        ),
+        TzxBlockDetails::Pause { duration_ms } => format!("pause: {duration_ms} ms"),
+        TzxBlockDetails::None => "unsupported/opaque block".into(),
+    }
 }
 
 #[cfg(test)]
