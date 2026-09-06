@@ -1286,3 +1286,21 @@ Current tag state: `v0.8.2` points at `db8092d`; current authority is not
 tagged (`git describe --tags` is `v0.8.2-48-g7ac525a`). CLI and GUI version
 output both derive from `env!("CARGO_PKG_VERSION")`, so no independent source
 version string was found.
+
+## Saltbox DISPLAY :0 spot check (2026-09-06)
+
+The previously SSH-headless session limitation was rechecked against the real
+desktop: `DISPLAY=:0`, Xauthority `/home/davedap/.Xauthority`, and
+`XDG_RUNTIME_DIR=/run/user/1000` were accepted by `xdpyinfo` (exit 0). The
+native `target/release/emuwiz` instance was observed through the Sunshine /
+Moonlight desktop at 1100x720. Screenshots from the disposable spot check live
+under `/tmp/emuwiz-desktop-qa-20260906-213726/`.
+
+Observed successfully: Home, Sources/DATs (including the Managed No-Intro
+section), Emulator Setup, Disc Conversion, Duplicate Finder, and Quick Rename
+rendered without startup failure or obvious clipping. This was a targeted live
+spot check, not completion of the full fresh-user acceptance matrix: onboarding,
+picker/import round trips, firmware fixture permutations, Playing Library,
+Cheats & Mods, ES-DE, and multi-viewport interaction remain manual follow-up.
+The AppImage was not launched in this pass. No real user libraries or BIOS
+files were used, and LBC was untouched.
