@@ -813,3 +813,39 @@ were verified in disposable tests.
   emulator profile and legal synthetic test firmware evidence.
 - No real BIOS collection, emulator configuration, game library, onboarding
   work, DAT GUI, ES-DE, Cheats & Mods, or LBC content was accessed or changed.
+
+## 21. Execution record: Playing Library / 1G1R Wave 5
+
+**Run:** 2026-09-06 at `cc78b75cf0dd2bfcd4190079a01e99ea5058e5f1` on a clean
+authoritative checkout. Disposable root:
+`/tmp/emuwiz-playing-library-qa-fzjirc`.
+
+The root held tiny synthetic multi-region/revision/beta/unmatched placeholders,
+a destination sentinel, and a DAT fixture area. It was used as `TMPDIR` for
+the existing real-filesystem Playing Library tests; all source placeholders and
+the sentinel retained their SHA-256 values after the run.
+
+The exercised production path was `build_playing_library_plan` and its real
+`ElectionExplanation`, followed by `build_playing_library_transaction` and the
+shared journaled rename-apply executor/rollback. No separate election or
+linking implementation was introduced.
+
+`CARGO_BUILD_JOBS=2 cargo test -p archivefs-core playing_library --
+--test-threads=1` passed **100 tests**. Coverage includes preference-ordered
+region/revision election and explanation evidence, unresolved/missing-track
+refusal, destination conflicts, preview-only planning, exact symlink creation,
+multi-file release atomicity, an induced mid-apply failure with no partial
+release, idempotent reapply, and rollback that removes only EmuWiz-created
+links. The transaction tests also preserve sources and unrelated destination
+content; a conflict is refused rather than overwritten.
+
+Confirmation is still the existing exact `CREATE {count} LINKS` form, produced
+from the planned operation count; no confirmation semantics changed. The
+automated contract covers stale/conflicting operations and journal-backed
+recovery/rollback rather than relying on in-memory winners.
+
+No `DISPLAY`/`WAYLAND_DISPLAY` desktop was available, so the Library
+Organisation click-through/confirmation/rollback presentation is **NOT
+TESTABLE here**, not a defect. It remains a P1 desktop follow-up. No real ROM,
+RomM, ES-DE, onboarding, DAT GUI, firmware, Cheats & Mods, or LBC state was
+accessed or modified. **P0 defects: none.**
