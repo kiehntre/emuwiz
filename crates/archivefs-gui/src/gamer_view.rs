@@ -809,7 +809,7 @@ impl<'a> GamerMetadataView<'a> {
         enrichment: Option<&'a crate::game_metadata::GameMetadataResult>,
     ) -> Self {
         let found = match enrichment {
-            Some(crate::game_metadata::GameMetadataResult::Found(metadata)) => Some(metadata),
+            Some(crate::game_metadata::GameMetadataResult::Found(found)) => Some(&found.metadata),
             _ => None,
         };
         Self {
@@ -1168,8 +1168,67 @@ pub(crate) fn show_gamer_details_panel(
         ui.label("Screenshot references are read from the imported RomM identity matched to this exact archive path. Only RomM-hosted references are eligible for loading; public scraper references are retained as provenance and are not fetched.");
     });
     let game_info_action = show_game_information_provenance(ui, enrichment);
+    show_howlongtobeat(ui, enrichment);
     show_retroachievements(ui, archive_path);
     game_info_action
+}
+
+/// Optional completion times imported into the local RomM identity cache.
+/// This is deliberately a presentation-only cache read: browsing neither
+/// contacts RomM nor invokes HowLongToBeat.
+fn show_howlongtobeat(
+    ui: &mut egui::Ui,
+    enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+) {
+    use crate::game_metadata::GameMetadataResult;
+
+    let Some(durations) = enrichment.and_then(|result| match result {
+        GameMetadataResult::Found(found) => found.howlongtobeat.as_ref(),
+        GameMetadataResult::NotFound | GameMetadataResult::Unavailable => None,
+    }) else {
+        return;
+    };
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "HowLongToBeat",
+        Some("Completion times cached by RomM."),
+    );
+    egui::Grid::new("gamer_details_howlongtobeat_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            optional_duration_row(ui, "Main Story", durations.main_story_seconds);
+            optional_duration_row(ui, "Main + Extras", durations.main_plus_extras_seconds);
+            optional_duration_row(ui, "Completionist", durations.completionist_seconds);
+        });
+    ui.label(
+        egui::RichText::new("Source: HowLongToBeat via RomM · cached metadata only")
+            .color(theme::muted(ui))
+            .small(),
+    );
+}
+
+fn optional_duration_row(ui: &mut egui::Ui, label: &str, seconds: Option<u64>) {
+    let Some(value) = seconds.and_then(format_completion_duration) else {
+        return;
+    };
+    detail_row(ui, label, &value);
+}
+
+fn format_completion_duration(seconds: u64) -> Option<String> {
+    let minutes = seconds.checked_div(60)?;
+    if minutes == 0 {
+        return None;
+    }
+    let hours = minutes / 60;
+    let remainder_minutes = minutes % 60;
+    Some(match (hours, remainder_minutes) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
+    })
 }
 
 /// Optional cache-only RetroAchievements summary.  It is deliberately a
@@ -1346,11 +1405,15 @@ fn show_game_information_provenance(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(ui, "Game information", None);
     match enrichment {
-        Some(GameMetadataResult::Found(metadata)) => {
+        Some(GameMetadataResult::Found(found)) => {
             widgets::technical_details(ui, "gamer_game_information_details", |ui| {
                 ui.label(format!(
                     "Source: {}",
-                    metadata.source.as_deref().unwrap_or("Unknown provider")
+                    found
+                        .metadata
+                        .source
+                        .as_deref()
+                        .unwrap_or("Unknown provider")
                 ));
                 ui.label("Read from the locally cached catalogue - not fetched while browsing.");
             });
@@ -1990,7 +2053,10 @@ mod game_metadata_enrichment_tests {
     }
 
     fn found(metadata: archivefs_core::ArchiveMetadata) -> GameMetadataResult {
-        GameMetadataResult::Found(Box::new(metadata))
+        GameMetadataResult::Found(Box::new(crate::game_metadata::GameMetadataFound {
+            metadata,
+            howlongtobeat: None,
+        }))
     }
 
     // --- GamerMetadataView::merge --------------------------------------
@@ -2100,6 +2166,57 @@ mod game_metadata_enrichment_tests {
         assert!(!rendered_text_contains(&output, "Genre"));
         assert!(!rendered_text_contains(&output, "Rating"));
         assert!(!rendered_text_contains(&output, "Synopsis"));
+    }
+
+    #[test]
+    fn completion_duration_formatting_is_compact_and_never_uses_raw_seconds() {
+        assert_eq!(format_completion_duration(45 * 60).as_deref(), Some("45m"));
+        assert_eq!(
+            format_completion_duration(12 * 60 * 60).as_deref(),
+            Some("12h")
+        );
+        assert_eq!(
+            format_completion_duration(32 * 60 * 60 + 15 * 60).as_deref(),
+            Some("32h 15m")
+        );
+        assert_eq!(format_completion_duration(59), None);
+    }
+
+    #[test]
+    fn howlongtobeat_section_only_renders_cached_populated_rows() {
+        let result = GameMetadataResult::Found(Box::new(crate::game_metadata::GameMetadataFound {
+            metadata: empty_archive_metadata(),
+            howlongtobeat: Some(
+                archivefs_core::identity_source::model::HowLongToBeatDurations {
+                    main_story_seconds: Some(45 * 60),
+                    main_plus_extras_seconds: None,
+                    completionist_seconds: Some(12 * 60 * 60),
+                },
+            ),
+        }));
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_howlongtobeat(ui, Some(&result));
+            });
+        });
+        assert!(rendered_text_contains(&output, "HowLongToBeat"));
+        assert!(rendered_text_contains(&output, "45m"));
+        assert!(rendered_text_contains(&output, "12h"));
+        assert!(!rendered_text_contains(&output, "Main + Extras"));
+        assert!(rendered_text_contains(&output, "via RomM"));
+    }
+
+    #[test]
+    fn howlongtobeat_section_is_absent_without_cached_durations() {
+        let result = found(empty_archive_metadata());
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_howlongtobeat(ui, Some(&result));
+            });
+        });
+        assert!(!rendered_text_contains(&output, "HowLongToBeat"));
     }
 
     // --- players wording: item 8 ----------------------------------------

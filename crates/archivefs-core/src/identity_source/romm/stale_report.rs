@@ -555,6 +555,7 @@ mod tests {
             players: None,
             rating: None,
             release_year: None,
+            howlongtobeat: None,
         }
     }
 

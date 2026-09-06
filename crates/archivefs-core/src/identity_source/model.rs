@@ -106,6 +106,30 @@ pub struct MetadataProviderId {
     pub id: String,
 }
 
+/// Optional completion-time estimates that RomM retained from its
+/// HowLongToBeat provider.
+///
+/// Values are whole seconds. They are display-only provenance from RomM: they
+/// are never used to identify a game, rank a match, or cause EmuWiz to contact
+/// HowLongToBeat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HowLongToBeatDurations {
+    /// The main-story estimate in seconds.
+    pub main_story_seconds: Option<u64>,
+    /// The main-story-plus-extras estimate in seconds.
+    pub main_plus_extras_seconds: Option<u64>,
+    /// The completionist estimate in seconds.
+    pub completionist_seconds: Option<u64>,
+}
+
+impl HowLongToBeatDurations {
+    pub fn has_any(&self) -> bool {
+        self.main_story_seconds.is_some()
+            || self.main_plus_extras_seconds.is_some()
+            || self.completionist_seconds.is_some()
+    }
+}
+
 /// A reference to artwork the external source owns.
 ///
 /// A reference, never the bytes: the source remains the owner of full-size
@@ -344,6 +368,10 @@ pub struct ExternalIdentityRecord {
     pub rating: Option<u8>,
     #[serde(default)]
     pub release_year: Option<u16>,
+    /// Completion-time metadata RomM retained from its HowLongToBeat provider.
+    /// Optional/defaulted so pre-existing identity-cache JSON remains readable.
+    #[serde(default)]
+    pub howlongtobeat: Option<HowLongToBeatDurations>,
 }
 
 impl ExternalIdentityRecord {
@@ -376,6 +404,10 @@ impl ExternalIdentityRecord {
             || self.players.is_some()
             || self.rating.is_some()
             || self.release_year.is_some()
+            || self
+                .howlongtobeat
+                .as_ref()
+                .is_some_and(HowLongToBeatDurations::has_any)
     }
 
     /// A one-line summary for a list view.

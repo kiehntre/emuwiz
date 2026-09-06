@@ -55,6 +55,7 @@ fn record(id: &str, title: &str) -> ExternalIdentityRecord {
         players: None,
         rating: None,
         release_year: None,
+        howlongtobeat: None,
     }
 }
 

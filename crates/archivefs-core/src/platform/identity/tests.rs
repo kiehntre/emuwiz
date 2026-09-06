@@ -69,6 +69,7 @@ fn romm_record(
         players: None,
         rating: None,
         release_year: None,
+        howlongtobeat: None,
     }
 }
 

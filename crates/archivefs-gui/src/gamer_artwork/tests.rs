@@ -44,6 +44,7 @@ fn record(id: &str, artwork: Option<ArtworkReference>) -> ExternalIdentityRecord
         players: None,
         rating: None,
         release_year: None,
+        howlongtobeat: None,
     }
 }
 

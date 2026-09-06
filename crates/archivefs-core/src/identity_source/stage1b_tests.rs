@@ -1019,6 +1019,7 @@ fn record_for(server: &str, id: &str, path: Option<PathBuf>) -> ExternalIdentity
         players: None,
         rating: None,
         release_year: None,
+        howlongtobeat: None,
     }
 }
 

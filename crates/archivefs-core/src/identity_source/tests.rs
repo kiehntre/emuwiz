@@ -1535,6 +1535,7 @@ mod identity_model {
             players: None,
             rating: None,
             release_year: None,
+            howlongtobeat: None,
         }
     }
 }

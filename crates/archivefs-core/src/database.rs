@@ -12370,6 +12370,7 @@ mod tests {
                 players: None,
                 rating: None,
                 release_year: None,
+                howlongtobeat: None,
             }],
             rejected_hashes: Vec::new(),
             unknown_platforms: Vec::new(),

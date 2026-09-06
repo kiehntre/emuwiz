@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::identity_source::model::{
     ArtworkReference, ExternalHash, ExternalIdentityRecord, ExternalVerification, HashAlgorithm,
-    IdentityProvider, MediaReference, MetadataProviderId,
+    HowLongToBeatDurations, IdentityProvider, MediaReference, MetadataProviderId,
 };
 use crate::identity_source::path_map::{PathMappings, PathTranslation};
 
@@ -49,6 +49,10 @@ const METADATA_ID_FIELDS: &[(&str, &str)] = &[
 /// The most `files[]` entries one record's relationships will carry, so a
 /// pathological record cannot make the cache unbounded.
 pub const MAX_RELATED_FILES: usize = 64;
+
+/// A hundred years is comfortably above a real game-completion estimate while
+/// refusing malformed provider integers that would be meaningless in the UI.
+const MAX_HLTB_DURATION_SECONDS: u64 = 100 * 366 * 24 * 60 * 60;
 
 /// A hash RomM published that could not be used.
 ///
@@ -213,6 +217,20 @@ pub fn normalise_rom(
         .and_then(|millis| millis.checked_div(1000))
         .and_then(unix_seconds_to_year);
 
+    // RomM's detailed ROM schema exposes its HowLongToBeat provider result at
+    // the top-level `hltb_metadata` object. Its `main_story`,
+    // `main_plus_extra`, and `completionist` values are whole seconds (the
+    // same unit RomM's own Game Details UI divides by 3600). RomM owns the
+    // provider match; EmuWiz only preserves those cached values.
+    let hltb_metadata = value.get("hltb_metadata");
+    let howlongtobeat = hltb_metadata
+        .map(|metadata| HowLongToBeatDurations {
+            main_story_seconds: hltb_duration_seconds(metadata, "main_story"),
+            main_plus_extras_seconds: hltb_duration_seconds(metadata, "main_plus_extra"),
+            completionist_seconds: hltb_duration_seconds(metadata, "completionist"),
+        })
+        .filter(HowLongToBeatDurations::has_any);
+
     // Multi-file structure, preserved rather than flattened.
     let related_files: Vec<String> = value
         .get("files")
@@ -310,7 +328,15 @@ pub fn normalise_rom(
         players,
         rating,
         release_year,
+        howlongtobeat,
     })
+}
+
+fn hltb_duration_seconds(value: &Value, field: &str) -> Option<u64> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|seconds| (1..=MAX_HLTB_DURATION_SECONDS).contains(seconds))
 }
 
 /// A Unix timestamp's calendar year in UTC, bounded to a plausible release
@@ -695,6 +721,12 @@ mod tests {
             "path_manual": "assets/manuals/game.pdf",
             "url_manual": "https://public.example/game.pdf",
             "summary": "A short adventure across five islands.",
+            "hltb_id": 12345,
+            "hltb_metadata": {
+                "main_story": 2_700,
+                "main_plus_extra": 5_400,
+                "completionist": 7_650
+            },
             "metadatum": {
                 "rom_id": 42,
                 "genres": ["Action", "Platformer"],
@@ -732,6 +764,44 @@ mod tests {
         assert_eq!(record.players.as_deref(), Some("1-2"));
         assert_eq!(record.rating, Some(87));
         assert_eq!(record.release_year, Some(1998));
+        assert_eq!(
+            record
+                .howlongtobeat
+                .as_ref()
+                .map(|times| times.main_story_seconds),
+            Some(Some(2_700))
+        );
+        assert!(
+            record
+                .metadata_provider_ids
+                .iter()
+                .any(|id| { id.provider == "howlongtobeat" && id.id == "12345" })
+        );
+    }
+
+    #[test]
+    fn hltb_durations_keep_partial_values_and_refuse_zero_malformed_or_implausible_values() {
+        let mut value = rom_with_enrichment();
+        value["hltb_metadata"] = json!({
+            "main_story": null,
+            "main_plus_extra": 0,
+            "completionist": 9_000_000,
+        });
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        let times = record
+            .howlongtobeat
+            .expect("the valid partial value survives");
+        assert_eq!(times.main_story_seconds, None);
+        assert_eq!(times.main_plus_extras_seconds, None);
+        assert_eq!(times.completionist_seconds, Some(9_000_000));
+
+        value["hltb_metadata"]["completionist"] = json!(MAX_HLTB_DURATION_SECONDS + 1);
+        value["hltb_metadata"]["main_story"] = json!("2700");
+        let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+        assert_eq!(record.howlongtobeat, None);
     }
 
     #[test]
@@ -810,6 +880,7 @@ mod tests {
         let mut value = rom_with_enrichment();
         value.as_object_mut().unwrap().remove("metadatum");
         value.as_object_mut().unwrap().remove("summary");
+        value.as_object_mut().unwrap().remove("hltb_metadata");
 
         let mut report = NormalisationReport::default();
         let record = normalise_rom(&value, "server", &no_mappings(), 1, &mut report)
@@ -820,6 +891,7 @@ mod tests {
         assert_eq!(record.players, None);
         assert_eq!(record.rating, None);
         assert_eq!(record.release_year, None);
+        assert_eq!(record.howlongtobeat, None);
         // Identity fields are entirely unaffected by the missing metadatum.
         assert_eq!(record.title.as_deref(), Some("Example Game"));
     }

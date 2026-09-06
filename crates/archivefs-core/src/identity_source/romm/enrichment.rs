@@ -87,7 +87,7 @@ mod tests {
 
     use super::*;
     use crate::identity_source::model::{
-        ExternalVerification, IdentityProvider, MetadataProviderId,
+        ExternalVerification, HowLongToBeatDurations, IdentityProvider, MetadataProviderId,
     };
     use crate::{ArchiveHealth, ArchiveIdentity, archive_kind};
 
@@ -136,6 +136,7 @@ mod tests {
             players: None,
             rating: None,
             release_year: None,
+            howlongtobeat: None,
         }
     }
 
@@ -247,5 +248,28 @@ mod tests {
         );
         assert_eq!(metadata.rating, Some(91));
         assert_eq!(metadata.source.as_deref(), Some("RomM"));
+    }
+
+    #[test]
+    fn hltb_cache_fields_round_trip_and_old_records_remain_readable() {
+        let mut record = bare_record();
+        record.howlongtobeat = Some(HowLongToBeatDurations {
+            main_story_seconds: Some(2_700),
+            main_plus_extras_seconds: None,
+            completionist_seconds: Some(7_650),
+        });
+        let value = serde_json::to_value(&record).expect("record serialises");
+        let restored: ExternalIdentityRecord =
+            serde_json::from_value(value.clone()).expect("new cache record loads");
+        assert_eq!(restored.howlongtobeat, record.howlongtobeat);
+
+        let mut old_value = value;
+        old_value
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("howlongtobeat");
+        let old: ExternalIdentityRecord =
+            serde_json::from_value(old_value).expect("pre-HLTB cache record still loads");
+        assert_eq!(old.howlongtobeat, None);
     }
 }

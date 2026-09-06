@@ -35,6 +35,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use archivefs_core::ArchiveMetadata;
 use archivefs_core::identity_source::cache::IdentityCache;
+use archivefs_core::identity_source::model::HowLongToBeatDurations;
 use eframe::egui;
 
 /// What the worker found for one lookup.
@@ -42,7 +43,7 @@ use eframe::egui;
 pub(crate) enum GameMetadataResult {
     /// The cache has a record for this path with at least one enrichment
     /// field set.
-    Found(Box<ArchiveMetadata>),
+    Found(Box<GameMetadataFound>),
     /// The cache opened fine, but has no record for this path (never
     /// synced, or RomM never matched this file) - distinct from
     /// [`Self::Unavailable`] so the UI can say "not matched" rather than
@@ -53,6 +54,14 @@ pub(crate) enum GameMetadataResult {
     /// unreadable. The game remains completely usable either way; this
     /// only changes what the enrichment panel says.
     Unavailable,
+}
+
+/// Cache-only details resolved for the selected game. The text metadata and
+/// HLTB values come from the same exact-path RomM cache record.
+#[derive(Debug, Clone)]
+pub(crate) struct GameMetadataFound {
+    pub(crate) metadata: ArchiveMetadata,
+    pub(crate) howlongtobeat: Option<HowLongToBeatDurations>,
 }
 
 /// One answer, bound to the path that asked for it - a reply for a path
@@ -174,7 +183,10 @@ fn lookup(cache: &IdentityCache, local_path: &Path) -> GameMetadataResult {
 
     match cache.record_for_path(local_path) {
         Some(record) if record.has_game_information() => {
-            GameMetadataResult::Found(Box::new(enrichment_metadata(record)))
+            GameMetadataResult::Found(Box::new(GameMetadataFound {
+                metadata: enrichment_metadata(record),
+                howlongtobeat: record.howlongtobeat.clone(),
+            }))
         }
         Some(_) | None => GameMetadataResult::NotFound,
     }

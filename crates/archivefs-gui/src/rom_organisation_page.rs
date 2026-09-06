@@ -1504,6 +1504,7 @@ mod tests {
             players: None,
             rating: None,
             release_year: None,
+            howlongtobeat: None,
         };
         let cache = IdentityCache {
             format_version: CACHE_FORMAT_VERSION,
