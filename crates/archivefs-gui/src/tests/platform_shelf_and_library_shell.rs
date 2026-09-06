@@ -171,6 +171,14 @@ fn every_navigation_destination_has_a_title_and_width_policy() {
 }
 
 #[test]
+fn problems_and_repair_uses_the_wide_content_column() {
+    assert_eq!(
+        main_view_content_width(MainView::Problems),
+        ui_layout::ContentWidth::Wide
+    );
+}
+
+#[test]
 fn home_is_the_default_view_and_the_first_sidebar_entry() {
     assert_eq!(MainView::default(), MainView::Home);
     assert_eq!(app_for_operation_tests().view, MainView::Home);

@@ -4106,10 +4106,10 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::DiscConversion
         | MainView::EmulatorSetup
         | MainView::DatSources
-        | MainView::Problems
         | MainView::Doctor
         | MainView::Settings
         | MainView::About => ui_layout::ContentWidth::Normal,
+        MainView::Problems => ui_layout::ContentWidth::Wide,
     }
 }
 
