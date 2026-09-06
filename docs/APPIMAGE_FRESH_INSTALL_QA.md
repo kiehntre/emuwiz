@@ -369,3 +369,19 @@ fixtures; one BLOCKER and one inconclusive P1 were found and documented
 without being "fixed away"; a reusable, self-cleaning QA harness script was
 added; and no real user state, unrelated adapter work, ES-DE work, or LBC
 was modified.
+
+## Current-artifact rebuild attempt — 2026-09-06
+
+At `6f5b95657871a4ca483d2d2f3057d39fcd0f91c5`, the current source still has
+the documented same-session onboarding completion → Home “Loading your games…”
+P0: no corrective commit or regression test was present. This blocks release
+readiness independently of packaging.
+
+`cargo check -p archivefs-gui` and the current release `emuwiz` build passed.
+The current AppImage was **not** rebuilt because this host has neither an
+approved `appimagetool` executable nor the required pinned type-2 runtime.
+The build script correctly fails closed for those explicit host dependencies;
+the historical artifact was not reused. Therefore normal/extract AppImage
+smokes and the fresh-home harness were not run against a falsely-current
+artifact. Status: **RELEASE READINESS BLOCKED BY KNOWN HOME P0** (and the
+missing approved packaging-tool inputs).
