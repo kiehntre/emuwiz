@@ -6,6 +6,7 @@ use crate::commodore_tape::{
     COMMODORE_TAP_HEADER_BYTES, T64_READ_BYTES, parse_commodore_tap, parse_t64,
 };
 use crate::tape_identity::{TzxBlockDetails, ZxTapBlockKind, parse_tzx, parse_zx_tap};
+use sha2::{Digest, Sha256};
 
 pub const MAX_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ANALYSIS_ENTRIES: usize = 256;
@@ -33,6 +34,28 @@ pub enum TapeEntryKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoaderClass {
+    RomStandard,
+    GenericTurbo,
+    CustomPulse,
+    MultiStage,
+    UnknownCustom,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LoaderConfidence {
+    Low,
+    Medium,
+    High,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderEvidence {
+    pub class: LoaderClass,
+    pub confidence: LoaderConfidence,
+    pub fingerprint: String,
+    pub clues: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TapeEntry {
     pub name: Option<String>,
     pub kind: TapeEntryKind,
@@ -48,7 +71,7 @@ pub struct TapeAnalysis {
     pub block_count: usize,
     pub entries: Vec<TapeEntry>,
     pub metadata: Vec<String>,
-    pub loader: Option<&'static str>,
+    pub loader: Option<LoaderEvidence>,
     pub checksum: ChecksumState,
     pub warnings: Vec<String>,
     pub semantic_blocks: Vec<String>,
@@ -80,7 +103,7 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
                 .into_iter()
                 .take(MAX_ANALYSIS_ENTRIES)
                 .collect(),
-            loader: None,
+            loader: Some(classify_tzx_loader(&observation.blocks)),
             checksum: ChecksumState::NotApplicable,
             warnings: Vec::new(),
             semantic_blocks: observation
@@ -153,11 +176,11 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
     }
     let obs = parse_zx_tap(bytes).map_err(|e| TapeAnalysisError::Malformed(e.to_string()))?;
     let mut entries = Vec::new();
-    let mut loader = None;
+    let mut has_basic = false;
     for header in obs.metadata.into_iter().take(MAX_ANALYSIS_ENTRIES) {
         let (kind, address) = match header.file_type {
             0 => {
-                loader = Some("BASIC -> CODE");
+                has_basic = true;
                 (TapeEntryKind::Basic, None)
             }
             3 => (TapeEntryKind::Code, Some(header.parameter1)),
@@ -188,13 +211,132 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
         block_count: obs.blocks.len(),
         entries,
         metadata: Vec::new(),
-        loader,
+        loader: Some(LoaderEvidence {
+            class: LoaderClass::RomStandard,
+            confidence: if checksum == ChecksumState::Valid {
+                LoaderConfidence::High
+            } else {
+                LoaderConfidence::Medium
+            },
+            fingerprint: fingerprint(&["rom-standard"]),
+            clues: if has_basic {
+                vec!["Spectrum ROM-standard BASIC header".into()]
+            } else {
+                vec!["Spectrum ROM-standard header".into()]
+            },
+        }),
         checksum,
         warnings,
         semantic_blocks: Vec::new(),
         logical_segments: entry_count.max(1),
         unsupported_blocks: 0,
     })
+}
+
+fn classify_tzx_loader(blocks: &[crate::tape_identity::TzxBlock]) -> LoaderEvidence {
+    let mut has_standard = false;
+    let mut turbo = 0usize;
+    let mut pulse = 0usize;
+    let mut tokens = Vec::new();
+    for block in blocks {
+        let token = match &block.details {
+            TzxBlockDetails::Standard { pause_ms, data_len } => {
+                has_standard = true;
+                format!("s:{data_len}:{pause_ms}")
+            }
+            TzxBlockDetails::Turbo {
+                pilot,
+                zero,
+                one,
+                pilot_count,
+                data_len,
+                ..
+            } => {
+                turbo += 1;
+                format!("t:{pilot}:{zero}:{one}:{pilot_count}:{data_len}")
+            }
+            TzxBlockDetails::PureData {
+                zero,
+                one,
+                data_len,
+                ..
+            } => {
+                turbo += 1;
+                format!("p:{zero}:{one}:{data_len}")
+            }
+            TzxBlockDetails::PureTone {
+                pulse: pulse_len,
+                count,
+            } => {
+                pulse += 1;
+                format!("tone:{pulse_len}:{count}")
+            }
+            TzxBlockDetails::PulseSequence { count, min, max } => {
+                pulse += 1;
+                format!("pulse:{count}:{min}:{max}")
+            }
+            TzxBlockDetails::Pause { duration_ms } => format!("pause:{duration_ms}"),
+            TzxBlockDetails::None => "opaque".into(),
+        };
+        tokens.push(token);
+    }
+    let (class, confidence, mut clues) = if turbo == 0 && pulse == 0 && has_standard {
+        (
+            LoaderClass::RomStandard,
+            LoaderConfidence::High,
+            vec!["standard-speed data blocks".into()],
+        )
+    } else if turbo > 0 && has_standard {
+        (
+            LoaderClass::MultiStage,
+            LoaderConfidence::Medium,
+            vec!["standard bootstrap followed by custom-timed data".into()],
+        )
+    } else if turbo > 1 {
+        (
+            LoaderClass::GenericTurbo,
+            LoaderConfidence::Medium,
+            vec!["multiple custom-timed data stages".into()],
+        )
+    } else if turbo == 1 {
+        (
+            LoaderClass::GenericTurbo,
+            LoaderConfidence::Low,
+            vec!["non-ROM timing parameters".into()],
+        )
+    } else if pulse > 0 {
+        (
+            LoaderClass::CustomPulse,
+            LoaderConfidence::Low,
+            vec!["custom pulse structure".into()],
+        )
+    } else {
+        (
+            LoaderClass::UnknownCustom,
+            LoaderConfidence::Low,
+            vec!["opaque or unsupported timing block".into()],
+        )
+    };
+    if tokens.iter().any(|t| t == "opaque") {
+        clues.push("opaque block reduces confidence".into());
+    }
+    LoaderEvidence {
+        class,
+        confidence,
+        fingerprint: fingerprint(&tokens),
+        clues,
+    }
+}
+
+fn fingerprint(tokens: &[impl AsRef<str>]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"loader-signature-v1\0");
+    for token in tokens {
+        hash.update(token.as_ref().as_bytes());
+        hash.update([0]);
+    }
+    let digest = hash.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn format_tzx_detail(detail: &TzxBlockDetails) -> String {
@@ -253,5 +395,17 @@ mod tests {
         let analysis = analyze_tape(&block(&h)).unwrap();
         assert_eq!(analysis.entries[0].name.as_deref(), Some("GAME"));
         assert_eq!(analysis.entries[0].load_address, Some(0x8000));
+    }
+
+    #[test]
+    fn loader_fingerprint_is_versioned_and_ignores_titles() {
+        assert_eq!(
+            fingerprint(&["turbo:2168:855:1710"]),
+            fingerprint(&["turbo:2168:855:1710"])
+        );
+        assert_ne!(
+            fingerprint(&["turbo:2168:855:1710"]),
+            fingerprint(&["turbo:2168:2168:1710"])
+        );
     }
 }
