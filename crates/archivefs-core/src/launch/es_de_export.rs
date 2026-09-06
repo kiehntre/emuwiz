@@ -89,6 +89,7 @@ use crate::launch::planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchContentRef, LaunchPlan, LaunchTarget,
 };
 use crate::launch::readiness::LaunchReadiness;
+use crate::platform::equivalent_platform_ids;
 
 /// One reviewed row mapping a [`crate::platform::Platform::id`] to its
 /// ES-DE system short name and full display name - see the module doc
@@ -475,6 +476,20 @@ pub const ES_DE_SYSTEM_MAP: &[EsDeSystemMapping] = &[
         es_de_system: "x68000",
         es_de_fullname: "Sharp X68000",
     },
+    // Final safe gaps: each remains a distinct canonical EmuWiz identity.
+    EsDeSystemMapping {
+        platform_id: "TurboGrafx-16",
+        es_de_system: "tg16",
+        es_de_fullname: "NEC TurboGrafx-16",
+    },
+    // PC-98 owns this one ES-DE series-level target. The persisted legacy
+    // `NEC PC-9801` identity reaches this row via the lookup-only equivalence
+    // fallback below, never through a duplicate destination row.
+    EsDeSystemMapping {
+        platform_id: "PC-98",
+        es_de_system: "pc98",
+        es_de_fullname: "NEC PC-9800 Series",
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.
@@ -482,6 +497,15 @@ pub fn es_de_system_for_platform(platform_id: &str) -> Option<&'static EsDeSyste
     ES_DE_SYSTEM_MAP
         .iter()
         .find(|entry| entry.platform_id == platform_id)
+        .or_else(|| {
+            equivalent_platform_ids(platform_id)
+                .into_iter()
+                .find_map(|equivalent| {
+                    ES_DE_SYSTEM_MAP
+                        .iter()
+                        .find(|entry| entry.platform_id == equivalent)
+                })
+        })
 }
 
 /// Why no [`EsDeEntryPlan`] could be produced at all - distinct from
@@ -788,6 +812,9 @@ mod tests {
             "Philips CD-i",
             "PS4",
             "Sharp X68000",
+            "TurboGrafx-16",
+            "PC-98",
+            "NEC PC-9801",
         ] {
             assert!(
                 es_de_system_for_platform(platform_id).is_some(),
@@ -1038,9 +1065,6 @@ mod tests {
             "Commodore 128",
             "NeoGeo64",
             "PC",
-            "PC-98",
-            "NEC PC-9801",
-            "TurboGrafx-16",
             "not-a-real-platform",
         ] {
             assert!(
@@ -1048,6 +1072,55 @@ mod tests {
                 "{platform_id} must remain refused until its policy is resolved"
             );
         }
+    }
+
+    #[test]
+    fn final_safe_gaps_have_exact_distinct_targets_and_lookup_only_pc98_equivalence() {
+        let tg16 = es_de_system_for_platform("TurboGrafx-16").unwrap();
+        assert_eq!(
+            (tg16.es_de_system, tg16.es_de_fullname),
+            ("tg16", "NEC TurboGrafx-16")
+        );
+        assert_eq!(
+            es_de_system_for_platform("PC Engine").unwrap().es_de_system,
+            "pcengine"
+        );
+        assert_eq!(
+            es_de_system_for_platform("PC Engine CD")
+                .unwrap()
+                .es_de_system,
+            "pcenginecd"
+        );
+        let pc98 = es_de_system_for_platform("PC-98").unwrap();
+        assert_eq!(
+            (pc98.es_de_system, pc98.es_de_fullname),
+            ("pc98", "NEC PC-9800 Series")
+        );
+        assert_eq!(es_de_system_for_platform("NEC PC-9801"), Some(pc98));
+        assert_eq!(
+            ES_DE_SYSTEM_MAP
+                .iter()
+                .filter(|row| row.es_de_system == "pc98")
+                .count(),
+            1
+        );
+        assert!(
+            ES_DE_SYSTEM_MAP
+                .iter()
+                .all(|row| row.platform_id != "NEC PC-9801")
+        );
+        assert_eq!(platform_by_id("PC-98").unwrap().id, "PC-98");
+        assert_eq!(platform_by_id("NEC PC-9801").unwrap().id, "NEC PC-9801");
+        for platform_id in ["Atari 8-bit", "Commodore 128", "NeoGeo64", "PC"] {
+            assert!(
+                es_de_system_for_platform(platform_id).is_none(),
+                "{platform_id} remains deferred or unsupported"
+            );
+        }
+        assert_eq!(
+            es_de_system_for_platform("MegaDrive").unwrap().es_de_system,
+            "megadrive"
+        );
     }
 
     #[test]
@@ -1103,19 +1176,29 @@ mod tests {
     }
 
     #[test]
-    fn batch_4_pc_engine_targets_and_neighbours_remain_distinct() {
+    fn pc_engine_and_final_safe_gap_targets_remain_distinct() {
         let pcengine = es_de_system_for_platform("PC Engine").unwrap();
         let pcenginecd = es_de_system_for_platform("PC Engine CD").unwrap();
         assert_eq!(pcengine.es_de_system, "pcengine");
         assert_eq!(pcenginecd.es_de_system, "pcenginecd");
         assert_ne!(pcengine.es_de_system, pcenginecd.es_de_system);
 
-        for platform_id in ["TurboGrafx-16", "PC-98", "NEC PC-9801"] {
-            assert!(
-                es_de_system_for_platform(platform_id).is_none(),
-                "{platform_id} must remain deferred rather than borrowing a Batch 4 target"
-            );
-        }
+        assert_eq!(
+            es_de_system_for_platform("TurboGrafx-16")
+                .unwrap()
+                .es_de_system,
+            "tg16"
+        );
+        assert_eq!(
+            es_de_system_for_platform("PC-98").unwrap().es_de_system,
+            "pc98"
+        );
+        assert_eq!(
+            es_de_system_for_platform("NEC PC-9801")
+                .unwrap()
+                .es_de_system,
+            "pc98"
+        );
         assert_ne!(
             es_de_system_for_platform("Acorn Electron")
                 .unwrap()
@@ -1241,30 +1324,22 @@ mod tests {
     }
 
     /// Still-unmapped policy/no-target platforms must keep failing closed
-    /// rather than falling back to a merely related Batch 1--5 row.
+    /// rather than falling back to a merely related ES-DE row.
     #[test]
-    fn platforms_still_unmapped_after_batch_5_remain_refused() {
+    fn platforms_still_unmapped_after_final_safe_gaps_remain_refused() {
         // NeoGeo/WonderSwan/Intellivision were the still-unmapped examples
         // when this test was first written for Batch 1; Batch 3 has since
         // mapped all three (see `batch_3_platforms_map_to_es_de_exactly`),
         // so they moved out of this list rather than being asserted here
         // and in a "now mapped" test simultaneously.
-        for platform_id in [
-            "Atari 8-bit",
-            "Commodore 128",
-            "NeoGeo64",
-            "PC",
-            "PC-98",
-            "NEC PC-9801",
-            "TurboGrafx-16",
-        ] {
+        for platform_id in ["Atari 8-bit", "Commodore 128", "NeoGeo64", "PC"] {
             assert!(
                 platform_by_id(platform_id).is_some(),
                 "{platform_id} should be a real registry id (fixture drift)"
             );
             assert!(
                 es_de_system_for_platform(platform_id).is_none(),
-                "{platform_id} must still be unmapped after Batch 5"
+                "{platform_id} must still be unmapped after the final safe gaps"
             );
         }
     }

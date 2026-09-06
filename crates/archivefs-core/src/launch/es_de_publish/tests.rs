@@ -216,6 +216,35 @@ fn batch_five_publication_previews_use_the_exact_reviewed_system_targets() {
 }
 
 #[test]
+fn final_safe_gap_publication_previews_preserve_distinct_targets_and_pc98_equivalence() {
+    for (platform_id, system, fullname) in [
+        ("TurboGrafx-16", "tg16", "NEC TurboGrafx-16"),
+        ("PC-98", "pc98", "NEC PC-9800 Series"),
+        ("NEC PC-9801", "pc98", "NEC PC-9800 Series"),
+    ] {
+        let home = tempdir().unwrap();
+        let systems_xml = minimal_systems_xml(system, fullname);
+        let profile = profile_with_system(home.path(), system, fullname, &systems_xml);
+        let destination_root = home.path().join("playing").join(platform_id);
+        let plan = plan_with_operations(
+            destination_root.clone(),
+            &[("Verified Game", destination_root.join("Verified Game.chd"))],
+        );
+
+        let publication = plan_es_de_gamelist_publication(&plan, platform_id, &profile)
+            .unwrap_or_else(|error| panic!("{platform_id} preview was refused: {error}"));
+        assert_eq!(publication.es_de_system, system);
+        assert_eq!(
+            publication.gamelist_path,
+            home.path()
+                .join("gamelists")
+                .join(system)
+                .join("gamelist.xml")
+        );
+    }
+}
+
+#[test]
 fn batch_4_publication_previews_use_each_verified_system_target() {
     for (platform_id, system, fullname) in [
         ("3DO", "3do", "3DO Interactive Multiplayer"),
