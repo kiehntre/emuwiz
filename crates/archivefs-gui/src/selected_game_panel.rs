@@ -134,6 +134,10 @@ pub(crate) struct SelectedArchiveActions {
     pub(crate) platform: Option<(PathBuf, PlatformAction)>,
     pub(crate) inspect: Option<PathBuf>,
     pub(crate) cheats_mods: Option<PathBuf>,
+    /// Set when the DAT check section's "Verify Games" action was clicked.
+    /// Routes into the existing Verify Games (DAT Sources) page; never
+    /// starts an audit itself.
+    pub(crate) open_dat_sources: bool,
 }
 
 pub(crate) fn show_selected_archive(
@@ -166,6 +170,7 @@ pub(crate) fn show_selected_archive(
     let mut platform_request = None;
     let mut inspect_request = None;
     let mut cheats_mods_request = None;
+    let mut open_dat_sources_request = false;
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
@@ -229,13 +234,15 @@ pub(crate) fn show_selected_archive(
                     inspect_request = Some(persisted.absolute_path.clone());
                 }
             }
-            show_dat_identity_section(
+            if show_dat_identity_section(
                 ui,
                 persisted
                     .and_then(|persisted| persisted.absolute_path.file_name())
                     .and_then(|name| name.to_str()),
                 dat_identities,
-            );
+            ) {
+                open_dat_sources_request = true;
+            }
             let action = show_platform_section(
                 ui,
                 persisted,
@@ -327,6 +334,14 @@ pub(crate) fn show_selected_archive(
         match selected_evidence {
             SelectedEvidenceView::Ready(report) => {
                 ui.strong("Game identified");
+                ui.label(
+                    egui::RichText::new(
+                        "Evidence read directly from this game or disc - independent of any DAT \
+                         catalogue.",
+                    )
+                    .color(theme::muted(ui))
+                    .small(),
+                );
                 widgets::technical_details(ui, "selected-game-identity", |ui| {
                     selected_evidence_page::show_identity_evidence(ui, report);
                 });
@@ -349,7 +364,7 @@ pub(crate) fn show_selected_archive(
                 });
             }
         }
-        show_dat_identity_section(
+        if show_dat_identity_section(
             ui,
             record
                 .mount_plan
@@ -358,7 +373,9 @@ pub(crate) fn show_selected_archive(
                 .file_name()
                 .and_then(|name| name.to_str()),
             dat_identities,
-        );
+        ) {
+            open_dat_sources_request = true;
+        }
         ui.add_space(6.0);
         let can_lazy_unmount = lazy_unmount_available(record, lazy_unmount_offers, busy);
         let remount_offered = remount_is_offered(record, remount_offers);
@@ -494,6 +511,7 @@ pub(crate) fn show_selected_archive(
         platform: platform_request,
         inspect: inspect_request,
         cheats_mods: cheats_mods_request,
+        open_dat_sources: open_dat_sources_request,
     }
 }
 

@@ -433,6 +433,9 @@ pub(crate) fn show_loaded_data(
     if let Some(archive_path) = selected_actions.cheats_mods {
         requested_action = Some(AppOperationRequest::OpenCheatsMods(archive_path));
     }
+    if selected_actions.open_dat_sources {
+        requested_action = Some(AppOperationRequest::OpenDatSources);
+    }
 
     if let Some(result) = mount_all_result {
         show_mount_all_result(ui, result);

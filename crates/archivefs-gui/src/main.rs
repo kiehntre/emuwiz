@@ -18398,6 +18398,11 @@ enum AppOperationRequest {
     /// Opens the first-class Cheats & Mods workspace for this exact
     /// archive - see `ArchiveFsApp::open_cheats_mods_workspace`.
     OpenCheatsMods(PathBuf),
+    /// Navigates to the existing Verify Games (DAT Sources) page - the
+    /// selected-game DAT check section's own "Verify Games" call to
+    /// action. Never starts an audit itself; it only opens the real,
+    /// existing workflow that does.
+    OpenDatSources,
 }
 
 impl From<ArchiveAction> for ActivityAction {
@@ -20940,6 +20945,10 @@ impl ArchiveFsApp {
                 AppOperationRequest::OpenCheatsMods(archive_path) => {
                     self.archive_context.select_only(archive_path.clone());
                     self.open_cheats_mods_workspace(context, archive_path);
+                }
+                AppOperationRequest::OpenDatSources => {
+                    self.quick_rename_mode = false;
+                    self.view = MainView::DatSources;
                 }
             }
         }
