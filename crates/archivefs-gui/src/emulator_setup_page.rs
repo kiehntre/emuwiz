@@ -115,6 +115,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "mgba" => "mGBA",
         "mesen" => "Mesen 2",
         "snes9x" => "Snes9x",
+        "rmg" => "RMG",
         "mame" => "MAME",
         "fbneo" => "FBNeo",
         "cemu" => "Cemu",
@@ -528,6 +529,19 @@ mod tests {
         assert_eq!(snes9x.name, "Snes9x");
         assert_eq!(retroarch.name, "RetroArch");
         assert_ne!(snes9x.adapter_id, retroarch.adapter_id);
+    }
+
+    #[test]
+    fn rmg_candidate_uses_its_own_name_not_the_generic_fallback() {
+        // Regression: `adapter_name()` had no `"rmg"` arm, so the N64 RMG row
+        // rendered the generic "Supported emulator" fallback instead of "RMG".
+        let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, Some("N64"), "");
+        let rmg = candidates
+            .iter()
+            .find(|c| c.platform_id == "N64" && c.adapter_id == "rmg")
+            .expect("standalone RMG candidate for N64");
+        assert_eq!(rmg.name, "RMG");
+        assert_ne!(rmg.name, "Supported emulator");
     }
 
     #[test]
