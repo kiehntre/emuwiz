@@ -849,3 +849,256 @@ Organisation click-through/confirmation/rollback presentation is **NOT
 TESTABLE here**, not a defect. It remains a P1 desktop follow-up. No real ROM,
 RomM, ES-DE, onboarding, DAT GUI, firmware, Cheats & Mods, or LBC state was
 accessed or modified. **P0 defects: none.**
+
+## 22. Current V1 release-readiness summary (audit at `4763dd3`)
+
+Read-only reconciliation of everything above against current source, run
+2026-09-06 at authoritative commit
+`4763dd34b8d5f4a02b2f5927dbdd995d7b41d7ce`. This section is the single current
+answer to "what actually remains before V1"; it supersedes reading the raw
+wave/table history above for that question. No production code was changed to
+produce it.
+
+### Closed since the original plan (§1-§17) was written
+
+- DAT Identity GUI P0 (`00713a2`) — selected-game DAT identity/verification
+  presentation, distinct from structural identity, real Verify Games route;
+  P1 items (all-library aggregate, BIOS-missing summary, cross-family
+  conflict model, source-variant projection) explicitly deferred, not
+  reopened.
+- Doctor/Emulator Setup 12-test regression (`76aff27`) — confirmed by direct
+  re-run (`cargo test -p archivefs-gui --bin archivefs-gui doctor_and_repair`,
+  124 passed, 0 failed) and by diff inspection: the fix touched only
+  `tests/doctor_and_repair.rs` (57 lines), zero production files. All 12 were
+  `STALE_TEST_EXPECTATION` against a `#[cfg(any())]`-disabled dead function
+  (`show_emulator_setup_summary`) whose strings ("Emulator readiness",
+  "Setup incomplete", "Download managed emulators" gated on a scan) never
+  render; the live page (`emulator_setup_page::show`) already used current
+  strings ("Emulator candidates", "Check emulators", "Not checked"). No
+  `REAL_GUI_REGRESSION` was found.
+- ES-DE final safe gaps (`48140d0`) — TurboGrafx-16 and PC-98/NEC PC-9801 now
+  map live; confirmed directly in `es_de_export.rs`
+  (`platforms_still_unmapped_after_final_safe_gaps_remain_refused` asserts
+  exactly `["Atari 8-bit", "Commodore 128", "NeoGeo64", "PC"]` remain
+  unmapped). Registry has 76 canonical platforms; 4 unmapped + 1 intentional
+  partial (MegaDrive) yields the 71 COMPLETE / 1 PARTIAL / 4 MISSING ceiling.
+  Confirmed unchanged from `docs/ESDE_FINAL_GAP_DECISIONS.md`'s decision.
+- Firmware/BIOS GUI (`d478e47`) — plain-language firmware summary shipped;
+  Wave 4 (§20) proved the backend projection paths; Stella/VICE/PPSSPP retain
+  `NotRequired`, `RequiredFirmwareMissing` remains the sole source of the
+  blocking wording.
+- ES-DE publication/recovery Wave 2 (§18), Cheats & Mods Wave 3 (§19),
+  Firmware Wave 4 (§20), Playing Library Wave 5 (§21) — all report **P0
+  defects: none** against real filesystem operations, journals, and rollback;
+  each wave's remaining gap is exactly one desktop GUI click-through pass
+  (see below), not a functional defect.
+- Physical Launch QA Wave 1 (`dae99e5`) — real RetroArch core launches (GBA,
+  PSX) reached actual content; one PSX core crash was RetroArch/Mednafen's
+  own (confirmed via `/var/crash`, real BIOS present, ruled out as a firmware
+  gap); EmuWiz's own handoff and fail-closed behavior were exactly correct.
+  No EmuWiz launch blocker found.
+- Recalbox competitive audit's two "P0 — before 1.0" recommendations
+  (5-step onboarding wizard; per-platform plain-language firmware summary)
+  are **both already implemented** (onboarding feature + `d478e47`) — that
+  doc is stale on those two rows; not edited here per this audit's
+  documentation-only scope, but the recommendations are no longer open work.
+
+### Home P0 — CONFIRMED STILL OPEN (`P0_OPEN`)
+
+Evidence, most recent first:
+- `4763dd3` (this repo, today): "the current source still has the documented
+  same-session onboarding completion → Home 'Loading your games…' P0: no
+  corrective commit or regression test was present."
+- No commit anywhere in `git log --all` touches this defect (searched for
+  onboarding/Home-load/refresh-generation fix commits; none exist).
+- No worktree or branch in this environment is dedicated to this fix (the
+  `/tmp/onboarding_*.log` files present on this host are ordinary onboarding
+  *unit* test runs from unrelated earlier work — they exercise
+  `onboarding::tests`/`tests::onboarding_flow` sidecar persistence, not the
+  GUI same-session load hang — and contain no evidence of a fix attempt for
+  this specific defect).
+- Original finding: `docs/APPIMAGE_FRESH_INSTALL_QA.md` (commit `e909efe`) —
+  a fresh onboarding completion in one running session left Home stuck on
+  "Loading your games…" indefinitely (10+ min, zero CPU, no error), with the
+  background load thread already exited (`/proc/<pid>/task/*/wchan` showed
+  both threads idling in `do_poll`) — i.e. a `refresh_generation`/state-
+  machine mismatch in `poll_load`/`start_load`, not a slow computation. A
+  fresh process relaunch against the identical on-disk state loaded
+  instantly, isolating the defect to the onboarding-finish → first-load
+  transition specifically.
+
+**Classification: `P0_OPEN`.** This is the single confirmed release blocker
+in the entire audited surface.
+
+### AppImage artifact — `STALE_ARTIFACT`, additionally `BLOCKED_BY_HOME_P0`
+
+- `dist/EmuWiz-x86_64.AppImage` (83,687,928 bytes, mtime unchanged since
+  `2026-09-06 00:47`) was built from commit `c16f486` — 15 authoritative
+  commits behind current HEAD, missing VICE, Stella's final-QA context,
+  ES-DE final safe gaps, DAT GUI P0, firmware GUI, and the Doctor test fix.
+- `4763dd3` recorded a rebuild attempt: `cargo check -p archivefs-gui` and
+  the release `emuwiz` binary build both passed, but the AppImage itself was
+  **not** packaged because this host has neither an approved `appimagetool`
+  executable nor the required pinned type-2 runtime file
+  (`docs/APPIMAGE_PACKAGING.md` requires both as explicit host inputs; the
+  build script fails closed rather than substituting an unapproved tool).
+- Even if packaging tools were available, rebuilding now would still ship a
+  build with the open Home P0 inside it, so a rebuild is not useful until
+  that defect is closed or explicitly accepted.
+
+**Classification: `STALE_ARTIFACT` (provenance) and `BLOCKED_BY_HOME_P0`
+(rebuild would not resolve release-readiness on its own).** Do not reuse the
+existing artifact as evidence of current-authority behavior for anything
+beyond the packaging/AppRun-mechanism findings already recorded in
+`docs/APPIMAGE_FRESH_INSTALL_QA.md`.
+
+### Remaining desktop-smoke items (no `DISPLAY`/`WAYLAND_DISPLAY` in any QA
+environment used so far)
+
+All of the following are **P1**, each with disposable-filesystem/backend
+correctness already proven green (per §18-§21); none is promoted to P0
+without direct evidence of a functional defect, per this audit's own
+instruction:
+
+| Desktop smoke | Backend evidence | Priority |
+| --- | --- | --- |
+| ES-DE GUI publish + real ES-DE launch | Wave 2 (§18): preview/apply/idempotence/rollback/recovery all PASS | P1 |
+| Cheats & Mods GUI apply/rollback confirmation wording | Wave 3 (§19): RetroArch/PCSX2/Dolphin Gecko+AR/Xenia all PASS, source hashes preserved | P1 |
+| Firmware/BIOS GUI wording + Doctor navigation | Wave 4 (§20): Verified/Found-not-verified/Required-missing/non-blocking/NotRequired all PASS at the projection layer; the 70-test GUI suite already covers the presentation logic itself, only live rendering is unverified | P1 |
+| Playing Library GUI confirmation/apply/rollback | Wave 5 (§21): 100 tests PASS on election, transaction, idempotent reapply, rollback | P1 |
+
+None of these four is a release blocker: each wave's underlying safety
+contract (no silent mutation, fail-closed on ambiguity, rollback restores
+exact prior state) is proven by real disposable-filesystem tests, not merely
+mocked. The desktop pass would confirm presentation/wording only.
+
+### Remaining real-installed-emulator physical-launch gaps
+
+Per `docs/PHYSICAL_QA_LAUNCH_WAVE1.md`, still genuinely untested with a
+physically installed emulator on any host used so far:
+
+- RMG, Mesen 2, Snes9x, Stella, VICE — none of the five installed on the
+  Wave 1 QA host; each adapter's own focused core/command/execution/
+  integration test suite is green (verified earlier in this session's work
+  promoting each adapter), so command construction, readiness, fail-closed
+  behavior, and RetroArch coexistence are proven at the unit level. Only the
+  "does a real installed binary actually open and load the game" step is
+  unverified.
+- RetroArch AppImage — no RetroArch AppImage installed on the Wave 1 host;
+  the underlying `feat(launch): support verified RetroArch AppImage
+  profiles` (`e6ebe22`) automated coverage is unaffected.
+
+**Classification: P1 coverage gap for all six, not a release blocker.**
+RetroArch itself (the emulator actually covering the overwhelming majority
+of the real library, per Wave 1's 68,853-item real-library evidence) was
+physically proven to reach real content on this exact host. A V1/alpha does
+not require physical proof of every adapter before shipping when: (a) the
+platform's RetroArch fallback path is itself physically proven, (b) each
+adapter's own unit/integration suite is green, and (c) no adapter is
+advertised to a user as "physically verified" anywhere in the GUI (readiness
+language is honestly sourced from discovery/hash evidence only, never from
+an unrun physical test).
+
+### openMSX / shared machine-profile seam
+
+Confirmed still deferred per `docs/OPENMSX_STANDALONE_ADAPTER_AUDIT.md`'s own
+Definition of Done — no machine-profile seam exists yet, no `openmsx`
+adapter code exists anywhere in `crates/`. **P1/P2 post-V1**, matching the
+existing roadmap; not a release blocker.
+
+### DAT backend/GUI deferred items
+
+Per `docs/DAT_GUI_WIRING_AUDIT.md` §"P0 / P1 / P2" (P0 already promoted,
+confirmed above): P1 items remaining open are an all-library aggregate
+count, carrying parsed-catalogue-variant into selected-game provenance, and
+a separate BIOS/firmware readiness view (the last one is now effectively
+superseded by the firmware/BIOS GUI work, `d478e47`, though the audit doc
+itself was not edited to reflect that — a stale-doc note, not a functional
+gap). P2 items (candidate/source comparison, raw DAT graph browsing,
+evidence export, saved filters, durable cross-evidence conflict model)
+remain untouched and unnecessary for V1. **None is release-blocking.**
+
+### Version/tag state
+
+- Workspace version in `Cargo.toml`: `0.8.1-alpha` (shared via
+  `version.workspace = true` across all three crates).
+- Latest tag reachable from HEAD: `v0.8.2` (`git merge-base --is-ancestor
+  v0.8.2 HEAD` succeeds; HEAD is 40 commits ahead of that tag).
+- No tag exists at or after current HEAD. The workspace version string
+  (`0.8.1-alpha`) predates even the `v0.8.2` tag it is already behind, and a
+  further 40 commits of adapter/GUI/QA work have landed since that tag with
+  no version bump.
+- **Not resolved here by design** (this audit does not force a version
+  decision): whichever version a release actually ships as, the current
+  `Cargo.toml` value does not reflect it, and this will need a real decision
+  (e.g. `0.8.3-alpha` or `0.9.0-alpha`) at release-cut time, separate from
+  the Home P0 fix.
+
+### One newly-observed small polish item (not fixed here — read-only audit)
+
+`crates/archivefs-gui/src/emulator_setup_page.rs`'s `adapter_name()` has no
+match arm for `"rmg"` (confirmed live: `platform_map.rs` registers
+`standalone_adapters: &["rmg"]` for N64), so an RMG candidate row would
+currently render the generic fallback label "Supported emulator" instead of
+"RMG" in Emulator Setup. **Classification: P2 polish** (cosmetic label gap
+only; readiness/launch behavior for the RMG adapter itself is unaffected and
+already covered by its own green test suite). Left unfixed per this audit's
+read-only scope; worth a one-line fix in a future GUI-only pass.
+
+### Authoritative release-readiness matrix
+
+| AREA | STATUS | EVIDENCE | SEVERITY | RELEASE BLOCKER? | NEXT ACTION |
+| --- | --- | --- | --- | --- | --- |
+| Home same-session load hang | OPEN | `4763dd3`; original finding in `APPIMAGE_FRESH_INSTALL_QA.md` (`e909efe`) | P0 | **YES** | Fix `poll_load`/`start_load` generation handling; add a regression test; retest |
+| AppImage artifact currency | OPEN | `4763dd3`; artifact from `c16f486`, 15 commits stale | P0 | **YES** (as a packaging gate; blocked on Home P0 + missing tools) | Once Home P0 closes and `appimagetool`/runtime are available, rebuild and rerun the fresh-install harness |
+| DAT Identity GUI P0 | CLOSED | `00713a2`; 23 focused + 191 re-verified GUI tests | NONE | No | none |
+| Doctor/Emulator Setup regressions | CLOSED | `76aff27`; re-run 124/124 green, test-only diff | NONE | No | none |
+| ES-DE final safe gaps (TG-16, PC-98) | CLOSED | `48140d0`; live export-table assertion | NONE | No | none |
+| ES-DE publication/recovery (Wave 2) | CLOSED (filesystem layer) | §18 | NONE | No | desktop GUI pass is P1, not a gate |
+| Cheats & Mods install/rollback (Wave 3) | CLOSED (filesystem layer) | §19 | NONE | No | desktop GUI pass is P1, not a gate |
+| Firmware/BIOS readiness (Wave 4) | CLOSED (projection layer) | §20; `d478e47` | NONE | No | desktop GUI pass is P1, not a gate |
+| Playing Library / 1G1R (Wave 5) | CLOSED (filesystem layer) | §21 | NONE | No | desktop GUI pass is P1, not a gate |
+| Physical Launch QA Wave 1 | CLOSED | `dae99e5`; real RetroArch GBA/PSX launches reached content | NONE | No | none |
+| ES-DE desktop GUI publish/launch | DESKTOP_SMOKE | §18 | P1 | No | run when a desktop/ES-DE session is available |
+| Cheats & Mods desktop GUI apply/rollback | DESKTOP_SMOKE | §19 | P1 | No | run when a desktop session is available |
+| Firmware/BIOS GUI wording live render | DESKTOP_SMOKE | §20 | P1 | No | run when a desktop session is available |
+| Playing Library GUI confirm/apply/rollback | DESKTOP_SMOKE | §21 | P1 | No | run when a desktop session is available |
+| RMG/Mesen 2/Snes9x/Stella/VICE physical launch | DEFERRED | `PHYSICAL_QA_LAUNCH_WAVE1.md`; unit suites green, no installed binary | P1 | No | run when any is installed on a QA host |
+| RetroArch AppImage physical launch | DEFERRED | `PHYSICAL_QA_LAUNCH_WAVE1.md`; no AppImage installed | P1 | No | run when one is installed on a QA host |
+| ES-DE intentional gaps (Atari 8-bit, C128, NeoGeo64, PC) | DEFERRED | `ESDE_FINAL_GAP_DECISIONS.md`; live export-table confirms exactly these 4 unmapped | P2 | No | policy decision only, not a defect |
+| MegaDrive regional PARTIAL | DEFERRED | `ESDE_FINAL_GAP_DECISIONS.md` | P2 | No | do not accept a guessed mapping |
+| openMSX adapter | DEFERRED | `OPENMSX_STANDALONE_ADAPTER_AUDIT.md`; no seam, no code | P2 | No | sequence after a machine-profile seam exists |
+| DAT P1 items (aggregate count, catalogue-variant provenance) | DEFERRED | `DAT_GUI_WIRING_AUDIT.md` | P1 | No | separate GUI-only follow-up pass |
+| DAT P2 items | DEFERRED | `DAT_GUI_WIRING_AUDIT.md` | P2 | No | none planned for V1 |
+| 94k RomM bounded performance pass | NOT_REQUIRED for this audit's scope | original plan §17 row, unchanged | P1 | No | run when a large snapshot + resource-watch environment is available |
+| Resize/focus/accessibility/long-session polish | DEFERRED | original plan §17 row, unchanged | P2 | No | representative desktop sweep, post-V1 acceptable |
+| RMG `adapter_name()` fallback label | OPEN (newly observed) | `emulator_setup_page.rs`, no `"rmg"` arm | P2 | No | one-line GUI fix in a future pass |
+| Recalbox audit's two "P0" items | CLOSED (doc stale) | onboarding feature + `d478e47` | NONE | No | optionally refresh `RECALBOX_COMPETITIVE_AUDIT.md`'s status column (not done here) |
+
+### Shortest true critical path
+
+Derived strictly from the evidence above — two items gate release, both
+already precisely diagnosed:
+
+1. **Fix the Home same-session "Loading your games…" hang.** Root cause is
+   already isolated to `poll_load`/`start_load`'s `refresh_generation`
+   matching around the onboarding-finish transition (see finding above). Add
+   a regression test that exercises finish-onboarding-in-one-session, not
+   only a fresh relaunch (the existing 23 onboarding tests all pass today
+   precisely because none of them reproduce the same-session transition).
+2. **Rebuild the AppImage** once (1) is closed and an approved
+   `appimagetool` + pinned type-2 runtime are available on the build host.
+3. **Re-run the fresh-install QA harness** (`packaging/appimage/
+   test-fresh-home.sh` plus the manual onboarding-completion walk in
+   `docs/APPIMAGE_FRESH_INSTALL_QA.md`) against the new artifact, confirming
+   the Home hang no longer reproduces in the exact repro steps already
+   documented.
+4. **Perform the four desktop-smoke passes** (ES-DE, Cheats & Mods,
+   Firmware/BIOS GUI, Playing Library) opportunistically wherever a
+   `DISPLAY`/`WAYLAND_DISPLAY` session becomes available — P1, not gating,
+   but cheap to close out given every backend contract is already green.
+
+Everything else audited in this pass (DAT GUI, Doctor/Emulator Setup, ES-DE
+mapping ceiling, five newest adapters' physical launch, openMSX, version/tag
+housekeeping) is confirmed closed, correctly deferred, or a non-blocking
+P1/P2 — none of it belongs on the critical path to V1.
