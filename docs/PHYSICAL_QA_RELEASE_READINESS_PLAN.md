@@ -922,6 +922,21 @@ desktop (`DISPLAY`/`WAYLAND_DISPLAY`) was available for the Library
 Organisation click-through; that is a P1 desktop follow-up, not a filesystem
 defect. No P0/P1 defect was found in the exercised production path.
 
+## 24. Real desktop GUI smoke attempt
+
+**Attempt:** 2026-09-06 at `8f7aecfadcbc1004fcfcbad6dff50aa370e22e46`.
+The authoritative host had neither `DISPLAY` nor `WAYLAND_DISPLAY`, no visible
+Xorg/Xwayland/KWin/GNOME/Xfce session, and `loginctl` could not access a user
+session bus. No known Nobara desktop clone was available under the accessible
+user home directories. Consequently, no GUI process, fixture state, AppImage,
+or real user data was launched or modified.
+
+The physical checks for Recently Found, Identify & Rename, Duplicate Finder,
+DAT Identity, Firmware, ES-DE, Cheats & Mods, Playing Library, and same-session
+onboarding/Home remain **P1 desktop follow-up work**. This is an environmental
+limitation, not a product defect; it must be rerun in a real X11/Wayland
+session using a disposable HOME and synthetic fixtures.
+
 Read-only reconciliation of everything above against current source, run
 2026-09-06 at authoritative commit
 `4763dd34b8d5f4a02b2f5927dbdd995d7b41d7ce`. This section is the single current
