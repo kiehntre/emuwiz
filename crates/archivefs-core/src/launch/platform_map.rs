@@ -307,6 +307,16 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &[],
         confidence: MappingConfidence::Exact,
     },
+    // DOSBox Staging has its own reviewed command/preflight adapter.  This
+    // registration only makes that existing adapter eligible for the shared
+    // selected-game candidate planner; it does not infer DOS identity or
+    // alter the adapter's directory/config safety checks.
+    LaunchCompatibility {
+        platform_id: "DOS",
+        standalone_adapters: &["dosbox-staging"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
 ];
 
 /// The reviewed row for `platform_id`, if any.
@@ -518,6 +528,7 @@ mod tests {
             "Atari2600",
             "Atari5200",
             "Atari Lynx",
+            "DOS",
         ] {
             assert!(
                 launch_compatibility_for_platform(platform_id).is_some(),
@@ -548,6 +559,14 @@ mod tests {
     fn psx_maps_to_duckstation_exactly() {
         let entry = launch_compatibility_for_platform("PSX").unwrap();
         assert_eq!(entry.standalone_adapters, &["duckstation"]);
+        assert_eq!(entry.confidence, MappingConfidence::Exact);
+    }
+
+    #[test]
+    fn dos_maps_to_dosbox_staging_exactly() {
+        let entry = launch_compatibility_for_platform("DOS").unwrap();
+        assert_eq!(entry.standalone_adapters, &["dosbox-staging"]);
+        assert!(platforms_for_standalone_adapter("dosbox-staging").contains(&"DOS"));
         assert_eq!(entry.confidence, MappingConfidence::Exact);
     }
 

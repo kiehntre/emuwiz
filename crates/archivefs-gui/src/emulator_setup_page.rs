@@ -7,8 +7,7 @@
 
 use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, Finding};
 use archivefs_core::launch::{
-    DOSBOX_SUPPORTED_PLATFORM_ID, LAUNCH_COMPATIBILITY, LaunchCompatibility,
-    SAMEBOY_SUPPORTED_PLATFORM_IDS,
+    LAUNCH_COMPATIBILITY, LaunchCompatibility, SAMEBOY_SUPPORTED_PLATFORM_IDS,
 };
 use eframe::egui;
 
@@ -123,6 +122,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "scummvm" => "ScummVM",
         "sameboy" => "SameBoy",
         "dosbox" => "DOSBox",
+        "dosbox-staging" => "DOSBox Staging",
         "stella" => "Stella",
         "vice" => "VICE",
         "openmsx" => "openMSX",
@@ -291,7 +291,7 @@ pub(crate) fn build_candidates(
             }
         }
     }
-    // These adapters have complete native command/readiness modules but are
+    // SameBoy has a complete native command/readiness module but is
     // intentionally not yet wired into core's shared selected-game matrix.
     // Showing them as explicit setup candidates is useful and honest: they
     // remain Needs setup until that shared authorization seam exists.
@@ -301,13 +301,6 @@ pub(crate) fn build_candidates(
             if matches_search(&candidate) {
                 candidates.push(candidate);
             }
-        }
-    }
-    if matches_filter(DOSBOX_SUPPORTED_PLATFORM_ID) {
-        let candidate =
-            unintegrated_candidate(DOSBOX_SUPPORTED_PLATFORM_ID, "dosbox", "DOSBox", findings);
-        if matches_search(&candidate) {
-            candidates.push(candidate);
         }
     }
     candidates
@@ -580,6 +573,19 @@ mod tests {
             .expect("standalone RMG candidate for N64");
         assert_eq!(rmg.name, "RMG");
         assert_ne!(rmg.name, "Supported emulator");
+    }
+
+    #[test]
+    fn dosbox_staging_candidate_uses_canonical_name() {
+        let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, Some("DOS"), "");
+        let dosbox = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.platform_id == "DOS" && candidate.adapter_id == "dosbox-staging"
+            })
+            .expect("DOSBox Staging candidate for DOS");
+        assert_eq!(dosbox.name, "DOSBox Staging");
+        assert_eq!(dosbox.state, CandidateState::NotChecked);
     }
 
     #[test]
