@@ -17,6 +17,18 @@
   onboarding) remains required; this command-line harness does not claim to
   exercise GUI navigation.
 
+## Current release-cut status (2026-09-06)
+
+The automated AppImage/tooling gate is closed by `ce33fdf` and `d36e304`:
+the pinned tooling contract is verified and the harness continues in
+`APPIMAGE_EXTRACT_AND_RUN=1` only after an explicit FUSE-unavailable error.
+Normal-mode FUSE failure on this QA host is an environment limitation, not an
+artifact defect. The remaining AppImage release gate is a real-desktop,
+interactive fresh-user acceptance of the current artifact, particularly the
+same-session Home transition after onboarding Finish. Historical sections below
+that describe a stale artifact, missing tooling, or the former Home P0 are
+retained as dated evidence and are superseded by this status.
+
 ## Current packaging-tool contract
 
 Current builds must use the immutable x86_64 pins in

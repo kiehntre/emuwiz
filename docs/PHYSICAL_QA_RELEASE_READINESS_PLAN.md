@@ -1163,3 +1163,71 @@ Everything else audited in this pass (DAT GUI, Doctor/Emulator Setup, ES-DE
 mapping ceiling, five newest adapters' physical launch, openMSX, version/tag
 housekeeping) is confirmed closed, correctly deferred, or a non-blocking
 P1/P2 — none of it belongs on the critical path to V1.
+
+## Final release-cut reconciliation (2026-09-06, `7ac525a`)
+
+This section supersedes the older point-in-time matrix and critical-path notes
+above where they describe pre-closure AppImage tooling, the DAT variant gap,
+the RMG label, or the 94k RomM pass. Historical QA observations remain useful
+evidence; they are not a statement of the current release-cut state.
+
+### Closed automated gates
+
+- Home post-onboarding same-session reload P0: `c379183`.
+- DAT Identity GUI P0: `00713a2`.
+- Doctor/Emulator Setup regression cleanup: `76aff27`.
+- Pinned AppImage tooling provenance: `ce33fdf` (appimagetool 1.9.1 and
+  type-2 runtime 20251108, checksum-verified by the packaging contract).
+- FUSE-less fresh-home harness fallback: `d36e304`; only explicit
+  FUSE-unavailable failures switch to extract-and-run, and other failures
+  remain fatal.
+- DAT catalogue/variant provenance: `9888bd5`.
+- RMG fallback label: `99e511d`.
+- Generated 94k RomM cache/load and browser-projection guard: `7ac525a`.
+
+### Manual-pending release gates
+
+The current AppImage technical mechanism is green: pinned tooling, the fresh
+artifact's extract-and-run version smoke, and the FUSE-less harness are proven;
+desktop `:0`/Xauthority access and normal GUI initialization have also been
+proven. This host lacks FUSE, so normal AppImage mode is an environment
+limitation, not an artifact defect.
+
+**Still required before an alpha/V1 cut:** complete the current artifact's
+interactive fresh-user GUI acceptance on a real desktop, including onboarding,
+the same-session Home transition immediately after Finish, empty and small
+source cases, restart consistency, Sources/Discovery, DAT and Doctor
+navigation, and isolated-HOME/source-immutability checks. This is manual
+pending, not a packaging or product defect. The broader P0 physical journeys
+in §3 remain release-owner acceptance work wherever the relevant emulator,
+ES-DE, and disposable filesystem environment is available.
+
+### Non-blocking deferred items
+
+- ES-DE V1 policy gaps remain intentionally unsupported: Atari 8-bit,
+  Commodore 128, NeoGeo64, and generic PC; MegaDrive remains intentionally
+  partial rather than guessing a region.
+- `openMSX` is deferred post-V1/P2: no adapter and no shared machine-profile
+  seam exists. It is greenfield multi-file adapter work, not a small existing
+  seam.
+- Physical launches for optional standalone adapters, desktop smoke sweeps,
+  resize/focus/accessibility/long-session polish, and optional RomM resource
+  watching are P1/P2 confidence follow-ups, not release blockers.
+- DAT aggregate count and other P2 browsing/reporting ideas are non-blocking;
+  catalogue/variant provenance is no longer in that list.
+
+### Release-cut actions not yet performed
+
+1. Finish and record the manual current-AppImage interactive acceptance above.
+2. Decide the target release version. The workspace currently advertises
+   `0.8.1-alpha`, which is stale relative to reachable tag `v0.8.2`.
+3. Bump the workspace version consistently after that decision.
+4. Rebuild the final AppImage from the versioned authority, then verify its
+   final SHA-256 and `--version` in extract-and-run mode (and normal mode where
+   FUSE is available).
+5. Create the release tag only after the final artifact/version checks pass.
+
+Current tag state: `v0.8.2` points at `db8092d`; current authority is not
+tagged (`git describe --tags` is `v0.8.2-48-g7ac525a`). CLI and GUI version
+output both derive from `env!("CARGO_PKG_VERSION")`, so no independent source
+version string was found.
