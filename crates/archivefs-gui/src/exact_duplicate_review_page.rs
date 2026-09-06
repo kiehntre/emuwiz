@@ -875,7 +875,14 @@ pub(crate) fn show_exact_duplicate_review_page(
             .as_ref()
             .map_or(0, |r| r.groups.len());
         if group_count == 0 && state.scan_status == Some(ScanStatus::Completed) {
-            ui.label("No equivalent N64 representations found.");
+            widgets::card(ui, |ui| {
+                widgets::empty_state(
+                    ui,
+                    "No equivalent N64 representations found.",
+                    "Run a scan to review byte-order duplicates.",
+                    None,
+                );
+            });
         }
         for index in 0..group_count {
             show_equivalent_group(ui, state, index);
@@ -886,13 +893,30 @@ pub(crate) fn show_exact_duplicate_review_page(
             .as_ref()
             .map_or(0, |report| report.groups.len());
         if group_count == 0 && state.scan_status == Some(ScanStatus::Completed) {
-            ui.label("No equivalent supported CUE/BIN and CHD discs found.");
+            widgets::card(ui, |ui| {
+                widgets::empty_state(
+                    ui,
+                    "No equivalent supported CUE/BIN and CHD discs found.",
+                    "Run a scan to review equivalent optical content.",
+                    None,
+                );
+            });
         }
         for index in 0..group_count {
             show_optical_group(ui, state, index);
         }
     } else {
         let group_count = state.report.as_ref().map_or(0, |r| r.groups.len());
+        if group_count == 0 && state.scan_status == Some(ScanStatus::Completed) {
+            widgets::card(ui, |ui| {
+                widgets::empty_state(
+                    ui,
+                    "No exact duplicate groups found.",
+                    "The scan found no byte-for-byte duplicate files to review.",
+                    None,
+                );
+            });
+        }
         for index in 0..group_count {
             show_group(ui, state, index);
         }
@@ -982,7 +1006,7 @@ fn show_recovery_banner(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageS
 
 fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState) {
     widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Review & actions").strong());
             if ui
                 .selectable_label(state.mode == DuplicateReviewMode::Exact, "Exact copies")
@@ -1024,7 +1048,7 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
         } else {
             ui.label("Choose a folder to scan for files that are byte-for-byte identical.");
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Source folder:");
             ui.add(
                 egui::TextEdit::singleline(&mut state.source_root_draft)
@@ -1036,7 +1060,7 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
                 state.source_root_draft = path.display().to_string();
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Trusted folder (optional):");
             ui.add(
                 egui::TextEdit::singleline(&mut state.trusted_root_draft)
@@ -1048,7 +1072,7 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
                 state.trusted_root_draft = path.display().to_string();
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Already-organized library folder (optional):");
             ui.add(
                 egui::TextEdit::singleline(&mut state.elected_library_draft)
@@ -1080,7 +1104,7 @@ fn show_setup_card(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState)
 fn show_scan_status(ui: &mut egui::Ui, status: &ScanStatus) {
     match status {
         ScanStatus::Scanning => {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label("Scanning for exact copies...");
             });
@@ -1200,16 +1224,23 @@ fn show_group(ui: &mut egui::Ui, state: &mut ExactDuplicateReviewPageState, inde
                 format_bytes(group.size_bytes)
             ));
             for member in &group.members {
-                ui.label(format!(
-                    "- {} (trusted root: {}, in organized library: {})",
-                    member.path.display(),
-                    if member.in_trusted_root { "yes" } else { "no" },
-                    if member.elected_in_library {
-                        "yes"
-                    } else {
-                        "no"
-                    }
-                ));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "- {} (trusted root: {}, in organized library: {})",
+                            member.path.display(),
+                            if member.in_trusted_root { "yes" } else { "no" },
+                            if member.elected_in_library {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                        ))
+                        .monospace()
+                        .color(theme::muted(ui)),
+                    )
+                    .wrap(),
+                );
             }
         }
 
