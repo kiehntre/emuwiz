@@ -311,13 +311,42 @@ pub(crate) fn build_candidates(
     candidates
 }
 
-pub(crate) fn candidate_columns(available_width: f32) -> usize {
-    if available_width >= 1_100.0 {
-        3
-    } else if available_width >= 680.0 {
-        2
-    } else {
-        1
+const CANDIDATE_CARD_MIN_WIDTH: f32 = 320.0;
+const CANDIDATE_CARD_MAX_WIDTH: f32 = 360.0;
+const CANDIDATE_CARD_GAP: f32 = 16.0;
+const CANDIDATE_CARD_MAX_COLUMNS: usize = 3;
+
+/// The candidate grid deliberately has a modest maximum card width.  A setup
+/// card is explanatory copy rather than a dashboard tile, so stretching it
+/// across a very wide desktop makes the page harder to scan and leaves the
+/// final row looking accidental.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CandidateGridLayout {
+    columns: usize,
+    card_width: f32,
+    row_width: f32,
+}
+
+fn candidate_grid_layout(available_width: f32, candidate_count: usize) -> CandidateGridLayout {
+    debug_assert!(candidate_count > 0);
+
+    let available_width = available_width.max(0.0);
+    let columns_that_fit = ((available_width + CANDIDATE_CARD_GAP)
+        / (CANDIDATE_CARD_MIN_WIDTH + CANDIDATE_CARD_GAP))
+        .floor() as usize;
+    let columns = columns_that_fit
+        .clamp(1, CANDIDATE_CARD_MAX_COLUMNS)
+        .min(candidate_count);
+    let card_width = ((available_width - CANDIDATE_CARD_GAP * columns.saturating_sub(1) as f32)
+        / columns as f32)
+        .min(CANDIDATE_CARD_MAX_WIDTH)
+        .max(0.0);
+
+    CandidateGridLayout {
+        columns,
+        card_width,
+        row_width: card_width * columns as f32
+            + CANDIDATE_CARD_GAP * columns.saturating_sub(1) as f32,
     }
 }
 
@@ -393,46 +422,53 @@ pub(crate) fn show(
         );
         return action;
     }
-    let columns = candidate_columns(ui.available_width());
-    let width = ((ui.available_width() - (columns.saturating_sub(1) as f32 * 12.0))
-        / columns as f32)
-        .max(180.0);
-    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-    ui.horizontal_wrapped(|ui| {
-        for candidate in &candidates {
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    let focused = focused_emulator.is_some_and(|focus| {
-                        focus.eq_ignore_ascii_case(candidate.name)
-                            || focus.eq_ignore_ascii_case(candidate.adapter_id)
-                    });
-                    if focused {
-                        ui.scroll_to_cursor(Some(egui::Align::Center));
-                    }
-                    widgets::card(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new(candidate.name).strong());
-                            widgets::status_badge(ui, candidate.state.label(), candidate.state.tone());
+    let grid = candidate_grid_layout(ui.available_width(), candidates.len());
+    for row in candidates.chunks(grid.columns) {
+        ui.horizontal(|ui| {
+            // Centre each row, including a short final row, without forcing a
+            // single candidate to claim the entire content width.
+            let row_width = grid.card_width * row.len() as f32
+                + CANDIDATE_CARD_GAP * row.len().saturating_sub(1) as f32;
+            ui.add_space(((ui.available_width() - row_width) / 2.0).max(0.0));
+            for (index, candidate) in row.iter().enumerate() {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(grid.card_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        let focused = focused_emulator.is_some_and(|focus| {
+                            focus.eq_ignore_ascii_case(candidate.name)
+                                || focus.eq_ignore_ascii_case(candidate.adapter_id)
                         });
-                        ui.label(egui::RichText::new(candidate.platform_id).color(theme::muted(ui)));
-                        ui.label(&candidate.reason);
-                        if candidate.state == CandidateState::Ready {
-                            ui.label(egui::RichText::new("Eligible evidence was found; final launch checks still run when you play.").small().color(theme::muted(ui)));
+                        if focused {
+                            ui.scroll_to_cursor(Some(egui::Align::Center));
                         }
-                        if !candidate.evidence.is_empty() {
-                            widgets::technical_details(ui, ("emulator-candidate", candidate.adapter_id, candidate.platform_id), |ui| {
-                                for line in &candidate.evidence {
-                                    ui.label(line);
-                                }
+                        widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(candidate.name).strong());
+                                widgets::status_badge(ui, candidate.state.label(), candidate.state.tone());
                             });
-                        }
-                    });
-                },
-            );
-        }
-    });
+                            ui.label(egui::RichText::new(candidate.platform_id).color(theme::muted(ui)));
+                            ui.label(&candidate.reason);
+                            if candidate.state == CandidateState::Ready {
+                                ui.label(egui::RichText::new("Eligible evidence was found; final launch checks still run when you play.").small().color(theme::muted(ui)));
+                            }
+                            if !candidate.evidence.is_empty() {
+                                widgets::technical_details(ui, ("emulator-candidate", candidate.adapter_id, candidate.platform_id), |ui| {
+                                    for line in &candidate.evidence {
+                                        ui.label(line);
+                                    }
+                                });
+                            }
+                        });
+                    },
+                );
+                if index + 1 < row.len() {
+                    ui.add_space(CANDIDATE_CARD_GAP);
+                }
+            }
+        });
+        ui.add_space(CANDIDATE_CARD_GAP);
+    }
     action
 }
 
@@ -674,8 +710,44 @@ mod tests {
             "azahar",
         );
         assert_eq!(azahar.len(), 1);
-        assert_eq!(candidate_columns(1_200.0), 3);
-        assert_eq!(candidate_columns(800.0), 2);
-        assert_eq!(candidate_columns(600.0), 1);
+    }
+
+    #[test]
+    fn candidate_grid_is_responsive_without_stretching_cards() {
+        let narrow = candidate_grid_layout(600.0, 12);
+        assert_eq!(narrow.columns, 1);
+        assert!(narrow.row_width <= 600.0);
+
+        let compact_desktop = candidate_grid_layout(1_024.0, 12);
+        assert_eq!(compact_desktop.columns, 3);
+        assert!(compact_desktop.row_width <= 1_024.0);
+
+        let desktop = candidate_grid_layout(1_100.0, 12);
+        assert_eq!(desktop.columns, 3);
+        assert!(desktop.card_width <= CANDIDATE_CARD_MAX_WIDTH);
+        assert!(desktop.row_width <= 1_100.0);
+
+        let wide_desktop = candidate_grid_layout(1_440.0, 12);
+        assert_eq!(wide_desktop.columns, 3);
+        assert_eq!(wide_desktop.card_width, CANDIDATE_CARD_MAX_WIDTH);
+        assert!(wide_desktop.row_width < 1_440.0);
+
+        let wide = candidate_grid_layout(1_920.0, 12);
+        assert_eq!(wide.columns, 3);
+        assert_eq!(wide.card_width, CANDIDATE_CARD_MAX_WIDTH);
+        assert!(wide.row_width < 1_920.0);
+    }
+
+    #[test]
+    fn candidate_grid_keeps_small_result_sets_compact_and_overflow_free() {
+        let single = candidate_grid_layout(1_920.0, 1);
+        assert_eq!(single.columns, 1);
+        assert_eq!(single.card_width, CANDIDATE_CARD_MAX_WIDTH);
+        assert!(single.row_width <= 1_920.0);
+
+        let pair = candidate_grid_layout(1_440.0, 2);
+        assert_eq!(pair.columns, 2);
+        assert_eq!(pair.card_width, CANDIDATE_CARD_MAX_WIDTH);
+        assert!(pair.row_width <= 1_440.0);
     }
 }
