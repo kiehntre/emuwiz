@@ -71,6 +71,8 @@ pub mod azahar_command;
 pub mod azahar_execution;
 pub mod cemu_command;
 pub mod cemu_execution;
+pub mod desmume_command;
+pub mod desmume_execution;
 pub mod dolphin_command;
 pub mod dolphin_execution;
 pub mod dosbox_command;
@@ -170,6 +172,14 @@ pub use cemu_execution::{
     CemuLaunchPreflightError, CemuLaunchPreflightErrorKind, CemuLaunchSpawnError,
     CemuPreflightRequest, LaunchedCemuProcess, preflight_and_launch_cemu, preflight_cemu_launch,
     spawn_cemu,
+};
+pub use desmume_command::{
+    DESMUME_SUPPORTED_PLATFORM_ID, DesmumeCommand, DesmumeCommandPlan, DesmumeCommandSelection,
+    build_desmume_command_plan,
+};
+pub use desmume_execution::{
+    DesmumeLaunchPreflightError, DesmumeLaunchPreflightErrorKind, DesmumeLaunchRequest,
+    preflight_desmume_launch, spawn_desmume,
 };
 pub use dolphin_command::{
     DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinCommand, DolphinCommandPlan, DolphinCommandSelection,

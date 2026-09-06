@@ -166,7 +166,7 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     },
     LaunchCompatibility {
         platform_id: "Nintendo DS",
-        standalone_adapters: &["melonds"],
+        standalone_adapters: &["melonds", "desmume"],
         retroarch_core_hints: &["melonds"],
         confidence: MappingConfidence::Exact,
     },

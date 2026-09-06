@@ -236,6 +236,14 @@ pub enum LaunchBlockerKind {
     MelonDsGameKeyMissing,
     /// The melonDS profile/executable binding could not be safely resolved.
     MelonDsBindingUnavailable,
+    /// A command-plan request was given a non-DeSmuME candidate.
+    DesmumeCandidateRequired,
+    /// The canonical identity does not target Nintendo DS.
+    DesmumePlatformMismatch,
+    /// The content is not a direct `.nds` file.
+    DesmumeContentFormatUnsupported,
+    /// The exact DeSmuME executable binding is unavailable.
+    DesmumeBindingUnavailable,
     /// A command-plan request was given a non-mGBA candidate.
     MgbaCandidateRequired,
     /// The canonical identity does not target a supported mGBA platform.

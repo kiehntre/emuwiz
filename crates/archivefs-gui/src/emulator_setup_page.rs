@@ -111,6 +111,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "dolphin" => "Dolphin",
         "flycast" => "Flycast",
         "melonds" => "melonDS",
+        "desmume" => "DeSmuME",
         "hatari" => "Hatari",
         "mgba" => "mGBA",
         "mesen" => "Mesen 2",

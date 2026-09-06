@@ -83,6 +83,12 @@ pub enum DiscoveredStandaloneProfile<'a> {
     MelonDs {
         profile: &'a MelonDsProfile,
     },
+    /// A discovered native DeSmuME profile. V1 has no external firmware
+    /// requirement: upstream defaults to HLE unless a user explicitly opts
+    /// into external BIOS/firmware paths, which EmuWiz never supplies.
+    Desmume {
+        profile: &'a crate::patch_manager::DesmumeProfile,
+    },
     Mgba {
         profile: &'a crate::patch_manager::MgbaProfile,
     },
@@ -260,6 +266,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn melonds(profile: &'a MelonDsProfile) -> Self {
         Self::MelonDs { profile }
+    }
+
+    pub fn desmume(profile: &'a crate::patch_manager::DesmumeProfile) -> Self {
+        Self::Desmume { profile }
     }
 
     pub fn mgba(profile: &'a crate::patch_manager::MgbaProfile) -> Self {
@@ -449,6 +459,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
                     firmware,
+                })
+            }
+            DiscoveredStandaloneProfile::Desmume { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "Nintendo DS") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "desmume",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
                 })
             }
             DiscoveredStandaloneProfile::Mgba { profile }
