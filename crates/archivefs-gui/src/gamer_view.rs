@@ -1064,7 +1064,7 @@ pub(crate) fn show_gamer_details_panel(
 
     widgets::section_header(ui, "GAME DETAILS", None);
     widgets::hero_card(ui, |ui| {
-        if ui.available_width() >= 700.0 {
+        if ui.available_width() >= DETAILS_HERO_HORIZONTAL_MIN_WIDTH {
             ui.horizontal_top(|ui| {
                 show_featured_cover(
                     ui,
@@ -1270,6 +1270,12 @@ fn details_cover_box(real_cover: bool) -> egui::Vec2 {
     crate::gamer_artwork::featured_cover_box(300.0, 390.0, real_cover)
         .unwrap_or_else(|| egui::vec2(220.0, 286.0))
 }
+
+/// Below this width the hero keeps the cover and metadata in a compact
+/// vertical flow.  The previous 700px cutoff still put the large poster-sized
+/// cover beside the details at a 900px desktop window, crowding the useful
+/// metadata and actions.
+pub(crate) const DETAILS_HERO_HORIZONTAL_MIN_WIDTH: f32 = 980.0;
 
 fn details_hero_subtitle(platform: &str, release_year: Option<u16>, format: &str) -> String {
     let year = release_year.map(|year| year.to_string());
@@ -1699,6 +1705,7 @@ mod game_metadata_enrichment_tests {
         assert!(real.y >= 300.0);
         assert!(real.x / real.y > 0.6 && real.x / real.y < 0.8);
         assert!(real.y > fallback.y);
+        assert!(DETAILS_HERO_HORIZONTAL_MIN_WIDTH > 900.0);
     }
 
     #[test]
