@@ -15,8 +15,8 @@ pre-release versioning convention.
 | --- | --- | --- |
 | AppImage | Existing, supported | [`docs/APPIMAGE_PACKAGING.md`](APPIMAGE_PACKAGING.md) |
 | Tarball + `install.sh` | Existing, supported | repository root `install.sh` |
-| DEB (Debian/Ubuntu) | New in this lane (V2) | `packaging/debian/build-deb.sh` |
-| RPM (Fedora/Nobara) | New in this lane (V2) | `packaging/rpm/build-rpm.sh` |
+| DEB (Debian/Ubuntu) | Packaging correct; blocked on an upstream compile error (V3) | `packaging/debian/build-deb.sh` |
+| RPM (Fedora/Nobara) | Packaging correct; blocked on the same upstream compile error (V3) | `packaging/rpm/build-rpm.sh` |
 | Flatpak | **Deferred** | see below |
 
 ### Flatpak status
@@ -96,25 +96,28 @@ packaging-only lane never silently reinterprets an upstream version bump.
 ## Runtime dependencies
 
 Audited against actual `Command::new(...)` call sites in `crates/*/src`
-(`ratarmount`, `fusermount`/`fusermount3`, `7z`, `rar`, `xdg-open`) and the
+(`ratarmount`, `fusermount`/`fusermount3`, `7z`, `rar`, `xdg-open`), the
 `diagnostics` module's own doctor-check categorisation (`ratarmount` /
 "unmount tool" is a `Configuration`-category check, i.e. EmuWiz **starts and
-runs without it**, self-diagnoses its absence, and degrades the
-archive-mount feature gracefully - it is not a hard startup requirement).
+runs without it**), and **real package-availability queries** run inside
+disposable `ubuntu:24.04`/`fedora:41` containers (packaging QA V3 -
+`apt-cache policy`/`apt-cache search` and `dnf list --available`, not
+guessed):
 
-| Tool | DEB | RPM | Why |
+| Tool | DEB name (confirmed) | RPM name (confirmed) | Why |
 | --- | --- | --- | --- |
-| `ratarmount` | Recommends | Recommends | Read-only archive mounting - a core *feature*, not a startup requirement. |
-| `fuse3` (`fusermount3`) | Recommends | Recommends | `ratarmount`'s mount backend. |
-| `7zip` \| `p7zip-full` (DEB) / `p7zip` + `p7zip-plugins` (RPM) | Recommends | Recommends | 7z archive support. Debian/Ubuntu 24.04+ ships the `7zip` package (upstream `p7zip` is unmaintained); `p7zip-full` is offered as an alternative for older suites. Fedora's current package name is unverified against live repo metadata from this host (see Task B2 caveat below) - confirm with `dnf` on a real Fedora/Nobara host before a production build. |
-| `unrar` | Suggests | Suggests | RAR read support; non-free, genuinely optional. |
-| `xdg-utils` (`xdg-open`) | Recommends | Recommends | Opening files/links via the desktop environment; not required to start. |
+| `ratarmount` | **not packaged** (Suggests only) | **not packaged** (Suggests only) | Confirmed absent from both Ubuntu 24.04's apt repos (`apt-cache search ratarmount` -> zero hits) and Fedora 41's dnf repos (`dnf list --available ratarmount` -> "No matching packages"). It is pip-installable (`pip3 install ratarmount`) - `python3-pip` is listed in `Recommends` on both formats as the practical path, since a `Recommends`/`Suggests` on a name apt/dnf can never resolve is misleading metadata even though it doesn't break the install. Read-only archive mounting is a core *feature*, not a startup requirement (see doctor-check note above), so this stays non-blocking either way. |
+| `fuse3` | `fuse3` | `fuse3` | Confirmed present, exact name, both distros. `ratarmount`'s mount backend. |
+| 7z support | `7zip` \| `p7zip-full` | `p7zip` + `p7zip-plugins` | Confirmed: Ubuntu 24.04's `p7zip-full` is now a transitional dummy package pulling in `7zip` (real successor, in `universe`); Fedora 41 has **not** made that switch and only ships `p7zip`/`p7zip-plugins` (`7zip` itself: "No matching packages" on `dnf`). DEB and RPM correctly differ here. |
+| `unrar` | Suggests | Suggests | Confirmed present on both (Ubuntu `1:7.0.7-1build1`, Fedora `0.3.1-1.fc41`); optional, non-free-adjacent, genuinely a "suggest". |
+| `xdg-utils` | `xdg-utils` | `xdg-utils` | Confirmed present, exact name, both distros. Opening files/links via the desktop environment; not required to start. |
 
 Nothing here is a hard `Depends:`/`Requires:` beyond what `dh_shlibdeps` /
 RPM's automatic ELF dependency generator adds for the binaries themselves
 (`${shlibs:Depends}`, `${misc:Depends}` on DEB; RPM's find-requires on the
-spec side) - **not yet verified against a real completed build** on this
-host (see Blockers).
+spec side) - **still not verified against a completed build** (see
+Blockers: the workspace does not currently compile from a clean checkout,
+independent of packaging).
 
 ## DEB packaging
 
@@ -190,93 +193,181 @@ production route: before a real Fedora/COPR submission, switch `%build` to
 - `bash -n` on `packaging/debian/build-deb.sh` and `packaging/rpm/build-rpm.sh`: **pass**.
 - `shellcheck`: not installed on this host; not run. No script uses anything shellcheck commonly flags (unquoted globs, word-splitting-sensitive expansions); re-run before a production release if available.
 
-## Package builds performed / deferred
+## Package builds: real containerised attempts (packaging QA V3)
 
-A real `packaging/debian/build-deb.sh` run was attempted on this host
-(Ubuntu 24.04) and correctly reached `dpkg-checkbuilddeps` before stopping:
+Real builds were run in disposable, network-pulled `ubuntu:24.04` and
+`fedora:41` containers (never against the host - `docker run --rm`, repo
+bind-mounted `:ro`, output bound to `dist/packages/`). **No package was
+installed on the authoring host at any point.**
 
-```
-dpkg-checkbuilddeps: error: Unmet build dependencies: debhelper-compat (= 13) cargo rustc (>= 1.75) libgl1-mesa-dev libxkbcommon-x11-dev
-```
+### Toolchain finding: distro `cargo`/`rustc` are too old
 
-This host's `cargo`/`rustc` are rustup-managed, not apt packages, and
-`debhelper` plus the X11/GL dev headers are not installed. **Not installed
-by this lane** (no sudo was run). To actually produce a `.deb`:
+This workspace's `rust-toolchain.toml` pins **`1.97.1`**. Real attempts with
+each distro's own packaged compiler failed **before** reaching application
+code:
 
-```sh
-sudo apt-get install debhelper dpkg-dev cargo rustc pkg-config \
-  libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-  libx11-dev libxrandr-dev libxi-dev libxcursor-dev
-CARGO_BUILD_JOBS=2 packaging/debian/build-deb.sh
-```
+- Ubuntu 24.04 apt `rustc 1.75.0` -> `crates/archivefs-core/Cargo.toml`
+  fails to parse: `feature 'edition2024' is required` (stabilised in
+  rustc 1.85, newer than 1.75).
+- Fedora 41 dnf `cargo 1.91.1` (Fedora actively backports Rust, so this
+  *did* clear the edition2024 floor) -> still fails:
+  `crates/archivefs-gui/Cargo.toml:25: newlines are unsupported in inline
+  tables` - a Cargo.toml syntax the workspace uses that even a fairly
+  recent 1.91 toolchain's TOML parser rejects.
 
-`rpmbuild` is not installed on this Ubuntu host at all (expected - it is not
-a Fedora system); a real RPM build must run on a Fedora/Nobara host or
-container:
+Both `Build-Depends`/`BuildRequires` on `cargo`/`rustc` were **removed**
+from `packaging/debian/control` and `packaging/rpm/emuwiz.spec` as a direct
+result (a real evidence-based fix, not a guess) - listing
+`rustc (>= 1.75)` was actively misleading, since a build root that
+satisfies it can still fail. The exact reproduction commands below install
+the pinned `1.97.1` via rustup instead.
 
-```sh
-sudo dnf install rpm-build rust cargo gcc pkgconf-pkg-config \
-  mesa-libGL-devel libxkbcommon-devel libxkbcommon-x11-devel \
-  wayland-devel libX11-devel libXrandr-devel libXi-devel libXcursor-devel \
-  desktop-file-utils appstream
-CARGO_BUILD_JOBS=2 packaging/rpm/build-rpm.sh
-```
-
-Once either build succeeds, validate with:
+### Debian/Ubuntu real build
 
 ```sh
-dpkg-deb --info dist/emuwiz_0.8.1~alpha-1_amd64.deb
-dpkg-deb --contents dist/emuwiz_0.8.1~alpha-1_amd64.deb
-lintian dist/emuwiz_0.8.1~alpha-1_amd64.deb        # if installed
-
-rpm -qpl dist/emuwiz-0.8.1-0.1.alpha*.rpm
-rpmlint dist/emuwiz-0.8.1-0.1.alpha*.rpm            # if installed
+docker run --rm \
+  -v "$PWD:/repo:ro" -v "$PWD/dist/packages:/out" ubuntu:24.04 bash -c '
+    set -euo pipefail
+    apt-get update -q
+    apt-get install -y -q --no-install-recommends \
+      git build-essential debhelper dpkg-dev pkg-config fakeroot curl \
+      libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+      libx11-dev libxrandr-dev libxi-dev libxcursor-dev ca-certificates \
+      desktop-file-utils appstream
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+    . "$HOME/.cargo/env"
+    git config --global --add safe.directory /repo
+    cd /repo
+    CARGO_BUILD_JOBS=2 bash packaging/debian/build-deb.sh --output-dir /out'
 ```
 
-## Disposable install QA (deferred)
+With the pinned toolchain, `dpkg-checkbuilddeps` passed cleanly and a real
+`cargo build --release` ran (confirmed compiling `archivefs-core`, `eframe`,
+`egui_glow`, etc.) - see the actual blocker below for why it did not finish.
 
-Docker is available on this host; Podman is not. A real `.deb`/`.rpm` was
-not produced in this pass (see above), so container install QA has nothing
-to install yet. Once a package exists, run (never against the host package
-database):
+### Fedora/Nobara real build
 
 ```sh
-# Debian/Ubuntu
-docker run --rm -v "$PWD/dist:/dist:ro" ubuntu:24.04 bash -c '
-  apt-get update -q && apt-get install -y /dist/emuwiz_*_amd64.deb &&
+docker run --rm \
+  -v "$PWD:/repo:ro" -v "$PWD/dist/packages:/out" fedora:41 bash -c '
+    set -euo pipefail
+    dnf install -y -q \
+      rpm-build rpmdevtools git gcc gcc-c++ pkgconf-pkg-config \
+      mesa-libGL-devel libxkbcommon-devel libxkbcommon-x11-devel \
+      wayland-devel libX11-devel libXrandr-devel libXi-devel libXcursor-devel \
+      desktop-file-utils appstream ca-certificates curl
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+    . "$HOME/.cargo/env"
+    git config --global --add safe.directory /repo
+    cd /repo
+    CARGO_BUILD_JOBS=2 bash packaging/rpm/build-rpm.sh --output-dir /out'
+```
+
+Same result: with the pinned toolchain and the `cargo`/`rust`
+`BuildRequires` removed, `rpmbuild`'s dependency check passed and a real
+`cargo build --release` ran to the same point as the DEB build.
+
+*(A real, in-container bug was also found and fixed during this: the
+spec's `%build` set `CARGO_BUILD_JOBS=%{_smp_mflags}`, which expands to a
+make(1)-style flag like `-j2`, not the bare integer Cargo expects - so the
+`:-2` fallback silently never applied. Fixed to
+`export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"`.)*
+
+### Actual blocker: a pre-existing compile error at HEAD (not a packaging bug)
+
+Both real builds reached and began compiling `archivefs-gui`, then failed
+identically on:
+
+```
+error[E0027]: pattern does not mention field `status`
+   --> crates/archivefs-gui/src/onframe_install_state.rs:121:13
+121 |         let Self::AwaitingConfirmation { binding } = self else {
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing field `status`
+```
+
+This is **not uncommitted working-tree drift** - it reproduces from
+`git archive HEAD` (a clean checkout of the committed tree), i.e. the
+workspace does not currently build `cargo build --release -p archivefs-gui`
+from a fresh clone at all, independent of packaging. It was introduced in
+`a967b14 refactor(gui): add Dolphin OnFrame install workflow state` and is
+inside `crates/archivefs-gui/src/onframe_install_state.rs`, a GUI/cheat
+workflow file this packaging-QA lane is explicitly not permitted to touch.
+**No `.deb`/`.rpm` was produced.** This needs a one-line fix
+(`{ binding, status: _ }` or similar) from whoever owns that file before any
+real package - or any plain `cargo build --release` from a clean checkout -
+can succeed.
+
+## Package inspection / install QA: blocked
+
+Tasks A2/B (DEB inspection, install/uninstall QA) and D2/E (RPM inspection,
+install/uninstall QA) could not run - there is no artifact to inspect or
+install. `dist/packages/` is empty; nothing was faked. Once the blocker
+above is fixed upstream, the exact commands to run are:
+
+```sh
+# DEB inspection + disposable install/uninstall QA
+dpkg-deb --info dist/packages/emuwiz_0.8.1~alpha-1_amd64.deb
+dpkg-deb --contents dist/packages/emuwiz_0.8.1~alpha-1_amd64.deb
+docker run --rm -v "$PWD/dist/packages:/pkgs:ro" ubuntu:24.04 bash -c '
+  apt-get update -q &&
+  apt-get install -y -q binutils &&
+  apt-get install -y /pkgs/emuwiz_*_amd64.deb /pkgs/emuwiz-cli_*_amd64.deb &&
   test -x /usr/bin/emuwiz && test -x /usr/bin/emuwiz-cli &&
-  desktop-file-validate /usr/share/applications/io.github.kiehntre.emuwiz.desktop &&
+  /usr/bin/emuwiz-cli --help &&
+  ldd /usr/bin/emuwiz | grep -qi "not found" && echo MISSING || echo OK &&
+  test -f /usr/share/applications/io.github.kiehntre.emuwiz.desktop &&
+  test -f /usr/share/metainfo/io.github.kiehntre.emuwiz.metainfo.xml &&
+  test -f /usr/share/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png &&
   apt-get remove -y emuwiz emuwiz-cli &&
   ! test -f /usr/bin/emuwiz'
 
-# Fedora
-docker run --rm -v "$PWD/dist:/dist:ro" fedora:latest bash -c '
-  dnf install -y /dist/emuwiz-*.rpm &&
+# RPM inspection + disposable install/uninstall QA
+rpm -qpi dist/packages/emuwiz-0.8.1-0.1.alpha*.rpm
+rpm -qpl dist/packages/emuwiz-0.8.1-0.1.alpha*.rpm
+rpm -qpR dist/packages/emuwiz-0.8.1-0.1.alpha*.rpm
+docker run --rm -v "$PWD/dist/packages:/pkgs:ro" fedora:41 bash -c '
+  dnf install -y /pkgs/emuwiz-0.8.1-*.rpm /pkgs/emuwiz-cli-0.8.1-*.rpm &&
   test -x /usr/bin/emuwiz && test -x /usr/bin/emuwiz-cli &&
+  /usr/bin/emuwiz-cli --help &&
+  ldd /usr/bin/emuwiz | grep -qi "not found" && echo MISSING || echo OK &&
+  test -f /usr/share/applications/io.github.kiehntre.emuwiz.desktop &&
+  test -f /usr/share/metainfo/io.github.kiehntre.emuwiz.metainfo.xml &&
+  test -f /usr/share/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png &&
   dnf remove -y emuwiz emuwiz-cli &&
   ! test -f /usr/bin/emuwiz'
 ```
 
-Both pull a base image over the network the first time; deferred here to
-avoid an unbounded download plus the cargo build inside the container while
-another lane's cargo activity is in progress on this host.
+`lintian`/`rpmlint` remain uninstalled on the authoring host and were not
+run - there is nothing to lint without a built package.
 
-## Known blockers (for the person who runs the real build)
+## Static validation performed (V3)
 
-1. `debhelper` (>= 13), `dpkg-dev`, and the X11/GL/Wayland `-dev` headers are
-   not installed on this authoring host.
-2. `rpmbuild` is not installed on this (Ubuntu) authoring host; needs a
-   Fedora/Nobara host or container.
-3. RPM `%build` currently does a live `cargo build` (crates.io network
-   access) - fine for local/V2 packaging, **not** acceptable for an official
-   Fedora/COPR submission without vendoring (see Source/build model above).
+- `desktop-file-validate` on the rendered `.desktop` file: **pass**.
+- `appstreamcli validate --no-net` on `assets/linux/io.github.kiehntre.emuwiz.metainfo.xml`: **pass** (1 pre-existing pedantic note).
+- `bash -n` on both build scripts: **pass**.
+- `shellcheck`: still not installed on this host; not run.
+- `lintian`/`rpmlint`: not installed; moot without a built package (see above).
+
+## Known blockers
+
+1. **The workspace does not compile at HEAD** - see "Actual blocker" above.
+   This is the sole reason no `.deb`/`.rpm` exists yet; it blocks every
+   packaging format equally, including the already-working AppImage path if
+   rebuilt from current HEAD.
+2. RPM `%build` still does a live `cargo build` (crates.io network access) -
+   fine for local/V2-V3 packaging QA, **not** acceptable for an official
+   Fedora/COPR submission without vendoring (see Source/build model above;
+   unchanged from V2).
+3. Neither distro's packaged `cargo`/`rustc` is new enough to build this
+   workspace (see Toolchain finding above); a real build - local or CI -
+   must provide the pinned `1.97.1` toolchain itself (rustup), on PATH,
+   ahead of `dpkg-buildpackage`/`rpmbuild`. This is now documented rather
+   than silently assumed.
 4. Exact `${shlibs:Depends}` / RPM auto-`Requires` for the GUI's dynamic
-   library needs have not been verified against a completed build on this
-   host - the `Build-Depends`/`BuildRequires` dev-header lists above are the
-   conventional winit/egui/glow set, not yet confirmed by `ldd` on a real
-   `emuwiz` binary. Re-check on the first real build.
-5. Debian's exact `7zip`/`p7zip-full` availability and Fedora's `p7zip` /
-   `p7zip-plugins` package names were not checked against live `apt`/`dnf`
-   repo metadata from this host (Ubuntu 24.04 apt metadata was not queried
-   either, to avoid an unrequested `apt update`). Confirm before relying on
-   `Recommends` resolving cleanly.
+   library needs still cannot be verified until a build actually completes.
+5. `ratarmount` is not an installable package on either distro (see Runtime
+   dependencies) - moved to `Suggests`, `python3-pip` added to
+   `Recommends` as the practical install path. This is now evidence-based,
+   not a caveat.
