@@ -138,3 +138,18 @@ journal, rollback, and recovery machinery. Planning itself performs no
 filesystem mutation, and no OnFrame timing semantics are converted into
 ordinary AR/Gecko semantics. The optional GUI action remains a later lane;
 V11 exposes only the safe core planner/staging/preview seam.
+
+## Dolphin OnFrame source binding
+
+`discover_dolphin_onframe_candidates` reads local Dolphin GameSettings INI files
+without mutation and emits only `[OnFrame]` patches. Action Replay and Gecko
+sections are never reclassified. Each candidate retains its patch title, exact
+operations (or typed unsupported issues), source path, and platform.
+
+`bind_dolphin_onframe_candidate` requires a caller-supplied verified GameCube or
+Wii game ID and Dolphin profile root. It deterministically resolves
+`GameSettings/<GAMEID>.ini`, refuses missing or conflicting identity, and marks
+installability false for mixed/unsupported documents. Title or filename
+matching is never used as identity evidence. This backend bridge supplies the
+inputs required by the future installer GUI; it performs no writes or native
+apply operations.

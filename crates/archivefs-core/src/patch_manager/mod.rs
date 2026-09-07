@@ -49,6 +49,7 @@ mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
 mod dolphin_onframe_install_plan;
+mod dolphin_onframe_source;
 mod dolphin_texture_mod;
 mod dolphin_texture_pack;
 mod duckstation_firmware;
@@ -399,6 +400,7 @@ pub use dolphin_onframe_install_plan::{
     StagedDolphinOnFrameIni, build_dolphin_onframe_install_preview, plan_dolphin_onframe_install,
     stage_dolphin_onframe_install,
 };
+pub use dolphin_onframe_source::{DolphinOnFrameBinding, DolphinOnFrameCandidate, DolphinOnFrameSourceError, bind_dolphin_onframe_candidate, discover_dolphin_onframe_candidates};
 pub use dolphin_texture_mod::{
     DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DolphinTextureModError, DolphinTextureModErrorKind,
     DolphinTextureModIdentity, DolphinTextureModPlan, DolphinTextureModPreviewRequest,
