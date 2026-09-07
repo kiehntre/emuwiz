@@ -31,6 +31,41 @@ pub struct Pc98BootEvidence {
     pub warnings: Vec<String>,
 }
 
+/// Convert only strong, bytes-derived PC-98 evidence into the shared
+/// platform-evidence lineage. Generic FAT and malformed sectors deliberately
+/// return no platform observation.
+pub fn structural_observation(
+    evidence: &Pc98BootEvidence,
+) -> Option<crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation> {
+    if evidence.confidence != Pc98EvidenceConfidence::Strong {
+        return None;
+    }
+    use crate::platform_evidence_fusion::evidence_lineage::{
+        ClaimStrength, ClaimType, EvidenceChannel, EvidenceObservation, IdentityScope,
+        LineageRelation, Provenance, Representation, SourceFamily,
+    };
+    Some(EvidenceObservation {
+        provenance: Provenance {
+            channel: EvidenceChannel::LocalStructural,
+            upstream_source: SourceFamily::Unknown,
+            upstream_version: None,
+            source_artifact: None,
+            imported_at_unix: None,
+            retrieved_at_unix: None,
+            generator_version: None,
+            lineage: LineageRelation::Independent,
+            representation: Representation::StructuralMetadata,
+        },
+        claim: ClaimType::PlatformCandidate,
+        claim_strength: ClaimStrength::Strong,
+        identity_scope: IdentityScope::PlatformIdentity,
+        hash_or_value: None,
+        platform_candidate: Some("PC-98".to_string()),
+        release_candidate: None,
+        notes: Some(evidence.reasons.join("; ")),
+    })
+}
+
 fn le16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes([
         *bytes.get(offset)?,
@@ -158,12 +193,17 @@ mod tests {
     fn nec_bpb_is_strong_pc98_evidence() {
         let e = inspect_pc98_boot_sector(&sector(b"NEC     "));
         assert_eq!(e.confidence, Pc98EvidenceConfidence::Strong);
+        assert_eq!(
+            structural_observation(&e).and_then(|observation| observation.platform_candidate),
+            Some("PC-98".to_string())
+        );
     }
 
     #[test]
     fn generic_fat_stays_generic() {
         let e = inspect_pc98_boot_sector(&sector(b"MSDOS5.0"));
         assert_eq!(e.confidence, Pc98EvidenceConfidence::GenericFat);
+        assert!(structural_observation(&e).is_none());
     }
 
     #[test]

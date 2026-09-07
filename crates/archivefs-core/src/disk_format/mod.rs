@@ -503,6 +503,11 @@ pub struct D88Layout {
     pub validated_track_entries: usize,
     pub declared_sectors: u32,
     pub declared_data_bytes: u64,
+    /// Absolute file offset of the validated logical track 0/head 0/sector 1
+    /// when it is a 512-byte sector.  This is retained solely so callers can
+    /// perform one bounded boot-sector read without reimplementing D88 track
+    /// mapping; `None` is an honest "not available" result.
+    pub boot_sector_offset: Option<u64>,
 }
 
 /// Geometry and header facts declared by an HDI or NHD container.

@@ -138,6 +138,7 @@ fn validate(
     let mut validated = 0usize;
     let mut sectors = 0u32;
     let mut data_bytes = 0u64;
+    let mut boot_sector_offset = None;
     for index in 0..MAX_D88_TRACK_ENTRIES {
         let Some(start) = offsets[index] else {
             continue;
@@ -156,7 +157,11 @@ fn validate(
         if validated >= TRACKS_TO_WALK || start > super::MAX_DISK_FORMAT_OFFSET {
             continue;
         }
-        let (track_sectors, track_bytes) = validate_track(reader, start, end, index, cancel)?;
+        let (track_sectors, track_bytes, track_boot) =
+            validate_track(reader, start, end, index, cancel)?;
+        if boot_sector_offset.is_none() {
+            boot_sector_offset = track_boot;
+        }
         sectors = sectors
             .checked_add(u32::from(track_sectors))
             .ok_or_else(|| malformed("the sector count overflows".to_string()))?;
@@ -182,6 +187,7 @@ fn validate(
             validated_track_entries: validated,
             declared_sectors: sectors,
             declared_data_bytes: data_bytes,
+            boot_sector_offset,
         },
         name,
     ))
@@ -193,11 +199,12 @@ fn validate_track(
     end: u64,
     index: usize,
     cancel: Option<&AtomicBool>,
-) -> Result<(u16, u64), DiskFormatRefusal> {
+) -> Result<(u16, u64, Option<u64>), DiskFormatRefusal> {
     let mut cursor = start;
     let mut expected_count = None;
     let mut data_bytes = 0u64;
     let mut count = 0u16;
+    let mut boot_sector_offset = None;
     while cursor < end {
         if super::cancelled(cancel) {
             return Err(DiskFormatRefusal::Cancelled);
@@ -259,6 +266,9 @@ fn validate_track(
                 "track {index} sector {record} data extends past the track"
             )));
         }
+        if cylinder == 0 && head == 0 && record == 1 && declared_bytes == 512 {
+            boot_sector_offset = Some(header_end);
+        }
         // These fields are intentionally observed rather than interpreted as
         // platform evidence: deleted-data and CRC/status values are disk-level
         // facts and may legally vary between preservation dumps.
@@ -282,7 +292,7 @@ fn validate_track(
             "track {index} sector count does not account for its full extent"
         )));
     }
-    Ok((count, data_bytes))
+    Ok((count, data_bytes, boot_sector_offset))
 }
 
 fn disk_name(bytes: &[u8]) -> Option<String> {

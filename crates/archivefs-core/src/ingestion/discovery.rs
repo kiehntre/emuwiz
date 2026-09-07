@@ -703,13 +703,13 @@ fn discover_direct_file(
         return discover_dsk_image(path, source_root);
     }
     if extension == "d88" {
-        return discover_d88_image(path, source_root);
+        return discover_d88_image(path, source_root, structural_evidence);
     }
     if extension == "crt" {
         return discover_crt_cartridge(path, source_root);
     }
     if matches!(extension.as_str(), "hdi" | "nhd") {
-        return discover_hard_disk_image(path, source_root, &extension);
+        return discover_hard_disk_image(path, source_root, &extension, structural_evidence);
     }
     if extension == "d64" {
         return discover_d64_image(path, source_root);
@@ -1795,9 +1795,14 @@ fn discover_x68000_media(path: &Path, source_root: &Path) -> GameDiscovery {
 }
 
 /// `.d88` is a structurally validated container shared by PC-88, PC-98,
-/// FM Towns and X68000. The parser proves only the container; folder evidence
-/// is still required before discovery can accept a platform assignment.
-fn discover_d88_image(path: &Path, source_root: &Path) -> GameDiscovery {
+/// FM Towns and X68000. A validated NEC FAT boot sector is an additional
+/// bytes-derived PC-98 platform observation; all other D88 cases still require
+/// independent folder/DAT evidence.
+fn discover_d88_image(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
     use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
 
     let evidence = inspect_disk_format(
@@ -1813,6 +1818,49 @@ fn discover_d88_image(path: &Path, source_root: &Path) -> GameDiscovery {
         .unwrap_or_else(|| "D88 disk container".to_string());
     match evidence.format {
         Some(DiskFormat::D88Container) => {
+            if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
+                .and_then(|container| container.boot_sector)
+            {
+                if let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
+                {
+                    structural_evidence.push(DiscoveredStructuralEvidence {
+                        path: path.to_path_buf(),
+                        observation,
+                    });
+                    let identity = identity_for(path, source_root);
+                    let conflicting = identity
+                        .as_ref()
+                        .and_then(|summary| summary.platform.as_deref())
+                        .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
+                    if let Some(platform) = conflicting {
+                        let platform = platform.to_string();
+                        return GameDiscovery {
+                            path: path.to_path_buf(),
+                            container: ContainerKind::DirectFile,
+                            content: Some(ContentKind::ComputerDisk),
+                            platform_hint: None,
+                            identity_candidate: identity,
+                            validation_state: ValidationState::Skipped,
+                            explanation: format!(
+                                "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
+                            ),
+                            skip_reason: Some(SkipReason::AmbiguousPlatform),
+                        };
+                    }
+                    return GameDiscovery {
+                        path: path.to_path_buf(),
+                        container: ContainerKind::DirectFile,
+                        content: Some(ContentKind::ComputerDisk),
+                        platform_hint: Some("PC-98".to_string()),
+                        identity_candidate: identity,
+                        validation_state: ValidationState::Accepted,
+                        explanation: format!(
+                            "Valid D88 container with strong PC-98 boot evidence. {detail}."
+                        ),
+                        skip_reason: None,
+                    };
+                }
+            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary) if summary.platform.is_some() => accepted(
@@ -1915,10 +1963,15 @@ fn discover_crt_cartridge(path: &Path, source_root: &Path) -> GameDiscovery {
     }
 }
 
-/// HDI and NHD headers prove only a coherent hard-disk container. They are
-/// shared image formats, so platform identity still comes from folder/DAT/hash
-/// evidence and never from capacity or the extension.
-fn discover_hard_disk_image(path: &Path, source_root: &Path, extension: &str) -> GameDiscovery {
+/// HDI and NHD headers prove only a coherent hard-disk container. A validated
+/// NEC FAT boot sector at the declared payload start can add PC-98 evidence;
+/// platform identity never comes from capacity or the extension.
+fn discover_hard_disk_image(
+    path: &Path,
+    source_root: &Path,
+    extension: &str,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
     use crate::disk_format::{DiskFormat, DiskFormatContext, inspect_disk_format};
 
     let evidence = inspect_disk_format(
@@ -1939,6 +1992,49 @@ fn discover_hard_disk_image(path: &Path, source_root: &Path, extension: &str) ->
         .unwrap_or_else(|| format!(".{extension} hard-disk container"));
     match evidence.format {
         Some(format) if format == expected => {
+            if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
+                .and_then(|container| container.boot_sector)
+            {
+                if let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
+                {
+                    structural_evidence.push(DiscoveredStructuralEvidence {
+                        path: path.to_path_buf(),
+                        observation,
+                    });
+                    let identity = identity_for(path, source_root);
+                    let conflicting = identity
+                        .as_ref()
+                        .and_then(|summary| summary.platform.as_deref())
+                        .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
+                    if let Some(platform) = conflicting {
+                        let platform = platform.to_string();
+                        return GameDiscovery {
+                            path: path.to_path_buf(),
+                            container: ContainerKind::DirectFile,
+                            content: Some(ContentKind::ComputerDisk),
+                            platform_hint: None,
+                            identity_candidate: identity,
+                            validation_state: ValidationState::Skipped,
+                            explanation: format!(
+                                "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
+                            ),
+                            skip_reason: Some(SkipReason::AmbiguousPlatform),
+                        };
+                    }
+                    return GameDiscovery {
+                        path: path.to_path_buf(),
+                        container: ContainerKind::DirectFile,
+                        content: Some(ContentKind::ComputerDisk),
+                        platform_hint: Some("PC-98".to_string()),
+                        identity_candidate: identity,
+                        validation_state: ValidationState::Accepted,
+                        explanation: format!(
+                            "Valid .{extension} container with strong PC-98 boot evidence. {detail}."
+                        ),
+                        skip_reason: None,
+                    };
+                }
+            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary) if summary.platform.is_some() => accepted(
