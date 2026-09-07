@@ -106,6 +106,7 @@ pub mod mesen_execution;
 pub mod mgba_command;
 pub mod mgba_execution;
 pub mod openmsx_command;
+pub mod openmsx_execution;
 pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;
@@ -332,6 +333,10 @@ pub use mgba_command::{
 pub use mgba_execution::{
     MgbaLaunchPreflightError, MgbaLaunchPreflightErrorKind, MgbaLaunchRequest,
     preflight_mgba_launch, spawn_mgba,
+};
+pub use openmsx_execution::{
+    OpenMsxLaunchExecutionError, OpenMsxLaunchPreflightError, OpenMsxLaunchPreflightErrorKind,
+    OpenMsxLaunchRequest, preflight_and_launch_openmsx, preflight_openmsx_launch, spawn_openmsx,
 };
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,
