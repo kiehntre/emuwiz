@@ -16,9 +16,16 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+/// Bounded gzip decompression of `.adz` (compressed Amiga floppy) containers,
+/// projected through the existing ADF parser - no new filesystem, no new
+/// ADF parsing.
+pub mod amiga_adz;
 /// Shared, read-only CD32/CDTV platform, machine, firmware, and media evidence.
 pub mod amiga_cd_evidence;
 pub mod amiga_disk;
+/// Bounded WHDLoad `.slave` discovery inside LHA/LZH archives, reusing the
+/// existing archive-member reader and WHDLoad slave parser.
+pub mod amiga_whdload_archive;
 /// Bounded, read-only Apple II disk structural evidence.
 pub mod apple2_disk;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the

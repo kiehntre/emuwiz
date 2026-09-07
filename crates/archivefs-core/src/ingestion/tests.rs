@@ -972,6 +972,203 @@ fn hdf_discovery_is_unchanged_by_the_adf_structural_wiring() {
     );
 }
 
+// --- Amiga archive-member WHDLoad + ADZ discovery -----------------------
+//
+// Hand-built exactly like `dat::archive::lha`'s own test fixture (a real,
+// minimal, stored/`-lh0-` LHA a genuine 7-Zip can list and extract).
+
+fn lha_entry(name: &str, payload: &[u8]) -> Vec<u8> {
+    let header_size = name.len() + 23;
+    let mut bytes = vec![header_size as u8, 0];
+    bytes.extend_from_slice(b"-lh0-");
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.push(0x20);
+    bytes.push(0);
+    bytes.push(name.len() as u8);
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&lha_crc16(payload).to_le_bytes());
+    bytes.push(0);
+    bytes[1] = bytes[2..]
+        .iter()
+        .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn stored_lha(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (name, payload) in entries {
+        bytes.extend(lha_entry(name, payload));
+    }
+    bytes.push(0);
+    bytes
+}
+
+fn lha_crc16(bytes: &[u8]) -> u16 {
+    let mut crc = 0_u16;
+    for byte in bytes {
+        crc ^= u16::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xa001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+fn lha_backend_available() -> bool {
+    crate::dat::archive::lha::LhaProvider::discover(std::time::Duration::from_secs(10)).is_ok()
+}
+
+#[test]
+fn lha_with_one_valid_slave_is_discovered_as_amiga_whdload_archive() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-one-slave");
+    std::fs::write(
+        dir.path().join("Turrican II.lha"),
+        stored_lha(&[("Game/Turrican2.Slave", &minimal_whdload_slave())]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(item.explanation.contains("Turrican2.Slave"), "{}", item.explanation);
+    assert_eq!(report.structural_evidence.len(), 1);
+    assert_eq!(
+        report.structural_evidence[0]
+            .observation
+            .platform_candidate
+            .as_deref(),
+        Some("Amiga")
+    );
+}
+
+#[test]
+fn lha_with_two_valid_slaves_is_ambiguous_never_auto_picked() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-two-slaves");
+    std::fs::write(
+        dir.path().join("Bundle.lha"),
+        stored_lha(&[
+            ("GameA/GameA.Slave", &minimal_whdload_slave()),
+            ("GameB/GameB.Slave", &minimal_whdload_slave()),
+        ]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(item.explanation.contains("ambiguous"), "{}", item.explanation);
+    assert!(item.explanation.contains("2 candidate"), "{}", item.explanation);
+    // Both candidates surface as structural evidence - neither is dropped.
+    assert_eq!(report.structural_evidence.len(), 2);
+}
+
+#[test]
+fn lha_with_no_slave_is_not_claimed_as_whdload() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-no-slave");
+    std::fs::write(
+        dir.path().join("Docs.lha"),
+        stored_lha(&[("Readme.txt", b"just docs")]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.platform_hint, None);
+    assert!(
+        report.structural_evidence.is_empty(),
+        "no valid slave means no Amiga structural evidence"
+    );
+}
+
+#[test]
+fn lha_with_traversal_slave_name_is_refused_not_extracted() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lha-traversal");
+    std::fs::write(
+        dir.path().join("evil.lha"),
+        stored_lha(&[("../evil.slave", &minimal_whdload_slave())]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(
+        item.platform_hint, None,
+        "an unsafe member path must never become Amiga platform evidence"
+    );
+    assert!(report.structural_evidence.is_empty());
+}
+
+#[test]
+fn lzh_extension_is_inspected_the_same_way_as_lha() {
+    if !lha_backend_available() {
+        return;
+    }
+    let dir = source_dir("lzh-one-slave");
+    std::fs::write(
+        dir.path().join("Game.lzh"),
+        stored_lha(&[("Game.Slave", &minimal_whdload_slave())]),
+    )
+    .unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+}
+
+#[test]
+fn adz_with_valid_gzipped_adf_is_discovered_as_amiga_image() {
+    let dir = source_dir("adz-valid");
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &minimal_flat_adf(0, b"PuzzleDisk")).unwrap();
+    std::fs::write(dir.path().join("Puzzle Game.adz"), encoder.finish().unwrap()).unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.content, Some(ContentKind::AmigaImage));
+    assert_eq!(item.validation_state, ValidationState::Accepted);
+    assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert!(item.explanation.contains("OFS"), "{}", item.explanation);
+    assert_eq!(report.structural_evidence.len(), 1);
+}
+
+#[test]
+fn adz_that_is_not_gzip_is_refused_not_guessed() {
+    let dir = source_dir("adz-not-gzip");
+    std::fs::write(dir.path().join("fake.adz"), b"not actually gzip at all").unwrap();
+
+    let report = discover_source(dir.path()).unwrap();
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(matches!(item.skip_reason, Some(SkipReason::InvalidContent(_))));
+    assert!(report.structural_evidence.is_empty());
+}
+
 /// Every extension the content registry recognises must actually be
 /// picked up end-to-end by discovery when placed as a loose file - keeps
 /// the registry table and the discovery wiring from silently drifting

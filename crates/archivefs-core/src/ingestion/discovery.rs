@@ -687,8 +687,14 @@ fn discover_direct_file(
     if extension == "adf" {
         return discover_amiga_floppy(path, source_root, structural_evidence);
     }
+    if extension == "adz" {
+        return discover_amiga_adz_floppy(path, source_root, structural_evidence);
+    }
     if matches!(extension.as_str(), "hdf" | "hdfx") {
         return discover_ambiguous_disk_image(path, source_root);
+    }
+    if matches!(extension.as_str(), "lha" | "lzh") {
+        return discover_whdload_archive(path, source_root, structural_evidence);
     }
     if matches!(extension.as_str(), "z80" | "sna" | "szx") {
         return discover_spectrum_snapshot(path, source_root);
@@ -1336,6 +1342,207 @@ fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> Ga
         reason,
         explanation,
     )
+}
+
+/// `.adz` is a gzip-wrapped Amiga floppy image - not a new filesystem or a
+/// new disk format (see [`crate::amiga_adz`]'s own module docs). This
+/// bounded-decompresses the container and reuses exactly the same
+/// [`structural_amiga_floppy_observation`] path [`discover_amiga_floppy`]
+/// uses for a raw `.adf` - the platform hint and structural evidence come
+/// from the decompressed AmigaDOS structure, never from the `.adz`
+/// extension alone.
+fn discover_amiga_adz_floppy(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
+    match crate::amiga_adz::inspect_adz(path) {
+        Ok(inspection) => {
+            let observation = structural_amiga_floppy_observation(&inspection.floppy);
+            let platform_hint = observation.platform_candidate.clone();
+            structural_evidence.push(DiscoveredStructuralEvidence {
+                path: path.to_path_buf(),
+                observation,
+            });
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::AmigaImage),
+                platform_hint,
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation: format!(
+                    "Compressed Amiga floppy image (.adz, {} decompressed bytes): {}",
+                    inspection.decompressed_bytes,
+                    amiga_floppy_explanation(&inspection.floppy)
+                ),
+                skip_reason: None,
+            }
+        }
+        Err(error) => {
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary)
+                    if summary
+                        .platform
+                        .as_deref()
+                        .is_some_and(|platform| platform != "Amiga") =>
+                {
+                    accepted(
+                        path.to_path_buf(),
+                        ContainerKind::DirectFile,
+                        ContentKind::ComputerDisk,
+                        identity,
+                        "Disk image (.adz did not verify as a compressed Amiga floppy, but \
+                         the platform is otherwise identified)."
+                            .to_string(),
+                    )
+                }
+                _ => skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::AmigaImage),
+                    SkipReason::InvalidContent(error.to_string()),
+                    format!(
+                        "This file is named .adz but its contents did not verify as a \
+                         compressed Amiga floppy image: {error}."
+                    ),
+                ),
+            }
+        }
+    }
+}
+
+/// `.lha`/`.lzh` are not registered as [`ContainerKind::Archive`] (LHA has
+/// no in-process decoder - see [`crate::dat::archive::lha`]'s own docs), so
+/// they reach `discover_direct_file` like `.adf`/`.rdb` do. Finding a file
+/// merely *named* `.slave` inside is never enough: only bytes that pass the
+/// existing [`crate::identity_source::whdload::parse_whdload_slave`] become
+/// a candidate (see [`crate::amiga_whdload_archive`]). No archive filename
+/// is ever treated as game identity, and no candidate is ever auto-picked
+/// when more than one validates - see that module's own contract.
+fn discover_whdload_archive(
+    path: &Path,
+    source_root: &Path,
+    structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+) -> GameDiscovery {
+    use crate::amiga_whdload_archive::{WhdloadArchiveError, discover_whdload_slaves_in_archive};
+    use std::sync::atomic::AtomicBool;
+
+    let cancel = AtomicBool::new(false);
+    match discover_whdload_slaves_in_archive(path, &cancel) {
+        Ok(discovery) if !discovery.candidates.is_empty() => {
+            for candidate in &discovery.candidates {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation: crate::identity_source::whdload::structural_slave_observation(
+                        &candidate.artifact,
+                    ),
+                });
+            }
+            let mut explanation = if discovery.candidates.len() == 1 {
+                format!(
+                    "WHDLoad archive ({}; verified WHDLoad slave runtime v{}).",
+                    discovery.candidates[0].member_path,
+                    discovery.candidates[0].artifact.parsed.runtime_version
+                )
+            } else {
+                format!(
+                    "WHDLoad archive ({} candidate .slave files: {}) - ambiguous, EmuWiz did \
+                     not pick one automatically.",
+                    discovery.candidates.len(),
+                    discovery
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.member_path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            if !discovery.diagnostics.is_empty() {
+                explanation.push_str(&format!(
+                    " {} other .slave-named member(s) did not verify and were ignored.",
+                    discovery.diagnostics.len()
+                ));
+            }
+            // Built manually, like `discover_amiga_floppy`: the platform
+            // hint must come from the verified slave structure (`Amiga`),
+            // never from `identity_for`'s own weak folder/filename guess -
+            // a bare `.lha` in an unaliased folder has no such guess to
+            // give, and one must never be needed here.
+            GameDiscovery {
+                path: path.to_path_buf(),
+                container: ContainerKind::DirectFile,
+                content: Some(ContentKind::AmigaImage),
+                platform_hint: Some("Amiga".to_string()),
+                identity_candidate: identity_for(path, source_root),
+                validation_state: ValidationState::Accepted,
+                explanation,
+                skip_reason: None,
+            }
+        }
+        Ok(discovery) => {
+            // No `.slave` validated - not WHDLoad. Never claim the Amiga
+            // platform from the `.lha`/`.lzh` extension alone; fall back to
+            // whatever independent identity evidence already exists.
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::Archive,
+                    identity,
+                    "LHA/LZH archive (no verified WHDLoad .slave found; not claimed as Amiga \
+                     content from the extension alone)."
+                        .to_string(),
+                ),
+                _ => skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::Archive),
+                    SkipReason::RecognizedContentNoIdentityMatch,
+                    format!(
+                        "This LHA/LZH archive has {} member(s) but none is a verified WHDLoad \
+                         .slave.",
+                        discovery.total_members
+                    ),
+                ),
+            }
+        }
+        Err(WhdloadArchiveError::BackendUnavailable) => {
+            // A missing optional local backend, not a corrupt/non-WHDLoad
+            // archive - fail soft, never claim or refuse either way.
+            let identity = identity_for(path, source_root);
+            match &identity {
+                Some(summary) if summary.platform.is_some() => accepted(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    ContentKind::Archive,
+                    identity,
+                    "LHA/LZH archive - member listing was unavailable (no local 7-Zip with an \
+                     LHA/LZH decoder was found), so EmuWiz preserves the archive without \
+                     guessing its contents."
+                        .to_string(),
+                ),
+                _ => skipped(
+                    path.to_path_buf(),
+                    ContainerKind::DirectFile,
+                    Some(ContentKind::Archive),
+                    SkipReason::RecognizedContentNoIdentityMatch,
+                    "This LHA/LZH archive could not be inspected for a WHDLoad .slave: no \
+                     local 7-Zip with an LHA/LZH decoder was found."
+                        .to_string(),
+                ),
+            }
+        }
+        Err(WhdloadArchiveError::Open { detail }) => skipped(
+            path.to_path_buf(),
+            ContainerKind::DirectFile,
+            Some(ContentKind::Archive),
+            SkipReason::InvalidContent(detail.clone()),
+            format!("This LHA/LZH archive could not be read: {detail}."),
+        ),
+    }
 }
 
 /// `.z80` / `.sna` / `.szx` are ZX Spectrum machine snapshots. The category

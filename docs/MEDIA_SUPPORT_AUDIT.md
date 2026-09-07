@@ -85,11 +85,11 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Atari ST | ST/STA raw FAT12 | YES | YES | PLAUSIBLE | PARTIAL | YES | YES | SUMMARY | YES | PARTIAL | 4 | `disk_format/atari_st` | geometry tests | platform identity ambiguity |
 | Atari ST | MSA | YES | YES | FAMILY | YES | YES | YES | SUMMARY | YES | YES | 4 | `disk_format` | disk tests | fuller sector inspection |
 | Atari ST | STX/Pasti | YES | YES | YES | YES | NO | YES | SUMMARY | NO | NO | 4 | `disk_format/atari_stx` | Pasti bounds tests | preservation semantics |
-| Amiga | ADF/ADZ | YES | YES | YES | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `amiga_disk`, `discovery` | ADF discovery tests | ADZ decompression path |
+| Amiga | ADF/ADZ | YES | YES | YES | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `amiga_disk`, `amiga_adz`, `discovery` | ADF discovery tests, ADZ decompression tests | none material for ADF; ADZ launch-input wiring remains ADF-only |
 | Amiga | HDF/RDB | YES | YES | YES | YES | YES | TOSEC | SUMMARY | YES | PARTIAL | 5 | `amiga_disk`, HDF traversal | HDF tests | richer filesystem/launch |
 | Amiga | DMS/IPF/HFE/SCP | EXT | NO | NO | NO | NO | TOSEC | NO | NO | NO | 1 | research docs | NO TEST COVERAGE FOUND | parsers and preservation model |
-| Amiga | WHDLoad directory/package | YES | YES | YES | YES | YES | TOSEC/WHDLoad | SUMMARY | PROJECT | YES | 6 | `identity_source/whdload`, `amiga_whdload_local` | slave/discovery/launch projection tests | no Amiga command executor; archive-member slave inspection |
-| Amiga | LHA/LZH | YES | LIST | NO | NO | MEMBERS | TOSEC | SUMMARY | NO | NO | 3 | archive inspector, `dat/archive/lha` | archive tests | extraction/embedded slave path |
+| Amiga | WHDLoad directory/package | YES | YES | YES | YES | YES | TOSEC/WHDLoad | SUMMARY | PROJECT | YES | 6 | `identity_source/whdload`, `amiga_whdload_local`, `amiga_whdload_archive` | slave/discovery/launch projection tests, archive-member slave tests | no Amiga command executor |
+| Amiga | LHA/LZH | YES | LIST | NO | SLAVE | MEMBERS | TOSEC | SUMMARY | NO | NO | 4 | archive inspector, `dat/archive/lha`, `amiga_whdload_archive` | archive tests, WHDLoad archive-member tests | exact DAT-hash identity for archive-embedded slaves; extraction of non-slave content |
 | Amiga | CD32/CDTV optical | YES | ISO | FAMILY | PARTIAL | YES | REDUMP | SUMMARY | PARTIAL | PARTIAL | 3 | shared optical stack | generic optical tests | Amiga-specific boot evidence |
 | Commodore | C64/C128 D64/D71/D81/G64/CRT | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `disk_format/d64`, CRT | disk-format tests | G64/NIB preservation depth |
 | Commodore | C64/T64/TAP | YES | YES | YES | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `commodore_tape`, `tape_analysis` | tape tests | custom waveform remains generic |
@@ -146,6 +146,11 @@ Verified in the current tree and/or local history (local authority wins):
   profile inspection, and Kickstart readiness (`20de545`, `bfda17c`,
   `423b839`, `7b3376c`).
 - ADF/HDF Amiga image inspection and bounded filesystem work.
+- Bounded ADZ (gzip-wrapped ADF) decompression reusing the existing ADF
+  parser unchanged (`amiga_adz`), and bounded WHDLoad `.slave` discovery
+  inside LHA/LZH archives reusing the existing archive-member reader and
+  slave parser, never auto-picking between multiple valid candidates
+  (`amiga_whdload_archive`).
 - Atari STX/Pasti, Acorn DFS, D64, DSK, D88, HDI/NHD, XDF/DIM and other disk
   structural parsers listed in `disk_format`.
 - LaserDisc set/framefile verification (`laserdisc_set`, `f892e15`).
@@ -182,24 +187,21 @@ specified but entirely absent. Existing safety gates should not be weakened.
 4. **Broader UEF/CAS semantics.** The bounded ordinary UEF/CAS bridge is
    implemented; bit-level UEF chunks, richer CAS variants, and turbo/custom
    loader semantics remain out of scope.
-5. **Amiga archive-member WHDLoad inspection and ADZ decompression.** Current
-   discovery expects extracted directories/files; LHA listing is not WHDLoad
-   semantic inspection.
-6. **LaserDisc frame/media metadata.** Set coherence is implemented, but no
+5. **LaserDisc frame/media metadata.** Set coherence is implemented, but no
    bounded ffprobe integration, exact frame-count/rate validation, or Singe
    script parser exists.
-7. **Raw preservation formats.** IPF, SCP/flux, NIB/WOZ and subchannel/weak-bit
+6. **Raw preservation formats.** IPF, SCP/flux, NIB/WOZ and subchannel/weak-bit
    semantics are not implemented beyond selected detection/registry evidence.
 
 ### P3
 
-8. **GUI detail parity for structural media.** Tape has a detailed page; most
+7. **GUI detail parity for structural media.** Tape has a detailed page; most
    disk/optical/CHD/CD-i/LaserDisc facts are backend-only or compact summaries.
-9. **Modern/less common containers.** WUD/WUX, NRG, MDS/MDF, CCD/SUB, IMD/TD0,
+8. **Modern/less common containers.** WUD/WUX, NRG, MDS/MDF, CCD/SUB, IMD/TD0,
    DMF, and similar variants have no safe dedicated readers.
-10. **Broader real-corpus validation.** Several families have synthetic tests
-    only; the coverage inventory records this honestly rather than upgrading
-    maturity from code presence alone.
+9. **Broader real-corpus validation.** Several families have synthetic tests
+   only; the coverage inventory records this honestly rather than upgrading
+   maturity from code presence alone.
 
 ## Launch/readiness and GUI conclusions
 
@@ -259,11 +261,9 @@ same branches as intentionally deferred or superseded.
    semantics and existing tape-analysis handoff are specified.
 5. **[P2] Extend LaserDisc verification with bounded media metadata and frame
    range checks**, retaining unknown results for variable-frame-rate assets.
-6. **[P2] Add archive-member WHDLoad/ADZ inspection** without implicit
-   extraction or unsafe decompression.
-7. **[P2] Add Atari STX/IPF/flux preservation evidence** only with documented
+6. **[P2] Add Atari STX/IPF/flux preservation evidence** only with documented
    weak-bit/intentional-error semantics.
-8. **[P3] Surface backend disk/optical/CD-i/LaserDisc evidence in GUI details**
+7. **[P3] Surface backend disk/optical/CD-i/LaserDisc evidence in GUI details**
    without creating a configuration editor or repair workflow.
 
 ## Audit boundaries and safety

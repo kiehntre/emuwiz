@@ -148,6 +148,13 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("adz", ContentKind::AmigaImage),
     cf("rdb", ContentKind::AmigaImage),
     cf("lha", ContentKind::AmigaImage),
+    // `.lzh` is the same LHA archive format under its other common
+    // extension (`dat::archive::lha`'s own `LhaProvider` treats both
+    // interchangeably); registered for the same weak-fallback reasons as
+    // `.lha` above - real classification happens in
+    // `super::discovery::discover_whdload_archive`, never from this
+    // extension mapping alone.
+    cf("lzh", ContentKind::AmigaImage),
     // --- Computer formats already supported elsewhere in EmuWiz ---
     cf("dsk", ContentKind::ComputerDisk),
     cf("d64", ContentKind::ComputerDisk),

@@ -336,6 +336,16 @@ impl ArchiveMemberSource for LhaArchiveSource {
     }
 }
 
+/// One archive member's name and declared logical size - enough for a
+/// caller (e.g. WHDLoad archive-member inspection) to decide which member(s)
+/// to bounded-read, without exposing the crate-private [`LhaMember`]
+/// representation.
+#[derive(Debug, Clone, Copy)]
+pub struct LhaMemberInfo<'a> {
+    pub path: &'a str,
+    pub logical_size: u64,
+}
+
 impl LhaArchiveSource {
     fn outer_identity_unchanged(&self) -> bool {
         std::fs::metadata(&self.archive_path)
@@ -344,6 +354,60 @@ impl LhaArchiveSource {
                 metadata.len() == self.opened_len
                     && metadata.modified().ok() == self.opened_modified
             })
+    }
+
+    /// Every member's name and declared logical size, in the same
+    /// deterministic order `verify_all` uses. Read-only metadata already
+    /// collected by [`LhaProvider::open`]'s listing pass - this never
+    /// re-lists or re-opens the archive.
+    pub fn member_infos(&self) -> impl Iterator<Item = LhaMemberInfo<'_>> {
+        self.members.iter().map(|member| LhaMemberInfo {
+            path: &member.path,
+            logical_size: member.logical_size,
+        })
+    }
+
+    /// Bounded, read-only extraction of exactly one member's bytes into
+    /// memory - never to disk, and never more than `max_bytes`. Reuses the
+    /// same fd-pinned `/proc/self/fd` stdout-streaming extraction
+    /// `verify_all`'s hashing path already uses ([`extract_args`] /
+    /// [`run_supervised`]); this simply collects the streamed bytes instead
+    /// of hashing them. An unsafe (traversal/absolute) member path or a
+    /// member whose declared size exceeds `max_bytes` is refused before the
+    /// backend is ever invoked - this is the same [`safe_member_name`] check
+    /// `verify_all` applies to every member.
+    pub fn read_member(
+        &self,
+        path: &str,
+        max_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<u8>, LhaError> {
+        let member = self
+            .members
+            .iter()
+            .find(|member| member.path == path)
+            .ok_or_else(|| LhaError::Unsupported {
+                detail: format!("no such archive member: {path}"),
+            })?;
+        if !safe_member_name(&member.path) {
+            return Err(LhaError::Unsupported {
+                detail: format!("unsafe member path: {}", member.path),
+            });
+        }
+        if member.logical_size > max_bytes {
+            return Err(LhaError::RefusedLimits {
+                reason: "member size",
+            });
+        }
+        read_member_bytes(
+            &self.executable,
+            self.process_limits,
+            &self.file,
+            &member.path,
+            member.logical_size,
+            self.timeout,
+            cancel,
+        )
     }
 }
 
@@ -505,6 +569,69 @@ fn hash_member(
         });
     }
     Ok(hasher.finish())
+}
+
+/// Bounded stdout-streaming extraction of one member's exact bytes into
+/// memory, mirroring [`hash_member`] above but collecting a buffer instead
+/// of a running hash. `declared_size` is trusted only as an upper bound
+/// enforced twice: once as the supervisor's own `max_stdout` ceiling, and
+/// again per-chunk against the running `received` total, exactly as
+/// `hash_member` does - a member cannot make this read more than its own
+/// declared size, whatever the backend actually emits.
+fn read_member_bytes(
+    executable: &Path,
+    limits: ProcessLimits,
+    file: &File,
+    path: &str,
+    declared_size: u64,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, LhaError> {
+    let fd = file.as_raw_fd();
+    let mut command = Command::new(executable);
+    command.args(extract_args(fd, path));
+    let mut buffer = Vec::with_capacity(declared_size as usize);
+    let mut received = 0_u64;
+    let outcome = run_supervised(
+        command,
+        limits,
+        timeout,
+        declared_size,
+        |chunk| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".to_string());
+            }
+            received = received
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| "member byte count overflow".to_string())?;
+            if received > declared_size {
+                return Err("member output exceeds declared size".to_string());
+            }
+            buffer.extend_from_slice(chunk);
+            Ok(())
+        },
+        Some(pin_fd_pre_exec(fd)),
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(ProcessError::Sink { detail }) if detail == "cancelled" => {
+            return Err(LhaError::Cancelled);
+        }
+        Err(error) => return Err(process_error(error)),
+    };
+    if !outcome.status.success() {
+        return Err(LhaError::BackendFailure {
+            status: outcome.status.code(),
+            detail: String::from_utf8_lossy(&outcome.stderr).into_owned(),
+        });
+    }
+    if received != declared_size {
+        return Err(LhaError::SizeMismatch {
+            declared: declared_size,
+            received,
+        });
+    }
+    Ok(buffer)
 }
 
 fn run_listing(

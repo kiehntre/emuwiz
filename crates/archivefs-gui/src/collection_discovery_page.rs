@@ -916,6 +916,55 @@ mod tests {
         }
     }
 
+    /// AMIGA ARCHIVE-MEMBER WHDLOAD + ADZ INSPECTION V1: this panel needs
+    /// no dedicated code for the new evidence - `discover_whdload_archive`/
+    /// `discover_amiga_adz_floppy` (`ingestion::discovery`) both produce an
+    /// ordinary [`GameDiscovery`] with the same, already-handled
+    /// `content: Some(ContentKind::AmigaImage)` /
+    /// `platform_hint: Some("Amiga")` shape `.adf` discovery has always
+    /// used, so `human_item_kind`/`content_label` already render it
+    /// correctly (see this task's own Task J: "verify it" rather than add
+    /// a separate Amiga package page).
+    #[test]
+    fn whdload_archive_and_adz_discoveries_render_as_amiga_image_with_no_new_gui_code() {
+        let whdload_archive_item = GameDiscovery {
+            path: PathBuf::from("Turrican II.lha"),
+            container: archivefs_core::ingestion::ContainerKind::DirectFile,
+            content: Some(ContentKind::AmigaImage),
+            platform_hint: Some("Amiga".to_string()),
+            identity_candidate: None,
+            validation_state: ValidationState::Accepted,
+            explanation: "WHDLoad archive (Game/Turrican2.Slave; verified WHDLoad slave \
+                          runtime v20)."
+                .to_string(),
+            skip_reason: None,
+        };
+        assert_eq!(human_item_kind(&whdload_archive_item), "Amiga Amiga image");
+
+        let adz_item = GameDiscovery {
+            path: PathBuf::from("Puzzle Game.adz"),
+            content: Some(ContentKind::AmigaImage),
+            platform_hint: Some("Amiga".to_string()),
+            explanation: "Compressed Amiga floppy image (.adz, 65536 decompressed bytes)."
+                .to_string(),
+            ..whdload_archive_item
+        };
+        assert_eq!(human_item_kind(&adz_item), "Amiga Amiga image");
+
+        // No-slave-found LHA falls back to the plain `Archive` kind, never
+        // an Amiga platform claim from the extension alone.
+        let unverified_lha_item = GameDiscovery {
+            path: PathBuf::from("Docs.lha"),
+            content: Some(ContentKind::Archive),
+            platform_hint: None,
+            explanation: "LHA/LZH archive (no verified WHDLoad .slave found; not claimed as \
+                          Amiga content from the extension alone)."
+                .to_string(),
+            ..adz_item
+        };
+        assert_eq!(human_item_kind(&unverified_lha_item), "Archive");
+    }
+
     #[test]
     fn format_count_groups_digits_into_thousands() {
         assert_eq!(format_count(0), "0");
