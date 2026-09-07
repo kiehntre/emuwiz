@@ -14,19 +14,19 @@ use std::fmt;
 use std::path::Path;
 
 use md5::Md5;
-use sha1::Sha1;
 use sha1::digest::Digest;
+use sha1::Sha1;
 
 use crate::chd_identity::{
-    CdromTrackFact, ChdMetadataFact, ChdMetadataOutcome, GdromTrackFact,
-    needs_specialist_optical_backend, observe_chd_identity_file,
+    needs_specialist_optical_backend, observe_chd_identity_file, CdromTrackFact, ChdMetadataFact,
+    ChdMetadataOutcome, GdromTrackFact,
 };
 use crate::chd_logical_media::open_chd_track_logical_media_file;
 use crate::dat::model::DatChecksum;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
 use crate::optical_fingerprint::{
-    OpticalFingerprintComparison, compare_optical_fingerprints, fingerprint_chd,
-    fingerprint_cue_bin,
+    compare_optical_fingerprints, fingerprint_chd, fingerprint_cue_bin,
+    OpticalFingerprintComparison,
 };
 
 /// Fixed memory bound for logical hashing.  CHD hunks are separately bounded
@@ -232,7 +232,9 @@ fn compare_track(
         reasons.push("subchannel state differs".into());
     }
 
-    let Some(actual_hashes) = &observed.hashes else {
+    // Copy the small hash bundle out before moving `observed` into the
+    // result.  Keeping a borrow of a field here would prevent that move.
+    let Some(actual_hashes) = observed.hashes.clone() else {
         let unsupported_reason = observed.unsupported_reason.clone();
         let unsupported = unsupported_reason.is_some();
         return TrackVerification {
