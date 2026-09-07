@@ -71,7 +71,8 @@ use archivefs_core::dat::rename_apply::{
     rollback_transaction,
 };
 use archivefs_core::dat::rename_plan::{
-    ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
+    PortabilityAssessment, PortabilityTarget, ProposalState, RenamePlan, RenamePlanContext,
+    ReviewDecision, assess_component, build_rename_plan,
 };
 use archivefs_core::dat::sources::audit_run::{
     CombinedDatAuditRequest, CombinedDatAuditSource, DatAuditOutcome, DatAuditProgress,
@@ -846,6 +847,40 @@ pub(crate) struct RenamePlanView {
     pub(crate) error: Option<String>,
 }
 
+fn portability_target_label(target: PortabilityTarget) -> &'static str {
+    match target {
+        PortabilityTarget::Linux => "Linux",
+        PortabilityTarget::WindowsNtfs => "Windows / NTFS",
+        PortabilityTarget::FatExfat => "FAT / exFAT",
+    }
+}
+
+fn portability_target_help(target: PortabilityTarget) -> &'static str {
+    match target {
+        PortabilityTarget::Linux => "Native Linux naming rules.",
+        PortabilityTarget::WindowsNtfs => {
+            "Avoids Windows-forbidden characters, reserved names, trailing dots/spaces, and case-insensitive collisions."
+        }
+        PortabilityTarget::FatExfat => {
+            "Portable naming suitable for FAT/exFAT-style destinations and case-insensitive filesystems."
+        }
+    }
+}
+
+fn portability_assessment_for_plan(
+    plan: &RenamePlanView,
+    target: PortabilityTarget,
+) -> (usize, Vec<PortabilityAssessment>) {
+    let assessments: Vec<PortabilityAssessment> = plan
+        .rows
+        .iter()
+        .filter_map(|row| row.proposed_basename.as_deref())
+        .map(|name| assess_component(name, target))
+        .filter(|assessment| !assessment.is_portable())
+        .collect();
+    (assessments.len(), assessments)
+}
+
 /// One plan row, ready to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenamePlanRowView {
@@ -1594,6 +1629,12 @@ pub(crate) fn rename_plan_page_bounds(total: usize, page: usize) -> (usize, usiz
 /// the global preferences by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatSourcesPageAction {
+    /// Selects the destination naming profile for the read-only rename plan.
+    /// Changing it invalidates the current preview so apply can never use a
+    /// plan reviewed under a different target.
+    SetPortabilityTarget {
+        target: PortabilityTarget,
+    },
     AddFile {
         path: PathBuf,
     },
@@ -3466,6 +3507,15 @@ impl DatSourcesPageState {
         }
         match action {
             DatSourcesPageAction::AddFile { path } => self.add(path, DatSourceKind::File),
+            DatSourcesPageAction::SetPortabilityTarget { .. } => {
+                self.rename_plan = None;
+                self.rename_plan_error = Some(
+                    "Destination profile changed; run Verify again to rebuild the preview."
+                        .to_string(),
+                );
+                self.review_decisions.clear();
+                self.abandon_apply_work();
+            }
             DatSourcesPageAction::AddWHDLoadDat { path } => self.add_whdload_catalogue(path),
             DatSourcesPageAction::OpenNoIntroDownloadPage => {
                 self.no_intro_action_error = open_no_intro_download_page();
@@ -6989,6 +7039,9 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// something whose difference from disk defines the unsaved-change state.
 #[derive(Default)]
 pub(crate) struct DatSourcesPageUi {
+    /// Session-local destination naming profile for rename previews. Linux is
+    /// the implicit default so existing users retain their current behaviour.
+    pub(crate) portability_target: Option<PortabilityTarget>,
     pub(crate) catalogue_picker: DatCataloguePickerState,
     pub(crate) selected_catalogue: Option<CatalogueRef>,
     pub(crate) open_catalogue_picker: bool,
@@ -11840,6 +11893,9 @@ fn show_rename_plan_section(
     ui_state: &mut DatSourcesPageUi,
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
+    let target = ui_state
+        .portability_target
+        .unwrap_or(PortabilityTarget::Linux);
     ui.add_space(10.0);
     widgets::section_header(ui, "Rename planning", None);
 
@@ -11851,6 +11907,51 @@ fn show_rename_plan_section(
     );
 
     widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Destination naming profile").strong());
+            for candidate in [
+                PortabilityTarget::Linux,
+                PortabilityTarget::WindowsNtfs,
+                PortabilityTarget::FatExfat,
+            ] {
+                let selected = target == candidate;
+                if ui
+                    .selectable_label(selected, portability_target_label(candidate))
+                    .on_hover_text(portability_target_help(candidate))
+                    .clicked()
+                {
+                    ui_state.portability_target = Some(candidate);
+                    action = Some(DatSourcesPageAction::SetPortabilityTarget { target: candidate });
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(portability_target_help(target))
+                .color(theme::muted(ui))
+                .small(),
+        );
+        let (portability_changes, _) = portability_assessment_for_plan(plan, target);
+        if portability_changes > 0 {
+            widgets::banner(
+                ui,
+                "Portability review",
+                &format!(
+                    "{portability_changes} name(s) require portability changes for {}.",
+                    portability_target_label(target)
+                ),
+                widgets::StatusTone::Warning,
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "All proposed names are portable for {}.",
+                    portability_target_label(target)
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
+        ui.add_space(6.0);
         ui.label(
             egui::RichText::new(format!(
                 "Source '{}' · {} · {} of {} audited files verified",

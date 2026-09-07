@@ -3967,8 +3967,58 @@ fn an_audit_result_shows_the_policy_preferred_candidate_for_multi_candidate_file
 // ---------------------------------------------------------------------------
 
 use archivefs_core::dat::rename_plan::{
-    ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, ReviewDecision, SourceObjectKind,
+    PortabilityTarget, ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, ReviewDecision,
+    SourceObjectKind,
 };
+
+#[test]
+fn destination_portability_profile_defaults_to_linux_and_exposes_all_choices() {
+    let ui_state = DatSourcesPageUi::default();
+    let target = ui_state
+        .portability_target
+        .unwrap_or(PortabilityTarget::Linux);
+    assert_eq!(target, PortabilityTarget::Linux);
+    assert_eq!(portability_target_label(PortabilityTarget::Linux), "Linux");
+    assert_eq!(
+        portability_target_label(PortabilityTarget::WindowsNtfs),
+        "Windows / NTFS"
+    );
+    assert_eq!(
+        portability_target_label(PortabilityTarget::FatExfat),
+        "FAT / exFAT"
+    );
+}
+
+#[test]
+fn changing_destination_profile_invalidates_the_existing_preview() {
+    let (_fixture, mut page) = page_with_plan(vec![plan_proposal(
+        "/roms/game.bin",
+        "game.bin",
+        Some("Game.bin"),
+        ProposalState::Suggested,
+    )]);
+    assert!(page.rename_plan.is_some());
+    page.apply(DatSourcesPageAction::SetPortabilityTarget {
+        target: PortabilityTarget::WindowsNtfs,
+    });
+    assert!(page.rename_plan.is_none());
+    assert!(page.apply_review.is_none());
+}
+
+#[test]
+fn portability_warning_summary_delegates_name_checks_to_core() {
+    let (_fixture, page) = page_with_plan(vec![plan_proposal(
+        "/roms/con.bin",
+        "con.bin",
+        Some("CON?.bin"),
+        ProposalState::Suggested,
+    )]);
+    let view = page.view().rename_plan.expect("rename plan");
+    let (changes, assessments) =
+        portability_assessment_for_plan(&view, PortabilityTarget::WindowsNtfs);
+    assert_eq!(changes, 1);
+    assert!(!assessments[0].is_portable());
+}
 
 fn plan_proposal(
     source: &str,
