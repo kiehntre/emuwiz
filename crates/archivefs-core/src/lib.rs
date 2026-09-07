@@ -25,6 +25,8 @@ pub mod amiga_disk;
 pub mod app_dirs;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
+/// Bounded MSX standard cassette WAV evidence.
+pub mod msx_tape;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation

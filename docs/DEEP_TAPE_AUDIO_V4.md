@@ -205,6 +205,17 @@ family label. Future V11 research may evaluate families only with such evidence;
 V10 emits no commercial loader names. Spectrum and C64 custom paths remain
 independent, and no emulator execution, DAT change, extraction, rename, or
 copyrighted fixture is involved.
+
+## V13: MSX standard cassette WAV evidence
+
+V13 adds a narrow MSX BIOS-cassette observer on the shared PCM edge stream.
+Standard 1200-baud FSK uses approximately 1200 Hz for zero and 2400 Hz for
+one, with an MSX header marker (`1f a6 de ba cc 13 7d 74`) required before a
+record is surfaced. Generic KCS/BBC/Spectrum/C64/CPC-like tones therefore do
+not become MSX merely by frequency coincidence. The result is bounded,
+read-only, confidence-bearing metadata; MSX CAS is a separate decoded-byte
+container and has no parser in the current repository. Turbo loaders and named
+families remain deferred to V14.
 ## V11: BBC Micro standard cassette WAV evidence
 
 V11 adds a conservative BBC Micro/Acorn standard-cassette projection on the
