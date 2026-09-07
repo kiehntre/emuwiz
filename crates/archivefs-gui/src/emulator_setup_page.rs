@@ -124,6 +124,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "stella" => "Stella",
         "vice" => "VICE",
         "openmsx" => "openMSX",
+        "fuse" => "Fuse",
         _ => "Supported emulator",
     }
 }

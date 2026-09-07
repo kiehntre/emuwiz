@@ -90,6 +90,7 @@ pub mod fbneo_command;
 pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
+pub mod fuse_command;
 pub mod fsuae_command;
 pub mod fsuae_execution;
 pub mod hatari_command;
@@ -263,6 +264,10 @@ pub use flycast_execution::{
     FlycastLaunchPreflightError, FlycastLaunchPreflightErrorKind, FlycastLaunchRequest,
     FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
     preflight_flycast_launch, spawn_flycast,
+};
+pub use fuse_command::{
+    FUSE_SUPPORTED_PLATFORM_ID, FuseCommand, FuseCommandPlan, FuseCommandSelection,
+    build_fuse_command_plan,
 };
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,

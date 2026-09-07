@@ -273,6 +273,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
+        platform_id: "ZX Spectrum",
+        standalone_adapters: &["fuse"],
+        retroarch_core_hints: &["fuse"],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "Atari5200",
         standalone_adapters: &[],
         retroarch_core_hints: &["a5200"],
@@ -553,6 +559,14 @@ mod tests {
         // core hint is unchanged and does not collapse into the standalone
         // adapter list.
         assert_eq!(entry.retroarch_core_hints, &["stella"]);
+    }
+
+    #[test]
+    fn zx_spectrum_maps_to_fuse_exactly() {
+        let entry = launch_compatibility_for_platform("ZX Spectrum").unwrap();
+        assert_eq!(entry.standalone_adapters, &["fuse"]);
+        assert!(platforms_for_standalone_adapter("fuse").contains(&"ZX Spectrum"));
+        assert_eq!(entry.confidence, MappingConfidence::Exact);
     }
 
     #[test]

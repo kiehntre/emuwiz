@@ -141,6 +141,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     OpenMsx {
         profile: &'a crate::patch_manager::OpenMsxProfile,
     },
+    Fuse {
+        profile: &'a crate::patch_manager::FuseProfile,
+    },
     /// A discovered native ScummVM binding. The verified engine:game ID is
     /// projected from identity facts; the binding itself is revalidated by
     /// ScummVM preflight before execution.
@@ -318,6 +321,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn openmsx(profile: &'a crate::patch_manager::OpenMsxProfile) -> Self {
         Self::OpenMsx { profile }
+    }
+
+    pub fn fuse(profile: &'a crate::patch_manager::FuseProfile) -> Self {
+        Self::Fuse { profile }
     }
 
     pub fn scummvm(binding: &'a ScummVmNativeLaunchBinding, eligible: bool) -> Self {
@@ -588,6 +595,18 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     adapter_id: "openmsx",
                     profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.executable.path.clone()),
+                    eligible: profile.eligible,
+                    firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Fuse { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "ZX Spectrum") =>
+            {
+                Some(StandaloneProfileInput {
+                    adapter_id: "fuse",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.executable.clone()),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
                 })

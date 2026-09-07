@@ -2104,6 +2104,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "fsuae" => Some("FS-UAE"),
             "dolphin" => Some("Dolphin"),
             "scummvm" => Some("ScummVM"),
+            "fuse" => Some("Fuse"),
             _ => None,
         },
         LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),

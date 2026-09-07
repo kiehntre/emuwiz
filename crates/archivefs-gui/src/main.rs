@@ -7192,6 +7192,23 @@ impl ArchiveFsApp {
                 .chain(amiga_whdload_profiles)
                 .collect();
 
+        // Fuse is a narrow, read-only ZX Spectrum adapter.  Discovery is
+        // additive: no executable means no Fuse candidate, and the generic
+        // planner still requires an independently resolved ZX Spectrum
+        // identity plus a supported direct content path.
+        let fuse_roots =
+            archivefs_core::patch_manager::FuseProfileDiscoveryRoots::from_environment();
+        let fuse_discovery = archivefs_core::patch_manager::discover_fuse_profiles(&fuse_roots);
+        standalone_profiles.extend(fuse_discovery.profiles.iter().map(|profile| {
+            archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "fuse",
+                profile_id: profile.profile_id.clone(),
+                profile_path: Some(profile.executable.clone()),
+                eligible: profile.eligible,
+                firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            }
+        }));
+
         // The remaining native adapters are additive inputs to the same
         // shared planner. Discovery and inspection are kept read-only and
         // bounded by their existing adapters; this block does not rebuild a

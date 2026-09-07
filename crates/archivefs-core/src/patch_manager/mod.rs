@@ -57,6 +57,7 @@ mod duckstation_local;
 mod emulator_profile_memory;
 mod emulator_request_bridge;
 mod flycast_local;
+mod fuse_local;
 mod gamehacking_browser_import;
 mod gamehacking_catalogue;
 mod gamehacking_gamecube_install_plan;
@@ -462,6 +463,12 @@ pub use flycast_local::{
     FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
     FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
     inspect_flycast_game, parse_flycast_version, resolve_flycast_native_launch_binding,
+};
+pub use fuse_local::{
+    FUSE_MAX_PROFILES, FUSE_NATIVE_BINARY_NAMES, FuseExecutable, FuseInstallationType,
+    FuseLaunchBlocker, FuseLaunchBlockerKind, FuseNativeLaunchBinding, FuseProfile,
+    FuseProfileDiscovery, FuseProfileDiscoveryRoots, discover_fuse_profiles,
+    resolve_fuse_native_launch_binding,
 };
 pub use gamehacking_browser_import::{
     BROWSER_IMPORT_PARSER_SCHEMA_VERSION, BROWSER_IMPORT_PROVENANCE_SCHEMA_VERSION,
