@@ -1058,3 +1058,7 @@ pub mod evidence_lineage;
 /// header's combined SHA-1 and an already-indexed MAMERedump disk declaration;
 /// it deliberately has no track-SHA1-to-CHD crosswalk.
 pub mod mame_redump_bridge;
+
+/// Explicit Normal/Full/Targeted scan policy for reusing current ancillary
+/// classifications without hiding or dropping files.
+pub mod scan_scope;
