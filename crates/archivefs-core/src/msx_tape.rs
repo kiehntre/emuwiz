@@ -29,6 +29,10 @@ pub struct MsxRecoveredFile {
     pub integrity: MsxIntegrity,
     pub confidence: RecoveryConfidence,
     pub warnings: Vec<String>,
+    pub marker_sample_start: u64,
+    pub marker_sample_end: u64,
+    pub marker_time_start_s: f64,
+    pub marker_time_end_s: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,10 +63,11 @@ pub fn decode_msx_wav(bytes: &[u8]) -> Result<MsxWavRecovery, WavError> {
         .map(|w| w[1].micros.saturating_sub(w[0].micros))
         .collect();
     let mut symbols = Vec::new();
+    let mut cell_start = 0usize;
     let mut elapsed = 0;
     let mut fast = 0;
     let mut slow = 0;
-    for p in intervals.iter().copied() {
+    for (interval_index, p) in intervals.iter().copied().enumerate() {
         if p == 0 || p > 2_000 {
             elapsed = 0;
             fast = 0;
@@ -76,28 +81,37 @@ pub fn decode_msx_wav(bytes: &[u8]) -> Result<MsxWavRecovery, WavError> {
         }
         elapsed += p;
         if elapsed >= BIT_US {
-            symbols.push(fast >= slow);
+            let start = audio.edges.get(cell_start).map(|e| e.sample).unwrap_or(0);
+            let end = audio
+                .edges
+                .get(interval_index + 1)
+                .map(|e| e.sample)
+                .unwrap_or(start);
+            symbols.push((fast >= slow, start, end));
+            cell_start = interval_index + 1;
             elapsed = 0;
             fast = 0;
             slow = 0;
         }
     }
     let mut out = Vec::new();
+    let mut spans = Vec::new();
     let mut i = 0;
     while i + 9 < symbols.len() && out.len() < MAX_BYTES {
-        if symbols[i] {
+        if symbols[i].0 {
             i += 1;
             continue;
         }
         let mut v = 0u8;
-        let mut ok = symbols[i + 9];
+        let ok = symbols[i + 9].0;
         for bit in 0..8 {
-            if symbols[i + 1 + bit] {
+            if symbols[i + 1 + bit].0 {
                 v |= 1 << bit;
             }
         }
         if ok {
             out.push(v);
+            spans.push((symbols[i].1, symbols[i + 9].2));
             i += 10;
         } else {
             i += 1;
@@ -125,17 +139,27 @@ pub fn decode_msx_wav(bytes: &[u8]) -> Result<MsxWavRecovery, WavError> {
             .ok()
             .map(|s| s.trim_matches('\0').trim().to_owned())
             .filter(|s| !s.is_empty());
+        let (marker_sample_start, marker_sample_end) = spans.get(at).copied().unwrap_or((0, 0));
+        let file_end = spans
+            .get((header + 7).min(spans.len().saturating_sub(1)))
+            .map(|s| s.1)
+            .unwrap_or(marker_sample_end);
         files.push(MsxRecoveredFile {
             filename,
             file_type: None,
             payload_length: 0,
-            start_sample: 0,
-            end_sample: 0,
-            start_micros: 0,
-            end_micros: 0,
+            start_sample: marker_sample_start,
+            end_sample: file_end,
+            start_micros: marker_sample_start.saturating_mul(1_000_000)
+                / audio.spec.sample_rate as u64,
+            end_micros: file_end.saturating_mul(1_000_000) / audio.spec.sample_rate as u64,
             integrity: MsxIntegrity::Valid,
             confidence: RecoveryConfidence::Medium,
             warnings: Vec::new(),
+            marker_sample_start,
+            marker_sample_end,
+            marker_time_start_s: marker_sample_start as f64 / audio.spec.sample_rate as f64,
+            marker_time_end_s: marker_sample_end as f64 / audio.spec.sample_rate as f64,
         });
         cursor = header + 7;
     }
@@ -165,10 +189,26 @@ pub fn decode_msx_custom_wav(bytes: &[u8]) -> Result<MsxCustomWavRecovery, WavEr
         });
     }
     let generic = crate::tape_audio::decode_custom_wav(bytes)?;
-    // V13 does not retain per-file end offsets, so the generic pass is kept
-    // bounded and treated as post-anchor evidence rather than exact slicing.
-    let stages: Vec<_> = generic.stages.into_iter().take(64).collect();
-    let blocks: Vec<_> = generic.blocks.into_iter().take(256).collect();
+    let anchor_end_sample = standard
+        .files
+        .iter()
+        .map(|f| f.end_sample)
+        .max()
+        .unwrap_or(0);
+    let anchor_end =
+        anchor_end_sample.saturating_mul(1_000_000) / standard.audio.spec.sample_rate as u64;
+    let stages: Vec<_> = generic
+        .stages
+        .into_iter()
+        .filter(|s| s.start_micros >= anchor_end)
+        .take(64)
+        .collect();
+    let blocks: Vec<_> = generic
+        .blocks
+        .into_iter()
+        .filter(|b| b.start_micros >= anchor_end)
+        .take(256)
+        .collect();
     let loader_class = if stages.len() > 1 {
         "MultiStage"
     } else if stages

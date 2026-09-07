@@ -259,3 +259,11 @@ normalized fingerprints and ambiguity preservation. Because V13 does not yet
 retain exact per-file waveform boundaries, this first hook treats the bounded
 post-anchor pass as evidence rather than claiming exact stage slicing. Named
 MSX loaders and CAS timing fingerprints remain deferred.
+
+## V15: MSX anchor provenance
+
+V15 retains decoded-cell sample/time spans for each recovered MSX marker and
+standard file region. Custom analysis now starts at the last trustworthy
+standard end boundary, avoiding broad whole-recording rescans and keeping
+standard evidence out of custom-stage fingerprints. If no valid standard file
+exists, no custom anchor is produced. CAS remains out of scope.
