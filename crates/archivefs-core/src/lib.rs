@@ -224,6 +224,8 @@ pub mod raw_cd_sector;
 
 /// Narrow, representation-independent optical-disc fingerprinting seam.
 pub mod optical_fingerprint;
+/// Conservative PC-98 boot-sector and FAT evidence.
+pub mod pc98_boot_evidence;
 /// A [`logical_media::LogicalMedia`] adapter over a plain, file-backed
 /// raw-sector optical image (`.bin`-style: a bare stream of 2352-byte CD
 /// sectors) - cooks physical raw sectors down to the conventional

@@ -29,6 +29,10 @@ The authoritative tree has:
 - `platform/mod.rs`: canonical `NEC PC-8801`, `PC-98`, legacy `NEC PC-9801`, `Sharp X68000`, and `FM Towns` records. FM Towns has shared optical/floppy extensions only; no family-specific detector is registered.
 - `content_registry.rs`: D88/HDI/NHD/XDF/DIM are `ComputerDisk` content extensions. This is content routing, not platform proof.
 - `coverage_inventory.rs`: X68000 XDF/DIM are synthetic-validated; no real specimen is recorded as validated in this workspace.
+- `pc98_boot_evidence.rs`: bounded logical 512-byte BPB inspection. A coherent
+  FAT BPB with an `NEC` OEM marker is reported as strong PC-98 evidence;
+  generic FAT remains explicitly generic. This is an evidence primitive, not a
+  replacement D88/HDI/NHD parser or an exact software identifier.
 
 The existing media ledger correctly calls this area partial: structural format support exists, while PC-98/X68000 filesystem evidence and launch remain gaps (`docs/MEDIA_SUPPORT_AUDIT.md`). The older specialized branch `feature/x68000-xdf-dim-evidence` (commits `988b1ad`/`a821845`) is now represented in the authority; it is useful archaeology, not a reason to add a second implementation.
 
@@ -77,7 +81,9 @@ PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is 
 ## Exact gaps
 
 1. There is no bounded sector/filesystem reader for PC-98/PC-88 (including FAT variants and non-filesystem/protected disks).
-2. There is no PC-98 IPL/boot-sector evidence bridge, and `fdi`, `hdm`, `hd5`, `hd4`, and related raw variants are not structurally distinguished in the current disk layer.
+2. The reusable PC-98 BPB evidence primitive exists, but D88/HDI/NHD sector
+   access is not yet wired to it and `fdi`, `hdm`, `hd5`, `hd4`, and related raw
+   variants are not structurally distinguished in the current disk layer.
 3. There is no Human68k partition/FAT/18.3-directory reader for X68000 HDD/floppy payloads; current XDF validation stops at IPL/BPB shape.
 4. There is no FM Towns IPL4/TownsOS boot detector or Towns-specific optical/system-volume evidence bridge.
 5. No Japanese-family DAT/hash normalisation bridge turns a validated disk plus a known catalogue into exact software identity.
@@ -85,7 +91,10 @@ PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is 
 
 ## Recommended implementation order
 
-1. **Read-only PC-98 evidence bridge:** bounded sector access and conservative BPB/PC-98 IPL observations for D88/FDI/HDM/HDI/NHD payloads. Keep “filesystem observed” separate from “PC-98 proven”; require two independent clues before assigning a machine.
+1. **Wire PC-98 evidence to existing containers:** provide bounded sector
+   access from D88/HDI/NHD into `pc98_boot_evidence`, keeping “filesystem
+   observed” separate from “PC-98 proven” and requiring independent
+   corroboration.
 2. **X68000 Human68k evidence:** inspect the already validated XDF/DIM payload for IPL, partition marker, BPB, and bounded root entries; add equivalent HDD evidence only after real specimens and a collision corpus are available.
 3. **FM Towns boot/optical bridge:** research and test `IPL4`/TownsOS evidence across floppy, CD and HDD paths; do not infer Towns from ISO, D88, or geometry alone.
 4. After those bridges, add DAT/hash identity and launch-profile wiring. Exact software identity should remain DAT/hash-driven even when platform evidence is strong.

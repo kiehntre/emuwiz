@@ -100,7 +100,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Apple II | 2MG | YES | YES | FAMILY | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | PARTIAL | 3 | `apple2_disk` | bounded header/range tests | recursive payload identity |
 | Apple II | WOZ/NIB | YES | YES | NO | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | NO | 3 | `apple2_disk` | signature/map/geometry tests | flux/GCR interpretation |
 | Macintosh | DC42/HFV/SIT | YES | PARTIAL | FAMILY | PARTIAL | NO | TOSEC | SUMMARY | NO | NO | 3 | `disk_format/dc42`, registry | DC42 tests | HFS/SIT depth |
-| Japanese PCs | D88/HDI/NHD/XDF/DIM | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | PARTIAL | PARTIAL | 4 | `disk_format/d88/hdi/x68000` | disk-format tests | PC-98/X68000 filesystem and launch |
+| Japanese PCs | D88/HDI/NHD/XDF/DIM | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | PARTIAL | PARTIAL | 4 | `disk_format/d88/hdi/x68000`, `pc98_boot_evidence` | disk-format + BPB evidence tests | container-to-boot wiring, filesystem and launch |
 | DOS/PC | IMG/IMA/RAW FAT12/16 | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `dos_boot_evidence`, `disk_format` | DOS boot tests | IMD/TD0/DMF |
 | ZX Spectrum | TAP/TZX | YES | YES | YES | YES | YES | TOSEC | DETAILED | YES | YES | 6 | `tape_identity`, `tape_analysis` | TZX semantic tests | named families only Alkatraz |
 | ZX Spectrum | WAV ROM/custom | YES | YES | YES | YES | YES | NO | DETAILED | NO | YES | 5 | `tape_audio`, `tape_analysis` | synthetic WAV tests | broader custom loaders |
