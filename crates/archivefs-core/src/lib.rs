@@ -201,6 +201,9 @@ pub mod chd_logical_media;
 /// `CD-RTOS` identity gate; this module reports structural corroboration.
 pub mod cdi_disc_evidence;
 
+/// Read-only LaserDisc game-set/framefile coherence verification.
+pub mod laserdisc_set;
+
 /// Shared, pure, read-only raw CD/CD-XA sector layout (sync pattern, mode
 /// byte, Mode 1 / Mode 2 Form 1 user-data extraction) used by both
 /// [`chd_logical_media`] and [`raw_cd_logical_media`].
