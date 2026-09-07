@@ -4185,6 +4185,7 @@ fn ready_selected_evidence_state(
             no_intro: selected_evidence_page::NoIntroLookupResult::NotImported,
             enrichment: selected_evidence_page::SelectedEvidenceEnrichmentStatus::Complete,
             base_observations: Vec::new(),
+            structural_media: None,
         }),
         hasheous: selected_evidence_page::HasheousState::default(),
     }

@@ -42,8 +42,12 @@ use std::sync::atomic::AtomicBool;
 
 use eframe::egui;
 
+use archivefs_core::chd_identity::{
+    ChdIdentityObservation, ChdMetadataOutcome, observe_chd_identity,
+};
 use archivefs_core::content_evidence::ContentEvidence;
 use archivefs_core::dat::model::ChecksumAlgorithm;
+use archivefs_core::disk_format::{DiskFormatContext, DiskFormatEvidence, inspect_disk_format};
 use archivefs_core::game_identity::inspect_catalogued_game_identity;
 use archivefs_core::gb_header_evidence::{observe_gb_evidence, parse_gb_header};
 use archivefs_core::gba_header_evidence::{observe_gba_evidence, parse_gba_header};
@@ -204,6 +208,308 @@ pub(crate) struct SelectedEvidenceReport {
     /// Structural + (if matched) direct No-Intro observations, ready to be
     /// merged with a Hasheous result once/if one arrives.
     pub base_observations: Vec<EvidenceObservation>,
+    /// Read-only structural media projection. It is computed with the same
+    /// bounded evidence pass as this report and rendered without further I/O.
+    pub structural_media: Option<StructuralMediaDetails>,
+}
+
+/// Presentation-owned, read-only projection of existing media evidence.
+/// Variants remain separate because disk, optical, CHD, CD-i, and LaserDisc
+/// evidence have different semantics and must not be flattened into one core
+/// identity enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StructuralMediaDetails {
+    Disk(DiskMediaDetails),
+    Optical(OpticalMediaDetails),
+    Chd(ChdMediaDetails),
+    Cdi(CdiMediaDetails),
+    LaserDisc(LaserDiscMediaDetails),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiskMediaDetails {
+    pub format: String,
+    pub geometry: Vec<String>,
+    pub filesystem: Option<String>,
+    pub volume_label: Option<String>,
+    pub integrity: String,
+    pub warnings: Vec<String>,
+    pub preservation_caveat: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpticalMediaDetails {
+    pub platform: String,
+    pub boot_product_evidence: Vec<String>,
+    pub container: String,
+    pub track_session_summary: Option<String>,
+    pub dat_status: String,
+    pub identity_confidence: String,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChdMediaDetails {
+    pub version: String,
+    pub media_class: Vec<String>,
+    pub internal_identity: String,
+    pub dat_status: String,
+    pub specialist_backend_required: bool,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CdiMediaDetails {
+    pub platform_evidence: String,
+    pub volume_geometry: String,
+    pub volume_identifier: String,
+    pub path_table: String,
+    pub startup: String,
+    pub integrity: String,
+    pub sector_limitation: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaserDiscMediaDetails {
+    pub family: String,
+    pub framefile: Option<String>,
+    pub components: String,
+    pub media: String,
+    pub mapping: String,
+    pub readiness: String,
+}
+
+fn dat_status(no_intro: &NoIntroLookupResult) -> String {
+    match no_intro {
+        NoIntroLookupResult::NotImported => "No local DAT imported".into(),
+        NoIntroLookupResult::Ambiguous { note } => format!("Conflict: {note}"),
+        NoIntroLookupResult::NoMatch { system_name } => format!("No match in {system_name}"),
+        NoIntroLookupResult::Matched { system_name, .. } => {
+            format!("Corroborated by {system_name}")
+        }
+    }
+}
+
+fn update_structural_media_dat_status(
+    details: &mut StructuralMediaDetails,
+    no_intro: &NoIntroLookupResult,
+) {
+    match details {
+        StructuralMediaDetails::Optical(details) => details.dat_status = dat_status(no_intro),
+        StructuralMediaDetails::Chd(details) => details.dat_status = dat_status(no_intro),
+        StructuralMediaDetails::Disk(_)
+        | StructuralMediaDetails::Cdi(_)
+        | StructuralMediaDetails::LaserDisc(_) => {}
+    }
+}
+
+fn disk_details(evidence: DiskFormatEvidence) -> Option<StructuralMediaDetails> {
+    let format = evidence.format?;
+    let mut geometry = evidence.evidence.clone();
+    if let Some(metadata) = evidence.metadata {
+        geometry.push(format!("Metadata: {metadata:?}"));
+    }
+    Some(StructuralMediaDetails::Disk(DiskMediaDetails {
+        format: format.label().into(),
+        geometry,
+        filesystem: evidence
+            .evidence
+            .iter()
+            .find(|fact| fact.to_ascii_lowercase().contains("filesystem"))
+            .cloned(),
+        volume_label: None,
+        integrity: if evidence.conclusive {
+            "Good".into()
+        } else {
+            "Structurally valid; platform not settled".into()
+        },
+        warnings: evidence
+            .refusal
+            .into_iter()
+            .map(|refusal| refusal.detail())
+            .collect(),
+        preservation_caveat:
+            "Structural evidence is descriptive; disk labels are not release identity.".into(),
+    }))
+}
+
+fn chd_details(
+    observation: ChdIdentityObservation,
+    no_intro: &NoIntroLookupResult,
+) -> StructuralMediaDetails {
+    let (media_class, specialist) = match &observation.metadata {
+        ChdMetadataOutcome::Observed(metadata) => (
+            metadata
+                .media_classes()
+                .iter()
+                .map(|class| format!("{class:?}"))
+                .collect(),
+            archivefs_core::chd_identity::needs_specialist_optical_backend(metadata),
+        ),
+        _ => (Vec::new(), false),
+    };
+    StructuralMediaDetails::Chd(ChdMediaDetails {
+        version: format!("v{}", observation.version),
+        media_class,
+        internal_identity: format!(
+            "raw SHA-1 {}; combined SHA-1 {}",
+            observation.raw_sha1_hex(),
+            observation.combined_sha1_hex()
+        ),
+        dat_status: dat_status(no_intro),
+        specialist_backend_required: specialist,
+        limitations: vec![
+            "CHD identity is container/logical evidence, not a platform guess.".into(),
+            "Track/layout details are limited to metadata recorded by the CHD.".into(),
+        ],
+    })
+}
+
+fn structural_media_details(
+    path: &Path,
+    bytes: &[u8],
+    structural_facts: &[ContentEvidence],
+    identity: &archivefs_core::game_identity::GameIdentityReport,
+    no_intro: &NoIntroLookupResult,
+) -> Option<StructuralMediaDetails> {
+    if path.is_dir() {
+        return archivefs_core::laserdisc_set::verify_laserdisc_set(path)
+            .ok()
+            .map(|evidence| {
+                StructuralMediaDetails::LaserDisc(LaserDiscMediaDetails {
+                    family: format!("{:#?}", evidence.detected_family),
+                    framefile: evidence.framefile_path.map(|p| p.display().to_string()),
+                    components: format!(
+                        "ROM {}, script {}, config {}",
+                        evidence.rom_components.len(),
+                        evidence.script_components.len(),
+                        evidence.config_components.len()
+                    ),
+                    media: format!(
+                        "{} present, {} missing",
+                        evidence.present_media.len(),
+                        evidence.missing_media.len()
+                    ),
+                    mapping: format!("{} frame mappings", evidence.mappings.len()),
+                    readiness: format!("{:#?}", evidence.readiness),
+                })
+            });
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if extension == "adf"
+        && let Ok(inspection) = archivefs_core::amiga_disk::inspect_amiga_floppy(path)
+    {
+        let disk = &inspection.disk.rdb;
+        let filesystem = &inspection.filesystem;
+        return Some(StructuralMediaDetails::Disk(DiskMediaDetails {
+            format: "ADF (Amiga floppy image)".into(),
+            geometry: vec![
+                format!("Image size: {} bytes", inspection.disk.image_size),
+                format!(
+                    "Geometry: {} cylinders, {} heads, {} sectors",
+                    disk.cylinders, disk.heads, disk.sectors
+                ),
+                format!("Logical block size: {} bytes", filesystem.block_size),
+            ],
+            filesystem: Some(format!("AmigaDOS {:?}", filesystem.family)),
+            volume_label: filesystem.volume_label.clone(),
+            integrity: "Good (boot and root structures validated)".into(),
+            warnings: Vec::new(),
+            preservation_caveat:
+                "Volume label is descriptive provenance, not confirmed release identity.".into(),
+        }));
+    }
+    if matches!(
+        extension.as_str(),
+        "d64"
+            | "dsk"
+            | "st"
+            | "stx"
+            | "fds"
+            | "trd"
+            | "scl"
+            | "d88"
+            | "hdi"
+            | "nhd"
+            | "ssd"
+            | "dsd"
+            | "xdf"
+            | "dim"
+            | "dc42"
+    ) {
+        let trusted = TrustedRoots::from_paths([path.parent().unwrap_or(path)]);
+        return disk_details(inspect_disk_format(
+            path,
+            &trusted,
+            DiskFormatContext::default(),
+            None,
+        ));
+    }
+    if extension == "chd" {
+        if let Ok(observation) = observe_chd_identity(bytes) {
+            return Some(chd_details(observation, no_intro));
+        }
+    }
+    if extension == "cdi"
+        && let Ok(media) = archivefs_core::dreamcast_cdi::open_dreamcast_cdi_logical_media(path)
+        && let Ok(evidence) = archivefs_core::cdi_disc_evidence::observe_cdi(&media)
+        && evidence.status != archivefs_core::cdi_disc_evidence::CdiStatus::NotCdi
+    {
+        return Some(StructuralMediaDetails::Cdi(CdiMediaDetails {
+            platform_evidence: evidence.system_identifier.clone(),
+            volume_geometry: format!(
+                "{} blocks × {} bytes; root LBA {} ({} bytes)",
+                evidence.volume_space_size,
+                evidence.logical_block_size,
+                evidence.root_extent_lba,
+                evidence.root_size_bytes
+            ),
+            volume_identifier: evidence.volume_identifier,
+            path_table: format!(
+                "little-endian {:?}, big-endian {:?}",
+                evidence.path_table_lba_le, evidence.path_table_lba_be
+            ),
+            startup: format!("{:#?}", evidence.startup),
+            integrity: format!("{:#?}", evidence.integrity),
+            sector_limitation: format!("{:#?}", evidence.sector_evidence),
+            warnings: evidence.warnings,
+        }));
+    }
+    if matches!(
+        extension.as_str(),
+        "iso" | "bin" | "cue" | "gdi" | "cdi" | "rvz" | "wbfs" | "wia"
+    ) && (!identity.evidence.is_empty() || !structural_facts.is_empty())
+    {
+        let platform = identity.platform.label().to_string();
+        let boot_product_evidence = identity
+            .evidence
+            .iter()
+            .filter_map(|evidence| {
+                evidence
+                    .value
+                    .as_ref()
+                    .map(|value| format!("{}: {value}", evidence.kind))
+            })
+            .collect();
+        return Some(StructuralMediaDetails::Optical(OpticalMediaDetails {
+            platform,
+            boot_product_evidence,
+            container: extension.to_ascii_uppercase(),
+            track_session_summary: None,
+            dat_status: dat_status(no_intro),
+            identity_confidence: "Existing identity evidence".into(),
+            limitations: vec![
+                "ISO/container inspection does not claim unavailable audio/session fidelity."
+                    .into(),
+            ],
+        }));
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +603,11 @@ pub(crate) fn gather_selected_evidence_fast(
 ) -> Result<SelectedEvidenceReport, String> {
     let archive = is_compressed_archive(path);
     let tape_analysis = analyze_tape_file(path, platform_hint);
+    let structural_prefix = if archive || path.is_dir() {
+        Vec::new()
+    } else {
+        read_structural_prefix(path)?
+    };
     let structural_facts = if archive {
         // Archive extensions do not feed any of this module's loose-ROM
         // structural detectors. Opening is enough to surface a missing or
@@ -306,9 +617,10 @@ pub(crate) fn gather_selected_evidence_fast(
         std::fs::File::open(path)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
         Vec::new()
+    } else if path.is_dir() {
+        Vec::new()
     } else {
-        let prefix = read_structural_prefix(path)?;
-        gather_structural_evidence(path, &prefix)
+        gather_structural_evidence(path, &structural_prefix)
     };
     let explanation = fuse_platform_evidence(structural_facts.clone());
 
@@ -319,11 +631,17 @@ pub(crate) fn gather_selected_evidence_fast(
     let identity = present_identity(&identity_result);
     let game_identity_report =
         inspect_catalogued_game_identity(path, platform_hint.or(identity.platform));
-
     let base_observations: Vec<EvidenceObservation> = structural_facts
         .iter()
         .map(observation_from_content_evidence)
         .collect();
+    let structural_media = structural_media_details(
+        path,
+        &structural_prefix,
+        &structural_facts,
+        &game_identity_report,
+        &NoIntroLookupResult::NotImported,
+    );
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
@@ -340,6 +658,7 @@ pub(crate) fn gather_selected_evidence_fast(
             SelectedEvidenceEnrichmentStatus::Pending
         },
         base_observations,
+        structural_media,
     })
 }
 
@@ -396,6 +715,9 @@ pub(crate) fn apply_selected_evidence_enrichment(
 ) {
     report.hashes = Some(enrichment.hashes);
     report.no_intro = enrichment.no_intro;
+    if let Some(details) = report.structural_media.as_mut() {
+        update_structural_media_dat_status(details, &report.no_intro);
+    }
     report.enrichment = SelectedEvidenceEnrichmentStatus::Complete;
     report
         .base_observations
@@ -465,6 +787,13 @@ pub(crate) fn gather_selected_evidence_with_platform(
     if let NoIntroLookupResult::Matched { observations, .. } = &no_intro {
         base_observations.extend(observations.clone());
     }
+    let structural_media = structural_media_details(
+        path,
+        &bytes,
+        &structural_facts,
+        &game_identity_report,
+        &no_intro,
+    );
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
@@ -477,6 +806,7 @@ pub(crate) fn gather_selected_evidence_with_platform(
         no_intro,
         enrichment,
         base_observations,
+        structural_media,
     })
 }
 
@@ -787,6 +1117,9 @@ pub(crate) fn show_selected_evidence_panel(
 }
 
 pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenceReport) {
+    if let Some(details) = &report.structural_media {
+        show_structural_media_details(ui, details);
+    }
     widgets::section_header(ui, "Structural evidence", None);
     if report.structural_facts.is_empty() {
         ui.label("No structural evidence was recognized for this file type.");
@@ -862,6 +1195,145 @@ pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenc
             );
         }
         SelectedEvidenceEnrichmentStatus::Complete => {}
+    }
+}
+
+fn show_structural_media_details(ui: &mut egui::Ui, details: &StructuralMediaDetails) {
+    widgets::section_header(ui, "Media details", None);
+    match details {
+        StructuralMediaDetails::Disk(details) => {
+            ui.label("Disk image");
+            widgets::status_rows(
+                ui,
+                &[
+                    ("Format", &details.format, widgets::StatusTone::Info),
+                    (
+                        "Integrity",
+                        &details.integrity,
+                        widgets::StatusTone::Success,
+                    ),
+                ],
+            );
+            if let Some(filesystem) = &details.filesystem {
+                ui.label(format!("Filesystem: {filesystem}"));
+            }
+            widgets::technical_details(ui, "structural-disk-details", |ui| {
+                for fact in &details.geometry {
+                    ui.label(fact);
+                }
+                if let Some(label) = &details.volume_label {
+                    ui.label(format!("Volume label (descriptive): {label}"));
+                }
+                ui.label(&details.preservation_caveat);
+                for warning in &details.warnings {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+            });
+        }
+        StructuralMediaDetails::Optical(details) => {
+            ui.label("Optical image");
+            widgets::status_rows(
+                ui,
+                &[
+                    ("Platform", &details.platform, widgets::StatusTone::Info),
+                    ("Container", &details.container, widgets::StatusTone::Info),
+                    (
+                        "DAT status",
+                        &details.dat_status,
+                        widgets::StatusTone::Pending,
+                    ),
+                ],
+            );
+            widgets::technical_details(ui, "structural-optical-details", |ui| {
+                for fact in &details.boot_product_evidence {
+                    ui.label(fact);
+                }
+                if let Some(summary) = &details.track_session_summary {
+                    ui.label(format!("Tracks/sessions: {summary}"));
+                }
+                ui.label(format!(
+                    "Identity confidence: {}",
+                    details.identity_confidence
+                ));
+                for limitation in &details.limitations {
+                    ui.label(limitation);
+                }
+            });
+        }
+        StructuralMediaDetails::Chd(details) => {
+            ui.label("CHD container");
+            widgets::status_rows(
+                ui,
+                &[
+                    ("Type/version", &details.version, widgets::StatusTone::Info),
+                    (
+                        "DAT status",
+                        &details.dat_status,
+                        widgets::StatusTone::Pending,
+                    ),
+                ],
+            );
+            widgets::technical_details(ui, "structural-chd-details", |ui| {
+                ui.label(format!("Media class: {}", details.media_class.join(", ")));
+                ui.label(&details.internal_identity);
+                if details.specialist_backend_required {
+                    ui.label("Specialist optical backend required for complete track access.");
+                }
+                for limitation in &details.limitations {
+                    ui.label(limitation);
+                }
+            });
+        }
+        StructuralMediaDetails::Cdi(details) => {
+            ui.label("CD-i structural evidence");
+            widgets::status_rows(
+                ui,
+                &[
+                    (
+                        "Platform",
+                        &details.platform_evidence,
+                        widgets::StatusTone::Info,
+                    ),
+                    (
+                        "Integrity",
+                        &details.integrity,
+                        widgets::StatusTone::Success,
+                    ),
+                ],
+            );
+            widgets::technical_details(ui, "structural-cdi-details", |ui| {
+                ui.label(format!("Volume: {}", details.volume_identifier));
+                ui.label(&details.volume_geometry);
+                ui.label(format!("Path table: {}", details.path_table));
+                ui.label(format!("Startup: {}", details.startup));
+                ui.label(format!("Sector evidence: {}", details.sector_limitation));
+                for warning in &details.warnings {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+            });
+        }
+        StructuralMediaDetails::LaserDisc(details) => {
+            ui.label("LaserDisc set");
+            widgets::status_rows(
+                ui,
+                &[
+                    ("Family", &details.family, widgets::StatusTone::Info),
+                    (
+                        "Readiness",
+                        &details.readiness,
+                        widgets::StatusTone::Pending,
+                    ),
+                    ("Media", &details.media, widgets::StatusTone::Info),
+                ],
+            );
+            widgets::technical_details(ui, "structural-laserdisc-details", |ui| {
+                if let Some(framefile) = &details.framefile {
+                    ui.label(format!("Framefile: {framefile}"));
+                }
+                ui.label(&details.components);
+                ui.label(&details.mapping);
+            });
+        }
     }
 }
 
@@ -1570,6 +2042,7 @@ mod tests {
             no_intro: NoIntroLookupResult::NotImported,
             enrichment: SelectedEvidenceEnrichmentStatus::Complete,
             base_observations,
+            structural_media: None,
         }
     }
 
