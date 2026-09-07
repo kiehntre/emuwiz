@@ -5,6 +5,8 @@
 //! proven to be direct writes are retained as opaque entries.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheatPlatform {
@@ -112,6 +114,64 @@ pub struct CheatDocument {
     pub operations: Vec<CheatOperation>,
     pub issues: Vec<CheatIssue>,
     pub provenance: Vec<String>,
+}
+
+/// A source entry supplied to the pure cross-source reconciliation service.
+/// `game_identity` must be a verified, platform-specific identity (for
+/// example a Game ID or PS2 serial/CRC), never a display title.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheatReconciliationEntry {
+    pub game_identity: String,
+    pub identity_verified: bool,
+    pub title: String,
+    pub source: String,
+    pub source_format: CheatSourceFormat,
+    pub document: CheatDocument,
+    pub raw_code: Option<String>,
+    pub provenance: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheatRelationship {
+    ExactSemanticDuplicate,
+    ExactRawDuplicate,
+    SameTitleDifferentCode,
+    RelatedUnproven,
+    Unique,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheatEvidenceQuality {
+    pub semantics_understood: bool,
+    pub identity_verified: bool,
+    pub provenance_present: bool,
+    pub warning_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheatReconciliationGroup {
+    pub relationship: CheatRelationship,
+    pub entry_indices: Vec<usize>,
+    pub normalized_title: String,
+    pub semantic_fingerprint: Option<String>,
+    pub raw_fingerprint: Option<String>,
+    pub differences: Vec<String>,
+    pub quality: Vec<CheatEvidenceQuality>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheatReconciliationResult {
+    pub game_identity: String,
+    pub platform: CheatPlatform,
+    pub groups: Vec<CheatReconciliationGroup>,
+    pub entries: Vec<CheatReconciliationEntry>,
+    pub auto_winner: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheatReconciliationOutcome {
+    Ready(CheatReconciliationResult),
+    Unavailable { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,9 +815,619 @@ pub fn supported_targets_for(document: &CheatDocument) -> Vec<TargetCapability> 
         .collect()
 }
 
+fn reconciliation_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn operation_semantics_known(document: &CheatDocument) -> bool {
+    !document.operations.is_empty()
+        && document
+            .operations
+            .iter()
+            .all(|operation| !matches!(operation, CheatOperation::UnsupportedRaw { .. }))
+}
+
+fn raw_fingerprint(entry: &CheatReconciliationEntry) -> Option<String> {
+    let raw = entry.raw_code.clone().or_else(|| {
+        let lines = entry.document.operations.iter().filter_map(|operation| {
+            if let CheatOperation::UnsupportedRaw { raw, .. } = operation {
+                Some(raw.as_str())
+            } else {
+                None
+            }
+        });
+        let joined = lines.collect::<Vec<_>>().join("\n");
+        (!joined.is_empty()).then_some(joined)
+    })?;
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut hash = Sha256::new();
+    hash.update(b"cheat-raw-v1\0");
+    hash.update(normalized.as_bytes());
+    Some(hex_digest(hash.finalize()))
+}
+
+fn semantic_fingerprint(document: &CheatDocument) -> Option<String> {
+    if !operation_semantics_known(document) {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"cheat-semantic-v1\0");
+    hash.update(platform_key(&document.platform).as_bytes());
+    hash.update([0]);
+    for operation in &document.operations {
+        match operation {
+            CheatOperation::Write8 { address, value } => {
+                hash.update(b"write8\0");
+                hash.update(address.to_le_bytes());
+                hash.update([*value]);
+            }
+            CheatOperation::Write16 { address, value } => {
+                hash.update(b"write16\0");
+                hash.update(address.to_le_bytes());
+                hash.update(value.to_le_bytes());
+            }
+            CheatOperation::Write32 { address, value } => {
+                hash.update(b"write32\0");
+                hash.update(address.to_le_bytes());
+                hash.update(value.to_le_bytes());
+            }
+            CheatOperation::OnFrameWrite8 { address, value } => {
+                hash.update(b"onframe8\0");
+                hash.update(address.to_le_bytes());
+                hash.update([*value]);
+            }
+            CheatOperation::OnFrameWrite16 { address, value } => {
+                hash.update(b"onframe16\0");
+                hash.update(address.to_le_bytes());
+                hash.update(value.to_le_bytes());
+            }
+            CheatOperation::OnFrameWrite32 { address, value } => {
+                hash.update(b"onframe32\0");
+                hash.update(address.to_le_bytes());
+                hash.update(value.to_le_bytes());
+            }
+            CheatOperation::UnsupportedRaw { .. } => return None,
+        }
+    }
+    Some(hex_digest(hash.finalize()))
+}
+
+fn platform_key(platform: &CheatPlatform) -> String {
+    match platform {
+        CheatPlatform::GameCube => "gamecube".into(),
+        CheatPlatform::Wii => "wii".into(),
+        CheatPlatform::Ps2 => "ps2".into(),
+        CheatPlatform::NintendoDs => "nintendo-ds".into(),
+        CheatPlatform::Other(value) => format!("other:{value}"),
+    }
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn entry_quality(entry: &CheatReconciliationEntry) -> CheatEvidenceQuality {
+    CheatEvidenceQuality {
+        semantics_understood: operation_semantics_known(&entry.document),
+        identity_verified: entry.identity_verified,
+        provenance_present: !entry.provenance.is_empty() || !entry.document.provenance.is_empty(),
+        warning_count: entry.document.issues.len()
+            + entry
+                .document
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, CheatOperation::UnsupportedRaw { .. }))
+                .count(),
+    }
+}
+
+fn difference_summary(left: &CheatDocument, right: &CheatDocument) -> Vec<String> {
+    let mut differences = Vec::new();
+    let count = left.operations.len().max(right.operations.len());
+    for index in 0..count {
+        if left.operations.get(index) != right.operations.get(index) {
+            differences.push(format!("operation {index} differs"));
+        }
+    }
+    if differences.is_empty() && left.source_format != right.source_format {
+        differences.push("source formats differ".into());
+    }
+    differences
+}
+
+/// Reconciles entries only when every item is tied to the same verified game
+/// identity and platform. It never mutates, installs, deletes, or selects a
+/// winner.
+pub fn reconcile_cheats_for_game(
+    entries: Vec<CheatReconciliationEntry>,
+) -> CheatReconciliationOutcome {
+    let Some(first) = entries.first() else {
+        return CheatReconciliationOutcome::Unavailable {
+            reason: "no cheat entries were supplied".into(),
+        };
+    };
+    if !first.identity_verified || first.game_identity.trim().is_empty() {
+        return CheatReconciliationOutcome::Unavailable {
+            reason: "game identity is not verified".into(),
+        };
+    }
+    if entries.iter().any(|entry| {
+        !entry.identity_verified
+            || entry.game_identity != first.game_identity
+            || entry.document.platform != first.document.platform
+    }) {
+        return CheatReconciliationOutcome::Unavailable {
+            reason: "entries do not share one verified game and platform identity".into(),
+        };
+    }
+
+    let semantics = entries
+        .iter()
+        .map(|entry| semantic_fingerprint(&entry.document))
+        .collect::<Vec<_>>();
+    let raws = entries.iter().map(raw_fingerprint).collect::<Vec<_>>();
+    let titles = entries
+        .iter()
+        .map(|entry| reconciliation_title(&entry.title))
+        .collect::<Vec<_>>();
+    let mut groups = Vec::new();
+    let mut assigned = vec![false; entries.len()];
+
+    let mut semantic_groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, fingerprint) in semantics.iter().enumerate() {
+        if let Some(fingerprint) = fingerprint {
+            semantic_groups
+                .entry(fingerprint.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    for (fingerprint, indexes) in semantic_groups {
+        if indexes.len() < 2 {
+            continue;
+        }
+        for index in &indexes {
+            assigned[*index] = true;
+        }
+        groups.push(CheatReconciliationGroup {
+            relationship: CheatRelationship::ExactSemanticDuplicate,
+            normalized_title: titles[indexes[0]].clone(),
+            entry_indices: indexes.iter().copied().collect(),
+            semantic_fingerprint: Some(fingerprint),
+            raw_fingerprint: None,
+            differences: Vec::new(),
+            quality: indexes
+                .iter()
+                .map(|index| entry_quality(&entries[*index]))
+                .collect(),
+        });
+    }
+
+    let mut raw_groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, fingerprint) in raws.iter().enumerate() {
+        if !assigned[index] {
+            if let Some(fingerprint) = fingerprint {
+                raw_groups
+                    .entry(fingerprint.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+    }
+    for (fingerprint, indexes) in raw_groups {
+        if indexes.len() < 2 {
+            continue;
+        }
+        for index in &indexes {
+            assigned[*index] = true;
+        }
+        groups.push(CheatReconciliationGroup {
+            relationship: CheatRelationship::ExactRawDuplicate,
+            normalized_title: titles[indexes[0]].clone(),
+            entry_indices: indexes.iter().copied().collect(),
+            semantic_fingerprint: None,
+            raw_fingerprint: Some(fingerprint),
+            differences: Vec::new(),
+            quality: indexes
+                .iter()
+                .map(|index| entry_quality(&entries[*index]))
+                .collect(),
+        });
+    }
+
+    let mut title_groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, title) in titles.iter().enumerate() {
+        if !assigned[index] {
+            title_groups.entry(title.clone()).or_default().push(index);
+        }
+    }
+    for (title, indexes) in title_groups {
+        if indexes.len() < 2 {
+            continue;
+        }
+        for index in &indexes {
+            assigned[*index] = true;
+        }
+        let comparable = indexes
+            .iter()
+            .all(|index| semantics[*index].is_some() || raws[*index].is_some());
+        let relationship = if comparable {
+            CheatRelationship::SameTitleDifferentCode
+        } else {
+            CheatRelationship::RelatedUnproven
+        };
+        let mut differences = Vec::new();
+        for pair in indexes.windows(2) {
+            differences.extend(difference_summary(
+                &entries[pair[0]].document,
+                &entries[pair[1]].document,
+            ));
+        }
+        groups.push(CheatReconciliationGroup {
+            relationship,
+            normalized_title: title,
+            entry_indices: indexes.iter().copied().collect(),
+            semantic_fingerprint: None,
+            raw_fingerprint: None,
+            differences,
+            quality: indexes
+                .iter()
+                .map(|index| entry_quality(&entries[*index]))
+                .collect(),
+        });
+    }
+
+    for index in 0..entries.len() {
+        if !assigned[index] {
+            groups.push(CheatReconciliationGroup {
+                relationship: CheatRelationship::Unique,
+                entry_indices: vec![index],
+                normalized_title: titles[index].clone(),
+                semantic_fingerprint: semantics[index].clone(),
+                raw_fingerprint: raws[index].clone(),
+                differences: Vec::new(),
+                quality: vec![entry_quality(&entries[index])],
+            });
+        }
+    }
+    groups.sort_by_key(|group| group.entry_indices[0]);
+    CheatReconciliationOutcome::Ready(CheatReconciliationResult {
+        game_identity: first.game_identity.clone(),
+        platform: first.document.platform.clone(),
+        groups,
+        entries,
+        auto_winner: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reconciliation_entry(
+        title: &str,
+        source: &str,
+        operation: CheatOperation,
+    ) -> CheatReconciliationEntry {
+        CheatReconciliationEntry {
+            game_identity: "GAFE01-r1".into(),
+            identity_verified: true,
+            title: title.into(),
+            source: source.into(),
+            source_format: CheatSourceFormat::Gecko,
+            document: CheatDocument {
+                title: title.into(),
+                platform: CheatPlatform::GameCube,
+                source_format: CheatSourceFormat::Gecko,
+                operations: vec![operation],
+                issues: Vec::new(),
+                provenance: vec![source.into()],
+            },
+            raw_code: None,
+            provenance: vec![source.into()],
+        }
+    }
+
+    fn reconciliation_ready(entries: Vec<CheatReconciliationEntry>) -> CheatReconciliationResult {
+        match reconcile_cheats_for_game(entries) {
+            CheatReconciliationOutcome::Ready(result) => result,
+            CheatReconciliationOutcome::Unavailable { reason } => panic!("{reason}"),
+        }
+    }
+
+    #[test]
+    fn reconciliation_requires_one_verified_game_identity() {
+        let mut entry = reconciliation_entry(
+            "Lives",
+            "BSFree",
+            CheatOperation::Write32 {
+                address: 0x100,
+                value: 1,
+            },
+        );
+        entry.identity_verified = false;
+        assert!(matches!(
+            reconcile_cheats_for_game(vec![entry]),
+            CheatReconciliationOutcome::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn semantic_duplicates_retain_all_sources_and_do_not_choose_winner() {
+        let result = reconciliation_ready(vec![
+            reconciliation_entry(
+                "Infinite Lives",
+                "BSFree",
+                CheatOperation::Write32 {
+                    address: 0x100,
+                    value: 1,
+                },
+            ),
+            reconciliation_entry(
+                " infinite   lives ",
+                "GameHacking",
+                CheatOperation::Write32 {
+                    address: 0x100,
+                    value: 1,
+                },
+            ),
+        ]);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(
+            result.groups[0].relationship,
+            CheatRelationship::ExactSemanticDuplicate
+        );
+        assert_eq!(result.groups[0].entry_indices, vec![0, 1]);
+        assert_eq!(result.auto_winner, None);
+        assert_eq!(result.entries.len(), 2);
+    }
+
+    #[test]
+    fn execution_policy_is_part_of_semantic_fingerprint() {
+        let ordinary = reconciliation_entry(
+            "Lives",
+            "local",
+            CheatOperation::Write32 {
+                address: 0x100,
+                value: 1,
+            },
+        );
+        let on_frame = reconciliation_entry(
+            "Lives",
+            "local-on-frame",
+            CheatOperation::OnFrameWrite32 {
+                address: 0x100,
+                value: 1,
+            },
+        );
+        let result = reconciliation_ready(vec![ordinary, on_frame]);
+        assert!(
+            result
+                .groups
+                .iter()
+                .all(|group| { group.relationship != CheatRelationship::ExactSemanticDuplicate })
+        );
+    }
+
+    #[test]
+    fn same_title_different_codes_are_a_conflict_with_differences() {
+        let result = reconciliation_ready(vec![
+            reconciliation_entry(
+                "Infinite Lives",
+                "A",
+                CheatOperation::Write32 {
+                    address: 0x100,
+                    value: 1,
+                },
+            ),
+            reconciliation_entry(
+                "infinite lives",
+                "B",
+                CheatOperation::Write32 {
+                    address: 0x100,
+                    value: 2,
+                },
+            ),
+        ]);
+        assert_eq!(
+            result.groups[0].relationship,
+            CheatRelationship::SameTitleDifferentCode
+        );
+        assert!(!result.groups[0].differences.is_empty());
+    }
+
+    #[test]
+    fn opaque_raw_codes_only_deduplicate_after_safe_whitespace_normalization() {
+        let mut first = reconciliation_entry(
+            "Mystery",
+            "A",
+            CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::GameSharkPs2,
+                raw: "ABCD 1234".into(),
+                reason: "encrypted variant".into(),
+            },
+        );
+        first.raw_code = Some("ABCD 1234\r\n".into());
+        let mut second = first.clone();
+        second.source = "B".into();
+        second.provenance = vec!["B".into()];
+        second.raw_code = Some("  ABCD 1234  \n".into());
+        let result = reconciliation_ready(vec![first, second]);
+        assert_eq!(
+            result.groups[0].relationship,
+            CheatRelationship::ExactRawDuplicate
+        );
+        assert!(result.groups[0].semantic_fingerprint.is_none());
+    }
+
+    #[test]
+    fn raw_line_reordering_does_not_deduplicate() {
+        let mut first = reconciliation_entry(
+            "Mystery",
+            "A",
+            CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::GameSharkPs2,
+                raw: "AA\nBB".into(),
+                reason: "opaque".into(),
+            },
+        );
+        first.raw_code = Some("AA\nBB".into());
+        let mut second = first.clone();
+        second.source = "B".into();
+        second.raw_code = Some("BB\nAA".into());
+        let result = reconciliation_ready(vec![first, second]);
+        assert!(
+            result
+                .groups
+                .iter()
+                .all(|group| { group.relationship != CheatRelationship::ExactRawDuplicate })
+        );
+    }
+
+    #[test]
+    fn different_games_and_platforms_never_group() {
+        let mut second = reconciliation_entry(
+            "Lives",
+            "B",
+            CheatOperation::Write32 {
+                address: 0x100,
+                value: 1,
+            },
+        );
+        second.game_identity = "GAFE02-r1".into();
+        assert!(matches!(
+            reconcile_cheats_for_game(vec![
+                reconciliation_entry(
+                    "Lives",
+                    "A",
+                    CheatOperation::Write32 {
+                        address: 0x100,
+                        value: 1,
+                    },
+                ),
+                second,
+            ]),
+            CheatReconciliationOutcome::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn operation_order_and_width_are_semantic() {
+        let first = reconciliation_entry(
+            "Combo",
+            "A",
+            CheatOperation::Write8 {
+                address: 1,
+                value: 2,
+            },
+        );
+        let mut second = first.clone();
+        second.source = "B".into();
+        second.document.operations = vec![CheatOperation::Write16 {
+            address: 1,
+            value: 2,
+        }];
+        let result = reconciliation_ready(vec![first, second]);
+        assert!(
+            result
+                .groups
+                .iter()
+                .all(|group| { group.relationship != CheatRelationship::ExactSemanticDuplicate })
+        );
+    }
+
+    #[test]
+    fn different_titles_with_same_operations_are_still_duplicates() {
+        let first = reconciliation_entry(
+            "Infinite Lives",
+            "A",
+            CheatOperation::Write8 {
+                address: 1,
+                value: 2,
+            },
+        );
+        let mut second = first.clone();
+        second.title = "God Mode".into();
+        second.document.title = second.title.clone();
+        second.source = "B".into();
+        let result = reconciliation_ready(vec![first, second]);
+        assert_eq!(
+            result.groups[0].relationship,
+            CheatRelationship::ExactSemanticDuplicate
+        );
+    }
+
+    #[test]
+    fn opaque_codes_never_receive_semantic_fingerprints() {
+        let entry = reconciliation_entry(
+            "Encrypted",
+            "A",
+            CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::GameSharkPs2,
+                raw: "ABCD 1234".into(),
+                reason: "encrypted".into(),
+            },
+        );
+        let result = reconciliation_ready(vec![entry]);
+        assert!(result.groups[0].semantic_fingerprint.is_none());
+        assert!(result.groups[0].raw_fingerprint.is_some());
+    }
+
+    #[test]
+    fn platform_mismatch_makes_reconciliation_unavailable() {
+        let mut second = reconciliation_entry(
+            "Lives",
+            "B",
+            CheatOperation::Write8 {
+                address: 1,
+                value: 2,
+            },
+        );
+        second.document.platform = CheatPlatform::Wii;
+        assert!(matches!(
+            reconcile_cheats_for_game(vec![
+                reconciliation_entry(
+                    "Lives",
+                    "A",
+                    CheatOperation::Write8 {
+                        address: 1,
+                        value: 2,
+                    },
+                ),
+                second,
+            ]),
+            CheatReconciliationOutcome::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_or_unmatched_entries_are_unique_not_deduplicated() {
+        let mut first = reconciliation_entry(
+            "Lives",
+            "A",
+            CheatOperation::Write8 {
+                address: 1,
+                value: 2,
+            },
+        );
+        first.document.operations.clear();
+        first.raw_code = None;
+        let result = reconciliation_ready(vec![first]);
+        assert_eq!(result.groups[0].relationship, CheatRelationship::Unique);
+    }
     #[test]
     fn dolphin_direct_writes_preserve_width() {
         assert!(matches!(
