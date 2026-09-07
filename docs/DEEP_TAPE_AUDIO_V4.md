@@ -250,3 +250,12 @@ classified conservatively as `GenericTurbo`, `CustomPulse`, `MultiStage`, or
 weak carrier match, invalid/truncated BBC header, Spectrum/C64/CPC waveform, or
 random FSK cannot unlock BBC custom labeling. Named BBC loaders and fastloader
 semantics remain deferred.
+## V14: bootstrap-gated MSX custom stages
+
+V14 reuses the bounded generic timing analyser after a recovered standard MSX
+BIOS marker. Stable later timing families are reported only as
+`GenericTurbo`, `CustomPulse`, `MultiStage`, or `UnknownCustom`, with existing
+normalized fingerprints and ambiguity preservation. Because V13 does not yet
+retain exact per-file waveform boundaries, this first hook treats the bounded
+post-anchor pass as evidence rather than claiming exact stage slicing. Named
+MSX loaders and CAS timing fingerprints remain deferred.

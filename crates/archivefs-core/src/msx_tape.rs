@@ -38,6 +38,16 @@ pub struct MsxWavRecovery {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsxCustomWavRecovery {
+    pub standard_files: usize,
+    pub stages: Vec<crate::tape_audio::CustomStageEvidence>,
+    pub blocks: Vec<crate::tape_audio::CustomRecoveredBlock>,
+    pub loader_class: &'static str,
+    pub fingerprint: String,
+    pub warnings: Vec<String>,
+}
+
 /// Recover standard MSX 1200-baud FSK bytes.  MSX uses one 1200-Hz cycle for
 /// zero and two 2400-Hz cycles for one, with an MSX BIOS header marker.  The
 /// byte stream is treated as evidence; CAS/container parsing remains separate.
@@ -137,5 +147,47 @@ pub fn decode_msx_wav(bytes: &[u8]) -> Result<MsxWavRecovery, WavError> {
         } else {
             Vec::new()
         },
+    })
+}
+
+/// Bootstrap-gated generic analysis for later MSX turbo/custom stages.  No
+/// stage is labelled MSX unless a standard MSX BIOS marker was recovered.
+pub fn decode_msx_custom_wav(bytes: &[u8]) -> Result<MsxCustomWavRecovery, WavError> {
+    let standard = decode_msx_wav(bytes)?;
+    if standard.files.is_empty() {
+        return Ok(MsxCustomWavRecovery {
+            standard_files: 0,
+            stages: Vec::new(),
+            blocks: Vec::new(),
+            loader_class: "UnknownCustom",
+            fingerprint: crate::tape_audio::custom_loader_fingerprint(&[]),
+            warnings: vec!["MSX custom analysis requires a recovered standard MSX marker".into()],
+        });
+    }
+    let generic = crate::tape_audio::decode_custom_wav(bytes)?;
+    // V13 does not retain per-file end offsets, so the generic pass is kept
+    // bounded and treated as post-anchor evidence rather than exact slicing.
+    let stages: Vec<_> = generic.stages.into_iter().take(64).collect();
+    let blocks: Vec<_> = generic.blocks.into_iter().take(256).collect();
+    let loader_class = if stages.len() > 1 {
+        "MultiStage"
+    } else if stages
+        .iter()
+        .any(|s| s.symbol_mode == Some(crate::tape_audio::CustomSymbolMode::PairedPulse))
+    {
+        "GenericTurbo"
+    } else if !stages.is_empty() {
+        "CustomPulse"
+    } else {
+        "UnknownCustom"
+    };
+    let fingerprint = crate::tape_audio::custom_loader_fingerprint(&stages);
+    Ok(MsxCustomWavRecovery {
+        standard_files: standard.files.len(),
+        stages,
+        blocks,
+        loader_class,
+        fingerprint,
+        warnings: Vec::new(),
     })
 }
