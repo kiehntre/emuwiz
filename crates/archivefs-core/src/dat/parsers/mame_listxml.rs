@@ -320,6 +320,17 @@ fn handle_empty_like(
                 sha1,
                 status,
                 merge: attr(e, b"merge"),
+                // `region`/`offset`/`bios`/`optional` are real MAME `-listxml`
+                // `<rom>` attributes (see MAME's `mame.xsd`) that the model
+                // already has fields for (populated by the Logiqx/ClrMamePro
+                // parsers) but this parser previously dropped. `region` is the
+                // authoritative source of ROM-role evidence for arcade drivers
+                // such as Neo Geo's `maincpu`/`fixed`/`audiocpu`/`sprites`/
+                // `ymsnd*` regions - see `neogeo_set::neogeo_rom_role`.
+                offset: attr(e, b"offset"),
+                bios: attr(e, b"bios"),
+                optional: attr(e, b"optional"),
+                region: attr(e, b"region"),
                 ..Default::default()
             });
         }
@@ -385,6 +396,34 @@ mod tests {
         assert_eq!(game.disks.len(), 1);
         assert_eq!(game.device_refs.len(), 1);
         assert_eq!(game.roms[0].crc32.as_deref(), Some("c1e6ab10"));
+    }
+
+    #[test]
+    fn rom_region_offset_bios_and_optional_attributes_are_captured() {
+        // Real MAME `-listxml` `<rom>` attributes (mame.xsd) the parser
+        // previously silently dropped - `region` is the authoritative
+        // source of ROM-role evidence (see `neogeo_set::neogeo_rom_role`).
+        let dir = tempfile::tempdir().unwrap();
+        let xml = r#"<mame build="0.280"><machine name="neogeo" isbios="yes" sourcefile="neogeo.cpp"><description>Neo-Geo</description><rom name="sp-s2.sp1" size="131072" crc="9036d879" sha1="4e4a440cae46f3889d20234aebd7f8d5f522496e" region="mainbios" offset="0"/><rom name="sfix.sfix" size="131072" crc="c2ea0cfd" sha1="fe1c6dd3dfcf97d960065b1bb46c1e11fc4a1149" region="fixedbios" offset="0" bios="us"/><rom name="000-lo.lo" size="131072" crc="e09e253c" sha1="945dffe1a3cd420ce1240b5363e5605ff6bfa19b" region="audiocpu" offset="0" optional="yes"/></machine></mame>"#;
+        let path = write(dir.path(), "neogeo.xml", xml);
+        let outcome = parse_mame_listxml(&path, DatLimits::default()).unwrap();
+        let game = &outcome.dat.games[0];
+        assert_eq!(game.roms[0].region.as_deref(), Some("mainbios"));
+        assert_eq!(game.roms[0].offset.as_deref(), Some("0"));
+        assert_eq!(game.roms[1].region.as_deref(), Some("fixedbios"));
+        assert_eq!(game.roms[1].bios.as_deref(), Some("us"));
+        assert_eq!(game.roms[2].region.as_deref(), Some("audiocpu"));
+        assert_eq!(game.roms[2].optional.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn rom_without_region_leaves_it_none_not_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml =
+            r#"<mame><machine name="pacman"><rom name="pac.bin" crc="AAAAAAAA"/></machine></mame>"#;
+        let path = write(dir.path(), "no-region.xml", xml);
+        let outcome = parse_mame_listxml(&path, DatLimits::default()).unwrap();
+        assert_eq!(outcome.dat.games[0].roms[0].region, None);
     }
 
     #[test]

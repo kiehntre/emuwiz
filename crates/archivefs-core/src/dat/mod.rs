@@ -50,6 +50,10 @@ pub mod library_identity_summary;
 pub mod limits;
 pub mod managed_sources;
 pub mod model;
+/// Neo Geo MVS/AES multi-ROM set coherence: a thin, read-only projection
+/// over the existing `set`/`dependency` engine plus MAME ROM-region role
+/// evidence. See that module's own doc for the reuse contract.
+pub mod neogeo_set;
 pub mod parser;
 pub mod parsers;
 pub mod policy;

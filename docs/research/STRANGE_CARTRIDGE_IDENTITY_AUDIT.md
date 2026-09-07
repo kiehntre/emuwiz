@@ -36,7 +36,7 @@ history is archaeological only; local code wins when they differ.
 | Atari 2600 | `.a26` is a strong platform extension; `.bin`/`.rom` remain weak; Stella launch planning exists; no cartridge-header parser | Most dumps are headerless raw ROM. Optional copier/homebrew headers are tool/container metadata, not universal retail identity | No, except via external DAT/hash | Authoritative for exact title/revision/mapper | DAT_HASH_AUTHORITATIVE_BY_DESIGN | None for safe identity; optional header recognition would be separate and non-authoritative |
 | Atari 5200 | `.a52` strong extension; `.bin`/`.rom`/`.car` weak; no internal parser | Common 5200 dumps are raw/headerless and overlap Atari 8-bit conventions | No general exact identity from content alone | Authoritative | DAT_HASH_AUTHORITATIVE_BY_DESIGN | No safe universal header identified |
 | Atari Jaguar | `.j64`/`.jag` strong extensions; `.rom`/`.bin`/`.abs`/`.cof` weak; coverage explicitly records no generic internal header; launch mapping only | Jaguar boot blocks can contain per-title/protection/encrypted structures, but are not a universal public identity header | Exact title needs DAT/hash or corroborated external evidence | Authoritative; protection bytes must not be used as title identity | DAT_HASH_AUTHORITATIVE_BY_DESIGN | Research only for a documented, non-encrypted identity leg; do not decode protection |
-| Neo Geo cartridge (MVS/AES) | `.zip`/`.7z` arcade sets are family/folder evidence; platform registry says archives alone prove nothing; no single-file cartridge parser | Identity is a multi-ROM set graph (P, S, M, V, C files), with MAME/FBNeo/software-list names and hashes; AES/MVS are distinct set contexts | Yes for a complete canonical set, not from an arbitrary single file | MAME/FBNeo DAT or software list is authoritative | CORROBORATED_INTERNAL_ID | Add set-graph inspection only if it can reuse existing DAT/archive infrastructure; never infer from ZIP filename |
+| Neo Geo cartridge (MVS/AES) | Multi-ROM set-graph inspection now implemented (`dat::set`, `dat::dependency`, `dat::neogeo_set`; NEO GEO MULTI-ROM SET COHERENCE V1) reusing the existing DAT/archive infrastructure unchanged - no single-file cartridge parser, by design | Identity is a multi-ROM set graph (P, S, M, V, C files), with MAME/FBNeo/software-list names and hashes; the MAME `region=` attribute (now captured) proves ROM role; AES/MVS remain distinct set contexts, never forced from set contents alone | Yes for a complete canonical set, not from an arbitrary single file | MAME/FBNeo DAT or software list is authoritative | CORROBORATED_INTERNAL_ID | None material: set-graph inspection implemented reusing existing DAT/archive infrastructure; never infers identity from a ZIP/folder name |
 
 ## Platform notes and false-positive policy
 
@@ -60,6 +60,11 @@ questions.
 Neo Geo MVS/AES software is a set, not a universal “cartridge header”. A
 complete ROM graph may be matched by MAME/FBNeo/software-list DATs; a lone
 `P1` or ZIP basename is insufficient. No automatic MVS↔AES winner is allowed.
+This set-graph layer is now implemented (`dat::neogeo_set`, NEO GEO
+MULTI-ROM SET COHERENCE V1) as a thin, read-only projection over the
+pre-existing generic `dat::set`/`dat::dependency` completeness engine, plus
+newly-captured MAME `region=` ROM-role evidence; it introduces no
+single-file header, no directory-name identity, and no MVS/AES guess.
 
 Generic `.bin`, `.rom`, `.zip`, `.car`, or `.dsk` content must remain
 ambiguous when multiple platforms accept it. Directory and filename names are
@@ -85,10 +90,14 @@ software identity belongs to canonical content hashes and DAT provenance.
    aliases but no dedicated cartridge identity module. Before coding, establish
    from authoritative dumps whether any stable, cross-release header exists;
    otherwise classify it with the same DAT-led policy as Atari/PC Engine.
-2. **Neo Geo MVS/AES set-coherence inspection (P2).** Existing archive/DAT
-   infrastructure can potentially verify required P/S/M/V/C members and
-   distinguish arcade/home set context. This is a set-graph verifier, not a
-   single-file header parser, and must preserve incomplete/ambiguous sets.
+2. ~~**Neo Geo MVS/AES set-coherence inspection (P2).**~~ **RESOLVED** (NEO
+   GEO MULTI-ROM SET COHERENCE V1): implemented as `dat::neogeo_set`, a
+   read-only projection reusing the existing `dat::set`/`dat::dependency`
+   completeness engine and MAME DAT infrastructure unchanged - no second
+   completeness engine, no single-file header parser, and incomplete/
+   ambiguous/conflicting sets are preserved rather than resolved to a
+   winner. MVS/AES is deliberately not modelled as a boolean since ROM-set
+   contents alone do not uniquely prove it (see the module's own doc).
 
 No other platform above has a proven missing internal identity parser. Adding
 one based on extension, size, folklore offsets, or encrypted boot bytes would

@@ -74,7 +74,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | NEC | PC Engine/TurboGrafx HuCard | EXT | NO | DAT | NO | NO | YES | SUMMARY | YES | YES | 4 | registry | platform tests | HuCard header parser |
 | NEC | PC Engine CD/TG-CD | YES | YES | YES | YES | YES | REDUMP | SUMMARY | YES | YES | 6 | `pcengine_cd_boot_evidence` | IPL tests | more track/session parity |
 | NEC | PC-FX | YES | YES | YES | YES | YES | REDUMP | SUMMARY | YES | YES | 6 | `pcfx_boot_evidence` | boot-sector tests | real samples |
-| SNK | Neo Geo cartridge | EXT | NO | DAT | NO | NO | YES | SUMMARY | YES | YES | 4 | registry/DAT | platform tests | cartridge header |
+| SNK | Neo Geo cartridge | EXT | NO | DAT | SET | SET | YES | SUMMARY | YES | YES | 5 | registry/DAT, `dat::set`, `dat::dependency`, `dat::neogeo_set` | platform tests, `neogeo_set` tests | none material by design (multi-ROM set identity, not a single-file header - see `docs/research/STRANGE_CARTRIDGE_IDENTITY_AUDIT.md`); MVS/AES mode is deliberately not forced from set contents alone |
 | SNK | Neo Geo CD | YES | YES | YES | YES | YES | REDUMP | SUMMARY | YES | YES | 6 | `neogeocd_boot_evidence` | IPL tests | more real media |
 | SNK | Neo Geo Pocket/Color | YES | YES | YES | YES | NO | YES | SUMMARY | YES | YES | 6 | `ngp_header_evidence` | header tests | none material |
 | Bandai | WonderSwan/Color | YES | YES | YES | YES | NO | YES | SUMMARY | YES | YES | 6 | `ws_header_evidence` | footer/header tests | none material |
