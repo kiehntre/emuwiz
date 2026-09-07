@@ -4,13 +4,19 @@
 //! install context. It owns only typed state and backend results; discovery,
 //! binding, planning, previewing, applying, and rollback remain core-owned.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use archivefs_core::patch_manager::{
     CheatDocument, CheatPlatform, DolphinOnFrameBinding, DolphinOnFrameCandidate,
-    DolphinOnFrameInstallPlan, DolphinOnFrameInstallPreview, DolphinOnFrameInstallStatus,
-    DolphinOnFrameSourceError, SharedApplyResult, bind_dolphin_onframe_candidate,
-    discover_dolphin_onframe_candidates,
+    DolphinOnFrameInstallPlan, DolphinOnFrameInstallPreview, DolphinOnFrameInstallPreviewRequest,
+    DolphinOnFrameInstallRequest, DolphinOnFrameInstallStatus, DolphinOnFrameSourceError,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, bind_dolphin_onframe_candidate,
+    build_dolphin_onframe_install_preview, build_shared_transaction_plan,
+    default_shared_backup_root, default_shared_history_root, discover_dolphin_onframe_candidates,
+    execute_shared_apply, execute_shared_rollback, generate_shared_operation_id,
+    preview_shared_rollback, stage_dolphin_onframe_install,
 };
 
 use crate::onframe_install_state::OnFrameInstallState;
@@ -108,6 +114,7 @@ pub(crate) struct OnFrameInstallSession {
     pub preview: Option<DolphinOnFrameInstallPreview>,
     pub transaction: Option<SharedApplyResult>,
     pub rollback_available: bool,
+    pub rollback_preview: Option<SharedRollbackPreview>,
     pub recovery_required: Option<String>,
     pub error: Option<String>,
 }
@@ -241,6 +248,211 @@ impl OnFrameInstallSession {
         }
     }
 
+    pub(crate) fn prepare_preview(&mut self) -> bool {
+        let Some(binding) = self.binding.as_ref().cloned() else {
+            self.set_error("OnFrame preview requires a verified binding");
+            return false;
+        };
+        let existing = match fs::read_to_string(&binding.gamesettings_destination) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                self.set_error(format!("could not read Dolphin GameSettings: {error}"));
+                return false;
+            }
+        };
+        let plan = match archivefs_core::patch_manager::plan_dolphin_onframe_install(
+            &DolphinOnFrameInstallRequest {
+                game_id: &binding.verified_game_id,
+                revision: None,
+                document: &binding.candidate.document,
+                existing_contents: existing.as_deref(),
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.set_error(error.to_string());
+                return false;
+            }
+        };
+        let staging_root = match crate::default_generated_dolphin_local_staging_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.set_error(error);
+                return false;
+            }
+        };
+        let staged = match stage_dolphin_onframe_install(&staging_root, &plan, existing.is_some()) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.set_error(error.to_string());
+                return false;
+            }
+        };
+        let preview =
+            match build_dolphin_onframe_install_preview(&DolphinOnFrameInstallPreviewRequest {
+                selected_archive: binding.candidate.provenance.clone(),
+                configuration_path: binding.profile_root.clone(),
+                game_id: binding.verified_game_id.clone(),
+                revision: None,
+                staged,
+            }) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    self.set_error(error.to_string());
+                    return false;
+                }
+            };
+        self.retain_plan_and_preview(plan, preview)
+    }
+
+    pub(crate) fn apply_confirmed(&mut self, profile_id: &str) -> bool {
+        if !matches!(
+            self.workflow_state,
+            OnFrameInstallState::AwaitingConfirmation { .. }
+        ) {
+            self.set_error("OnFrame apply requires explicit confirmation");
+            return false;
+        }
+        let Some(preview) = self.preview.as_ref() else {
+            self.set_error("OnFrame apply requires a retained preview");
+            return false;
+        };
+        let plan = match build_shared_transaction_plan(
+            &preview.report,
+            profile_id,
+            "dolphin-onframe",
+            &preview.staged.staging_root,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.set_error(error.detail);
+                return false;
+            }
+        };
+        let replacement_approved = plan.entries.iter().any(|entry| {
+            entry.proposed_action == archivefs_core::patch_manager::PreviewProposedAction::Replace
+        });
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.set_error(error.detail);
+                return false;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.set_error(error.detail);
+                return false;
+            }
+        };
+        self.begin_apply();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |value| value.as_secs());
+        let result = execute_shared_apply(
+            &plan,
+            &SharedApplyOptions {
+                dry_run: false,
+                confirmation: Some(SharedApplyConfirmation {
+                    plan_id: plan.plan_id.clone(),
+                    general_approved: true,
+                    replacement_approved,
+                }),
+                operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                current_context: plan.context.clone(),
+                history_root,
+                backup_root,
+            },
+        );
+        self.retain_apply_result(result);
+        true
+    }
+
+    pub(crate) fn prepare_rollback(&mut self) -> bool {
+        let Some(transaction) = self.transaction.as_ref() else {
+            self.set_error("No OnFrame transaction is available to roll back");
+            return false;
+        };
+        let Some(journal_path) = transaction.journal_path.as_ref() else {
+            self.set_error("The OnFrame transaction has no rollback journal");
+            return false;
+        };
+        let Some(binding) = self.binding.as_ref() else {
+            self.set_error("OnFrame rollback requires the original binding");
+            return false;
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.set_error(error.detail);
+                return false;
+            }
+        };
+        self.rollback_preview = Some(preview_shared_rollback(
+            journal_path,
+            &binding.profile_root,
+            &backup_root,
+        ));
+        self.rollback_preview
+            .as_ref()
+            .is_some_and(|preview| preview.available)
+    }
+
+    pub(crate) fn rollback_confirmed(&mut self) -> bool {
+        let Some(preview) = self.rollback_preview.take() else {
+            self.set_error("Rollback requires an available rollback preview");
+            return false;
+        };
+        let history_root = match default_shared_history_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.set_error(error.detail);
+                return false;
+            }
+        };
+        let backup_root = match default_shared_backup_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.set_error(error.detail);
+                return false;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |value| value.as_secs());
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: generate_shared_operation_id(),
+                timestamp_unix_seconds: timestamp,
+                history_root,
+                backup_root,
+            },
+        );
+        if result.status == archivefs_core::patch_manager::SharedApplyStatus::Success {
+            self.rollback_available = false;
+            if let Some(binding) = self.binding.as_ref() {
+                self.workflow_state = OnFrameInstallState::RolledBack {
+                    binding: binding.backend.clone(),
+                };
+            }
+            true
+        } else {
+            self.set_error(format!(
+                "OnFrame rollback did not fully succeed: {:?}",
+                result.status
+            ));
+            false
+        }
+    }
+
     pub(crate) fn begin_apply(&mut self) {
         self.workflow_state.approve();
     }
@@ -337,6 +549,7 @@ impl OnFrameInstallSession {
         self.preview = None;
         self.transaction = None;
         self.rollback_available = false;
+        self.rollback_preview = None;
         self.recovery_required = None;
     }
 }
@@ -483,6 +696,18 @@ mod tests {
         assert_eq!(view.game_id.as_deref(), Some("GMSE01"));
         assert_eq!(view.patch.as_deref(), Some("60 FPS"));
         assert!(!view.can_install);
+    }
+
+    #[test]
+    fn apply_method_requires_explicit_confirmation_state() {
+        let mut session = selected_session(CheatPlatform::GameCube);
+        assert!(session.bind_selected(Some("GMSE01"), Some(Path::new("/dolphin")), false));
+        assert!(!session.apply_confirmed("profile"));
+        assert!(matches!(
+            session.workflow_state,
+            OnFrameInstallState::Failed { .. }
+        ));
+        assert!(session.transaction.is_none());
     }
 
     #[test]

@@ -30683,6 +30683,11 @@ fn local_dolphin_install_context(
     };
     Some(user_cheat_import_page::LocalDolphinInstallContext {
         candidate,
+        platform: if is_wii {
+            archivefs_core::patch_manager::CheatPlatform::Wii
+        } else {
+            archivefs_core::patch_manager::CheatPlatform::GameCube
+        },
         configuration_path,
         profile_id,
     })

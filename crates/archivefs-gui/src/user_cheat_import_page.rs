@@ -147,6 +147,7 @@ impl Default for LocalPcsx2InstallStage {
 /// Dolphin Gecko provider workflow binds them, never re-derived here.
 pub(crate) struct LocalDolphinInstallContext {
     pub candidate: DolphinCandidate,
+    pub platform: CheatPlatform,
     pub configuration_path: PathBuf,
     /// The selected Dolphin profile's own ID, exactly the string
     /// `build_shared_transaction_plan` already scopes every other Dolphin
@@ -498,8 +499,180 @@ impl UserCheatImportPageState {
         self.show_local_install_panel(ui);
         self.show_local_pcsx2_install_panel(ui);
         self.show_local_dolphin_install_panel(ui);
+        self.show_onframe_install_panel(ui, local_dolphin_install_context);
         self.show_local_xenia_install_picker(ui, local_xenia_install_context);
         self.show_local_xenia_install_panel(ui);
+    }
+
+    fn show_onframe_install_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+    ) {
+        ui.add_space(theme_gap());
+        let Some(context) = local_dolphin_install_context else {
+            return;
+        };
+        let platform = context.platform.clone();
+        let game_id = context.candidate.game_id.clone();
+        let configuration_path = context.configuration_path.clone();
+        let profile_id = context.profile_id.clone();
+        let session = &mut self.onframe_install;
+        widgets::card(ui, |ui| {
+            ui.strong("Install a Dolphin OnFrame cheat");
+            ui.label(
+                "Choose a local OnFrame file, review the exact change, then confirm the install.",
+            );
+            if widgets::action_button(
+                ui,
+                "Choose OnFrame file…",
+                widgets::ActionStyle::Primary,
+                !session.source_candidates.discovering,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Dolphin OnFrame", &["ini"])
+                    .pick_file()
+            {
+                session.discover(path, platform.clone());
+            }
+            if session.source_candidates.discovering {
+                ui.spinner();
+                ui.label("Reading OnFrame candidates…");
+            }
+            if let Some(error) = session.source_candidates.discovery_error.as_deref() {
+                widgets::banner(
+                    ui,
+                    "OnFrame file could not be used",
+                    error,
+                    widgets::StatusTone::Blocked,
+                );
+            }
+            let mut clicked_candidate = None;
+            for (index, source) in session.source_candidates.candidates.iter().enumerate() {
+                let selected = session.source_candidates.selected == Some(index);
+                if ui
+                    .selectable_label(
+                        selected,
+                        format!(
+                            "{} — {}",
+                            source.candidate.title,
+                            source.provenance.display()
+                        ),
+                    )
+                    .clicked()
+                {
+                    clicked_candidate = Some(index);
+                }
+            }
+            if let Some(index) = clicked_candidate {
+                session.select_candidate(index);
+            }
+            if session.selected_candidate.is_some() && session.binding.is_none() {
+                if ui.button("Bind to verified game").clicked() {
+                    session.bind_selected(Some(&game_id), Some(&configuration_path), false);
+                }
+            }
+            if let Some(binding) = session.binding.as_ref() {
+                ui.label(format!("Verified game: {}", binding.verified_game_id));
+                ui.label(format!(
+                    "Destination: {}",
+                    binding.gamesettings_destination.display()
+                ));
+                if !binding.refusal_reasons.is_empty() {
+                    for reason in &binding.refusal_reasons {
+                        ui.colored_label(egui::Color32::YELLOW, reason);
+                    }
+                }
+                if session.preview.is_none() && binding.can_install {
+                    if ui.button("Build install preview").clicked() {
+                        session.prepare_preview();
+                    }
+                }
+            }
+            if let Some(plan) = session.plan.as_ref() {
+                egui::CollapsingHeader::new("Install preview")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(format!("Patch: {}", plan.patch_name));
+                        ui.label(format!("Exact operations: {}", plan.lines.len()));
+                        ui.label(format!("Status: {:?}", plan.status));
+                        for conflict in &plan.conflicts {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("Conflict: {conflict}"),
+                            );
+                        }
+                        for warning in &plan.warnings {
+                            ui.label(format!("Warning: {warning}"));
+                        }
+                        ui.monospace(plan.new_contents.as_str());
+                    });
+            }
+            match &session.workflow_state {
+                crate::onframe_install_state::OnFrameInstallState::PreviewReady { .. } => {
+                    if ui.button("Review and confirm install").clicked() {
+                        session.request_confirmation();
+                    }
+                }
+                crate::onframe_install_state::OnFrameInstallState::AwaitingConfirmation {
+                    ..
+                } => {
+                    ui.label("This will update Dolphin's GameSettings file after confirmation.");
+                    if ui.button("Confirm Apply").clicked() {
+                        session.apply_confirmed(&profile_id);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        session.workflow_state.cancel_confirmation();
+                    }
+                }
+                crate::onframe_install_state::OnFrameInstallState::Applied {
+                    transaction_id,
+                    ..
+                } => {
+                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Success);
+                    if let Some(transaction_id) = transaction_id {
+                        ui.label(format!("Transaction: {transaction_id}"));
+                    }
+                    if session.rollback_available && ui.button("Undo this install").clicked() {
+                        session.prepare_rollback();
+                    }
+                }
+                crate::onframe_install_state::OnFrameInstallState::RolledBack { .. } => {
+                    widgets::status_badge(ui, "Install undone", widgets::StatusTone::Info);
+                }
+                crate::onframe_install_state::OnFrameInstallState::RecoveryRequired {
+                    detail,
+                    ..
+                } => {
+                    widgets::banner(
+                        ui,
+                        "Recovery required",
+                        detail,
+                        widgets::StatusTone::Blocked,
+                    );
+                }
+                crate::onframe_install_state::OnFrameInstallState::Failed { message } => {
+                    widgets::banner(
+                        ui,
+                        "OnFrame install blocked",
+                        message,
+                        widgets::StatusTone::Blocked,
+                    );
+                }
+                _ => {}
+            }
+            if let Some(rollback) = session.rollback_preview.as_ref() {
+                ui.label("Rollback preview");
+                ui.label(format!("Rollback available: {}", rollback.available));
+                if rollback.available && ui.button("Confirm undo").clicked() {
+                    session.rollback_confirmed();
+                }
+                if ui.button("Cancel undo").clicked() {
+                    session.rollback_preview = None;
+                }
+            }
+        });
     }
 
     /// Dolphin's local-file entry point: unlike RetroArch/PCSX2, Dolphin

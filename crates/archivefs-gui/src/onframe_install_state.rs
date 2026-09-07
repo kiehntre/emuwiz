@@ -38,6 +38,9 @@ pub enum OnFrameInstallState {
         transaction_id: Option<String>,
         rollback_available: bool,
     },
+    RolledBack {
+        binding: DolphinOnFrameBinding,
+    },
     AlreadyInstalled {
         binding: DolphinOnFrameBinding,
     },
