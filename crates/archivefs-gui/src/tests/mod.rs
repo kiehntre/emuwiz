@@ -1024,6 +1024,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         // Left unloaded: these tests never open the Cheat Sources page,
         // and loading it here would read the real per-user preferences.
         cheat_sources_page: None,
+        cheat_reconciliation_review:
+            cheat_reconciliation_review::CheatReconciliationReviewState::default(),
         cheatbase_page: Default::default(),
         user_cheat_import_page: Default::default(),
         local_mod_package: Default::default(),
