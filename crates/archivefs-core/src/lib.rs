@@ -34,6 +34,8 @@ pub mod managed_appimage_bootstrap;
 pub mod retroachievements;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
+/// Bounded PCM/WAV pulse evidence for tape recordings.
+pub mod tape_audio;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
