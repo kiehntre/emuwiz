@@ -180,6 +180,7 @@ fn lookup_no_intro_for(
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedEvidenceReport {
     pub path: PathBuf,
+    pub tape_analysis: Option<Result<archivefs_core::tape_analysis::TapeAnalysis, String>>,
     pub structural_facts: Vec<ContentEvidence>,
     pub identity: IdentityPresentation,
     /// The raw identity result `identity` was presented from - kept
@@ -222,6 +223,30 @@ fn is_compressed_archive(path: &Path) -> bool {
                 | archivefs_core::ArchiveKind::Rar
         )
     )
+}
+
+fn analyze_tape_file(
+    path: &Path,
+    platform_hint: Option<&str>,
+) -> Option<Result<archivefs_core::tape_analysis::TapeAnalysis, String>> {
+    if !crate::tape_analysis_page::is_tape_path(path) {
+        return None;
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(Err(format!("could not inspect tape size: {error}"))),
+    };
+    if metadata.len() > archivefs_core::tape_analysis::MAX_ANALYSIS_BYTES as u64 {
+        return Some(Err("tape exceeds the bounded 8 MiB analysis limit".into()));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(format!("could not read tape: {error}"))),
+    };
+    Some(crate::tape_analysis_page::analyze_bytes(
+        &bytes,
+        platform_hint,
+    ))
 }
 
 /// Gathers real evidence for `path`: reads it once, runs the real
@@ -271,6 +296,7 @@ pub(crate) fn gather_selected_evidence_fast(
     platform_hint: Option<&str>,
 ) -> Result<SelectedEvidenceReport, String> {
     let archive = is_compressed_archive(path);
+    let tape_analysis = analyze_tape_file(path, platform_hint);
     let structural_facts = if archive {
         // Archive extensions do not feed any of this module's loose-ROM
         // structural detectors. Opening is enough to surface a missing or
@@ -301,6 +327,7 @@ pub(crate) fn gather_selected_evidence_fast(
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
+        tape_analysis,
         structural_facts,
         identity,
         identity_result,
@@ -393,6 +420,14 @@ pub(crate) fn gather_selected_evidence_with_platform(
 ) -> Result<SelectedEvidenceReport, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let tape_analysis = if crate::tape_analysis_page::is_tape_path(path) {
+        Some(crate::tape_analysis_page::analyze_bytes(
+            &bytes,
+            platform_hint,
+        ))
+    } else {
+        None
+    };
     let structural_facts = gather_structural_evidence(path, &bytes);
     let explanation = fuse_platform_evidence(structural_facts.clone());
 
@@ -433,6 +468,7 @@ pub(crate) fn gather_selected_evidence_with_platform(
 
     Ok(SelectedEvidenceReport {
         path: path.to_path_buf(),
+        tape_analysis,
         structural_facts,
         identity,
         identity_result,
@@ -1511,6 +1547,7 @@ mod tests {
         let identity_result = inspect_identity(IdentityInspectionInput::default());
         SelectedEvidenceReport {
             path: PathBuf::from("test.gb"),
+            tape_analysis: None,
             structural_facts: Vec::new(),
             identity:
                 archivefs_core::platform_evidence_fusion::identity_presentation::present_identity(

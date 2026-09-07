@@ -4165,6 +4165,7 @@ fn ready_selected_evidence_state(
         generation: 0,
         report: Box::new(selected_evidence_page::SelectedEvidenceReport {
             path: path.to_path_buf(),
+            tape_analysis: None,
             structural_facts: Vec::new(),
             identity,
             identity_result,

@@ -211,6 +211,7 @@ pub(crate) mod romm_source;
 pub(crate) mod rpcs3_page;
 pub(crate) mod selected_evidence_no_intro;
 pub(crate) mod selected_evidence_page;
+pub(crate) mod tape_analysis_page;
 pub mod selection_guard;
 mod source_state;
 mod sources_page;

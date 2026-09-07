@@ -345,8 +345,22 @@ pub(crate) fn show_selected_archive(
                 widgets::technical_details(ui, "selected-game-identity", |ui| {
                     selected_evidence_page::show_identity_evidence(ui, report);
                 });
+                if let Some(tape_analysis) = &report.tape_analysis {
+                    match tape_analysis {
+                        Ok(analysis) => tape_analysis_page::show_result(ui, analysis),
+                        Err(message) => {
+                            widgets::banner(
+                                ui,
+                                "Tape analysis unavailable",
+                                message,
+                                widgets::StatusTone::Info,
+                            );
+                        }
+                    }
+                }
             }
             SelectedEvidenceView::Loading => {
+                tape_analysis_page::show_loading(ui);
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Checking game identity…");
