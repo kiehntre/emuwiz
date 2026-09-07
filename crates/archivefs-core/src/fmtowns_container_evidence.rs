@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
-use crate::disk_format::{DiskFormat, DiskFormatContext, DiskFormatMetadata, inspect_disk_format};
-use crate::fmtowns_boot_evidence::{FmTownsBootEvidence, inspect_fmtowns_boot_sector};
-use crate::safe_read::{TrustedRoots, open_bounded_read};
+use crate::disk_format::{inspect_disk_format, DiskFormat, DiskFormatContext, DiskFormatMetadata};
+use crate::fmtowns_boot_evidence::{inspect_fmtowns_boot_sector, FmTownsBootEvidence};
+use crate::safe_read::{open_bounded_read, TrustedRoots};
 
 const MAX_BOOT_READ: usize = 1024;
 const FBIOS_MAGIC: &[u8; 5] = b"FBIOS";
