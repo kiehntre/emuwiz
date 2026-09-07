@@ -20,10 +20,14 @@ encrypted codes, and unknown widths from being silently converted to writes.
 * PNACH `byte`, `short`, and `word` patch lines map to the matching width.
   `double` and `extended` remain unsupported because the IR does not model
   their semantics.
-* RetroArch `.cht` entries, Action Replay DS records, GameShark, and
-  CodeBreaker do not have a proven direct-write grammar in the current core;
-  they remain native/browse-only or opaque until an authoritative parser is
-  available. No encrypted representation is guessed.
+* Nintendo DS Action Replay now has a strict source-only classifier for
+  canonical direct-only `0XXXXXXX YYYYYYYY`, `1XXXXXXX 0000YYYY`, and
+  `2XXXXXXX 000000YY` records. It maps those records to `Write32`, `Write16`,
+  and `Write8` respectively, while preserving every other line as
+  `UnsupportedRaw` with a typed refusal reason. It has no target writer.
+* RetroArch `.cht` entries, GameShark, and CodeBreaker remain native/browse-only
+  or opaque until an authoritative, version-specific parser and encoder exist.
+  No encrypted representation is guessed.
 
 The V2 `encode_operation` helper emits pure in-memory direct-write text for
 Dolphin Action Replay, Gecko, and PNACH. `assess_document_conversion` returns
@@ -33,12 +37,11 @@ explicitly, and `can_apply` is false whenever an operation, issue, platform,
 or encoder is unresolved. No output is fabricated and no emulator file is
 written.
 
-Nintendo DS Action Replay, RetroArch expressions, GameShark, and CodeBreaker
-remain opaque in this revision. The current repository does not provide an
-authoritative grammar for their direct-write subsets; conditions, activators,
-pointer/loop codes, master/init codes, and encrypted variants are therefore
-preserved as unsupported rather than guessed. No melonDS, DeSmuME, or
-RetroArch writer is enabled by the IR.
+DS Action Replay conditions, activators, pointers, loops/multi-writes,
+copy/fill, offset/data-register operations, processor/master-init forms, and
+unknown/encrypted variants remain preserved as unsupported rather than
+guessed. The parser rejects malformed, noncanonical, and misaligned direct
+writes. No melonDS, DeSmuME, or RetroArch DS writer is enabled by the IR.
 
 V4 exposes `convert_cheat_document` and `supported_targets_for` as the reusable
 converter-service seam. They return GUI-ready capability and per-operation

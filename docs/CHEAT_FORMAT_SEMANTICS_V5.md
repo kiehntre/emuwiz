@@ -1,7 +1,7 @@
 # Cheat-format semantic evidence (V5)
 
-**Decision status:** research complete; no parser, encoder, installer, or GUI
-change is made by this document.  The neutral IR remains deliberately limited
+**Decision status:** research complete; V6 adds a source-only DS AR parser and
+classifier, but no encoder, installer, or GUI change.  The neutral IR remains deliberately limited
 to proven direct writes.  In particular, a familiar brand name is never enough
 to identify a cheat grammar.
 
@@ -56,9 +56,10 @@ solely of the canonical `0`, `1`, and `2` forms proves that offset is its
 initial zero value.  Alignment should also be checked for 16- and 32-bit
 writes before an eventual parser accepts a record.
 
-This is **High** confidence for parsing to neutral IR.  It is **not** an
-approved target encoder: neither a melonDS nor a DeSmuME native direct-write
-file/install contract is presently implemented or reviewed in EmuWiz.
+This is now implemented as a **High** confidence source-to-IR classifier in
+`cheat_ir.rs`. It is **not** an approved target encoder: neither a melonDS nor
+a DeSmuME native direct-write file/install contract is presently implemented or
+reviewed in EmuWiz.
 
 ### DS families deliberately not reduced to writes
 
@@ -167,7 +168,7 @@ replaced by one.
 | PS2 | PNACH | PCSX2 raw patch | Yes | Yes | `byte`/`short`/`word` | no device encryption | direct-write preview/conversion | complete current boundary |
 | PS2 | GameShark | version unspecified | No | No | none proven | unknown/version-dependent | target shown unavailable | acquire lawful versioned fixtures and an authoritative grammar |
 | PS2 | CodeBreaker | version unspecified | No | No | none proven | unknown/version-dependent | target shown unavailable | acquire lawful versioned fixtures and an authoritative grammar |
-| Nintendo DS | Action Replay DS | DeSmuME ARparser-compatible canonical direct records | **Yes, future source parser** | No | canonical `0`/`1`/`2` complete direct-only records | no, only under direct-only constraint | CheatBase browse-only | add isolated source→IR parser and fixtures, then separately audit writer |
+| Nintendo DS | Action Replay DS | DeSmuME ARparser-compatible canonical direct records | **Yes, V6** | No | canonical `0`/`1`/`2` complete direct-only records | no, only under direct-only constraint | CheatBase browse-only plus source-only IR classifier | separately audit a native target writer |
 | RetroArch | `.cht` | generic/core-dependent | No generic parse | No generic encode | none globally | handler/core state required | bounded native install only | audit one named core/handler, not “RetroArch” generally |
 
 ## Ranked next implementation targets

@@ -59,6 +59,36 @@ pub enum CheatIssue {
     UnknownWidth,
     RawPreserved,
     MissingTargetEncoder,
+    DsActionReplayUnsupported(DsActionReplayUnsupportedKind),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DsActionReplayUnsupportedKind {
+    Malformed,
+    NonCanonical,
+    Misaligned,
+    HookOrSpecial,
+    Conditional,
+    Activator,
+    Pointer,
+    LoopOrMultiWrite,
+    CopyFill,
+    OffsetRegister,
+    MasterInit,
+    EncryptedOrUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DsActionReplayUnsupported {
+    pub kind: DsActionReplayUnsupportedKind,
+    pub raw: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DsActionReplayClassification {
+    DirectWrite(CheatOperation),
+    Unsupported(DsActionReplayUnsupported),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +182,215 @@ pub fn dolphin_line_to_ir(raw: &str, format: CheatSourceFormat) -> CheatOperatio
             raw: raw.to_string(),
             reason: "control or format-specific operation".into(),
         },
+    }
+}
+
+fn ds_action_replay_unsupported(
+    raw: &str,
+    kind: DsActionReplayUnsupportedKind,
+    reason: impl Into<String>,
+) -> DsActionReplayClassification {
+    DsActionReplayClassification::Unsupported(DsActionReplayUnsupported {
+        kind,
+        raw: raw.to_string(),
+        reason: reason.into(),
+    })
+}
+
+/// Classifies one canonical Nintendo DS Action Replay pair.
+///
+/// Only the three constant-write families are projected into the neutral IR.
+/// The complete record must be direct-only because the real AR interpreter has
+/// mutable offset/data/condition state.  Everything else remains raw and
+/// carries a typed refusal reason.
+pub fn ds_action_replay_line_to_ir(raw: &str) -> DsActionReplayClassification {
+    let fields: Vec<_> = raw.split_whitespace().collect();
+    if fields.len() != 2 {
+        return ds_action_replay_unsupported(
+            raw,
+            DsActionReplayUnsupportedKind::Malformed,
+            "a DS Action Replay pair must contain exactly two hexadecimal words",
+        );
+    }
+    let Ok(first) = u32::from_str_radix(fields[0], 16) else {
+        return ds_action_replay_unsupported(
+            raw,
+            DsActionReplayUnsupportedKind::Malformed,
+            "the DS Action Replay address/opcode word is not hexadecimal",
+        );
+    };
+    let Ok(value) = u32::from_str_radix(fields[1], 16) else {
+        return ds_action_replay_unsupported(
+            raw,
+            DsActionReplayUnsupportedKind::Malformed,
+            "the DS Action Replay value word is not hexadecimal",
+        );
+    };
+    if fields[0].len() != 8 || fields[1].len() != 8 {
+        return ds_action_replay_unsupported(
+            raw,
+            DsActionReplayUnsupportedKind::Malformed,
+            "DS Action Replay words must be exactly eight hexadecimal digits",
+        );
+    }
+
+    let family = first >> 28;
+    let address = u64::from(first & 0x0FFF_FFFF);
+    let direct = match family {
+        0 => {
+            if first == 0 {
+                return ds_action_replay_unsupported(
+                    raw,
+                    DsActionReplayUnsupportedKind::HookOrSpecial,
+                    "00000000 is the Action Replay manual-hook special case",
+                );
+            }
+            if address % 4 != 0 {
+                return ds_action_replay_unsupported(
+                    raw,
+                    DsActionReplayUnsupportedKind::Misaligned,
+                    "a 32-bit DS Action Replay write must be four-byte aligned",
+                );
+            }
+            Some(CheatOperation::Write32 { address, value })
+        }
+        1 => {
+            if value > 0xFFFF {
+                return ds_action_replay_unsupported(
+                    raw,
+                    DsActionReplayUnsupportedKind::NonCanonical,
+                    "a 16-bit DS Action Replay write must have zero unused value bits",
+                );
+            }
+            if address % 2 != 0 {
+                return ds_action_replay_unsupported(
+                    raw,
+                    DsActionReplayUnsupportedKind::Misaligned,
+                    "a 16-bit DS Action Replay write must be two-byte aligned",
+                );
+            }
+            Some(CheatOperation::Write16 {
+                address,
+                value: value as u16,
+            })
+        }
+        2 => {
+            if value > 0xFF {
+                return ds_action_replay_unsupported(
+                    raw,
+                    DsActionReplayUnsupportedKind::NonCanonical,
+                    "an 8-bit DS Action Replay write must have zero unused value bits",
+                );
+            }
+            Some(CheatOperation::Write8 {
+                address,
+                value: value as u8,
+            })
+        }
+        3..=6 => {
+            return ds_action_replay_unsupported(
+                raw,
+                DsActionReplayUnsupportedKind::Conditional,
+                "conditional comparison families are not representable by a direct write",
+            );
+        }
+        7..=10 => {
+            return ds_action_replay_unsupported(
+                raw,
+                DsActionReplayUnsupportedKind::Conditional,
+                "masked conditional families are not representable by a direct write",
+            );
+        }
+        11 => {
+            return ds_action_replay_unsupported(
+                raw,
+                DsActionReplayUnsupportedKind::Pointer,
+                "the B family loads a mutable offset from memory",
+            );
+        }
+        12 => {
+            return ds_action_replay_unsupported(
+                raw,
+                DsActionReplayUnsupportedKind::LoopOrMultiWrite,
+                "C-family trainer and loop operations are stateful",
+            );
+        }
+        13 => {
+            let subtype = (first >> 24) & 0xFF;
+            let (kind, reason) = match subtype {
+                0xD0..=0xD2 => (
+                    DsActionReplayUnsupportedKind::LoopOrMultiWrite,
+                    "D0-D2 terminator and loop operations are stateful",
+                ),
+                0xD3 | 0xDC => (
+                    DsActionReplayUnsupportedKind::OffsetRegister,
+                    "D3/DC mutate the Action Replay offset register",
+                ),
+                0xD4..=0xDB => (
+                    DsActionReplayUnsupportedKind::OffsetRegister,
+                    "D4-DB use mutable data/offset state",
+                ),
+                0xDF => (
+                    DsActionReplayUnsupportedKind::MasterInit,
+                    "DF changes the emulated processor context",
+                ),
+                _ => (
+                    DsActionReplayUnsupportedKind::EncryptedOrUnknown,
+                    "unknown D-family operation",
+                ),
+            };
+            return ds_action_replay_unsupported(raw, kind, reason);
+        }
+        14 | 15 => {
+            return ds_action_replay_unsupported(
+                raw,
+                DsActionReplayUnsupportedKind::CopyFill,
+                "E/F families copy or fill memory and are not direct writes",
+            );
+        }
+        _ => {
+            return ds_action_replay_unsupported(
+                raw,
+                DsActionReplayUnsupportedKind::EncryptedOrUnknown,
+                "unknown or encrypted DS Action Replay opcode family",
+            );
+        }
+    };
+    DsActionReplayClassification::DirectWrite(direct.expect("direct family has an operation"))
+}
+
+/// Parses a bounded, line-oriented DS Action Replay document into the
+/// existing neutral IR. Unsupported lines remain in-order as `UnsupportedRaw`
+/// operations and add a typed issue; they are never dropped.
+pub fn parse_ds_action_replay_document(
+    title: impl Into<String>,
+    text: &str,
+    provenance: Vec<String>,
+) -> CheatDocument {
+    let mut operations = Vec::new();
+    let mut issues = Vec::new();
+    for raw in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match ds_action_replay_line_to_ir(raw) {
+            DsActionReplayClassification::DirectWrite(operation) => operations.push(operation),
+            DsActionReplayClassification::Unsupported(unsupported) => {
+                issues.push(CheatIssue::DsActionReplayUnsupported(
+                    unsupported.kind.clone(),
+                ));
+                operations.push(CheatOperation::UnsupportedRaw {
+                    source_format: CheatSourceFormat::ActionReplayDs,
+                    raw: unsupported.raw,
+                    reason: unsupported.reason,
+                });
+            }
+        }
+    }
+    CheatDocument {
+        title: title.into(),
+        platform: CheatPlatform::NintendoDs,
+        source_format: CheatSourceFormat::ActionReplayDs,
+        operations,
+        issues,
+        provenance,
     }
 }
 
@@ -269,9 +508,7 @@ pub fn assess_document_conversion(
     let mut operation_status = Vec::with_capacity(document.operations.len());
     let mut output = Vec::new();
     for op in &document.operations {
-        if matches!(op, CheatOperation::UnsupportedRaw { .. })
-            || encode_operation(op, &target).is_none()
-        {
+        if matches!(op, CheatOperation::UnsupportedRaw { .. }) {
             unsupported += 1;
             let reason = match op {
                 CheatOperation::UnsupportedRaw { reason, .. } => reason.clone(),
@@ -291,7 +528,10 @@ pub fn assess_document_conversion(
     }
     let missing_encoder = matches!(
         target,
-        CheatTargetFormat::GameSharkPs2 | CheatTargetFormat::CodeBreakerPs2
+        CheatTargetFormat::GameSharkPs2
+            | CheatTargetFormat::CodeBreakerPs2
+            | CheatTargetFormat::ActionReplayDs
+            | CheatTargetFormat::RetroArch
     );
     if missing_encoder {
         warnings.push(CheatIssue::MissingTargetEncoder);
@@ -486,5 +726,167 @@ mod tests {
         assert_eq!(preview.unsupported_operations, 1);
         assert!(!preview.can_apply);
         assert_eq!(supported_targets_for(&d).len(), 2);
+    }
+
+    #[test]
+    fn ds_action_replay_direct_write_families_are_typed() {
+        assert_eq!(
+            ds_action_replay_line_to_ir("02345678 DEADBEEF"),
+            DsActionReplayClassification::DirectWrite(CheatOperation::Write32 {
+                address: 0x0234_5678,
+                value: 0xDEAD_BEEF,
+            })
+        );
+        assert_eq!(
+            ds_action_replay_line_to_ir("12345678 0000BEEF"),
+            DsActionReplayClassification::DirectWrite(CheatOperation::Write16 {
+                address: 0x0234_5678,
+                value: 0xBEEF,
+            })
+        );
+        assert_eq!(
+            ds_action_replay_line_to_ir("22345679 000000EF"),
+            DsActionReplayClassification::DirectWrite(CheatOperation::Write8 {
+                address: 0x0234_5679,
+                value: 0xEF,
+            })
+        );
+    }
+
+    #[test]
+    fn ds_action_replay_rejects_malformed_noncanonical_and_misaligned_lines() {
+        let cases = [
+            ("not-hex 00000000", DsActionReplayUnsupportedKind::Malformed),
+            ("02345678", DsActionReplayUnsupportedKind::Malformed),
+            (
+                "12345678 1000BEEF",
+                DsActionReplayUnsupportedKind::NonCanonical,
+            ),
+            (
+                "22345679 000001EF",
+                DsActionReplayUnsupportedKind::NonCanonical,
+            ),
+            (
+                "02345679 DEADBEEF",
+                DsActionReplayUnsupportedKind::Misaligned,
+            ),
+            (
+                "12345679 0000BEEF",
+                DsActionReplayUnsupportedKind::Misaligned,
+            ),
+            (
+                "00000000 12345678",
+                DsActionReplayUnsupportedKind::HookOrSpecial,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let DsActionReplayClassification::Unsupported(result) =
+                ds_action_replay_line_to_ir(raw)
+            else {
+                panic!("{raw} unexpectedly parsed as direct write");
+            };
+            assert_eq!(result.kind, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn ds_action_replay_classifies_stateful_families_without_guessing() {
+        let cases = [
+            (
+                "32345678 00000001",
+                DsActionReplayUnsupportedKind::Conditional,
+            ),
+            ("B2345678 00000000", DsActionReplayUnsupportedKind::Pointer),
+            (
+                "C0000000 00000001",
+                DsActionReplayUnsupportedKind::LoopOrMultiWrite,
+            ),
+            (
+                "D3000000 00000010",
+                DsActionReplayUnsupportedKind::OffsetRegister,
+            ),
+            ("E2345678 00000004", DsActionReplayUnsupportedKind::CopyFill),
+            ("F2345678 00000004", DsActionReplayUnsupportedKind::CopyFill),
+            (
+                "DFFFFFFF 99999999",
+                DsActionReplayUnsupportedKind::MasterInit,
+            ),
+            (
+                "A2345678 0000FFFF",
+                DsActionReplayUnsupportedKind::Conditional,
+            ),
+            (
+                "F2345678 00000004 extra",
+                DsActionReplayUnsupportedKind::Malformed,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let DsActionReplayClassification::Unsupported(result) =
+                ds_action_replay_line_to_ir(raw)
+            else {
+                panic!("{raw} unexpectedly parsed as direct write");
+            };
+            assert_eq!(result.kind, expected, "{raw}");
+            assert_eq!(result.raw, raw);
+        }
+    }
+
+    #[test]
+    fn ds_action_replay_document_preserves_mixed_operations_and_identity() {
+        let document = parse_ds_action_replay_document(
+            "Mario DS",
+            "02345678 DEADBEEF\n12345678 0000BEEF\n32345678 00000001\n22345679 000000EF",
+            vec!["CheatBase:rom-42".into()],
+        );
+        assert_eq!(document.title, "Mario DS");
+        assert_eq!(document.platform, CheatPlatform::NintendoDs);
+        assert_eq!(document.source_format, CheatSourceFormat::ActionReplayDs);
+        assert_eq!(document.provenance, vec!["CheatBase:rom-42".to_string()]);
+        assert_eq!(document.operations.len(), 4);
+        assert_eq!(
+            document
+                .operations
+                .iter()
+                .filter(|operation| !matches!(operation, CheatOperation::UnsupportedRaw { .. }))
+                .count(),
+            3
+        );
+        assert!(matches!(
+            &document.operations[2],
+            CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::ActionReplayDs,
+                raw,
+                ..
+            } if raw == "32345678 00000001"
+        ));
+        assert_eq!(document.issues.len(), 1);
+
+        let preview = convert_cheat_document(&document, CheatTargetFormat::ActionReplayDs);
+        assert_eq!(preview.exact_operations, 3);
+        assert_eq!(preview.unsupported_operations, 1);
+        assert!(!preview.can_apply);
+        assert!(preview.warnings.contains(&CheatIssue::MissingTargetEncoder));
+        assert_eq!(preview.provenance, document.provenance);
+    }
+
+    #[test]
+    fn ds_action_replay_service_does_not_offer_cross_platform_writers() {
+        let document =
+            parse_ds_action_replay_document("DS", "02345678 DEADBEEF", vec!["fixture".into()]);
+        let capabilities = supported_targets_for(&document);
+        assert_eq!(capabilities.len(), 2);
+        assert!(capabilities.iter().all(|capability| matches!(
+            capability.capability,
+            ConversionCapability::Unsupported { .. }
+        )));
+        assert!(capabilities.iter().all(|capability| {
+            matches!(
+                capability.target,
+                CheatTargetFormat::ActionReplayDs | CheatTargetFormat::RetroArch
+            )
+        }));
+        let dolphin = convert_cheat_document(&document, CheatTargetFormat::Gecko);
+        assert!(!dolphin.can_apply);
+        assert!(dolphin.warnings.contains(&CheatIssue::PlatformMismatch));
     }
 }
