@@ -404,6 +404,72 @@ V4 is local artifact/install QA, not a claim of official Debian or Fedora
 repository compliance. RPM still builds with live Cargo dependency access;
 vendoring remains the documented prerequisite for a Fedora/COPR submission.
 
+## Package builds and install QA (V5 current release-candidate HEAD)
+
+V5 rebuilt the packages from the current committed authority
+`a2d51bbbac0088a56c4de53a323b57c6ece21c87` (`feat(identity): add PC-98 boot
+evidence`). The preflight tree was clean, no Cargo/Rust or packaging-owner
+process conflict was present, and the packaging scripts were unchanged from
+their recorded history. The source was bind-mounted read-only into disposable
+build containers; no package was installed on the authoring host.
+
+Toolchain and build settings:
+
+- `ubuntu:24.04`, rustup Rust `1.97.1` (`rustc 1.97.1`, `cargo 1.97.1`)
+- `fedora:41`, rustup Rust `1.97.1` (`rustc 1.97.1`, `cargo 1.97.1`)
+- both builds used `CARGO_BUILD_JOBS=2` and the existing packaging scripts
+
+Debian artifacts (`0.8.1~alpha-1`, `amd64`):
+
+| Artifact | Size | SHA-256 |
+| --- | ---: | --- |
+| `emuwiz_0.8.1~alpha-1_amd64.deb` | 71,258,814 bytes | `c08b111942bfd5cc0883626be166b99f4408fb3fd09329f6e72af6257d7dff7e` |
+| `emuwiz-cli_0.8.1~alpha-1_amd64.deb` | 5,999,270 bytes | `1d0c34bcae45c4733886c3f48e62bc8f89bed06cf54e3b64f45a8b3ff304e340` |
+| `emuwiz_0.8.1~alpha-1_amd64.buildinfo` | 9,185 bytes | `c8b3fa2b2ceae54fb4c7918e6aed3cb0d874b37492cc74673952d89a157592d5` |
+| `emuwiz_0.8.1~alpha-1_amd64.changes` | 1,628 bytes | `0de1993b5dc2eac20580904e7e616a4a44d1170c2dc1f7c1d0e2b025700a85cf` |
+
+RPM artifacts (`0.8.1-0.1.alpha.fc41`, `x86_64`):
+
+| Artifact | Size | SHA-256 |
+| --- | ---: | --- |
+| `emuwiz-0.8.1-0.1.alpha.fc41.x86_64.rpm` | 71,454,812 bytes | `f5fc81c6ec10bc0f943484e680775d6d1782568b8664abbeb3578c5465de9120` |
+| `emuwiz-cli-0.8.1-0.1.alpha.fc41.x86_64.rpm` | 6,148,306 bytes | `be7a64c57a64630f2d50a875a886cdcec381c647cc43731e5ded54a4d612d894` |
+| `emuwiz-cli-debuginfo-0.8.1-0.1.alpha.fc41.x86_64.rpm` | 52,714,996 bytes | `d44dabd8f6eb5fa3d899abf64ad78882cf672fbe9d4070a28e75f13146fb9670` |
+| `emuwiz-debuginfo-0.8.1-0.1.alpha.fc41.x86_64.rpm` | 86,933,242 bytes | `6d0009d64a1809c8bc668e9b363b803272ba37f04f01f329f991acc93e93c9ef` |
+| `emuwiz-debugsource-0.8.1-0.1.alpha.fc41.x86_64.rpm` | 3,017,986 bytes | `c73739790ed009e93d25498067e3bf5eaeaff01fa2fde64dad40d2204df875f7` |
+
+Package metadata and QA:
+
+- Debian package dependencies are `libc6 (>= 2.39)` and `libgcc-s1 (>= 4.2)`.
+  GUI recommendations are `emuwiz-cli`, `fuse3`, `xdg-utils`, `7zip |
+  p7zip-full`, and `python3-pip`; CLI recommendations omit the GUI and retain
+  the runtime tools. `ratarmount` and `unrar` are suggestions.
+- RPM package dependencies are the generated glibc/libgcc/libm/rtld
+  requirements. GUI recommendations are `emuwiz-cli` plus `fuse3`, `p7zip`,
+  `p7zip-plugins`, `python3-pip`, and `xdg-utils`; CLI recommendations are
+  the runtime tools without the GUI. `ratarmount` and `unrar` are suggestions.
+- In fresh second containers, `emuwiz-cli --help`, `emuwiz-cli --version`,
+  `ldd`, desktop-file validation, AppStream validation with
+  `appstreamcli validate --no-net`, and all packaged icon checks passed.
+- `apt remove emuwiz emuwiz-cli` and `dnf remove emuwiz emuwiz-cli` passed;
+  all package-owned regular files and symlinks were absent afterward.
+- `lintian` passed with warnings `initial-upload-closes-no-bugs` for each
+  changelog and `no-manual-page` for each binary. `rpmlint` returned 64 with
+  five spelling findings for the British `organise`/`organised` wording and
+  `ratarmount`, plus four `no-manual-page-for-binary`/`no-documentation`
+  warnings. These are metadata/style findings, not runtime failures.
+- Build warnings were limited to the existing duplicate Cargo target-source
+  warnings, Rust dead-code warnings in existing GUI/core code, Debian
+  libc6-diversion notices, and RPM's `%{?dist}` comment, `dwz` single-file
+  optimization, and unsupported `.debug_gdb_scripts` notices.
+- `desktop-file-validate` and `appstreamcli validate --no-net` passed; the
+  AppStream command emitted one existing pedantic note. `bash -n` passed for
+  all shell scripts under `scripts/` and `packaging/`.
+
+V5 is local current-head artifact/install QA, not a claim of official Debian
+or Fedora repository compliance. No release, tag, or publish operation was
+performed.
+
 ## Known blockers
 
 1. RPM `%build` still does a live `cargo build` (crates.io network access) -
