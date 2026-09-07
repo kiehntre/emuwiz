@@ -163,3 +163,45 @@ Synthetic fixtures cover 22.05/44.1/48/96 kHz, drift, CRC failure, partial
 data, false positives, metadata projection, and the deferred custom-stage
 boundary. No named loader is guessed, no emulator is run, and no raw PCM is
 stored.
+
+## V10: CPC custom/turbo waveform recovery
+
+V10 adds a generic, bootstrap-gated second pass for non-standard CPC waveform
+stages. It runs only after V9 has recovered at least one checksum-valid standard
+CPC block; a CPC-like leader, timing similarity, or an invalid/truncated header
+cannot unlock this interpretation. Standard block metadata remains authoritative
+and is retained alongside custom-stage evidence.
+
+The scanner discovers bounded local timing families after the bootstrap,
+recognises stable non-standard pilots, accepts one-to-three short sync pulses,
+and cuts stages at long pauses. Each stage is calibrated independently, keeping
+sample/time bounds, timing-family clusters, symbol mode, bit-order evidence,
+ambiguity count, and confidence. Stable paired-pulse binary stages are reported
+as `GenericTurbo`; a reliable custom pulse train without enough framing as
+`CustomPulse`; materially different stages as `MultiStage`; and clear but
+undecodable anchored evidence as `UnknownCustom`. Recovered bytes are retained
+only when the existing generic V5 symbol model is sufficiently unambiguous.
+MSB/LSB ambiguity is preserved rather than guessed, and a damaged stage does not
+erase neighbouring recovered stages.
+
+The CPC custom fingerprint hashes normalized timing-family ratios, pilot counts,
+stage order, symbol mode, and bit-order evidence. It excludes sample rate,
+absolute sample positions, filenames, and payload bytes, so equivalent 44.1 and
+48 kHz captures (including small speed drift) remain comparable. No raw PCM is
+stored. The V10 projection adds generic loader evidence without replacing V9
+filename, addresses, block flags, or CRC state.
+
+CDT/TZX parsing can provide logical CPC block identity and, for supported
+container blocks, timing metadata, but the current parser does not expose every
+custom pulse/direct-recording/generalized-data detail through the same bounded
+interval API. V10 therefore compares standard block metadata only and does not
+claim byte-identical custom-stage parity; that bridge is a later, separately
+scoped task.
+
+Named CPC loader recognition is deliberately deferred. The repository audit did
+not identify a sufficiently reliable, non-game-specific combination of bootstrap,
+sync, timing, and stage-order clues with a near-miss corpus for a fail-closed
+family label. Future V11 research may evaluate families only with such evidence;
+V10 emits no commercial loader names. Spectrum and C64 custom paths remain
+independent, and no emulator execution, DAT change, extraction, rename, or
+copyrighted fixture is involved.

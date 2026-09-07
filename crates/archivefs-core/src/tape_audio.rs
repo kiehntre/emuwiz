@@ -193,6 +193,42 @@ pub struct AmstradCpcWavRecovery {
     pub custom_stage_candidate: bool,
 }
 
+/// Generic custom stages found only after a checksum-valid CPC bootstrap.
+/// `evidence` reuses the V5 timing/symbol model; the outer bounds add the
+/// original PCM provenance without retaining PCM samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmstradCpcCustomStage {
+    pub evidence: CustomStageEvidence,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub timing_scale_millionths: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmstradCpcCustomBlock {
+    pub bytes: Vec<u8>,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub decoded_bits: usize,
+    pub ambiguous_bits: usize,
+    pub mode: CustomSymbolMode,
+    pub bit_order: CustomBitOrder,
+    pub confidence: RecoveryConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmstradCpcCustomWavRecovery {
+    pub audio: TapeAudioAnalysis,
+    pub standard_blocks: usize,
+    pub stages: Vec<AmstradCpcCustomStage>,
+    pub blocks: Vec<AmstradCpcCustomBlock>,
+    pub loader_class: &'static str,
+    pub fingerprint: String,
+    pub warnings: Vec<String>,
+}
+
 /// Generic custom stages discovered in a recording that already contains a
 /// checksum-valid standard C64 stream. This provenance gate is intentional:
 /// pulse timings alone cannot safely distinguish C64 fastloaders from another
@@ -808,6 +844,281 @@ pub fn amstrad_cpc_wav_tape_analysis(
         logical_segments: recovery.blocks.len().max(1),
         unsupported_blocks: 0,
     })
+}
+
+/// Decode generic custom/turbo stages only when V9 recovered at least one
+/// checksum-valid CPC standard record. This is a provenance gate: pulse
+/// timing alone is never promoted to CPC evidence.
+pub fn decode_amstrad_cpc_custom_wav(
+    bytes: &[u8],
+) -> Result<AmstradCpcCustomWavRecovery, WavError> {
+    let standard = decode_amstrad_cpc_wav(bytes)?;
+    let audio = standard.audio.clone();
+    let standard_blocks = standard
+        .blocks
+        .iter()
+        .filter(|block| block.checksum_valid == Some(true))
+        .count();
+    if standard_blocks == 0 {
+        return Ok(AmstradCpcCustomWavRecovery {
+            audio,
+            standard_blocks: 0,
+            stages: Vec::new(),
+            blocks: Vec::new(),
+            loader_class: "UnknownCustom",
+            fingerprint: cpc_custom_loader_fingerprint(&[]),
+            warnings: vec![
+                "custom CPC timing requires a checksum-valid standard CPC bootstrap".into(),
+            ],
+        });
+    }
+    let intervals: Vec<u64> = audio
+        .edges
+        .windows(2)
+        .map(|w| w[1].micros.saturating_sub(w[0].micros))
+        .collect();
+    let start_sample = standard
+        .blocks
+        .iter()
+        .filter(|b| b.checksum_valid == Some(true))
+        .map(|b| b.end_sample)
+        .max()
+        .unwrap_or(0);
+    let edge_start = audio
+        .edges
+        .iter()
+        .position(|edge| edge.sample >= start_sample)
+        .unwrap_or(intervals.len());
+    let (stages, blocks) = decode_cpc_custom_intervals(&audio, &intervals, edge_start);
+    let loader_class = if stages.len() > 1 {
+        "MultiStage"
+    } else if blocks
+        .iter()
+        .any(|block| block.mode == CustomSymbolMode::PairedPulse)
+    {
+        "GenericTurbo"
+    } else if !stages.is_empty() {
+        "CustomPulse"
+    } else {
+        "UnknownCustom"
+    };
+    let mut warnings = if stages.is_empty() {
+        vec!["CPC bootstrap is valid, but no bounded custom stage was recovered".into()]
+    } else if blocks.is_empty() {
+        vec!["CPC custom timing was found, but no unambiguous bytes were recovered".into()]
+    } else {
+        Vec::new()
+    };
+    if standard.custom_stage_candidate && stages.is_empty() {
+        warnings.push(
+            "V9 observed a non-standard post-bootstrap region; V10 could not decode it".into(),
+        );
+    }
+    Ok(AmstradCpcCustomWavRecovery {
+        audio,
+        standard_blocks,
+        fingerprint: cpc_custom_loader_fingerprint(&stages),
+        stages,
+        blocks,
+        loader_class,
+        warnings,
+    })
+}
+
+/// Combined V9/V10 projection. Standard CPC entries and metadata remain
+/// authoritative; custom evidence is added as a generic loader description.
+pub fn amstrad_cpc_custom_wav_tape_analysis(
+    bytes: &[u8],
+) -> Result<crate::tape_analysis::TapeAnalysis, WavError> {
+    let custom = decode_amstrad_cpc_custom_wav(bytes)?;
+    let mut analysis = amstrad_cpc_wav_tape_analysis(bytes)?;
+    if !custom.stages.is_empty() {
+        let confidence = if custom
+            .blocks
+            .iter()
+            .all(|b| b.confidence == RecoveryConfidence::High)
+        {
+            crate::tape_analysis::LoaderConfidence::High
+        } else if !custom.blocks.is_empty() {
+            crate::tape_analysis::LoaderConfidence::Medium
+        } else {
+            crate::tape_analysis::LoaderConfidence::Low
+        };
+        analysis.loader = Some(crate::tape_analysis::LoaderEvidence {
+            class: match custom.loader_class {
+                "GenericTurbo" => crate::tape_analysis::LoaderClass::GenericTurbo,
+                "MultiStage" => crate::tape_analysis::LoaderClass::MultiStage,
+                "CustomPulse" => crate::tape_analysis::LoaderClass::CustomPulse,
+                _ => crate::tape_analysis::LoaderClass::UnknownCustom,
+            },
+            confidence,
+            fingerprint: custom.fingerprint.clone(),
+            clues: vec![
+                "checksum-valid CPC standard bootstrap".into(),
+                format!("{} custom stage(s)", custom.stages.len()),
+            ],
+        });
+        analysis.metadata.push(format!(
+            "CPC custom loader evidence: {}",
+            custom.loader_class
+        ));
+        analysis
+            .semantic_blocks
+            .extend(custom.blocks.iter().map(|block| {
+                format!(
+                    "CPC custom {} bytes, {:?} {:?}",
+                    block.bytes.len(),
+                    block.mode,
+                    block.bit_order
+                )
+            }));
+        analysis.logical_segments += custom.stages.len();
+    }
+    analysis.warnings.extend(custom.warnings);
+    Ok(analysis)
+}
+
+fn decode_cpc_custom_intervals(
+    audio: &TapeAudioAnalysis,
+    intervals: &[u64],
+    edge_start: usize,
+) -> (Vec<AmstradCpcCustomStage>, Vec<AmstradCpcCustomBlock>) {
+    let mut stages = Vec::new();
+    let mut blocks = Vec::new();
+    let mut cursor = edge_start.min(intervals.len());
+    while cursor < intervals.len() && stages.len() < MAX_CUSTOM_STAGES {
+        let Some((pilot_start, pilot_end, pilot_cluster)) =
+            find_cpc_custom_pilot(intervals, cursor)
+        else {
+            break;
+        };
+        let sync_start = pilot_end;
+        let sync_len = (1..=3)
+            .find(|length| {
+                sync_start + length <= intervals.len()
+                    && intervals[sync_start..sync_start + length]
+                        .iter()
+                        .all(|value| *value < pilot_cluster / 2)
+            })
+            .unwrap_or(0);
+        let data_start = sync_start + sync_len;
+        let bounded_end = (data_start + MAX_CUSTOM_DATA_PULSES).min(intervals.len());
+        // A long quiet gap separates custom stages.  Bound each stage at the
+        // first such gap so the next pilot can be discovered independently.
+        let data_end = intervals[data_start..bounded_end]
+            .iter()
+            .position(|value| *value > 20_000)
+            .map(|offset| data_start + offset)
+            .unwrap_or(bounded_end);
+        let data = &intervals[data_start..data_end];
+        let clusters = timing_clusters(data);
+        let (mode, bit_order, recovered, ambiguous) = infer_custom_data(data, &clusters);
+        let start_edge = pilot_start.min(audio.edges.len().saturating_sub(1));
+        let end_edge = (data_end + 1).min(audio.edges.len().saturating_sub(1));
+        let start = audio.edges[start_edge];
+        let end = audio.edges[end_edge];
+        let confidence = if pilot_end - pilot_start >= 96
+            && sync_len > 0
+            && !clusters.is_empty()
+            && ambiguous == 0
+        {
+            RecoveryConfidence::High
+        } else if pilot_end - pilot_start >= 48 && !clusters.is_empty() {
+            RecoveryConfidence::Medium
+        } else {
+            RecoveryConfidence::Low
+        };
+        let evidence = CustomStageEvidence {
+            start_micros: start.micros,
+            end_micros: end.micros,
+            pilot_micros: pilot_cluster,
+            pilot_count: pilot_end - pilot_start,
+            sync_pulses: intervals[sync_start..data_start].to_vec(),
+            clusters: clusters.clone(),
+            symbol_mode: mode,
+            bit_order,
+            ambiguous_symbols: ambiguous,
+            confidence,
+        };
+        stages.push(AmstradCpcCustomStage {
+            evidence,
+            start_sample: start.sample,
+            end_sample: end.sample,
+            timing_scale_millionths: (pilot_cluster.saturating_mul(1_000_000) / 1000) as u32,
+        });
+        if let (Some(mode), Some(bytes)) = (mode, recovered) {
+            if !bytes.is_empty() {
+                blocks.push(AmstradCpcCustomBlock {
+                    bytes,
+                    start_sample: start.sample,
+                    end_sample: end.sample,
+                    start_micros: start.micros,
+                    end_micros: end.micros,
+                    decoded_bits: data.len()
+                        / if mode == CustomSymbolMode::PairedPulse {
+                            2
+                        } else {
+                            1
+                        },
+                    ambiguous_bits: ambiguous,
+                    mode,
+                    bit_order,
+                    confidence,
+                });
+            }
+        }
+        cursor = data_end.max(pilot_end + 1);
+    }
+    (stages, blocks)
+}
+
+/// CPC custom pilots are measured against the CPC leader timing, not the
+/// Spectrum ROM pilot used by the generic V5 detector.  Keeping this gate
+/// separate allows legitimate CPC stages near 2.4 ms while still rejecting a
+/// repeated standard CPC leader as a custom stage.
+fn find_cpc_custom_pilot(intervals: &[u64], from: usize) -> Option<(usize, usize, u64)> {
+    let mut start = from;
+    while start + 32 <= intervals.len() {
+        let candidate = intervals[start];
+        if !(500..=20_000).contains(&candidate) {
+            start += 1;
+            continue;
+        }
+        let end = start + cpc_run(intervals, start, candidate);
+        if end - start >= 32 && !close(candidate, 1000, 0.18) {
+            return Some((start, end, median(&intervals[start..end])));
+        }
+        start += 1;
+    }
+    None
+}
+
+/// Stable CPC-specific fingerprint over normalized stage timing and symbol
+/// structure. It excludes sample rate, offsets, filenames, and payload bytes.
+pub fn cpc_custom_loader_fingerprint(stages: &[AmstradCpcCustomStage]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"amstrad-cpc-custom-loader-v1\0");
+    hash.update(stages.len().to_le_bytes());
+    for stage in stages {
+        hash.update(stage.evidence.pilot_count.to_le_bytes());
+        for timing in custom_timing_fingerprint(&stage.evidence) {
+            hash.update((timing / 50_000 * 50_000).to_le_bytes());
+        }
+        hash.update([match stage.evidence.symbol_mode {
+            Some(CustomSymbolMode::PairedPulse) => 1,
+            Some(CustomSymbolMode::SinglePulse) => 2,
+            None => 0,
+        }]);
+        hash.update([match stage.evidence.bit_order {
+            CustomBitOrder::MsbFirst => 1,
+            CustomBitOrder::LsbFirst => 2,
+            CustomBitOrder::Ambiguous => 0,
+        }]);
+    }
+    hash.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn find_cpc_leader(intervals: &[u64], from: usize) -> Option<(usize, usize, u64)> {
@@ -1836,6 +2147,47 @@ mod tests {
         wav(rate, 1, 8, &samples)
     }
 
+    fn cpc_custom_wav(rate: u32, pilot: u64, second_stage: bool) -> Vec<u8> {
+        let mut header = vec![0u8; CPC_SEGMENT_BYTES];
+        header[..8].copy_from_slice(b"TEST    ");
+        header[16] = 1;
+        header[17] = 1;
+        header[18] = 1;
+        header[19..21].copy_from_slice(&(32u16).to_le_bytes());
+        header[21..23].copy_from_slice(&(0x4000u16).to_le_bytes());
+        header[23] = 1;
+        header[24..26].copy_from_slice(&(32u16).to_le_bytes());
+        header[26..28].copy_from_slice(&(0x4000u16).to_le_bytes());
+        let mut intervals = cpc_stream(CPC_SYNC_HEADER, &header, 1000, false);
+        intervals.push(50_000);
+        let add_custom = |out: &mut Vec<u64>, pilot: u64| {
+            for _ in 0..80 {
+                out.push(pilot);
+            }
+            out.push(pilot / 4);
+            // Framing hint: 01, 02 selects MSB-first in the existing V5 model.
+            for byte in [0x01u8, 0x02, 0x04, 0x08] {
+                for bit in (0..8).rev().map(|i| (byte >> i) & 1) {
+                    let pulse = if bit == 0 { pilot / 3 } else { pilot * 2 / 3 };
+                    out.extend([pulse, pulse]);
+                }
+            }
+            out.push(80_000);
+        };
+        add_custom(&mut intervals, pilot);
+        if second_stage {
+            add_custom(&mut intervals, pilot * 2);
+        }
+        let mut samples = vec![128u8; rate as usize / 50];
+        let mut high = true;
+        for micros in intervals {
+            let count = ((micros * rate as u64 + 500_000) / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        }
+        wav(rate, 1, 8, &samples)
+    }
+
     #[test]
     fn cpc_standard_waveform_recovers_header_across_sample_rates() {
         for rate in [22_050, 44_100, 48_000, 96_000] {
@@ -1899,6 +2251,49 @@ mod tests {
                 .blocks
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cpc_custom_requires_bootstrap_and_recovers_generic_turbo() {
+        let recovery = decode_amstrad_cpc_custom_wav(&cpc_custom_wav(44_100, 1200, false)).unwrap();
+        assert_eq!(recovery.standard_blocks, 1);
+        assert_eq!(recovery.loader_class, "GenericTurbo");
+        assert_eq!(recovery.stages.len(), 1);
+        assert_eq!(recovery.blocks.len(), 1);
+        assert_eq!(recovery.blocks[0].bytes, vec![1, 2, 4, 8]);
+        assert!(recovery.blocks[0].start_sample < recovery.blocks[0].end_sample);
+        assert!(recovery.stages[0].timing_scale_millionths > 0);
+        let no_bootstrap =
+            decode_amstrad_cpc_custom_wav(&wav(44_100, 1, 8, &[128, 255, 0, 255])).unwrap();
+        assert_eq!(no_bootstrap.standard_blocks, 0);
+        assert!(no_bootstrap.stages.is_empty());
+    }
+
+    #[test]
+    fn cpc_custom_multistage_fingerprint_is_rate_and_drift_stable() {
+        let a = decode_amstrad_cpc_custom_wav(&cpc_custom_wav(44_100, 1200, true)).unwrap();
+        let b = decode_amstrad_cpc_custom_wav(&cpc_custom_wav(48_000, 1210, true)).unwrap();
+        assert_eq!(a.loader_class, "MultiStage");
+        assert_eq!(a.stages.len(), 2);
+        assert_eq!(a.fingerprint, b.fingerprint);
+        let analysis =
+            amstrad_cpc_custom_wav_tape_analysis(&cpc_custom_wav(44_100, 1200, false)).unwrap();
+        assert_eq!(analysis.platform, Some("Amstrad CPC"));
+        assert!(analysis.loader.is_some());
+        assert!(
+            analysis
+                .entries
+                .iter()
+                .any(|e| e.name.as_deref() == Some("TEST"))
+        );
+    }
+
+    #[test]
+    fn invalid_cpc_bootstrap_does_not_unlock_custom_stage() {
+        let recovery = decode_amstrad_cpc_custom_wav(&cpc_wav(44_100, 1000, true, true)).unwrap();
+        assert_eq!(recovery.standard_blocks, 0);
+        assert!(recovery.stages.is_empty());
+        assert_eq!(recovery.loader_class, "UnknownCustom");
     }
 
     #[test]
