@@ -510,6 +510,18 @@ pub enum LaunchBlockerKind {
     OpenMsxPlatformMismatch,
     OpenMsxContentFormatUnsupported,
     OpenMsxBindingUnavailable,
+    /// A command-plan request was given a non-Tsugaru candidate.
+    TsugaruCandidateRequired,
+    /// The canonical identity does not target FM Towns.
+    TsugaruPlatformMismatch,
+    /// The selected content is outside Tsugaru V1's documented CD-image slice.
+    TsugaruContentFormatUnsupported,
+    /// The selected Tsugaru profile or ROM directory is unavailable.
+    TsugaruProfileUnavailable,
+    /// Required Tsugaru ROM/firmware assets are known to be absent.
+    TsugaruFirmwareMissing,
+    /// Tsugaru ROM/firmware readiness could not be established.
+    TsugaruFirmwareUnavailable,
     /// A command-plan request was given a non-VICE candidate.
     ViceCandidateRequired,
     /// The canonical identity does not target `Commodore 64` - the only

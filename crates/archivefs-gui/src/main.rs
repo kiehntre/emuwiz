@@ -7209,6 +7209,37 @@ impl ArchiveFsApp {
             }
         }));
 
+        // Tsugaru is an additive FM Towns candidate.  Its discovery remains
+        // read-only and only becomes launchable when an explicit ROM
+        // directory is configured; the shared planner still requires a
+        // separately resolved FM Towns identity.
+        let tsugaru_roots =
+            archivefs_core::patch_manager::TsugaruProfileDiscoveryRoots::from_environment();
+        let tsugaru_discovery =
+            archivefs_core::patch_manager::discover_tsugaru_profiles(&tsugaru_roots);
+        standalone_profiles.extend(tsugaru_discovery.profiles.iter().map(|profile| {
+            archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "tsugaru",
+                profile_id: profile.profile_id.clone(),
+                profile_path: Some(profile.executable.path.clone()),
+                eligible: profile.eligible,
+                firmware: match profile.firmware {
+                    archivefs_core::patch_manager::TsugaruFirmwareState::Verified => {
+                        archivefs_core::launch::FirmwareReadiness::Verified
+                    }
+                    archivefs_core::patch_manager::TsugaruFirmwareState::PresentUnverified => {
+                        archivefs_core::launch::FirmwareReadiness::PresentUnverified
+                    }
+                    archivefs_core::patch_manager::TsugaruFirmwareState::Missing => {
+                        archivefs_core::launch::FirmwareReadiness::Missing
+                    }
+                    archivefs_core::patch_manager::TsugaruFirmwareState::Unknown => {
+                        archivefs_core::launch::FirmwareReadiness::Unknown
+                    }
+                },
+            }
+        }));
+
         // The remaining native adapters are additive inputs to the same
         // shared planner. Discovery and inspection are kept read-only and
         // bounded by their existing adapters; this block does not rebuild a

@@ -302,6 +302,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &[],
         confidence: MappingConfidence::Exact,
     },
+    LaunchCompatibility {
+        platform_id: "FM Towns",
+        standalone_adapters: &["tsugaru"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
     // ScummVM's command and execution adapters are complete and require a
     // detector-verified engine/game identity plus an extracted game folder.
     // This row only makes that already-reviewed adapter reachable by generic

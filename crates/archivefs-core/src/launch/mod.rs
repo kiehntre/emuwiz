@@ -127,6 +127,8 @@ pub mod snes9x_command;
 pub mod snes9x_execution;
 pub mod stella_command;
 pub mod stella_execution;
+pub mod tsugaru_command;
+pub mod tsugaru_execution;
 pub mod vice_command;
 pub mod vice_execution;
 pub mod vita3k_command;
@@ -424,6 +426,15 @@ pub use stella_command::{
 pub use stella_execution::{
     StellaLaunchPreflightError, StellaLaunchPreflightErrorKind, StellaLaunchRequest,
     preflight_stella_launch, spawn_stella,
+};
+pub use tsugaru_command::{
+    TSUGARU_SUPPORTED_PLATFORM_ID, TsugaruCommand, TsugaruCommandPlan, TsugaruMediaFormat,
+    build_tsugaru_command_plan, tsugaru_media_format,
+};
+pub use tsugaru_execution::{
+    TsugaruLaunchExecutionError, TsugaruLaunchPreflightError, TsugaruLaunchPreflightErrorKind,
+    TsugaruLaunchRequest, preflight_and_launch_tsugaru, preflight_tsugaru_launch,
+    spawn_tsugaru,
 };
 pub use vice_command::{
     VICE_ATTACH_CRT, VICE_AUTOSTART, VICE_DISABLE_SAVE_RESOURCES, VICE_SUPPORTED_PLATFORM_ID,

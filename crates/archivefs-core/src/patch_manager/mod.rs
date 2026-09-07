@@ -99,6 +99,7 @@ mod shared_preview;
 mod shared_transaction;
 mod snes9x_local;
 mod stella_local;
+mod tsugaru_local;
 mod user_cheat_import;
 mod vice_local;
 mod vita3k_local;
@@ -761,6 +762,12 @@ pub use stella_local::{
     StellaLaunchBlockerKind, StellaNativeLaunchBinding, StellaProfile, StellaProfileDiscovery,
     StellaProfileDiscoveryRoots, discover_stella_profiles, parse_stella_version,
     resolve_stella_native_launch_binding,
+};
+pub use tsugaru_local::{
+    TSUGARU_EXECUTABLE_NAME, TSUGARU_FIRMWARE_DIRECTORY_ENV, TSUGARU_ROM_DIRECTORY_ENV,
+    TsugaruExecutable, TsugaruFirmwareState, TsugaruInstallationType, TsugaruProfile,
+    TsugaruProfileDiscovery, TsugaruProfileDiscoveryRoots, discover_tsugaru_profiles,
+    resolve_tsugaru_native_launch_binding,
 };
 pub use user_cheat_import::{
     USER_CHEAT_MAX_CHEATS_PER_FILE, USER_CHEAT_MAX_DEPTH, USER_CHEAT_MAX_FILE_BYTES,

@@ -144,6 +144,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Fuse {
         profile: &'a crate::patch_manager::FuseProfile,
     },
+    Tsugaru {
+        profile: &'a crate::patch_manager::TsugaruProfile,
+    },
     /// A discovered native ScummVM binding. The verified engine:game ID is
     /// projected from identity facts; the binding itself is revalidated by
     /// ScummVM preflight before execution.
@@ -325,6 +328,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn fuse(profile: &'a crate::patch_manager::FuseProfile) -> Self {
         Self::Fuse { profile }
+    }
+
+    pub fn tsugaru(profile: &'a crate::patch_manager::TsugaruProfile) -> Self {
+        Self::Tsugaru { profile }
     }
 
     pub fn scummvm(binding: &'a ScummVmNativeLaunchBinding, eligible: bool) -> Self {
@@ -609,6 +616,32 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.executable.clone()),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::Tsugaru { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "FM Towns") =>
+            {
+                let firmware = match profile.firmware {
+                    crate::patch_manager::TsugaruFirmwareState::Verified => {
+                        FirmwareReadiness::Verified
+                    }
+                    crate::patch_manager::TsugaruFirmwareState::PresentUnverified => {
+                        FirmwareReadiness::PresentUnverified
+                    }
+                    crate::patch_manager::TsugaruFirmwareState::Missing => {
+                        FirmwareReadiness::Missing
+                    }
+                    crate::patch_manager::TsugaruFirmwareState::Unknown => {
+                        FirmwareReadiness::Unknown
+                    }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "tsugaru",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.executable.path.clone()),
+                    eligible: profile.eligible,
+                    firmware,
                 })
             }
             DiscoveredStandaloneProfile::ScummVm { binding, eligible }
