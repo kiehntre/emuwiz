@@ -32,6 +32,7 @@ mod cheat_history;
 mod cheat_install_plan;
 mod cheat_install_result;
 mod cheat_installer;
+mod cheat_ir;
 mod cheat_journey;
 mod cheat_provider;
 mod cheat_rollback;
@@ -235,6 +236,11 @@ pub use cheat_install_result::{
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
     CheatInstallRunOutcome, execute_cheat_install_run,
+};
+pub use cheat_ir::{
+    CheatConversionPreview, CheatDocument, CheatIssue, CheatOperation, CheatPlatform,
+    CheatSourceFormat, CheatTargetFormat, ConversionCapability, assess_document_conversion,
+    dolphin_line_to_ir, pnach_line_to_ir,
 };
 pub use cheat_journey::{
     CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
