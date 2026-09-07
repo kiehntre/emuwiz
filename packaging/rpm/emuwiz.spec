@@ -22,8 +22,15 @@ URL:            %{forgeurl}
 # yet a published release tarball.
 Source0:        emuwiz-%{version}.tar.gz
 
-BuildRequires:  cargo >= 1.75
-BuildRequires:  rust >= 1.75
+# NOT listing cargo/rust here: this workspace's rust-toolchain.toml pins
+# 1.97.1 (edition2024 plus newer Cargo.toml syntax), and Fedora 41's dnf
+# `cargo`/`rust` (1.91.1) demonstrably cannot parse this workspace's
+# Cargo.toml - confirmed by a real failed build under packaging QA V3. A
+# `cargo >= 1.75`/`rust >= 1.75` BuildRequires would be actively misleading:
+# a build root that satisfies it can still fail. Until this project either
+# lowers its MSRV or Fedora ships a new-enough rustc, the build host must
+# provide the pinned toolchain itself (e.g. via rustup - see
+# docs/LINUX_PACKAGING.md) ahead of `rpmbuild`, on PATH.
 BuildRequires:  gcc
 BuildRequires:  pkgconfig
 BuildRequires:  mesa-libGL-devel
@@ -37,12 +44,19 @@ BuildRequires:  libXcursor-devel
 BuildRequires:  desktop-file-utils
 BuildRequires:  appstream
 
+# ratarmount confirmed absent from Fedora 41's official repos entirely
+# (packaging QA V3, real `dnf list --available`) - it is pip-installable
+# (python3-pip is in Recommends for that path). fuse3, xdg-utils, p7zip,
+# p7zip-plugins, unrar were all confirmed present with these exact names
+# on the same run; Fedora, unlike current Debian/Ubuntu, has NOT renamed
+# p7zip to a `7zip` package, so DEB and RPM intentionally differ here.
 Recommends:     %{name}-cli = %{version}-%{release}
-Recommends:     ratarmount
 Recommends:     fuse3
 Recommends:     xdg-utils
 Recommends:     p7zip
 Recommends:     p7zip-plugins
+Recommends:     python3-pip
+Suggests:       ratarmount
 Suggests:       unrar
 
 %description
@@ -65,10 +79,11 @@ This package provides the graphical application.
 
 %package cli
 Summary:        Verify, organise, and play a retro-game library (CLI)
-Recommends:     ratarmount
 Recommends:     fuse3
 Recommends:     p7zip
 Recommends:     p7zip-plugins
+Recommends:     python3-pip
+Suggests:       ratarmount
 Suggests:       unrar
 
 %description cli
@@ -84,8 +99,11 @@ dependency on the GUI package, so it can be installed standalone
 %autosetup -n emuwiz-%{version}
 
 %build
-export CARGO_BUILD_JOBS=%{?_smp_mflags:%{_smp_mflags}}
-export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+# CARGO_BUILD_JOBS wants a bare integer; %{_smp_mflags} expands to "-jN"
+# (a make(1) flag), which is NOT the same thing and silently produced an
+# invalid value here until real QA (packaging V3) caught it - do not
+# reintroduce %{_smp_mflags} for this variable.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 cargo build --release --locked \
     -p archivefs-gui --bin emuwiz \
     -p archivefs-cli --bin emuwiz-cli
