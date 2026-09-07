@@ -40,6 +40,17 @@ pointer/loop codes, master/init codes, and encrypted variants are therefore
 preserved as unsupported rather than guessed. No melonDS, DeSmuME, or
 RetroArch writer is enabled by the IR.
 
+V4 exposes `convert_cheat_document` and `supported_targets_for` as the reusable
+converter-service seam. They return GUI-ready capability and per-operation
+previews without installing or overwriting emulator files. RetroArch remains
+deferred because the existing `.cht` parser retains code expressions as opaque
+strings rather than an authoritative width/address/value tuple.
+
+The target audit found that DuckStation, melonDS, DeSmuME, mGBA, and SameBoy
+currently provide inventory/read-only configuration in this repository, not a
+proven direct-write native writer. No additional target encoder is invented in
+V4; one should be added only after an authoritative native grammar exists.
+
 The intended architecture is:
 
 ```text

@@ -112,6 +112,12 @@ pub enum OperationConversionStatus {
     Unsupported { reason: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetCapability {
+    pub target: CheatTargetFormat,
+    pub capability: ConversionCapability,
+}
+
 fn parse_pair(raw: &str) -> Option<(u32, u32)> {
     let mut fields = raw.split_whitespace();
     let a = u32::from_str_radix(fields.next()?, 16).ok()?;
@@ -308,6 +314,57 @@ pub fn assess_document_conversion(
     }
 }
 
+/// Stable service seam for callers such as the GUI; it deliberately delegates
+/// to the pure assessor so parser and installer internals stay out of UI code.
+pub fn convert_cheat_document(
+    document: &CheatDocument,
+    target: CheatTargetFormat,
+) -> CheatConversionPreview {
+    assess_document_conversion(document, target)
+}
+
+/// Enumerates targets without inventing encoders.  Unsupported entries are
+/// still returned so a GUI can explain why a target is unavailable.
+pub fn supported_targets_for(document: &CheatDocument) -> Vec<TargetCapability> {
+    let targets = match &document.platform {
+        CheatPlatform::GameCube | CheatPlatform::Wii => vec![
+            CheatTargetFormat::DolphinActionReplay,
+            CheatTargetFormat::Gecko,
+        ],
+        CheatPlatform::Ps2 => vec![
+            CheatTargetFormat::Pnach,
+            CheatTargetFormat::GameSharkPs2,
+            CheatTargetFormat::CodeBreakerPs2,
+        ],
+        CheatPlatform::NintendoDs => vec![
+            CheatTargetFormat::ActionReplayDs,
+            CheatTargetFormat::RetroArch,
+        ],
+        CheatPlatform::Other(_) => Vec::new(),
+    };
+    targets
+        .into_iter()
+        .map(|target| {
+            let preview = assess_document_conversion(document, target.clone());
+            let capability = if preview.can_apply {
+                ConversionCapability::Exact
+            } else if preview.unsupported_operations > 0 {
+                ConversionCapability::Unsupported {
+                    reason: "one or more operations are not safely representable".into(),
+                }
+            } else {
+                ConversionCapability::Unsupported {
+                    reason: preview
+                        .warnings
+                        .first()
+                        .map_or_else(|| "target unavailable".into(), |issue| format!("{issue:?}")),
+                }
+            };
+            TargetCapability { target, capability }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +458,33 @@ mod tests {
         assert!(!preview.can_apply);
         assert!(preview.output_preview.is_none());
         assert!(preview.warnings.contains(&CheatIssue::MissingTargetEncoder));
+    }
+
+    #[test]
+    fn service_lists_only_platform_targets_and_preserves_mixed_status() {
+        let d = CheatDocument {
+            title: "mixed".into(),
+            platform: CheatPlatform::GameCube,
+            source_format: CheatSourceFormat::Gecko,
+            operations: vec![
+                CheatOperation::Write8 {
+                    address: 1,
+                    value: 2,
+                },
+                CheatOperation::UnsupportedRaw {
+                    source_format: CheatSourceFormat::Gecko,
+                    raw: "conditional".into(),
+                    reason: "conditional operation".into(),
+                },
+            ],
+            issues: vec![],
+            provenance: vec!["fixture".into()],
+        };
+        let preview = convert_cheat_document(&d, CheatTargetFormat::Gecko);
+        assert_eq!(preview.operation_count, 2);
+        assert_eq!(preview.exact_operations, 1);
+        assert_eq!(preview.unsupported_operations, 1);
+        assert!(!preview.can_apply);
+        assert_eq!(supported_targets_for(&d).len(), 2);
     }
 }

@@ -240,7 +240,8 @@ pub use cheat_installer::{
 pub use cheat_ir::{
     CheatConversionPreview, CheatDocument, CheatIssue, CheatOperation, CheatPlatform,
     CheatSourceFormat, CheatTargetFormat, ConversionCapability, OperationConversionStatus,
-    assess_document_conversion, dolphin_line_to_ir, encode_operation, pnach_line_to_ir,
+    TargetCapability, assess_document_conversion, convert_cheat_document, dolphin_line_to_ir,
+    encode_operation, pnach_line_to_ir, supported_targets_for,
 };
 pub use cheat_journey::{
     CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
