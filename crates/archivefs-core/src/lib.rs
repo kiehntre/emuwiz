@@ -36,12 +36,14 @@ mod database;
 /// over the existing per-subsystem reports. See the module documentation
 /// for the read-only contract.
 pub mod diagnostics;
+pub mod dragon_coco_tape;
 pub mod emulator_download;
 pub mod managed_appimage_bootstrap;
 /// Optional, read-only RetroAchievements game metadata and bounded cache.
 pub mod retroachievements;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
+pub mod uef_tape;
 /// Bounded PCM/WAV pulse evidence for tape recordings.
 pub mod tape_audio;
 use database::scan_and_persist_folders;

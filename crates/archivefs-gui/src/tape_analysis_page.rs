@@ -177,6 +177,8 @@ pub(crate) fn format_label(format: TapeFormat) -> &'static str {
         TapeFormat::MsxWav => "WAV",
         TapeFormat::Atari8BitWav => "WAV",
         TapeFormat::T64 => "T64",
+        TapeFormat::BbcUef => "UEF",
+        TapeFormat::DragonCocoCas => "CAS",
     }
 }
 

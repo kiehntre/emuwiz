@@ -22,6 +22,8 @@ pub enum TapeFormat {
     MsxWav,
     Atari8BitWav,
     T64,
+    BbcUef,
+    DragonCocoCas,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumState {
@@ -185,6 +187,14 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
             logical_segments: entry_count.max(1),
             unsupported_blocks: 0,
         });
+    }
+    if bytes.starts_with(b"UEF File!") || bytes.starts_with(&[0x1f, 0x8b]) {
+        return crate::uef_tape::parse_uef(bytes);
+    }
+    if bytes.windows(2).any(|window| window == [0x55, 0x3c]) {
+        if let Ok(analysis) = crate::dragon_coco_tape::parse_dragon_coco_cas(bytes) {
+            return Ok(analysis);
+        }
     }
     let obs = parse_zx_tap(bytes).map_err(|e| TapeAnalysisError::Malformed(e.to_string()))?;
     let mut entries = Vec::new();

@@ -23,9 +23,8 @@ cache; no conclusion below relies on that failure.
   emulator profiles where listed below.
 - **Backend-only families:** most structural disk parsers, tape waveform
   decoders, CHD logical reading, CD-i evidence, and LaserDisc set verification.
-- **Research-only families:** Dragon/CoCo cassette research, several Apple and
-  Japanese disk variants, raw preservation formats without parsers, and UEF/CAS
-  container bridges.
+- **Research-only families:** several Apple and Japanese disk variants, raw
+  preservation formats without parsers, and unsupported UEF/CAS chunk families.
 - **Genuinely unsupported:** MP3/FLAC/OGG tape decoding, raw LaserDisc RF,
   unsupported archive codecs, many modern package formats, and unimplemented
   disk/optical variants listed as `NONE`.
@@ -34,7 +33,8 @@ cache; no conclusion below relies on that failure.
   LaserDisc verification already exist in local history or current code.
 - **Highest-value real gaps:** broader disk geometry/filesystem inspection,
   GUI surfacing for structural media evidence, CHD/DAT logical parity, missing
-  Amiga launch command planning, and deferred CAS/UEF/container bridges.
+  Amiga launch command planning, and deferred container families beyond the
+  bounded UEF/CAS bridge.
 
 ## Capability and maturity keys
 
@@ -95,7 +95,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Commodore | C64/T64/TAP | YES | YES | YES | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `commodore_tape`, `tape_analysis` | tape tests | custom waveform remains generic |
 | Amstrad | CPC DSK/EDSK/CDT | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `disk_format/dsk`, CPC tape | DSK/CPC WAV tests | protected-sector semantics |
 | BBC/Acorn | DFS SSD/DSD | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `disk_format/dfs` | DFS tests | ADFS parser |
-| BBC/Acorn | UEF/CAS tape | EXT | NO | NO | NO | NO | TOSEC | NO | NO | NO | 1 | `docs/TAPE_DRAGON_COCO_RESEARCH.md` | research only | structured UEF/CAS parser |
+| BBC/Acorn | UEF tape | EXT | NO | FAMILY | YES | YES | TOSEC | SUMMARY | NO | YES | 4 | `uef_tape`, `tape_analysis` | synthetic UEF tests | unsupported/bit-level chunks remain bounded |
 | Apple II | DO/PO/DSK | YES | YES | FAMILY | YES | SUMMARY | TOSEC | SUMMARY | NO | PARTIAL | 4 | `apple2_disk` | synthetic DOS 3.3/ProDOS/negative tests | broader catalogue/filesystem and launch |
 | Apple II | 2MG | YES | YES | FAMILY | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | PARTIAL | 3 | `apple2_disk` | bounded header/range tests | recursive payload identity |
 | Apple II | WOZ/NIB | YES | YES | NO | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | NO | 3 | `apple2_disk` | signature/map/geometry tests | flux/GCR interpretation |
@@ -107,7 +107,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | BBC Micro | WAV standard/custom | YES | YES | YES | YES | YES | NO | DETAILED | NO | YES | 5 | `bbc_tape` | BBC waveform tests | named/custom semantics deferred |
 | MSX | WAV standard/custom | YES | YES | YES | YES | YES | NO | DETAILED | NO | YES | 5 | `msx_tape` | MSX waveform tests | no CAS parser; named loaders deferred |
 | Atari 8-bit | WAV standard/custom | YES | YES | YES | YES | YES | NO | DETAILED | NO | YES | 5 | `atari_tape` | Atari WAV tests | broader formats |
-| Dragon/CoCo | CAS/WAV | RESEARCH | NO | NO | NO | NO | NO | NO | NO | NO | 1 | `docs/TAPE_DRAGON_COCO_RESEARCH.md` | research only | decoder |
+| Dragon/CoCo | CAS/WAV | EXT | NO | FAMILY | YES | YES | TOSEC | SUMMARY | NO | YES | 4 | `dragon_coco_tape`, `tape_analysis` | synthetic CAS tests | ordinary blocks only; turbo/custom deferred |
 | Optical containers | ISO | YES | YES | NO alone | PARTIAL | YES | REDUMP | SUMMARY | PROFILE | PARTIAL | 4 | `iso9660`, collector | ISO tests | platform-specific boot breadth |
 | Optical containers | CUE/BIN, multi-BIN | YES | YES | NO alone | PARTIAL | YES | REDUMP | SUMMARY | PROFILE | PARTIAL | 4 | `ingestion/cue_bin`, raw media | CUE tests | session/subchannel parity |
 | Optical containers | CHD | YES | YES | NO alone | PARTIAL | YES | MAME/REDUMP | SUMMARY | PROFILE | PARTIAL | 4 | `chd_identity`, `chd_logical_media` | CHD tests | specialist/multi-track and DAT raw parity |
@@ -179,8 +179,9 @@ specified but entirely absent. Existing safety gates should not be weakened.
 
 ### P2
 
-4. **UEF/CAS structured tape containers.** BBC/Acorn and Dragon/CoCo research
-   exists, but no parser bridges container bytes into tape analysis.
+4. **Broader UEF/CAS semantics.** The bounded ordinary UEF/CAS bridge is
+   implemented; bit-level UEF chunks, richer CAS variants, and turbo/custom
+   loader semantics remain out of scope.
 5. **Amiga archive-member WHDLoad inspection and ADZ decompression.** Current
    discovery expects extracted directories/files; LHA listing is not WHDLoad
    semantic inspection.
