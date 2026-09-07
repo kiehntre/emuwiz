@@ -11,26 +11,29 @@ use std::thread;
 
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::patch_manager::{
-    CheatCandidateOptions, CheatDestinationRequest, CheatJourneyApplyApproval,
-    CheatJourneyApplyOptions, CheatJourneyGameIdentity, CheatJourneyPreview,
-    CheatJourneyPreviewAction, CheatJourneyUndoConfirmation, CheatJourneyUndoOptions,
-    CheatJourneyUndoPreview, DolphinCandidate, DolphinInstallPreview, DolphinInstallPreviewRequest,
-    LocalDolphinInstallState, LocalPcsx2InstallState, LocalXeniaInstallState, Pcsx2GameIdentity,
-    Pcsx2InstallPreview, Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic,
-    UserCheatFormat, UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame,
-    UserCheatMatchState, XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile,
-    apply_cheat_journey, build_dolphin_install_preview, build_pcsx2_install_preview,
-    build_shared_transaction_plan, build_xenia_install_preview, check_local_dolphin_install_state,
-    check_local_pcsx2_install_state, check_local_xenia_install_state, default_shared_backup_root,
-    default_shared_history_root, discover_local_dolphin_cheat_file,
+    CheatCandidateOptions, CheatDestinationRequest, CheatDocument, CheatIssue,
+    CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyGameIdentity,
+    CheatJourneyPreview, CheatJourneyPreviewAction, CheatJourneyUndoConfirmation,
+    CheatJourneyUndoOptions, CheatJourneyUndoPreview, CheatOperation, CheatPlatform,
+    CheatSourceFormat, CheatTargetFormat, ConversionCapability, DolphinCandidate,
+    DolphinInstallPreview, DolphinInstallPreviewRequest, LocalDolphinInstallState,
+    LocalPcsx2InstallState, LocalXeniaInstallState, Pcsx2GameIdentity, Pcsx2InstallPreview,
+    Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation,
+    SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
+    SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat,
+    UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState,
+    XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey,
+    build_dolphin_install_preview, build_pcsx2_install_preview, build_shared_transaction_plan,
+    build_xenia_install_preview, check_local_dolphin_install_state,
+    check_local_pcsx2_install_state, check_local_xenia_install_state, convert_cheat_document,
+    default_shared_backup_root, default_shared_history_root, discover_local_dolphin_cheat_file,
     discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file,
     discover_local_xenia_patch_file, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
     preview_cheat_journey, preview_cheat_journey_undo, preview_shared_rollback,
     scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
-    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach, undo_cheat_journey,
+    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach,
+    supported_targets_for, undo_cheat_journey,
 };
 use eframe::egui;
 
@@ -268,6 +271,10 @@ pub(crate) struct UserCheatImportPageState {
     report_context_key: Option<String>,
     last_source: Option<(PathBuf, bool)>,
     selected_candidate: Option<usize>,
+    /// Candidate whose conversion capabilities are being reviewed.  The
+    /// converter is deliberately preview-only; native install paths below
+    /// remain separate and authoritative.
+    converter_candidate: Option<usize>,
     technical_details: bool,
     local_install: LocalInstallStage,
     local_pcsx2_install: LocalPcsx2InstallStage,
@@ -697,6 +704,7 @@ impl UserCheatImportPageState {
                             ui.label("Individual cheat names are not exposed by the current bounded import API.");
                             ui.label("No files were installed or changed.");
                         }
+                        self.show_conversion_preview(ui, candidate, index);
                         match candidate.format {
                             UserCheatFormat::RetroarchCht => {
                                 self.show_install_action(ui, candidate, local_install_context);
@@ -2190,6 +2198,101 @@ impl UserCheatImportPageState {
         });
     }
 
+    /// Shows the neutral conversion service without coupling the GUI to any
+    /// parser or emulator writer.  The current bounded import report does not
+    /// expose individual code lines, so it is represented honestly as one
+    /// opaque operation: targets and their reasons remain reviewable, while
+    /// the UI can never present an incomplete conversion as safe to apply.
+    fn show_conversion_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        index: usize,
+    ) {
+        if !ui
+            .button(if self.converter_candidate == Some(index) {
+                "Hide conversion preview"
+            } else {
+                "Convert cheat"
+            })
+            .clicked()
+        {
+            return;
+        }
+        self.converter_candidate = (self.converter_candidate != Some(index)).then_some(index);
+        if self.converter_candidate != Some(index) {
+            return;
+        }
+        let source_format = match candidate.format {
+            UserCheatFormat::RetroarchCht => CheatSourceFormat::RetroArch,
+            UserCheatFormat::Pcsx2Pnach => CheatSourceFormat::Pnach,
+        };
+        let platform = candidate
+            .platform_hint
+            .as_deref()
+            .map(|value| {
+                let lower = value.to_ascii_lowercase();
+                if lower.contains("gamecube") || lower == "gc" {
+                    CheatPlatform::GameCube
+                } else if lower == "wii" {
+                    CheatPlatform::Wii
+                } else if lower.contains("playstation 2") || lower == "ps2" {
+                    CheatPlatform::Ps2
+                } else if lower.contains("nintendo ds") || lower == "nds" {
+                    CheatPlatform::NintendoDs
+                } else {
+                    CheatPlatform::Other(value.to_string())
+                }
+            })
+            .unwrap_or_else(|| CheatPlatform::Other("unknown".into()));
+        let document = CheatDocument {
+            title: candidate.provenance.original_filename.clone(),
+            platform,
+            source_format: source_format.clone(),
+            operations: vec![CheatOperation::UnsupportedRaw {
+                source_format,
+                raw: candidate.provenance.original_filename.clone(),
+                reason: "Individual operations are not exposed by the bounded import report."
+                    .into(),
+            }],
+            issues: vec![CheatIssue::RawPreserved],
+            provenance: vec![candidate.provenance.original_path.display().to_string()],
+        };
+        widgets::card(ui, |ui| {
+            ui.strong("Conversion preview");
+            ui.label("Choose a target format to review what can be converted safely.");
+            for capability in supported_targets_for(&document) {
+                let target = target_label(&capability.target);
+                let status = match capability.capability {
+                    ConversionCapability::Exact => "Exact".to_string(),
+                    ConversionCapability::Lossy { .. } => "Lossy".to_string(),
+                    ConversionCapability::Unsupported { reason } => {
+                        format!("Unsupported: {reason}")
+                    }
+                };
+                ui.label(format!("{target}: {status}"));
+            }
+            let target = supported_targets_for(&document)
+                .first()
+                .map(|entry| entry.target.clone());
+            if let Some(target) = target {
+                let preview = convert_cheat_document(&document, target);
+                ui.label(format!(
+                    "Operations: {} exact, {} lossy, {} unsupported",
+                    preview.exact_operations,
+                    preview.lossy_operations,
+                    preview.unsupported_operations
+                ));
+                ui.label(if preview.can_apply {
+                    "Can convert"
+                } else {
+                    "Can't convert safely"
+                });
+            }
+            ui.label("No emulator files were written.");
+        });
+    }
+
     fn start_local_xenia_install(
         &mut self,
         source_path: PathBuf,
@@ -2547,6 +2650,19 @@ fn format_label(format: UserCheatFormat) -> &'static str {
     match format {
         UserCheatFormat::RetroarchCht => "RetroArch .cht",
         UserCheatFormat::Pcsx2Pnach => "PCSX2 .pnach",
+    }
+}
+
+fn target_label(target: &CheatTargetFormat) -> &'static str {
+    match target {
+        CheatTargetFormat::DolphinActionReplay => "Dolphin Action Replay",
+        CheatTargetFormat::Gecko => "Gecko",
+        CheatTargetFormat::Pnach => "PCSX2 PNACH",
+        CheatTargetFormat::RetroArch => "RetroArch",
+        CheatTargetFormat::ActionReplayDs => "Action Replay DS",
+        CheatTargetFormat::GameSharkPs2 => "PS2 GameShark",
+        CheatTargetFormat::CodeBreakerPs2 => "PS2 CodeBreaker",
+        CheatTargetFormat::DolphinOnFrame => "Dolphin On-Frame",
     }
 }
 
