@@ -71,6 +71,66 @@ pub struct SpectrumWavRecovery {
     pub blocks: Vec<RecoveredTapeBlock>,
     pub warnings: Vec<String>,
 }
+
+/// A timing family discovered in a non-ROM waveform.  Centres and spread are
+/// expressed in microseconds so equivalent recordings at different sample
+/// rates can be compared without retaining PCM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomTimingCluster {
+    pub centre_micros: u64,
+    pub count: usize,
+    pub spread_micros: u64,
+    pub confidence: RecoveryConfidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomSymbolMode {
+    PairedPulse,
+    SinglePulse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomBitOrder {
+    MsbFirst,
+    LsbFirst,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomStageEvidence {
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub pilot_micros: u64,
+    pub pilot_count: usize,
+    pub sync_pulses: Vec<u64>,
+    pub clusters: Vec<CustomTimingCluster>,
+    pub symbol_mode: Option<CustomSymbolMode>,
+    pub bit_order: CustomBitOrder,
+    pub ambiguous_symbols: usize,
+    pub confidence: RecoveryConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomRecoveredBlock {
+    pub bytes: Vec<u8>,
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub decoded_bits: usize,
+    pub ambiguous_bits: usize,
+    pub checksum_valid: Option<bool>,
+    pub mode: CustomSymbolMode,
+    pub bit_order: CustomBitOrder,
+    pub confidence: RecoveryConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomWavRecovery {
+    pub audio: TapeAudioAnalysis,
+    pub stages: Vec<CustomStageEvidence>,
+    pub blocks: Vec<CustomRecoveredBlock>,
+    pub loader_class: &'static str,
+    pub warnings: Vec<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WavError {
     Malformed(&'static str),
@@ -213,22 +273,336 @@ pub fn decode_spectrum_wav(bytes: &[u8]) -> Result<SpectrumWavRecovery, WavError
     })
 }
 
+/// Conservatively discovers and decodes generic/turbo pulse trains.  This is
+/// intentionally independent of the Spectrum ROM decoder above: a non-ROM
+/// pilot is evidence of a custom waveform, never a named commercial loader.
+pub fn decode_custom_wav(bytes: &[u8]) -> Result<CustomWavRecovery, WavError> {
+    let audio = analyze_wav(bytes)?;
+    let intervals: Vec<u64> = audio
+        .edges
+        .windows(2)
+        .map(|w| w[1].micros.saturating_sub(w[0].micros))
+        .filter(|value| *value > 0 && *value <= 20_000)
+        .take(MAX_CUSTOM_PULSES)
+        .collect();
+    let mut stages = Vec::new();
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < intervals.len() && stages.len() < MAX_CUSTOM_STAGES {
+        let Some((pilot_start, pilot_end, pilot_cluster)) = find_custom_pilot(&intervals, cursor)
+        else {
+            break;
+        };
+        let sync_start = pilot_end;
+        let sync_len = (1..=3)
+            .find(|length| {
+                sync_start + length <= intervals.len()
+                    && intervals[sync_start..sync_start + length]
+                        .iter()
+                        .all(|value| *value < pilot_cluster / 2)
+            })
+            .unwrap_or(0);
+        let data_start = sync_start + sync_len;
+        let data_end = (data_start + MAX_CUSTOM_DATA_PULSES).min(intervals.len());
+        let data = &intervals[data_start..data_end];
+        let clusters = timing_clusters(data);
+        let (mode, bit_order, recovered, ambiguous) = infer_custom_data(data, &clusters);
+        let start_micros = audio.edges[pilot_start].micros;
+        let end_edge = (data_end + 1).min(audio.edges.len().saturating_sub(1));
+        let end_micros = audio.edges[end_edge].micros;
+        let confidence = if pilot_end - pilot_start >= 96
+            && sync_len > 0
+            && !clusters.is_empty()
+            && ambiguous == 0
+        {
+            RecoveryConfidence::High
+        } else if pilot_end - pilot_start >= 48 && !clusters.is_empty() {
+            RecoveryConfidence::Medium
+        } else {
+            RecoveryConfidence::Low
+        };
+        let stage = CustomStageEvidence {
+            start_micros,
+            end_micros,
+            pilot_micros: pilot_cluster,
+            pilot_count: pilot_end - pilot_start,
+            sync_pulses: intervals[sync_start..data_start].to_vec(),
+            clusters: clusters.clone(),
+            symbol_mode: mode,
+            bit_order,
+            ambiguous_symbols: ambiguous,
+            confidence,
+        };
+        stages.push(stage);
+        if let (Some(mode), Some(bytes)) = (mode, recovered) {
+            if !bytes.is_empty() {
+                let checksum =
+                    (bytes.len() >= 2).then(|| bytes.iter().fold(0u8, |acc, byte| acc ^ byte) == 0);
+                blocks.push(CustomRecoveredBlock {
+                    bytes,
+                    start_micros,
+                    end_micros,
+                    decoded_bits: data.len()
+                        / if mode == CustomSymbolMode::PairedPulse {
+                            16
+                        } else {
+                            8
+                        },
+                    ambiguous_bits: ambiguous,
+                    checksum_valid: checksum,
+                    mode,
+                    bit_order,
+                    confidence,
+                });
+            }
+        }
+        cursor = data_end.max(pilot_end + 1);
+    }
+    let loader_class = if stages.len() > 1 {
+        "MultiStage"
+    } else if blocks
+        .iter()
+        .any(|block| block.mode == CustomSymbolMode::PairedPulse)
+    {
+        "GenericTurbo"
+    } else if !stages.is_empty() {
+        "CustomPulse"
+    } else {
+        "UnknownCustom"
+    };
+    let warnings = if stages.is_empty() {
+        vec!["no stable non-ROM custom pilot was recovered".into()]
+    } else if blocks.is_empty() {
+        vec!["custom timing was found, but no unambiguous byte block was recovered".into()]
+    } else {
+        Vec::new()
+    };
+    Ok(CustomWavRecovery {
+        audio,
+        stages,
+        blocks,
+        loader_class,
+        warnings,
+    })
+}
+
+const MAX_CUSTOM_PULSES: usize = 200_000;
+const MAX_CUSTOM_STAGES: usize = 16;
+const MAX_CUSTOM_DATA_PULSES: usize = 32_768;
+
+fn find_custom_pilot(intervals: &[u64], from: usize) -> Option<(usize, usize, u64)> {
+    let mut i = from;
+    while i < intervals.len() {
+        let start = i;
+        let centre = intervals[i];
+        while i < intervals.len() && close(intervals[i], centre, 0.10) {
+            i += 1;
+        }
+        if i - start >= 32 && !close(centre, 2168, 0.18) {
+            return Some((start, i, centre));
+        }
+        i = start + 1;
+    }
+    None
+}
+
+fn timing_clusters(values: &[u64]) -> Vec<CustomTimingCluster> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mut groups: Vec<Vec<u64>> = Vec::new();
+    for value in sorted {
+        if let Some(group) = groups.last_mut()
+            && close(value, group[group.len() - 1], 0.14)
+        {
+            group.push(value);
+        } else if groups.len() < 8 {
+            groups.push(vec![value]);
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|group| group.len() >= 4)
+        .map(|group| {
+            let centre = median(&group);
+            let spread = group
+                .iter()
+                .map(|value| value.abs_diff(centre))
+                .max()
+                .unwrap_or(0);
+            let confidence = if group.len() >= 24 && spread <= centre / 8 {
+                RecoveryConfidence::High
+            } else if group.len() >= 8 {
+                RecoveryConfidence::Medium
+            } else {
+                RecoveryConfidence::Low
+            };
+            CustomTimingCluster {
+                centre_micros: centre,
+                count: group.len(),
+                spread_micros: spread,
+                confidence,
+            }
+        })
+        .collect()
+}
+
+fn infer_custom_data(
+    data: &[u64],
+    clusters: &[CustomTimingCluster],
+) -> (
+    Option<CustomSymbolMode>,
+    CustomBitOrder,
+    Option<Vec<u8>>,
+    usize,
+) {
+    if clusters.len() < 2 {
+        return (None, CustomBitOrder::Ambiguous, None, data.len());
+    }
+    let mut centres: Vec<u64> = clusters
+        .iter()
+        .map(|cluster| cluster.centre_micros)
+        .collect();
+    centres.sort_unstable();
+    let short = centres[0];
+    let long = centres[1];
+    let pair_fit = data
+        .chunks_exact(2)
+        .filter(|pair| {
+            close(pair[0], pair[1], 0.18)
+                && (close(pair[0], short, 0.22) || close(pair[0], long, 0.22))
+        })
+        .count();
+    let single_fit = data
+        .iter()
+        .filter(|value| close(**value, short, 0.22) || close(**value, long, 0.22))
+        .count();
+    let mode = if pair_fit >= 4 && pair_fit * 2 >= single_fit {
+        CustomSymbolMode::PairedPulse
+    } else if single_fit >= 8 {
+        CustomSymbolMode::SinglePulse
+    } else {
+        return (None, CustomBitOrder::Ambiguous, None, data.len());
+    };
+    let width = if mode == CustomSymbolMode::PairedPulse {
+        2
+    } else {
+        1
+    };
+    let symbols: Vec<Option<u8>> = data
+        .chunks_exact(width)
+        .map(|chunk| {
+            let value = if mode == CustomSymbolMode::PairedPulse {
+                if !close(chunk[0], chunk[1], 0.18) {
+                    return None;
+                }
+                chunk[0]
+            } else {
+                chunk[0]
+            };
+            if close(value, short, 0.22) {
+                Some(0)
+            } else if close(value, long, 0.22) {
+                Some(1)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let ambiguous = symbols.iter().filter(|symbol| symbol.is_none()).count();
+    let usable: Vec<u8> = symbols.into_iter().flatten().collect();
+    if usable.len() < 8 {
+        return (Some(mode), CustomBitOrder::Ambiguous, None, ambiguous);
+    }
+    let msb = bits_to_bytes(&usable, false);
+    let lsb = bits_to_bytes(&usable, true);
+    // A small framing hint is the only order selection made here: a leading
+    // flag byte of 0, 1, or FF is common in tape blocks.  Otherwise retain
+    // both interpretations as ambiguous and refuse to invent bytes.
+    let framing = |bytes: &[u8]| {
+        bytes
+            .first()
+            .is_some_and(|byte| matches!(byte, 0 | 1 | 0xff))
+    };
+    let bit_order = if framing(&msb) && !framing(&lsb) {
+        CustomBitOrder::MsbFirst
+    } else if framing(&lsb) && !framing(&msb) {
+        CustomBitOrder::LsbFirst
+    } else {
+        CustomBitOrder::Ambiguous
+    };
+    let bytes = match bit_order {
+        CustomBitOrder::MsbFirst => msb,
+        CustomBitOrder::LsbFirst => lsb,
+        CustomBitOrder::Ambiguous => return (Some(mode), bit_order, None, ambiguous),
+    };
+    (Some(mode), bit_order, Some(bytes), ambiguous)
+}
+
+fn bits_to_bytes(bits: &[u8], lsb: bool) -> Vec<u8> {
+    bits.chunks_exact(8)
+        .map(|chunk| {
+            chunk.iter().enumerate().fold(0u8, |acc, (index, bit)| {
+                if lsb {
+                    acc | (*bit << index)
+                } else {
+                    (acc << 1) | *bit
+                }
+            })
+        })
+        .take(4096)
+        .collect()
+}
+
 /// Reuses the canonical TAP interpreter for blocks recovered from audio.
 /// Invalid/partial blocks remain available in `SpectrumWavRecovery`, but are
 /// not promoted into a TAP analysis until their checksums are valid.
 pub fn recovered_tape_analysis(
     recovery: &SpectrumWavRecovery,
 ) -> Option<crate::tape_analysis::TapeAnalysis> {
+    tape_analysis_from_blocks(
+        recovery
+            .blocks
+            .iter()
+            .map(|block| (&block.bytes, block.checksum_valid)),
+    )
+}
+
+/// Attempts the same TAP handoff for custom bytes, but only when every
+/// recovered block has an independently valid checksum. Generic bytes that do
+/// not satisfy the TAP interpreter remain custom evidence instead.
+pub fn custom_recovered_tape_analysis(
+    recovery: &CustomWavRecovery,
+) -> Option<crate::tape_analysis::TapeAnalysis> {
+    tape_analysis_from_blocks(
+        recovery
+            .blocks
+            .iter()
+            .map(|block| (&block.bytes, block.checksum_valid)),
+    )
+}
+
+/// Stable, sample-rate-independent fingerprint material for one custom stage.
+/// It contains only normalized timing families, never filenames, sample
+/// indices, or audio bytes.
+pub fn custom_timing_fingerprint(stage: &CustomStageEvidence) -> Vec<u64> {
+    let base = stage.pilot_micros.max(1);
+    stage
+        .clusters
+        .iter()
+        .map(|cluster| cluster.centre_micros.saturating_mul(1_000_000) / base)
+        .collect()
+}
+
+fn tape_analysis_from_blocks<'a>(
+    blocks: impl IntoIterator<Item = (&'a Vec<u8>, Option<bool>)>,
+) -> Option<crate::tape_analysis::TapeAnalysis> {
     let mut tap = Vec::new();
-    for block in &recovery.blocks {
-        if block.bytes.len() < 2 || block.bytes.len() > u16::MAX as usize {
+    for (bytes, checksum_valid) in blocks {
+        if bytes.len() < 2 || bytes.len() > u16::MAX as usize || checksum_valid != Some(true) {
             return None;
         }
-        if block.checksum_valid != Some(true) {
-            return None;
-        }
-        tap.extend_from_slice(&(block.bytes.len() as u16).to_le_bytes());
-        tap.extend_from_slice(&block.bytes);
+        tap.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        tap.extend_from_slice(bytes);
     }
     (!tap.is_empty())
         .then(|| crate::tape_analysis::analyze_tape(&tap).ok())
@@ -456,5 +830,84 @@ mod tests {
         let result = decode_spectrum_wav(&wav(rate, 1, 8, &samples)).unwrap();
         assert_eq!(result.blocks.len(), 1);
         assert_eq!(result.blocks[0].bytes, vec![0xA5]);
+    }
+
+    #[test]
+    fn discovers_and_recovers_a_non_rom_paired_waveform() {
+        let rate = 44_100u32;
+        let mut samples = vec![128u8; rate as usize / 20];
+        let mut high = true;
+        let mut add = |micros: u64| {
+            let count = (micros * rate as u64 / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        };
+        for _ in 0..80 {
+            add(1200);
+        }
+        add(300);
+        // 0x01 followed by 0x02 gives the framing hint needed to select MSB.
+        for bit in [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0] {
+            let pulse = if bit == 0 { 400 } else { 800 };
+            add(pulse);
+            add(pulse);
+        }
+        samples.extend(std::iter::repeat_n(0, 100));
+        let result = decode_custom_wav(&wav(rate, 1, 8, &samples)).unwrap();
+        assert_eq!(result.loader_class, "GenericTurbo");
+        assert_eq!(result.stages.len(), 1);
+        assert_eq!(result.blocks[0].mode, CustomSymbolMode::PairedPulse);
+        assert_eq!(result.blocks[0].bit_order, CustomBitOrder::MsbFirst);
+        assert_eq!(result.blocks[0].bytes, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn standard_rom_timing_is_not_reclassified_as_custom() {
+        let rate = 22_050u32;
+        let mut samples = vec![128u8; rate as usize / 20];
+        let mut high = true;
+        let mut add = |micros: u64| {
+            let count = (micros * rate as u64 / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        };
+        for _ in 0..80 {
+            add(2168);
+        }
+        add(667);
+        add(735);
+        let result = decode_custom_wav(&wav(rate, 1, 8, &samples)).unwrap();
+        assert!(result.stages.is_empty());
+        assert_eq!(result.loader_class, "UnknownCustom");
+    }
+
+    #[test]
+    fn custom_fingerprint_uses_normalized_timing_not_sample_indices() {
+        let stage = CustomStageEvidence {
+            start_micros: 10,
+            end_micros: 100,
+            pilot_micros: 1200,
+            pilot_count: 64,
+            sync_pulses: vec![300],
+            clusters: vec![
+                CustomTimingCluster {
+                    centre_micros: 400,
+                    count: 20,
+                    spread_micros: 2,
+                    confidence: RecoveryConfidence::High,
+                },
+                CustomTimingCluster {
+                    centre_micros: 800,
+                    count: 20,
+                    spread_micros: 3,
+                    confidence: RecoveryConfidence::High,
+                },
+            ],
+            symbol_mode: Some(CustomSymbolMode::PairedPulse),
+            bit_order: CustomBitOrder::Ambiguous,
+            ambiguous_symbols: 0,
+            confidence: RecoveryConfidence::High,
+        };
+        assert_eq!(custom_timing_fingerprint(&stage), vec![333_333, 666_666]);
     }
 }

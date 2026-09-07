@@ -21,3 +21,19 @@ PCM is never retained in analysis results. Compressed audio, WAV formats other
 than bounded PCM integer input, custom waveform loaders, emulator execution,
 and tape extraction remain out of scope. Unsupported codecs and
 malformed/truncated chunks fail closed.
+
+## V5: generic custom/turbo waveform evidence
+
+V5 adds `decode_custom_wav`, a conservative second pass over the existing edge
+stream. It discovers bounded timing clusters, stable non-ROM pilot trains, and
+one-to-three-pulse sync candidates, then attempts stage-local two-symbol data
+recovery in paired-pulse or single-pulse mode. Timing centres, spread, stage
+boundaries, ambiguity, bit-order evidence, and confidence are retained as
+structured evidence. A small framing hint may distinguish MSB/LSB order;
+otherwise the order remains ambiguous and bytes are not claimed.
+
+This is generic custom decoding, not identification of a named commercial
+loader. Standard Spectrum ROM decoding remains the V4b path. V5 does not
+promise that every custom loader is decodable, does not fabricate TAP metadata,
+and keeps uncertain timing as `UnknownCustom`/review evidence. No emulator is
+executed, no DAT identity or rename is changed, and no raw PCM is persisted.
