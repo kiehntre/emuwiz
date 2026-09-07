@@ -20,39 +20,62 @@ encrypted codes, and unknown widths from being silently converted to writes.
 * PNACH `byte`, `short`, and `word` patch lines map to the matching width.
   `double` and `extended` remain unsupported because the IR does not model
   their semantics.
-* Nintendo DS Action Replay now has a strict source-only classifier for
+* Nintendo DS Action Replay now has a strict classifier and pure text encoder
   canonical direct-only `0XXXXXXX YYYYYYYY`, `1XXXXXXX 0000YYYY`, and
   `2XXXXXXX 000000YY` records. It maps those records to `Write32`, `Write16`,
-  and `Write8` respectively, while preserving every other line as
-  `UnsupportedRaw` with a typed refusal reason. It has no target writer.
+  and `Write8` respectively, and emits the exact inverse canonical forms when
+  the document is Nintendo DS and contains only supported operations. Every
+  other line remains `UnsupportedRaw` with a typed refusal reason.
 * RetroArch `.cht` entries, GameShark, and CodeBreaker remain native/browse-only
   or opaque until an authoritative, version-specific parser and encoder exist.
   No encrypted representation is guessed.
 
-The V2 `encode_operation` helper emits pure in-memory direct-write text for
-Dolphin Action Replay, Gecko, and PNACH. `assess_document_conversion` returns
-per-operation status, provenance, output preview text, and exact/lossy/
-unsupported counts. A missing GameShark/CodeBreaker encoder is reported
-explicitly, and `can_apply` is false whenever an operation, issue, platform,
-or encoder is unresolved. No output is fabricated and no emulator file is
-written.
+The `encode_operation` helper emits pure in-memory direct-write text for
+Dolphin Action Replay, Gecko, PNACH, and the canonical DS Action Replay
+subset. `assess_document_conversion` returns per-operation status, provenance,
+output preview text, and exact/lossy/unsupported counts. A missing
+GameShark/CodeBreaker or RetroArch encoder is reported explicitly, and
+`can_apply` is false whenever an operation, issue, platform, or encoder is
+unresolved. No output is fabricated and no emulator file is written.
 
 DS Action Replay conditions, activators, pointers, loops/multi-writes,
 copy/fill, offset/data-register operations, processor/master-init forms, and
 unknown/encrypted variants remain preserved as unsupported rather than
 guessed. The parser rejects malformed, noncanonical, and misaligned direct
-writes. No melonDS, DeSmuME, or RetroArch DS writer is enabled by the IR.
+writes. Conversion preview exposes complete text only; mixed documents never
+expose a partial export. No emulator installation writer is enabled by the IR.
 
-V4 exposes `convert_cheat_document` and `supported_targets_for` as the reusable
-converter-service seam. They return GUI-ready capability and per-operation
-previews without installing or overwriting emulator files. RetroArch remains
-deferred because the existing `.cht` parser retains code expressions as opaque
-strings rather than an authoritative width/address/value tuple.
+## DS target-writer audit (V7)
 
-The target audit found that DuckStation, melonDS, DeSmuME, mGBA, and SameBoy
-currently provide inventory/read-only configuration in this repository, not a
-proven direct-write native writer. No additional target encoder is invented in
-V4; one should be added only after an authoritative native grammar exists.
+The V7 encoder is an in-memory format encoder, not an emulator installer.
+
+| Target | Accepts DS AR directly | Per-game storage evidence | Safe EmuWiz writer | Decision |
+|---|---:|---|---:|---|
+| melonDS standalone | not established | no reviewed native cheat-file/identity contract in the current repo | No | defer pending a versioned native format and transactional identity seam |
+| DeSmuME standalone | parser accepts AR semantics, but native persistence is not an EmuWiz contract | no reviewed per-game native install contract | No | defer; do not write config or `.dct`-style state |
+| RetroArch DS cores | core-dependent `.cht` handler; not a generic DS AR target | game-specific `.cht` path is known by RetroArch, but handler/core semantics remain authoritative | No | defer; core-specific writer audit required |
+
+The reviewed RetroArch melonDS documentation records RetroArch cheats as
+supported but native cheats as unsupported, and current DS database `.cht`
+entries contain core-dependent multi-line expressions. Therefore a common
+`Write8`/`Write16`/`Write32` IR is not enough to claim a safe writer. No target
+writer or emulator installation was added in V7. The first recommended writer
+target is a named RetroArch DS core only after its handler grammar and
+per-game file association are fixture-proven; standalone melonDS and DeSmuME
+remain later candidates.
+
+The converter service exposes `convert_cheat_document`,
+`supported_targets_for`, and the pure `export_conversion_preview` seam. They
+return GUI-ready capability and complete previews without installing or
+overwriting emulator files. RetroArch remains deferred because the existing
+`.cht` parser retains code expressions as opaque strings rather than an
+authoritative width/address/value tuple.
+
+The target audit found that melonDS, DeSmuME, and RetroArch DS cores do not
+currently provide a proven, reusable native DS direct-write writer seam in
+this repository. No native installation encoder is invented in V7; one should
+be added only after an authoritative grammar, per-game identity, and
+transactional storage path are reviewed.
 
 The intended architecture is:
 

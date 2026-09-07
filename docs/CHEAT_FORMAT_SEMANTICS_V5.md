@@ -1,7 +1,8 @@
 # Cheat-format semantic evidence (V5)
 
-**Decision status:** research complete; V6 adds a source-only DS AR parser and
-classifier, but no encoder, installer, or GUI change.  The neutral IR remains deliberately limited
+**Decision status:** research complete; V7 adds a pure DS AR direct-write
+encoder and complete preview round-trip, but no installer or GUI change. The
+neutral IR remains deliberately limited
 to proven direct writes.  In particular, a familiar brand name is never enough
 to identify a cheat grammar.
 
@@ -56,10 +57,12 @@ solely of the canonical `0`, `1`, and `2` forms proves that offset is its
 initial zero value.  Alignment should also be checked for 16- and 32-bit
 writes before an eventual parser accepts a record.
 
-This is now implemented as a **High** confidence source-to-IR classifier in
-`cheat_ir.rs`. It is **not** an approved target encoder: neither a melonDS nor
-a DeSmuME native direct-write file/install contract is presently implemented or
-reviewed in EmuWiz.
+This is implemented as a **High** confidence source-to-IR classifier and
+canonical inverse encoder in `cheat_ir.rs`. The encoder is available only for
+Nintendo DS documents whose operations are all direct writes; it rejects
+invalid alignment/address cases and never truncates. It is not an emulator
+installer: neither a melonDS nor a DeSmuME native direct-write file/install
+contract is presently implemented or reviewed in EmuWiz.
 
 ### DS families deliberately not reduced to writes
 
@@ -168,14 +171,15 @@ replaced by one.
 | PS2 | PNACH | PCSX2 raw patch | Yes | Yes | `byte`/`short`/`word` | no device encryption | direct-write preview/conversion | complete current boundary |
 | PS2 | GameShark | version unspecified | No | No | none proven | unknown/version-dependent | target shown unavailable | acquire lawful versioned fixtures and an authoritative grammar |
 | PS2 | CodeBreaker | version unspecified | No | No | none proven | unknown/version-dependent | target shown unavailable | acquire lawful versioned fixtures and an authoritative grammar |
-| Nintendo DS | Action Replay DS | DeSmuME ARparser-compatible canonical direct records | **Yes, V6** | No | canonical `0`/`1`/`2` complete direct-only records | no, only under direct-only constraint | CheatBase browse-only plus source-only IR classifier | separately audit a native target writer |
+| Nintendo DS | Action Replay DS | DeSmuME ARparser-compatible canonical direct records | **Yes, V7** | **Yes, pure text only** | canonical `0`/`1`/`2` complete direct-only records | no, only under direct-only constraint | CheatBase browse-only plus exact source/target preview | separately audit a native target writer |
 | RetroArch | `.cht` | generic/core-dependent | No generic parse | No generic encode | none globally | handler/core state required | bounded native install only | audit one named core/handler, not “RetroArch” generally |
 
 ## Ranked next implementation targets
 
-1. **Nintendo DS Action Replay source-to-IR direct-only parser.** High
-   semantic confidence, useful CheatBase coverage, small isolated parser;
-   retain unsupported lines and do not add a writer.
+1. **Nintendo DS Action Replay target writer for one named core.** The source
+   parser and pure encoder are complete; the next work must prove a specific
+   emulator/core file grammar and transactional per-game association before
+   any install path is enabled.
 2. **A named RetroArch core/handler structured format, if one has a reviewed
    native contract.** Potentially useful, but only after a per-core evidence
    pack establishes memory region, width, endian and handler semantics.

@@ -185,6 +185,31 @@ pub fn dolphin_line_to_ir(raw: &str, format: CheatSourceFormat) -> CheatOperatio
     }
 }
 
+/// Encodes one neutral direct-write operation as canonical Nintendo DS Action
+/// Replay text. This is pure in-memory formatting; it never writes an
+/// emulator file.
+pub fn encode_ds_action_replay_operation(operation: &CheatOperation) -> Option<String> {
+    match operation {
+        CheatOperation::Write32 { address, value }
+            if *address <= 0x0FFF_FFFF && *address != 0 && address % 4 == 0 =>
+        {
+            Some(format!("0{address:07X} {value:08X}"))
+        }
+        CheatOperation::Write16 { address, value }
+            if *address <= 0x0FFF_FFFF && address % 2 == 0 =>
+        {
+            Some(format!("1{address:07X} 0000{value:04X}"))
+        }
+        CheatOperation::Write8 { address, value } if *address <= 0x0FFF_FFFF => {
+            Some(format!("2{address:07X} 000000{value:02X}"))
+        }
+        CheatOperation::Write8 { .. }
+        | CheatOperation::Write16 { .. }
+        | CheatOperation::Write32 { .. }
+        | CheatOperation::UnsupportedRaw { .. } => None,
+    }
+}
+
 fn ds_action_replay_unsupported(
     raw: &str,
     kind: DsActionReplayUnsupportedKind,
@@ -476,8 +501,8 @@ pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) 
             };
             Some(format!("patch=1,EE,{address:08X},{width},{rendered}"))
         }
+        CheatTargetFormat::ActionReplayDs => encode_ds_action_replay_operation(operation),
         CheatTargetFormat::RetroArch
-        | CheatTargetFormat::ActionReplayDs
         | CheatTargetFormat::GameSharkPs2
         | CheatTargetFormat::CodeBreakerPs2 => None,
     }
@@ -530,7 +555,6 @@ pub fn assess_document_conversion(
         target,
         CheatTargetFormat::GameSharkPs2
             | CheatTargetFormat::CodeBreakerPs2
-            | CheatTargetFormat::ActionReplayDs
             | CheatTargetFormat::RetroArch
     );
     if missing_encoder {
@@ -547,7 +571,7 @@ pub fn assess_document_conversion(
         lossy_operations: 0,
         unsupported_operations: unsupported,
         warnings,
-        output_preview: (!output.is_empty()).then(|| output.join("\n")),
+        output_preview: (can_apply && !output.is_empty()).then(|| output.join("\n")),
         can_apply,
         operation_status,
         provenance: document.provenance.clone(),
@@ -561,6 +585,16 @@ pub fn convert_cheat_document(
     target: CheatTargetFormat,
 ) -> CheatConversionPreview {
     assess_document_conversion(document, target)
+}
+
+/// Returns a complete, pure-text conversion only when the requested target is
+/// fully supported. Mixed or otherwise non-applicable documents never expose a
+/// partial export.
+pub fn export_conversion_preview(
+    document: &CheatDocument,
+    target: CheatTargetFormat,
+) -> Option<String> {
+    convert_cheat_document(document, target).output_preview
 }
 
 /// Enumerates targets without inventing encoders.  Unsupported entries are
@@ -754,6 +788,60 @@ mod tests {
     }
 
     #[test]
+    fn ds_action_replay_encoder_emits_canonical_fixed_width_words() {
+        assert_eq!(
+            encode_ds_action_replay_operation(&CheatOperation::Write32 {
+                address: 0x0234_5678,
+                value: 0xDEAD_BEEF,
+            }),
+            Some("02345678 DEADBEEF".into())
+        );
+        assert_eq!(
+            encode_ds_action_replay_operation(&CheatOperation::Write16 {
+                address: 0x0234_5678,
+                value: 0xBEEF,
+            }),
+            Some("12345678 0000BEEF".into())
+        );
+        assert_eq!(
+            encode_ds_action_replay_operation(&CheatOperation::Write8 {
+                address: 0x0234_5679,
+                value: 0xEF,
+            }),
+            Some("22345679 000000EF".into())
+        );
+    }
+
+    #[test]
+    fn ds_action_replay_encoder_refuses_invalid_or_opaque_operations() {
+        for operation in [
+            CheatOperation::Write32 {
+                address: 0x0234_5679,
+                value: 1,
+            },
+            CheatOperation::Write16 {
+                address: 0x0234_5679,
+                value: 1,
+            },
+            CheatOperation::Write32 {
+                address: 0x1000_0000,
+                value: 1,
+            },
+            CheatOperation::Write8 {
+                address: 0x1000_0000,
+                value: 1,
+            },
+            CheatOperation::UnsupportedRaw {
+                source_format: CheatSourceFormat::ActionReplayDs,
+                raw: "conditional".into(),
+                reason: "stateful".into(),
+            },
+        ] {
+            assert_eq!(encode_ds_action_replay_operation(&operation), None);
+        }
+    }
+
+    #[test]
     fn ds_action_replay_rejects_malformed_noncanonical_and_misaligned_lines() {
         let cases = [
             ("not-hex 00000000", DsActionReplayUnsupportedKind::Malformed),
@@ -865,7 +953,7 @@ mod tests {
         assert_eq!(preview.exact_operations, 3);
         assert_eq!(preview.unsupported_operations, 1);
         assert!(!preview.can_apply);
-        assert!(preview.warnings.contains(&CheatIssue::MissingTargetEncoder));
+        assert!(!preview.warnings.contains(&CheatIssue::MissingTargetEncoder));
         assert_eq!(preview.provenance, document.provenance);
     }
 
@@ -875,18 +963,77 @@ mod tests {
             parse_ds_action_replay_document("DS", "02345678 DEADBEEF", vec!["fixture".into()]);
         let capabilities = supported_targets_for(&document);
         assert_eq!(capabilities.len(), 2);
-        assert!(capabilities.iter().all(|capability| matches!(
-            capability.capability,
-            ConversionCapability::Unsupported { .. }
-        )));
-        assert!(capabilities.iter().all(|capability| {
-            matches!(
-                capability.target,
-                CheatTargetFormat::ActionReplayDs | CheatTargetFormat::RetroArch
-            )
-        }));
+        assert!(matches!(
+            capabilities
+                .iter()
+                .find(|capability| capability.target == CheatTargetFormat::ActionReplayDs)
+                .map(|capability| &capability.capability),
+            Some(ConversionCapability::Exact)
+        ));
+        assert!(matches!(
+            capabilities
+                .iter()
+                .find(|capability| capability.target == CheatTargetFormat::RetroArch)
+                .map(|capability| &capability.capability),
+            Some(ConversionCapability::Unsupported { .. })
+        ));
         let dolphin = convert_cheat_document(&document, CheatTargetFormat::Gecko);
         assert!(!dolphin.can_apply);
         assert!(dolphin.warnings.contains(&CheatIssue::PlatformMismatch));
+    }
+
+    #[test]
+    fn ds_action_replay_round_trip_and_export_are_complete_only() {
+        let document = parse_ds_action_replay_document(
+            "DS",
+            "02345678 DEADBEEF\n12345678 0000BEEF\n22345679 000000EF",
+            vec!["CheatBase:rom-42".into()],
+        );
+        let preview = convert_cheat_document(&document, CheatTargetFormat::ActionReplayDs);
+        assert!(preview.can_apply);
+        assert_eq!(preview.exact_operations, 3);
+        assert_eq!(preview.unsupported_operations, 0);
+        assert_eq!(
+            export_conversion_preview(&document, CheatTargetFormat::ActionReplayDs).as_deref(),
+            Some("02345678 DEADBEEF\n12345678 0000BEEF\n22345679 000000EF")
+        );
+
+        let mixed = parse_ds_action_replay_document(
+            "DS",
+            "02345678 DEADBEEF\n32345678 00000001\n22345679 000000EF",
+            vec!["fixture".into()],
+        );
+        let mixed_preview = convert_cheat_document(&mixed, CheatTargetFormat::ActionReplayDs);
+        assert_eq!(mixed_preview.exact_operations, 2);
+        assert_eq!(mixed_preview.unsupported_operations, 1);
+        assert!(!mixed_preview.can_apply);
+        assert_eq!(mixed_preview.output_preview, None);
+        assert_eq!(
+            export_conversion_preview(&mixed, CheatTargetFormat::ActionReplayDs),
+            None
+        );
+        assert_eq!(mixed.provenance, vec!["fixture".to_string()]);
+    }
+
+    #[test]
+    fn ds_action_replay_target_rejects_non_ds_platform_documents() {
+        let document = CheatDocument {
+            title: "PS2".into(),
+            platform: CheatPlatform::Ps2,
+            source_format: CheatSourceFormat::Pnach,
+            operations: vec![CheatOperation::Write32 {
+                address: 0x0234_5678,
+                value: 1,
+            }],
+            issues: vec![],
+            provenance: vec![],
+        };
+        let preview = convert_cheat_document(&document, CheatTargetFormat::ActionReplayDs);
+        assert!(!preview.can_apply);
+        assert!(preview.warnings.contains(&CheatIssue::PlatformMismatch));
+        assert_eq!(
+            export_conversion_preview(&document, CheatTargetFormat::ActionReplayDs),
+            None
+        );
     }
 }
