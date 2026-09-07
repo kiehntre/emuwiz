@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use crate::emulator_environment::retroarch::{
     CoreInfoFinding, ProfileRef, RetroArchEnvironmentReport,
 };
+use crate::launch::amiga_whdload_command::{SelectedWHDLoadSlave, VerifiedWHDLoadTarget};
 use crate::launch::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
 use crate::launch::readiness::{
     FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchReadiness, LaunchWarning,
@@ -64,12 +65,25 @@ pub struct ResolvedIdentity {
 }
 
 /// What kind of content this candidate would actually run, when known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchContentKind {
+    /// A verified WHDLoad package. The package/slave binding is carried by
+    /// the typed Amiga launch context; this marker alone never authorizes a
+    /// launch.
+    Whdload(VerifiedWHDLoadContent),
     OpticalDisc,
     Cartridge,
     Executable,
     Unknown,
+}
+
+/// The verified package/slave relationship required by the WHDLoad launch
+/// backend. This cannot be constructed from an arbitrary path alone; callers
+/// must obtain both values from the existing bounded WHDLoad inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedWHDLoadContent {
+    pub target: VerifiedWHDLoadTarget,
+    pub selected_slave: SelectedWHDLoadSlave,
 }
 
 /// The container format the content is currently held in, when known.

@@ -46,6 +46,17 @@ use archivefs_core::emulator_environment::retroarch::{
     ProfileRef, RetroArchEnvironmentReport,
 };
 use archivefs_core::launch::{
+    AmigaWHDLoadLaunchError, DuckStationLaunchExecutionError, DuckStationLaunchRequest,
+    LaunchedAmigaWHDLoadProcess, LaunchedDuckStationProcess, LaunchedPpssppProcess,
+    LaunchedRpcs3Process, LaunchedXemuProcess, LaunchedXeniaProcess, PpssppLaunchExecutionError,
+    PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest, WHDLoadLaunchInput,
+    XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
+    build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
+    preflight_and_launch_amiga_whdload, preflight_and_launch_duckstation,
+    preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
+    preflight_and_launch_xenia,
+};
+use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
     DolphinLaunchExitReport, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
     DolphinLaunchSpawnError, FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchCandidate,
@@ -56,14 +67,6 @@ use archivefs_core::launch::{
     Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest, Pcsx2LaunchSpawnError,
     RetroArchLaunchRequest, preflight_and_launch_dolphin, preflight_and_launch_pcsx2,
     preflight_and_launch_retroarch,
-};
-use archivefs_core::launch::{
-    DuckStationLaunchExecutionError, DuckStationLaunchRequest, LaunchedDuckStationProcess,
-    LaunchedPpssppProcess, LaunchedRpcs3Process, LaunchedXemuProcess, LaunchedXeniaProcess,
-    PpssppLaunchExecutionError, PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest,
-    XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
-    preflight_and_launch_duckstation, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
-    preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
 use archivefs_core::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
@@ -133,6 +136,7 @@ pub(crate) enum LaunchReadinessInput {
         rpcs3: Option<Rpcs3LaunchContext>,
         xemu: Option<XemuLaunchContext>,
         xenia: Option<XeniaLaunchContext>,
+        amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
     },
 }
 
@@ -203,6 +207,7 @@ pub(crate) enum TypedLaunchRequest {
     Dolphin(DolphinLaunchRequest),
     Pcsx2(Pcsx2LaunchRequest, Vec<FirmwareIdentityRecord>),
     Standalone(StandaloneLaunchRequest),
+    AmigaWHDLoad(WHDLoadLaunchInput),
 }
 
 impl TypedLaunchRequest {
@@ -212,6 +217,10 @@ impl TypedLaunchRequest {
             Self::Dolphin(_) => "Dolphin",
             Self::Pcsx2(_, _) => "PCSX2",
             Self::Standalone(request) => request.adapter_name(),
+            Self::AmigaWHDLoad(request) => match request.profile.emulator {
+                archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "Amiberry",
+                archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "FS-UAE",
+            },
         }
     }
 
@@ -221,12 +230,14 @@ impl TypedLaunchRequest {
         dolphin: &mut DolphinLaunchState,
         pcsx2: &mut Pcsx2LaunchState,
         standalone: &mut StandaloneLaunchState,
+        amiga_whdload: &mut AmigaWHDLoadLaunchState,
     ) {
         match self {
             Self::RetroArch(request) => retroarch.start(request),
             Self::Dolphin(request) => dolphin.start(request),
             Self::Pcsx2(request, evidence) => pcsx2.start(request, evidence),
             Self::Standalone(request) => standalone.start(request),
+            Self::AmigaWHDLoad(request) => amiga_whdload.start(request),
         }
     }
 }
@@ -315,6 +326,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         rpcs3,
         xemu,
         xenia,
+        amiga_whdload,
         ..
     } = input
     else {
@@ -369,6 +381,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                 rpcs3.as_ref(),
                 xemu.as_ref(),
                 xenia.as_ref(),
+                amiga_whdload.as_ref(),
             )
         })
         .collect();
@@ -416,6 +429,101 @@ pub(crate) struct XeniaLaunchContext {
     pub(crate) roots: archivefs_core::patch_manager::XeniaProfileDiscoveryRoots,
     pub(crate) verified_xex_title_id: Option<String>,
     pub(crate) verified_xex_media_id: Option<String>,
+}
+
+pub(crate) struct AmigaWHDLoadLaunchContext {
+    pub(crate) requests: Vec<(String, String, WHDLoadLaunchInput)>,
+}
+
+enum AmigaWHDLoadProcess {
+    Running(LaunchedAmigaWHDLoadProcess),
+}
+
+#[derive(Default)]
+pub(crate) struct AmigaWHDLoadLaunchState {
+    tracked: Option<(PathBuf, String, AmigaWHDLoadStage)>,
+}
+
+enum AmigaWHDLoadStage {
+    Starting(Receiver<Result<AmigaWHDLoadProcess, String>>),
+    Running(AmigaWHDLoadProcess),
+    Exited(AmigaWHDLoadProcess),
+    Failed(String),
+}
+
+impl AmigaWHDLoadLaunchState {
+    pub(crate) fn poll(&mut self) -> bool {
+        let Some((path, adapter, stage)) = self.tracked.take() else {
+            return false;
+        };
+        let (stage, changed) = match stage {
+            AmigaWHDLoadStage::Starting(receiver) => match receiver.try_recv() {
+                Ok(Ok(process)) => (AmigaWHDLoadStage::Running(process), true),
+                Ok(Err(error)) => (AmigaWHDLoadStage::Failed(error), true),
+                Err(TryRecvError::Disconnected) => (
+                    AmigaWHDLoadStage::Failed("launch worker stopped unexpectedly".into()),
+                    true,
+                ),
+                Err(TryRecvError::Empty) => (AmigaWHDLoadStage::Starting(receiver), false),
+            },
+            AmigaWHDLoadStage::Running(mut process) => {
+                let exited = match &mut process {
+                    AmigaWHDLoadProcess::Running(process) => process.poll().is_some(),
+                };
+                (
+                    if exited {
+                        AmigaWHDLoadStage::Exited(process)
+                    } else {
+                        AmigaWHDLoadStage::Running(process)
+                    },
+                    exited,
+                )
+            }
+            other @ (AmigaWHDLoadStage::Exited(_) | AmigaWHDLoadStage::Failed(_)) => (other, false),
+        };
+        self.tracked = Some((path, adapter, stage));
+        changed
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(
+            self.tracked,
+            Some((
+                _,
+                _,
+                AmigaWHDLoadStage::Starting(_) | AmigaWHDLoadStage::Running(_)
+            ))
+        )
+    }
+
+    fn start(&mut self, request: WHDLoadLaunchInput) {
+        let path = request
+            .target
+            .as_ref()
+            .map(|target| target.package_path.clone())
+            .unwrap_or_default();
+        let adapter = match request.profile.emulator {
+            archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "amiberry",
+            archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "fsuae",
+        }
+        .to_string();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let plan = match request.profile.emulator {
+                archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => {
+                    build_amiberry_whdload_command_plan(&request)
+                }
+                archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => {
+                    build_fsuae_whdload_command_plan(&request)
+                }
+            };
+            let result = preflight_and_launch_amiga_whdload(&plan)
+                .map(AmigaWHDLoadProcess::Running)
+                .map_err(|error: AmigaWHDLoadLaunchError| format!("{error:?}"));
+            let _ = sender.send(result);
+        });
+        self.tracked = Some((path, adapter, AmigaWHDLoadStage::Starting(receiver)));
+    }
 }
 
 enum StandaloneProcess {
@@ -1516,6 +1624,7 @@ pub(crate) fn show_launch_readiness_panel(
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
+    amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> Option<LaunchReadinessPageAction> {
     let mut action = None;
     widgets::section_header(
@@ -1565,6 +1674,7 @@ pub(crate) fn show_launch_readiness_panel(
             rpcs3,
             xemu,
             xenia,
+            amiga_whdload,
             ..
         } => {
             if show_plan(
@@ -1582,6 +1692,8 @@ pub(crate) fn show_launch_readiness_panel(
                 dolphin_launch_state,
                 pcsx2_launch_state,
                 standalone_launch_state,
+                amiga_whdload.as_ref(),
+                amiga_whdload_launch_state,
             ) {
                 action = Some(LaunchReadinessPageAction::OpenDoctor);
             }
@@ -1609,6 +1721,8 @@ fn show_plan(
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
+    amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
+    amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> bool {
     let mut open_doctor = false;
     if plan.candidates.is_empty() {
@@ -1638,6 +1752,8 @@ fn show_plan(
             dolphin_launch_state,
             pcsx2_launch_state,
             standalone_launch_state,
+            amiga_whdload,
+            amiga_whdload_launch_state,
         );
     }
     open_doctor
@@ -1933,6 +2049,7 @@ fn typed_launch_request(
     rpcs3: Option<&Rpcs3LaunchContext>,
     xemu: Option<&XemuLaunchContext>,
     xenia: Option<&XeniaLaunchContext>,
+    amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
 ) -> Option<TypedLaunchRequest> {
     if let Some(request) = retroarch_launch_request(plan, candidate, retroarch) {
         return Some(TypedLaunchRequest::RetroArch(request));
@@ -1950,6 +2067,26 @@ fn typed_launch_request(
             context.firmware_evidence.clone(),
         ));
     }
+    if let Some(context) = amiga_whdload
+        && let LaunchTarget::Standalone {
+            adapter_id,
+            profile_id,
+            ..
+        } = &candidate.target
+        && let Some((candidate_adapter, candidate_profile, request)) =
+            context
+                .requests
+                .iter()
+                .find(|(candidate_adapter, candidate_profile, _)| {
+                    candidate_adapter == adapter_id && candidate_profile == profile_id
+                })
+        && candidate.readiness == LaunchReadiness::Ready
+        && candidate.blockers.is_empty()
+        && candidate.warnings.is_empty()
+    {
+        let _ = (candidate_adapter, candidate_profile);
+        return Some(TypedLaunchRequest::AmigaWHDLoad(request.clone()));
+    }
     standalone_launch_request(plan, candidate, duckstation, ppsspp, rpcs3, xemu, xenia)
         .map(TypedLaunchRequest::Standalone)
 }
@@ -1963,6 +2100,8 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "rpcs3" => Some("RPCS3"),
             "xemu" => Some("xemu"),
             "xenia" => Some("Xenia"),
+            "amiberry" => Some("Amiberry"),
+            "fsuae" => Some("FS-UAE"),
             "dolphin" => Some("Dolphin"),
             "scummvm" => Some("ScummVM"),
             _ => None,
@@ -2155,6 +2294,8 @@ fn show_candidate(
     dolphin_launch_state: &mut DolphinLaunchState,
     pcsx2_launch_state: &mut Pcsx2LaunchState,
     standalone_launch_state: &mut StandaloneLaunchState,
+    amiga_whdload: Option<&AmigaWHDLoadLaunchContext>,
+    amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> bool {
     let mut open_doctor = false;
     widgets::card(ui, |ui| {
@@ -2229,6 +2370,24 @@ fn show_candidate(
             ui.add_space(6.0);
             show_standalone_launch_action(ui, standalone_launch_state, request);
         }
+        if let Some(context) = amiga_whdload
+            && let Some(TypedLaunchRequest::AmigaWHDLoad(request)) = typed_launch_request(
+                plan,
+                candidate,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(context),
+            )
+        {
+            ui.add_space(6.0);
+            show_amiga_whdload_launch_action(ui, amiga_whdload_launch_state, request);
+        }
     });
     open_doctor
 }
@@ -2258,6 +2417,50 @@ fn show_standalone_launch_action(
         return;
     }
     if ui.button(format!("Launch {adapter}")).clicked() {
+        state.start(request);
+    }
+}
+
+fn show_amiga_whdload_launch_action(
+    ui: &mut egui::Ui,
+    state: &mut AmigaWHDLoadLaunchState,
+    request: WHDLoadLaunchInput,
+) {
+    let same_request = state.tracked.as_ref().is_some_and(|(path, adapter, _)| {
+        let request_path = request
+            .target
+            .as_ref()
+            .map(|target| target.package_path.as_path());
+        let request_adapter = match request.profile.emulator {
+            archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "amiberry",
+            archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "fsuae",
+        };
+        request_path == Some(path.as_path()) && request_adapter == adapter
+    });
+    if same_request {
+        match state.tracked.as_ref().map(|(_, _, stage)| stage) {
+            Some(AmigaWHDLoadStage::Starting(_)) => {
+                ui.label("Launching WHDLoad…");
+            }
+            Some(AmigaWHDLoadStage::Running(_)) => {
+                ui.label("WHDLoad running");
+            }
+            Some(AmigaWHDLoadStage::Exited(_)) => {
+                ui.label("WHDLoad process exited");
+            }
+            Some(AmigaWHDLoadStage::Failed(detail)) => {
+                ui.label("WHDLoad launch failed");
+                ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
+            }
+            None => {}
+        }
+        return;
+    }
+    let label = match request.profile.emulator {
+        archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => "Amiberry",
+        archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "FS-UAE",
+    };
+    if ui.button(format!("Launch {label} WHDLoad")).clicked() {
         state.start(request);
     }
 }

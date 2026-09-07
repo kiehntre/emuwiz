@@ -72,6 +72,7 @@ pub(crate) fn is_identity_conferring(kind: IdentityKind) -> bool {
     matches!(
         kind,
         IdentityKind::Ps1Serial
+            | IdentityKind::AmigaWHDLoad
             | IdentityKind::Ps2Serial
             | IdentityKind::PspDiscId
             | IdentityKind::Ps3TitleId
@@ -141,6 +142,7 @@ fn find_value(resolved: &[(IdentityKind, String)], kind: IdentityKind) -> Option
 fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
     match platform {
         IdentityPlatform::PlayStation => Some("PSX"),
+        IdentityPlatform::Amiga => Some("Amiga"),
         IdentityPlatform::PlayStation2 => Some("PS2"),
         IdentityPlatform::Psp => Some("PSP"),
         IdentityPlatform::PlayStation3 => Some("PS3"),
@@ -206,6 +208,14 @@ fn resolved_identity_for_platform(
                 platform_id,
                 serial.to_string(),
                 vec![VerifiedIdentityFact::Ps1Serial(serial.to_string())],
+            ))
+        }
+        IdentityPlatform::Amiga => {
+            let identity = find_value(resolved, IdentityKind::AmigaWHDLoad)?;
+            Some((
+                platform_id,
+                identity.to_string(),
+                vec![VerifiedIdentityFact::AmigaIdentity(identity.to_string())],
             ))
         }
         IdentityPlatform::PlayStation2 => {

@@ -1084,6 +1084,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
         launch_pcsx2: launch_readiness_page::Pcsx2LaunchState::default(),
         launch_standalone: launch_readiness_page::StandaloneLaunchState::default(),
+        launch_amiga_whdload: launch_readiness_page::AmigaWHDLoadLaunchState::default(),
         cheat_archive_picker: None,
         confirm_cheat_archive_change: None,
         confirm_unmount_all: None,

@@ -52,6 +52,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     }
 }
 
@@ -68,6 +69,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     }
 }
 
@@ -84,6 +86,7 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     }
 }
 
@@ -289,6 +292,7 @@ fn render_with_states(
                 dolphin_state,
                 pcsx2_state,
                 standalone_state,
+                &mut AmigaWHDLoadLaunchState::default(),
             );
         });
     })
@@ -452,6 +456,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     };
     assert!(matches!(
         gamer_play_action(&input),
@@ -479,6 +484,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     };
     assert!(matches!(
         gamer_play_action(&input),
@@ -508,6 +514,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     });
     assert!(matches!(
         action,
@@ -536,6 +543,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         rpcs3: None,
         xemu: None,
         xenia: None,
+        amiga_whdload: None,
     });
     assert!(matches!(
         action,
@@ -1150,6 +1158,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
             &mut DolphinLaunchState,
             &mut Pcsx2LaunchState,
             &mut StandaloneLaunchState,
+            &mut AmigaWHDLoadLaunchState,
         ) -> Option<LaunchReadinessPageAction>,
     ) {
     }

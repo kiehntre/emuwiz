@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
+use crate::amiga_whdload_archive::discover_whdload_slaves_in_archive;
 use crate::atari7800_header_evidence::{A78_HEADER_BYTES, parse_a78_header};
 use crate::commodore_tape::{
     COMMODORE_TAP_HEADER_BYTES, CommodoreTapeError, T64_READ_BYTES, inspect_commodore_tap_file,
@@ -202,6 +203,9 @@ impl fmt::Display for IdentityStatus {
 #[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
     Platform,
+    /// SHA-256 of a structurally validated WHDLoad slave. This is an opaque
+    /// content identity, never a filename or package-name guess.
+    AmigaWHDLoad,
     Ps1Serial,
     Ps2Serial,
     PspDiscId,
@@ -286,6 +290,7 @@ impl fmt::Display for IdentityKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Platform => "Platform",
+            Self::AmigaWHDLoad => "Amiga WHDLoad slave",
             Self::Ps1Serial => "PS1 serial",
             Self::Ps2Serial => "PS2 serial",
             Self::PspDiscId => "PSP disc ID",
@@ -336,6 +341,7 @@ pub enum IdentityConfidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityPlatform {
+    Amiga,
     PlayStation,
     PlayStation2,
     Psp,
@@ -382,6 +388,7 @@ impl IdentityPlatform {
     pub fn from_catalogue(value: Option<&str>) -> Self {
         let value = value.unwrap_or_default().trim().to_ascii_lowercase();
         match value.as_str() {
+            "amiga" | "commodore amiga" | "commodoreamiga" => Self::Amiga,
             "playstation" | "playstation 1" | "playstation1" | "psx" | "ps1"
             | "sony playstation" => Self::PlayStation,
             "playstation 2" | "playstation2" | "ps2" | "sony playstation 2" => Self::PlayStation2,
@@ -460,6 +467,7 @@ impl IdentityPlatform {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Amiga => "Commodore Amiga",
             Self::PlayStation => "PlayStation",
             Self::PlayStation2 => "PlayStation 2",
             Self::Psp => "PlayStation Portable",
@@ -948,6 +956,50 @@ fn inspect_game_identity_with_platform_trust(
             "shared identity inspection currently supports PS2, GameCube, and Wii",
             "platform eligibility",
         ));
+        return report;
+    }
+
+    // WHDLoad identity is admitted only when the existing bounded LHA
+    // inspector validates exactly one embedded slave. The package name is
+    // never used as identity and multiple valid slaves remain ambiguous.
+    if platform == IdentityPlatform::Amiga
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "lha" | "lzh"))
+    {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match discover_whdload_slaves_in_archive(path, &cancel) {
+            Ok(discovery) if discovery.candidates.len() == 1 => {
+                let candidate = &discovery.candidates[0];
+                report.evidence.push(evidence(
+                    &report,
+                    IdentityKind::AmigaWHDLoad,
+                    IdentityStatus::Verified,
+                    Some(candidate.artifact.hashes.sha256.clone()),
+                    IdentityConfidence::ExactBytes,
+                    "exact SHA-256 of one structurally validated WHDLoad slave",
+                    "verified WHDLoad slave structure",
+                ));
+            }
+            Ok(discovery) if discovery.candidates.len() > 1 => {
+                report.evidence.push(evidence(
+                    &report,
+                    IdentityKind::AmigaWHDLoad,
+                    IdentityStatus::Ambiguous,
+                    None,
+                    IdentityConfidence::Unavailable,
+                    "multiple valid WHDLoad slaves were found; no slave was selected",
+                    "verified WHDLoad slave structure",
+                ));
+            }
+            Ok(_) | Err(_) => add_unavailable(
+                &mut report,
+                IdentityStatus::Missing,
+                "no uniquely verified WHDLoad slave is available",
+            ),
+        }
+        report.complete = true;
         return report;
     }
 
@@ -3498,6 +3550,7 @@ fn inspect_iso_source(
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::Amiga
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
@@ -6380,6 +6433,7 @@ fn push_with_source(
 
 fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diagnostic: &str) {
     let kinds: &[IdentityKind] = match report.platform {
+        IdentityPlatform::Amiga => &[IdentityKind::AmigaWHDLoad],
         IdentityPlatform::PlayStation => &[IdentityKind::Ps1Serial],
         IdentityPlatform::PlayStation2 => {
             &[IdentityKind::Ps2Serial, IdentityKind::Pcsx2ExecutableCrc]
@@ -6628,6 +6682,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::Amiga
         | IdentityPlatform::Other => {}
     }
 }
@@ -10903,6 +10958,15 @@ mod tests {
             crate::launch::planning::CanonicalIdentityStatus::Unknown
         ));
         assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn amiga_platform_context_is_canonical() {
+        assert_eq!(
+            IdentityPlatform::from_catalogue(Some("Commodore Amiga")),
+            IdentityPlatform::Amiga
+        );
+        assert_eq!(IdentityPlatform::Amiga.label(), "Commodore Amiga");
     }
 
     #[test]

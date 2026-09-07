@@ -211,11 +211,11 @@ pub(crate) mod romm_source;
 pub(crate) mod rpcs3_page;
 pub(crate) mod selected_evidence_no_intro;
 pub(crate) mod selected_evidence_page;
-pub(crate) mod tape_analysis_page;
 pub mod selection_guard;
 mod source_state;
 mod sources_page;
 pub mod status_wording;
+pub(crate) mod tape_analysis_page;
 mod ui;
 pub mod view_mode;
 
@@ -3931,6 +3931,7 @@ struct ArchiveFsApp {
     /// reasoning as `launch_retroarch` above applies unchanged.
     launch_pcsx2: launch_readiness_page::Pcsx2LaunchState,
     launch_standalone: launch_readiness_page::StandaloneLaunchState,
+    launch_amiga_whdload: launch_readiness_page::AmigaWHDLoadLaunchState,
     /// A tentative archive choice is isolated here until the picker is
     /// applied. It never mutates Library focus or multi-selection.
     cheat_archive_picker: Option<CheatArchivePickerState>,
@@ -4591,6 +4592,7 @@ impl ArchiveFsApp {
             launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
             launch_pcsx2: launch_readiness_page::Pcsx2LaunchState::default(),
             launch_standalone: launch_readiness_page::StandaloneLaunchState::default(),
+            launch_amiga_whdload: launch_readiness_page::AmigaWHDLoadLaunchState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
             confirm_unmount_all: None,
@@ -6871,7 +6873,7 @@ impl ArchiveFsApp {
         // Archive safety: only the transient, selection-bound preparation
         // state may provide an inner member. The bridge still refuses it
         // unless the record is genuinely mounted.
-        let content = match focused_record {
+        let mut content = match focused_record {
             Some(record) => {
                 let member = self.resolved_archive_member_path(record);
                 archivefs_core::launch::launch_content_ref_from_archive_record(
@@ -6894,6 +6896,142 @@ impl ArchiveFsApp {
                     .to_string(),
             },
         };
+
+        // WHDLoad is an additive, content-bound launch seam.  The package
+        // and slave are accepted only after the existing bounded LHA
+        // inspector found exactly one valid slave; ADF/HDF and arbitrary
+        // paths never enter this branch.
+        let mut amiga_whdload_profiles = Vec::new();
+        let mut amiga_whdload_requests = Vec::new();
+        let mut verified_whdload_content = None;
+        if let Some(record) = focused_record
+            && matches!(
+                identity_status,
+                archivefs_core::launch::CanonicalIdentityStatus::Resolved(_)
+            )
+            && record
+                .mount_plan
+                .archive
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(extension.to_ascii_lowercase().as_str(), "lha" | "lzh")
+                })
+        {
+            let cancel = AtomicBool::new(false);
+            if let Ok(discovery) =
+                archivefs_core::amiga_whdload_archive::discover_whdload_slaves_in_archive(
+                    &record.mount_plan.archive.path,
+                    &cancel,
+                )
+                && discovery.candidates.len() == 1
+            {
+                let candidate = &discovery.candidates[0];
+                let mut artifact = candidate.artifact.clone();
+                artifact.path = record.mount_plan.archive.path.clone();
+                let selected_name = Path::new(&candidate.member_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned);
+                if let Some(selected_name) = selected_name {
+                    artifact.name = selected_name.clone();
+                    let target = archivefs_core::launch::VerifiedWHDLoadTarget {
+                        package_path: record.mount_plan.archive.path.clone(),
+                        format: archivefs_core::launch::WhdloadPackageFormat::Lha,
+                    };
+                    let selected_slave = archivefs_core::launch::SelectedWHDLoadSlave {
+                        artifact_path: record.mount_plan.archive.path.clone(),
+                        name: selected_name.clone(),
+                        parsed: artifact.parsed.clone(),
+                    };
+                    verified_whdload_content =
+                        Some(archivefs_core::launch::VerifiedWHDLoadContent {
+                            target: target.clone(),
+                            selected_slave: selected_slave.clone(),
+                        });
+                    if let Some(roots) =
+                        archivefs_core::patch_manager::AmigaProfileDiscoveryRoots::from_environment(
+                        )
+                    {
+                        let discovery =
+                            archivefs_core::patch_manager::discover_amiga_profiles(&roots);
+                        let identity = match &identity_status {
+                            archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) => {
+                                identity
+                            }
+                            _ => unreachable!(),
+                        };
+                        for profile in &discovery.profiles {
+                            let emulator = profile.emulator;
+                            let candidate_count = discovery
+                                .profiles
+                                .iter()
+                                .filter(|other| other.emulator == emulator)
+                                .count();
+                            let inspection =
+                                archivefs_core::patch_manager::inspect_amiga_whdload_game(
+                                    profile,
+                                    &archivefs_core::patch_manager::AmigaGameRequest {
+                                        verified_amiga_identity: Some(identity.game_key.clone()),
+                                        bare_slaves: vec![artifact.clone()],
+                                        ..Default::default()
+                                    },
+                                );
+                            let executable = match profile.executable_candidates.as_slice() {
+                                [executable] => Some(executable.path.clone()),
+                                _ => None,
+                            };
+                            let request = archivefs_core::launch::WHDLoadLaunchInput {
+                                identity: identity_status.clone(),
+                                target: Some(target.clone()),
+                                slave: Some(selected_slave.clone()),
+                                profile: archivefs_core::launch::WHDLoadProfileInput {
+                                    emulator,
+                                    profile_id: profile.profile_id.clone(),
+                                    executable,
+                                    configuration: profile.global_config_path.clone(),
+                                    candidate_count,
+                                    eligible: profile.eligible,
+                                    kickstart: inspection.health.kickstart.state,
+                                    verified_identity: identity.game_key.clone(),
+                                },
+                            };
+                            let adapter_id = match emulator {
+                                archivefs_core::patch_manager::AmigaEmulatorKind::Amiberry => {
+                                    "amiberry"
+                                }
+                                archivefs_core::patch_manager::AmigaEmulatorKind::FsUae => "fsuae",
+                            };
+                            amiga_whdload_profiles.push(
+                                archivefs_core::launch::StandaloneProfileInput {
+                                    adapter_id,
+                                    profile_id: profile.profile_id.clone(),
+                                    profile_path: profile.global_config_path.clone(),
+                                    eligible: profile.eligible,
+                                    firmware:
+                                        archivefs_core::launch::FirmwareReadiness::NotRequired,
+                                },
+                            );
+                            amiga_whdload_requests.push((
+                                adapter_id.to_string(),
+                                profile.profile_id.clone(),
+                                request,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let amiga_whdload_context = (!amiga_whdload_requests.is_empty()).then_some(
+            launch_readiness_page::AmigaWHDLoadLaunchContext {
+                requests: amiga_whdload_requests,
+            },
+        );
+        if let Some(binding) = verified_whdload_content {
+            content.kind = Some(archivefs_core::launch::LaunchContentKind::Whdload(binding));
+        }
 
         // Real, already-discovered Dolphin profiles only - never a
         // fabricated `StandaloneProfileInput`. `DolphinLocalProfilesState`
@@ -7051,6 +7189,7 @@ impl ArchiveFsApp {
                 .into_iter()
                 .chain(pcsx2_standalone_profiles)
                 .chain(flycast_standalone_profiles)
+                .chain(amiga_whdload_profiles)
                 .collect();
 
         // The remaining native adapters are additive inputs to the same
@@ -7319,6 +7458,7 @@ impl ArchiveFsApp {
                     // this read-only input builder using their existing
                     // adapter roots.
                     "PSX" | "PSP" | "PS3" | "Xbox" => true,
+                    "Amiga" => amiga_whdload_context.is_some(),
                     _ => true,
                 }
             }
@@ -7360,6 +7500,7 @@ impl ArchiveFsApp {
             rpcs3: rpcs3_context,
             xemu: xemu_context,
             xenia: xenia_context,
+            amiga_whdload: amiga_whdload_context,
         }
     }
 
@@ -12886,6 +13027,9 @@ impl ArchiveFsApp {
         if self.launch_standalone.poll() || self.launch_standalone.is_active() {
             ui.ctx().request_repaint();
         }
+        if self.launch_amiga_whdload.poll() || self.launch_amiga_whdload.is_active() {
+            ui.ctx().request_repaint();
+        }
         let launch_readiness_action = launch_readiness_page::show_launch_readiness_panel(
             ui,
             &launch_readiness_input,
@@ -12893,6 +13037,7 @@ impl ArchiveFsApp {
             &mut self.launch_dolphin,
             &mut self.launch_pcsx2,
             &mut self.launch_standalone,
+            &mut self.launch_amiga_whdload,
         );
         if matches!(
             launch_readiness_action,
@@ -18963,6 +19108,7 @@ impl ArchiveFsApp {
                                 &mut self.launch_dolphin,
                                 &mut self.launch_pcsx2,
                                 &mut self.launch_standalone,
+                                &mut self.launch_amiga_whdload,
                             );
                         }
                         Some(GamerViewAction::Operation(request)) => {

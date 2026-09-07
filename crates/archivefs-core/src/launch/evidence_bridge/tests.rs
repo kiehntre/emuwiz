@@ -85,6 +85,35 @@ fn verified_ps2_serial_resolves_with_a_matching_fact() {
 }
 
 #[test]
+fn verified_amiga_whdload_identity_projects_to_amiga_fact() {
+    let source = report(
+        IdentityPlatform::Amiga,
+        vec![evidence(
+            IdentityKind::AmigaWHDLoad,
+            IdentityStatus::Verified,
+            Some("slave-sha256"),
+            IdentityConfidence::ExactBytes,
+        )],
+    );
+
+    let (status, facts) = canonical_identity_from_game_report(&source);
+
+    assert_eq!(
+        status,
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Amiga".to_string(),
+            game_key: "slave-sha256".to_string(),
+        })
+    );
+    assert_eq!(
+        facts,
+        vec![VerifiedIdentityFact::AmigaIdentity(
+            "slave-sha256".to_string()
+        )]
+    );
+}
+
+#[test]
 fn verified_ngp_hash_resolves_without_promoting_header_metadata() {
     let source = report(
         IdentityPlatform::Ngpc,
