@@ -17,7 +17,7 @@ pub enum MsxIntegrity {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MsxRecoveredFile {
     pub filename: Option<String>,
     pub file_type: Option<u8>,
@@ -35,7 +35,7 @@ pub struct MsxRecoveredFile {
     pub marker_time_end_s: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MsxWavRecovery {
     pub audio: crate::tape_audio::TapeAudioAnalysis,
     pub files: Vec<MsxRecoveredFile>,
@@ -163,10 +163,11 @@ pub fn decode_msx_wav(bytes: &[u8]) -> Result<MsxWavRecovery, WavError> {
         });
         cursor = header + 7;
     }
+    let has_files = !files.is_empty();
     Ok(MsxWavRecovery {
         audio,
         files,
-        warnings: if files.is_empty() {
+        warnings: if !has_files {
             vec!["WAV recognised, but no MSX BIOS header was recovered".into()]
         } else {
             Vec::new()

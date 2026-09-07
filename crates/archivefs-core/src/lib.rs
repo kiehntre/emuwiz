@@ -23,6 +23,8 @@ pub mod amiga_disk;
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
 pub mod app_dirs;
+/// Bounded Atari 8-bit standard cassette WAV evidence.
+pub mod atari_tape;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
 /// Bounded MSX standard cassette WAV evidence.
