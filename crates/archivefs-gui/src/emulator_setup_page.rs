@@ -5,7 +5,7 @@
 //! merely because an executable name sounds plausible, and the final adapter
 //! preflight remains the authority for launching a particular game.
 
-use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, Finding};
+use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, Finding, Measurement};
 use archivefs_core::launch::{LAUNCH_COMPATIBILITY, LaunchCompatibility};
 use eframe::egui;
 
@@ -141,6 +141,21 @@ fn finding_for<'a>(findings: &'a [Finding], adapter_id: &str, name: &str) -> Opt
     })
 }
 
+/// Read the readiness verdict produced by Doctor's existing adapter-specific
+/// inspection.  Older findings expressed the same fact in their title; keep
+/// that compatibility while preferring the typed measurement so standalone
+/// adapters are not dependent on wording chosen for their prose.
+fn finding_is_ready(finding: &Finding) -> bool {
+    finding.severity == DoctorSeverity::Info
+        && (matches!(
+            finding.measurements.get("ready"),
+            Some(Measurement::Flag(true))
+        ) || finding
+            .title
+            .to_ascii_lowercase()
+            .contains("ready to launch"))
+}
+
 fn candidate_from_mapping(
     mapping: &LaunchCompatibility,
     adapter_id: &'static str,
@@ -171,12 +186,7 @@ fn candidate_from_mapping(
         CandidateState::Blocked
     } else if finding.severity == DoctorSeverity::Warning {
         CandidateState::Warnings
-    } else if finding.severity == DoctorSeverity::Info
-        && finding
-            .title
-            .to_ascii_lowercase()
-            .contains("ready to launch")
-    {
+    } else if finding_is_ready(finding) {
         CandidateState::Ready
     } else {
         CandidateState::NeedsSetup
@@ -608,6 +618,25 @@ mod tests {
             .find(|c| c.adapter_id == "dolphin")
             .unwrap();
         assert!(missing.reason.contains("Evidence"));
+    }
+
+    #[test]
+    fn typed_ready_measurement_promotes_standalone_without_title_wording() {
+        let mut ready = finding("PPSSPP", DoctorSeverity::Info, "PPSSPP profile inspected");
+        ready
+            .measurements
+            .insert("ready".to_string(), Measurement::Flag(true));
+        let candidates = build_candidates(
+            Some(&[ready]),
+            RetroArchSetupStatus::NotChecked,
+            Some("PSP"),
+            "",
+        );
+        let ppsspp = candidates
+            .iter()
+            .find(|candidate| candidate.adapter_id == "ppsspp")
+            .expect("PPSSPP candidate");
+        assert_eq!(ppsspp.state, CandidateState::Ready);
     }
 
     #[test]
