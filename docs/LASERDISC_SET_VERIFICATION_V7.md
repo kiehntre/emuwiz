@@ -17,10 +17,11 @@ identifies an emulator family.
 Readiness is `Ready`, `Partial`, `Broken`, or `Unknown`. Missing media,
 malformed frame numbers, unsafe absolute/traversal references, and empty
 assets are reported without repair or automatic winner selection. Video files
-are checked with bounded filesystem metadata only; no full-video hash,
-decode, seek validation, or transcoding is performed in V7. Duration,
-resolution, codec, multi-video semantics, and emulator-specific script
-validation remain follow-up work.
+are checked with bounded filesystem metadata and, when the optional `ffprobe`
+tool is available, a bounded JSON summary. V2 also compares mapped frame starts
+with a trustworthy reported frame count per media file. No full-video hash,
+decode, seek validation, or transcoding is performed. Multi-video semantics
+and emulator-specific script validation remain follow-up work.
 
 The verifier is read-only and does not download ROMs/videos, mutate user
 files, execute scripts, or perform raw analogue LaserDisc RF capture/decoding.

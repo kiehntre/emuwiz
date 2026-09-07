@@ -113,7 +113,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Optical containers | CHD | YES | YES | NO alone | PARTIAL | YES | MAME/REDUMP | SUMMARY | PROFILE | PARTIAL | 5 | `chd_identity`, `chd_logical_media`, `chd_redump` | CHD/redump track tests | specialist layouts and broader multi-track parity |
 | Optical containers | GDI/CDI/CCD/IMG/MDS/NRG/CSO/RVZ/WBFS/WUD/WUX | EXT | PARTIAL | FAMILY | PARTIAL | NO | PARTIAL | SUMMARY | PROFILE | PARTIAL | 3 | registry + selected adapters | extension/negative tests | per-container readers |
 | Philips CD-i | ISO/BIN/CHD logical media | YES | YES | YES | YES | YES | REDUMP | SUMMARY | NO | PARTIAL | 4 | `cdi_disc_evidence`, `platform` | CD-i synthetic tests | raw Mode 2/session parity |
-| LaserDisc sets | Daphne framefile | YES | YES | SET | VERIFY | YES | NO | NO | PROFILE | YES | 4 | `laserdisc_set` | synthetic set tests | video metadata/frame-range checks |
+| LaserDisc sets | Daphne framefile | YES | YES | SET | VERIFY | YES | NO | NO | PROFILE | YES | 4 | `laserdisc_set` | synthetic set + bounded ffprobe/range tests | deeper seek/decode semantics |
 | LaserDisc sets | Hypseus/Singe | YES | PARTIAL | SET | PARTIAL | YES | NO | NO | PROFILE | PARTIAL | 3 | `laserdisc_set` | synthetic set tests | script semantics |
 | LaserDisc sets | MAME LD | PARTIAL | NO | NO | NO | NO | MAME | NO | PROFILE | PARTIAL | 2 | `laserdisc_set` config marker | limited tests | software-list integration |
 | Archives | ZIP/7z/RAR/TAR/GZIP/BZ2/XZ | YES | LIST | NO | SAFETY | MEMBERS | NO | SUMMARY | NO | NO | 3 | `inspector`, archive resolver | archive/member tests | extraction policy varies; encrypted archives |
@@ -199,9 +199,9 @@ specified but entirely absent. Existing safety gates should not be weakened.
 4. **Broader UEF/CAS semantics.** The bounded ordinary UEF/CAS bridge is
    implemented; bit-level UEF chunks, richer CAS variants, and turbo/custom
    loader semantics remain out of scope.
-5. **LaserDisc frame/media metadata.** Set coherence is implemented, but no
-   bounded ffprobe integration, exact frame-count/rate validation, or Singe
-   script parser exists.
+5. **LaserDisc frame/media metadata.** Bounded optional ffprobe summaries and
+   per-media frame-start range checks are implemented. Exact seek/decode
+   validation and a Singe script parser remain follow-up work.
 6. **Raw preservation formats.** IPF, SCP/flux, NIB/WOZ and subchannel/weak-bit
    semantics are not implemented beyond selected detection/registry evidence.
 

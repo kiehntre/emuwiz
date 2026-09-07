@@ -6,11 +6,19 @@
 //! executing scripts, or choosing an identity from a directory name.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 pub const MAX_SET_ENTRIES: usize = 4096;
 pub const MAX_FRAMEFILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_FRAMEFILE_LINES: usize = 32_768;
+const MAX_FFPROBE_OUTPUT: usize = 128 * 1024;
+const FFPROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaserdiscFamily {
@@ -28,6 +36,47 @@ pub enum LaserdiscReadiness {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaserdiscProbeStatus {
+    Available,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaserdiscMediaMetadata {
+    pub container_format: Option<String>,
+    pub video_codec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Kept as the ffprobe rational/text value; no guessed floating-point FPS
+    /// is used for frame-range validation.
+    pub frame_rate: Option<String>,
+    pub duration_millis: Option<u64>,
+    pub reported_frame_count: Option<u64>,
+    pub audio_stream_count: usize,
+    pub video_stream_count: usize,
+    pub probe_status: LaserdiscProbeStatus,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaserdiscFrameRangeStatus {
+    RangeValid,
+    RangeExceedsMedia,
+    RangeUnverified,
+    MetadataUnavailable,
+    MalformedMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaserdiscFrameRangeEvidence {
+    pub media_name: String,
+    pub first_referenced_frame: u64,
+    pub last_referenced_frame: u64,
+    pub status: LaserdiscFrameRangeStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameMapping {
     pub start_frame: u64,
@@ -37,11 +86,13 @@ pub struct FrameMapping {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoAssetEvidence {
+    pub media_name: String,
     pub path: PathBuf,
     pub exists: bool,
     pub readable: bool,
     pub size_bytes: Option<u64>,
     pub metadata_note: Option<String>,
+    pub metadata: Option<LaserdiscMediaMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +105,195 @@ pub struct LaserdiscSetEvidence {
     pub present_media: Vec<PathBuf>,
     pub missing_media: Vec<String>,
     pub video_assets: Vec<VideoAssetEvidence>,
+    pub frame_ranges: Vec<LaserdiscFrameRangeEvidence>,
+    pub frame_range_status: LaserdiscFrameRangeStatus,
     pub rom_components: Vec<PathBuf>,
     pub script_components: Vec<PathBuf>,
     pub config_components: Vec<PathBuf>,
     pub warnings: Vec<String>,
     pub readiness: LaserdiscReadiness,
+}
+
+fn parse_u64(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse().ok())
+        .or_else(|| value.and_then(Value::as_u64))
+}
+
+fn parse_u32(value: Option<&Value>) -> Option<u32> {
+    parse_u64(value).and_then(|value| u32::try_from(value).ok())
+}
+
+fn parse_duration_millis(value: Option<&Value>) -> Option<u64> {
+    let text = value?.as_str()?;
+    let seconds = text.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let millis = seconds * 1000.0;
+    (millis <= u64::MAX as f64).then(|| millis.round() as u64)
+}
+
+fn probe_error_metadata(status: LaserdiscProbeStatus, warning: String) -> LaserdiscMediaMetadata {
+    LaserdiscMediaMetadata {
+        container_format: None,
+        video_codec: None,
+        width: None,
+        height: None,
+        frame_rate: None,
+        duration_millis: None,
+        reported_frame_count: None,
+        audio_stream_count: 0,
+        video_stream_count: 0,
+        probe_status: status,
+        warnings: vec![warning],
+    }
+}
+
+fn read_bounded(mut reader: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    while bytes.len() < MAX_FFPROBE_OUTPUT {
+        let limit = (MAX_FFPROBE_OUTPUT - bytes.len()).min(buffer.len());
+        match reader.read(&mut buffer[..limit]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+        }
+    }
+    bytes
+}
+
+fn run_ffprobe(executable: &Path, media: &Path) -> Result<Vec<u8>, String> {
+    let mut child = Command::new(executable)
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,duration,nb_frames:format=format_name,duration",
+            "-show_streams",
+            "-show_format",
+        ])
+        .arg(media)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffprobe stdout unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ffprobe stderr unavailable".to_string())?;
+    let stdout_thread = thread::spawn(move || read_bounded(stdout));
+    let stderr_thread = thread::spawn(move || read_bounded(stderr));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < FFPROBE_TIMEOUT => {
+                thread::sleep(Duration::from_millis(20))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return Err("ffprobe timed out".into());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error.to_string());
+            }
+        }
+    };
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_string());
+    }
+    Ok(stdout)
+}
+
+fn parse_ffprobe_metadata(bytes: &[u8]) -> Result<LaserdiscMediaMetadata, String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let streams = value
+        .get("streams")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ffprobe output has no streams array".to_string())?;
+    let video: Vec<&Value> = streams
+        .iter()
+        .filter(|stream| stream.get("codec_type").and_then(Value::as_str) == Some("video"))
+        .collect();
+    let audio_count = streams
+        .iter()
+        .filter(|stream| stream.get("codec_type").and_then(Value::as_str) == Some("audio"))
+        .count();
+    let mut warnings = Vec::new();
+    if video.is_empty() {
+        warnings.push("no video stream reported".into());
+    }
+    if video.len() > 1 {
+        warnings.push("multiple video streams reported; first stream used for metadata".into());
+    }
+    let first = video.first().copied();
+    let frame_count = first.and_then(|stream| parse_u64(stream.get("nb_frames")));
+    if first.is_some() && frame_count.is_none() {
+        warnings.push("video frame count was not reported; range remains unverified".into());
+    }
+    let format = value.get("format");
+    Ok(LaserdiscMediaMetadata {
+        container_format: format
+            .and_then(|format| format.get("format_name"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        video_codec: first
+            .and_then(|stream| stream.get("codec_name"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        width: first.and_then(|stream| parse_u32(stream.get("width"))),
+        height: first.and_then(|stream| parse_u32(stream.get("height"))),
+        frame_rate: first
+            .and_then(|stream| stream.get("avg_frame_rate"))
+            .and_then(Value::as_str)
+            .filter(|rate| !rate.is_empty() && *rate != "0/0")
+            .map(str::to_string),
+        duration_millis: first
+            .and_then(|stream| parse_duration_millis(stream.get("duration")))
+            .or_else(|| format.and_then(|format| parse_duration_millis(format.get("duration")))),
+        reported_frame_count: frame_count,
+        audio_stream_count: audio_count,
+        video_stream_count: video.len(),
+        probe_status: LaserdiscProbeStatus::Available,
+        warnings,
+    })
+}
+
+fn probe_media(path: &Path) -> LaserdiscMediaMetadata {
+    let executable = std::env::var_os("ARCHIVEFS_FFPROBE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ffprobe"));
+    match run_ffprobe(&executable, path) {
+        Ok(bytes) => match parse_ffprobe_metadata(&bytes) {
+            Ok(metadata) => metadata,
+            Err(error) => probe_error_metadata(
+                LaserdiscProbeStatus::Failed,
+                format!("ffprobe metadata was malformed: {error}"),
+            ),
+        },
+        Err(error) if error.contains("No such file") || error.contains("not found") => {
+            probe_error_metadata(
+                LaserdiscProbeStatus::Unavailable,
+                "ffprobe is not installed; media metadata unavailable".into(),
+            )
+        }
+        Err(error) => probe_error_metadata(
+            LaserdiscProbeStatus::Failed,
+            format!("ffprobe failed: {error}"),
+        ),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +460,125 @@ fn parse_framefile(
     Ok((mappings, warnings))
 }
 
+fn verify_frame_ranges(
+    mappings: &[FrameMapping],
+    metadata: &[VideoAssetEvidence],
+    malformed_mapping: bool,
+) -> (Vec<LaserdiscFrameRangeEvidence>, LaserdiscFrameRangeStatus) {
+    let mut by_media = std::collections::BTreeMap::<&str, Vec<u64>>::new();
+    for mapping in mappings {
+        by_media
+            .entry(mapping.media_name.as_str())
+            .or_default()
+            .push(mapping.start_frame);
+    }
+    let mut statuses = std::collections::BTreeMap::<&str, LaserdiscFrameRangeStatus>::new();
+    for (index, mapping) in mappings.iter().enumerate() {
+        let status = if malformed_mapping {
+            LaserdiscFrameRangeStatus::MalformedMapping
+        } else {
+            let asset = metadata
+                .iter()
+                .find(|asset| asset.media_name == mapping.media_name);
+            match asset.and_then(|asset| asset.metadata.as_ref()) {
+                Some(metadata) if metadata.probe_status == LaserdiscProbeStatus::Available => {
+                    match metadata.reported_frame_count {
+                        Some(frame_count) if frame_count == 0 => {
+                            LaserdiscFrameRangeStatus::RangeExceedsMedia
+                        }
+                        Some(frame_count) if mappings.len() == 1 => {
+                            if mapping.start_frame < frame_count {
+                                LaserdiscFrameRangeStatus::RangeValid
+                            } else {
+                                LaserdiscFrameRangeStatus::RangeExceedsMedia
+                            }
+                        }
+                        Some(frame_count) => {
+                            let required = mappings
+                                .get(index + 1)
+                                .and_then(|next| next.start_frame.checked_sub(mapping.start_frame));
+                            match required {
+                                Some(0) => LaserdiscFrameRangeStatus::MalformedMapping,
+                                Some(required) if required > frame_count => {
+                                    LaserdiscFrameRangeStatus::RangeExceedsMedia
+                                }
+                                Some(_) => LaserdiscFrameRangeStatus::RangeValid,
+                                None => LaserdiscFrameRangeStatus::RangeUnverified,
+                            }
+                        }
+                        None => LaserdiscFrameRangeStatus::RangeUnverified,
+                    }
+                }
+                Some(_) | None => LaserdiscFrameRangeStatus::MetadataUnavailable,
+            }
+        };
+        let entry = statuses
+            .entry(mapping.media_name.as_str())
+            .or_insert(status);
+        *entry = match (*entry, status) {
+            (LaserdiscFrameRangeStatus::RangeExceedsMedia, _)
+            | (_, LaserdiscFrameRangeStatus::RangeExceedsMedia) => {
+                LaserdiscFrameRangeStatus::RangeExceedsMedia
+            }
+            (LaserdiscFrameRangeStatus::MalformedMapping, _)
+            | (_, LaserdiscFrameRangeStatus::MalformedMapping) => {
+                LaserdiscFrameRangeStatus::MalformedMapping
+            }
+            (LaserdiscFrameRangeStatus::MetadataUnavailable, _)
+            | (_, LaserdiscFrameRangeStatus::MetadataUnavailable) => {
+                LaserdiscFrameRangeStatus::MetadataUnavailable
+            }
+            (LaserdiscFrameRangeStatus::RangeUnverified, _)
+            | (_, LaserdiscFrameRangeStatus::RangeUnverified) => {
+                LaserdiscFrameRangeStatus::RangeUnverified
+            }
+            _ => LaserdiscFrameRangeStatus::RangeValid,
+        };
+    }
+    let mut ranges = Vec::new();
+    for (media_name, mut starts) in by_media {
+        starts.sort_unstable();
+        let first = starts[0];
+        let last = *starts.last().unwrap_or(&first);
+        let status = statuses
+            .get(media_name)
+            .copied()
+            .unwrap_or(LaserdiscFrameRangeStatus::MetadataUnavailable);
+        ranges.push(LaserdiscFrameRangeEvidence {
+            media_name: media_name.to_string(),
+            first_referenced_frame: first,
+            last_referenced_frame: last,
+            status,
+        });
+    }
+    let overall = if malformed_mapping || mappings.is_empty() {
+        LaserdiscFrameRangeStatus::MalformedMapping
+    } else if ranges
+        .iter()
+        .any(|range| range.status == LaserdiscFrameRangeStatus::MalformedMapping)
+    {
+        LaserdiscFrameRangeStatus::MalformedMapping
+    } else if ranges
+        .iter()
+        .any(|range| range.status == LaserdiscFrameRangeStatus::RangeExceedsMedia)
+    {
+        LaserdiscFrameRangeStatus::RangeExceedsMedia
+    } else if ranges
+        .iter()
+        .any(|range| range.status == LaserdiscFrameRangeStatus::MetadataUnavailable)
+    {
+        LaserdiscFrameRangeStatus::MetadataUnavailable
+    } else if ranges
+        .iter()
+        .any(|range| range.status == LaserdiscFrameRangeStatus::RangeUnverified)
+    {
+        LaserdiscFrameRangeStatus::RangeUnverified
+    } else {
+        LaserdiscFrameRangeStatus::RangeValid
+    };
+    (ranges, overall)
+}
+
 /// Verify one set root. Only direct children are considered; this avoids
 /// accidentally combining unrelated sibling titles and keeps work bounded.
 pub fn verify_laserdisc_set(
@@ -278,14 +632,18 @@ pub fn verify_laserdisc_set(
             Ok(path) => match fs::metadata(&path) {
                 Ok(meta) if meta.is_file() && meta.len() > 0 => {
                     present_media.push(path.clone());
+                    let metadata = probe_media(&path);
+                    for warning in &metadata.warnings {
+                        warnings.push(format!("{}: {warning}", name));
+                    }
                     video_assets.push(VideoAssetEvidence {
+                        media_name: name.clone(),
                         path: path.clone(),
                         exists: true,
                         readable: fs::File::open(&path).is_ok(),
                         size_bytes: Some(meta.len()),
-                        metadata_note: Some(
-                            "container/frame metadata not decoded; bounded stat only".into(),
-                        ),
+                        metadata_note: Some("bounded ffprobe summary; no full decode".into()),
+                        metadata: Some(metadata),
                     });
                 }
                 Ok(_) => {
@@ -306,6 +664,14 @@ pub fn verify_laserdisc_set(
     let rom_components: Vec<PathBuf> = files.iter().filter(|p| is_rom(p)).cloned().collect();
     let script_components: Vec<PathBuf> = files.iter().filter(|p| is_script(p)).cloned().collect();
     let config_components: Vec<PathBuf> = files.iter().filter(|p| is_config(p)).cloned().collect();
+    let malformed_mapping = warnings.iter().any(|warning| {
+        warning.contains("malformed")
+            || warning.contains("invalid frame")
+            || warning.contains("path traversal")
+            || warning.contains("absolute media")
+    });
+    let (frame_ranges, frame_range_status) =
+        verify_frame_ranges(&mappings, &video_assets, malformed_mapping);
     let has_hypseus = !script_components.is_empty();
     let has_daphne = framefile_path.is_some() && !rom_components.is_empty();
     let detected_family = if has_hypseus {
@@ -330,12 +696,8 @@ pub fn verify_laserdisc_set(
         }
     } else if mappings.is_empty()
         || !missing_media.is_empty()
-        || warnings.iter().any(|w| {
-            w.contains("malformed")
-                || w.contains("invalid frame")
-                || w.contains("path traversal")
-                || w.contains("absolute media")
-        })
+        || malformed_mapping
+        || frame_range_status == LaserdiscFrameRangeStatus::RangeExceedsMedia
     {
         LaserdiscReadiness::Broken
     } else if detected_family == LaserdiscFamily::Unknown
@@ -355,6 +717,8 @@ pub fn verify_laserdisc_set(
         present_media,
         missing_media,
         video_assets,
+        frame_ranges,
+        frame_range_status,
         rom_components,
         script_components,
         config_components,
@@ -414,5 +778,80 @@ mod tests {
         write(&d.path().join("b.m2v"), b"b");
         let e = verify_laserdisc_set(d.path()).unwrap();
         assert!(e.warnings.iter().any(|w| w.contains("conflicting")));
+    }
+
+    #[test]
+    fn parses_bounded_ffprobe_summary_without_using_duration_as_frame_count() {
+        let json = br#"{
+            "streams": [
+                {"codec_type":"video","codec_name":"mpeg2video","width":640,"height":480,
+                 "avg_frame_rate":"30000/1001","duration":"12.5","nb_frames":"375"},
+                {"codec_type":"audio","codec_name":"pcm_s16le"}
+            ],
+            "format": {"format_name":"mpeg","duration":"12.5"}
+        }"#;
+        let metadata = parse_ffprobe_metadata(json).unwrap();
+        assert_eq!(metadata.container_format.as_deref(), Some("mpeg"));
+        assert_eq!(metadata.video_codec.as_deref(), Some("mpeg2video"));
+        assert_eq!(metadata.width, Some(640));
+        assert_eq!(metadata.height, Some(480));
+        assert_eq!(metadata.frame_rate.as_deref(), Some("30000/1001"));
+        assert_eq!(metadata.duration_millis, Some(12_500));
+        assert_eq!(metadata.reported_frame_count, Some(375));
+        assert_eq!(metadata.audio_stream_count, 1);
+        assert_eq!(metadata.video_stream_count, 1);
+        assert_eq!(metadata.probe_status, LaserdiscProbeStatus::Available);
+    }
+
+    #[test]
+    fn frame_ranges_distinguish_valid_excess_and_unverified() {
+        let metadata = |frames| VideoAssetEvidence {
+            media_name: "video.m2v".into(),
+            path: PathBuf::from("video.m2v"),
+            exists: true,
+            readable: true,
+            size_bytes: Some(1),
+            metadata_note: None,
+            metadata: Some(LaserdiscMediaMetadata {
+                container_format: Some("mpeg".into()),
+                video_codec: Some("mpeg2video".into()),
+                width: Some(640),
+                height: Some(480),
+                frame_rate: Some("30000/1001".into()),
+                duration_millis: Some(1_000),
+                reported_frame_count: frames,
+                audio_stream_count: 0,
+                video_stream_count: 1,
+                probe_status: LaserdiscProbeStatus::Available,
+                warnings: Vec::new(),
+            }),
+        };
+        let mapping = |frame| FrameMapping {
+            start_frame: frame,
+            media_name: "video.m2v".into(),
+            line: 1,
+        };
+        let (ranges, status) = verify_frame_ranges(&[mapping(374)], &[metadata(Some(375))], false);
+        assert_eq!(status, LaserdiscFrameRangeStatus::RangeValid);
+        assert_eq!(ranges[0].last_referenced_frame, 374);
+        let (_, status) = verify_frame_ranges(&[mapping(375)], &[metadata(Some(375))], false);
+        assert_eq!(status, LaserdiscFrameRangeStatus::RangeExceedsMedia);
+        let (_, status) = verify_frame_ranges(&[mapping(10)], &[metadata(None)], false);
+        assert_eq!(status, LaserdiscFrameRangeStatus::RangeUnverified);
+    }
+
+    #[test]
+    fn unavailable_metadata_does_not_downgrade_complete_set() {
+        let d = set();
+        write(&d.path().join("game.framefile"), b"0 video.m2v\n");
+        write(&d.path().join("video.m2v"), b"video");
+        write(&d.path().join("game.rom"), b"rom");
+        let evidence = verify_laserdisc_set(d.path()).unwrap();
+        assert_eq!(evidence.readiness, LaserdiscReadiness::Ready);
+        assert!(matches!(
+            evidence.frame_range_status,
+            LaserdiscFrameRangeStatus::MetadataUnavailable
+                | LaserdiscFrameRangeStatus::RangeUnverified
+        ));
     }
 }
