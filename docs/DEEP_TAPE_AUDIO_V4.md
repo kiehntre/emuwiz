@@ -66,3 +66,27 @@ The structural description used for Alkatraz is the documented loader sequence
 in [Tape Decoding Using Taper](https://worldofspectrum.net/legacy-info/tape-decoding-using-taper/): standard BASIC, a short-pilot headerless turbo stage,
 roughly twelve seconds of noise, then further custom loading. The matcher
 requires the machine-readable subset of every one of those stages.
+
+## V7: Commodore 64 cassette WAV decoding
+
+V7 adds bounded decoding for the **standard C64 Datasette ROM protocol** only.
+It uses the existing PCM downmix, hysteretic edges, and microsecond timestamps;
+no second WAV parser or retained PCM representation is introduced. Each local
+short-pulse leader calibrates the short/medium/long timing classes, then the
+decoder requires an `L,M` byte marker, LSB-first `S,M`/`M,S` bit pairs, and an
+odd parity bit. A valid stream must also carry the standard nine-byte countdown
+(`$89..$81` or `$09..$01`) and one 192-byte buffer with its XOR check byte.
+
+The decoder records source sample/time bounds, parity errors, checksum state,
+and duplicate relationship. Standard duplicate copies are compared rather than
+shown as separate logical files. Verified header/data pairs project the existing
+`TapeEntry` fields: filename, BASIC-versus-code type, load address, and declared
+length. Partial, malformed, checksum-invalid, Spectrum, and generic pulse
+streams do not produce a logical entry.
+
+This V1 intentionally defers TAP-payload decoding (the current TAP path exposes
+container metadata only), VIC/PET/C16/Plus/4 timing variants, sequential-file
+semantics, and all custom/turbo fastloaders. The implementation is based on
+[Datassette Encoding](https://www.c64-wiki.com/wiki/Datassette_Encoding) and
+[Simon’s Mostly Reliable Guide to the Commodore Tape Format](https://eden.mose.org.uk/download/Commodore%20Tape%20Format.pdf).
+All fixtures are synthetic.

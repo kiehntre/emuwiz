@@ -131,6 +131,31 @@ pub struct CustomWavRecovery {
     pub loader_class: &'static str,
     pub warnings: Vec<String>,
 }
+
+/// One bounded standard Commodore ROM tape stream recovered from PCM edge
+/// timing. `payload` excludes the nine sync/countdown bytes and trailing XOR
+/// checksum. It is evidence, never a release identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommodoreRecoveredBlock {
+    pub payload: Vec<u8>,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub checksum_valid: Option<bool>,
+    pub parity_errors: usize,
+    pub confidence: RecoveryConfidence,
+    pub duplicate_of: Option<usize>,
+}
+
+/// Bounded C64 Datasette-compatible standard-ROM recovery. Custom/turbo
+/// timings are deliberately not interpreted by this V1 decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommodoreWavRecovery {
+    pub audio: TapeAudioAnalysis,
+    pub blocks: Vec<CommodoreRecoveredBlock>,
+    pub warnings: Vec<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WavError {
     Malformed(&'static str),
@@ -384,6 +409,295 @@ pub fn decode_custom_wav(bytes: &[u8]) -> Result<CustomWavRecovery, WavError> {
         loader_class,
         warnings,
     })
+}
+
+const MAX_COMMODORE_BLOCKS: usize = 64;
+const COMMODORE_LEADER_PULSES: usize = 64;
+const COMMODORE_PAYLOAD_BYTES: usize = 192;
+
+/// Recover standard C64 Datasette streams from the existing bounded PCM edge
+/// layer. Timings are calibrated from each short-pulse leader, so sample rate
+/// and modest uniform speed drift do not become identity evidence.
+pub fn decode_commodore_wav(bytes: &[u8]) -> Result<CommodoreWavRecovery, WavError> {
+    let audio = analyze_wav(bytes)?;
+    let intervals: Vec<u64> = audio
+        .edges
+        .windows(2)
+        .map(|edges| edges[1].micros.saturating_sub(edges[0].micros))
+        .collect();
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < intervals.len() && blocks.len() < MAX_COMMODORE_BLOCKS {
+        let Some((leader_start, leader_end, short)) = find_commodore_leader(&intervals, cursor)
+        else {
+            break;
+        };
+        let medium = short.saturating_mul(3) / 2;
+        let long = short.saturating_mul(19) / 10;
+        let Some(mut position) = find_commodore_marker(&intervals, leader_end, medium, long) else {
+            cursor = leader_end;
+            continue;
+        };
+        let start = position;
+        let mut raw = Vec::new();
+        let mut parity_errors = 0usize;
+        let mut complete = false;
+        while raw.len() <= COMMODORE_PAYLOAD_BYTES + 10 && position + 2 <= intervals.len() {
+            if is_commodore_pair(intervals[position], intervals[position + 1], long, short) {
+                complete = true;
+                position += 2;
+                break;
+            }
+            let Some((byte, parity_ok, next)) =
+                decode_commodore_byte(&intervals, position, short, medium, long)
+            else {
+                break;
+            };
+            raw.push(byte);
+            parity_errors += usize::from(!parity_ok);
+            position = next;
+        }
+        cursor = position.max(leader_end + 1);
+        if raw.len() < 10 || !valid_commodore_countdown(&raw[..9]) {
+            continue;
+        }
+        let contents = &raw[9..];
+        if contents.len() < 2 {
+            continue;
+        }
+        let (payload, check) = contents.split_at(contents.len() - 1);
+        // Standard program/header records are exactly one 192-byte buffer.
+        // Refuse a partial/oversized stream rather than guessing a boundary.
+        if payload.len() != COMMODORE_PAYLOAD_BYTES {
+            continue;
+        }
+        // A complete 192-byte stream has an unambiguous payload/check-byte
+        // boundary even when the optional L,S end marker is clipped. The
+        // marker contributes to framing confidence, not to the XOR itself.
+        let checksum_valid = (payload.len() == COMMODORE_PAYLOAD_BYTES)
+            .then(|| payload.iter().fold(0u8, |sum, byte| sum ^ byte) == check[0]);
+        let duplicate_of = blocks
+            .iter()
+            .rposition(|previous: &CommodoreRecoveredBlock| previous.payload == payload)
+            .filter(|_| blocks.len() > 0);
+        let start_edge = audio.edges.get(leader_start).copied();
+        let end_edge = audio
+            .edges
+            .get(position.min(audio.edges.len().saturating_sub(1)))
+            .copied();
+        let (start_sample, start_micros) = start_edge
+            .map(|edge| (edge.sample, edge.micros))
+            .unwrap_or((0, 0));
+        let (end_sample, end_micros) = end_edge
+            .map(|edge| (edge.sample, edge.micros))
+            .unwrap_or((0, 0));
+        blocks.push(CommodoreRecoveredBlock {
+            payload: payload.to_vec(),
+            start_sample,
+            end_sample,
+            start_micros,
+            end_micros,
+            checksum_valid,
+            parity_errors,
+            confidence: if checksum_valid == Some(true) && parity_errors == 0 && complete {
+                RecoveryConfidence::High
+            } else if parity_errors == 0 {
+                RecoveryConfidence::Medium
+            } else {
+                RecoveryConfidence::Low
+            },
+            duplicate_of,
+        });
+        let _ = start;
+    }
+    let warnings = if blocks.is_empty() {
+        vec!["no complete C64 standard-ROM tape stream was recovered".into()]
+    } else {
+        Vec::new()
+    };
+    Ok(CommodoreWavRecovery {
+        audio,
+        blocks,
+        warnings,
+    })
+}
+
+/// Project only checksum-valid, non-duplicate standard streams into the
+/// existing logical TapeAnalysis model. A header creates an entry only after
+/// enough following data bytes have been recovered for its declared range.
+pub fn commodore_wav_tape_analysis(
+    bytes: &[u8],
+) -> Result<crate::tape_analysis::TapeAnalysis, WavError> {
+    let recovery = decode_commodore_wav(bytes)?;
+    let mut entries = Vec::new();
+    let mut pending: Option<(u8, String, u16, u16, Vec<u8>)> = None;
+    let mut warnings = recovery.warnings.clone();
+    for block in &recovery.blocks {
+        if block.duplicate_of.is_some() {
+            continue;
+        }
+        if block.checksum_valid != Some(true) {
+            warnings.push("Commodore stream retained with invalid or unavailable XOR check".into());
+            continue;
+        }
+        if let Some((file_type, name, start, end, data)) = pending.as_mut() {
+            data.extend_from_slice(&block.payload);
+            let expected = usize::from(end.saturating_sub(*start));
+            if data.len() >= expected {
+                entries.push(crate::tape_analysis::TapeEntry {
+                    name: (!name.is_empty()).then_some(name.clone()),
+                    kind: if *file_type == 1 {
+                        crate::tape_analysis::TapeEntryKind::Basic
+                    } else {
+                        crate::tape_analysis::TapeEntryKind::Code
+                    },
+                    load_address: Some(*start),
+                    length: expected as u64,
+                    checksum: crate::tape_analysis::ChecksumState::Valid,
+                });
+                pending = None;
+            }
+            continue;
+        }
+        if let Some((file_type, name, start, end)) = commodore_header(&block.payload) {
+            if end < start {
+                warnings.push("Commodore header has reversed address range".into());
+                continue;
+            }
+            pending = Some((file_type, name, start, end, Vec::new()));
+        }
+    }
+    let checksum = if recovery
+        .blocks
+        .iter()
+        .any(|block| block.checksum_valid == Some(false))
+    {
+        crate::tape_analysis::ChecksumState::Invalid
+    } else if recovery
+        .blocks
+        .iter()
+        .any(|block| block.checksum_valid == Some(true))
+    {
+        crate::tape_analysis::ChecksumState::Valid
+    } else {
+        crate::tape_analysis::ChecksumState::NotPresent
+    };
+    Ok(crate::tape_analysis::TapeAnalysis {
+        format: crate::tape_analysis::TapeFormat::CommodoreWav,
+        platform: Some("Commodore 64"),
+        block_count: recovery.blocks.len(),
+        entries,
+        metadata: vec!["C64 standard-ROM Datasette waveform recovery".into()],
+        loader: None,
+        checksum,
+        warnings,
+        semantic_blocks: recovery
+            .blocks
+            .iter()
+            .map(|block| {
+                format!(
+                    "Commodore stream: {} bytes, XOR {:?}, duplicate {:?}",
+                    block.payload.len(),
+                    block.checksum_valid,
+                    block.duplicate_of
+                )
+            })
+            .collect(),
+        logical_segments: recovery.blocks.len(),
+        unsupported_blocks: 0,
+    })
+}
+
+fn find_commodore_leader(intervals: &[u64], from: usize) -> Option<(usize, usize, u64)> {
+    let mut start = from;
+    while start + COMMODORE_LEADER_PULSES <= intervals.len() {
+        let candidate = intervals[start];
+        if candidate < 80 || candidate > 600 {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < intervals.len() && close(intervals[end], candidate, 0.15) {
+            end += 1;
+        }
+        if end - start >= COMMODORE_LEADER_PULSES {
+            return Some((start, end, median(&intervals[start..end])));
+        }
+        start += 1;
+    }
+    None
+}
+
+fn find_commodore_marker(intervals: &[u64], from: usize, medium: u64, long: u64) -> Option<usize> {
+    (from..intervals.len().saturating_sub(19))
+        .find(|index| is_commodore_pair(intervals[*index], intervals[*index + 1], long, medium))
+}
+
+fn is_commodore_pair(first: u64, second: u64, expected_first: u64, expected_second: u64) -> bool {
+    close(first, expected_first, 0.20) && close(second, expected_second, 0.20)
+}
+
+fn decode_commodore_byte(
+    intervals: &[u64],
+    position: usize,
+    short: u64,
+    medium: u64,
+    long: u64,
+) -> Option<(u8, bool, usize)> {
+    if position + 20 > intervals.len()
+        || !is_commodore_pair(intervals[position], intervals[position + 1], long, medium)
+    {
+        return None;
+    }
+    let mut value = 0u8;
+    let mut parity = 1u8;
+    for bit in 0..9 {
+        let first = intervals[position + 2 + bit * 2];
+        let second = intervals[position + 3 + bit * 2];
+        let decoded = if is_commodore_pair(first, second, short, medium) {
+            0
+        } else if is_commodore_pair(first, second, medium, short) {
+            1
+        } else {
+            return None;
+        };
+        if bit < 8 {
+            value |= decoded << bit;
+        }
+        parity ^= decoded;
+    }
+    // `parity` begins at one and includes all nine recorded bits. Odd parity
+    // is therefore valid only when the final XOR is zero.
+    Some((value, parity == 0, position + 20))
+}
+
+fn valid_commodore_countdown(bytes: &[u8]) -> bool {
+    bytes == [0x89, 0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81]
+        || bytes == [0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+}
+
+fn commodore_header(payload: &[u8]) -> Option<(u8, String, u16, u16)> {
+    if payload.len() != COMMODORE_PAYLOAD_BYTES || !matches!(payload[0], 1..=5) {
+        return None;
+    }
+    let name = payload[5..21]
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != b' ')
+        .map(|byte| {
+            if (0x20..=0x7e).contains(&byte) {
+                byte as char
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect();
+    Some((
+        payload[0],
+        name,
+        u16::from_le_bytes([payload[1], payload[2]]),
+        u16::from_le_bytes([payload[3], payload[4]]),
+    ))
 }
 
 const MAX_CUSTOM_PULSES: usize = 200_000;
@@ -909,5 +1223,121 @@ mod tests {
             confidence: RecoveryConfidence::High,
         };
         assert_eq!(custom_timing_fingerprint(&stage), vec![333_333, 666_666]);
+    }
+
+    fn commodore_stream(payload: &[u8], second_copy: bool) -> Vec<u64> {
+        let (short, medium, long) = (176u64, 256u64, 336u64);
+        let mut intervals = vec![short; 72];
+        let countdown: [u8; 9] = if second_copy {
+            [0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        } else {
+            [0x89, 0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81]
+        };
+        let write_byte = |byte: u8, output: &mut Vec<u64>| {
+            output.extend([long, medium]);
+            let mut parity = 1u8;
+            for bit in 0..8 {
+                let value = (byte >> bit) & 1;
+                parity ^= value;
+                if value == 0 {
+                    output.extend([short, medium]);
+                } else {
+                    output.extend([medium, short]);
+                }
+            }
+            if parity == 0 {
+                output.extend([short, medium]);
+            } else {
+                output.extend([medium, short]);
+            }
+        };
+        for byte in countdown.into_iter().chain(payload.iter().copied()) {
+            write_byte(byte, &mut intervals);
+        }
+        write_byte(
+            payload.iter().fold(0u8, |sum, byte| sum ^ byte),
+            &mut intervals,
+        );
+        intervals.extend([long, short]);
+        intervals
+    }
+
+    fn commodore_wav(rate: u32, streams: &[Vec<u8>]) -> Vec<u8> {
+        let mut samples = vec![128u8; rate as usize / 50];
+        let mut high = true;
+        for (index, stream) in streams.iter().enumerate() {
+            for micros in commodore_stream(stream, index % 2 == 1) {
+                let count = ((micros * rate as u64 + 500_000) / 1_000_000).max(1) as usize;
+                samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+                high = !high;
+            }
+        }
+        wav(rate, 1, 8, &samples)
+    }
+
+    fn commodore_header(name: &[u8], start: u16, end: u16) -> Vec<u8> {
+        let mut header = vec![
+            0x03,
+            start as u8,
+            (start >> 8) as u8,
+            end as u8,
+            (end >> 8) as u8,
+        ];
+        header.extend_from_slice(name);
+        header.resize(21, b' ');
+        header.resize(COMMODORE_PAYLOAD_BYTES, b' ');
+        header
+    }
+
+    #[test]
+    fn recovers_standard_commodore_header_data_and_duplicate_copies() {
+        let header = commodore_header(b"SYNTH", 0x0801, 0x0804);
+        let mut data = vec![1, 2, 3];
+        data.resize(COMMODORE_PAYLOAD_BYTES, 0);
+        let wav = commodore_wav(44_100, &[header.clone(), header, data.clone(), data]);
+        let recovery = decode_commodore_wav(&wav).unwrap();
+        assert_eq!(recovery.blocks.len(), 4);
+        assert_eq!(recovery.blocks[0].checksum_valid, Some(true));
+        assert_eq!(recovery.blocks[1].duplicate_of, Some(0));
+        assert_eq!(recovery.blocks[3].duplicate_of, Some(2));
+        let analysis = commodore_wav_tape_analysis(&wav).unwrap();
+        assert_eq!(analysis.entries.len(), 1);
+        assert_eq!(analysis.entries[0].name.as_deref(), Some("SYNTH"));
+        assert_eq!(analysis.entries[0].load_address, Some(0x0801));
+        assert_eq!(analysis.entries[0].length, 3);
+    }
+
+    #[test]
+    fn commodore_standard_decoder_is_sample_rate_independent() {
+        let header = commodore_header(b"RATE", 0x1000, 0x1001);
+        let mut data = vec![42];
+        data.resize(COMMODORE_PAYLOAD_BYTES, 0);
+        for rate in [22_050, 44_100, 48_000, 96_000] {
+            let recovery =
+                decode_commodore_wav(&commodore_wav(rate, &[header.clone(), data.clone()]))
+                    .unwrap();
+            assert_eq!(recovery.blocks.len(), 2, "rate {rate}");
+            assert!(
+                recovery
+                    .blocks
+                    .iter()
+                    .all(|block| block.checksum_valid == Some(true)),
+                "rate {rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn spectrum_and_custom_waveforms_are_not_commodore() {
+        let rate = 22_050;
+        let mut samples = vec![128u8; rate as usize / 50];
+        let mut high = true;
+        for micros in std::iter::repeat_n(2168, 80).chain([667, 735]) {
+            let count = (micros * rate as u64 / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        }
+        let recovery = decode_commodore_wav(&wav(rate, 1, 8, &samples)).unwrap();
+        assert!(recovery.blocks.is_empty());
     }
 }
