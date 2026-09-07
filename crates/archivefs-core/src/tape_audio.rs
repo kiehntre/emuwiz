@@ -4,6 +4,8 @@
 
 use std::convert::TryInto;
 
+use sha2::{Digest, Sha256};
+
 pub const MAX_WAV_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CHANNELS: u16 = 8;
 pub const MAX_SAMPLE_RATE: u32 = 192_000;
@@ -154,6 +156,20 @@ pub struct CommodoreRecoveredBlock {
 pub struct CommodoreWavRecovery {
     pub audio: TapeAudioAnalysis,
     pub blocks: Vec<CommodoreRecoveredBlock>,
+    pub warnings: Vec<String>,
+}
+
+/// Generic custom stages discovered in a recording that already contains a
+/// checksum-valid standard C64 stream. This provenance gate is intentional:
+/// pulse timings alone cannot safely distinguish C64 fastloaders from another
+/// machine's tape protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommodoreCustomWavRecovery {
+    pub standard_blocks: usize,
+    pub stages: Vec<CustomStageEvidence>,
+    pub blocks: Vec<CustomRecoveredBlock>,
+    pub loader_class: &'static str,
+    pub fingerprint: String,
     pub warnings: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,6 +538,86 @@ pub fn decode_commodore_wav(bytes: &[u8]) -> Result<CommodoreWavRecovery, WavErr
     })
 }
 
+/// Conservatively expose V5's generic custom timing recovery as C64 custom
+/// evidence. The independent standard-ROM recovery is a required provenance
+/// clue; without it this function returns UnknownCustom rather than guessing a
+/// platform or commercial fastloader name.
+pub fn decode_commodore_custom_wav(bytes: &[u8]) -> Result<CommodoreCustomWavRecovery, WavError> {
+    let standard = decode_commodore_wav(bytes)?;
+    let standard_blocks = standard
+        .blocks
+        .iter()
+        .filter(|block| block.checksum_valid == Some(true))
+        .count();
+    if standard_blocks == 0 {
+        return Ok(CommodoreCustomWavRecovery {
+            standard_blocks: 0,
+            stages: Vec::new(),
+            blocks: Vec::new(),
+            loader_class: "UnknownCustom",
+            fingerprint: custom_loader_fingerprint(&[]),
+            warnings: vec![
+                "custom timing was not labelled C64 without a valid standard C64 bootstrap".into(),
+            ],
+        });
+    }
+    let generic = decode_custom_wav(bytes)?;
+    // `decode_custom_wav` intentionally ignores the short C64 ROM leader;
+    // remaining stages are independently calibrated and retain their V5
+    // timing, symbol-mode, ambiguity, and provenance facts.
+    let stages = generic.stages;
+    let blocks = generic.blocks;
+    let loader_class = if stages.len() > 1 {
+        "MultiStage"
+    } else if blocks
+        .iter()
+        .any(|block| block.mode == CustomSymbolMode::PairedPulse)
+    {
+        "GenericTurbo"
+    } else if !stages.is_empty() {
+        "CustomPulse"
+    } else {
+        "UnknownCustom"
+    };
+    let mut warnings = generic.warnings;
+    if stages.is_empty() {
+        warnings.push("no non-ROM custom C64 stage was recovered".into());
+    }
+    Ok(CommodoreCustomWavRecovery {
+        standard_blocks,
+        fingerprint: custom_loader_fingerprint(&stages),
+        stages,
+        blocks,
+        loader_class,
+        warnings,
+    })
+}
+
+/// Stable timing-only custom loader fingerprint. It intentionally excludes
+/// titles, payload bytes, source paths, sample indices, and sample rate.
+pub fn custom_loader_fingerprint(stages: &[CustomStageEvidence]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"commodore-custom-loader-v1\0");
+    for stage in stages {
+        hash.update(stage.pilot_count.to_le_bytes());
+        for timing in custom_timing_fingerprint(stage) {
+            // Edge timestamps are quantized differently at 44.1/48 kHz.
+            // Keep enough resolution to distinguish real timing families but
+            // deliberately discard that capture-rate rounding noise.
+            hash.update((timing / 50_000 * 50_000).to_le_bytes());
+        }
+        hash.update([match stage.symbol_mode {
+            Some(CustomSymbolMode::PairedPulse) => 1,
+            Some(CustomSymbolMode::SinglePulse) => 2,
+            None => 0,
+        }]);
+    }
+    hash.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Project only checksum-valid, non-duplicate standard streams into the
 /// existing logical TapeAnalysis model. A header creates an entry only after
 /// enough following data bytes have been recovered for its declared range.
@@ -712,7 +808,10 @@ fn find_custom_pilot(intervals: &[u64], from: usize) -> Option<(usize, usize, u6
         while i < intervals.len() && close(intervals[i], centre, 0.10) {
             i += 1;
         }
-        if i - start >= 32 && !close(centre, 2168, 0.18) {
+        // C64 ROM leaders are much shorter than the non-ROM custom pilot
+        // range supported by V5. Skipping them lets a standard C64 bootstrap
+        // coexist with a later independently calibrated custom stage.
+        if i - start >= 32 && centre > 500 && !close(centre, 2168, 0.18) {
             return Some((start, i, centre));
         }
         i = start + 1;
@@ -1275,6 +1374,46 @@ mod tests {
         wav(rate, 1, 8, &samples)
     }
 
+    /// A synthetic standard C64 bootstrap followed by a deliberately generic
+    /// custom stage. The custom bytes use V5's documented framing hint; they
+    /// are not a commercial fastloader signature or a C64 header.
+    fn commodore_custom_wav(rate: u32, pilot: u64, zero: u64, one: u64, paired: bool) -> Vec<u8> {
+        let header = commodore_header(b"BOOT", 0x0801, 0x0801);
+        let mut samples = vec![128u8; rate as usize / 50];
+        let mut high = true;
+        let mut add = |micros: u64| {
+            let count = ((micros * rate as u64 + 500_000) / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        };
+        for micros in commodore_stream(&header, false) {
+            add(micros);
+        }
+        // A gap makes the non-ROM stage boundary explicit without retaining
+        // a raw-sample position in the resulting fingerprint.
+        // This interval is deliberately outside the bounded custom-pulse
+        // window, making a stage boundary without a second PCM representation.
+        add(50_000);
+        for _ in 0..80 {
+            add(pilot);
+        }
+        add(pilot / 4);
+        // 0x01, 0x02, 0x04, 0x08 is V5's synthetic framing hint for unambiguous MSB
+        // recovery. It must never be interpreted as a standard C64 header.
+        for byte in [0x01, 0x02, 0x04, 0x08] {
+            for bit in (0..8).rev().map(|bit| (byte >> bit) & 1) {
+                let pulse = if bit == 0 { zero } else { one };
+                add(pulse);
+                if paired {
+                    add(pulse);
+                }
+            }
+        }
+        // Retain the final encoded pulse in the edge-interval stream.
+        add(zero);
+        wav(rate, 1, 8, &samples)
+    }
+
     fn commodore_header(name: &[u8], start: u16, end: u16) -> Vec<u8> {
         let mut header = vec![
             0x03,
@@ -1339,5 +1478,56 @@ mod tests {
         }
         let recovery = decode_commodore_wav(&wav(rate, 1, 8, &samples)).unwrap();
         assert!(recovery.blocks.is_empty());
+        let custom = decode_commodore_custom_wav(&wav(rate, 1, 8, &samples)).unwrap();
+        assert_eq!(custom.loader_class, "UnknownCustom");
+        assert!(custom.stages.is_empty());
+    }
+
+    #[test]
+    fn c64_custom_stage_uses_standard_bootstrap_and_recovers_generic_bytes() {
+        let recovered =
+            decode_commodore_custom_wav(&commodore_custom_wav(44_100, 1200, 400, 800, true))
+                .unwrap();
+        assert_eq!(recovered.standard_blocks, 1);
+        assert_eq!(recovered.loader_class, "GenericTurbo");
+        assert_eq!(recovered.stages.len(), 1);
+        assert_eq!(recovered.blocks.len(), 1);
+        assert_eq!(recovered.blocks[0].bytes, vec![0x01, 0x02, 0x04, 0x08]);
+        assert_eq!(recovered.blocks[0].mode, CustomSymbolMode::PairedPulse);
+        assert_eq!(recovered.blocks[0].bit_order, CustomBitOrder::MsbFirst);
+    }
+
+    #[test]
+    fn c64_custom_stage_is_sample_rate_stable_and_timing_sensitive() {
+        let at_44100 =
+            decode_commodore_custom_wav(&commodore_custom_wav(44_100, 1200, 400, 800, true))
+                .unwrap();
+        let at_48000 =
+            decode_commodore_custom_wav(&commodore_custom_wav(48_000, 1200, 400, 800, true))
+                .unwrap();
+        let changed =
+            decode_commodore_custom_wav(&commodore_custom_wav(48_000, 1200, 400, 1000, true))
+                .unwrap();
+        assert_eq!(at_44100.fingerprint, at_48000.fingerprint);
+        assert_ne!(at_44100.fingerprint, changed.fingerprint);
+    }
+
+    #[test]
+    fn c64_single_pulse_custom_bytes_remain_generic_and_do_not_make_metadata() {
+        let fixture = commodore_custom_wav(44_100, 1200, 400, 800, false);
+        let recovered = decode_commodore_custom_wav(&fixture).unwrap();
+        assert_eq!(recovered.standard_blocks, 1);
+        assert_eq!(recovered.loader_class, "CustomPulse");
+        assert_eq!(recovered.stages.len(), 1);
+        assert_eq!(recovered.blocks[0].bytes, vec![0x01, 0x02, 0x04, 0x08]);
+        assert_eq!(recovered.blocks[0].mode, CustomSymbolMode::SinglePulse);
+        // The valid bootstrap header deliberately has no matching standard
+        // data record. Generic custom bytes must not be mistaken for one.
+        assert!(
+            commodore_wav_tape_analysis(&fixture)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 }

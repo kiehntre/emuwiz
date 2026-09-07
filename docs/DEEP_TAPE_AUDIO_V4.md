@@ -90,3 +90,40 @@ semantics, and all custom/turbo fastloaders. The implementation is based on
 [Datassette Encoding](https://www.c64-wiki.com/wiki/Datassette_Encoding) and
 [Simon’s Mostly Reliable Guide to the Commodore Tape Format](https://eden.mose.org.uk/download/Commodore%20Tape%20Format.pdf).
 All fixtures are synthetic.
+
+## V8: C64 custom/fastloader waveform evidence
+
+V8 adds a deliberately generic interpretation for non-ROM pulse stages in a
+recording that has already yielded at least one checksum-valid C64 standard-ROM
+stream. This independent bootstrap requirement prevents a Spectrum recording,
+random pulse train, or a lone unusual timing cluster from being labelled C64.
+The existing bounded V5 stage scanner supplies stable pilots, one-to-three
+pulse sync candidates, local timing clusters, pulse spread, and stage time
+bounds. C64 ROM leaders are excluded from that custom-stage pass, so a normal
+bootstrap followed by a custom payload can be represented as separate stages
+and each custom stage calibrates its own timing scale.
+
+When two stable timing families and V5's framing evidence make decoding
+defensible, V8 retains generic single-pulse or paired-pulse bytes along with
+the selected bit order, ambiguity count, confidence, and source-time bounds.
+Ambiguous ordering or framing remains timing evidence without invented bytes.
+Custom bytes are never parsed as a C64 ROM header: filename, type, and load
+address remain absent unless V7 independently recovered a valid standard
+header/data relationship. A damaged stage does not erase valid evidence from
+another bounded stage.
+
+The resulting class is only `GenericTurbo`, `CustomPulse`, `MultiStage`, or
+`UnknownCustom`; no commercial fastloader name or game title is inferred. The
+timing fingerprint is a short hash of normalized per-stage timing families,
+pilot counts, and symbol modes. It excludes filenames, payload bytes, sample
+rate, sample indexes, paths, and raw PCM, so equivalent 44.1/48 kHz captures
+remain comparable while materially different timing changes the signature.
+
+Current Commodore TAP support intentionally remains container-header-only and
+does not expose tape intervals to this decoder. Consequently V8 does not claim
+TAP custom-stage parity; that is deferred until the TAP reader can safely
+provide bounded timing payloads to the same semantic stage decoder. Named C64
+fastloaders (including Novaload, Cyberload, Freeload, Ocean, and US Gold
+families) are also deferred: V8 has no documented, multi-clue, non-game-
+specific signature plus near-miss corpus sufficient for fail-closed naming.
+All fixtures remain synthetic.
