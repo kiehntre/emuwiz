@@ -163,6 +163,8 @@ pub mod source_folder_migration;
 pub mod recovery_state_migration;
 
 pub mod disk_format;
+/// Bounded Sharp X68000 Human68k boot/filesystem evidence.
+pub mod x68000_human68k;
 
 /// Pure content/container/media evidence, deliberately separate from
 /// canonical platform identity. See the module documentation for why.

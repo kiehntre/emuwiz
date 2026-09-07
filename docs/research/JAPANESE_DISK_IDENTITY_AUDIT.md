@@ -40,6 +40,11 @@ The authoritative tree has:
   sector, then delegates interpretation to the primitive above. Only strong
   boot evidence becomes a PC-98 platform observation; generic FAT and missing
   sectors remain non-identifying.
+- `x68000_human68k.rs`: bounded logical-sector evidence for the X68000 IPL
+  branch (`0x60`) plus the documented 1024-byte Human68k BPB geometry. It
+  emits typed boot/filesystem facts and shared content observations only for
+  the strong combination; generic FAT remains non-identifying and exact title
+  identity remains DAT/hash-led.
 
 The existing media ledger correctly calls this area partial: structural format support exists, while PC-98/X68000 filesystem evidence and launch remain gaps (`docs/MEDIA_SUPPORT_AUDIT.md`). The older specialized branch `feature/x68000-xdf-dim-evidence` (commits `988b1ad`/`a821845`) is now represented in the authority; it is useful archaeology, not a reason to add a second implementation.
 
@@ -52,12 +57,12 @@ The existing media ledger correctly calls this area partial: structural format s
 | PC-88 + D88 | **Strong** D88 | **Strong** per-track C/H/R/N records | Not inspected | Not inspected | D88 is shared; valid D88 + `pc88`/PC-88 folder is corroboration only | No | Required for title/release | **CORROBORATED_PLATFORM** with independent PC-88 folder; otherwise **FAMILY_ONLY** |
 | PC-98 + D88 | **Strong** D88 | **Strong** per-track geometry | Not inspected | **Strong** when validated track 0/0/1 carries NEC FAT BPB | Shared with PC-88, FM Towns and X68000; strong boot evidence is bytes-derived, generic FAT remains shared | No | Required for exact release | **STRONG_PLATFORM** with NEC boot; otherwise **FAMILY_ONLY** |
 | FM Towns + D88 | **Strong** D88 | **Strong** | Not inspected | Not inspected | D88 is shared and does not identify Towns; folder or title/catalogue evidence is required | No | Required | **CORROBORATED_PLATFORM** only with independent Towns evidence; otherwise **FAMILY_ONLY** |
-| X68000 + D88 | **Strong** D88 | **Strong** | Not inspected | Not inspected | D88 is shared; X68000 folder/boot/DAT evidence is needed | No | Required | **CORROBORATED_PLATFORM** only with independent X68000 evidence; otherwise **FAMILY_ONLY** |
+| X68000 + D88 | **Strong** D88 | **Strong** | Human68k candidate when a mapped logical sector is supplied | **Strong** with IPL/BPB evidence | D88 is shared; only mapped Human68k bytes strengthen X68000; geometry alone remains family-only | No | Required | **STRONG_PLATFORM** with Human68k bytes; otherwise **FAMILY_ONLY** |
 | PC-98 + HDI | **Strong** HDI header | **Strong** C/H/S/sector-size fields | Not inspected | **Strong** when declared payload sector 0 carries NEC FAT BPB | Header/geometry alone remains shared; strong boot bytes are required | No | Required | **STRONG_PLATFORM** with NEC boot; otherwise **FAMILY_ONLY** |
 | PC-98 + NHD | **Strong** `T98HDDIMAGE.R0` header | **Strong** C/H/S/sector-size fields | Not inspected | **Strong** when declared payload sector 0 carries NEC FAT BPB | Header/geometry alone remains shared; strong boot bytes are required | No | Required | **STRONG_PLATFORM** with NEC boot; otherwise **FAMILY_ONLY** |
-| X68000 + HDI/NHD | **Strong** container if header validates | **Strong** | Not inspected | Not inspected | No X68000-specific bytes are examined by the HDI/NHD adapter; extension/capacity collisions must remain ambiguous | No | Required | **FAMILY_ONLY** unless a separate X68000 identity source corroborates it |
+| X68000 + HDI/NHD | **Strong** container if header validates | **Strong** | Human68k candidate when a mapped logical sector is supplied | **Strong** with IPL/BPB evidence | HDI/NHD geometry alone remains shared; mapped Human68k bytes are required for a strong conclusion | No | Required | **STRONG_PLATFORM** with Human68k bytes; otherwise **FAMILY_ONLY** |
 | X68000 + XDF | **Strong** raw-layout validation | **Strong** 77×2×8×1024 | BPB shape only; no directory walk | **Strong-ish** X68000 IPL branch opcode plus BPB constraints | The combination is a strong X68000 floppy signature in the parser, but discovery still requires independent platform identity and the raw image has no self-describing container | No | Required for title/release | **CORROBORATED_PLATFORM** operationally; parser evidence is candidate **STRONG_PLATFORM** |
-| X68000 + DIM | **Strong** DIFC header and track map | **Strong** media-specific geometry | Not inspected | Not inspected | DIFC/DIM is a strong X68000-oriented container convention, but no boot/filesystem bytes are read; retain independent corroboration in ingestion | No | Required | **CORROBORATED_PLATFORM** operationally; parser evidence is candidate **STRONG_PLATFORM** |
+| X68000 + DIM | **Strong** DIFC header and track map | **Strong** media-specific geometry | Human68k candidate when a mapped logical sector is supplied | **Strong** with IPL/BPB evidence | DIM identifies an X68000-oriented container; filesystem bytes are still inspected through the shared sector mapping | No | Required | **STRONG_PLATFORM** with Human68k bytes; otherwise **CORROBORATED_PLATFORM** |
 | FM Towns + ISO/CUE/BIN/CHD | Generic optical container | Track/sector geometry only | ISO may be readable, but ISO is not Towns identity | No Towns detector currently | Shared with many machines; Towns folder/catalogue/boot evidence is required | No | Required | **FAMILY_ONLY** / **DAT_HASH_REQUIRED** |
 | FM Towns + HDM/raw floppy | Generic/raw or shared Japanese floppy | Geometry may be recoverable | No TownsOS/FAT traversal currently | No Towns boot detector currently | Extension and geometry collide with PC-98-compatible media | No | Required | **FAMILY_ONLY** |
 
@@ -93,7 +98,7 @@ bridging, and launch readiness remain follow-up work.
 
 ### Filesystem and boot layers
 
-PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is shared and does not settle the machine family. X68000 Human68k media uses a distinct IPL/partition/boot layout; a Human68k filesystem walk would be stronger than extension evidence, but it is absent. FM Towns/TownsOS and its boot records are absent. No current parser extracts directory names, volume labels, boot filenames, partitions, or executable identities for these families.
+PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is shared and does not settle the machine family. The bounded Human68k bridge now recognises only the X68000 IPL branch plus coherent 1024-byte BPB shape from a caller-supplied mapped sector. It does not walk directories, infer titles, or scan partitions. FM Towns/TownsOS remains covered by its separate IPL4 bridge.
 
 ## Exact gaps
 
@@ -101,7 +106,7 @@ PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is 
 2. The reusable PC-98 BPB evidence primitive is now wired to validated D88,
    HDI and NHD layouts. It intentionally does not scan un-declared partitions,
    add `fdi`/`hdm`/`hd5`/`hd4` variants, or infer PC-98 from generic FAT.
-3. There is no Human68k partition/FAT/18.3-directory reader for X68000 HDD/floppy payloads; current XDF validation stops at IPL/BPB shape.
+3. Human68k filesystem evidence is now a bounded boot/BPB primitive for mapped sectors; partition traversal, FAT/18.3-directory walking, and HDD sector wiring remain unresolved.
 4. FM Towns IPL4 evidence is resolved for the bounded D88/HDI/NHD V1 path;
    Towns-specific optical/system-volume evidence, raw direct floppy access,
    partition traversal, and launch readiness remain unresolved.
