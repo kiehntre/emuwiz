@@ -689,10 +689,10 @@ pub(crate) fn show_selected_evidence_panel(
     match state {
         SelectedEvidenceState::Idle => {
             widgets::card(ui, |ui| {
-                ui.label("Identity evidence has not been loaded for this file yet.");
+                ui.label("EmuWiz hasn't identified this game yet.");
                 if widgets::action_button(
                     ui,
-                    "Load identity evidence",
+                    "Identify this game",
                     widgets::ActionStyle::Secondary,
                     true,
                 )
@@ -734,7 +734,7 @@ pub(crate) fn show_selected_evidence_panel(
                 );
                 if widgets::action_button(
                     ui,
-                    "Load identity evidence",
+                    "Identify this game",
                     widgets::ActionStyle::Secondary,
                     true,
                 )

@@ -587,7 +587,7 @@ impl PlayingLibraryPageState {
                     .err();
                     self.retrodeck_error = Some(match rollback_error {
                         Some(rollback) => format!(
-                            "ES-DE publication failed: {error}; link rollback also failed: {rollback}"
+                            "Adding games to ES-DE failed: {error}; link rollback also failed: {rollback}"
                         ),
                         None => error.to_string(),
                     });
@@ -1057,9 +1057,7 @@ fn esde_friendly_error(error: &EsDePublicationError) -> String {
         EsDePublicationError::MalformedGamelist { .. } => "ES-DE's existing game list does not \
              look like a game list EmuWiz recognises, so nothing was changed."
             .to_string(),
-        EsDePublicationError::NothingToPublish => {
-            "There is nothing new to publish to ES-DE.".to_string()
-        }
+        EsDePublicationError::NothingToPublish => "ES-DE is already up to date.".to_string(),
         EsDePublicationError::UnresolvedRecovery { .. } => "A previous ES-DE update did not \
              finish. Restore it before publishing again."
             .to_string(),
@@ -1147,6 +1145,12 @@ pub(crate) fn show_playing_library_page(
         egui::RichText::new(
             "Pick one representative release per game and create a linked library of it. \
              Your original files are never moved, renamed, or changed.",
+        )
+        .color(theme::muted(ui)),
+    );
+    ui.label(
+        egui::RichText::new(
+            "You can also add this library to ES-DE / RetroDECK after building it.",
         )
         .color(theme::muted(ui)),
     );
@@ -1906,7 +1910,7 @@ fn show_esde_publish_section(
     state: &PlayingLibraryPageState,
     action: &mut Option<PlayingLibraryPageAction>,
 ) {
-    widgets::section_header(ui, "Publish to ES-DE", None);
+    widgets::section_header(ui, "Add to ES-DE / RetroDECK", None);
     ui.label(
         egui::RichText::new(
             "Add the games you just created to ES-DE's menu. Your original files and links are \
@@ -2078,7 +2082,7 @@ fn show_esde_publish_section(
                 } else {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Published {} game(s) to ES-DE.",
+                            "Added {} game(s) to ES-DE.",
                             publication.added.len()
                         ))
                         .color(theme::SUCCESS)
@@ -2088,8 +2092,7 @@ fn show_esde_publish_section(
             } else if publication.is_unchanged() {
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("ES-DE is already up to date - nothing to publish.")
-                        .color(theme::muted(ui)),
+                    egui::RichText::new("ES-DE is already up to date.").color(theme::muted(ui)),
                 );
             } else if state.esde_pending_publish() {
                 ui.add_space(6.0);
@@ -2110,7 +2113,7 @@ fn show_esde_publish_section(
                 ui.add_space(6.0);
                 if widgets::action_button(
                     ui,
-                    "Publish to ES-DE",
+                    "Add to ES-DE / RetroDECK",
                     widgets::ActionStyle::Primary,
                     true,
                 )
@@ -2125,7 +2128,7 @@ fn show_esde_publish_section(
             ui.add_space(6.0);
             widgets::banner(
                 ui,
-                "Could not publish to ES-DE",
+                "Could not add games to ES-DE",
                 friendly,
                 widgets::StatusTone::Blocked,
             );

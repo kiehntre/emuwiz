@@ -5040,7 +5040,7 @@ impl ArchiveFsApp {
             ActivityAction::Refresh,
             None,
             ActivityOutcome::Started,
-            "Loading archive snapshot.",
+            "Loading your library.",
         ));
         Self {
             state: start_load(context.clone(), generation, None),
@@ -5413,7 +5413,7 @@ impl ArchiveFsApp {
             ActivityAction::Refresh,
             None,
             ActivityOutcome::Started,
-            "Refreshing archive snapshot.",
+            "Refreshing your library.",
         ));
         let previous = match std::mem::replace(
             &mut self.state,
@@ -5506,7 +5506,7 @@ impl ArchiveFsApp {
             self.archive_preparation = ArchivePreparationState::Failed {
                 archive_path,
                 message:
-                    "This game is no longer in the current library snapshot. Refresh and try again."
+                    "This game isn't in your library any more. Refresh and try again."
                         .to_string(),
             };
             return;
@@ -5609,7 +5609,7 @@ impl ArchiveFsApp {
             self.archive_preparation = ArchivePreparationState::Failed {
                 archive_path,
                 message:
-                    "This game is no longer in the current library snapshot. Refresh and try again."
+                    "This game isn't in your library any more. Refresh and try again."
                         .to_string(),
             };
             return;
@@ -5860,7 +5860,7 @@ impl ArchiveFsApp {
                         ActivityAction::Refresh,
                         None,
                         ActivityOutcome::Completed,
-                        "Archive snapshot refreshed.",
+                        "Your library was refreshed.",
                     ));
                     self.refresh_error = None;
                     self.snapshot_stale = false;

@@ -8232,7 +8232,7 @@ pub(crate) fn show_quick_rename_page(
                 widgets::StatusTone::Warning,
             );
             egui::CollapsingHeader::new(format!(
-                "Unresolved rename transaction recovery ({})",
+                "Undo or continue an interrupted rename ({})",
                 blocking.len()
             ))
             .id_salt("quick-rename-blocking-recovery")

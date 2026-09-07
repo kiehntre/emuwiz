@@ -1118,7 +1118,7 @@ fn a_real_existing_path_shows_no_inline_error() {
     ));
 }
 
-// --- "Publish to ES-DE" -------------------------------------------------
+// --- "Add to ES-DE / RetroDECK" -------------------------------------------------
 
 mod esde {
     use archivefs_core::launch::es_de_publish::es_de_gamelist_recovery_path;
@@ -1152,7 +1152,7 @@ mod esde {
 
     /// Builds a real, applied playing library (one election, real symlink
     /// on disk) plus a real ES-DE home with a `psx` system - the shared
-    /// starting point for every "Publish to ES-DE" test.
+    /// starting point for every "Add to ES-DE / RetroDECK" test.
     fn library_and_esde_home(tag: &str) -> (Fixture, PlayingLibraryPageState) {
         let fixture = Fixture::new(tag);
         let (mut state, _original, _destination) = preview_a_single_election(&fixture);
@@ -1173,7 +1173,7 @@ mod esde {
         let (mut state, _original, _destination) = preview_a_single_election(&fixture);
 
         let (output, _) = render(&ctx, &mut state, base_input());
-        assert!(!rendered_text_contains(&output, "Publish to ES-DE"));
+        assert!(!rendered_text_contains(&output, "Add to ES-DE / RetroDECK"));
     }
 
     #[test]
@@ -1182,7 +1182,7 @@ mod esde {
         let (_fixture, mut state) = library_and_esde_home("esde-appears-after-create");
 
         let (output, _) = render(&ctx, &mut state, base_input());
-        assert!(rendered_text_contains(&output, "Publish to ES-DE"));
+        assert!(rendered_text_contains(&output, "Add to ES-DE / RetroDECK"));
     }
 
     #[test]
@@ -1193,7 +1193,7 @@ mod esde {
         assert!(state.apply_error().is_none());
 
         let (output, _) = render(&ctx, &mut state, base_input());
-        assert!(!rendered_text_contains(&output, "Publish to ES-DE"));
+        assert!(!rendered_text_contains(&output, "Add to ES-DE / RetroDECK"));
     }
 
     #[test]
