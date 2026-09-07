@@ -37,3 +37,32 @@ loader. Standard Spectrum ROM decoding remains the V4b path. V5 does not
 promise that every custom loader is decodable, does not fabricate TAP metadata,
 and keeps uncertain timing as `UnknownCustom`/review evidence. No emulator is
 executed, no DAT identity or rename is changed, and no raw PCM is persisted.
+
+## V6: named Spectrum loader families
+
+V6 adds one deliberately narrow named-family interpretation: **Alkatraz**.
+It is emitted only when the semantic sequence has all of these independent
+clues: a standard bootstrap, a non-header turbo block with a short 192–288
+pulse pilot, a 10–14 second inter-stage gap, and a following custom-timed data
+stage. This is high-confidence structural recognition. A single timing value,
+partial recording, wrong gap, wrong stage order, or standard-header framing
+stays in the generic classes.
+
+The classifier uses normalized timing/stage facts, not titles, paths, raw
+samples, or a game catalogue. Its fingerprint remains the existing normalized
+loader fingerprint, so changing a filename cannot affect classification. TZX
+directly supplies the full sequence. V5 WAV recovery intentionally does not
+yet retain a whole-recording bootstrap/gap sequence, so it does not emit an
+Alkatraz name from a partial waveform; that is a deliberate parity refusal,
+not a TZX-only signature table.
+
+Speedlock and Bleepload are intentionally deferred: reviewed references
+describe their use and implementation families, but do not provide a stable,
+non-game-specific timing-and-stage signature for this fail-closed registry.
+Fixtures are synthetic timing structures only. No game title is inferred, no
+emulator runs, no PCM is persisted, and no DAT or rename decision changes.
+
+The structural description used for Alkatraz is the documented loader sequence
+in [Tape Decoding Using Taper](https://worldofspectrum.net/legacy-info/tape-decoding-using-taper/): standard BASIC, a short-pilot headerless turbo stage,
+roughly twelve seconds of noise, then further custom loading. The matcher
+requires the machine-readable subset of every one of those stages.

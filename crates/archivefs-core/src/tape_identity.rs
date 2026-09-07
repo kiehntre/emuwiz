@@ -167,6 +167,9 @@ pub enum TzxBlockDetails {
         used_bits: u8,
         pause_ms: u16,
         data_len: u32,
+        /// First payload byte retained as bounded framing evidence only.
+        /// It is not decoded program data or identity metadata.
+        data_flag: Option<u8>,
     },
     PureTone {
         pulse: u16,
@@ -573,6 +576,7 @@ fn tzx_details(kind: TzxBlockKind, data: &[u8], start: usize) -> TzxBlockDetails
                 used_bits,
                 pause_ms,
                 data_len,
+                data_flag: data.get(p + 18).copied(),
             },
             _ => TzxBlockDetails::None,
         },

@@ -40,6 +40,13 @@ pub enum LoaderClass {
     CustomPulse,
     MultiStage,
     UnknownCustom,
+    KnownFamily(KnownLoaderFamily),
+}
+/// A named family is interpretation of existing loader evidence, never game
+/// identity. It is emitted only for a documented multi-clue structural match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownLoaderFamily {
+    Alkatraz,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LoaderConfidence {
@@ -280,7 +287,7 @@ fn classify_tzx_loader(blocks: &[crate::tape_identity::TzxBlock]) -> LoaderEvide
         };
         tokens.push(token);
     }
-    let (class, confidence, mut clues) = if turbo == 0 && pulse == 0 && has_standard {
+    let (mut class, mut confidence, mut clues) = if turbo == 0 && pulse == 0 && has_standard {
         (
             LoaderClass::RomStandard,
             LoaderConfidence::High,
@@ -320,12 +327,74 @@ fn classify_tzx_loader(blocks: &[crate::tape_identity::TzxBlock]) -> LoaderEvide
     if tokens.iter().any(|t| t == "opaque") {
         clues.push("opaque block reduces confidence".into());
     }
+    if let Some((family, family_confidence, family_clues)) = known_family_from_tzx(blocks) {
+        class = LoaderClass::KnownFamily(family);
+        confidence = family_confidence;
+        clues.extend(family_clues);
+    }
     LoaderEvidence {
         class,
         confidence,
         fingerprint: fingerprint(&tokens),
         clues,
     }
+}
+
+/// Applies the documented Alkatraz structure only when every independently
+/// observable clue agrees. One pulse count, a loader name, or an incidental
+/// custom block can never produce a named result.
+fn known_family_from_tzx(
+    blocks: &[crate::tape_identity::TzxBlock],
+) -> Option<(KnownLoaderFamily, LoaderConfidence, Vec<String>)> {
+    for window in blocks.windows(4) {
+        let [bootstrap, first_turbo, gap, second_stage] = window else {
+            continue;
+        };
+        let TzxBlockDetails::Standard { data_len, .. } = bootstrap.details else {
+            continue;
+        };
+        let TzxBlockDetails::Turbo {
+            pilot_count,
+            data_len: first_len,
+            data_flag,
+            ..
+        } = first_turbo.details
+        else {
+            continue;
+        };
+        let TzxBlockDetails::Pause { duration_ms } = gap.details else {
+            continue;
+        };
+        let second_is_custom = match second_stage.details {
+            TzxBlockDetails::Turbo { data_len, .. }
+            | TzxBlockDetails::PureData { data_len, .. } => data_len > 0,
+            _ => false,
+        };
+        // The published structural signature is: standard bootstrap;
+        // headerless turbo with about a 240-pulse pilot; a roughly 12 second
+        // gap; then more custom data. The intervals below deliberately allow
+        // only modest capture/encoder jitter.
+        if data_len == 0
+            || !(192..=288).contains(&pilot_count)
+            || first_len == 0
+            || data_flag == Some(0)
+            || !(10_000..=14_000).contains(&duration_ms)
+            || !second_is_custom
+        {
+            continue;
+        }
+        return Some((
+            KnownLoaderFamily::Alkatraz,
+            LoaderConfidence::High,
+            vec![
+                "Alkatraz: standard bootstrap before custom stages".into(),
+                "Alkatraz: short 192–288 pulse turbo pilot".into(),
+                "Alkatraz: headerless turbo framing".into(),
+                "Alkatraz: 10–14 second inter-stage gap followed by custom data".into(),
+            ],
+        ));
+    }
+    None
 }
 
 fn fingerprint(tokens: &[impl AsRef<str>]) -> String {
@@ -354,6 +423,7 @@ fn format_tzx_detail(detail: &TzxBlockDetails) -> String {
             used_bits,
             pause_ms,
             data_len,
+            ..
         } => format!(
             "turbo data: {data_len} bytes, pilot {pilot}, sync {sync1}/{sync2}, bits {zero}/{one}, pilot count {pilot_count}, final bits {used_bits}, pause {pause_ms} ms"
         ),
@@ -407,5 +477,99 @@ mod tests {
             fingerprint(&["turbo:2168:855:1710"]),
             fingerprint(&["turbo:2168:2168:1710"])
         );
+    }
+
+    fn tzx_header() -> Vec<u8> {
+        b"ZXTape!\x1a\x01\x14".to_vec()
+    }
+
+    fn standard_block(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x10];
+        out.extend_from_slice(&1000u16.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn turbo_block(pilot_count: u16, flag: u8, data_len: usize) -> Vec<u8> {
+        let data_len = data_len.max(1);
+        let mut out = vec![0x11];
+        for timing in [2168u16, 667, 735, 855, 1710, pilot_count] {
+            out.extend_from_slice(&timing.to_le_bytes());
+        }
+        out.push(8);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(data_len as u32).to_le_bytes()[..3]);
+        out.push(flag);
+        out.extend(std::iter::repeat_n(0x55, data_len - 1));
+        out
+    }
+
+    fn pause_block(duration_ms: u16) -> Vec<u8> {
+        let mut out = vec![0x20];
+        out.extend_from_slice(&duration_ms.to_le_bytes());
+        out
+    }
+
+    fn alkatraz_fixture(pilot_count: u16, gap_ms: u16, include_tail: bool) -> Vec<u8> {
+        let mut out = tzx_header();
+        out.extend(standard_block(&[0, 1, 2]));
+        out.extend(turbo_block(pilot_count, 0xff, 3));
+        out.extend(pause_block(gap_ms));
+        if include_tail {
+            out.extend(turbo_block(300, 0xff, 3));
+        }
+        out
+    }
+
+    #[test]
+    fn alkatraz_requires_documented_multi_stage_signature() {
+        let analysis = analyze_tape(&alkatraz_fixture(240, 12_000, true)).unwrap();
+        assert_eq!(
+            analysis.loader.as_ref().unwrap().class,
+            LoaderClass::KnownFamily(KnownLoaderFamily::Alkatraz)
+        );
+        assert_eq!(
+            analysis.loader.as_ref().unwrap().confidence,
+            LoaderConfidence::High
+        );
+    }
+
+    #[test]
+    fn alkatraz_accepts_modest_documented_pilot_jitter() {
+        let analysis = analyze_tape(&alkatraz_fixture(252, 12_600, true)).unwrap();
+        assert_eq!(
+            analysis.loader.as_ref().unwrap().class,
+            LoaderClass::KnownFamily(KnownLoaderFamily::Alkatraz)
+        );
+    }
+
+    #[test]
+    fn alkatraz_near_misses_stay_generic() {
+        for fixture in [
+            alkatraz_fixture(240, 8_000, true),
+            alkatraz_fixture(350, 12_000, true),
+            alkatraz_fixture(240, 12_000, false),
+        ] {
+            let analysis = analyze_tape(&fixture).unwrap();
+            assert!(!matches!(
+                analysis.loader.unwrap().class,
+                LoaderClass::KnownFamily(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn alkatraz_standard_header_framing_is_not_named() {
+        let mut fixture = tzx_header();
+        fixture.extend(standard_block(&[0, 1, 2]));
+        fixture.extend(turbo_block(240, 0, 3));
+        fixture.extend(pause_block(12_000));
+        fixture.extend(turbo_block(300, 0xff, 3));
+        let analysis = analyze_tape(&fixture).unwrap();
+        assert!(!matches!(
+            analysis.loader.unwrap().class,
+            LoaderClass::KnownFamily(_)
+        ));
     }
 }
