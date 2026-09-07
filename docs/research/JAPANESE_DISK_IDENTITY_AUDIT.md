@@ -1,0 +1,108 @@
+# Japanese Computer Disk Identity Audit V1
+
+Status: research-only, 2026-09-07
+
+This audit describes the authoritative tree at `eb1ea221bf6cfe31afe3dd176f7e1ca39b8fe3d8`. It does not add a parser, a platform guess, or a launch adapter. The working tree contained unrelated media/identity edits when the audit started; those files were deliberately not changed.
+
+## Identity layers
+
+These are separate claims:
+
+1. **Container** — the bytes form D88, HDI, NHD, XDF, or DIM.
+2. **Geometry** — cylinders, heads, sectors, sector size, and track layout.
+3. **Filesystem** — a readable FAT/PC-98/Human68k/TownsOS directory and allocation structure.
+4. **Boot** — a machine-specific IPL, boot sector, or boot record.
+5. **Machine family** — PC-88, PC-98, X68000, or FM Towns.
+6. **Exact software** — title/release/media set, normally from a catalogue or verified DAT.
+7. **DAT/hash** — byte identity against an authoritative DAT/hash source.
+
+A valid container is never treated as proof of the software title. An extension is dispatch input for a bounded parser, not identity evidence.
+
+## Current implementation
+
+The authoritative tree has:
+
+- `disk_format/d88.rs`: bounded D88 header, track-table, sector-header and data-length validation. It records disk name, write-protect and media bytes, but does not walk a filesystem or boot sector.
+- `disk_format/hdi.rs`: bounded Anex86 HDI and T98-Next NHD header/geometry validation. It intentionally reads no filesystem or boot bytes.
+- `disk_format/x68000.rs`: bounded XDF 2HD validation (exact 77-cylinder/2-head/8-sector/1024-byte geometry plus an X68000 IPL/BPB shape) and DIM/DIFC header/track validation.
+- `ingestion/discovery.rs`: D88 and HDI/NHD remain accepted only when independent folder/platform evidence supplies a machine identity. XDF/DIM require validated structure and an available platform identity in the discovery path; no filename-only acceptance is made.
+- `platform/mod.rs`: canonical `NEC PC-8801`, `PC-98`, legacy `NEC PC-9801`, `Sharp X68000`, and `FM Towns` records. FM Towns has shared optical/floppy extensions only; no family-specific detector is registered.
+- `content_registry.rs`: D88/HDI/NHD/XDF/DIM are `ComputerDisk` content extensions. This is content routing, not platform proof.
+- `coverage_inventory.rs`: X68000 XDF/DIM are synthetic-validated; no real specimen is recorded as validated in this workspace.
+
+The existing media ledger correctly calls this area partial: structural format support exists, while PC-98/X68000 filesystem evidence and launch remain gaps (`docs/MEDIA_SUPPORT_AUDIT.md`). The older specialized branch `feature/x68000-xdf-dim-evidence` (commits `988b1ad`/`a821845`) is now represented in the authority; it is useful archaeology, not a reason to add a second implementation.
+
+## Evidence matrix
+
+`Strong` means the bytes themselves are distinctive enough for that layer. `Corroborated` means a structural result plus independent folder/catalogue/boot evidence. `Family-only` means a useful ecosystem narrowing, not a machine assignment. The final column is the safe V1 classification for an image without a title DAT match.
+
+| Platform / format | Container | Geometry | Filesystem | Boot | Machine-family evidence | Exact software | DAT/hash | Safe V1 result |
+|---|---|---|---|---|---|---|---|---|
+| PC-88 + D88 | **Strong** D88 | **Strong** per-track C/H/R/N records | Not inspected | Not inspected | D88 is shared; valid D88 + `pc88`/PC-88 folder is corroboration only | No | Required for title/release | **CORROBORATED_PLATFORM** with independent PC-88 folder; otherwise **FAMILY_ONLY** |
+| PC-98 + D88 | **Strong** D88 | **Strong** per-track geometry | Not inspected | Not inspected | Shared with PC-88, FM Towns and X68000; `pc98`/PC-9801 folder plus valid D88 is corroboration | No | Required for exact release | **CORROBORATED_PLATFORM** with independent PC-98 folder; otherwise **FAMILY_ONLY** |
+| FM Towns + D88 | **Strong** D88 | **Strong** | Not inspected | Not inspected | D88 is shared and does not identify Towns; folder or title/catalogue evidence is required | No | Required | **CORROBORATED_PLATFORM** only with independent Towns evidence; otherwise **FAMILY_ONLY** |
+| X68000 + D88 | **Strong** D88 | **Strong** | Not inspected | Not inspected | D88 is shared; X68000 folder/boot/DAT evidence is needed | No | Required | **CORROBORATED_PLATFORM** only with independent X68000 evidence; otherwise **FAMILY_ONLY** |
+| PC-98 + HDI | **Strong** HDI header | **Strong** C/H/S/sector-size fields | Not inspected | Not inspected | HDI is a Japanese hard-disk container commonly used by PC-98, but the header alone does not prove PC-98; current discovery requires independent identity | No | Required | **CORROBORATED_PLATFORM** with PC-98 evidence; otherwise **FAMILY_ONLY** |
+| PC-98 + NHD | **Strong** `T98HDDIMAGE.R0` header | **Strong** C/H/S/sector-size fields | Not inspected | Not inspected | NHD identifies the T98-Next container convention, not a software or machine by itself; current discovery is fail-closed | No | Required | **CORROBORATED_PLATFORM** with PC-98 evidence; otherwise **FAMILY_ONLY** |
+| X68000 + HDI/NHD | **Strong** container if header validates | **Strong** | Not inspected | Not inspected | No X68000-specific bytes are examined by the HDI/NHD adapter; extension/capacity collisions must remain ambiguous | No | Required | **FAMILY_ONLY** unless a separate X68000 identity source corroborates it |
+| X68000 + XDF | **Strong** raw-layout validation | **Strong** 77×2×8×1024 | BPB shape only; no directory walk | **Strong-ish** X68000 IPL branch opcode plus BPB constraints | The combination is a strong X68000 floppy signature in the parser, but discovery still requires independent platform identity and the raw image has no self-describing container | No | Required for title/release | **CORROBORATED_PLATFORM** operationally; parser evidence is candidate **STRONG_PLATFORM** |
+| X68000 + DIM | **Strong** DIFC header and track map | **Strong** media-specific geometry | Not inspected | Not inspected | DIFC/DIM is a strong X68000-oriented container convention, but no boot/filesystem bytes are read; retain independent corroboration in ingestion | No | Required | **CORROBORATED_PLATFORM** operationally; parser evidence is candidate **STRONG_PLATFORM** |
+| FM Towns + ISO/CUE/BIN/CHD | Generic optical container | Track/sector geometry only | ISO may be readable, but ISO is not Towns identity | No Towns detector currently | Shared with many machines; Towns folder/catalogue/boot evidence is required | No | Required | **FAMILY_ONLY** / **DAT_HASH_REQUIRED** |
+| FM Towns + HDM/raw floppy | Generic/raw or shared Japanese floppy | Geometry may be recoverable | No TownsOS/FAT traversal currently | No Towns boot detector currently | Extension and geometry collide with PC-98-compatible media | No | Required | **FAMILY_ONLY** |
+
+The matrix intentionally does not turn the `DiskFormat::platform()` convenience labels (`NEC PC-8801`, `PC-98`, or `Sharp X68000`) into unconditional identity. The detection and discovery gates are the authority: shared D88/HDI/NHD results are suppressed until corroborating evidence exists.
+
+## Format-specific findings and collision tests
+
+### D88
+
+The D88 header contains a disk name/comment, media flag, declared image size and up to 164 track offsets; each track contains sector headers with cylinder/head/record/size and status fields. The format specification explicitly permits multiple disks concatenated after the declared size. Therefore the parser can prove a coherent D88 container and geometry, but disk name is provenance, not a title or platform signature. D88 is used by PC-88, PC-98, FM Towns and X68000 tooling. A bare valid D88 is consequently **FAMILY_ONLY**, not PC-88.
+
+### HDI and NHD
+
+HDI provides a small geometry/type header; NHD provides the `T98HDDIMAGE.R0` signature, comment, header size and C/H/S geometry. Neither adapter reads the payload's partition table, BPB, root directory, or boot code. A valid HDI/NHD is therefore a hard-disk container plus geometry, not proof of PC-98, X68000, DOS, or a release. A PC-98 folder/DAT/hash can corroborate it; capacity and extension cannot.
+
+### XDF and DIM
+
+XDF is headerless raw media. Current validation correctly rejects a same-sized random file unless its first sector has the expected X68000 IPL/BPB fields. That is materially stronger than an `.xdf` suffix, but it still does not identify a title or provide a filesystem walk. DIM's `DIFC HEADER` and bounded media/track map provide a structured X68000-oriented container and geometry; its comments/labels are not identity authority. Keep a separate raw-image/DIM collision test in future work: PC-98-like 2HD geometry alone must not pass the XDF gate.
+
+### FM Towns
+
+FM Towns software commonly uses CD media as well as Japanese-compatible floppy formats. Towns system software can boot directly from CD; the current optical path only provides generic disc evidence. A first-sector `IPL4` boot check is a promising family-specific bridge, but it is not currently implemented and must be validated against multiple Towns system/game images before being treated as platform proof. Towns hard-disk images likewise need partition/boot evidence; a generic ISO/FAT result is not enough.
+
+### Filesystem and boot layers
+
+PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is shared and does not settle the machine family. X68000 Human68k media uses a distinct IPL/partition/boot layout; a Human68k filesystem walk would be stronger than extension evidence, but it is absent. FM Towns/TownsOS and its boot records are absent. No current parser extracts directory names, volume labels, boot filenames, partitions, or executable identities for these families.
+
+## Exact gaps
+
+1. There is no bounded sector/filesystem reader for PC-98/PC-88 (including FAT variants and non-filesystem/protected disks).
+2. There is no PC-98 IPL/boot-sector evidence bridge, and `fdi`, `hdm`, `hd5`, `hd4`, and related raw variants are not structurally distinguished in the current disk layer.
+3. There is no Human68k partition/FAT/18.3-directory reader for X68000 HDD/floppy payloads; current XDF validation stops at IPL/BPB shape.
+4. There is no FM Towns IPL4/TownsOS boot detector or Towns-specific optical/system-volume evidence bridge.
+5. No Japanese-family DAT/hash normalisation bridge turns a validated disk plus a known catalogue into exact software identity.
+6. D88 multi-disk boundary handling is not exposed as a first-class per-disk identity object; the format documentation warns that concatenation may only be inferred from the declared size versus file length.
+
+## Recommended implementation order
+
+1. **Read-only PC-98 evidence bridge:** bounded sector access and conservative BPB/PC-98 IPL observations for D88/FDI/HDM/HDI/NHD payloads. Keep “filesystem observed” separate from “PC-98 proven”; require two independent clues before assigning a machine.
+2. **X68000 Human68k evidence:** inspect the already validated XDF/DIM payload for IPL, partition marker, BPB, and bounded root entries; add equivalent HDD evidence only after real specimens and a collision corpus are available.
+3. **FM Towns boot/optical bridge:** research and test `IPL4`/TownsOS evidence across floppy, CD and HDD paths; do not infer Towns from ISO, D88, or geometry alone.
+4. After those bridges, add DAT/hash identity and launch-profile wiring. Exact software identity should remain DAT/hash-driven even when platform evidence is strong.
+
+## Top 3 real implementation opportunities
+
+1. **PC-98 D88/HDI/NHD sector-and-boot evidence** — highest leverage because current containers and geometry already exist, while discovery must still rely on folders.
+2. **X68000 Human68k payload inspection** — extend the existing XDF/DIM gate without replacing it; prove partition/boot/filesystem evidence and preserve fail-closed collisions.
+3. **FM Towns IPL4/TownsOS evidence bridge** — add a bounded detector for floppy/CD/HDD boot records, validated against independent Towns specimens before changing classification.
+
+## References
+
+- D88 structure and its shared emulator use: [PC98.org D88 format notes](https://www.pc98.org/project/doc/d88.html).
+- NHD header and C/H/S layout: [PC98.org NHD format notes](https://www.pc98.org/project/doc/nhd.html).
+- DIM structure and X68000 implementation cross-checks already used by the code: [PC98.org DIM notes](https://www.pc98.org/project/doc/dim.html), [XEiJ `FDMedia`](https://stdkmd.net/xeij/source/xeij-FDMedia.java.htm), and [XDF builder notes](https://github.com/mikewolak/x68k_sprite_demo/blob/main/README.md).
+- Human68k SxSI partition/boot layout: [erique/scsitools](https://github.com/erique/scsitools).
+- FM Towns IPL4 boot-sector observation: [YSFLIGHT FM Towns bootloader notes](https://ysflight.in.coocan.jp/FM/towns/bootloader/e.html).
+- FM Towns emulator/boot media context: [MAME FM Towns driver guide](https://wiki.mamedev.org/index.php?title=Driver%3AFMTowns).
+
+No source above is used to claim exact game identity. DAT/hash verification remains the authority for that layer.
