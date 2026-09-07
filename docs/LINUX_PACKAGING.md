@@ -15,8 +15,8 @@ pre-release versioning convention.
 | --- | --- | --- |
 | AppImage | Existing, supported | [`docs/APPIMAGE_PACKAGING.md`](APPIMAGE_PACKAGING.md) |
 | Tarball + `install.sh` | Existing, supported | repository root `install.sh` |
-| DEB (Debian/Ubuntu) | Packaging correct; blocked on an upstream compile error (V3) | `packaging/debian/build-deb.sh` |
-| RPM (Fedora/Nobara) | Packaging correct; blocked on the same upstream compile error (V3) | `packaging/rpm/build-rpm.sh` |
+| DEB (Debian/Ubuntu) | V4 artifact build and disposable install/uninstall QA passed | `packaging/debian/build-deb.sh` |
+| RPM (Fedora/Nobara) | V4 artifact build and disposable install/uninstall QA passed | `packaging/rpm/build-rpm.sh` |
 | Flatpak | **Deferred** | see below |
 
 ### Flatpak status
@@ -115,9 +115,8 @@ guessed):
 Nothing here is a hard `Depends:`/`Requires:` beyond what `dh_shlibdeps` /
 RPM's automatic ELF dependency generator adds for the binaries themselves
 (`${shlibs:Depends}`, `${misc:Depends}` on DEB; RPM's find-requires on the
-spec side) - **still not verified against a completed build** (see
-Blockers: the workspace does not currently compile from a clean checkout,
-independent of packaging).
+spec side). V4 inspected the generated dependency metadata in disposable
+Ubuntu 24.04 and Fedora 41 containers.
 
 ## DEB packaging
 
@@ -299,7 +298,7 @@ workflow file this packaging-QA lane is explicitly not permitted to touch.
 real package - or any plain `cargo build --release` from a clean checkout -
 can succeed.
 
-## Package inspection / install QA: blocked
+## Package inspection / install QA: blocked in V3 (superseded)
 
 Tasks A2/B (DEB inspection, install/uninstall QA) and D2/E (RPM inspection,
 install/uninstall QA) could not run - there is no artifact to inspect or
@@ -350,24 +349,73 @@ run - there is nothing to lint without a built package.
 - `shellcheck`: still not installed on this host; not run.
 - `lintian`/`rpmlint`: not installed; moot without a built package (see above).
 
+## Package builds and install QA (V4)
+
+V4 reran the real packaging scripts after the OnFrame compile fix (`acb3fbc`)
+in fresh, disposable containers. The repository was bind-mounted read-only;
+only `dist/packages/` was writable. No package was installed on the authoring
+host.
+
+Toolchain and images:
+
+- `ubuntu:24.04`, rustup Rust `1.97.1` (`rustc 1.97.1`, `cargo 1.97.1`)
+- `fedora:41`, rustup Rust `1.97.1` (`rustc 1.97.1`, `cargo 1.97.1`)
+- both builds used `CARGO_BUILD_JOBS=2` and the existing build scripts
+
+Debian artifacts (`0.8.1~alpha-1`, `amd64`):
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `emuwiz_0.8.1~alpha-1_amd64.deb` | `f5431f30c36d7248ef3f1655cc18519a31909314c0db1a8b453a28e40a899beb` |
+| `emuwiz-cli_0.8.1~alpha-1_amd64.deb` | `217c8ce359ed2459f5015fc128c43c16c3b2962c6619a669199d45f9f66d7ced` |
+
+RPM artifacts (`0.8.1-0.1.alpha.fc41`, `x86_64`):
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `emuwiz-0.8.1-0.1.alpha.fc41.x86_64.rpm` | `1d163597dfda3515462b97fe983e8b67dae9cdd82c1dbad818417ff4a3096f2f` |
+| `emuwiz-cli-0.8.1-0.1.alpha.fc41.x86_64.rpm` | `60402d2a486fcadf136be0c29cf05cb4caa74d8907deefe7905c46b0becddde0` |
+| `emuwiz-debuginfo-0.8.1-0.1.alpha.fc41.x86_64.rpm` | `a07c61245b1f0674d30b7a6bf358b109b4ed3fe78a16d54ffd0aac2c2795e2d8` |
+| `emuwiz-cli-debuginfo-0.8.1-0.1.alpha.fc41.x86_64.rpm` | `b2f048c940ee04a33cdd4098c7cc7fd9d8555a15c2d859ed9b492a0e63678404` |
+| `emuwiz-debugsource-0.8.1-0.1.alpha.fc41.x86_64.rpm` | `a157cfaaef9b6cadd0e0a6bc49e11d19c05fe06c0771bd02fc93bd6eee6d0ba5` |
+
+Inspection and install QA passed in second fresh containers for each distro:
+
+- `dpkg-deb --info/--contents` and `rpm -qpi/-qpl/-qpR` showed the expected
+  GUI/CLI split, desktop entry, AppStream metadata, icons, and documentation.
+- Debian dependencies were `libc6`/`libgcc-s1`; runtime recommendations were
+  `fuse3`, `xdg-utils`, `7zip | p7zip-full`, `python3-pip` (GUI also recommends
+  the CLI), with `ratarmount` and `unrar` suggested.
+- RPM dependencies were automatic glibc/libgcc/libm/rtld requirements;
+  recommendations were `fuse3`, `p7zip`, `p7zip-plugins`, `python3-pip`,
+  `xdg-utils` (GUI also recommends the CLI), with `ratarmount` and `unrar`
+  suggested.
+- `emuwiz-cli --help` and `--version` worked after installation (`0.8.1-alpha`);
+  `ldd` reported no missing libraries. Package-owned binaries, desktop files,
+  metadata, and icons disappeared after `apt remove`/`dnf remove`.
+- Debian `lintian` reported only the expected no-manual-page and initial-upload
+  changelog warnings. RPM `rpmlint` reported spelling errors for the British
+  “organise/organised” wording and no-manual-page/no-documentation warnings;
+  these are metadata/style findings, not runtime defects.
+- `desktop-file-validate` and `appstreamcli validate --no-net` passed for the
+  rendered DEB and RPM payloads (one existing pedantic AppStream note).
+
+V4 is local artifact/install QA, not a claim of official Debian or Fedora
+repository compliance. RPM still builds with live Cargo dependency access;
+vendoring remains the documented prerequisite for a Fedora/COPR submission.
+
 ## Known blockers
 
-1. **The workspace does not compile at HEAD** - see "Actual blocker" above.
-   This is the sole reason no `.deb`/`.rpm` exists yet; it blocks every
-   packaging format equally, including the already-working AppImage path if
-   rebuilt from current HEAD.
-2. RPM `%build` still does a live `cargo build` (crates.io network access) -
+1. RPM `%build` still does a live `cargo build` (crates.io network access) -
    fine for local/V2-V3 packaging QA, **not** acceptable for an official
    Fedora/COPR submission without vendoring (see Source/build model above;
    unchanged from V2).
-3. Neither distro's packaged `cargo`/`rustc` is new enough to build this
+2. Neither distro's packaged `cargo`/`rustc` is new enough to build this
    workspace (see Toolchain finding above); a real build - local or CI -
    must provide the pinned `1.97.1` toolchain itself (rustup), on PATH,
    ahead of `dpkg-buildpackage`/`rpmbuild`. This is now documented rather
    than silently assumed.
-4. Exact `${shlibs:Depends}` / RPM auto-`Requires` for the GUI's dynamic
-   library needs still cannot be verified until a build actually completes.
-5. `ratarmount` is not an installable package on either distro (see Runtime
+3. `ratarmount` is not an installable package on either distro (see Runtime
    dependencies) - moved to `Suggests`, `python3-pip` added to
    `Recommends` as the practical install path. This is now evidence-based,
    not a caveat.
