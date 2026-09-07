@@ -6259,6 +6259,11 @@ impl ArchiveFsApp {
     /// clearly-named page so emulator setup is discoverable without entering
     /// "Problems & Repair". Per-emulator rows appear in the scan's
     /// "Emulators" / "Emulator profiles" categories once the check has run.
+    /// `emulator_setup_page::show` also renders a small "Frontends" section
+    /// (currently just ES-DE) below the emulator candidates - frontends are
+    /// not emulators, so they are kept out of the `LAUNCH_COMPATIBILITY`
+    /// candidate grid and shown separately instead. See "ES-DE INTEGRATION
+    /// VISIBILITY + SETUP FIX V1".
     fn show_emulator_setup_page(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         // One-shot navigation hint: `take()` here means the first frame
         // after a repair-action navigation may scroll the relevant card

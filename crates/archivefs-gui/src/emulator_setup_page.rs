@@ -6,6 +6,10 @@
 //! preflight remains the authority for launching a particular game.
 
 use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, Finding, Measurement};
+use archivefs_core::emulator_environment::es_de::{
+    self, DiscoveryError, EligibilityBlocker, EsDeEnvironmentReport, ExecutableSearchOutcome,
+    ProfileKind,
+};
 use archivefs_core::launch::{LAUNCH_COMPATIBILITY, LaunchCompatibility};
 use eframe::egui;
 
@@ -55,6 +59,12 @@ pub(crate) struct EmulatorSetupCandidate {
 pub(crate) struct EmulatorSetupPageState {
     pub(crate) platform_filter: String,
     pub(crate) search: String,
+    /// Read-only ES-DE discovery result, cached for the lifetime of this
+    /// page state so `show` does not re-probe the filesystem every frame.
+    /// Cleared only by constructing a fresh `EmulatorSetupPageState`
+    /// (e.g. the "Check emulators" flow does not currently refresh this -
+    /// see [`show_frontends`]).
+    frontend_report: Option<Result<EsDeEnvironmentReport, DiscoveryError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,12 +428,171 @@ pub(crate) fn show(
         });
         ui.add_space(CANDIDATE_CARD_GAP);
     }
+
+    ui.add_space(theme::SECTION_GAP);
+    show_frontends(ui, state);
+
     action
+}
+
+/// A friendly, non-technical reason ES-DE was found but is not yet ready -
+/// covers every [`EligibilityBlocker`] variant explicitly (no wildcard arm)
+/// so a new blocker added upstream fails to compile here rather than
+/// silently falling back to a generic message.
+fn frontend_blocker_reason(blocker: &EligibilityBlocker) -> &'static str {
+    match blocker {
+        EligibilityBlocker::ExecutableMissing => "the ES-DE executable was not found on your PATH",
+        EligibilityBlocker::ExecutableUnsafe => {
+            "the ES-DE executable was found, but is not safely usable (not a plain executable file)"
+        }
+        EligibilityBlocker::ConfigurationRootMissing => {
+            "its configuration directory (~/ES-DE) was not found"
+        }
+        EligibilityBlocker::ConfigurationRootUnsafe => {
+            "its configuration directory exists, but is not usable"
+        }
+        EligibilityBlocker::ConflictingCandidates => {
+            "more than one ES-DE install was found pointing at the same configuration, so \
+             EmuWiz will not guess which one to use"
+        }
+    }
+}
+
+/// Frontends (currently just ES-DE) are not emulators - they organize and
+/// launch games across many emulators - so they are deliberately kept out
+/// of the `LAUNCH_COMPATIBILITY`-driven candidate grid above and shown in
+/// their own small, clearly-labelled subsection instead. See "ES-DE
+/// INTEGRATION VISIBILITY + SETUP FIX V1": this reads
+/// `archivefs_core::emulator_environment::es_de` (already-mature,
+/// read-only discovery used elsewhere by the Playing Library "Publish to
+/// ES-DE" flow) and projects it here for the first time - it performs no
+/// writes and does not modify any ES-DE configuration.
+fn show_frontends(ui: &mut egui::Ui, state: &mut EmulatorSetupPageState) {
+    if state.frontend_report.is_none() {
+        state.frontend_report = Some(es_de::discover_es_de_environment_default());
+    }
+
+    widgets::section_header(
+        ui,
+        "Frontends",
+        Some(
+            "Frontends like ES-DE organize and launch games across many emulators. They are \
+             set up separately from the individual emulators above.",
+        ),
+    );
+
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("ES-DE").strong());
+            ui.label(egui::RichText::new("Frontend").color(theme::muted(ui)));
+        });
+
+        match state
+            .frontend_report
+            .as_ref()
+            .expect("populated immediately above")
+        {
+            Err(err) => {
+                widgets::status_badge(ui, "Not detected", widgets::StatusTone::Pending);
+                ui.label(format!("EmuWiz could not check for ES-DE: {err}"));
+            }
+            Ok(report) => {
+                let native = report
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.profile_kind == ProfileKind::Native);
+                // A `Native` profile is always produced by discovery (it
+                // reflects the documented default `~/ES-DE` home whether or
+                // not anything is actually there), so `None` here is a
+                // defensive fallback rather than a reachable state today -
+                // "detected" is judged by whether the `es-de` executable
+                // itself was actually found, not by that profile's mere
+                // existence.
+                let not_installed = native.is_none_or(|profile| {
+                    profile.executable.outcome != ExecutableSearchOutcome::Found
+                });
+                if not_installed {
+                    widgets::status_badge(ui, "Not detected", widgets::StatusTone::Pending);
+                    ui.label(
+                        "ES-DE was not found. Install it and EmuWiz will detect it here \
+                         automatically - nothing is required from you now.",
+                    );
+                } else {
+                    match native.expect("not_installed is false only when native is Some") {
+                        profile if profile.eligible => {
+                            widgets::status_badge(ui, "Detected", widgets::StatusTone::Success);
+                            ui.label("ES-DE is installed.");
+                            ui.label(format!(
+                                "ROM library home: {}",
+                                profile.home_directory.path.display
+                            ));
+                            ui.label(format!(
+                                "EmuWiz found {} configured system{}.",
+                                profile.systems.len(),
+                                if profile.systems.len() == 1 { "" } else { "s" }
+                            ));
+                            if profile.systems_may_be_incomplete {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "EmuWiz could not read ES-DE's full bundled systems list, \
+                                     so this count may be incomplete.",
+                                    )
+                                    .small()
+                                    .color(theme::muted(ui)),
+                                );
+                            }
+                            ui.label(
+                            egui::RichText::new(
+                                "Per-system emulator and BIOS readiness is not checked here yet \
+                                 - use Playing Library's \"Publish to ES-DE\" flow to review and \
+                                 publish games.",
+                            )
+                            .small()
+                            .color(theme::muted(ui)),
+                        );
+                        }
+                        profile => {
+                            widgets::status_badge(ui, "Needs setup", widgets::StatusTone::Warning);
+                            ui.label("ES-DE was found, but is not ready yet:");
+                            for blocker in &profile.blockers {
+                                ui.label(format!("• {}", frontend_blocker_reason(blocker)));
+                            }
+                        }
+                    }
+                }
+
+                widgets::technical_details(ui, ("frontend-esde", "es-de", "status"), |ui| {
+                    ui.label(format!("Discovery complete: {}", report.discovery_complete));
+                    for profile in &report.profiles {
+                        ui.label(format!(
+                            "Profile {:?} ({:?}): eligible={}",
+                            profile.profile_kind, profile.provenance, profile.eligible
+                        ));
+                        ui.label(format!(
+                            "  executable: {:?} via {:?}",
+                            profile.executable.outcome, profile.executable.provenance
+                        ));
+                        ui.label(format!(
+                            "  home directory probe: {:?}",
+                            profile.home_directory.probe
+                        ));
+                        for finding in &profile.systems_files {
+                            ui.label(format!(
+                                "  systems file [{:?}] {}: {:?}",
+                                finding.role, finding.path.display, finding.read
+                            ));
+                        }
+                    }
+                });
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 
     fn finding(name: &str, severity: DoctorSeverity, title: &str) -> Finding {
         Finding {
@@ -771,6 +940,7 @@ mod tests {
         let mut state = EmulatorSetupPageState {
             platform_filter: "Commodore 64".to_string(),
             search: String::new(),
+            ..Default::default()
         };
         let output = context.run(
             egui::RawInput {
@@ -800,5 +970,346 @@ mod tests {
             "cards in the same row must have aligned top edges: VICE at {vice_top}, \
              RetroArch at {retroarch_top}"
         );
+    }
+
+    // --- ES-DE frontend visibility (ES-DE INTEGRATION VISIBILITY + SETUP V1) ---
+    //
+    // These tests never touch the real ES-DE discovery machinery's default
+    // (`discover_es_de_environment_default`, which reads real process
+    // `$HOME`/`$PATH`) - each builds its own bounded temp fixture and an
+    // explicit `DiscoveryEnvironment`, exactly mirroring the pattern already
+    // used by `playing_library_page.rs`'s own ES-DE tests, so results never
+    // depend on whatever is actually installed on the machine running the
+    // test.
+
+    struct EsDeFixture {
+        root: std::path::PathBuf,
+    }
+
+    impl EsDeFixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "archivefs-gui-esde-setup-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        /// The directory ES-DE discovery actually probes for the `Native`
+        /// profile - `<HOME>/ES-DE`, not `HOME` itself (see
+        /// `discover_es_de_environment`'s `home_dir.join("ES-DE")`).
+        fn es_de_home(&self) -> std::path::PathBuf {
+            self.root.join("ES-DE")
+        }
+
+        fn env(&self) -> es_de::DiscoveryEnvironment {
+            es_de::DiscoveryEnvironment {
+                home: Some(self.root.clone().into_os_string()),
+                path: None,
+                explicit_bundled_systems_files: Vec::new(),
+                appimage_search_roots: Vec::new(),
+                explicit_root: None,
+                explicit_appimages: Vec::new(),
+                explicit_portables: Vec::new(),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<std::path::PathBuf> {
+            fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else {
+                        out.push(path);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.root, &mut out);
+            out.sort();
+            out
+        }
+    }
+
+    impl Drop for EsDeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn render_frontends(state: &mut EmulatorSetupPageState) -> egui::FullOutput {
+        let context = egui::Context::default();
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    show_frontends(ui, state);
+                });
+            },
+        )
+    }
+
+    fn output_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn walk(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => nested.iter().any(|s| walk(s, needle)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|clipped| walk(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn es_de_not_installed_shows_not_detected_and_is_labelled_frontend() {
+        let fixture = EsDeFixture::new("not-installed");
+        let report = es_de::discover_es_de_environment(&HostReadOnlyFilesystem, &fixture.env())
+            .expect("discovery with an explicit HOME never fails");
+        let mut state = EmulatorSetupPageState {
+            frontend_report: Some(Ok(report)),
+            ..Default::default()
+        };
+        let output = render_frontends(&mut state);
+        assert!(output_contains(&output, "ES-DE"), "ES-DE must be visible");
+        assert!(
+            output_contains(&output, "Frontend"),
+            "ES-DE must be labelled as a frontend, not an emulator"
+        );
+        assert!(output_contains(&output, "Not detected"));
+    }
+
+    #[test]
+    fn es_de_installed_and_eligible_reports_systems_without_claiming_full_readiness() {
+        let fixture = EsDeFixture::new("eligible");
+        // A usable home directory plus a real, executable `es-de` on PATH -
+        // the two things `EsDeProfile::eligible` requires.
+        let bin_dir = fixture.root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let executable = bin_dir.join("es-de");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::create_dir_all(fixture.es_de_home().join("custom_systems")).unwrap();
+        std::fs::write(
+            fixture.es_de_home().join("custom_systems/es_systems.xml"),
+            r#"<?xml version="1.0"?>
+<systemList>
+  <system>
+    <name>nes</name>
+    <fullname>Nintendo Entertainment System</fullname>
+    <path>%ROMPATH%/nes</path>
+    <extension>.nes .zip</extension>
+    <command>%EMULATOR_RETROARCH% %ROM%</command>
+    <platform>nes</platform>
+    <theme>nes</theme>
+  </system>
+</systemList>
+"#,
+        )
+        .unwrap();
+        let mut env = fixture.env();
+        env.path = Some(bin_dir.clone().into_os_string());
+        let report = es_de::discover_es_de_environment(&HostReadOnlyFilesystem, &env)
+            .expect("discovery with an explicit HOME never fails");
+        assert!(
+            report
+                .profiles
+                .iter()
+                .any(|profile| profile.profile_kind == ProfileKind::Native && profile.eligible),
+            "fixture must actually be eligible for this test to be meaningful"
+        );
+        let mut state = EmulatorSetupPageState {
+            frontend_report: Some(Ok(report)),
+            ..Default::default()
+        };
+        let output = render_frontends(&mut state);
+        assert!(output_contains(&output, "Detected"));
+        assert!(output_contains(&output, "1 configured system."));
+        // V1 deliberately never claims per-system emulator/BIOS readiness -
+        // it only reports what ES-DE discovery itself can see.
+        assert!(output_contains(&output, "not checked here yet"));
+    }
+
+    #[test]
+    fn es_de_executable_found_but_config_root_missing_is_reported_as_needs_setup() {
+        let fixture = EsDeFixture::new("found-but-blocked");
+        // An `es-de` executable really is on PATH here (so this is not the
+        // "Not detected" case), but `<HOME>/ES-DE` itself is never created -
+        // `EligibilityBlocker::ConfigurationRootMissing` should block
+        // eligibility and the specific reason must be shown, not a silent
+        // "Ready".
+        let bin_dir = fixture.root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let executable = bin_dir.join("es-de");
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = fixture.env();
+        env.path = Some(bin_dir.into_os_string());
+        let report = es_de::discover_es_de_environment(&HostReadOnlyFilesystem, &env)
+            .expect("discovery with an explicit HOME never fails");
+        let native = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_kind == ProfileKind::Native)
+            .expect("a Native profile is always produced");
+        assert_eq!(native.executable.outcome, ExecutableSearchOutcome::Found);
+        assert!(
+            !native.eligible,
+            "fixture must actually be blocked for this test to be meaningful"
+        );
+        let mut state = EmulatorSetupPageState {
+            frontend_report: Some(Ok(report)),
+            ..Default::default()
+        };
+        let output = render_frontends(&mut state);
+        assert!(output_contains(&output, "Needs setup"));
+        assert!(
+            output_contains(
+                &output,
+                "its configuration directory (~/ES-DE) was not found"
+            ),
+            "the specific blocker reason must be shown, not a generic message"
+        );
+    }
+
+    #[test]
+    fn malformed_systems_file_renders_without_panicking() {
+        let fixture = EsDeFixture::new("malformed");
+        std::fs::create_dir_all(fixture.es_de_home().join("custom_systems")).unwrap();
+        std::fs::write(
+            fixture.es_de_home().join("custom_systems/es_systems.xml"),
+            "<systemList><system><name>broken</name>",
+        )
+        .unwrap();
+        let report = es_de::discover_es_de_environment(&HostReadOnlyFilesystem, &fixture.env())
+            .expect("a malformed file is a soft diagnostic, never a hard discovery error");
+        // The fixture is deliberately truncated (an unclosed `<system>`) -
+        // core's own parser is expected to fail soft: no fabricated system
+        // record, plus a diagnostic explaining why, never a panic and never
+        // an invented "successfully parsed" system.
+        let native = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_kind == ProfileKind::Native)
+            .expect("a Native profile is always produced");
+        assert!(
+            native.systems.is_empty(),
+            "an unclosed <system> element must never be fabricated into a parsed system"
+        );
+        assert!(
+            native
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "systems_file_unclosed_element_at_eof"),
+            "fixture must actually be malformed for this test to be meaningful"
+        );
+        let mut state = EmulatorSetupPageState {
+            frontend_report: Some(Ok(report)),
+            ..Default::default()
+        };
+        // The real assertion is simply that this does not panic.
+        let output = render_frontends(&mut state);
+        assert!(output_contains(&output, "ES-DE"));
+    }
+
+    #[test]
+    fn technical_details_are_collapsed_by_default() {
+        let fixture = EsDeFixture::new("collapsed");
+        let report = es_de::discover_es_de_environment(&HostReadOnlyFilesystem, &fixture.env())
+            .expect("discovery with an explicit HOME never fails");
+        let mut state = EmulatorSetupPageState {
+            frontend_report: Some(Ok(report)),
+            ..Default::default()
+        };
+        let output = render_frontends(&mut state);
+        assert!(
+            !output_contains(&output, "Discovery complete:"),
+            "technical details must stay collapsed until the user opens them"
+        );
+        assert!(output_contains(&output, "Technical details"));
+    }
+
+    #[test]
+    fn discovery_never_writes_to_the_fixture() {
+        let fixture = EsDeFixture::new("no-writes");
+        std::fs::create_dir_all(fixture.es_de_home().join("custom_systems")).unwrap();
+        std::fs::write(
+            fixture.es_de_home().join("custom_systems/es_systems.xml"),
+            "<systemList/>",
+        )
+        .unwrap();
+        let before = fixture.snapshot();
+        let report = es_de::discover_es_de_environment(&HostReadOnlyFilesystem, &fixture.env())
+            .expect("discovery with an explicit HOME never fails");
+        let mut state = EmulatorSetupPageState {
+            frontend_report: Some(Ok(report)),
+            ..Default::default()
+        };
+        let _ = render_frontends(&mut state);
+        assert_eq!(
+            before,
+            fixture.snapshot(),
+            "neither discovery nor rendering the setup card may write to ES-DE's directories"
+        );
+    }
+
+    #[test]
+    fn full_setup_page_still_shows_generic_emulator_candidates_alongside_frontends() {
+        let context = egui::Context::default();
+        let mut state = EmulatorSetupPageState {
+            platform_filter: "Commodore 64".to_string(),
+            search: String::new(),
+            ..Default::default()
+        };
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 1200.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ = show(
+                        ui,
+                        &mut state,
+                        None,
+                        false,
+                        RetroArchSetupStatus::Ready,
+                        None,
+                    );
+                });
+            },
+        );
+        assert!(
+            output_contains(&output, "VICE"),
+            "adding the frontends section must not remove existing emulator candidates"
+        );
+        assert!(
+            output_contains(&output, "ES-DE"),
+            "ES-DE must now be visible on the same page"
+        );
+        assert!(output_contains(&output, "Frontend"));
     }
 }
