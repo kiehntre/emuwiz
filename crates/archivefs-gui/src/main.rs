@@ -25282,32 +25282,37 @@ fn show_recent_cheat_activity(
         })
         .take(4)
         .collect();
-    widgets::section_header(
-        ui,
-        "Recent related activity",
-        Some(
-            "A compact view of this session's emulator profile scans, local PNACH inspection, and trusted catalogue retrieval.",
-        ),
-    );
-    if entries.is_empty() {
-        ui.weak("No related activity has been recorded in this session.");
-        return;
-    }
-    for entry in entries {
-        widgets::card(ui, |ui| {
-            widgets::activity_row_header(
-                ui,
-                entry.outcome.to_string(),
-                activity_outcome_tone(entry.outcome),
-                entry.action.to_string(),
-                Some(&format_history_timestamp(entry.timestamp)),
-                |_ui| {},
+    egui::CollapsingHeader::new("Recent related activity")
+        .id_salt("cheats-recent-related-activity")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "This session's emulator checks, local PNACH inspection, and catalogue retrieval.",
+                )
+                .color(theme::muted(ui))
+                .small(),
             );
-            ui.add(egui::Label::new(&entry.message).truncate())
-                .on_hover_text(&entry.message);
+            if entries.is_empty() {
+                ui.weak("No related activity has been recorded in this session.");
+            } else {
+                for entry in entries {
+                    widgets::card(ui, |ui| {
+                        widgets::activity_row_header(
+                            ui,
+                            entry.outcome.to_string(),
+                            activity_outcome_tone(entry.outcome),
+                            entry.action.to_string(),
+                            Some(&format_history_timestamp(entry.timestamp)),
+                            |_ui| {},
+                        );
+                        ui.add(egui::Label::new(&entry.message).truncate())
+                            .on_hover_text(&entry.message);
+                    });
+                    ui.add_space(4.0);
+                }
+            }
         });
-        ui.add_space(4.0);
-    }
 }
 
 /// A compact, honest notice - not a full section with its own heading and

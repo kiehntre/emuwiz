@@ -120,29 +120,31 @@ pub(crate) fn show_doctor_page(
                 None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
             }
         });
-        ui.add_space(8.0);
-        let health_grid = doctor_health_grid_layout(ui.available_width());
-        let metrics = [
-            ("Blocking", health.blocking, widgets::StatusTone::Blocked),
-            ("Warnings", health.warnings, widgets::StatusTone::Warning),
-            (
-                "Informational",
-                health.informational,
-                widgets::StatusTone::Info,
-            ),
-            ("Unknown", health.unknown, widgets::StatusTone::Pending),
-        ];
-        ui.spacing_mut().item_spacing.x = health_grid.gap;
-        ui.spacing_mut().item_spacing.y = health_grid.gap;
-        ui.horizontal_wrapped(|ui| {
-            for (label, count, tone) in metrics {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(health_grid.card_width, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| doctor_health_metric(ui, health_grid.card_width, label, count, tone),
-                );
-            }
-        });
+        if displayed.is_some() {
+            ui.add_space(8.0);
+            let health_grid = doctor_health_grid_layout(ui.available_width());
+            let metrics = [
+                ("Blocking", health.blocking, widgets::StatusTone::Blocked),
+                ("Warnings", health.warnings, widgets::StatusTone::Warning),
+                (
+                    "Informational",
+                    health.informational,
+                    widgets::StatusTone::Info,
+                ),
+                ("Unknown", health.unknown, widgets::StatusTone::Pending),
+            ];
+            ui.spacing_mut().item_spacing.x = health_grid.gap;
+            ui.spacing_mut().item_spacing.y = health_grid.gap;
+            ui.horizontal_wrapped(|ui| {
+                for (label, count, tone) in metrics {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(health_grid.card_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| doctor_health_metric(ui, health_grid.card_width, label, count, tone),
+                    );
+                }
+            });
+        }
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             if widgets::action_button(

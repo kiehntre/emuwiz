@@ -32,6 +32,53 @@ use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
 
+fn row_for_visibility(
+    platform_display: Option<&str>,
+    platform_unresolved: bool,
+    health_state: DatHealthState,
+) -> DatSourceRowView {
+    DatSourceRowView {
+        id: "test".to_string(),
+        display_name: "test.dat".to_string(),
+        path: "/tmp/test.dat".to_string(),
+        kind_label: "DAT file",
+        enabled: true,
+        platform_display: platform_display.map(str::to_string),
+        platform_id: platform_display.map(str::to_string),
+        platform_unresolved,
+        formats: Vec::new(),
+        health_state,
+        health_detail: None,
+        last_validated: None,
+        health_stale: false,
+        entry_count: None,
+        rom_count: None,
+        changed: false,
+        busy: false,
+        detail: None,
+        groups: Vec::new(),
+        incomplete_load: false,
+        dat_files_read: None,
+        dat_files_total: None,
+        history_link_available: false,
+    }
+}
+
+#[test]
+fn local_dat_default_view_prioritises_assigned_sources_but_keeps_warnings_visible() {
+    let assigned = row_for_visibility(Some("NES"), false, DatHealthState::NotChecked);
+    let unassigned = row_for_visibility(None, false, DatHealthState::NotChecked);
+    let unresolved = row_for_visibility(None, true, DatHealthState::NotChecked);
+    let warning = row_for_visibility(None, false, DatHealthState::ValidWithWarnings);
+
+    assert!(local_dat_row_visible(&assigned, false, false));
+    assert!(!local_dat_row_visible(&unassigned, false, false));
+    assert!(local_dat_row_visible(&unresolved, false, false));
+    assert!(local_dat_row_visible(&warning, false, false));
+    assert!(local_dat_row_visible(&unassigned, false, true));
+    assert!(local_dat_row_visible(&unassigned, true, false));
+}
+
 const LOGIQX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <datafile>
     <header>

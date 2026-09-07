@@ -7050,6 +7050,10 @@ pub(crate) struct DatSourcesPageUi {
     /// whole list to compact or expanded browsing.
     pub(crate) local_sources_expanded: Option<bool>,
     pub(crate) managed_sources_expanded: Option<bool>,
+    /// Large local DAT registries are platform-first by default. These are
+    /// session-only disclosure choices; the registry itself is unchanged.
+    pub(crate) show_all_local_dat_sources: bool,
+    pub(crate) show_unassigned_local_dat_sources: bool,
     /// Which source's detail disclosure is open.
     pub(crate) open_inspect: Option<String>,
     /// Which source's platform picker is open.
@@ -7140,6 +7144,27 @@ impl DatSourcesPageUi {
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
+
+/// The normal DAT view is useful only when it starts with sources that can
+/// affect the user's configured library. Unassigned sources are retained and
+/// remain one click away; unresolved assignments and real validation warnings
+/// stay visible so this filter cannot hide a safety-relevant problem.
+pub(crate) fn local_dat_row_visible(
+    row: &DatSourceRowView,
+    show_all: bool,
+    show_unassigned: bool,
+) -> bool {
+    show_all
+        || row.platform_display.is_some()
+        || row.platform_unresolved
+        || show_unassigned
+        || matches!(
+            row.health_state,
+            DatHealthState::ValidWithWarnings
+                | DatHealthState::Invalid
+                | DatHealthState::Unreadable
+        )
+}
 
 /// Draws the page and returns at most one requested action.
 pub(crate) fn show_dat_sources_page(
@@ -7241,6 +7266,27 @@ pub(crate) fn show_dat_sources_page(
     ui.label(egui::RichText::new("User-added DAT files and folders. These stay local-only and are never updateable.").color(theme::muted(ui)).small());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{} source(s)", view.rows.len())).strong());
+        if ui
+            .button(if ui_state.show_all_local_dat_sources {
+                "Show relevant DATs"
+            } else {
+                "Show all DATs"
+            })
+            .clicked()
+        {
+            ui_state.show_all_local_dat_sources = !ui_state.show_all_local_dat_sources;
+        }
+        if ui
+            .button(if ui_state.show_unassigned_local_dat_sources {
+                "Hide unassigned"
+            } else {
+                "Show unassigned"
+            })
+            .clicked()
+        {
+            ui_state.show_unassigned_local_dat_sources =
+                !ui_state.show_unassigned_local_dat_sources;
+        }
         if ui.button("Expand all").clicked() {
             ui_state.local_sources_expanded = Some(true);
         }
@@ -7277,7 +7323,27 @@ pub(crate) fn show_dat_sources_page(
             None,
         );
     } else {
-        for row in &view.rows {
+        let visible_rows = view
+            .rows
+            .iter()
+            .filter(|row| {
+                local_dat_row_visible(
+                    row,
+                    ui_state.show_all_local_dat_sources,
+                    ui_state.show_unassigned_local_dat_sources,
+                )
+            })
+            .collect::<Vec<_>>();
+        if visible_rows.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No assigned DATs are in the main view. Use Show unassigned or Show all DATs to browse the rest.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
+        for row in visible_rows {
             let open = ui_state
                 .local_sources_expanded
                 .unwrap_or(view.rows.len() < 10);

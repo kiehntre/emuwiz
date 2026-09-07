@@ -2059,8 +2059,11 @@ pub(super) fn show_bsfree_game_browser(
     // "installable via Dolphin" claim relevant to what is being browsed; for
     // any other platform (or no platform) the catalogue is browse-only, and
     // saying otherwise would imply this platform's cheats can be installed.
-    let is_gamecube_browse = context.is_some_and(|(_, _, platform)| {
-        archivefs_core::canonical_platform_for_alias(platform) == Some("GameCube")
+    let is_dolphin_browse = context.is_some_and(|(_, _, platform)| {
+        matches!(
+            archivefs_core::canonical_platform_for_alias(platform),
+            Some("GameCube" | "Wii")
+        )
     });
 
     widgets::section_header(
@@ -2070,14 +2073,14 @@ pub(super) fn show_bsfree_game_browser(
     );
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            if is_gamecube_browse {
+            if is_dolphin_browse {
                 widgets::status_badge(
                     ui,
-                    "GameCube: installable via Dolphin",
+                    "GameCube/Wii: installable via Dolphin",
                     widgets::StatusTone::Info,
                 );
                 ui.label(
-                    "GameCube cheats can be installed with Dolphin. Other BSFree formats remain \
+                    "Supported GameCube/Wii cheats can be installed with Dolphin. Other BSFree formats remain \
                      browse only.",
                 );
             } else {

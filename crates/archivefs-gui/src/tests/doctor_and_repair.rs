@@ -338,8 +338,15 @@ fn recent_cheat_activity_is_filtered_and_compact() {
         });
     });
 
-    assert!(rendered_text_contains(&output, "profile scan complete"));
-    assert!(rendered_text_contains(&output, "trusted catalogue failed"));
+    assert!(rendered_text_contains(&output, "Recent related activity"));
+    assert!(
+        !rendered_text_contains(&output, "profile scan complete"),
+        "activity details are collapsed until explicitly requested"
+    );
+    assert!(
+        !rendered_text_contains(&output, "trusted catalogue failed"),
+        "activity details are collapsed until explicitly requested"
+    );
     assert!(!rendered_text_contains(&output, "unrelated mount"));
     assert!(!rendered_text_contains(&output, "unrelated catalogue"));
 }
