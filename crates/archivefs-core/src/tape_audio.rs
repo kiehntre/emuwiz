@@ -44,6 +44,33 @@ pub struct TapeAudioAnalysis {
     pub pulse_summary: PulseSummary,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryConfidence {
+    High,
+    Medium,
+    Low,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredTapeBlock {
+    pub bytes: Vec<u8>,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub timing_scale_millionths: u32,
+    pub decoded_bits: usize,
+    pub ambiguous_bits: usize,
+    pub checksum_valid: Option<bool>,
+    pub confidence: RecoveryConfidence,
+    pub warnings: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpectrumWavRecovery {
+    pub audio: TapeAudioAnalysis,
+    pub blocks: Vec<RecoveredTapeBlock>,
+    pub warnings: Vec<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WavError {
     Malformed(&'static str),
@@ -74,6 +101,151 @@ pub fn analyze_wav(bytes: &[u8]) -> Result<TapeAudioAnalysis, WavError> {
         pulse_summary,
         warnings,
     })
+}
+
+/// Attempts conservative ZX Spectrum ROM-loader demodulation from the pulse
+/// edges already produced by [`analyze_wav`]. It never invents bytes when a
+/// pilot/sync/timing decision is ambiguous.
+pub fn decode_spectrum_wav(bytes: &[u8]) -> Result<SpectrumWavRecovery, WavError> {
+    let audio = analyze_wav(bytes)?;
+    let mut blocks = Vec::new();
+    let intervals: Vec<u64> = audio
+        .edges
+        .windows(2)
+        .map(|w| w[1].micros.saturating_sub(w[0].micros))
+        .collect();
+    let mut i = 0usize;
+    while i < intervals.len() {
+        let pilot_start = i;
+        while i < intervals.len() && close(intervals[i], 2168, 0.16) {
+            i += 1;
+        }
+        if i - pilot_start < 64 {
+            i = pilot_start + 1;
+            continue;
+        }
+        let median = median(&intervals[pilot_start..i]);
+        let scale = median.saturating_mul(1_000_000) / 2168;
+        if i + 2 >= intervals.len()
+            || !close_scaled_tolerant(intervals[i], 667, scale, 0.35)
+            || !close_scaled_tolerant(intervals[i + 1], 735, scale, 0.35)
+        {
+            i = pilot_start + 1;
+            continue;
+        }
+        let start_edge = audio.edges[pilot_start].sample;
+        i += 2;
+        let mut out = Vec::new();
+        let mut bits = 0usize;
+        let mut ambiguous = 0usize;
+        let mut current = 0u8;
+        let mut bit_in = 0u8;
+        let mut end_edge = start_edge;
+        while i + 1 < intervals.len() && out.len() < 4096 {
+            if intervals[i] > 4_000 || intervals[i + 1] > 4_000 {
+                break;
+            }
+            let a = intervals[i];
+            let b = intervals[i + 1];
+            let target0 = 855u64.saturating_mul(scale as u64) / 1_000_000;
+            let target1 = 1710u64.saturating_mul(scale as u64) / 1_000_000;
+            let value = if close(a, target0, 0.22) && close(b, target0, 0.22) {
+                Some(0)
+            } else if close(a, target1, 0.22) && close(b, target1, 0.22) {
+                Some(1)
+            } else {
+                None
+            };
+            let Some(value) = value else {
+                ambiguous += 1;
+                break;
+            };
+            current = (current << 1) | value;
+            bit_in += 1;
+            bits += 1;
+            i += 2;
+            end_edge = audio.edges[i.min(audio.edges.len() - 1)].sample;
+            if bit_in == 8 {
+                out.push(current);
+                current = 0;
+                bit_in = 0;
+            }
+        }
+        let recovered = !out.is_empty();
+        if recovered {
+            let checksum = (out.len() >= 2).then(|| out.iter().fold(0u8, |x, b| x ^ b) == 0);
+            let confidence = if checksum == Some(true) && ambiguous == 0 {
+                RecoveryConfidence::High
+            } else if bits >= 8 {
+                RecoveryConfidence::Medium
+            } else {
+                RecoveryConfidence::Low
+            };
+            blocks.push(RecoveredTapeBlock {
+                bytes: out,
+                start_sample: start_edge,
+                end_sample: end_edge,
+                start_micros: start_edge.saturating_mul(1_000_000) / audio.spec.sample_rate as u64,
+                end_micros: end_edge.saturating_mul(1_000_000) / audio.spec.sample_rate as u64,
+                timing_scale_millionths: scale as u32,
+                decoded_bits: bits,
+                ambiguous_bits: ambiguous,
+                checksum_valid: checksum,
+                confidence,
+                warnings: if ambiguous > 0 {
+                    vec!["data timing became ambiguous".into()]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+        i = if recovered { i } else { pilot_start + 1 };
+    }
+    let warnings = if blocks.is_empty() {
+        vec!["WAV recognised, but no confident Spectrum pilot/sync/data block was recovered".into()]
+    } else {
+        Vec::new()
+    };
+    Ok(SpectrumWavRecovery {
+        audio,
+        blocks,
+        warnings,
+    })
+}
+
+/// Reuses the canonical TAP interpreter for blocks recovered from audio.
+/// Invalid/partial blocks remain available in `SpectrumWavRecovery`, but are
+/// not promoted into a TAP analysis until their checksums are valid.
+pub fn recovered_tape_analysis(
+    recovery: &SpectrumWavRecovery,
+) -> Option<crate::tape_analysis::TapeAnalysis> {
+    let mut tap = Vec::new();
+    for block in &recovery.blocks {
+        if block.bytes.len() < 2 || block.bytes.len() > u16::MAX as usize {
+            return None;
+        }
+        if block.checksum_valid != Some(true) {
+            return None;
+        }
+        tap.extend_from_slice(&(block.bytes.len() as u16).to_le_bytes());
+        tap.extend_from_slice(&block.bytes);
+    }
+    (!tap.is_empty())
+        .then(|| crate::tape_analysis::analyze_tape(&tap).ok())
+        .flatten()
+}
+
+fn close(value: u64, target: u64, tolerance: f64) -> bool {
+    let d = value.abs_diff(target) as f64;
+    d <= target as f64 * tolerance
+}
+fn close_scaled_tolerant(value: u64, target: u64, scale: u64, tolerance: f64) -> bool {
+    close(value, target.saturating_mul(scale) / 1_000_000, tolerance)
+}
+fn median(values: &[u64]) -> u64 {
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    v[v.len() / 2]
 }
 
 fn decode_wav(bytes: &[u8]) -> Result<(WavSpec, Vec<i32>), WavError> {
@@ -259,5 +431,30 @@ mod tests {
         let mut b = wav(44100, 1, 8, &[0]);
         b[20] = 3;
         assert!(matches!(analyze_wav(&b), Err(WavError::Unsupported(_))));
+    }
+
+    #[test]
+    fn recovers_a_rom_timed_byte() {
+        let rate = 22_050u32;
+        let mut samples = vec![128u8; rate as usize / 10];
+        let mut level = 220i16;
+        let mut add = |micros: u64| {
+            let n = (micros * rate as u64 / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if level > 0 { 255 } else { 0 }, n));
+            level = -level;
+        };
+        for _ in 0..141 {
+            add(2168);
+        }
+        add(667);
+        add(735);
+        for bit in [1, 0, 1, 0, 0, 1, 0, 1] {
+            add(if bit == 1 { 1710 } else { 855 });
+            add(if bit == 1 { 1710 } else { 855 });
+        }
+        add(855);
+        let result = decode_spectrum_wav(&wav(rate, 1, 8, &samples)).unwrap();
+        assert_eq!(result.blocks.len(), 1);
+        assert_eq!(result.blocks[0].bytes, vec![0xA5]);
     }
 }
