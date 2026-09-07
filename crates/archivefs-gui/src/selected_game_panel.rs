@@ -360,7 +360,9 @@ pub(crate) fn show_selected_archive(
                 }
             }
             SelectedEvidenceView::Loading => {
-                tape_analysis_page::show_loading(ui);
+                if tape_analysis_page::should_show_loading(&record.mount_plan.archive.path) {
+                    tape_analysis_page::show_loading(ui);
+                }
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Checking game identity…");

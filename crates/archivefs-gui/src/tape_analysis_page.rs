@@ -24,6 +24,14 @@ pub(crate) fn is_tape_path(path: &Path) -> bool {
     )
 }
 
+/// Whether the selected-file panel should reserve space for the asynchronous
+/// tape-analysis progress card.  Keeping this decision next to the supported
+/// extension gate prevents ordinary ROM selections from showing a misleading
+/// tape-analysis animation while their general evidence inspection runs.
+pub(crate) fn should_show_loading(path: &Path) -> bool {
+    is_tape_path(path)
+}
+
 pub(crate) fn analyze_bytes(
     bytes: &[u8],
     platform_hint: Option<&str>,
@@ -376,5 +384,12 @@ mod tests {
         assert!(is_tape_path(Path::new("demo.tzx")));
         assert!(is_tape_path(Path::new("demo.wav")));
         assert!(!is_tape_path(Path::new("demo.iso")));
+    }
+
+    #[test]
+    fn tape_progress_is_hidden_for_non_tape_selections() {
+        assert!(should_show_loading(Path::new("demo.wav")));
+        assert!(!should_show_loading(Path::new("demo.rom")));
+        assert!(!should_show_loading(Path::new("demo.iso")));
     }
 }
