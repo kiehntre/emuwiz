@@ -255,6 +255,7 @@ pub struct BsFreeNamedRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BsFreeGameSearchRequest {
     pub platform_id: Option<String>,
+    pub system_id: Option<i64>,
     pub title: String,
     pub version: Option<String>,
     pub device_id: Option<i64>,
@@ -750,11 +751,23 @@ impl BsFreeCatalogue {
             ));
         }
         let system_ids = request
-            .platform_id
-            .as_deref()
-            .map(system_ids_for_platform)
-            .unwrap_or_else(all_mapped_system_ids);
-        if request.platform_id.is_some() && system_ids.is_empty() {
+            .system_id
+            .map(|system_id| vec![system_id])
+            .or_else(|| request.platform_id.as_deref().map(system_ids_for_platform))
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.connection
+                    .prepare("SELECT id FROM systems ORDER BY id")
+                    .map_err(query_error)
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map([], |row| row.get::<_, i64>(0))
+                            .map_err(query_error)?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(query_error)
+                    })
+            })?;
+        if (request.platform_id.is_some() || request.system_id.is_some()) && system_ids.is_empty() {
             return Ok(BsFreeGameSearchResult {
                 confidence: ProviderGameMatchConfidence::NoMatch,
                 exact_revision_verified: false,
@@ -2170,7 +2183,7 @@ mod tests {
 
     #[test]
     fn all_verified_bsfree_targets_resolve_through_the_one_canonical_registry() {
-        assert_eq!(crate::platform::canonical_ids().len(), 76);
+        assert_eq!(crate::platform::canonical_ids().len(), 77);
         for upstream_id in 1..=44 {
             let upstream_name = verified_system_name(upstream_id).unwrap();
             let mapping = bsfree_platform_mapping(upstream_id, upstream_name);
@@ -2223,6 +2236,7 @@ mod tests {
         let result = catalogue
             .search_games(&BsFreeGameSearchRequest {
                 platform_id: Some("NES".to_string()),
+                system_id: None,
                 title: "Super Mario Bros.".to_string(),
                 version: None,
                 device_id: None,
@@ -2238,6 +2252,7 @@ mod tests {
         let none = catalogue
             .search_games(&BsFreeGameSearchRequest {
                 platform_id: Some("GameCube".to_string()),
+                system_id: None,
                 title: "Super Mario Bros.".to_string(),
                 version: None,
                 device_id: None,

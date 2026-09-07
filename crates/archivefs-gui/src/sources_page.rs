@@ -2036,6 +2036,22 @@ pub(super) fn bsfree_code_capability(
     }
 }
 
+fn bsfree_platform_capability(platform_id: Option<&str>) -> (&'static str, widgets::StatusTone) {
+    match platform_id {
+        Some("GameCube") | Some("Wii") => ("Installable via Dolphin", widgets::StatusTone::Success),
+        Some(_) => ("Browse only", widgets::StatusTone::Pending),
+        None => ("Unsupported / unmapped", widgets::StatusTone::Warning),
+    }
+}
+
+fn bsfree_platform_display(system: &BsFreeSystem) -> &str {
+    system
+        .mapping
+        .archivefs_platform_display_name
+        .as_deref()
+        .unwrap_or(&system.name)
+}
+
 pub(super) fn show_bsfree_game_browser(
     ui: &mut egui::Ui,
     manager: &BsFreeManagerState,
@@ -2053,6 +2069,7 @@ pub(super) fn show_bsfree_game_browser(
         state.search_result = None;
         state.selected_game = None;
         state.cheats = None;
+        state.search_system_id = None;
     }
 
     // Whether this browser was opened for a GameCube game. Only then is the
@@ -2080,8 +2097,7 @@ pub(super) fn show_bsfree_game_browser(
                     widgets::StatusTone::Info,
                 );
                 ui.label(
-                    "Supported GameCube/Wii cheats can be installed with Dolphin. Other BSFree formats remain \
-                     browse only.",
+                    "GameCube cheats can be installed with Dolphin; Wii cheats can be installed with Dolphin. Other BSFree formats remain browse only.",
                 );
             } else {
                 widgets::status_badge(ui, "Browse only", widgets::StatusTone::Pending);
@@ -2094,6 +2110,9 @@ pub(super) fn show_bsfree_game_browser(
         ui.label("Match based on platform and title. Exact game revision is not verified.");
 
         let usable = matches!(manager, BsFreeManagerState::Ready(status) if status.usable);
+        if usable && state.platforms.is_none() && !busy {
+            action = Some(BsFreeOperation::LoadSystems);
+        }
         match manager {
             BsFreeManagerState::Ready(status) if !status.usable => widgets::banner(
                 ui,
@@ -2116,13 +2135,137 @@ pub(super) fn show_bsfree_game_browser(
             BsFreeManagerState::Ready(_) => {}
         }
 
+        if let Some(platforms) = state.platforms.as_ref() {
+            match platforms {
+                Err(message) => widgets::banner(
+                    ui,
+                    "BSFree platform catalogue unavailable",
+                    message,
+                    widgets::StatusTone::Warning,
+                ),
+                Ok(platforms) => {
+                    let platforms = platforms.clone();
+                    let previous_platform = state.search_platform.clone();
+                    let previous_system_id = state.search_system_id;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Platform");
+                        egui::ComboBox::from_id_salt("bsfree-platform-selector")
+                            .selected_text(
+                                if state.search_platform.is_empty()
+                                    && state.search_system_id.is_none()
+                                {
+                                    "All platforms".to_string()
+                                } else if let Some(system_id) = state.search_system_id {
+                                    platforms
+                                        .iter()
+                                        .find(|system| system.upstream_id == system_id)
+                                        .map(bsfree_platform_display)
+                                        .unwrap_or("Selected BSFree system")
+                                        .to_string()
+                                } else {
+                                    state.search_platform.clone()
+                                },
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut state.search_platform,
+                                    String::new(),
+                                    "All platforms",
+                                );
+                                state.search_system_id = None;
+                                let query = state.platform_query.trim().to_ascii_lowercase();
+                                for system in platforms.iter().filter(|system| {
+                                    query.is_empty()
+                                        || bsfree_platform_display(system)
+                                            .to_ascii_lowercase()
+                                            .contains(&query)
+                                        || system.name.to_ascii_lowercase().contains(&query)
+                                }) {
+                                    let display = bsfree_platform_display(system).to_string();
+                                    let capability = bsfree_platform_capability(
+                                        system.mapping.archivefs_platform_id.as_deref(),
+                                    )
+                                    .0;
+                                    let label = format!("{display} · {capability}");
+                                    if ui
+                                        .selectable_label(
+                                            state.search_system_id == Some(system.upstream_id)
+                                                || (state.search_system_id.is_none()
+                                                    && state.search_platform
+                                                        == system
+                                                            .mapping
+                                                            .archivefs_platform_id
+                                                            .clone()
+                                                            .unwrap_or_default()),
+                                            label,
+                                        )
+                                        .clicked()
+                                    {
+                                        state.search_platform = system
+                                            .mapping
+                                            .archivefs_platform_id
+                                            .clone()
+                                            .unwrap_or_default();
+                                        state.search_system_id = system
+                                            .mapping
+                                            .archivefs_platform_id
+                                            .is_none()
+                                            .then_some(system.upstream_id);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        ui.label("Filter");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.platform_query)
+                                .desired_width(150.0)
+                                .hint_text("Find a BSFree platform"),
+                        );
+                        ui.label(format!(
+                            "{} platforms · {} cheats",
+                            platforms.len(),
+                            platforms
+                                .iter()
+                                .map(|system| system.cheat_count)
+                                .sum::<u64>()
+                        ));
+                    });
+                    for system in &platforms {
+                        if state.search_system_id == Some(system.upstream_id)
+                            || (state.search_system_id.is_none()
+                                && state.search_platform
+                                    == system
+                                        .mapping
+                                        .archivefs_platform_id
+                                        .clone()
+                                        .unwrap_or_default())
+                        {
+                            let (label, tone) = bsfree_platform_capability(
+                                system.mapping.archivefs_platform_id.as_deref(),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!(
+                                    "{}: {} cheats",
+                                    bsfree_platform_display(system),
+                                    system.cheat_count
+                                ));
+                                widgets::status_badge(ui, label, tone);
+                            });
+                            break;
+                        }
+                    }
+                    if previous_platform != state.search_platform
+                        || previous_system_id != state.search_system_id
+                    {
+                        state.search_result = None;
+                        state.selected_game = None;
+                        state.cheats = None;
+                    }
+                }
+            }
+        }
+
         ui.horizontal_wrapped(|ui| {
-            ui.label("Platform");
-            ui.add(
-                egui::TextEdit::singleline(&mut state.search_platform)
-                    .desired_width(130.0)
-                    .hint_text("Canonical platform"),
-            );
             ui.label("Title");
             ui.add(egui::TextEdit::singleline(&mut state.search_title).desired_width(300.0));
             if widgets::action_button(
@@ -2136,6 +2279,7 @@ pub(super) fn show_bsfree_game_browser(
                 action = Some(BsFreeOperation::Search(BsFreeGameSearchRequest {
                     platform_id: (!state.search_platform.trim().is_empty())
                         .then(|| state.search_platform.trim().to_string()),
+                    system_id: state.search_system_id,
                     title: state.search_title.trim().to_string(),
                     version: None,
                     device_id: None,

@@ -53,7 +53,7 @@ use archivefs_core::patch_manager::{
     BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat, BsFreeGameCubeError,
     BsFreeGameCubeErrorKind, BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch,
     BsFreeGameCubeSearchOutcome, BsFreeGameCubeSearchStatus, BsFreeGameSearchRequest,
-    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, BsFreeWiiCheat,
+    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, BsFreeSystem, BsFreeWiiCheat,
     BsFreeWiiCheatSelection, BsFreeWiiCodeFormat, BsFreeWiiDedupFinding, BsFreeWiiError,
     BsFreeWiiErrorKind, BsFreeWiiInstallPreviewRequest, BsFreeWiiMatch, BsFreeWiiSearchOutcome,
     BsFreeWiiSearchStatus, CheatCandidate, CheatCandidateArchive, CheatCandidateClassification,
@@ -2534,6 +2534,7 @@ enum BsFreeOperation {
     Validate,
     SetEnabled(bool),
     Remove,
+    LoadSystems,
     Search(BsFreeGameSearchRequest),
     LoadGame { upstream_uid: i64, offset: u32 },
 }
@@ -2543,6 +2544,7 @@ enum BsFreeOperationResult {
     Status(Box<BsFreeSourceStatus>),
     Removed,
     Search(BsFreeGameSearchResult),
+    Systems(archivefs_core::patch_manager::ProviderPage<BsFreeSystem>),
     Game(
         BsFreeGame,
         archivefs_core::patch_manager::ProviderPage<BsFreeCheat>,
@@ -2578,6 +2580,9 @@ struct BsFreeGuiState {
     search_context: Option<PathBuf>,
     search_title: String,
     search_platform: String,
+    search_system_id: Option<i64>,
+    platforms: Option<Result<Vec<BsFreeSystem>, String>>,
+    platform_query: String,
     search_result: Option<Result<BsFreeGameSearchResult, String>>,
     selected_game: Option<BsFreeGame>,
     cheats: Option<Result<archivefs_core::patch_manager::ProviderPage<BsFreeCheat>, String>>,
@@ -9821,11 +9826,15 @@ impl ArchiveFsApp {
                 self.bsfree_ui.selected_game = None;
                 self.bsfree_ui.cheats = None;
             }
+            Ok(BsFreeOperationResult::Systems(page)) => {
+                self.bsfree_ui.platforms = Some(Ok(page.rows));
+            }
             Ok(BsFreeOperationResult::Game(game, cheats)) => {
                 self.bsfree_ui.selected_game = Some(game);
                 self.bsfree_ui.cheats = Some(Ok(cheats));
             }
             Err(message) => match operation {
+                BsFreeOperation::LoadSystems => self.bsfree_ui.platforms = Some(Err(message)),
                 BsFreeOperation::Search(_) => self.bsfree_ui.search_result = Some(Err(message)),
                 BsFreeOperation::LoadGame { .. } => self.bsfree_ui.cheats = Some(Err(message)),
                 BsFreeOperation::LoadStatus => {
@@ -22344,6 +22353,12 @@ fn run_bsfree_operation(
         BsFreeOperation::Search(request) => BsFreeCatalogue::open_installed(&paths)?
             .search_games(request)
             .map(BsFreeOperationResult::Search),
+        BsFreeOperation::LoadSystems => BsFreeCatalogue::open_installed(&paths)?
+            .systems(PageRequest {
+                offset: 0,
+                limit: PageRequest::HARD_LIMIT,
+            })
+            .map(BsFreeOperationResult::Systems),
         BsFreeOperation::LoadGame {
             upstream_uid,
             offset,

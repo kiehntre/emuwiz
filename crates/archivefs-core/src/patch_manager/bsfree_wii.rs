@@ -759,6 +759,7 @@ pub fn bsfree_wii_match(
     let normalized_title = normalize_title(archive_title);
     let search = catalogue.search_games(&super::BsFreeGameSearchRequest {
         platform_id: Some("Wii".to_string()),
+        system_id: None,
         title: archive_title.to_string(),
         version: None,
         device_id: None,
@@ -858,6 +859,7 @@ pub fn bsfree_wii_search(
     }
     let search = catalogue.search_games(&super::BsFreeGameSearchRequest {
         platform_id: Some("Wii".to_string()),
+        system_id: None,
         title: probe_title.clone(),
         version: None,
         device_id: None,
