@@ -82,6 +82,7 @@ use serde::Serialize;
 mod bsfree;
 mod cheat_source;
 mod cheatbase;
+mod cheat_reconcile;
 mod dat;
 mod platform_artwork;
 mod repair;
@@ -385,8 +386,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "cheats" => {
             let mut input_args = args.collect::<Vec<_>>();
+            if input_args.first().map(String::as_str) == Some("reconcile") {
+                input_args.remove(0);
+                cheat_reconcile::run(input_args)?;
+                return Ok(());
+            }
             if input_args.first().map(String::as_str) != Some("source") {
-                return Err("cheats requires `source <bsfree|cheatbase> <command>`".into());
+                return Err(
+                    "cheats requires `source <bsfree|cheatbase> <command>` or `reconcile <entries.json>`"
+                        .into(),
+                );
             }
             let provider = input_args
                 .get(1)

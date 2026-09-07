@@ -43,3 +43,23 @@ The result includes evidence-quality signals, operation differences for title
 conflicts, and `auto_winner: None` by construction. A future GUI can render
 duplicate groups and conflicts without understanding individual formats, while
 existing native apply/install paths remain unchanged.
+
+## CLI report
+
+The read-only CLI exposes the same service without adding another reconciliation
+engine:
+
+```text
+emuwiz-cli cheats reconcile entries.json
+emuwiz-cli cheats reconcile --input entries.json --relationship conflicts --json
+```
+
+`entries.json` is a JSON array of `CheatReconciliationEntry` values produced by
+an existing source-ingestion path. The core identity gate requires every entry
+to carry the same verified game identity and platform; titles are never used to
+resolve a game. Human output summarizes duplicate, conflict, related, and unique
+groups and always states that there is no automatic winner. `--json` emits the
+serialized result, retaining group relationships, differences, quality, source,
+and provenance. Filters are presentation-only. The command never edits source
+data, provider caches, emulator files, or the input file; a conflict is a
+successful report, not a failure exit status.
