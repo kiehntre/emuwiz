@@ -91,15 +91,25 @@ pub enum ConversionCapability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheatConversionPreview {
+    pub title: String,
     pub source_format: CheatSourceFormat,
     pub target_format: CheatTargetFormat,
     pub platform: CheatPlatform,
+    pub operation_count: usize,
     pub exact_operations: usize,
     pub lossy_operations: usize,
     pub unsupported_operations: usize,
     pub warnings: Vec<CheatIssue>,
     pub output_preview: Option<String>,
     pub can_apply: bool,
+    pub operation_status: Vec<OperationConversionStatus>,
+    pub provenance: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationConversionStatus {
+    Exact,
+    Unsupported { reason: String },
 }
 
 fn parse_pair(raw: &str) -> Option<(u32, u32)> {
@@ -190,6 +200,44 @@ pub fn pnach_line_to_ir(raw: &str) -> CheatOperation {
     }
 }
 
+/// Encodes one neutral direct-write operation for a proven target grammar.
+/// This is pure text generation; it never writes emulator files.
+pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) -> Option<String> {
+    let (prefix, address, value) = match operation {
+        CheatOperation::Write8 { address, value } => (0x00u8, *address, u32::from(*value)),
+        CheatOperation::Write16 { address, value } => (0x02u8, *address, u32::from(*value)),
+        CheatOperation::Write32 { address, value } => (0x04u8, *address, *value),
+        CheatOperation::UnsupportedRaw { .. } => return None,
+    };
+    match target {
+        CheatTargetFormat::DolphinActionReplay | CheatTargetFormat::Gecko => {
+            if address > 0x00ff_ffff {
+                return None;
+            }
+            Some(format!("{prefix:02X}{address:06X} {value:08X}"))
+        }
+        CheatTargetFormat::Pnach => {
+            let width = match operation {
+                CheatOperation::Write8 { .. } => "byte",
+                CheatOperation::Write16 { .. } => "short",
+                CheatOperation::Write32 { .. } => "word",
+                CheatOperation::UnsupportedRaw { .. } => return None,
+            };
+            let rendered = match operation {
+                CheatOperation::Write8 { value, .. } => format!("{value:02X}"),
+                CheatOperation::Write16 { value, .. } => format!("{value:04X}"),
+                CheatOperation::Write32 { value, .. } => format!("{value:08X}"),
+                CheatOperation::UnsupportedRaw { .. } => return None,
+            };
+            Some(format!("patch=1,EE,{address:08X},{width},{rendered}"))
+        }
+        CheatTargetFormat::RetroArch
+        | CheatTargetFormat::ActionReplayDs
+        | CheatTargetFormat::GameSharkPs2
+        | CheatTargetFormat::CodeBreakerPs2 => None,
+    }
+}
+
 pub fn assess_document_conversion(
     document: &CheatDocument,
     target: CheatTargetFormat,
@@ -212,11 +260,24 @@ pub fn assess_document_conversion(
     let mut exact = 0;
     let mut unsupported = 0;
     let mut warnings = document.issues.clone();
+    let mut operation_status = Vec::with_capacity(document.operations.len());
+    let mut output = Vec::new();
     for op in &document.operations {
-        if matches!(op, CheatOperation::UnsupportedRaw { .. }) {
+        if matches!(op, CheatOperation::UnsupportedRaw { .. })
+            || encode_operation(op, &target).is_none()
+        {
             unsupported += 1;
+            let reason = match op {
+                CheatOperation::UnsupportedRaw { reason, .. } => reason.clone(),
+                _ => "target cannot represent this direct write".into(),
+            };
+            operation_status.push(OperationConversionStatus::Unsupported { reason });
         } else {
             exact += 1;
+            operation_status.push(OperationConversionStatus::Exact);
+            if let Some(line) = encode_operation(op, &target) {
+                output.push(line);
+            }
         }
     }
     if !platform_ok {
@@ -231,15 +292,19 @@ pub fn assess_document_conversion(
     }
     let can_apply = platform_ok && unsupported == 0 && !missing_encoder && warnings.is_empty();
     CheatConversionPreview {
+        title: document.title.clone(),
         source_format: document.source_format.clone(),
         target_format: target,
         platform: document.platform.clone(),
+        operation_count: document.operations.len(),
         exact_operations: exact,
         lossy_operations: 0,
         unsupported_operations: unsupported,
         warnings,
-        output_preview: None,
+        output_preview: (!output.is_empty()).then(|| output.join("\n")),
         can_apply,
+        operation_status,
+        provenance: document.provenance.clone(),
     }
 }
 
@@ -283,5 +348,58 @@ mod tests {
             provenance: vec![],
         };
         assert!(!assess_document_conversion(&d, CheatTargetFormat::Pnach).can_apply);
+    }
+
+    #[test]
+    fn direct_writes_have_exact_target_previews() {
+        let d = CheatDocument {
+            title: "demo".into(),
+            platform: CheatPlatform::GameCube,
+            source_format: CheatSourceFormat::DolphinActionReplay,
+            operations: vec![
+                CheatOperation::Write8 {
+                    address: 0x123456,
+                    value: 0xab,
+                },
+                CheatOperation::Write16 {
+                    address: 0x123458,
+                    value: 0xcdef,
+                },
+                CheatOperation::Write32 {
+                    address: 0x12345c,
+                    value: 0x01234567,
+                },
+            ],
+            issues: vec![],
+            provenance: vec!["local:test".into()],
+        };
+        let preview = assess_document_conversion(&d, CheatTargetFormat::Gecko);
+        assert!(preview.can_apply);
+        assert_eq!(preview.exact_operations, 3);
+        assert_eq!(preview.unsupported_operations, 0);
+        assert_eq!(
+            preview.output_preview.as_deref(),
+            Some("00123456 000000AB\n02123458 0000CDEF\n0412345C 01234567")
+        );
+        assert_eq!(preview.provenance, d.provenance);
+    }
+
+    #[test]
+    fn ps2_missing_encoder_is_explicit() {
+        let d = CheatDocument {
+            title: "ps2".into(),
+            platform: CheatPlatform::Ps2,
+            source_format: CheatSourceFormat::Pnach,
+            operations: vec![CheatOperation::Write32 {
+                address: 0x20123456,
+                value: 1,
+            }],
+            issues: vec![],
+            provenance: vec![],
+        };
+        let preview = assess_document_conversion(&d, CheatTargetFormat::GameSharkPs2);
+        assert!(!preview.can_apply);
+        assert!(preview.output_preview.is_none());
+        assert!(preview.warnings.contains(&CheatIssue::MissingTargetEncoder));
     }
 }

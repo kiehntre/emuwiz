@@ -1,4 +1,4 @@
-# Neutral cheat IR (V1)
+# Neutral cheat IR (V2)
 
 The core patch manager exposes a deliberately small, read-only semantic
 intermediate representation for future cheat conversion work.  It is an
@@ -25,10 +25,20 @@ encrypted codes, and unknown widths from being silently converted to writes.
   they remain native/browse-only or opaque until an authoritative parser is
   available. No encrypted representation is guessed.
 
-`assess_document_conversion` enforces platform gates and returns a preview
-with exact, lossy, and unsupported counts. A missing GameShark/CodeBreaker
-encoder is reported explicitly, and `can_apply` is false whenever an
-operation, issue, platform, or encoder is unresolved. No output is fabricated.
+The V2 `encode_operation` helper emits pure in-memory direct-write text for
+Dolphin Action Replay, Gecko, and PNACH. `assess_document_conversion` returns
+per-operation status, provenance, output preview text, and exact/lossy/
+unsupported counts. A missing GameShark/CodeBreaker encoder is reported
+explicitly, and `can_apply` is false whenever an operation, issue, platform,
+or encoder is unresolved. No output is fabricated and no emulator file is
+written.
+
+Nintendo DS Action Replay, RetroArch expressions, GameShark, and CodeBreaker
+remain opaque in this revision. The current repository does not provide an
+authoritative grammar for their direct-write subsets; conditions, activators,
+pointer/loop codes, master/init codes, and encrypted variants are therefore
+preserved as unsupported rather than guessed. No melonDS, DeSmuME, or
+RetroArch writer is enabled by the IR.
 
 The intended architecture is:
 
