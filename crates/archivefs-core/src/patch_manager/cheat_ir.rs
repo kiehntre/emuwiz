@@ -255,7 +255,7 @@ pub fn assess_document_conversion(
         ) | (
             CheatPlatform::NintendoDs,
             CheatTargetFormat::ActionReplayDs | CheatTargetFormat::RetroArch
-        ) | (_, CheatTargetFormat::RetroArch)
+        )
     );
     let mut exact = 0;
     let mut unsupported = 0;
