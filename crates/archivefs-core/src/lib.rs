@@ -206,6 +206,8 @@ pub mod iso9660;
 /// (chd-rs) to [`logical_media::LogicalMedia`], connecting a CHD's selected
 /// CD/GD-ROM data track to [`iso9660`].
 pub mod chd_logical_media;
+/// Bounded, read-only CHD logical-track verification against DAT expectations.
+pub mod chd_redump;
 
 /// Philips CD-i filesystem, volume, and startup evidence layered on the
 /// shared logical optical-media reader. The platform registry owns the

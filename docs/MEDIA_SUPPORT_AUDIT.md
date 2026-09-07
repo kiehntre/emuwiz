@@ -110,7 +110,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Dragon/CoCo | CAS/WAV | EXT | NO | FAMILY | YES | YES | TOSEC | SUMMARY | NO | YES | 4 | `dragon_coco_tape`, `tape_analysis` | synthetic CAS tests | ordinary blocks only; turbo/custom deferred |
 | Optical containers | ISO | YES | YES | NO alone | PARTIAL | YES | REDUMP | SUMMARY | PROFILE | PARTIAL | 4 | `iso9660`, collector | ISO tests | platform-specific boot breadth |
 | Optical containers | CUE/BIN, multi-BIN | YES | YES | NO alone | PARTIAL | YES | REDUMP | SUMMARY | PROFILE | PARTIAL | 4 | `ingestion/cue_bin`, raw media | CUE tests | session/subchannel parity |
-| Optical containers | CHD | YES | YES | NO alone | PARTIAL | YES | MAME/REDUMP | SUMMARY | PROFILE | PARTIAL | 4 | `chd_identity`, `chd_logical_media` | CHD tests | specialist/multi-track and DAT raw parity |
+| Optical containers | CHD | YES | YES | NO alone | PARTIAL | YES | MAME/REDUMP | SUMMARY | PROFILE | PARTIAL | 5 | `chd_identity`, `chd_logical_media`, `chd_redump` | CHD/redump track tests | specialist layouts and broader multi-track parity |
 | Optical containers | GDI/CDI/CCD/IMG/MDS/NRG/CSO/RVZ/WBFS/WUD/WUX | EXT | PARTIAL | FAMILY | PARTIAL | NO | PARTIAL | SUMMARY | PROFILE | PARTIAL | 3 | registry + selected adapters | extension/negative tests | per-container readers |
 | Philips CD-i | ISO/BIN/CHD logical media | YES | YES | YES | YES | YES | REDUMP | SUMMARY | NO | PARTIAL | 4 | `cdi_disc_evidence`, `platform` | CD-i synthetic tests | raw Mode 2/session parity |
 | LaserDisc sets | Daphne framefile | YES | YES | SET | VERIFY | YES | NO | NO | PROFILE | YES | 4 | `laserdisc_set` | synthetic set tests | video metadata/frame-range checks |
@@ -172,10 +172,13 @@ specified but entirely absent. Existing safety gates should not be weakened.
    Amiga command/execution planner. Files: `launch/input_projection.rs`,
    `launch/amiberry_*`, `launch/fsuae_*`. Requires an explicit emulator command
    contract and BIOS policy.
-2. **CHD/DAT logical verification parity.** CHD headers and logical readers
-   exist, but full raw/track reconstruction and Redump per-track parity remain
-   intentionally bounded. Files: `chd_logical_media.rs`, `dat/archive/chd.rs`,
-   `disc_evidence_collector.rs`. Requires track/pregap/subchannel research.
+2. **CHD/DAT logical verification parity.** Bounded per-track comparison now
+   exists for the proven logical track and preserves explicit mismatch,
+   incomplete, unsupported and unverified outcomes. Full raw/track
+   reconstruction, non-zero-pregap seeking, subchannel bytes and specialist
+   multi-track parity remain intentionally bounded. Files:
+   `chd_redump.rs`, `chd_logical_media.rs`, `dat/archive/chd.rs`,
+   `disc_evidence_collector.rs`.
 3. **Apple II filesystem breadth and preservation interpretation.** Bounded DOS
    3.3/ProDOS/container evidence now exists in `apple2_disk`; full catalogue
    traversal, GCR decoding, and WOZ/NIB logical identity remain out of scope.
@@ -252,8 +255,9 @@ same branches as intentionally deferred or superseded.
 
 1. **[P1] Complete Amiga WHDLoad launch command/execution planning** from the
    existing verified identity/profile projection.
-2. **[P1] Add bounded CHD logical/Redump track verification** with explicit
-   pregap, mode/form, subchannel and specialist-backend refusals.
+2. **[P1] Extend bounded CHD logical/Redump verification** to additional
+   proven track layouts, including non-zero pregap and specialist-backed
+   subchannel parity; the V1 single-track/core comparison is now available.
 3. **[P1] Extend Apple II filesystem evidence** with bounded catalogue
    traversal and optional GCR-aware identity; the V1 DOS 3.3/ProDOS/container
    gate is already implemented.
