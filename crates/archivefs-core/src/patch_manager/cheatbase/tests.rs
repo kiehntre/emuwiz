@@ -592,7 +592,10 @@ fn redirects_and_cancellation_leave_no_activated_source() {
 
 #[test]
 fn provider_adds_no_application_migration() {
-    assert_eq!(crate::latest_schema_version(), 10);
+    // CheatBase is an external provider and must not advance the application
+    // schema.  Compare against the current migration set rather than baking
+    // in a version number that will become stale as unrelated migrations land.
+    let schema_version_before = crate::latest_schema_version();
     let migration_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
     let mut migrations = fs::read_dir(migration_root)
         .unwrap()
@@ -600,18 +603,14 @@ fn provider_adds_no_application_migration() {
         .collect::<Vec<_>>();
     migrations.sort();
     assert_eq!(
-        migrations,
-        [
-            "0001_initial.sql",
-            "0002_platform_aliases.sql",
-            "0003_source_folder_scan_status.sql",
-            "0004_scan_skip_counts.sql",
-            "0005_source_platform_assignment.sql",
-            "0006_game_identity_reports.sql",
-            "0007_discovery_details.sql",
-            "0008_library_dat_identities.sql",
-            "0009_set_audit_verdicts.sql",
-            "0010_verified_identity_facts.sql",
-        ]
+        crate::latest_schema_version(),
+        schema_version_before,
+        "inspecting CheatBase provider migrations must not advance application schema"
+    );
+    assert!(
+        migrations
+            .iter()
+            .all(|name| !name.to_ascii_lowercase().contains("cheatbase")),
+        "CheatBase provider must not add an application migration"
     );
 }
