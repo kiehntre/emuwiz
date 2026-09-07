@@ -23,6 +23,8 @@ pub mod amiga_disk;
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
 pub mod app_dirs;
+/// Bounded BBC Micro/Acorn standard cassette WAV evidence.
+pub mod bbc_tape;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation

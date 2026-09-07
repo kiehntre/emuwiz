@@ -205,3 +205,27 @@ family label. Future V11 research may evaluate families only with such evidence;
 V10 emits no commercial loader names. Spectrum and C64 custom paths remain
 independent, and no emulator execution, DAT change, extraction, rename, or
 copyrighted fixture is involved.
+## V11: BBC Micro standard cassette WAV evidence
+
+V11 adds a conservative BBC Micro/Acorn standard-cassette projection on the
+shared PCM edge stream. It recognises the documented 1200-baud CUTS/KCS-style
+carrier (approximately 1200 Hz and 2400 Hz), 8N1 framing, and the `0x2a`
+standard block synchronisation byte. Header metadata is decoded only when the
+filename terminator, little-endian load/exec addresses, block number, length,
+flags, and big-endian BBC CRC-16 are structurally present. Carrier similarity
+alone is never promoted to BBC evidence; missing framing or an invalid header
+CRC remains an explicit refusal/medium-confidence result.
+
+The bounded result retains filename, addresses, block sequence metadata,
+continuation/final state, checksum state, confidence, and audio sample/time
+provenance. It does not retain PCM or payload bytes in the shared analysis
+projection. Multiple blocks are recovered independently, so a valid standard
+bootstrap followed by an unknown timing stage remains BBC-anchored without
+claiming a custom BBC loader. Fastloaders and named loader families are
+deliberately deferred.
+
+UEF is a separate gzip-wrapped chunked container and is not treated as raw WAV;
+the repository currently has no UEF parser. A future UEF bridge can compare
+the same header fields and block CRCs, but V11 does not invent one or conflate
+container metadata with waveform evidence. All fixtures are synthetic and the
+decoder performs no extraction, launch, DAT, or rename work.
