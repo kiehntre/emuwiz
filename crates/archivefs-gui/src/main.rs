@@ -146,6 +146,7 @@ mod cheats_mods_preview;
 mod onboarding;
 use cheats_mods_preview::*;
 mod cheatbase_page;
+mod cheat_reconciliation_review;
 mod emulator_download_page;
 mod emulator_setup_page;
 mod gamer_platform_shelf;
@@ -4007,6 +4008,8 @@ struct ArchiveFsApp {
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
     cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
+    /// Read-only review of core-produced duplicate/conflict reports.
+    cheat_reconciliation_review: cheat_reconciliation_review::CheatReconciliationReviewState,
     /// The browse-only CheatBase panel embedded in Cheats & Mods. Its setup,
     /// search, and inspection work is explicit and independent of emulator
     /// cheat installation workflows.
@@ -4544,6 +4547,8 @@ impl ArchiveFsApp {
             pending_source_scan_summary: None,
             sources_last_scan: None,
             cheat_sources_page: None,
+            cheat_reconciliation_review:
+                cheat_reconciliation_review::CheatReconciliationReviewState::default(),
             cheatbase_page: cheatbase_page::CheatBasePageState::default(),
             emulator_download_page: emulator_download_page::EmulatorDownloadPageState::default(),
             rom_organisation_page: None,
@@ -19573,6 +19578,8 @@ impl ArchiveFsApp {
                                 &mut self.dolphin_texture_mod,
                                 &mut self.local_mod_package,
                             );
+                            ui.add_space(theme::SECTION_GAP);
+                            self.cheat_reconciliation_review.show(ui);
                             ui.add_space(theme::SECTION_GAP);
                             let bsfree_action = show_bsfree_game_browser(
                                 ui,
