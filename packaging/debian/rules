@@ -1,0 +1,55 @@
+#!/usr/bin/env -S make -f
+# EmuWiz Debian packaging rules.
+#
+# Builds the two canonical binaries (emuwiz, emuwiz-cli) with cargo and
+# stages the shared AppStream/desktop/icon assets from assets/linux and
+# assets/branding (packaging/debian never carries its own copies of them -
+# see docs/LINUX_PACKAGING.md).
+
+export DH_VERBOSE = 1
+export CARGO_BUILD_JOBS ?= 2
+export CARGO_TARGET_DIR = $(CURDIR)/target
+# Rust crates commonly need a real HOME for the registry cache even in a
+# clean chroot/pbuilder build.
+export HOME ?= /tmp/emuwiz-build-home
+
+APP_ID := io.github.kiehntre.emuwiz
+ICON_SIZES := 32 64 128 256 512
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked \
+		-p archivefs-gui --bin emuwiz \
+		-p archivefs-cli --bin emuwiz-cli
+
+override_dh_auto_test:
+	# Packaging does not re-run the workspace test suite; upstream CI owns
+	# that. Uncomment for a from-source rebuild that wants it:
+	# cargo test --release -p archivefs-gui -p archivefs-cli
+
+override_dh_auto_install:
+	dh_auto_install
+
+	# Desktop entry: render the shared template's @EMUWIZ_EXEC@ placeholder.
+	sed 's/@EMUWIZ_EXEC@/emuwiz/' assets/linux/$(APP_ID).desktop.in \
+		> debian/$(APP_ID).desktop
+	install -Dm644 debian/$(APP_ID).desktop \
+		debian/emuwiz/usr/share/applications/$(APP_ID).desktop
+
+	# AppStream metadata (shared, not duplicated).
+	install -Dm644 assets/linux/$(APP_ID).metainfo.xml \
+		debian/emuwiz/usr/share/metainfo/$(APP_ID).metainfo.xml
+
+	# hicolor icons from the shared branding assets.
+	for size in $(ICON_SIZES); do \
+		install -Dm644 assets/branding/emuwiz-logo-$$size.png \
+			debian/emuwiz/usr/share/icons/hicolor/$${size}x$${size}/apps/$(APP_ID).png ; \
+	done
+
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym

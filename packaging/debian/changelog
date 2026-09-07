@@ -1,0 +1,7 @@
+emuwiz (0.8.1~alpha-1) UNRELEASED; urgency=medium
+
+  * Initial Debian packaging foundation (packaging only; not yet released).
+    See docs/LINUX_PACKAGING.md for the version-mapping rationale and the
+    build/validation status of this packaging lane.
+
+ -- David Armstrong <kiehntre@users.noreply.github.com>  Mon, 07 Sep 2026 00:00:00 +0000

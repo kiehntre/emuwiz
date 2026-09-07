@@ -1,0 +1,56 @@
+Source: emuwiz
+Section: utils
+Priority: optional
+Maintainer: David Armstrong <kiehntre@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.75),
+               pkg-config,
+               libgl1-mesa-dev,
+               libxkbcommon-dev,
+               libxkbcommon-x11-dev,
+               libwayland-dev,
+               libx11-dev,
+               libxrandr-dev,
+               libxi-dev,
+               libxcursor-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/kiehntre/emuwiz
+Rules-Requires-Root: no
+
+Package: emuwiz
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: emuwiz-cli, ratarmount, fuse3, xdg-utils, 7zip | p7zip-full
+Suggests: unrar
+Description: Verify, organise, and play a retro-game library
+ EmuWiz helps you turn a messy emulation collection into a verified,
+ organised, and more playable library. It identifies supported games
+ from their files and archive contents, checks them against
+ preservation databases, highlights missing or questionable files,
+ helps discover and prepare emulator profiles, builds organised
+ libraries for tools such as RomM and ES-DE, and provides safe cheat,
+ patch, and selected mod workflows.
+ .
+ Potentially destructive operations are previewed before they run and
+ use confirmation, verification, and rollback safeguards where
+ supported. EmuWiz can also mount supported ZIP, 7z, and RAR archives
+ read-only via ratarmount/FUSE, so you can browse and use their
+ contents without permanently extracting everything. It runs locally
+ on Linux, and your collection stays yours.
+ .
+ This package provides the graphical application.
+
+Package: emuwiz-cli
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: ratarmount, fuse3, 7zip | p7zip-full
+Suggests: unrar
+Description: Verify, organise, and play a retro-game library (CLI)
+ EmuWiz helps you turn a messy emulation collection into a verified,
+ organised, and more playable library. See the emuwiz package
+ description for details.
+ .
+ This package provides the emuwiz-cli command-line tool. It has no
+ dependency on the GUI package and can be installed standalone, e.g.
+ for headless/server use.
