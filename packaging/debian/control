@@ -1,10 +1,13 @@
+#  `ratarmount` is Suggests, not Recommends: confirmed absent from Ubuntu
+#  24.04's apt repos entirely (packaging QA V3, real `apt-cache search`) -
+#  it is pip-installable (`python3-pip` is in Recommends for that path).
+#  fuse3 / xdg-utils / 7zip / p7zip-full / unrar were all confirmed present
+#  with these exact names on the same run.
 Source: emuwiz
 Section: utils
 Priority: optional
 Maintainer: David Armstrong <kiehntre@users.noreply.github.com>
 Build-Depends: debhelper-compat (= 13),
-               cargo,
-               rustc (>= 1.75),
                pkg-config,
                libgl1-mesa-dev,
                libxkbcommon-dev,
@@ -21,8 +24,8 @@ Rules-Requires-Root: no
 Package: emuwiz
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Recommends: emuwiz-cli, ratarmount, fuse3, xdg-utils, 7zip | p7zip-full
-Suggests: unrar
+Recommends: emuwiz-cli, fuse3, xdg-utils, 7zip | p7zip-full, python3-pip
+Suggests: ratarmount, unrar
 Description: Verify, organise, and play a retro-game library
  EmuWiz helps you turn a messy emulation collection into a verified,
  organised, and more playable library. It identifies supported games
@@ -44,8 +47,8 @@ Description: Verify, organise, and play a retro-game library
 Package: emuwiz-cli
 Architecture: amd64
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Recommends: ratarmount, fuse3, 7zip | p7zip-full
-Suggests: unrar
+Recommends: fuse3, 7zip | p7zip-full, python3-pip
+Suggests: ratarmount, unrar
 Description: Verify, organise, and play a retro-game library (CLI)
  EmuWiz helps you turn a messy emulation collection into a verified,
  organised, and more playable library. See the emuwiz package
