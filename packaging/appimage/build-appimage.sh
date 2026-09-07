@@ -223,6 +223,9 @@ for size in 32 64 128 256 512; do
 done
 install -m 0644 "$REPO_ROOT/assets/branding/emuwiz-logo-256.png" \
     "$APPDIR/io.github.kiehntre.emuwiz.png"
+install -d -m 0755 "$APPDIR/usr/share/metainfo"
+install -m 0644 "$REPO_ROOT/assets/linux/io.github.kiehntre.emuwiz.metainfo.xml" \
+    "$APPDIR/usr/share/metainfo/io.github.kiehntre.emuwiz.metainfo.xml"
 
 "$SCRIPT_DIR/verify-appdir.sh" "$APPDIR"
 
