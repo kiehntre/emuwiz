@@ -279,6 +279,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "Dragon / Tandy CoCo",
+        standalone_adapters: &["xroar"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
         platform_id: "Atari5200",
         standalone_adapters: &[],
         retroarch_core_hints: &["a5200"],

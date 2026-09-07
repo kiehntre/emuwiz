@@ -126,6 +126,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "openmsx" => "openMSX",
         "fuse" => "Fuse",
         "tsugaru" => "Tsugaru",
+        "xroar" => "XRoar",
         _ => "Supported emulator",
     }
 }

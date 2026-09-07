@@ -144,6 +144,9 @@ pub enum DiscoveredStandaloneProfile<'a> {
     Fuse {
         profile: &'a crate::patch_manager::FuseProfile,
     },
+    XRoar {
+        profile: &'a crate::patch_manager::XRoarProfile,
+    },
     Tsugaru {
         profile: &'a crate::patch_manager::TsugaruProfile,
     },
@@ -328,6 +331,10 @@ impl<'a> DiscoveredStandaloneProfile<'a> {
 
     pub fn fuse(profile: &'a crate::patch_manager::FuseProfile) -> Self {
         Self::Fuse { profile }
+    }
+
+    pub fn xroar(profile: &'a crate::patch_manager::XRoarProfile) -> Self {
+        Self::XRoar { profile }
     }
 
     pub fn tsugaru(profile: &'a crate::patch_manager::TsugaruProfile) -> Self {
@@ -616,6 +623,32 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                     profile_path: Some(profile.executable.clone()),
                     eligible: profile.eligible,
                     firmware: FirmwareReadiness::NotRequired,
+                })
+            }
+            DiscoveredStandaloneProfile::XRoar { profile }
+                if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == profile.machine.platform_id()) =>
+            {
+                let firmware = match profile.firmware {
+                    crate::patch_manager::XRoarFirmwareState::Verified => {
+                        FirmwareReadiness::Verified
+                    }
+                    crate::patch_manager::XRoarFirmwareState::PresentUnverified => {
+                        FirmwareReadiness::PresentUnverified
+                    }
+                    crate::patch_manager::XRoarFirmwareState::Missing => {
+                        FirmwareReadiness::Missing
+                    }
+                    crate::patch_manager::XRoarFirmwareState::Unknown => {
+                        FirmwareReadiness::Unknown
+                    }
+                };
+                Some(StandaloneProfileInput {
+                    adapter_id: "xroar",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.executable.path.clone()),
+                    eligible: profile.eligible,
+                    firmware,
                 })
             }
             DiscoveredStandaloneProfile::Tsugaru { profile }

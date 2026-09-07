@@ -137,6 +137,8 @@ pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
 pub mod xenia_execution;
+pub mod xroar_command;
+pub mod xroar_execution;
 
 #[cfg(test)]
 mod plan_to_spawn_tests;
@@ -443,6 +445,14 @@ pub use vice_command::{
 pub use vice_execution::{
     ViceLaunchPreflightError, ViceLaunchPreflightErrorKind, ViceLaunchRequest,
     preflight_vice_launch, spawn_vice,
+};
+pub use xroar_command::{
+    XROAR_SUPPORTED_TAPE_PLATFORM_IDS, XRoarCommand, XRoarCommandPlan, XRoarMediaFormat,
+    build_xroar_command_plan, xroar_media_format,
+};
+pub use xroar_execution::{
+    XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
+    XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
 };
 pub use vita3k_command::{
     VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,

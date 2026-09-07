@@ -106,6 +106,7 @@ mod vita3k_local;
 mod xemu_local;
 mod xenia_install_plan;
 mod xenia_local;
+mod xroar_local;
 mod xenia_patch_document;
 mod xenia_provider;
 
@@ -817,6 +818,12 @@ pub use xenia_local::{
     XeniaProfileDiscoveryRoots, XeniaProfileScope, check_local_xenia_install_state,
     discover_local_xenia_patch_file, discover_xenia_profiles, load_local_xenia_destination,
     resolve_xenia_launch_binding, stage_local_xenia_patch_file,
+};
+pub use xroar_local::{
+    XROAR_EXECUTABLE_NAME, XROAR_FIRMWARE_DIRECTORY_ENV, XROAR_MACHINE_ENV, XRoarExecutable,
+    XRoarExplicitProfile, XRoarFirmwareState, XRoarInstallationType, XRoarMachine, XRoarProfile,
+    XRoarProfileDiscovery, XRoarProfileDiscoveryRoots, discover_xroar_profiles,
+    resolve_xroar_native_launch_binding,
 };
 pub use xenia_patch_document::{
     MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,

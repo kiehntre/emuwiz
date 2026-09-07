@@ -1759,6 +1759,22 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "Retained as its own canonical identifier because existing libraries already store it separately from `PC Engine`; the two are the same hardware under different regional names.",
     },
     Platform {
+        id: "Dragon / Tandy CoCo",
+        display_name: "Dragon / Tandy CoCo",
+        folder_aliases: &[],
+        filename_aliases: &[],
+        // Ordinary CAS evidence is deliberately family-level. It does not
+        // identify a Dragon/CoCo machine variant, so no extension or magic
+        // rule is allowed to manufacture one here.
+        strong_extensions: &[],
+        weak_extensions: &[],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: Some("XRoar"),
+        explanation: "Family-level Dragon/CoCo cassette evidence is available; machine selection remains an explicit launch requirement.",
+    },
+    Platform {
         id: "ZX Spectrum",
         display_name: "ZX Spectrum",
         folder_aliases: &[

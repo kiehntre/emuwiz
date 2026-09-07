@@ -452,6 +452,18 @@ pub enum LaunchBlockerKind {
     HatariIpfBackendUnavailable,
     HatariDiskDriveInvalid,
     HatariContentUnavailable,
+    /// A command-plan request was given a non-XRoar candidate.
+    XRoarCandidateRequired,
+    /// The canonical identity does not match the selected XRoar machine.
+    XRoarPlatformMismatch,
+    /// The selected content is outside XRoar V1's CAS-only slice.
+    XRoarContentFormatUnsupported,
+    /// The selected XRoar executable/profile is unavailable.
+    XRoarBindingUnavailable,
+    /// Required XRoar machine firmware is known to be absent.
+    XRoarFirmwareMissing,
+    /// XRoar machine firmware readiness could not be established.
+    XRoarFirmwareUnavailable,
     /// A Cemu command-plan request found no eligible discovered profile, or
     /// [`crate::patch_manager::resolve_cemu_native_launch_binding`] itself
     /// refused to produce a binding - see the blocker detail for the
