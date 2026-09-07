@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 /// Shared, read-only CD32/CDTV platform, machine, firmware, and media evidence.
 pub mod amiga_cd_evidence;
 pub mod amiga_disk;
+/// Bounded, read-only Apple II disk structural evidence.
+pub mod apple2_disk;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.

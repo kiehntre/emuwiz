@@ -96,7 +96,9 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Amstrad | CPC DSK/EDSK/CDT | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `disk_format/dsk`, CPC tape | DSK/CPC WAV tests | protected-sector semantics |
 | BBC/Acorn | DFS SSD/DSD | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `disk_format/dfs` | DFS tests | ADFS parser |
 | BBC/Acorn | UEF/CAS tape | EXT | NO | NO | NO | NO | TOSEC | NO | NO | NO | 1 | `docs/TAPE_DRAGON_COCO_RESEARCH.md` | research only | structured UEF/CAS parser |
-| Apple II | DO/PO/DSK/2MG/WOZ/NIB | EXT | PARTIAL | FAMILY | PARTIAL | NO | TOSEC | SUMMARY | NO | NO | 2 | registry | NO TEST COVERAGE FOUND for most | Apple filesystem/GCR parser |
+| Apple II | DO/PO/DSK | YES | YES | FAMILY | YES | SUMMARY | TOSEC | SUMMARY | NO | PARTIAL | 4 | `apple2_disk` | synthetic DOS 3.3/ProDOS/negative tests | broader catalogue/filesystem and launch |
+| Apple II | 2MG | YES | YES | FAMILY | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | PARTIAL | 3 | `apple2_disk` | bounded header/range tests | recursive payload identity |
+| Apple II | WOZ/NIB | YES | YES | NO | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | NO | 3 | `apple2_disk` | signature/map/geometry tests | flux/GCR interpretation |
 | Macintosh | DC42/HFV/SIT | YES | PARTIAL | FAMILY | PARTIAL | NO | TOSEC | SUMMARY | NO | NO | 3 | `disk_format/dc42`, registry | DC42 tests | HFS/SIT depth |
 | Japanese PCs | D88/HDI/NHD/XDF/DIM | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | PARTIAL | PARTIAL | 4 | `disk_format/d88/hdi/x68000` | disk-format tests | PC-98/X68000 filesystem and launch |
 | DOS/PC | IMG/IMA/RAW FAT12/16 | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `dos_boot_evidence`, `disk_format` | DOS boot tests | IMD/TD0/DMF |
@@ -169,10 +171,11 @@ specified but entirely absent. Existing safety gates should not be weakened.
    exist, but full raw/track reconstruction and Redump per-track parity remain
    intentionally bounded. Files: `chd_logical_media.rs`, `dat/archive/chd.rs`,
    `disc_evidence_collector.rs`. Requires track/pregap/subchannel research.
-3. **Apple II and Japanese disk filesystem evidence.** Containers are detected
-   or structurally parsed, but platform/filesystem identity is mostly family or
-   DAT-level. Files: `disk_format/*`, `platform_evidence_fusion`. Requires
-   format-specific, preservation-safe parsers.
+3. **Apple II filesystem breadth and preservation interpretation.** Bounded DOS
+   3.3/ProDOS/container evidence now exists in `apple2_disk`; full catalogue
+   traversal, GCR decoding, and WOZ/NIB logical identity remain out of scope.
+   Japanese disk filesystem evidence is still mostly family or DAT-level.
+   Files: `apple2_disk`, `disk_format/*`, `platform_evidence_fusion`.
 
 ### P2
 
@@ -248,8 +251,9 @@ same branches as intentionally deferred or superseded.
    existing verified identity/profile projection.
 2. **[P1] Add bounded CHD logical/Redump track verification** with explicit
    pregap, mode/form, subchannel and specialist-backend refusals.
-3. **[P1] Add Apple II disk structural evidence** (DOS 3.3/ProDOS/GCR) using
-   synthetic fixtures and no preservation-lossy conversion.
+3. **[P1] Extend Apple II filesystem evidence** with bounded catalogue
+   traversal and optional GCR-aware identity; the V1 DOS 3.3/ProDOS/container
+   gate is already implemented.
 4. **[P2] Implement a minimal UEF/CAS container bridge** only after format
    semantics and existing tape-analysis handoff are specified.
 5. **[P2] Extend LaserDisc verification with bounded media metadata and frame
