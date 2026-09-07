@@ -159,6 +159,40 @@ pub struct CommodoreWavRecovery {
     pub warnings: Vec<String>,
 }
 
+/// One standard Amstrad CPC cassette record recovered from PCM. CPC records
+/// use an MSB-first stream, with a one bit represented by two equal periods
+/// approximately twice the duration of a zero bit. The record is accepted
+/// only when its standard sync byte and complemented CRC agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmstradCpcRecoveredBlock {
+    pub sync_byte: u8,
+    pub payload: Vec<u8>,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub block_number: Option<u8>,
+    pub first_block: Option<bool>,
+    pub last_block: Option<bool>,
+    pub filename: Option<String>,
+    pub file_type: Option<u8>,
+    pub load_address: Option<u16>,
+    pub length: Option<u16>,
+    pub execution_address: Option<u16>,
+    pub checksum_valid: Option<bool>,
+    pub timing_scale_millionths: u32,
+    pub confidence: RecoveryConfidence,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmstradCpcWavRecovery {
+    pub audio: TapeAudioAnalysis,
+    pub blocks: Vec<AmstradCpcRecoveredBlock>,
+    pub warnings: Vec<String>,
+    pub custom_stage_candidate: bool,
+}
+
 /// Generic custom stages discovered in a recording that already contains a
 /// checksum-valid standard C64 stream. This provenance gate is intentional:
 /// pulse timings alone cannot safely distinguish C64 fastloaders from another
@@ -172,6 +206,14 @@ pub struct CommodoreCustomWavRecovery {
     pub fingerprint: String,
     pub warnings: Vec<String>,
 }
+
+const CPC_MAX_BLOCKS: usize = 64;
+const CPC_MAX_SEGMENTS: usize = 8;
+const CPC_SEGMENT_BYTES: usize = 256;
+const CPC_LEADER_MIN_PULSES: usize = 64;
+const CPC_LEADER_CONFIDENT_PULSES: usize = 512;
+const CPC_SYNC_HEADER: u8 = 0x2c;
+const CPC_SYNC_DATA: u8 = 0x16;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WavError {
     Malformed(&'static str),
@@ -536,6 +578,321 @@ pub fn decode_commodore_wav(bytes: &[u8]) -> Result<CommodoreWavRecovery, WavErr
         blocks,
         warnings,
     })
+}
+
+/// Recover standard Amstrad CPC cassette records from the existing PCM edge
+/// layer. The decoder is deliberately narrower than a generic pulse decoder:
+/// it requires the CPC leader/zero marker, a standard sync byte and a valid
+/// complemented CRC for each recovered 256-byte segment. Non-standard timing
+/// after a valid record is reported as a future custom-stage candidate only.
+pub fn decode_amstrad_cpc_wav(bytes: &[u8]) -> Result<AmstradCpcWavRecovery, WavError> {
+    let audio = analyze_wav(bytes)?;
+    let intervals: Vec<u64> = audio
+        .edges
+        .windows(2)
+        .map(|w| w[1].micros.saturating_sub(w[0].micros))
+        .collect();
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    let mut custom_stage_candidate = false;
+    while cursor + CPC_LEADER_MIN_PULSES + 20 < intervals.len() && blocks.len() < CPC_MAX_BLOCKS {
+        let Some((leader_start, leader_end, one)) = find_cpc_leader(&intervals, cursor) else {
+            break;
+        };
+        let zero = one / 2;
+        if leader_end + 2 > intervals.len()
+            || !cpc_period(intervals[leader_end], zero)
+            || !cpc_period(intervals[leader_end + 1], zero)
+        {
+            cursor = leader_end.saturating_add(1);
+            continue;
+        }
+        let sync_pos = leader_end + 2;
+        let Some((sync, after_sync)) = decode_cpc_byte(&intervals, sync_pos, zero, one) else {
+            cursor = leader_end.saturating_add(1);
+            continue;
+        };
+        if sync != CPC_SYNC_HEADER && sync != CPC_SYNC_DATA {
+            cursor = leader_end.saturating_add(1);
+            continue;
+        }
+        let mut position = after_sync;
+        let mut payload = Vec::new();
+        let mut checksum_valid = None;
+        let mut complete_segments = 0usize;
+        let mut warnings = Vec::new();
+        for _ in 0..CPC_MAX_SEGMENTS {
+            let segment_start = payload.len();
+            let mut segment = Vec::with_capacity(CPC_SEGMENT_BYTES);
+            let mut failed = false;
+            for _ in 0..CPC_SEGMENT_BYTES {
+                if let Some((value, next)) = decode_cpc_byte(&intervals, position, zero, one) {
+                    segment.push(value);
+                    position = next;
+                } else {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                break;
+            }
+            let Some((crc_hi, next)) = decode_cpc_byte(&intervals, position, zero, one) else {
+                break;
+            };
+            let Some((crc_lo, next2)) = decode_cpc_byte(&intervals, next, zero, one) else {
+                break;
+            };
+            position = next2;
+            let expected = (!cpc_crc16(&segment)).to_be_bytes();
+            let valid = [crc_hi, crc_lo] == expected;
+            checksum_valid = Some(checksum_valid.unwrap_or(true) && valid);
+            if !valid {
+                warnings.push("CPC segment CRC mismatch".into());
+            }
+            payload.extend_from_slice(&segment);
+            complete_segments += 1;
+            // A standard header is exactly one 256-byte segment. Data records
+            // may contain up to eight; a following leader is a clear boundary.
+            if sync == CPC_SYNC_HEADER {
+                break;
+            }
+            if position + CPC_LEADER_MIN_PULSES < intervals.len()
+                && cpc_period(intervals[position], one)
+            {
+                let run = cpc_run(&intervals, position, one);
+                if run >= CPC_LEADER_MIN_PULSES {
+                    break;
+                }
+            }
+            if payload.len() >= CPC_MAX_SEGMENTS * CPC_SEGMENT_BYTES {
+                break;
+            }
+            let _ = segment_start;
+        }
+        if complete_segments == 0 {
+            cursor = leader_end + 1;
+            continue;
+        }
+        let start = audio.edges[leader_start];
+        let end_index = position.min(audio.edges.len().saturating_sub(1));
+        let end = audio.edges[end_index];
+        let header = if sync == CPC_SYNC_HEADER {
+            cpc_header(&payload)
+        } else {
+            None
+        };
+        let confidence = if checksum_valid == Some(true)
+            && leader_end - leader_start >= CPC_LEADER_CONFIDENT_PULSES
+        {
+            RecoveryConfidence::High
+        } else if checksum_valid == Some(true) {
+            RecoveryConfidence::Medium
+        } else {
+            RecoveryConfidence::Low
+        };
+        blocks.push(AmstradCpcRecoveredBlock {
+            sync_byte: sync,
+            payload,
+            start_sample: start.sample,
+            end_sample: end.sample,
+            start_micros: start.micros,
+            end_micros: end.micros,
+            block_number: header.as_ref().map(|h| h.0),
+            first_block: header.as_ref().map(|h| h.1),
+            last_block: header.as_ref().map(|h| h.2),
+            filename: header.as_ref().map(|h| h.3.clone()),
+            file_type: header.as_ref().map(|h| h.4),
+            load_address: header.as_ref().map(|h| h.5),
+            length: header.as_ref().map(|h| h.6),
+            execution_address: header.as_ref().map(|h| h.7),
+            checksum_valid,
+            // CPC's default writer speed is conventionally represented by a
+            // 1000-us one period; the measured period is retained as the
+            // local calibration rather than treated as machine identity.
+            timing_scale_millionths: (one.saturating_mul(1_000_000) / 1000) as u32,
+            confidence,
+            warnings,
+        });
+        if position < intervals.len() {
+            let run = cpc_run(&intervals, position, one);
+            if run >= CPC_LEADER_MIN_PULSES {
+                custom_stage_candidate = false;
+            } else if intervals[position] > one.saturating_mul(3)
+                && position + 1 < intervals.len()
+                && intervals[position + 1] > one.saturating_mul(3)
+            {
+                custom_stage_candidate = true;
+            }
+        }
+        cursor = position.max(leader_end + 1);
+    }
+    let warnings = if blocks.is_empty() {
+        vec!["no standard Amstrad CPC leader/sync/CRC block was recovered".into()]
+    } else if custom_stage_candidate {
+        vec![
+            "non-standard timing follows a valid CPC record; custom/turbo decoding is deferred"
+                .into(),
+        ]
+    } else {
+        Vec::new()
+    };
+    Ok(AmstradCpcWavRecovery {
+        audio,
+        blocks,
+        warnings,
+        custom_stage_candidate,
+    })
+}
+
+/// Project standard CPC records into the common tape model. Header metadata is
+/// emitted only for the documented 64-byte system header fields.
+pub fn amstrad_cpc_wav_tape_analysis(
+    bytes: &[u8],
+) -> Result<crate::tape_analysis::TapeAnalysis, WavError> {
+    let recovery = decode_amstrad_cpc_wav(bytes)?;
+    let entries = recovery
+        .blocks
+        .iter()
+        .filter(|b| b.sync_byte == CPC_SYNC_HEADER)
+        .map(|b| crate::tape_analysis::TapeEntry {
+            name: b.filename.clone(),
+            kind: if b.file_type == Some(0) {
+                crate::tape_analysis::TapeEntryKind::Basic
+            } else {
+                crate::tape_analysis::TapeEntryKind::Code
+            },
+            load_address: b.load_address,
+            length: b.length.map(u64::from).unwrap_or(b.payload.len() as u64),
+            checksum: if b.checksum_valid == Some(true) {
+                crate::tape_analysis::ChecksumState::Valid
+            } else {
+                crate::tape_analysis::ChecksumState::Invalid
+            },
+        })
+        .collect::<Vec<_>>();
+    let checksum = if recovery
+        .blocks
+        .iter()
+        .any(|b| b.checksum_valid == Some(false))
+    {
+        crate::tape_analysis::ChecksumState::Invalid
+    } else if recovery
+        .blocks
+        .iter()
+        .any(|b| b.checksum_valid == Some(true))
+    {
+        crate::tape_analysis::ChecksumState::Valid
+    } else {
+        crate::tape_analysis::ChecksumState::NotPresent
+    };
+    Ok(crate::tape_analysis::TapeAnalysis {
+        format: crate::tape_analysis::TapeFormat::AmstradCpcWav,
+        platform: Some("Amstrad CPC"),
+        block_count: recovery.blocks.len(),
+        entries,
+        metadata: vec!["Amstrad CPC standard cassette waveform recovery".into()],
+        loader: None,
+        checksum,
+        warnings: recovery.warnings,
+        semantic_blocks: recovery
+            .blocks
+            .iter()
+            .map(|b| {
+                format!(
+                    "CPC sync 0x{:02x}, block {:?}, CRC {:?}",
+                    b.sync_byte, b.block_number, b.checksum_valid
+                )
+            })
+            .collect(),
+        logical_segments: recovery.blocks.len().max(1),
+        unsupported_blocks: 0,
+    })
+}
+
+fn find_cpc_leader(intervals: &[u64], from: usize) -> Option<(usize, usize, u64)> {
+    let mut start = from;
+    while start + CPC_LEADER_MIN_PULSES <= intervals.len() {
+        let candidate = intervals[start];
+        if !(500..=5000).contains(&candidate) {
+            start += 1;
+            continue;
+        }
+        let end = start + cpc_run(intervals, start, candidate);
+        if end - start >= CPC_LEADER_MIN_PULSES {
+            return Some((start, end, median(&intervals[start..end])));
+        }
+        start += 1;
+    }
+    None
+}
+
+fn cpc_run(values: &[u64], start: usize, target: u64) -> usize {
+    values[start..]
+        .iter()
+        .take_while(|v| cpc_period(**v, target))
+        .count()
+}
+
+fn cpc_period(value: u64, target: u64) -> bool {
+    target > 0 && close(value, target, 0.25)
+}
+
+fn decode_cpc_byte(intervals: &[u64], position: usize, zero: u64, one: u64) -> Option<(u8, usize)> {
+    let mut out = 0u8;
+    let mut p = position;
+    for _ in 0..8 {
+        if p + 1 >= intervals.len() {
+            return None;
+        }
+        let a = intervals[p];
+        let b = intervals[p + 1];
+        let value = if cpc_period(a, zero) && cpc_period(b, zero) {
+            0
+        } else if cpc_period(a, one) && cpc_period(b, one) {
+            1
+        } else {
+            return None;
+        };
+        out = (out << 1) | value;
+        p += 2;
+    }
+    Some((out, p))
+}
+
+fn cpc_crc16(bytes: &[u8]) -> u16 {
+    let mut crc = 0xffffu16;
+    for byte in bytes {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn cpc_header(payload: &[u8]) -> Option<(u8, bool, bool, String, u8, u16, u16, u16)> {
+    if payload.len() < 28 {
+        return None;
+    }
+    let end = payload[0..16].iter().position(|b| *b == 0).unwrap_or(16);
+    let filename = String::from_utf8_lossy(&payload[..end])
+        .trim_end()
+        .to_string();
+    Some((
+        payload[16],
+        payload[23] != 0,
+        payload[17] != 0,
+        filename,
+        payload[18],
+        u16::from_le_bytes([payload[21], payload[22]]),
+        u16::from_le_bytes([payload[19], payload[20]]),
+        u16::from_le_bytes([payload[26], payload[27]]),
+    ))
 }
 
 /// Conservatively expose V5's generic custom timing recovery as C64 custom
@@ -1426,6 +1783,122 @@ mod tests {
         header.resize(21, b' ');
         header.resize(COMMODORE_PAYLOAD_BYTES, b' ');
         header
+    }
+
+    fn cpc_stream(sync: u8, payload: &[u8], one: u64, corrupt_crc: bool) -> Vec<u64> {
+        let zero = one / 2;
+        let mut intervals = vec![one; 512];
+        intervals.extend([zero, zero]);
+        let mut write_byte = |byte: u8| {
+            for bit in (0..8).rev() {
+                let pulse = if (byte >> bit) & 1 == 0 { zero } else { one };
+                intervals.extend([pulse, pulse]);
+            }
+        };
+        write_byte(sync);
+        let mut segment = payload.to_vec();
+        segment.resize(CPC_SEGMENT_BYTES, 0);
+        for byte in &segment {
+            write_byte(*byte);
+        }
+        let mut crc = (!cpc_crc16(&segment)).to_be_bytes();
+        if corrupt_crc {
+            crc[1] ^= 0x01;
+        }
+        write_byte(crc[0]);
+        write_byte(crc[1]);
+        intervals
+    }
+
+    fn cpc_wav(rate: u32, one: u64, corrupt_crc: bool, custom_tail: bool) -> Vec<u8> {
+        let mut header = vec![0u8; CPC_SEGMENT_BYTES];
+        header[..8].copy_from_slice(b"TEST    ");
+        header[16] = 1;
+        header[17] = 1;
+        header[18] = 1;
+        header[19..21].copy_from_slice(&(32u16).to_le_bytes());
+        header[21..23].copy_from_slice(&(0x4000u16).to_le_bytes());
+        header[23] = 1;
+        header[24..26].copy_from_slice(&(32u16).to_le_bytes());
+        header[26..28].copy_from_slice(&(0x4000u16).to_le_bytes());
+        let mut intervals = cpc_stream(CPC_SYNC_HEADER, &header, one, corrupt_crc);
+        intervals.extend([50_000]);
+        if custom_tail {
+            intervals.extend([one * 4, one * 4, one * 4, one * 4]);
+        }
+        let mut samples = vec![128u8; rate as usize / 50];
+        let mut high = true;
+        for micros in intervals {
+            let count = ((micros * rate as u64 + 500_000) / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        }
+        wav(rate, 1, 8, &samples)
+    }
+
+    #[test]
+    fn cpc_standard_waveform_recovers_header_across_sample_rates() {
+        for rate in [22_050, 44_100, 48_000, 96_000] {
+            let result = decode_amstrad_cpc_wav(&cpc_wav(rate, 1000, false, false)).unwrap();
+            assert_eq!(result.blocks.len(), 1, "rate {rate}");
+            let block = &result.blocks[0];
+            assert_eq!(block.sync_byte, CPC_SYNC_HEADER);
+            assert_eq!(block.filename.as_deref(), Some("TEST"));
+            assert_eq!(block.block_number, Some(1));
+            assert_eq!(block.first_block, Some(true));
+            assert_eq!(block.last_block, Some(true));
+            assert_eq!(block.load_address, Some(0x4000));
+            assert_eq!(block.length, Some(32));
+            assert_eq!(block.execution_address, Some(0x4000));
+            assert_eq!(block.checksum_valid, Some(true));
+        }
+    }
+
+    #[test]
+    fn cpc_checksum_timing_and_custom_boundary_fail_soft() {
+        let bad = decode_amstrad_cpc_wav(&cpc_wav(44_100, 1000, true, false)).unwrap();
+        assert_eq!(bad.blocks.len(), 1);
+        assert_eq!(bad.blocks[0].checksum_valid, Some(false));
+        let drift = decode_amstrad_cpc_wav(&cpc_wav(48_000, 1100, false, true)).unwrap();
+        assert_eq!(drift.blocks[0].checksum_valid, Some(true));
+        assert!(drift.custom_stage_candidate);
+        assert!(drift.warnings.iter().any(|w| w.contains("deferred")));
+    }
+
+    #[test]
+    fn cpc_projection_and_false_positive_guards() {
+        let analysis = amstrad_cpc_wav_tape_analysis(&cpc_wav(44_100, 1000, false, false)).unwrap();
+        assert_eq!(
+            analysis.format,
+            crate::tape_analysis::TapeFormat::AmstradCpcWav
+        );
+        assert_eq!(analysis.platform, Some("Amstrad CPC"));
+        assert_eq!(analysis.entries[0].name.as_deref(), Some("TEST"));
+        assert!(
+            decode_amstrad_cpc_wav(&wav(44_100, 1, 8, &[0, 255, 0, 255]))
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
+        let mut spectrum_intervals = vec![2168u64; 100];
+        spectrum_intervals.extend([667, 735]);
+        for bit in (0..8).rev().map(|i| (0xa5 >> i) & 1) {
+            let pulse = if bit == 0 { 855 } else { 1710 };
+            spectrum_intervals.extend([pulse, pulse]);
+        }
+        let mut samples = vec![128u8; 44_100 / 50];
+        let mut high = true;
+        for micros in spectrum_intervals {
+            let count = ((micros * 44_100 + 500_000) / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 255 } else { 0 }, count));
+            high = !high;
+        }
+        assert!(
+            decode_amstrad_cpc_wav(&wav(44_100, 1, 8, &samples))
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
     }
 
     #[test]

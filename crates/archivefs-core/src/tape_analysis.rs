@@ -17,6 +17,7 @@ pub enum TapeFormat {
     Tzx,
     CommodoreTap,
     CommodoreWav,
+    AmstradCpcWav,
     T64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

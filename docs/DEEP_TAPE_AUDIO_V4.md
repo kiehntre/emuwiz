@@ -127,3 +127,39 @@ fastloaders (including Novaload, Cyberload, Freeload, Ocean, and US Gold
 families) are also deferred: V8 has no documented, multi-clue, non-game-
 specific signature plus near-miss corpus sufficient for fail-closed naming.
 All fixtures remain synthetic.
+
+## V9: standard Amstrad CPC cassette WAV decoding
+
+V9 adds `decode_amstrad_cpc_wav` on the same bounded PCM edge stream. The
+standard CPC cassette manager writes a record as a long leader of one bits
+(normally 2048), a zero marker, a sync byte (`0x2c` for a header record or
+`0x16` for a data record), then MSB-first bytes. Each bit is one low/high cycle;
+the one period is twice the zero period. Records contain 256-byte segments and
+the complemented CRC-16 (polynomial `x^15+x^12+x^5+1`, initial `0xffff`,
+big-endian CRC bytes). Header fields are projected only from their documented
+positions: 16-byte filename, block number, last/first flags, file type, data
+length/location, logical length, and execution address.
+
+The decoder calibrates the measured leader locally, accepts bounded timing
+drift, retains source sample/time ranges, timing scale, checksum state,
+warnings, and confidence, and refuses to identify CPC from timing alone. A
+valid sync plus complete segment is required for a CPC block; bad CRC is
+retained as an explicitly invalid block, while truncation, random pulses,
+Spectrum ROM timing, C64 timing, and generic custom timing fail soft. Multiple
+good blocks are retained independently. A non-standard gap/timing stage after
+a valid standard record is exposed only as `custom_stage_candidate`; V10 may
+use that CPC anchor for generic custom/turbo analysis, but V9 does not decode
+or name it.
+
+CDT/TZX standard blocks describe the same logical sync/data/CRC structure, so
+their block identity and header metadata are comparable with V9 recovery. CDT
+also carries container timing, pauses, and custom block encodings that are not
+represented by this WAV evidence layer; byte-for-byte container parity is
+therefore intentionally not claimed. The model follows the CPC firmware and
+technical references: [CPC cassette data information](https://cpctech.cpcwiki.de/docs/sound.html),
+[CPC firmware cassette manager](https://cpcrulez.fr/codingBOOK_soft968-CPC464-664-6128_firmware_008.htm),
+and the [CDT/TZX format notes](https://www.cpctech.cpcwiki.de/docs/cdt.html).
+Synthetic fixtures cover 22.05/44.1/48/96 kHz, drift, CRC failure, partial
+data, false positives, metadata projection, and the deferred custom-stage
+boundary. No named loader is guessed, no emulator is run, and no raw PCM is
+stored.
