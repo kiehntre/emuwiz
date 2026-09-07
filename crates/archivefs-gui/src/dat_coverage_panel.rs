@@ -667,13 +667,32 @@ fn render_expected_block_arcade(
     request
 }
 
+/// Whether one coverage entry belongs in the default view. Mirrors
+/// `dat_sources_page::local_dat_row_visible`'s intent for the same reason:
+/// coverage for a source with no platform assignment is fundamentally
+/// undefined (see this module's own "explicit-platform rule" doc), so a
+/// source with `platform: None` clutters the page without saying anything
+/// useful, and stays one click away rather than dominating the default view.
+pub(crate) fn coverage_entry_visible(
+    entry: &SourceCoverageEntry,
+    show_all: bool,
+    show_unassigned: bool,
+) -> bool {
+    show_all || show_unassigned || entry.platform.is_some()
+}
+
 /// Draws the whole "Collection coverage" section and returns at most one
-/// request for the page to act on.
+/// request for the page to act on. `show_all`/`show_unassigned` are the same
+/// page-level visibility flags `dat_sources_page`'s "Local DAT Sources" list
+/// uses, so one pair of "Show all DATs"/"Show unassigned" buttons governs
+/// both sections consistently instead of each needing its own toggle.
 pub(crate) fn show_coverage_section(
     ui: &mut egui::Ui,
     entries: &[SourceCoverageEntry],
     open_source: &mut Option<String>,
     missing_open: &mut BTreeSet<String>,
+    show_all: bool,
+    show_unassigned: bool,
 ) -> Option<CoveragePanelRequest> {
     let mut request = None;
 
@@ -693,7 +712,22 @@ pub(crate) fn show_coverage_section(
         return None;
     }
 
-    for entry in entries {
+    let visible_entries: Vec<&SourceCoverageEntry> = entries
+        .iter()
+        .filter(|entry| coverage_entry_visible(entry, show_all, show_unassigned))
+        .collect();
+    if visible_entries.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No assigned catalogues are in the main view. Use Show unassigned or Show all \
+                 DATs to browse the rest.",
+            )
+            .color(theme::muted(ui))
+            .small(),
+        );
+    }
+
+    for entry in visible_entries {
         widgets::card(ui, |ui| {
             let is_open = open_source.as_deref() == Some(entry.source_id.as_str());
             ui.horizontal_wrapped(|ui| {

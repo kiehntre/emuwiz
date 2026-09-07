@@ -3835,6 +3835,62 @@ fn the_policy_section_and_summary_render_at_a_narrow_compact_width() {
     ));
 }
 
+// --- Effective policy "Sources consulted" default collapse -------------
+//
+// PHYSICAL RUNTIME UX REPAIR V2: a broad scope ("All platforms") lists
+// every enabled source in priority order - for a real 431-source local
+// registry that was an unconditional wall of rows, unrelated to the
+// "Show all DATs"/"Show unassigned" fix applied to the source lists above
+// it on the same page. The itemised order now lives behind the same
+// collapsed-by-default "Technical details" idiom the rest of this page
+// already uses; only a compact count stays in the default view.
+
+#[test]
+fn sources_consulted_default_view_shows_only_a_count_not_every_source() {
+    let fixture = Fixture::new();
+    let dat_a = fixture.write("collection-a.dat", LOGIQX);
+    let dat_b = fixture.write(
+        "collection-b.dat",
+        &LOGIQX.replace("Test No-Intro Collection", "Second Test Collection"),
+    );
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat_a });
+    page.apply(DatSourcesPageAction::AddFile { path: dat_b });
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_at_width(&view, &mut ui_state, 1100.0);
+
+    assert!(rendered_text_contains(&output, "Effective policy"));
+    assert!(rendered_text_contains(&output, "Sources consulted: 2"));
+    // The itemised, numbered "1. <name> (priority <n>)" rows stay behind
+    // the collapsed disclosure - not painted in the default view.
+    assert!(!rendered_text_contains(&output, "priority 100)"));
+    assert!(!rendered_text_contains(&output, "Test No-Intro Collection"));
+}
+
+#[test]
+fn sources_consulted_expands_to_the_full_itemised_order() {
+    let fixture = Fixture::new();
+    let dat_a = fixture.write("collection-a.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat_a });
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    // The same trick `dat_coverage_panel`'s tests use to see collapsed
+    // content: force every CollapsingHeader's body to paint this frame.
+    let context = egui::Context::default();
+    context.memory_mut(|memory| memory.set_everything_is_visible(true));
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_dat_sources_page(ui, &view, &mut ui_state);
+        });
+    });
+    assert!(
+        rendered_text_contains(&output, "priority 100)"),
+        "expanding the disclosure must reveal the itemised, per-source priority order"
+    );
+}
+
 #[test]
 fn games_only_wording_is_beginner_facing_and_switching_is_reversible() {
     let fixture = Fixture::new();

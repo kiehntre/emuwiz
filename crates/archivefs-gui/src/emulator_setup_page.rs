@@ -363,7 +363,15 @@ pub(crate) fn show(
     }
     let grid = candidate_grid_layout(ui.available_width(), candidates.len());
     for row in candidates.chunks(grid.columns) {
-        ui.horizontal(|ui| {
+        // `ui.horizontal` centres its children on the cross (vertical) axis
+        // by default - with cards of differing heights (a "Ready" card's
+        // extra "Technical details" line, a longer reason, ...) that made
+        // every row look staggered/masonry-like even though the layout
+        // below is genuinely row-major (`chunks(grid.columns)`, one row per
+        // `ui.horizontal`). Top-aligning the row is the actual fix: shorter
+        // cards keep their own natural height, but every card's *top* edge
+        // now lines up with the rest of its row.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
             // Centre each row, including a short final row, without forcing a
             // single candidate to claim the entire content width.
             let row_width = grid.card_width * row.len() as f32
@@ -728,5 +736,67 @@ mod tests {
         assert_eq!(pair.columns, 2);
         assert_eq!(pair.card_width, CANDIDATE_CARD_MAX_WIDTH);
         assert!(pair.row_width <= 1_440.0);
+    }
+
+    // --- physical row layout (PHYSICAL RUNTIME UX REPAIR V2) ---------------
+    //
+    // The real regression: `ui.horizontal` centres its children on the
+    // cross (vertical) axis by default. VICE's card (no extra evidence
+    // line) and RetroArch's "Ready" card (an extra "Technical details"
+    // line) have different natural heights, so the same genuinely
+    // row-major layout (`chunks(grid.columns)`, one `ui.horizontal`/row)
+    // rendered the shorter card's top edge lower than the taller card's -
+    // looking exactly like an accidental masonry layout even though no
+    // masonry algorithm was ever in play.
+
+    fn text_top_y(output: &egui::FullOutput, needle: &str) -> Option<f32> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<f32> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle => Some(text.pos.y),
+                egui::Shape::Vec(nested) => nested.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| walk(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn candidate_rows_top_align_cards_of_different_heights() {
+        let context = egui::Context::default();
+        let mut state = EmulatorSetupPageState {
+            platform_filter: "Commodore 64".to_string(),
+            search: String::new(),
+        };
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ = show(
+                        ui,
+                        &mut state,
+                        None,
+                        false,
+                        RetroArchSetupStatus::Ready,
+                        None,
+                    );
+                });
+            },
+        );
+        let vice_top = text_top_y(&output, "VICE").expect("VICE card must render");
+        let retroarch_top = text_top_y(&output, "RetroArch").expect("RetroArch card must render");
+        assert!(
+            (vice_top - retroarch_top).abs() < 2.0,
+            "cards in the same row must have aligned top edges: VICE at {vice_top}, \
+             RetroArch at {retroarch_top}"
+        );
     }
 }

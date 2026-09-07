@@ -7208,6 +7208,36 @@ pub(crate) fn show_dat_sources_page(
     verify_summary::show(ui, view);
     ui.add_space(12.0);
 
+    // Shared page-level visibility toggle: governs both the coverage
+    // section below and the "Local DAT Sources" list further down, so a
+    // library with a large local registry does not open on a wall of
+    // catalogues with no platform assigned - the same regression the
+    // physical screenshot in PHYSICAL RUNTIME UX REPAIR V2 reported.
+    ui.horizontal(|ui| {
+        if ui
+            .button(if ui_state.show_all_local_dat_sources {
+                "Show relevant DATs"
+            } else {
+                "Show all DATs"
+            })
+            .clicked()
+        {
+            ui_state.show_all_local_dat_sources = !ui_state.show_all_local_dat_sources;
+        }
+        if ui
+            .button(if ui_state.show_unassigned_local_dat_sources {
+                "Hide unassigned"
+            } else {
+                "Show unassigned"
+            })
+            .clicked()
+        {
+            ui_state.show_unassigned_local_dat_sources =
+                !ui_state.show_unassigned_local_dat_sources;
+        }
+    });
+    ui.add_space(6.0);
+
     if action.is_none()
         && let Some(coverage_action) = show_dat_coverage_section(ui, view, ui_state)
     {
@@ -7266,27 +7296,11 @@ pub(crate) fn show_dat_sources_page(
     ui.label(egui::RichText::new("User-added DAT files and folders. These stay local-only and are never updateable.").color(theme::muted(ui)).small());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{} source(s)", view.rows.len())).strong());
-        if ui
-            .button(if ui_state.show_all_local_dat_sources {
-                "Show relevant DATs"
-            } else {
-                "Show all DATs"
-            })
-            .clicked()
-        {
-            ui_state.show_all_local_dat_sources = !ui_state.show_all_local_dat_sources;
-        }
-        if ui
-            .button(if ui_state.show_unassigned_local_dat_sources {
-                "Hide unassigned"
-            } else {
-                "Show unassigned"
-            })
-            .clicked()
-        {
-            ui_state.show_unassigned_local_dat_sources =
-                !ui_state.show_unassigned_local_dat_sources;
-        }
+        // "Show all DATs"/"Show unassigned" live once, near the top of the
+        // page (above "Collection coverage"), and this list reads the same
+        // shared flags - a second identical button pair here would collide
+        // in the widget ID space and diverge visually from the coverage
+        // section it must stay consistent with.
         if ui.button("Expand all").clicked() {
             ui_state.local_sources_expanded = Some(true);
         }
@@ -7481,6 +7495,8 @@ fn show_dat_coverage_section(
         &view.coverage_sources,
         &mut ui_state.open_coverage,
         &mut ui_state.coverage_missing_open,
+        ui_state.show_all_local_dat_sources,
+        ui_state.show_unassigned_local_dat_sources,
     )?;
     Some(match request {
         CoveragePanelRequest::Load { source_id } => {
@@ -10998,28 +11014,42 @@ fn show_effective_policy_summary(ui: &mut egui::Ui, view: &DatPolicyView) {
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new(format!("Platform: {}", view.effective.platform)).strong());
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Sources consulted:").strong());
-            if view.effective.source_ordering.is_empty() {
+        if view.effective.source_ordering.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Sources consulted:").strong());
                 ui.label(
                     egui::RichText::new("none enabled for this scope")
                         .color(theme::muted(ui))
                         .small(),
                 );
-            } else {
-                ui.vertical(|ui| {
-                    for source in &view.effective.source_ordering {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}. {} (priority {})",
-                                source.consulted_position, source.display_name, source.priority
-                            ))
-                            .small(),
-                        );
-                    }
-                });
-            }
-        });
+            });
+        } else {
+            // A broad scope (e.g. "All platforms") legitimately consults
+            // every enabled source - for a large local registry (431 in the
+            // real case that motivated this) that is a wall of rows with no
+            // relation to the current task, exactly the usability problem
+            // this page's "Show all DATs"/"Show unassigned" split already
+            // solved for the source lists above. The count stays visible;
+            // the itemised order is one click away, collapsed by default.
+            ui.label(
+                egui::RichText::new(format!(
+                    "Sources consulted: {} (by priority)",
+                    view.effective.source_ordering.len()
+                ))
+                .strong(),
+            );
+            widgets::technical_details(ui, ("effective-policy-sources", &view.scope), |ui| {
+                for source in &view.effective.source_ordering {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}. {} (priority {})",
+                            source.consulted_position, source.display_name, source.priority
+                        ))
+                        .small(),
+                    );
+                }
+            });
+        }
         ui.add_space(4.0);
         summary_row(ui, "Region preference", &view.effective.region);
         summary_row(ui, "Language preference", &view.effective.language);

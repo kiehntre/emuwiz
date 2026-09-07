@@ -170,12 +170,33 @@ fn render(
     open: &mut Option<String>,
     missing_open: &mut BTreeSet<String>,
 ) -> (egui::FullOutput, Option<CoveragePanelRequest>) {
+    // Every existing test here is about one open entry's rendered content,
+    // not the visibility filter - `true, true` (show everything) keeps
+    // their behaviour exactly as before. See `render_with_visibility` for
+    // the filter's own tests.
+    render_with_visibility(entries, open, missing_open, true, true)
+}
+
+fn render_with_visibility(
+    entries: &[SourceCoverageEntry],
+    open: &mut Option<String>,
+    missing_open: &mut BTreeSet<String>,
+    show_all: bool,
+    show_unassigned: bool,
+) -> (egui::FullOutput, Option<CoveragePanelRequest>) {
     let context = egui::Context::default();
     context.memory_mut(|memory| memory.set_everything_is_visible(true));
     let mut captured = None;
     let output = context.run(egui::RawInput::default(), |context| {
         egui::CentralPanel::default().show(context, |ui| {
-            captured = show_coverage_section(ui, entries, open, missing_open);
+            captured = show_coverage_section(
+                ui,
+                entries,
+                open,
+                missing_open,
+                show_all,
+                show_unassigned,
+            );
         });
     });
     (output, captured)
@@ -522,7 +543,8 @@ fn a_narrow_viewport_render_does_not_panic() {
         },
         |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                let _ = show_coverage_section(ui, &entries, &mut open, &mut missing_open);
+                let _ =
+                    show_coverage_section(ui, &entries, &mut open, &mut missing_open, true, true);
             });
         },
     );
@@ -564,4 +586,114 @@ fn no_raw_enum_or_debug_text_reaches_the_user() {
         );
     }
     assert!(rendered_text_contains(&output, "Assigned to SNES"));
+}
+
+// --- default visibility filter (PHYSICAL RUNTIME UX REPAIR V2) --------------
+//
+// The physical regression this covers: the "Collection coverage" section
+// used to render every configured source unconditionally, with no relation
+// to the page's "Show all DATs"/"Show unassigned" buttons at all - a large
+// local registry opened on a wall of "not assigned to a platform" cards
+// before a user ever reached the (correctly filtered) "Local DAT Sources"
+// list further down the same page.
+
+fn unassigned_entry(id: &str, label: &str) -> SourceCoverageEntry {
+    SourceCoverageEntry {
+        source_id: id.to_string(),
+        source_label: label.to_string(),
+        platform: None,
+        enabled: true,
+        load: CoverageLoad::NotOpened,
+    }
+}
+
+#[test]
+fn default_view_hides_unassigned_sources() {
+    let assigned = entry(CoverageLoad::NotOpened);
+    let unassigned = unassigned_entry("no-intro-abc800", "No-Intro: Luxor - ABC 800 (Flux)");
+    let entries = [assigned, unassigned];
+    let (output, _) =
+        render_with_visibility(&entries, &mut None, &mut BTreeSet::new(), false, false);
+    assert!(rendered_text_contains(
+        &output,
+        "No-Intro - Game Boy Advance"
+    ));
+    assert!(!rendered_text_contains(
+        &output,
+        "No-Intro: Luxor - ABC 800 (Flux)"
+    ));
+}
+
+#[test]
+fn default_view_with_only_unassigned_sources_shows_the_hint_not_a_wall() {
+    let entries = [
+        unassigned_entry("a", "No-Intro: Luxor - ABC 800 (Flux)"),
+        unassigned_entry("b", "No-Intro: Microsoft - MSX"),
+        unassigned_entry("c", "No-Intro: Microsoft - Xbox"),
+    ];
+    let (output, _) =
+        render_with_visibility(&entries, &mut None, &mut BTreeSet::new(), false, false);
+    for label in [
+        "No-Intro: Luxor - ABC 800 (Flux)",
+        "No-Intro: Microsoft - MSX",
+        "No-Intro: Microsoft - Xbox",
+    ] {
+        assert!(
+            !rendered_text_contains(&output, label),
+            "{label} must not appear in the default (unassigned-hidden) view"
+        );
+    }
+    assert!(rendered_text_contains(
+        &output,
+        "No assigned catalogues are in the main view"
+    ));
+}
+
+#[test]
+fn show_all_reveals_unassigned_sources() {
+    let entries = [unassigned_entry(
+        "no-intro-abc800",
+        "No-Intro: Luxor - ABC 800 (Flux)",
+    )];
+    let (output, _) =
+        render_with_visibility(&entries, &mut None, &mut BTreeSet::new(), true, false);
+    assert!(rendered_text_contains(
+        &output,
+        "No-Intro: Luxor - ABC 800 (Flux)"
+    ));
+}
+
+#[test]
+fn show_unassigned_reveals_unassigned_sources_without_show_all() {
+    let entries = [unassigned_entry(
+        "no-intro-abc800",
+        "No-Intro: Luxor - ABC 800 (Flux)",
+    )];
+    let (output, _) =
+        render_with_visibility(&entries, &mut None, &mut BTreeSet::new(), false, true);
+    assert!(rendered_text_contains(
+        &output,
+        "No-Intro: Luxor - ABC 800 (Flux)"
+    ));
+}
+
+#[test]
+fn assigned_sources_always_visible_regardless_of_flags() {
+    let entries = [entry(CoverageLoad::NotOpened)];
+    let (output, _) =
+        render_with_visibility(&entries, &mut None, &mut BTreeSet::new(), false, false);
+    assert!(rendered_text_contains(
+        &output,
+        "No-Intro - Game Boy Advance"
+    ));
+}
+
+#[test]
+fn coverage_entry_visible_matches_the_documented_predicate() {
+    let assigned = entry(CoverageLoad::NotOpened);
+    let unassigned = unassigned_entry("x", "x");
+    assert!(coverage_entry_visible(&assigned, false, false));
+    assert!(!coverage_entry_visible(&unassigned, false, false));
+    assert!(coverage_entry_visible(&unassigned, true, false));
+    assert!(coverage_entry_visible(&unassigned, false, true));
 }
