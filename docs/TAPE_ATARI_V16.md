@@ -43,6 +43,16 @@ pulse timing, V16 records a deferred custom-stage candidate. It does not label
 the stage, decode it, or infer a loader name. That evidence is reserved for a
 future bootstrap-gated custom/turbo lane.
 
+V17 adds that bounded lane. It reuses the generic pulse-family and symbol
+recovery machinery only after a complete checksum-valid Atari record. The
+result retains stage-local timing clusters, symbol mode, bit order, confidence,
+warnings, sample/time bounds, and recovered bytes where the model is
+unambiguous. Classes are limited to `GenericTurbo`, `CustomPulse`,
+`MultiStage`, and `UnknownCustom`; ambiguous or corrupt stages remain visible
+without being promoted to a named loader. Fingerprints use normalized timing,
+mode/order, stage ordering, and relative gaps, so sample-rate and small-speed
+changes do not become identity evidence.
+
 ## References
 
 The implementation was checked against the Atari reference material and

@@ -8,6 +8,7 @@
 //! commercial formats.
 
 use crate::tape_audio::{PulseEdge, RecoveryConfidence, WavError, analyze_wav};
+use sha2::{Digest, Sha256};
 
 const MIN_BAUD: f64 = 540.0;
 const MAX_BAUD: f64 = 660.0;
@@ -53,6 +54,38 @@ pub struct AtariWavRecovery {
     pub audio: crate::tape_audio::TapeAudioAnalysis,
     pub records: Vec<AtariRecoveredRecord>,
     pub custom_stage_candidate: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtariCustomStage {
+    pub evidence: crate::tape_audio::CustomStageEvidence,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub timing_scale_millionths: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtariCustomBlock {
+    pub bytes: Vec<u8>,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_micros: u64,
+    pub end_micros: u64,
+    pub decoded_bits: usize,
+    pub ambiguous_bits: usize,
+    pub mode: crate::tape_audio::CustomSymbolMode,
+    pub bit_order: crate::tape_audio::CustomBitOrder,
+    pub confidence: RecoveryConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtariCustomWavRecovery {
+    pub standard: AtariWavRecovery,
+    pub stages: Vec<AtariCustomStage>,
+    pub blocks: Vec<AtariCustomBlock>,
+    pub loader_class: &'static str,
+    pub fingerprint: String,
     pub warnings: Vec<String>,
 }
 
@@ -143,6 +176,144 @@ pub fn decode_atari_wav(bytes: &[u8]) -> Result<AtariWavRecovery, WavError> {
         custom_stage_candidate,
         warnings,
     })
+}
+
+/// Recover generic non-standard stages only after a complete, checksum-valid
+/// Atari standard record. The shared custom decoder is deliberately filtered
+/// to the post-anchor region; no weak Atari resemblance can unlock it.
+pub fn decode_atari_custom_wav(bytes: &[u8]) -> Result<AtariCustomWavRecovery, WavError> {
+    let standard = decode_atari_wav(bytes)?;
+    let anchor_end = standard
+        .records
+        .iter()
+        .filter(|record| record.complete && record.checksum == AtariChecksum::Valid)
+        .map(|record| record.end_micros)
+        .max()
+        .unwrap_or(0);
+    if anchor_end == 0 {
+        return Ok(AtariCustomWavRecovery {
+            standard,
+            stages: Vec::new(),
+            blocks: Vec::new(),
+            loader_class: "UnknownCustom",
+            fingerprint: atari_custom_fingerprint(&[]),
+            warnings: vec![
+                "Atari custom recovery requires a complete checksum-valid standard record anchor"
+                    .into(),
+            ],
+        });
+    }
+    let generic = crate::tape_audio::decode_custom_wav(bytes)?;
+    let crate::tape_audio::CustomWavRecovery {
+        stages: generic_stages,
+        blocks: generic_blocks,
+        warnings: generic_warnings,
+        ..
+    } = generic;
+    let rate = standard.audio.spec.sample_rate as u64;
+    let stages = generic_stages
+        .into_iter()
+        .filter(|stage| stage.start_micros >= anchor_end)
+        .take(16)
+        .map(|evidence| AtariCustomStage {
+            start_sample: evidence.start_micros.saturating_mul(rate) / 1_000_000,
+            end_sample: evidence.end_micros.saturating_mul(rate) / 1_000_000,
+            timing_scale_millionths: evidence
+                .pilot_micros
+                .saturating_mul(1_000_000)
+                .checked_div(1_200u64.max(evidence.pilot_micros))
+                .unwrap_or(0)
+                .min(u64::from(u32::MAX)) as u32,
+            evidence,
+        })
+        .collect::<Vec<_>>();
+    let stages_start = stages
+        .iter()
+        .map(|stage| stage.evidence.start_micros)
+        .collect::<Vec<_>>();
+    let blocks = generic_blocks
+        .into_iter()
+        .filter(|block| block.start_micros >= anchor_end)
+        .take(256)
+        .map(|block| AtariCustomBlock {
+            start_sample: block.start_micros.saturating_mul(rate) / 1_000_000,
+            end_sample: block.end_micros.saturating_mul(rate) / 1_000_000,
+            bytes: block.bytes,
+            start_micros: block.start_micros,
+            end_micros: block.end_micros,
+            decoded_bits: block.decoded_bits,
+            ambiguous_bits: block.ambiguous_bits,
+            mode: block.mode,
+            bit_order: block.bit_order,
+            confidence: block.confidence,
+        })
+        .collect::<Vec<_>>();
+    let loader_class = if stages.len() > 1 {
+        "MultiStage"
+    } else if blocks
+        .iter()
+        .any(|block| block.mode == crate::tape_audio::CustomSymbolMode::PairedPulse)
+    {
+        "GenericTurbo"
+    } else if !stages.is_empty() {
+        "CustomPulse"
+    } else {
+        "UnknownCustom"
+    };
+    let mut warnings = generic_warnings;
+    warnings.retain(|warning| !warning.contains("no stable non-ROM custom pilot"));
+    if stages.is_empty() {
+        warnings.push("No bounded non-standard Atari stage followed the standard anchor".into());
+    }
+    if blocks.iter().any(|block| block.ambiguous_bits > 0) {
+        warnings.push("Atari custom stage retained with ambiguous symbols".into());
+    }
+    if !stages_start.is_empty() && stages_start.windows(2).any(|w| w[0] >= w[1]) {
+        warnings.push("Atari custom stage ordering was ambiguous".into());
+    }
+    Ok(AtariCustomWavRecovery {
+        standard,
+        fingerprint: atari_custom_fingerprint(&stages),
+        stages,
+        blocks,
+        loader_class,
+        warnings,
+    })
+}
+
+/// Stable Atari custom-stage fingerprint. It uses normalized timing families,
+/// mode/order and relative inter-stage gaps, never sample indices or PCM.
+pub fn atari_custom_fingerprint(stages: &[AtariCustomStage]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"atari-custom-loader-v1\0");
+    hash.update((stages.len() as u32).to_le_bytes());
+    for pair in stages.windows(2) {
+        let gap = pair[1]
+            .evidence
+            .start_micros
+            .saturating_sub(pair[0].evidence.end_micros);
+        hash.update((gap / 1_000).to_le_bytes());
+    }
+    for stage in stages {
+        hash.update((stage.evidence.pilot_count as u32).to_le_bytes());
+        for timing in crate::tape_audio::custom_timing_fingerprint(&stage.evidence) {
+            hash.update((timing / 100_000 * 100_000).to_le_bytes());
+        }
+        hash.update([match stage.evidence.symbol_mode {
+            Some(crate::tape_audio::CustomSymbolMode::PairedPulse) => 1,
+            Some(crate::tape_audio::CustomSymbolMode::SinglePulse) => 2,
+            None => 0,
+        }]);
+        hash.update([match stage.evidence.bit_order {
+            crate::tape_audio::CustomBitOrder::MsbFirst => 1,
+            crate::tape_audio::CustomBitOrder::LsbFirst => 2,
+            crate::tape_audio::CustomBitOrder::Ambiguous => 0,
+        }]);
+    }
+    hash.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -497,6 +668,40 @@ mod tests {
         wav(rate, &samples)
     }
 
+    fn append_intervals(rate: u32, mut samples: Vec<u8>, intervals: &[u64]) -> Vec<u8> {
+        let mut high = true;
+        for micros in intervals {
+            let count = (micros.saturating_mul(rate as u64) / 1_000_000).max(1) as usize;
+            samples.extend(std::iter::repeat_n(if high { 235 } else { 20 }, count));
+            high = !high;
+        }
+        wav(rate, &samples)
+    }
+
+    fn custom_stage_intervals() -> Vec<u64> {
+        let mut intervals = vec![1_200; 96];
+        intervals.push(300);
+        let bytes = [0x01, 0xa5, 0x5a, 0xff];
+        for byte in bytes {
+            for bit in (0..8).rev() {
+                let pulse = if (byte >> bit) & 1 == 0 { 700 } else { 900 };
+                intervals.extend([pulse, pulse]);
+            }
+        }
+        intervals.extend([700, 700, 700]);
+        intervals
+    }
+
+    fn custom_wave(rate: u32, standard: Option<&[u8]>, intervals: &[u64]) -> Vec<u8> {
+        let base = if let Some(frame) = standard {
+            let records = vec![frame.to_vec()];
+            make_wave(rate, &records, 1.0)
+        } else {
+            make_wave(rate, &[], 1.0)
+        };
+        append_intervals(rate, base[44..].to_vec(), intervals)
+    }
+
     #[test]
     fn standard_records_recover_across_sample_rates() {
         let frame = record(0xfc, b"ATARI", false);
@@ -565,5 +770,93 @@ mod tests {
         );
         assert_eq!(analysis.platform, Some("Atari 8-bit"));
         assert_eq!(analysis.entries[0].length, 128);
+    }
+
+    #[test]
+    fn strong_atari_anchor_unlocks_generic_turbo_and_preserves_standard_records() {
+        let frame = record(0xfc, b"BOOT", false);
+        let result = decode_atari_custom_wav(&custom_wave(
+            44_100,
+            Some(&frame),
+            &custom_stage_intervals(),
+        ))
+        .unwrap();
+        assert_eq!(result.standard.records[0].checksum, AtariChecksum::Valid);
+        assert_eq!(result.loader_class, "GenericTurbo");
+        assert_eq!(result.stages.len(), 1);
+        assert_eq!(result.blocks[0].bytes[0], 0x01);
+        assert!(result.blocks[0].start_sample > result.standard.records[0].end_sample);
+    }
+
+    #[test]
+    fn custom_pulse_and_unknown_fallbacks_remain_conservative() {
+        let frame = record(0xfc, b"BOOT", false);
+        let mut pulse = vec![1_200; 96];
+        pulse.push(300);
+        pulse.extend(std::iter::repeat_n(450, 32));
+        let result = decode_atari_custom_wav(&custom_wave(48_000, Some(&frame), &pulse)).unwrap();
+        assert_eq!(result.loader_class, "CustomPulse");
+        assert!(result.blocks.is_empty());
+
+        let unanchored =
+            decode_atari_custom_wav(&custom_wave(44_100, None, &custom_stage_intervals())).unwrap();
+        assert_eq!(unanchored.loader_class, "UnknownCustom");
+        assert!(unanchored.stages.is_empty());
+    }
+
+    #[test]
+    fn checksum_invalid_anchor_does_not_unlock_custom_recovery() {
+        let frame = record(0xfc, b"BAD", true);
+        let result = decode_atari_custom_wav(&custom_wave(
+            44_100,
+            Some(&frame),
+            &custom_stage_intervals(),
+        ))
+        .unwrap();
+        assert!(result.stages.is_empty());
+        assert_eq!(result.loader_class, "UnknownCustom");
+    }
+
+    #[test]
+    fn custom_fingerprint_is_rate_stable_and_drift_sensitive() {
+        let frame = record(0xfc, b"BOOT", false);
+        let a = decode_atari_custom_wav(&custom_wave(
+            44_100,
+            Some(&frame),
+            &custom_stage_intervals(),
+        ))
+        .unwrap();
+        let b = decode_atari_custom_wav(&custom_wave(
+            48_000,
+            Some(&frame),
+            &custom_stage_intervals(),
+        ))
+        .unwrap();
+        assert_eq!(a.fingerprint, b.fingerprint);
+
+        let drifted = custom_stage_intervals()
+            .into_iter()
+            .map(|value| {
+                if value == 700 {
+                    800
+                } else if value == 900 {
+                    1_100
+                } else {
+                    value
+                }
+            })
+            .collect::<Vec<_>>();
+        let c = decode_atari_custom_wav(&custom_wave(44_100, Some(&frame), &drifted)).unwrap();
+        assert_ne!(a.fingerprint, c.fingerprint);
+    }
+
+    #[test]
+    fn standard_only_has_no_custom_classification() {
+        let frame = record(0xfc, b"ONLY", false);
+        let result =
+            decode_atari_custom_wav(&make_wave(22_050, std::slice::from_ref(&frame), 1.0)).unwrap();
+        assert!(result.standard.records.len() == 1);
+        assert!(result.stages.is_empty());
+        assert_eq!(result.loader_class, "UnknownCustom");
     }
 }
