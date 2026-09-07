@@ -242,8 +242,8 @@ pub use cheat_ir::{
     CheatSourceFormat, CheatTargetFormat, ConversionCapability, DsActionReplayClassification,
     DsActionReplayUnsupported, DsActionReplayUnsupportedKind, OperationConversionStatus,
     TargetCapability, assess_document_conversion, convert_cheat_document, dolphin_line_to_ir,
-    ds_action_replay_line_to_ir, encode_ds_action_replay_operation, encode_operation,
-    export_conversion_preview, parse_ds_action_replay_document, pnach_line_to_ir,
+    dolphin_on_frame_line_to_ir, ds_action_replay_line_to_ir, encode_ds_action_replay_operation,
+    encode_operation, export_conversion_preview, parse_ds_action_replay_document, pnach_line_to_ir,
     supported_targets_for,
 };
 pub use cheat_journey::{

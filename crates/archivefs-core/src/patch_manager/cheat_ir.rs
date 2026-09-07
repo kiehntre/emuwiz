@@ -19,6 +19,7 @@ pub enum CheatPlatform {
 pub enum CheatSourceFormat {
     DolphinActionReplay,
     Gecko,
+    DolphinOnFrame,
     Pnach,
     RetroArch,
     ActionReplayDs,
@@ -38,6 +39,18 @@ pub enum CheatOperation {
         value: u16,
     },
     Write32 {
+        address: u64,
+        value: u32,
+    },
+    OnFrameWrite8 {
+        address: u64,
+        value: u8,
+    },
+    OnFrameWrite16 {
+        address: u64,
+        value: u16,
+    },
+    OnFrameWrite32 {
         address: u64,
         value: u32,
     },
@@ -105,6 +118,7 @@ pub struct CheatDocument {
 pub enum CheatTargetFormat {
     DolphinActionReplay,
     Gecko,
+    DolphinOnFrame,
     Pnach,
     RetroArch,
     ActionReplayDs,
@@ -185,6 +199,73 @@ pub fn dolphin_line_to_ir(raw: &str, format: CheatSourceFormat) -> CheatOperatio
     }
 }
 
+fn parse_on_frame_hex(raw: &str) -> Option<u32> {
+    let value = raw.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    (!value.is_empty() && value.len() <= 8)
+        .then(|| u32::from_str_radix(value, 16).ok())
+        .flatten()
+}
+
+/// Maps only unconditional Dolphin OnFrame memory writes. OnFrame entries are
+/// applied on Dolphin's frame patch cycle, so they use distinct IR variants
+/// rather than losing their execution policy as ordinary writes.
+pub fn dolphin_on_frame_line_to_ir(raw: &str) -> CheatOperation {
+    let mut normalized = raw.trim().to_string();
+    if let Some(index) = normalized.find('=') {
+        normalized.replace_range(index..=index, ":");
+    }
+    let fields: Vec<_> = normalized.split(':').map(str::trim).collect();
+    if fields.len() != 3 {
+        return CheatOperation::UnsupportedRaw {
+            source_format: CheatSourceFormat::DolphinOnFrame,
+            raw: raw.to_string(),
+            reason: "malformed or conditional OnFrame patch".into(),
+        };
+    }
+    let Some(address) = parse_on_frame_hex(fields[0]) else {
+        return CheatOperation::UnsupportedRaw {
+            source_format: CheatSourceFormat::DolphinOnFrame,
+            raw: raw.to_string(),
+            reason: "OnFrame address is not a valid 32-bit hexadecimal value".into(),
+        };
+    };
+    let Some(value) = parse_on_frame_hex(fields[2]) else {
+        return CheatOperation::UnsupportedRaw {
+            source_format: CheatSourceFormat::DolphinOnFrame,
+            raw: raw.to_string(),
+            reason: "OnFrame value is not a valid 32-bit hexadecimal value".into(),
+        };
+    };
+    match fields[1].to_ascii_lowercase().as_str() {
+        "byte" if value <= u32::from(u8::MAX) => CheatOperation::OnFrameWrite8 {
+            address: u64::from(address),
+            value: value as u8,
+        },
+        "word" if value <= u32::from(u16::MAX) => CheatOperation::OnFrameWrite16 {
+            address: u64::from(address),
+            value: value as u16,
+        },
+        "dword" => CheatOperation::OnFrameWrite32 {
+            address: u64::from(address),
+            value,
+        },
+        "byte" | "word" => CheatOperation::UnsupportedRaw {
+            source_format: CheatSourceFormat::DolphinOnFrame,
+            raw: raw.to_string(),
+            reason: "OnFrame value exceeds the declared write width".into(),
+        },
+        _ => CheatOperation::UnsupportedRaw {
+            source_format: CheatSourceFormat::DolphinOnFrame,
+            raw: raw.to_string(),
+            reason: "unsupported or conditional OnFrame patch type".into(),
+        },
+    }
+}
+
 /// Encodes one neutral direct-write operation as canonical Nintendo DS Action
 /// Replay text. This is pure in-memory formatting; it never writes an
 /// emulator file.
@@ -206,6 +287,9 @@ pub fn encode_ds_action_replay_operation(operation: &CheatOperation) -> Option<S
         CheatOperation::Write8 { .. }
         | CheatOperation::Write16 { .. }
         | CheatOperation::Write32 { .. }
+        | CheatOperation::OnFrameWrite8 { .. }
+        | CheatOperation::OnFrameWrite16 { .. }
+        | CheatOperation::OnFrameWrite32 { .. }
         | CheatOperation::UnsupportedRaw { .. } => None,
     }
 }
@@ -473,10 +557,16 @@ pub fn pnach_line_to_ir(raw: &str) -> CheatOperation {
 /// Encodes one neutral direct-write operation for a proven target grammar.
 /// This is pure text generation; it never writes emulator files.
 pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) -> Option<String> {
+    if matches!(target, CheatTargetFormat::DolphinOnFrame) {
+        return encode_on_frame_operation(operation);
+    }
     let (prefix, address, value) = match operation {
         CheatOperation::Write8 { address, value } => (0x00u8, *address, u32::from(*value)),
         CheatOperation::Write16 { address, value } => (0x02u8, *address, u32::from(*value)),
         CheatOperation::Write32 { address, value } => (0x04u8, *address, *value),
+        CheatOperation::OnFrameWrite8 { .. }
+        | CheatOperation::OnFrameWrite16 { .. }
+        | CheatOperation::OnFrameWrite32 { .. } => return None,
         CheatOperation::UnsupportedRaw { .. } => return None,
     };
     match target {
@@ -491,21 +581,41 @@ pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) 
                 CheatOperation::Write8 { .. } => "byte",
                 CheatOperation::Write16 { .. } => "short",
                 CheatOperation::Write32 { .. } => "word",
+                CheatOperation::OnFrameWrite8 { .. }
+                | CheatOperation::OnFrameWrite16 { .. }
+                | CheatOperation::OnFrameWrite32 { .. } => return None,
                 CheatOperation::UnsupportedRaw { .. } => return None,
             };
             let rendered = match operation {
                 CheatOperation::Write8 { value, .. } => format!("{value:02X}"),
                 CheatOperation::Write16 { value, .. } => format!("{value:04X}"),
                 CheatOperation::Write32 { value, .. } => format!("{value:08X}"),
+                CheatOperation::OnFrameWrite8 { .. }
+                | CheatOperation::OnFrameWrite16 { .. }
+                | CheatOperation::OnFrameWrite32 { .. } => return None,
                 CheatOperation::UnsupportedRaw { .. } => return None,
             };
             Some(format!("patch=1,EE,{address:08X},{width},{rendered}"))
         }
         CheatTargetFormat::ActionReplayDs => encode_ds_action_replay_operation(operation),
+        CheatTargetFormat::DolphinOnFrame => unreachable!("handled before target dispatch"),
         CheatTargetFormat::RetroArch
         | CheatTargetFormat::GameSharkPs2
         | CheatTargetFormat::CodeBreakerPs2 => None,
     }
+}
+
+fn encode_on_frame_operation(operation: &CheatOperation) -> Option<String> {
+    let (address, kind, value) = match operation {
+        CheatOperation::OnFrameWrite8 { address, value } => (*address, "byte", u32::from(*value)),
+        CheatOperation::OnFrameWrite16 { address, value } => (*address, "word", u32::from(*value)),
+        CheatOperation::OnFrameWrite32 { address, value } => (*address, "dword", *value),
+        CheatOperation::Write8 { .. }
+        | CheatOperation::Write16 { .. }
+        | CheatOperation::Write32 { .. } => return None,
+        CheatOperation::UnsupportedRaw { .. } => return None,
+    };
+    (address <= u64::from(u32::MAX)).then(|| format!("0x{address:08X}:{kind}:0x{value:08X}"))
 }
 
 pub fn assess_document_conversion(
@@ -516,7 +626,9 @@ pub fn assess_document_conversion(
         (&document.platform, &target),
         (
             CheatPlatform::GameCube | CheatPlatform::Wii,
-            CheatTargetFormat::DolphinActionReplay | CheatTargetFormat::Gecko
+            CheatTargetFormat::DolphinActionReplay
+                | CheatTargetFormat::Gecko
+                | CheatTargetFormat::DolphinOnFrame
         ) | (
             CheatPlatform::Ps2,
             CheatTargetFormat::Pnach
@@ -540,12 +652,15 @@ pub fn assess_document_conversion(
                 _ => "target cannot represent this direct write".into(),
             };
             operation_status.push(OperationConversionStatus::Unsupported { reason });
-        } else {
+        } else if let Some(line) = encode_operation(op, &target) {
             exact += 1;
             operation_status.push(OperationConversionStatus::Exact);
-            if let Some(line) = encode_operation(op, &target) {
-                output.push(line);
-            }
+            output.push(line);
+        } else {
+            unsupported += 1;
+            operation_status.push(OperationConversionStatus::Unsupported {
+                reason: "operation or execution policy is not representable by the target".into(),
+            });
         }
     }
     if !platform_ok {
@@ -604,6 +719,7 @@ pub fn supported_targets_for(document: &CheatDocument) -> Vec<TargetCapability> 
         CheatPlatform::GameCube | CheatPlatform::Wii => vec![
             CheatTargetFormat::DolphinActionReplay,
             CheatTargetFormat::Gecko,
+            CheatTargetFormat::DolphinOnFrame,
         ],
         CheatPlatform::Ps2 => vec![
             CheatTargetFormat::Pnach,
@@ -759,7 +875,7 @@ mod tests {
         assert_eq!(preview.exact_operations, 1);
         assert_eq!(preview.unsupported_operations, 1);
         assert!(!preview.can_apply);
-        assert_eq!(supported_targets_for(&d).len(), 2);
+        assert_eq!(supported_targets_for(&d).len(), 3);
     }
 
     #[test]
@@ -1035,5 +1151,114 @@ mod tests {
             export_conversion_preview(&document, CheatTargetFormat::ActionReplayDs),
             None
         );
+    }
+
+    #[test]
+    fn dolphin_on_frame_direct_writes_preserve_width_and_timing() {
+        assert_eq!(
+            dolphin_on_frame_line_to_ir("0x80001234:byte:0xAB"),
+            CheatOperation::OnFrameWrite8 {
+                address: 0x8000_1234,
+                value: 0xAB,
+            }
+        );
+        assert_eq!(
+            dolphin_on_frame_line_to_ir("80001234:word:0000BEEF"),
+            CheatOperation::OnFrameWrite16 {
+                address: 0x8000_1234,
+                value: 0xBEEF,
+            }
+        );
+        assert_eq!(
+            dolphin_on_frame_line_to_ir("80001234:dword:DEADBEEF"),
+            CheatOperation::OnFrameWrite32 {
+                address: 0x8000_1234,
+                value: 0xDEAD_BEEF,
+            }
+        );
+    }
+
+    #[test]
+    fn dolphin_on_frame_rejects_conditional_and_truncating_forms() {
+        for raw in [
+            "80001234:byte:0xAB:0xCD",
+            "80001234:byte:0x1FF",
+            "80001234:word:0x1_0000",
+            "80001234:float:0x3F800000",
+            "not-hex:dword:1",
+        ] {
+            assert!(matches!(
+                dolphin_on_frame_line_to_ir(raw),
+                CheatOperation::UnsupportedRaw {
+                    source_format: CheatSourceFormat::DolphinOnFrame,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn dolphin_on_frame_encoder_is_canonical_and_same_platform() {
+        let operation = CheatOperation::OnFrameWrite32 {
+            address: 0x8000_1234,
+            value: 0xDEAD_BEEF,
+        };
+        assert_eq!(
+            encode_operation(&operation, &CheatTargetFormat::DolphinOnFrame),
+            Some("0x80001234:dword:0xDEADBEEF".into())
+        );
+        assert_eq!(
+            encode_operation(&operation, &CheatTargetFormat::Gecko),
+            None
+        );
+    }
+
+    #[test]
+    fn dolphin_on_frame_document_requires_complete_supported_output() {
+        let document = CheatDocument {
+            title: "frame patch".into(),
+            platform: CheatPlatform::GameCube,
+            source_format: CheatSourceFormat::DolphinOnFrame,
+            operations: vec![
+                CheatOperation::OnFrameWrite8 {
+                    address: 0x8000_1234,
+                    value: 1,
+                },
+                CheatOperation::UnsupportedRaw {
+                    source_format: CheatSourceFormat::DolphinOnFrame,
+                    raw: "80001234:byte:1:2".into(),
+                    reason: "conditional OnFrame patch".into(),
+                },
+            ],
+            issues: vec![],
+            provenance: vec!["fixture".into()],
+        };
+        let preview = convert_cheat_document(&document, CheatTargetFormat::DolphinOnFrame);
+        assert_eq!(preview.exact_operations, 1);
+        assert_eq!(preview.unsupported_operations, 1);
+        assert!(!preview.can_apply);
+        assert!(preview.output_preview.is_none());
+        assert_eq!(preview.provenance, document.provenance);
+    }
+
+    #[test]
+    fn dolphin_direct_write_conversion_to_on_frame_is_not_assumed() {
+        let document = CheatDocument {
+            title: "direct".into(),
+            platform: CheatPlatform::GameCube,
+            source_format: CheatSourceFormat::Gecko,
+            operations: vec![CheatOperation::Write16 {
+                address: 0x8000_1234,
+                value: 0xBEEF,
+            }],
+            issues: vec![],
+            provenance: vec![],
+        };
+        let preview = convert_cheat_document(&document, CheatTargetFormat::DolphinOnFrame);
+        assert!(!preview.can_apply);
+        assert_eq!(preview.output_preview, None);
+        assert!(supported_targets_for(&document)
+            .iter()
+            .any(|capability| capability.target == CheatTargetFormat::DolphinOnFrame));
     }
 }

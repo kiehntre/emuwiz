@@ -8,10 +8,11 @@ installers remain the only apply paths.
 ## Model and safety
 
 `CheatDocument` retains the console, source format, title, provenance, typed
-operations and issues.  V1 operations are only `Write8`, `Write16`, and
-`Write32`.  Anything else is retained as `UnsupportedRaw` with its source text
-and a reason.  This prevents conditions, activators, pointers, master codes,
-encrypted codes, and unknown widths from being silently converted to writes.
+operations and issues. V1 direct operations are `Write8`, `Write16`, and
+`Write32`; V10 adds timing-explicit `OnFrameWrite8/16/32`. Anything else is
+retained as `UnsupportedRaw` with its source text and a reason. This prevents
+conditions, activators, pointers, master codes, encrypted codes, and unknown
+widths from being silently converted to writes.
 
 ## Current mappings
 
@@ -29,10 +30,17 @@ encrypted codes, and unknown widths from being silently converted to writes.
 * RetroArch `.cht` entries, GameShark, and CodeBreaker remain native/browse-only
   or opaque until an authoritative, version-specific parser and encoder exist.
   No encrypted representation is guessed.
+* Dolphin `[OnFrame]` has a separate timing-preserving subset. Canonical
+  `0xADDRESS:byte:0xVALUE`, `word`, and `dword` entries map to
+  `OnFrameWrite8`, `OnFrameWrite16`, and `OnFrameWrite32`. These operations are
+  applied on Dolphin's frame patch cycle; they are not collapsed into ordinary
+  writes. Conditional comparands, malformed lines, unsupported types, and
+  values that would be truncated remain `UnsupportedRaw`.
 
 The `encode_operation` helper emits pure in-memory direct-write text for
-Dolphin Action Replay, Gecko, PNACH, and the canonical DS Action Replay
-subset. `assess_document_conversion` returns per-operation status, provenance,
+Dolphin Action Replay, Gecko, PNACH, the canonical DS Action Replay subset,
+and the timing-explicit Dolphin OnFrame format. `assess_document_conversion`
+returns per-operation status, provenance,
 output preview text, and exact/lossy/unsupported counts. A missing
 GameShark/CodeBreaker or RetroArch encoder is reported explicitly, and
 `can_apply` is false whenever an operation, issue, platform, or encoder is
@@ -88,3 +96,21 @@ This is N parsers plus N encoders, rather than an unsafe N×N collection of
 brand-specific translators. AR, Gecko, GameShark, and CodeBreaker are not
 assumed to be universal formats merely because they display hexadecimal code
 lines.
+
+## Dolphin OnFrame boundary (V10)
+
+Dolphin parses OnFrame entries as `address:type:value[:comparand]`, with
+`byte`, `word`, and `dword` direct writes. A fourth field is a conditional
+comparand. The native patch engine applies the OnFrame list during its frame
+patch cycle, so EmuWiz preserves this execution policy in distinct
+`OnFrameWrite8/16/32` operations.
+
+Complete GameCube/Wii OnFrame documents can be rendered back to canonical
+OnFrame text. V10 does not convert ordinary Action Replay/Gecko writes to
+OnFrame, or OnFrame writes to AR/Gecko: the existing neutral direct-write
+address model does not prove exact address-space and lifetime equivalence for
+that conversion. Existing AR/Gecko direct-write conversion is unchanged.
+Float, conditional, branch, pointer, and other stateful patch forms remain
+unsupported. Dolphin's native INI loader/writer already handles
+`[OnFrame]`, `[OnFrame_Enabled]`, and `[OnFrame_Disabled]`; V10 only adds the
+pure IR parser/preview/encoder and writes no emulator files.
