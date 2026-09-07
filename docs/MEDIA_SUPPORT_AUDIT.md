@@ -100,7 +100,7 @@ parsing; **4** verified identity/integrity; **5** user-facing GUI/workflow;
 | Apple II | 2MG | YES | YES | FAMILY | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | PARTIAL | 3 | `apple2_disk` | bounded header/range tests | recursive payload identity |
 | Apple II | WOZ/NIB | YES | YES | NO | PARTIAL | SUMMARY | TOSEC | SUMMARY | NO | NO | 3 | `apple2_disk` | signature/map/geometry tests | flux/GCR interpretation |
 | Macintosh | DC42/HFV/SIT | YES | PARTIAL | FAMILY | PARTIAL | NO | TOSEC | SUMMARY | NO | NO | 3 | `disk_format/dc42`, registry | DC42 tests | HFS/SIT depth |
-| Japanese PCs | D88/HDI/NHD/XDF/DIM | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | PARTIAL | PARTIAL | 5 | `disk_format/d88/hdi/x68000`, `pc98_boot_evidence`, `pc98_container_evidence` | disk-format + PC-98 container/BPB tests | filesystem and launch; non-PC-98 Japanese media remains ambiguous |
+| Japanese PCs | D88/HDI/NHD/XDF/DIM | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | PARTIAL | PARTIAL | 5 | `disk_format/d88/hdi/x68000`, `pc98_boot_evidence`, `pc98_container_evidence`, `fmtowns_boot_evidence`, `fmtowns_container_evidence` | disk-format + PC-98/FM Towns boot-evidence tests | exact titles, filesystem/launch; raw/optical Towns paths and non-PC-98 Japanese media remain scoped separately |
 | DOS/PC | IMG/IMA/RAW FAT12/16 | YES | YES | FAMILY | YES | YES | TOSEC | SUMMARY | YES | YES | 6 | `dos_boot_evidence`, `disk_format` | DOS boot tests | IMD/TD0/DMF |
 | ZX Spectrum | TAP/TZX | YES | YES | YES | YES | YES | TOSEC | DETAILED | YES | YES | 6 | `tape_identity`, `tape_analysis` | TZX semantic tests | named families only Alkatraz |
 | ZX Spectrum | WAV ROM/custom | YES | YES | YES | YES | YES | NO | DETAILED | NO | YES | 5 | `tape_audio`, `tape_analysis` | synthetic WAV tests | broader custom loaders |
@@ -154,6 +154,12 @@ Verified in the current tree and/or local history (local authority wins):
 - PC-98 boot evidence is now wired through validated D88, HDI and NHD layouts
   (`pc98_container_evidence`); generic FAT, geometry-only and conflicting
   Japanese-platform cases remain fail-closed.
+- FM Towns IPL4 evidence is now wired through validated D88, HDI and NHD
+  layouts (`fmtowns_boot_evidence`, `fmtowns_container_evidence`). A valid
+  IPL4 signature plus x86 transfer is strong platform evidence; a bounded
+  `FBIOS` probe can add TownsOS evidence on contiguous HDI/NHD payloads. Generic
+  FAT, container/geometry-only, malformed and filename-only cases remain
+  non-Towns.
 - Atari STX/Pasti, Acorn DFS, D64, DSK, D88, HDI/NHD, XDF/DIM and other disk
   structural parsers listed in `disk_format`.
 - LaserDisc set/framefile verification (`laserdisc_set`, `f892e15`).

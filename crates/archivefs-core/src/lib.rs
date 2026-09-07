@@ -222,6 +222,9 @@ pub mod laserdisc_set;
 /// [`chd_logical_media`] and [`raw_cd_logical_media`].
 pub mod raw_cd_sector;
 
+/// Conservative FM Towns IPL4/TownsOS boot evidence.
+pub mod fmtowns_boot_evidence;
+pub mod fmtowns_container_evidence;
 /// Narrow, representation-independent optical-disc fingerprinting seam.
 pub mod optical_fingerprint;
 /// Conservative PC-98 boot-sector and FAT evidence.

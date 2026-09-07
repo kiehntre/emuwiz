@@ -79,7 +79,17 @@ XDF is headerless raw media. Current validation correctly rejects a same-sized r
 
 ### FM Towns
 
-FM Towns software commonly uses CD media as well as Japanese-compatible floppy formats. Towns system software can boot directly from CD; the current optical path only provides generic disc evidence. A first-sector `IPL4` boot check is a promising family-specific bridge, but it is not currently implemented and must be validated against multiple Towns system/game images before being treated as platform proof. Towns hard-disk images likewise need partition/boot evidence; a generic ISO/FAT result is not enough.
+FM Towns software commonly uses CD media as well as Japanese-compatible floppy formats. Towns system software can boot directly from CD; the current optical path still provides only generic disc evidence. Towns hard-disk images likewise need partition/boot evidence; a generic ISO/FAT result is not enough.
+
+V1 now implements a bounded first-logical-sector IPL4 probe over the already
+validated D88, HDI and NHD container layouts. The exact `IPL4` signature at
+offset zero and a valid x86 short/near transfer are required for strong FM
+Towns platform evidence. BPB fields are retained as corroborative filesystem
+facts only; generic FAT remains generic. For contiguous HDI/NHD payloads, the
+boot-declared IO.SYS range is checked without reading the range, and a bounded
+`FBIOS` prefix probe may mark TownsOS as a candidate. No title is inferred.
+Raw direct floppy access, partition traversal, optical IPL/system-volume
+bridging, and launch readiness remain follow-up work.
 
 ### Filesystem and boot layers
 
@@ -92,7 +102,9 @@ PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is 
    HDI and NHD layouts. It intentionally does not scan un-declared partitions,
    add `fdi`/`hdm`/`hd5`/`hd4` variants, or infer PC-98 from generic FAT.
 3. There is no Human68k partition/FAT/18.3-directory reader for X68000 HDD/floppy payloads; current XDF validation stops at IPL/BPB shape.
-4. There is no FM Towns IPL4/TownsOS boot detector or Towns-specific optical/system-volume evidence bridge.
+4. FM Towns IPL4 evidence is resolved for the bounded D88/HDI/NHD V1 path;
+   Towns-specific optical/system-volume evidence, raw direct floppy access,
+   partition traversal, and launch readiness remain unresolved.
 5. No Japanese-family DAT/hash normalisation bridge turns a validated disk plus a known catalogue into exact software identity.
 6. D88 multi-disk boundary handling is not exposed as a first-class per-disk identity object; the format documentation warns that concatenation may only be inferred from the declared size versus file length.
 
@@ -102,7 +114,9 @@ PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is 
    add partition/filesystem traversal only when real specimens establish safe
    offsets and collision tests; do not weaken the current boot gate.
 2. **X68000 Human68k evidence:** inspect the already validated XDF/DIM payload for IPL, partition marker, BPB, and bounded root entries; add equivalent HDD evidence only after real specimens and a collision corpus are available.
-3. **FM Towns boot/optical bridge:** research and test `IPL4`/TownsOS evidence across floppy, CD and HDD paths; do not infer Towns from ISO, D88, or geometry alone.
+3. **FM Towns optical/raw/HDD expansion:** extend the bounded IPL4/TownsOS
+   evidence to independently validated raw floppy and optical/system-volume
+   paths; do not infer Towns from ISO, D88, or geometry alone.
 4. After those bridges, add DAT/hash identity and launch-profile wiring. Exact software identity should remain DAT/hash-driven even when platform evidence is strong.
 
 ## Top 3 real implementation opportunities
@@ -119,5 +133,7 @@ PC-88/PC-98 media may contain FAT-like layouts, but FAT12/FAT16/BPB geometry is 
 - Human68k SxSI partition/boot layout: [erique/scsitools](https://github.com/erique/scsitools).
 - FM Towns IPL4 boot-sector observation: [YSFLIGHT FM Towns bootloader notes](https://ysflight.in.coocan.jp/FM/towns/bootloader/e.html).
 - FM Towns emulator/boot media context: [MAME FM Towns driver guide](https://wiki.mamedev.org/index.php?title=Driver%3AFMTowns).
+- FM Towns ROM IPL4 and bounded IO.SYS boot flow: [Joe’s FM Towns boot article](https://duriansoftware.com/joe/how-the-fm-towns-boots-from-cd-rom).
+- IPL4 sector shape and the following x86 jump: [OS/2 Museum FM Towns/FMR analysis](https://www.os2museum.com/wp/the-answer-to-0x49-fujitsu-fmr/).
 
 No source above is used to claim exact game identity. DAT/hash verification remains the authority for that layer.
