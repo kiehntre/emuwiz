@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
+use crate::onframe_install_session::OnFrameInstallSession;
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::patch_manager::{
     CheatCandidateOptions, CheatDestinationRequest, CheatDocument, CheatIssue,
@@ -280,6 +281,9 @@ pub(crate) struct UserCheatImportPageState {
     local_pcsx2_install: LocalPcsx2InstallStage,
     local_dolphin_install: LocalDolphinInstallStage,
     local_xenia_install: LocalXeniaInstallStage,
+    /// Dedicated OnFrame workflow state; never shared with Gecko/Action Replay.
+    pub(crate) onframe_install: OnFrameInstallSession,
+    onframe_profile_key: Option<String>,
 }
 
 impl UserCheatImportPageState {
@@ -355,6 +359,7 @@ impl UserCheatImportPageState {
             return;
         }
         self.context_key = context_key;
+        self.onframe_install.reset_for_game_identity_change();
         if self.report_context_key != self.context_key {
             self.generation = self.generation.wrapping_add(1);
             self.task = None;
@@ -374,6 +379,11 @@ impl UserCheatImportPageState {
     ) {
         let context_key = selected_game.map(|(id, _)| id.to_string());
         self.invalidate_if_context_changed(context_key);
+        let profile_key = local_dolphin_install_context.map(|context| context.profile_id.clone());
+        if self.onframe_profile_key != profile_key {
+            self.onframe_profile_key = profile_key;
+            self.onframe_install.reset_for_profile_change();
+        }
         self.poll(context);
 
         widgets::section_header(

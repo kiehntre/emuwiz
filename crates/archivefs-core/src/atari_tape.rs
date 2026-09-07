@@ -820,19 +820,17 @@ mod tests {
     #[test]
     fn custom_fingerprint_is_rate_stable_and_drift_sensitive() {
         let frame = record(0xfc, b"BOOT", false);
-        let a = decode_atari_custom_wav(&custom_wave(
-            44_100,
-            Some(&frame),
-            &custom_stage_intervals(),
-        ))
-        .unwrap();
-        let b = decode_atari_custom_wav(&custom_wave(
-            48_000,
-            Some(&frame),
-            &custom_stage_intervals(),
-        ))
-        .unwrap();
-        assert_eq!(a.fingerprint, b.fingerprint);
+        let recoveries = [22_050, 44_100, 48_000, 96_000]
+            .into_iter()
+            .map(|rate| {
+                decode_atari_custom_wav(&custom_wave(rate, Some(&frame), &custom_stage_intervals()))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let a = &recoveries[0];
+        for recovery in &recoveries[1..] {
+            assert_eq!(a.fingerprint, recovery.fingerprint);
+        }
 
         let drifted = custom_stage_intervals()
             .into_iter()

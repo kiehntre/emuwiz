@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use archivefs_core::patch_manager::{
-    CheatPlatform, DolphinOnFrameBinding, DolphinOnFrameCandidate, DolphinOnFrameInstallStatus,
+    DolphinOnFrameBinding, DolphinOnFrameCandidate, DolphinOnFrameInstallStatus,
     bind_dolphin_onframe_candidate,
 };
 
@@ -118,7 +118,7 @@ impl OnFrameInstallState {
         };
     }
     pub fn approve(&mut self) {
-        let Self::AwaitingConfirmation { binding } = self else {
+        let Self::AwaitingConfirmation { binding, .. } = self else {
             return;
         };
         *self = Self::Applying {
@@ -185,7 +185,9 @@ impl OnFrameInstallState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archivefs_core::patch_manager::{CheatDocument, CheatOperation, CheatSourceFormat};
+    use archivefs_core::patch_manager::{
+        CheatDocument, CheatOperation, CheatPlatform, CheatSourceFormat,
+    };
     fn candidate() -> DolphinOnFrameCandidate {
         DolphinOnFrameCandidate {
             title: "60 FPS".into(),
