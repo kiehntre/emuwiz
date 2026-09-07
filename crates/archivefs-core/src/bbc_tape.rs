@@ -42,6 +42,16 @@ pub struct BbcWavRecovery {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BbcCustomWavRecovery {
+    pub standard_blocks: usize,
+    pub stages: Vec<crate::tape_audio::CustomStageEvidence>,
+    pub blocks: Vec<crate::tape_audio::CustomRecoveredBlock>,
+    pub loader_class: &'static str,
+    pub fingerprint: String,
+    pub warnings: Vec<String>,
+}
+
 /// Decode standard BBC cassette blocks from the already-conditioned WAV edge
 /// stream.  Carrier timing is classified as approximately 1200 Hz (0) or
 /// 2400 Hz (1), then framed as 8N1, least-significant bit first.
@@ -276,6 +286,65 @@ pub fn bbc_wav_tape_analysis(bytes: &[u8]) -> Result<crate::tape_analysis::TapeA
         semantic_blocks: vec!["BBC standard cassette blocks".into()],
         logical_segments: recovery.blocks.len(),
         unsupported_blocks: 0,
+    })
+}
+
+/// Bootstrap-gated generic analysis for post-standard BBC stages.  The
+/// existing custom analyser is reused; without a valid BBC header CRC it is
+/// never allowed to label a stage as BBC custom evidence.
+pub fn decode_bbc_custom_wav(bytes: &[u8]) -> Result<BbcCustomWavRecovery, WavError> {
+    let standard = decode_bbc_wav(bytes)?;
+    let valid_end = standard
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.checksum, BbcChecksum::Valid))
+        .map(|b| b.end_micros)
+        .max();
+    let Some(end) = valid_end else {
+        return Ok(BbcCustomWavRecovery {
+            standard_blocks: 0,
+            stages: Vec::new(),
+            blocks: Vec::new(),
+            loader_class: "UnknownCustom",
+            fingerprint: crate::tape_audio::custom_loader_fingerprint(&[]),
+            warnings: vec![
+                "BBC custom analysis requires a valid standard BBC CRC bootstrap".into(),
+            ],
+        });
+    };
+    let generic = crate::tape_audio::decode_custom_wav(bytes)?;
+    let stages: Vec<_> = generic
+        .stages
+        .into_iter()
+        .filter(|s| s.start_micros >= end)
+        .take(64)
+        .collect();
+    let blocks: Vec<_> = generic
+        .blocks
+        .into_iter()
+        .filter(|b| b.start_micros >= end)
+        .take(256)
+        .collect();
+    let loader_class = if stages.len() > 1 {
+        "MultiStage"
+    } else if stages
+        .iter()
+        .any(|s| s.symbol_mode == Some(crate::tape_audio::CustomSymbolMode::PairedPulse))
+    {
+        "GenericTurbo"
+    } else if !stages.is_empty() {
+        "CustomPulse"
+    } else {
+        "UnknownCustom"
+    };
+    let fingerprint = crate::tape_audio::custom_loader_fingerprint(&stages);
+    Ok(BbcCustomWavRecovery {
+        standard_blocks: standard.blocks.len(),
+        stages,
+        blocks,
+        loader_class,
+        fingerprint,
+        warnings: Vec::new(),
     })
 }
 

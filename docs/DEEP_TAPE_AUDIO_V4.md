@@ -229,3 +229,13 @@ the repository currently has no UEF parser. A future UEF bridge can compare
 the same header fields and block CRCs, but V11 does not invent one or conflate
 container metadata with waveform evidence. All fixtures are synthetic and the
 decoder performs no extraction, launch, DAT, or rename work.
+
+## V12: bootstrap-gated BBC custom stages
+
+V12 reuses the generic bounded custom-stage analyser only after at least one
+standard BBC block has a valid header CRC. Post-bootstrap timing families are
+classified conservatively as `GenericTurbo`, `CustomPulse`, `MultiStage`, or
+`UnknownCustom`, with normalized fingerprints and stage-local provenance. A
+weak carrier match, invalid/truncated BBC header, Spectrum/C64/CPC waveform, or
+random FSK cannot unlock BBC custom labeling. Named BBC loaders and fastloader
+semantics remain deferred.
