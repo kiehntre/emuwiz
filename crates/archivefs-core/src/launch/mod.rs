@@ -67,6 +67,8 @@ pub mod amiberry_cd_discovery;
 pub mod amiberry_cd_execution;
 pub mod amiberry_command;
 pub mod amiberry_execution;
+pub mod amiga_whdload_command;
+pub mod amiga_whdload_execution;
 pub mod azahar_command;
 pub mod azahar_execution;
 pub mod cemu_command;
@@ -155,6 +157,15 @@ pub use amiberry_execution::{
     AmiberryLaunchExecutionError, AmiberryLaunchExitReport, AmiberryLaunchPreflightError,
     AmiberryLaunchPreflightErrorKind, AmiberryLaunchSpawnError, LaunchedAmiberryProcess,
     preflight_amiberry_launch, preflight_and_launch_amiberry, spawn_amiberry,
+};
+pub use amiga_whdload_command::{
+    AmigaWHDLoadCommand, AmigaWHDLoadCommandPlan, SelectedWHDLoadSlave, VerifiedWHDLoadTarget,
+    WHDLoadLaunchInput, WHDLoadProfileInput, WHDLoadRequirements, WhdloadPackageFormat,
+    build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
+};
+pub use amiga_whdload_execution::{
+    AmigaWHDLoadLaunchError, LaunchedAmigaWHDLoadProcess, preflight_amiga_whdload_launch,
+    preflight_and_launch_amiga_whdload, spawn_amiga_whdload,
 };
 pub use azahar_command::{
     AZAHAR_SUPPORTED_PLATFORM_ID, AzaharCommand, AzaharCommandPlan, AzaharLaunchRequest,

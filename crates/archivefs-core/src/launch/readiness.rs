@@ -390,6 +390,22 @@ pub enum LaunchBlockerKind {
     AmiberryKickstartUnavailable,
     /// IPF requires CAPS/SPS support that was not proven available.
     AmiberryIpfBackendUnavailable,
+    /// The verified WHDLoad package/archive was not supplied.
+    WhdloadTargetMissing,
+    /// A verified WHDLoad slave was not selected unambiguously.
+    WhdloadSlaveMissing,
+    /// More than one emulator profile could satisfy the WHDLoad launch.
+    WhdloadProfileAmbiguous,
+    /// The selected WHDLoad package format is outside the proven command slice.
+    WhdloadTargetUnsupported,
+    /// The selected WHDLoad slave is not bound to the verified package.
+    WhdloadSlaveNotBound,
+    /// The selected WHDLoad emulator executable is unavailable.
+    WhdloadExecutableMissing,
+    /// The selected WHDLoad profile/configuration is unavailable.
+    WhdloadProfileMissing,
+    /// WHDLoad's existing Amiga Kickstart readiness gate is not satisfied.
+    WhdloadKickstartUnavailable,
     /// A MAME launch requires a resolved Arcade platform.
     MamePlatformMismatch,
     /// No unique DAT-backed MAME set identity is available.
