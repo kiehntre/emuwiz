@@ -150,6 +150,7 @@ mod emulator_download_page;
 mod emulator_setup_page;
 mod gamer_platform_shelf;
 mod user_cheat_import_page;
+mod onframe_install_state;
 use gamer_platform_shelf::*;
 mod gamer_view;
 use gamer_view::*;
