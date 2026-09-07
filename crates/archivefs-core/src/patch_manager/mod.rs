@@ -48,6 +48,7 @@ mod dolphin_dedup;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
+mod dolphin_onframe_install_plan;
 mod dolphin_texture_mod;
 mod dolphin_texture_pack;
 mod duckstation_firmware;
@@ -238,13 +239,15 @@ pub use cheat_installer::{
     CheatInstallRunOutcome, execute_cheat_install_run,
 };
 pub use cheat_ir::{
-    CheatConversionPreview, CheatDocument, CheatIssue, CheatOperation, CheatPlatform,
-    CheatSourceFormat, CheatTargetFormat, ConversionCapability, DsActionReplayClassification,
-    DsActionReplayUnsupported, DsActionReplayUnsupportedKind, OperationConversionStatus,
-    TargetCapability, assess_document_conversion, convert_cheat_document, dolphin_line_to_ir,
+    CheatConversionPreview, CheatDocument, CheatEvidenceQuality, CheatIssue, CheatOperation,
+    CheatPlatform, CheatReconciliationEntry, CheatReconciliationGroup, CheatReconciliationOutcome,
+    CheatReconciliationResult, CheatRelationship, CheatSourceFormat, CheatTargetFormat,
+    ConversionCapability, DsActionReplayClassification, DsActionReplayUnsupported,
+    DsActionReplayUnsupportedKind, OperationConversionStatus, TargetCapability,
+    assess_document_conversion, convert_cheat_document, dolphin_line_to_ir,
     dolphin_on_frame_line_to_ir, ds_action_replay_line_to_ir, encode_ds_action_replay_operation,
     encode_operation, export_conversion_preview, parse_ds_action_replay_document, pnach_line_to_ir,
-    supported_targets_for,
+    reconcile_cheats_for_game, supported_targets_for,
 };
 pub use cheat_journey::{
     CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
@@ -389,6 +392,12 @@ pub use dolphin_local::{
     discover_dolphin_profiles, dolphin_user_path, inspect_dolphin_local_game,
     inspect_dolphin_profile, inspect_dolphin_profile_with_activation, match_dolphin_inventory,
     parse_dolphin_version, resolve_dolphin_native_launch_binding, select_dolphin_profile,
+};
+pub use dolphin_onframe_install_plan::{
+    DolphinOnFrameInstallPlan, DolphinOnFrameInstallPlanError, DolphinOnFrameInstallPreview,
+    DolphinOnFrameInstallPreviewRequest, DolphinOnFrameInstallRequest, DolphinOnFrameInstallStatus,
+    StagedDolphinOnFrameIni, build_dolphin_onframe_install_preview, plan_dolphin_onframe_install,
+    stage_dolphin_onframe_install,
 };
 pub use dolphin_texture_mod::{
     DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DolphinTextureModError, DolphinTextureModErrorKind,

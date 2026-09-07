@@ -114,3 +114,27 @@ Float, conditional, branch, pointer, and other stateful patch forms remain
 unsupported. Dolphin's native INI loader/writer already handles
 `[OnFrame]`, `[OnFrame_Enabled]`, and `[OnFrame_Disabled]`; V10 only adds the
 pure IR parser/preview/encoder and writes no emulator files.
+
+## Dolphin OnFrame transactional installer (V11)
+
+V11 adds a backend-only installer boundary for a complete `DolphinOnFrame`
+document. The destination is the existing Dolphin profile root's
+`GameSettings/<GAMEID>.ini`, or `GameSettings/<GAMEID>r<revision>.ini` when an
+exact verified revision is supplied. The planner requires a valid GameCube/Wii
+identity and refuses any document containing an issue or an operation other
+than a timing-explicit `OnFrameWrite8`, `OnFrameWrite16`, or `OnFrameWrite32`.
+
+The planner edits only the named patch body in `[OnFrame]` and its name in
+`[OnFrame_Enabled]`/`[OnFrame_Disabled]`. A same-title, byte-for-byte matching
+patch is an idempotent no-op (or an enable-only update when its body is
+disabled); a same-title patch with different lines is a hard conflict. New
+titles are appended. `[ActionReplay]`, `[Gecko]`, settings, graphics, and all
+other existing sections are preserved by the full-fidelity INI editor.
+
+The generated INI is staged, then passed through the existing Dolphin shared
+preview and transaction path. Applying it still requires explicit
+confirmation and uses the shared destination re-check, atomic write, backup,
+journal, rollback, and recovery machinery. Planning itself performs no
+filesystem mutation, and no OnFrame timing semantics are converted into
+ordinary AR/Gecko semantics. The optional GUI action remains a later lane;
+V11 exposes only the safe core planner/staging/preview seam.
