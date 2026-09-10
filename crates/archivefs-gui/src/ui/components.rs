@@ -6,6 +6,10 @@ use eframe::egui;
 use super::theme;
 use crate::{ClipboardBackend, open_folder_in_file_manager};
 
+const EMUWIZ_MASCOT_BADGE_PNG: &[u8] = include_bytes!("../../assets/emuwiz_mascot_badge.png");
+const EMUWIZ_MAGIC_DIVIDER_LONG_PNG: &[u8] =
+    include_bytes!("../../assets/emuwiz_magic_divider_long.png");
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionStyle {
     Primary,
@@ -137,6 +141,380 @@ pub(crate) fn page_header_with_icon(ui: &mut egui::Ui, icon: &str, title: &str, 
         });
     });
     ui.add_space(theme::SPACE_2XL.min(theme::SECTION_GAP));
+}
+
+/// The small branded header for dense utility pages. The artwork is cached in
+/// egui's temporary context data, so it is decoded/uploaded once per UI
+/// context and a decode failure simply leaves the native text header intact.
+/// All status content is supplied by the caller; this primitive has no
+/// diagnostic meaning of its own.
+pub(crate) fn workshop_light_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    purpose: &str,
+    status: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(theme::RAISED_SURFACE.gamma_multiply(0.72))
+        .stroke(theme::border(ui))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(texture) =
+                    cached_workshop_texture(ui, "mascot", EMUWIZ_MASCOT_BADGE_PNG)
+                {
+                    ui.add(
+                        egui::Image::new((texture.id(), egui::vec2(42.0, 42.0)))
+                            .sense(egui::Sense::hover()),
+                    );
+                }
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(theme::PAGE_TITLE_SIZE)
+                            .strong(),
+                    );
+                    ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+                    status(ui);
+                });
+            });
+            if let Some(texture) =
+                cached_workshop_texture(ui, "divider", EMUWIZ_MAGIC_DIVIDER_LONG_PNG)
+            {
+                let size = workshop_divider_size(ui.available_width());
+                ui.add(
+                    egui::Image::new((texture.id(), size))
+                        .tint(egui::Color32::from_white_alpha(105))
+                        .sense(egui::Sense::hover()),
+                );
+            }
+        });
+    ui.add_space(theme::SPACE_SM);
+}
+
+fn cached_workshop_texture(ui: &egui::Ui, kind: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("emuwiz-workshop-light-header", kind));
+    if let Some(texture) = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<egui::TextureHandle>(id))
+    {
+        return Some(texture);
+    }
+    // Some headless egui test renderers cap one texture side at 2048 pixels;
+    // the supplied divider is intentionally wide, so downsample only the
+    // uploaded copy while preserving its aspect ratio.
+    let decoded = image::load_from_memory(bytes).ok()?.thumbnail(2048, 2048);
+    let rgba = decoded.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let texture = ui.ctx().load_texture(
+        format!("emuwiz-workshop-light-header-{kind}"),
+        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+        egui::TextureOptions::LINEAR,
+    );
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id, texture.clone()));
+    Some(texture)
+}
+
+fn workshop_divider_size(available_width: f32) -> egui::Vec2 {
+    let width = available_width.clamp(0.0, 520.0);
+    egui::vec2(width, width * 724.0 / 2172.0)
+}
+
+#[cfg(test)]
+mod workshop_light_header_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_workshop_assets_decode() {
+        assert!(image::load_from_memory(EMUWIZ_MASCOT_BADGE_PNG).is_ok());
+        assert!(image::load_from_memory(EMUWIZ_MAGIC_DIVIDER_LONG_PNG).is_ok());
+    }
+
+    #[test]
+    fn invalid_workshop_asset_has_native_fallback_path() {
+        assert!(image::load_from_memory(b"not an image").is_err());
+    }
+
+    #[test]
+    fn divider_keeps_approved_aspect_ratio_and_bounds_narrow_widths() {
+        let size = workshop_divider_size(700.0);
+        assert_eq!(size.x, 520.0);
+        assert!((size.y / size.x - 724.0 / 2172.0).abs() < f32::EPSILON);
+
+        let narrow = workshop_divider_size(80.0);
+        assert_eq!(narrow.x, 80.0);
+        assert!(narrow.y > 0.0);
+    }
+}
+
+/// The shared compact page-hero: a raised card carrying a motif slot, a
+/// title, a one-line purpose, an optional state/safety badge, an optional
+/// small motto line, and a primary-action slot. This is the reusable
+/// building block for the "retro control room" visual direction
+/// (`docs/GUI_DESIGN_SYSTEM.md`) - every major workflow page composes the
+/// same shape instead of inventing its own header/hero layout.
+///
+/// `motif` paints into a fixed-size square slot to its caller's taste (a
+/// lightweight drawn shape, an icon glyph, ...); it must be cheap and
+/// fallback-safe - see each page's own motif function for the concrete
+/// per-workflow treatment. `state_line` is the honest current
+/// readiness/safety statement (e.g. "Read-only inspection"), always paired
+/// with a status tone so meaning never rests on colour alone. `motto` is
+/// the page's single small contextual line (used sparingly - at most one
+/// per page). `primary_action` renders the page's one obvious next step;
+/// pass an empty closure when the page has no single primary action yet.
+/// `signal` renders the page's optional "signal panel" - a small
+/// terminal/oscilloscope-style readout box (see [`signal_panel`]) placed to
+/// the right of the title block, matching the reference mockups' secondary
+/// status readout next to the hero artwork. Pass an empty closure for pages
+/// that have no such readout yet; this never fabricates a reading - callers
+/// only pass their own real, already-known state.
+pub(crate) fn page_hero(
+    ui: &mut egui::Ui,
+    motif: impl FnOnce(&mut egui::Ui, egui::Vec2),
+    title: &str,
+    purpose: &str,
+    state_line: Option<(&str, StatusTone)>,
+    motto: Option<&str>,
+    signal: impl FnOnce(&mut egui::Ui),
+    primary_action: impl FnOnce(&mut egui::Ui),
+) {
+    page_hero_with_motif_size(
+        ui,
+        egui::vec2(56.0, 56.0),
+        motif,
+        title,
+        purpose,
+        state_line,
+        motto,
+        signal,
+        primary_action,
+    );
+}
+
+/// Variant of [`page_hero`] for pages whose visual identity needs a larger
+/// bounded illustration. The default remains compact so existing pages keep
+/// their established layout.
+pub(crate) fn page_hero_with_motif_size(
+    ui: &mut egui::Ui,
+    motif_size: egui::Vec2,
+    motif: impl FnOnce(&mut egui::Ui, egui::Vec2),
+    title: &str,
+    purpose: &str,
+    state_line: Option<(&str, StatusTone)>,
+    motto: Option<&str>,
+    signal: impl FnOnce(&mut egui::Ui),
+    primary_action: impl FnOnce(&mut egui::Ui),
+) {
+    hero_card(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(motif_size, egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 8.0, theme::DEEP_BACKGROUND.gamma_multiply(1.0));
+            {
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                motif(&mut child, motif_size);
+            }
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(theme::PAGE_TITLE_SIZE)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+                if let Some((label, tone)) = state_line {
+                    status_badge(ui, label, tone);
+                }
+                if let Some(motto) = motto {
+                    ui.label(
+                        egui::RichText::new(motto)
+                            .italics()
+                            .small()
+                            .color(theme::muted(ui)),
+                    );
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                signal(ui);
+            });
+        });
+        ui.add_space(theme::SPACE_SM);
+        primary_action(ui);
+    });
+    ui.add_space(theme::SPACE_SM);
+}
+
+/// A dark terminal/oscilloscope-style readout panel - the shared "signal
+/// panel" chrome for the reference mockups' secondary status box next to a
+/// page's hero artwork (Tape Inspector's "TAPE SIGNAL … PLAYING" panel,
+/// Disc Conversion's "FLOOPY POWER … CONVERTING" panel). `lines` are the
+/// caller's own already-known, honest status text (never fabricated data -
+/// an idle state must say idle, a real percentage must be a real
+/// percentage). `reading` paints a bounded custom readout (a waveform, a
+/// progress bar) directly with the painter into the remaining space below
+/// the text - no heap allocation beyond the caller's own bounded drawing,
+/// and no repaint is requested here: callers that animate follow the same
+/// `request_repaint_after` convention as the page's own motif.
+pub(crate) fn signal_panel(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    lines: &[String],
+    reading: impl FnOnce(&egui::Painter, egui::Rect),
+) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, theme::DEEP_BACKGROUND);
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.55)),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(8.0);
+    const LINE_HEIGHT: f32 = 14.0;
+    for (index, line) in lines.iter().enumerate() {
+        painter.text(
+            egui::pos2(inner.left(), inner.top() + index as f32 * LINE_HEIGHT),
+            egui::Align2::LEFT_TOP,
+            line,
+            egui::FontId::monospace(11.0),
+            theme::TEAL,
+        );
+    }
+    let reading_top = inner.top() + lines.len() as f32 * LINE_HEIGHT + 4.0;
+    let reading_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), reading_top.min(inner.bottom())),
+        inner.max,
+    );
+    if reading_rect.height() > 1.0 && reading_rect.width() > 1.0 {
+        reading(painter, reading_rect);
+    }
+}
+
+/// A compact colored badge identifying one supported format (e.g. "TAP",
+/// "CHD") - visually distinct from [`status_badge`] (a state) and
+/// [`info_chip`] (a neutral tag): `accent` is a caller-chosen identity
+/// colour for that one format so a row of formats stays distinguishable at
+/// a glance, matching the reference mockups' per-format colored chips.
+/// Never a status colour - a format chip does not carry a readiness
+/// meaning.
+pub(crate) fn format_chip(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
+    egui::Frame::new()
+        .fill(accent.gamma_multiply(0.22))
+        .stroke(egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.75)))
+        .corner_radius(5)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(accent).strong().small());
+        });
+}
+
+/// A wrapping row of [`format_chip`]s. Callers must only pass formats their
+/// own backend genuinely supports today - this performs no filtering or
+/// validation of its own.
+pub(crate) fn format_chip_row(ui: &mut egui::Ui, chips: &[(&str, egui::Color32)]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+        for (label, accent) in chips {
+            format_chip(ui, label, *accent);
+        }
+    });
+}
+
+/// The shared "Choose -> Step -> Step -> ..." workflow strip for a page with
+/// a real, ordered multi-step flow. `current` is the zero-based index of the
+/// step the user is on now; it is highlighted with both colour (teal) and
+/// text weight/marker so the current step is never communicated by colour
+/// alone. Only render this where the steps are the actual states the page's
+/// own logic walks through - never a fabricated flow.
+pub(crate) fn workflow_strip(ui: &mut egui::Ui, steps: &[&str], current: usize) {
+    const BADGE_DIAMETER: f32 = 24.0;
+    const CONNECTOR_WIDTH: f32 = 22.0;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(2.0, 6.0);
+        for (index, step) in steps.iter().enumerate() {
+            let is_done = index < current;
+            let is_current = index == current;
+            let badge_color = if is_current {
+                theme::TEAL
+            } else if is_done {
+                theme::TEAL.gamma_multiply(0.65)
+            } else {
+                theme::muted(ui)
+            };
+            if index > 0 {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(CONNECTOR_WIDTH, BADGE_DIAMETER),
+                    egui::Sense::hover(),
+                );
+                let connector_color = if index <= current {
+                    theme::TEAL.gamma_multiply(0.7)
+                } else {
+                    theme::muted(ui).gamma_multiply(0.6)
+                };
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::pos2(rect.right(), rect.center().y),
+                    ],
+                    egui::Stroke::new(1.5_f32, connector_color),
+                );
+            }
+            ui.vertical(|ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(BADGE_DIAMETER, BADGE_DIAMETER),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                let radius = BADGE_DIAMETER / 2.0 - 1.0;
+                if is_current {
+                    painter.circle_filled(rect.center(), radius, badge_color.gamma_multiply(0.22));
+                }
+                painter.circle_stroke(
+                    rect.center(),
+                    radius,
+                    egui::Stroke::new(1.5_f32, badge_color),
+                );
+                let badge_text = if is_done {
+                    "✓".to_string()
+                } else {
+                    (index + 1).to_string()
+                };
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    badge_text,
+                    egui::FontId::monospace(12.0),
+                    badge_color,
+                );
+                // Never colour alone: the current step also carries a
+                // leading glyph and bold weight; a completed step keeps its
+                // checkmark from the badge above reflected in its label too.
+                let label = if is_current {
+                    format!("▶ {step}")
+                } else if is_done {
+                    format!("✓ {step}")
+                } else {
+                    (*step).to_string()
+                };
+                let text = if is_current {
+                    egui::RichText::new(label)
+                        .color(theme::TEAL)
+                        .strong()
+                        .small()
+                } else {
+                    egui::RichText::new(label).color(theme::muted(ui)).small()
+                };
+                ui.label(text);
+            });
+        }
+    });
 }
 
 pub(crate) fn section_header(ui: &mut egui::Ui, title: &str, description: Option<&str>) {
@@ -1072,6 +1450,117 @@ mod tests {
             !rendered_text_contains(&output, "download_too_large"),
             "the full error text is preserved, but only behind Technical details"
         );
+    }
+
+    #[test]
+    fn page_hero_renders_title_purpose_state_and_motto() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                page_hero(
+                    ui,
+                    |ui, size| {
+                        // A fallback-safe motif: draws nothing but must not
+                        // panic even though it is given real layout space.
+                        let _ = ui.allocate_exact_size(size, egui::Sense::hover());
+                    },
+                    "Tape Inspector",
+                    "Inspect cassette structure.",
+                    Some(("Read-only inspection", StatusTone::Info)),
+                    Some("Replay your youth."),
+                    |_ui| {},
+                    |ui| {
+                        ui.label("Primary action slot");
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "Tape Inspector"));
+        assert!(rendered_text_contains(
+            &output,
+            "Inspect cassette structure."
+        ));
+        assert!(rendered_text_contains(&output, "Read-only inspection"));
+        assert!(rendered_text_contains(&output, "Replay your youth."));
+        assert!(rendered_text_contains(&output, "Primary action slot"));
+    }
+
+    #[test]
+    fn workflow_strip_highlights_current_step_with_marker_and_colour() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                workflow_strip(ui, &["Choose", "Inspect", "Convert", "Verify"], 1);
+            });
+        });
+        for expected in ["Choose", "Inspect", "Convert", "Verify"] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "workflow_strip did not render {expected:?}"
+            );
+        }
+        // The current step is marked with a non-colour cue (the leading
+        // glyph plus its numbered/checkmark badge), not colour alone.
+        assert!(rendered_text_contains(&output, "▶ Inspect"));
+        assert!(rendered_text_contains(&output, "✓ Choose"));
+    }
+
+    #[test]
+    fn signal_panel_renders_its_status_lines_and_reading() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                signal_panel(
+                    ui,
+                    egui::vec2(160.0, 70.0),
+                    &["TAPE SIGNAL".to_string(), "IDLE".to_string()],
+                    |painter, rect| {
+                        painter.line_segment(
+                            [rect.left_center(), rect.right_center()],
+                            egui::Stroke::new(1.5_f32, theme::TEAL),
+                        );
+                    },
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "TAPE SIGNAL"));
+        assert!(rendered_text_contains(&output, "IDLE"));
+    }
+
+    #[test]
+    fn signal_panel_is_fallback_safe_at_degenerate_sizes() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                signal_panel(ui, egui::vec2(0.0, 0.0), &[], |_painter, _rect| {});
+                signal_panel(
+                    ui,
+                    egui::vec2(40.0, 10.0),
+                    &["ONE".to_string(), "TWO".to_string(), "THREE".to_string()],
+                    |_painter, _rect| {},
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn format_chip_row_renders_every_label() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                format_chip_row(
+                    ui,
+                    &[
+                        ("TAP", egui::Color32::from_rgb(59, 130, 246)),
+                        ("TZX / CDT", theme::SUCCESS),
+                        ("T64", egui::Color32::from_rgb(168, 85, 247)),
+                    ],
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "TAP"));
+        assert!(rendered_text_contains(&output, "TZX / CDT"));
+        assert!(rendered_text_contains(&output, "T64"));
     }
 
     #[test]
