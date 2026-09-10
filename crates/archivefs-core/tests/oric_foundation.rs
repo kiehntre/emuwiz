@@ -174,6 +174,27 @@ fn extensions_register_candidates_without_proving_oric() {
 }
 
 #[test]
+fn standard_tap_fields_and_shared_tape_analysis() {
+    let bytes = tap(b"HEADER ONLY", 0x500, &[1, 2, 3]);
+    let parsed = parse_oric_tap(&bytes).unwrap();
+    let h = &parsed.blocks[0];
+    assert_eq!(h.filename, "HEADER ONLY");
+    assert_eq!(h.start_address, 0x500);
+    assert_eq!(h.end_address, 0x502);
+    assert_eq!(h.payload_length, 3);
+    assert_eq!(h.program_kind, OricProgramKind::MachineCode);
+    assert_eq!(h.auto_start, OricAutoStart::MachineCode);
+    let analysis = analyze_tape(&bytes).unwrap();
+    assert_eq!(analysis.format, TapeFormat::OricTap);
+    assert_eq!(analysis.checksum, ChecksumState::NotPresent);
+    assert_eq!(analysis.entries[0].load_address, Some(0x500));
+    assert_eq!(
+        observe_oric_media(&bytes).unwrap().machine_compatibility(),
+        OricMachineCompatibility::Undetermined
+    );
+}
+
+#[test]
 fn basic_and_non_autostart_headers_and_multiple_segments() {
     let mut first = tap(b"", 0x501, &[1]);
     first[6] = 0;
@@ -656,6 +677,39 @@ fn corrupt_complete_member_reads_still_consume_archive_budget() {
     )
     .unwrap();
     assert!(subsequent.evidence.is_empty());
+}
+
+#[test]
+fn sevenz_uses_the_same_complete_observer_and_provenance() {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    let dir = Temp::new();
+    let path = dir.0.join("fixture.7z");
+    let bytes = mfm(1, 40, 17);
+    let mut writer = ArchiveWriter::new(fs::File::create(&path).unwrap()).unwrap();
+    let mut entry = ArchiveEntry::new_file("nested/media.dsk");
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(std::io::Cursor::new(&bytes)))
+        .unwrap();
+    writer.finish().unwrap();
+    let original = fs::read(&path).unwrap();
+    let result = archivefs_core::archive_member_content_evidence::observe_sevenz_member_content(
+        &path,
+        &TrustedRoots::none(),
+        archivefs_core::dat::archive::limits::ArchiveLimits::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(result.members.len(), 1);
+    let m = &result.members[0];
+    assert_eq!(m.member_index, 0);
+    assert_eq!(m.member_name, "nested/media.dsk");
+    assert_eq!(m.declared_size, bytes.len() as u64);
+    assert_eq!(
+        fuse_platform_evidence(m.evidence.clone()).resolved_platform,
+        Some("Oric")
+    );
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 #[test]

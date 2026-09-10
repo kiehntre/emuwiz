@@ -179,6 +179,7 @@ pub(crate) fn format_label(format: TapeFormat) -> &'static str {
         TapeFormat::T64 => "T64",
         TapeFormat::BbcUef => "UEF",
         TapeFormat::DragonCocoCas => "CAS",
+        TapeFormat::OricTap => "TAP",
     }
 }
 

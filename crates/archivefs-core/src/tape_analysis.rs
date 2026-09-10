@@ -197,6 +197,11 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
             return Ok(analysis);
         }
     }
+    if crate::oric_tape::has_oric_leader(bytes) {
+        let observation = crate::oric_tape::parse_oric_tap(bytes)
+            .map_err(|error| TapeAnalysisError::Malformed(format!("{error:?}")))?;
+        return Ok(observation.analysis());
+    }
     let obs = parse_zx_tap(bytes).map_err(|e| TapeAnalysisError::Malformed(e.to_string()))?;
     let mut entries = Vec::new();
     let mut has_basic = false;

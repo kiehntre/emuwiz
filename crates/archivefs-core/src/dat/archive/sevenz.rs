@@ -642,7 +642,9 @@ impl SevenZArchiveSource {
         use crate::archive_member_content_evidence::{
             ArchiveMemberContentResult, MemberProbeOutcome,
         };
-        use crate::content_detector::run_content_detectors;
+        use crate::content_detector::stream_probe::{
+            probe_content_stream, MAX_COMPLETE_INPUT_BYTES,
+        };
         use crate::inspector::InspectorEntryClassification;
 
         let members: Vec<MemberMeta> = self.members.clone();
@@ -650,6 +652,7 @@ impl SevenZArchiveSource {
         let reader = &mut self.reader;
         let mut cursor: usize = 0;
         let mut total_consumed: u64 = 0;
+        let mut complete_input_budget = MAX_COMPLETE_INPUT_BYTES;
         let mut results: Vec<ArchiveMemberContentResult> = Vec::with_capacity(members.len());
         let mut stop = false;
 
@@ -745,14 +748,17 @@ impl SevenZArchiveSource {
                 return Ok(false);
             }
 
-            let mut buf = Vec::with_capacity(max_probe_bytes.min(1 << 16));
-            let mut limited = stream.take(max_probe_bytes as u64);
-            let read_result = limited.read_to_end(&mut buf);
-            let inner = limited.into_inner();
-            match read_result {
-                Ok(bytes_probed) => {
+            let mut stream = stream;
+            match probe_content_stream(
+                &mut stream,
+                meta.logical_size,
+                max_probe_bytes,
+                &mut complete_input_budget,
+                detectors,
+            ) {
+                Ok((bytes_probed, report)) => {
                     let remaining = meta.logical_size.saturating_sub(bytes_probed as u64);
-                    if let Err(error) = drain_member(inner, remaining, cancel) {
+                    if let Err(error) = drain_member(&mut stream, remaining, cancel) {
                         stop = true;
                         results.push(ArchiveMemberContentResult {
                             member_index: index,
@@ -764,13 +770,12 @@ impl SevenZArchiveSource {
                         return Ok(false);
                     }
                     total_consumed = consumed_after;
-                    let evidence = run_content_detectors(detectors.iter().copied(), &buf).evidence;
                     results.push(ArchiveMemberContentResult {
                         member_index: index,
                         member_name: meta.name.clone(),
                         declared_size: meta.logical_size,
                         outcome: MemberProbeOutcome::Probed { bytes_probed },
-                        evidence,
+                        evidence: report.evidence,
                     });
                     Ok(true)
                 }
