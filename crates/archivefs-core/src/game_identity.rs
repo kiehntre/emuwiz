@@ -362,6 +362,8 @@ pub enum IdentityPlatform {
     GameBoyColor,
     GameBoyAdvance,
     VirtualBoy,
+    PokemonMini,
+    WataraSupervision,
     N64,
     Commodore64,
     Vic20,
@@ -381,6 +383,7 @@ pub enum IdentityPlatform {
     AtariLynx,
     AtariJaguar,
     AtariST,
+    Enterprise,
     Other,
 }
 
@@ -416,6 +419,12 @@ impl IdentityPlatform {
             "game boy color" | "gbc" | "nintendo game boy color" => Self::GameBoyColor,
             "game boy advance" | "gba" | "nintendo game boy advance" => Self::GameBoyAdvance,
             "virtual boy" | "virtualboy" | "vb" | "nintendo virtual boy" => Self::VirtualBoy,
+            "pokémon mini" | "pokemon mini" | "pokemonmini" | "nintendo pokemon mini" => {
+                Self::PokemonMini
+            }
+            "watara supervision" | "supervision" | "watara-supervision" | "svision" => {
+                Self::WataraSupervision
+            }
             "n64" | "nintendo 64" | "nintendo64" => Self::N64,
             "commodore 64" | "commodore64" | "c64" => Self::Commodore64,
             "vic-20" | "vic20" | "commodore vic-20" | "commodore vic20" => Self::Vic20,
@@ -461,6 +470,8 @@ impl IdentityPlatform {
             }
             "atari st" | "atarist" | "atari ste" | "atariste" | "atari tt" | "atarittu"
             | "atari falcon" | "atarifalcon" => Self::AtariST,
+            "enterprise" | "enterprise 64" | "enterprise64" | "ep64" | "enterprise 128"
+            | "enterprise128" | "ep128" => Self::Enterprise,
             _ => Self::Other,
         }
     }
@@ -488,6 +499,8 @@ impl IdentityPlatform {
             Self::GameBoyColor => "Game Boy Color",
             Self::GameBoyAdvance => "Game Boy Advance",
             Self::VirtualBoy => "Nintendo Virtual Boy",
+            Self::PokemonMini => "Nintendo Pokémon Mini",
+            Self::WataraSupervision => "Watara Supervision",
             Self::N64 => "Nintendo 64",
             Self::Commodore64 => "Commodore 64",
             Self::Vic20 => "VIC-20",
@@ -507,6 +520,7 @@ impl IdentityPlatform {
             Self::AtariLynx => "Atari Lynx",
             Self::AtariJaguar => "Atari Jaguar",
             Self::AtariST => "Atari ST",
+            Self::Enterprise => "Enterprise 64/128",
             Self::Other => "Unsupported platform",
         }
     }
@@ -918,6 +932,7 @@ fn inspect_game_identity_with_platform_trust(
             | IdentityPlatform::GameBoyColor
             | IdentityPlatform::GameBoyAdvance
             | IdentityPlatform::VirtualBoy
+            | IdentityPlatform::PokemonMini
             | IdentityPlatform::N64
             | IdentityPlatform::Atari2600
             | IdentityPlatform::Atari5200
@@ -1278,6 +1293,8 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::GameBoyAdvance, "gba") => Some("gba"),
         (IdentityPlatform::VirtualBoy, "vb") => Some("vb"),
         (IdentityPlatform::VirtualBoy, "vboy") => Some("vboy"),
+        (IdentityPlatform::PokemonMini, "min") => Some("min"),
+        (IdentityPlatform::WataraSupervision, "sv") => Some("sv"),
         (IdentityPlatform::N64, "z64") => Some("z64"),
         (IdentityPlatform::N64, "v64") => Some("v64"),
         (IdentityPlatform::N64, "n64") => Some("n64"),
@@ -1433,6 +1450,7 @@ fn inspect_loose_rom(
     let mut atari7800_header = None;
     let mut lynx_header = None;
     let mut ngp_header = None;
+    let mut pokemon_mini_header = None;
     if report.platform == IdentityPlatform::Nes && format == "nes" {
         nes_header = inspect_nes_header(&mut file, before.len);
     }
@@ -1489,6 +1507,35 @@ fn inspect_loose_rom(
         };
         report.platform = platform;
         ngp_header = Some(fact);
+    }
+    if report.platform == IdentityPlatform::PokemonMini {
+        if before.len > crate::pokemon_mini_header_evidence::POKEMON_MINI_MAX_ROM_BYTES as u64 {
+            add_loose_rom_unavailable(
+                report,
+                IdentityStatus::ResourceLimitReached,
+                "the Pokémon Mini cartridge exceeds the documented 2 MiB address space",
+            );
+            return;
+        }
+        file.seek(SeekFrom::Start(0)).ok();
+        let read_len = before
+            .len
+            .min(crate::pokemon_mini_header_evidence::POKEMON_MINI_MAX_ROM_BYTES as u64)
+            as usize;
+        let mut bytes = vec![0u8; read_len];
+        if file.read_exact(&mut bytes).is_ok() {
+            pokemon_mini_header =
+                crate::pokemon_mini_header_evidence::parse_pokemon_mini_header(&bytes);
+        }
+        file.seek(SeekFrom::Start(0)).ok();
+        if pokemon_mini_header.is_none() {
+            add_loose_rom_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "the Pokémon Mini cartridge header did not validate against the file",
+            );
+            return;
+        }
     }
     if (format == "a78" && atari7800_header.is_none()) || (format == "lnx" && lynx_header.is_none())
     {
@@ -1639,6 +1686,20 @@ fn inspect_loose_rom(
                 fact.system_flag, fact.software_id, fact.version, fact.title
             ),
             "ngp_header_evidence::parse_ngp_header",
+        ));
+    }
+    if let Some(fact) = pokemon_mini_header {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::Platform,
+            IdentityStatus::Verified,
+            Some(IdentityPlatform::PokemonMini.label().to_string()),
+            IdentityConfidence::StructuredMetadata,
+            &format!(
+                "Pokémon Mini cartridge header validated: game code {:?}, title {:?}, optional PM marker {}",
+                fact.game_code, fact.title, fact.pm_marker_present
+            ),
+            "pokemon_mini_header_evidence::parse_pokemon_mini_header",
         ));
     }
     if let Some(bytes) = whole_file_bytes.as_deref() {
@@ -3540,6 +3601,8 @@ fn inspect_iso_source(
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::VirtualBoy
+        | IdentityPlatform::PokemonMini
+        | IdentityPlatform::WataraSupervision
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
@@ -3550,6 +3613,7 @@ fn inspect_iso_source(
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::Enterprise
         | IdentityPlatform::Amiga
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
@@ -6448,7 +6512,10 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         IdentityPlatform::Pcfx => &[IdentityKind::PcfxDiscHash],
         IdentityPlatform::PcEngineCd => &[IdentityKind::PceCdBootStructure],
         IdentityPlatform::NeoGeoCd => &[IdentityKind::NeoGeoCdBootStructure],
-        IdentityPlatform::Ngp | IdentityPlatform::Ngpc => &[IdentityKind::LooseRomSha256],
+        IdentityPlatform::Ngp | IdentityPlatform::Ngpc | IdentityPlatform::PokemonMini => {
+            &[IdentityKind::LooseRomSha256]
+        }
+        IdentityPlatform::WataraSupervision => &[IdentityKind::LooseRomSha256],
         IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -6456,6 +6523,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar => &[IdentityKind::LooseRomSha256],
         IdentityPlatform::AtariST => &[],
+        IdentityPlatform::Enterprise => &[],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
         }
@@ -6661,6 +6729,8 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::VirtualBoy
+        | IdentityPlatform::PokemonMini
+        | IdentityPlatform::WataraSupervision
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
@@ -6682,6 +6752,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::Enterprise
         | IdentityPlatform::Amiga
         | IdentityPlatform::Other => {}
     }

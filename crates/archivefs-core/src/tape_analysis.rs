@@ -13,6 +13,7 @@ pub const MAX_ANALYSIS_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TapeFormat {
+    OricTap,
     ZxTap,
     Tzx,
     CommodoreTap,

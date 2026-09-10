@@ -105,6 +105,7 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     // exact identity remains DAT/hash-driven and has no header parser here.
     cf("vb", ContentKind::RomCartridge),
     cf("vboy", ContentKind::RomCartridge),
+    cf("min", ContentKind::RomCartridge),
     // --- Sega ---
     cf("sms", ContentKind::RomCartridge),
     cf("gg", ContentKind::RomCartridge),
@@ -157,6 +158,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("lzh", ContentKind::AmigaImage),
     // --- Computer formats already supported elsewhere in EmuWiz ---
     cf("dsk", ContentKind::ComputerDisk),
+    cf("sap", ContentKind::ComputerDisk),
+    cf("k7", ContentKind::TapeImage),
+    cf("m5", ContentKind::RomCartridge),
+    cf("m7", ContentKind::RomCartridge),
     cf("d64", ContentKind::ComputerDisk),
     cf("g64", ContentKind::ComputerDisk),
     cf("d71", ContentKind::ComputerDisk),

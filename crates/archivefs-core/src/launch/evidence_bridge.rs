@@ -182,6 +182,9 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         // launch identity kind exists for them yet. PS4 has bounded
         // PARAM.SFO identity but no launch support in this phase.
         IdentityPlatform::PlayStation4
+        | IdentityPlatform::PokemonMini
+        | IdentityPlatform::WataraSupervision
+        | IdentityPlatform::Enterprise
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
@@ -401,6 +404,9 @@ fn resolved_identity_for_platform(
         // already returned `None` above, so this arm is only for
         // exhaustiveness.
         IdentityPlatform::PlayStation4
+        | IdentityPlatform::PokemonMini
+        | IdentityPlatform::WataraSupervision
+        | IdentityPlatform::Enterprise
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch

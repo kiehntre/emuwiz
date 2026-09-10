@@ -26,6 +26,7 @@
 //! separately reviewed layers.
 
 use crate::content_evidence::{ContentEvidence, observe_content_evidence};
+pub mod stream_probe;
 
 /// A stable, read-only content detector.
 ///
@@ -55,6 +56,18 @@ pub trait ContentDetector {
     /// [`ContentDetectionOutcome`]/[`ContentDiagnostic`] - the trait does
     /// not model it directly.
     fn detect(&self, data: &[u8]) -> ContentDetectionOutcome;
+
+    /// Observers requiring full input must be excluded by prefix callers
+    /// unless the complete extent is known.
+    fn requires_complete_input(&self) -> bool {
+        false
+    }
+
+    /// Opt into a bounded complete-member read from a byte-derived hint.
+    /// This request is not platform evidence.
+    fn complete_input_limit(&self, _prefix: &[u8]) -> Option<usize> {
+        None
+    }
 }
 
 /// What one [`ContentDetector::detect`] call found.

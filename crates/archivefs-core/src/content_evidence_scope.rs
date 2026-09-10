@@ -83,6 +83,18 @@ use ContentEvidenceKind::{BootStructure, Container, ContentSignature, Filesystem
 /// conservative default (an unclassified fact can never discriminate a
 /// platform in [`crate::platform_evidence_fusion`] either).
 const SCOPE_CATALOG: &[ScopeEntry] = &[
+    // oric_media.rs: complete, bounded format validation identifies the
+    // canonical Oric family, without asserting a particular machine.
+    ScopeEntry {
+        kind: ContentEvidenceKind::TapeFormat,
+        value: crate::oric_media::ORIC_TAP_EVIDENCE,
+        scope: EvidenceScope::PlatformSpecific("Oric"),
+    },
+    ScopeEntry {
+        kind: ContentEvidenceKind::DiskFormat,
+        value: crate::oric_media::ORIC_DSK_EVIDENCE,
+        scope: EvidenceScope::PlatformSpecific("Oric"),
+    },
     // -- Generic: shared across many unrelated formats/platforms --
     ScopeEntry {
         kind: Filesystem,
@@ -105,6 +117,14 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         kind: BootStructure,
         value: "default.xex",
         scope: EvidenceScope::Generic,
+    },
+    // pokemon_mini_header_evidence.rs: the bounded cartridge header (fixed
+    // NINTENDO watermark offset plus a validated game-code field) is
+    // Pokémon Mini specific, not a generic convention.
+    ScopeEntry {
+        kind: BootStructure,
+        value: "Pokemon Mini cartridge header",
+        scope: EvidenceScope::PlatformSpecific("Pokemon Mini"),
     },
     ScopeEntry {
         kind: MediaClass,

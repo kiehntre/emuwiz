@@ -38,6 +38,9 @@ pub mod atari_tape;
 pub mod bbc_tape;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
+/// Bounded Oric media structure and read-only source bindings.
+pub mod oric_media;
+pub mod oric_tape;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -50,6 +53,8 @@ pub mod managed_appimage_bootstrap;
 pub mod retroachievements;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
+/// Bounded, read-only Thomson SAP floppy evidence.
+pub mod thomson_sap;
 pub mod uef_tape;
 /// Bounded PCM/WAV pulse evidence for tape recordings.
 pub mod tape_audio;
@@ -409,6 +414,9 @@ pub mod lynx_header_evidence;
 /// Pure, read-only Neo Geo Pocket / Neo Geo Pocket Color cartridge header
 /// evidence.
 pub mod ngp_header_evidence;
+
+/// Pure, read-only bounded Pokémon Mini cartridge header evidence.
+pub mod pokemon_mini_header_evidence;
 
 /// Pure, read-only Bandai WonderSwan / WonderSwan Color ROM footer
 /// evidence, including an opt-in whole-ROM checksum verifier.

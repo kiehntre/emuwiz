@@ -57,6 +57,7 @@ pub mod dfs;
 pub mod dsk;
 pub mod fds;
 pub mod hdi;
+pub mod oric;
 pub mod scl;
 pub mod trd;
 pub mod x68000;
@@ -157,6 +158,8 @@ pub const DSK_INFO_BLOCK_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskFormat {
+    /// The reviewed ordinary-sector Euphoric MFM_DISK subset, family only.
+    OricMfm,
     /// A sector-order Commodore 1541 disk image (`.d64`). The media is shared
     /// by C64, C128 and VIC-20 software, so this is deliberately family-level
     /// evidence rather than a machine claim.
@@ -215,6 +218,7 @@ pub enum DiskFormat {
 impl DiskFormat {
     pub fn label(self) -> &'static str {
         match self {
+            Self::OricMfm => "Oric MFM_DISK geometry 1",
             Self::Commodore1541D64 => "Commodore 1541 D64 disk image",
             Self::AtariStRawFloppy => "Atari ST raw floppy image",
             Self::AtariStPasti => "Atari ST Pasti (STX) image",
@@ -237,6 +241,7 @@ impl DiskFormat {
     /// The canonical platform identifier this format belongs to.
     pub fn platform(self) -> &'static str {
         match self {
+            Self::OricMfm => "Oric",
             Self::Commodore1541D64 => "Commodore disk media",
             Self::AtariStRawFloppy | Self::AtariStPasti => "AtariST",
             Self::FamicomDiskSystem => "NES",
@@ -269,6 +274,7 @@ impl DiskFormat {
     /// AMSDOS/CPC disks do not have it.
     pub fn proves_platform(self) -> bool {
         match self {
+            Self::OricMfm => true,
             Self::Commodore1541D64 | Self::AtariStRawFloppy | Self::CpcEmuDsk => false,
             Self::AtariStPasti
             | Self::FamicomDiskSystem
@@ -608,6 +614,7 @@ pub struct Dc42Layout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum DiskFormatMetadata {
+    OricMfm(oric::OricMfmLayout),
     D64(D64Layout),
     Floppy(FloppyGeometry),
     Pasti(PastiLayout),
@@ -772,7 +779,14 @@ pub fn inspect_disk_format(
         Adapter::AtariStRawFloppy => atari_st::inspect(&mut reader, context, cancel),
         Adapter::AtariStPasti => atari_stx::inspect(&mut reader, context, cancel),
         Adapter::FamicomDiskSystem => fds::inspect(&mut reader, context, cancel),
-        Adapter::CpcEmuDsk => dsk::inspect(&mut reader, context, cancel),
+        Adapter::CpcEmuDsk => {
+            // A shared suffix selects candidates, never a platform.
+            if reader.read_exact_at(0, 8).is_ok_and(|h| h == b"MFM_DISK") {
+                oric::inspect(&mut reader, context, cancel)
+            } else {
+                dsk::inspect(&mut reader, context, cancel)
+            }
+        }
         Adapter::SpectrumTrDos => trd::inspect(&mut reader, context, cancel),
         Adapter::SpectrumScl => scl::inspect(&mut reader, context, cancel),
         Adapter::D88 => d88::inspect(&mut reader, context, cancel),

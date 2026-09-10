@@ -169,6 +169,8 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::GameBoyColor
         | IdentityPlatform::GameBoyAdvance
         | IdentityPlatform::VirtualBoy
+        | IdentityPlatform::PokemonMini
+        | IdentityPlatform::WataraSupervision
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
@@ -190,6 +192,7 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::WiiU
         | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
+        | IdentityPlatform::Enterprise
         | IdentityPlatform::Other => return None,
     };
     Some(requirement)

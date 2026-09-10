@@ -1,6 +1,6 @@
 //! Bounded, read-only ZIP archive-member **content** evidence: runs this
 //! crate's existing [`crate::content_detector::ContentDetector`]s against a
-//! bounded prefix of each member's *decompressed* bytes, then aggregates the
+//! bounded prefix (or explicitly requested bounded complete input), then aggregates the
 //! results with an explicit, never-silently-resolved multi-member policy.
 //!
 //! # How this differs from the two existing archive modules
@@ -12,12 +12,13 @@
 //!   for its own bounded pre-filter (skip directories, documentation, and
 //!   artwork before ever decompressing anything) but goes one step further
 //!   for the remaining candidates: it actually decompresses a bounded
-//!   prefix and runs real detectors over it.
+//!   prefix and runs real detectors over it. Observers requiring complete
+//!   input can request a bounded continuation through the shared stream probe.
 //! - [`crate::dat::archive::zip`]/[`crate::dat::archive::sevenz`] hash every
 //!   member's **entire** decompressed stream, for DAT-verification purposes
-//!   - the opposite performance profile from what content *identification*
-//!     needs. This module never fully decompresses a member; see
-//!   [`MAX_MEMBER_PROBE_BYTES`].
+//!   - exact release verification remains separate from content observation.
+//!   This module has bounded complete reads only for reviewed observers;
+//!   it does not hash all members or resolve releases.
 //!
 //! # Filename is never authority
 //!
@@ -43,10 +44,9 @@
 //!
 //! - [`MAX_MEMBERS_PROBED`]: at most this many stream-bearing candidate
 //!   members are ever decompressed in one archive pass.
-//! - [`MAX_MEMBER_PROBE_BYTES`]: at most this many decompressed bytes are
-//!   ever read per member - covers every fixed-offset cartridge header this
-//!   crate knows (through SNES HiROM's `0xFFC0` candidate), never a whole
-//!   member.
+//! - [`MAX_MEMBER_PROBE_BYTES`]: ordinary prefix budget. Complete observers
+//!   may opt into at most 8 MiB/member and 64 MiB extra across the archive.
+//!   An incomplete prefix is never passed to a complete-input observer.
 //! - A member whose *declared* (pre-decompression) uncompressed size exceeds
 //!   [`MAX_CANDIDATE_MEMBER_SIZE`] is skipped without ever being opened -
 //!   this bounds against an archive-bomb-style member whose compressed size
@@ -61,12 +61,12 @@
 //!   treats it.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zip::ZipArchive;
 
-use crate::content_detector::{ContentDetector, run_content_detectors};
+use crate::content_detector::ContentDetector;
+use crate::content_detector::stream_probe::{MAX_COMPLETE_INPUT_BYTES, probe_content_stream};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceKind, observe_content_evidence};
 use crate::header_normalization::HeaderNormalizationDetector;
 use crate::inspector::{InspectorEntryClassification, classify_entry};
@@ -84,6 +84,9 @@ pub const MAX_MEMBERS_PROBED: usize = 2000;
 /// ~4 MiB in) and end-of-file footers (WonderSwan) are out of bounded-prefix
 /// reach by construction - a real, documented limitation, not an oversight;
 /// see the module documentation.
+/// Complete-input detectors may opt into the shared stream probe's separate
+/// bounded read (8 MiB/member, 64 MiB extra/archive). Prefixes alone cannot
+/// establish complete tape/disk validity.
 pub const MAX_MEMBER_PROBE_BYTES: usize = 0x1_0000; // 64 KiB
 
 /// A member whose declared uncompressed size exceeds this is skipped without
@@ -95,8 +98,8 @@ pub const MAX_CANDIDATE_MEMBER_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// rather than executed - reported, never silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberProbeOutcome {
-    /// Real bytes were decompressed (up to [`MAX_MEMBER_PROBE_BYTES`]) and
-    /// run through this crate's content detectors.
+    /// Real bytes were decompressed under the prefix/complete-input budgets
+    /// and run through this crate's content detectors.
     Probed { bytes_probed: usize },
     /// [`crate::inspector::classify_entry`] marked this a directory,
     /// documentation, artwork, or nested-archive entry - never decompressed.
@@ -170,6 +173,9 @@ pub(crate) fn member_detectors() -> Vec<Box<dyn ContentDetector>> {
         Box::new(crate::atari7800_header_evidence::Atari7800HeaderDetector),
         Box::new(crate::lynx_header_evidence::LynxHeaderDetector),
         Box::new(crate::ngp_header_evidence::NgpHeaderDetector),
+        Box::new(crate::pokemon_mini_header_evidence::PokemonMiniHeaderDetector),
+        Box::new(crate::oric_media::OricMediaDetector),
+        Box::new(crate::thomson_sap::ThomsonSapDetector),
         // Generic DOS MZ executable structure - Weak, non-platform
         // evidence (an archived `.exe`); never resolves DOS on its own.
         Box::new(crate::executable_signatures::MzDetector),
@@ -198,6 +204,7 @@ pub fn observe_zip_member_content(
 
     let mut members = Vec::new();
     let mut truncated = false;
+    let mut complete_input_budget = MAX_COMPLETE_INPUT_BYTES;
 
     for index in 0..total_entries {
         if members.len() >= MAX_MEMBERS_PROBED {
@@ -248,16 +255,17 @@ pub fn observe_zip_member_content(
                     // guarantees this probe reaches every fixed-offset
                     // header this crate's detectors expect, up to the
                     // documented bound.
-                    let mut buf = Vec::with_capacity(MAX_MEMBER_PROBE_BYTES.min(1024));
-                    match zip_file
-                        .take(MAX_MEMBER_PROBE_BYTES as u64)
-                        .read_to_end(&mut buf)
-                    {
-                        Ok(read) => {
-                            let evidence =
-                                run_content_detectors(detector_refs.iter().copied(), &buf).evidence;
-                            (MemberProbeOutcome::Probed { bytes_probed: read }, evidence)
-                        }
+                    match probe_content_stream(
+                        zip_file,
+                        declared_size,
+                        MAX_MEMBER_PROBE_BYTES,
+                        &mut complete_input_budget,
+                        &detector_refs,
+                    ) {
+                        Ok((read, report)) => (
+                            MemberProbeOutcome::Probed { bytes_probed: read },
+                            report.evidence,
+                        ),
                         Err(error) => (
                             MemberProbeOutcome::SkippedCorrupt {
                                 detail: error.to_string(),

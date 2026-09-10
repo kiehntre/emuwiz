@@ -2319,6 +2319,12 @@ const REVIEWED_MAGIC_CONFIDENCE: &[(&str, u64, &[u8], MagicConfidence)] = &[
         MagicConfidence::Strong,
     ),
     ("Philips CD-i", 0x8008, b"CD-RTOS", MagicConfidence::Strong),
+    (
+        "Pokemon Mini",
+        0x21a4,
+        b"NINTENDO",
+        MagicConfidence::Corroborated,
+    ),
     ("Dreamcast", 0, b"SEGA SEGAKATANA", MagicConfidence::Strong),
     (
         "GameGear",
@@ -2502,7 +2508,7 @@ fn a_platform_with_mixed_confidence_rules_reports_its_best_match() {
 }
 
 #[test]
-fn total_magic_rule_coverage_is_twenty_one_rules_across_eighteen_platforms() {
+fn total_magic_rule_coverage_is_twenty_two_rules_across_nineteen_platforms() {
     let mut rule_count = 0usize;
     let mut platform_count = 0usize;
     for platform in PLATFORMS {
@@ -2511,10 +2517,10 @@ fn total_magic_rule_coverage_is_twenty_one_rules_across_eighteen_platforms() {
         }
         rule_count += platform.magic.len();
     }
-    assert_eq!(rule_count, 21);
+    assert_eq!(rule_count, 22);
     assert_eq!(
-        platform_count, 18,
-        "the CPC parity rule adds shared coverage to an existing platform"
+        platform_count, 19,
+        "Pokemon Mini adds the newest magic-rule platform"
     );
 }
 
@@ -2681,4 +2687,18 @@ fn segadiscsystem_rules_are_corroborated_not_strong() {
              across every related Sega CD / 32X-CD-compatible case"
         );
     }
+}
+
+#[test]
+fn watara_supervision_has_scoped_aliases_and_candidate_sv_media() {
+    for alias in ["Watara Supervision", "Supervision", "svision"] {
+        assert_eq!(
+            platform_for_alias(alias).map(|platform| platform.id),
+            Some("Watara Supervision")
+        );
+    }
+    let platform = platform_by_id("Watara Supervision").expect("Supervision registry row");
+    assert!(platform.weak_extensions.contains(&"sv"));
+    assert!(!platform.strong_extensions.contains(&"sv"));
+    assert!(platform.weak_extensions.contains(&"bin"));
 }

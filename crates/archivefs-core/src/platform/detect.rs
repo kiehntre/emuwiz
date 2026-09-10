@@ -27,10 +27,10 @@
 //!
 //! The only filesystem access is `symlink_metadata`, one `read_dir` of the
 //! containing directory when layout evidence is requested, and at most
-//! [`MAX_MAGIC_READ_BYTES`](super::MAX_MAGIC_READ_BYTES) bytes read at a known
-//! offset from the file itself. Nothing is written, no archive is opened or
-//! extracted, no image is parsed or hashed, no process is spawned and no
-//! network request is made.
+//! [`MAX_MAGIC_READ_BYTES`](super::MAX_MAGIC_READ_BYTES) bytes per magic rule.
+//! Reviewed structural tape/disk observers have their own explicit budgets;
+//! Oric TAP validates a complete input up to 8 MiB through shared safe reads.
+//! Nothing is written or extracted; no process or network request is made.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -216,8 +216,8 @@ impl<'a> DetectionRequest<'a> {
         self
     }
 
-    /// Enables the two bounded filesystem reads: one directory listing and
-    /// one short read at a known offset per signature rule.
+    /// Enables a bounded directory listing, fixed signatures and reviewed
+    /// structural observers, each with its own explicit read budget.
     pub fn inspecting_content(mut self) -> Self {
         self.inspect_layout = true;
         self.read_signatures = true;
@@ -805,8 +805,8 @@ fn structural_format_evidence(
     trusted: &TrustedRoots,
     folder_platform: Option<&str>,
 ) -> Vec<DetectionEvidence> {
-    // Commodore TAP is the one `.tap` format in this phase with a
-    // self-identifying header. Use its machine byte to distinguish C64/VIC-20
+    // Commodore TAP has a self-identifying header. Use its machine byte to
+    // distinguish C64/VIC-20
     // from the otherwise shared `.tap` extension; a bare extension remains
     // weak evidence and ZX TAP is not parsed here.
     if path
@@ -826,6 +826,28 @@ fn structural_format_evidence(
                 observation.machine.label()
             ),
         }];
+    }
+
+    if path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("tap"))
+    {
+        return crate::oric_media::inspect_oric_file(
+            path,
+            trusted,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .ok()
+        .map(|inspection| {
+            vec![DetectionEvidence {
+                source: DetectionSource::Signature,
+                conclusive: true,
+                platform: "Oric",
+                detail: inspection.observation().evidence()[0].detail.clone(),
+            }]
+        })
+        .unwrap_or_default();
     }
 
     use crate::disk_format::{DiskFormatContext, inspect_disk_format};

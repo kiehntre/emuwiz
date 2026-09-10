@@ -46,9 +46,15 @@ const IDENTITY_PLATFORMS: &[IdentityPlatform] = &[
     IdentityPlatform::N64,
     IdentityPlatform::Ngp,
     IdentityPlatform::Ngpc,
+    IdentityPlatform::PokemonMini,
 ];
 
 fn identity_dispatches(extension: &str) -> bool {
+    // Complete Oric observers use shared tape/disk detection, not the
+    // cartridge-only IdentityPlatform projection.
+    if crate::oric_media::candidate_extension(extension) {
+        return true;
+    }
     let path = Path::new("fixture").with_extension(extension);
     IDENTITY_PLATFORMS
         .iter()

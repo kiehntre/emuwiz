@@ -201,6 +201,36 @@ use RequiredFact::{AnyOfKind, Exact, ValuePrefix};
 ///   `ContentSignature = "PKG"` by itself; the PS3 rule below requires the
 ///   full `PS3_GAME` + `SELF` + `PARAM.SFO`-derived product-code combo.
 pub const RULES: &[FusionRule] = &[
+    FusionRule {
+        id: "oric_standard_tap",
+        platform: "Oric",
+        legs: &[Exact {
+            kind: ContentEvidenceKind::TapeFormat,
+            value: crate::oric_media::ORIC_TAP_EVIDENCE,
+            min_confidence: STRONG,
+        }],
+        explanation: "complete bounded Oric TAP structure proves family media, not a release or machine model",
+    },
+    FusionRule {
+        id: "oric_mfm_disk",
+        platform: "Oric",
+        legs: &[Exact {
+            kind: ContentEvidenceKind::DiskFormat,
+            value: crate::oric_media::ORIC_DSK_EVIDENCE,
+            min_confidence: STRONG,
+        }],
+        explanation: "reviewed MFM_DISK structure and sector CRCs prove Oric-family media, not filesystem or machine compatibility",
+    },
+    FusionRule {
+        id: "pokemon_mini_cartridge_header",
+        platform: "Pokemon Mini",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "Pokemon Mini cartridge header",
+            min_confidence: STRONG,
+        }],
+        explanation: "the bounded Pokémon Mini cartridge header is platform-specific; release identity remains DAT/hash-led",
+    },
     // -- Sega optical: single-leg, each already Strong+platform-specific --
     FusionRule {
         id: "saturn_boot_signature",
