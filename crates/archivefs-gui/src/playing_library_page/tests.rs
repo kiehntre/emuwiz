@@ -587,6 +587,8 @@ fn install_retrodeck_projection(
 fn retrodeck_gui_apply_requires_confirmation_then_publishes_and_rolls_back() {
     let fixture = Fixture::new("retrodeck-gui-success");
     let (mut state, original, _destination) = preview_a_single_election(&fixture);
+    state.set_destination(PlayingLibraryDestination::EsDe);
+    state.preview();
     state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
         platform: "PSX".into(),
         machine_key: None,
@@ -771,6 +773,8 @@ fn successful_apply_creates_symlinks_only_nothing_else_under_destination() {
 fn romm_preview_shows_slug_counts_visibility_and_keeps_details_collapsed() {
     let fixture = Fixture::new("romm-preview");
     let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+    state.set_destination(PlayingLibraryDestination::Romm);
+    state.preview();
     state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
         platform: "Game Boy Advance".to_string(),
         machine_key: None,
@@ -796,6 +800,8 @@ fn romm_preview_shows_slug_counts_visibility_and_keeps_details_collapsed() {
 fn retrodeck_preview_card_is_visible_and_unverified_apply_is_blocked() {
     let fixture = Fixture::new("retrodeck-preview");
     let (mut state, _original, _destination) = preview_a_single_election(&fixture);
+    state.set_destination(PlayingLibraryDestination::EsDe);
+    state.preview();
     state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
         platform: "PSX".to_string(),
         machine_key: None,
@@ -821,6 +827,8 @@ fn retrodeck_preview_card_is_visible_and_unverified_apply_is_blocked() {
 fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     let fixture = Fixture::new("romm-apply");
     let (mut state, original, destination) = preview_a_single_election(&fixture);
+    state.set_destination(PlayingLibraryDestination::Romm);
+    state.preview();
     state.dat_platform_identity = Some(DatPlatformIdentity::Resolved {
         platform: "Game Boy Advance".to_string(),
         machine_key: None,

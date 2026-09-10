@@ -59,8 +59,20 @@ pub(crate) fn playing_library_confirmation_phrase(count: usize) -> String {
 
 pub(crate) const TYPED_CONFIRMATION_THRESHOLD: usize = 8;
 
+/// Beginner-facing destination choice. All variants use the existing
+/// Playing Library election and apply machinery; this selects the reviewed
+/// destination projection shown by the workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PlayingLibraryDestination {
+    #[default]
+    Generic,
+    Romm,
+    EsDe,
+}
+
 /// The page's authoritative state.
 pub(crate) struct PlayingLibraryPageState {
+    pub(crate) destination: PlayingLibraryDestination,
     pub(crate) selected_catalogue: Option<CatalogueRef>,
     pub(crate) catalogue_picker: DatCataloguePickerState,
     #[cfg(test)]
@@ -148,6 +160,7 @@ pub(crate) struct PlayingLibraryPageState {
 impl Default for PlayingLibraryPageState {
     fn default() -> Self {
         Self {
+            destination: PlayingLibraryDestination::Generic,
             selected_catalogue: None,
             catalogue_picker: DatCataloguePickerState::default(),
             #[cfg(test)]
@@ -245,6 +258,15 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn load() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_destination(&mut self, destination: PlayingLibraryDestination) {
+        self.destination = destination;
+        self.plan = None;
+        self.romm_projection = None;
+        self.retrodeck_projection = None;
+        self.romm_error = None;
+        self.retrodeck_error = None;
     }
 
     #[cfg(test)]
@@ -1140,7 +1162,12 @@ pub(crate) fn show_playing_library_page(
 ) -> Option<PlayingLibraryPageAction> {
     let mut action = None;
 
-    widgets::section_header(ui, "Build Playing Library (1G1R)", None);
+    let title = match state.destination {
+        PlayingLibraryDestination::Generic => "Build Generic Playing Library (1G1R)",
+        PlayingLibraryDestination::Romm => "Build RomM Library (1G1R)",
+        PlayingLibraryDestination::EsDe => "Build ES-DE Library (1G1R)",
+    };
+    widgets::section_header(ui, title, None);
     ui.label(
         egui::RichText::new(
             "Pick one representative release per game and create a linked library of it. \
@@ -1148,12 +1175,18 @@ pub(crate) fn show_playing_library_page(
         )
         .color(theme::muted(ui)),
     );
-    ui.label(
-        egui::RichText::new(
-            "You can also add this library to ES-DE / RetroDECK after building it.",
-        )
-        .color(theme::muted(ui)),
-    );
+    let destination_help = match state.destination {
+        PlayingLibraryDestination::Generic => {
+            "A clean linked library without frontend-specific folders."
+        }
+        PlayingLibraryDestination::Romm => {
+            "The existing RomM projection supplies the reviewed platform folder automatically."
+        }
+        PlayingLibraryDestination::EsDe => {
+            "The existing ES-DE mapping supplies the reviewed system folder automatically."
+        }
+    };
+    ui.label(egui::RichText::new(destination_help).color(theme::muted(ui)));
     ui.add_space(8.0);
 
     widgets::section_header(
@@ -1200,7 +1233,12 @@ pub(crate) fn show_playing_library_page(
         }
         ui.add_space(6.0);
 
-        ui.label(egui::RichText::new("Playing Library destination").strong());
+        let destination_label = match state.destination {
+            PlayingLibraryDestination::Generic => "Playing Library destination",
+            PlayingLibraryDestination::Romm => "RomM library destination root",
+            PlayingLibraryDestination::EsDe => "ES-DE library destination root",
+        };
+        ui.label(egui::RichText::new(destination_label).strong());
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.destination_root_draft)
@@ -1209,7 +1247,13 @@ pub(crate) fn show_playing_library_page(
             );
             if ui.button("Browse…").clicked()
                 && let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose Playing Library Destination Folder")
+                    .set_title(match state.destination {
+                        PlayingLibraryDestination::Generic => {
+                            "Choose Playing Library Destination Folder"
+                        }
+                        PlayingLibraryDestination::Romm => "Choose RomM Library Folder",
+                        PlayingLibraryDestination::EsDe => "Choose ES-DE Library Folder",
+                    })
                     .pick_folder()
             {
                 state.destination_root_draft = path.display().to_string();
@@ -1306,8 +1350,12 @@ pub(crate) fn show_playing_library_page(
         widgets::section_header(ui, "Apply", Some("Review the plan before creating links."));
         show_preview_summary(ui, plan, state, &mut action);
         ui.add_space(10.0);
-        show_romm_projection_summary(ui, state, &mut action);
-        show_retrodeck_projection_summary(ui, state, &mut action);
+        if matches!(state.destination, PlayingLibraryDestination::Romm) {
+            show_romm_projection_summary(ui, state, &mut action);
+        }
+        if matches!(state.destination, PlayingLibraryDestination::EsDe) {
+            show_retrodeck_projection_summary(ui, state, &mut action);
+        }
     }
 
     if let Some(transaction) = state.applied() {

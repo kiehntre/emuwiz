@@ -27,6 +27,7 @@ use archivefs_core::{
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use crate::playing_library_page::PlayingLibraryDestination;
 use crate::ui::{components as widgets, theme};
 
 /// The page's authoritative state.
@@ -860,6 +861,14 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             .color(theme::muted(ui)),
         );
     }
+    if !state.showing_playing_library {
+        widgets::section_header(
+            ui,
+            "Build a library for…",
+            Some("Choose a destination, then review the read-only plan before anything changes."),
+        );
+        show_library_destination_cards(ui, state);
+    }
     ui.add_space(8.0);
 
     if state.showing_playing_library {
@@ -1131,6 +1140,88 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             ),
             widgets::StatusTone::Pending,
         );
+    }
+}
+
+const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 3] = [
+    (
+        "Build RomM library",
+        "Build a RomM-ready playing library using the reviewed platform folders.",
+        PlayingLibraryDestination::Romm,
+    ),
+    (
+        "Build ES-DE library",
+        "Build a library arranged for ES-DE system folders.",
+        PlayingLibraryDestination::EsDe,
+    ),
+    (
+        "Build generic playing library",
+        "Build a simple playing library without frontend-specific layout.",
+        PlayingLibraryDestination::Generic,
+    ),
+];
+
+const DESTINATION_CARD_MIN_WIDTH: f32 = 340.0;
+const DESTINATION_CARD_MAX_WIDTH: f32 = 440.0;
+const DESTINATION_CARD_GAP: f32 = 16.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DestinationCardLayout {
+    columns: usize,
+    card_width: f32,
+}
+
+fn destination_card_layout(available_width: f32, card_count: usize) -> DestinationCardLayout {
+    let available_width = available_width.max(0.0);
+    let fitting = ((available_width + DESTINATION_CARD_GAP)
+        / (DESTINATION_CARD_MIN_WIDTH + DESTINATION_CARD_GAP))
+        .floor() as usize;
+    let columns = fitting.clamp(1, 3).min(card_count.max(1));
+    let card_width = ((available_width - DESTINATION_CARD_GAP * columns.saturating_sub(1) as f32)
+        / columns as f32)
+        .min(DESTINATION_CARD_MAX_WIDTH)
+        .max(0.0);
+    DestinationCardLayout { columns, card_width }
+}
+
+fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
+    let layout = destination_card_layout(ui.available_width(), LIBRARY_DESTINATION_CARDS.len());
+    for row in LIBRARY_DESTINATION_CARDS.chunks(layout.columns) {
+        ui.horizontal(|ui| {
+            for (index, (title, description, destination)) in row.iter().enumerate() {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(layout.card_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        widgets::card(ui, |ui| {
+                            ui.label(egui::RichText::new(*title).strong());
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(*description).color(theme::muted(ui)),
+                            ).wrap());
+                            ui.label(egui::RichText::new("Source collection stays where it is.")
+                                .color(theme::muted(ui)).small());
+                            let selected = state.playing_library.destination == *destination;
+                            if selected {
+                                widgets::status_badge(ui, "Current choice", widgets::StatusTone::Active);
+                            }
+                            if widgets::action_button(
+                                ui,
+                                "Choose",
+                                if selected { widgets::ActionStyle::Secondary } else { widgets::ActionStyle::Primary },
+                                true,
+                            ).clicked() {
+                                state.showing_playing_library = true;
+                                state.playing_library.set_destination(*destination);
+                            }
+                        });
+                    },
+                );
+                if index + 1 < row.len() {
+                    ui.add_space(DESTINATION_CARD_GAP);
+                }
+            }
+        });
+        ui.add_space(DESTINATION_CARD_GAP);
     }
 }
 
@@ -2014,5 +2105,34 @@ mod tests {
         assert!(rendered_text_contains(&output, "Result: Will create link"));
         // The linked-library preview never shows a rename/move arrow row.
         assert!(!rendered_text_contains(&output, "/sources/Combat.bin → "));
+    }
+
+    #[test]
+    fn destination_choices_render_without_changing_the_existing_flow() {
+        let mut state = RomOrganisationPageState::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Build RomM library"));
+        assert!(rendered_text_contains(&output, "Build ES-DE library"));
+        assert!(rendered_text_contains(&output, "Build generic playing library"));
+        assert!(rendered_text_contains(&output, "Source collection stays where it is."));
+    }
+
+    #[test]
+    fn destination_card_layout_is_bounded_and_monotonic() {
+        let mut previous = usize::MAX;
+        for width in [1600.0, 1008.0, 884.0, 784.0, 684.0, 400.0] {
+            let layout = destination_card_layout(width, LIBRARY_DESTINATION_CARDS.len());
+            let used = layout.card_width * layout.columns as f32
+                + DESTINATION_CARD_GAP * layout.columns.saturating_sub(1) as f32;
+            assert!(used <= width + 0.5);
+            assert!((1..=3).contains(&layout.columns));
+            assert!(layout.columns <= previous);
+            previous = layout.columns;
+        }
     }
 }
