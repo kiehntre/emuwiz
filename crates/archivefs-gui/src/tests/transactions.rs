@@ -84,6 +84,8 @@ mod romm_dispatch_tests {
                 directory: PathBuf::from("/tmp/artwork"),
                 format_version: 1,
             },
+            media_coverage: None,
+            platform_media_coverage: Default::default(),
             token_available: true,
             token_problem: None,
             cache_format_version: Some(1),

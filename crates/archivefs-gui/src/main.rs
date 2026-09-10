@@ -142,6 +142,9 @@ use archivefs_core::patch_manager::{
 };
 use collection_discovery_page::*;
 mod administration_pages;
+mod es_de_media_state;
+mod launchbox_local_state;
+mod platform_artwork_manager;
 mod cheats_mods_preview;
 mod onboarding;
 use cheats_mods_preview::*;
@@ -276,6 +279,7 @@ use ui::platform_artwork::{
     bundled_platform_artwork, canonical_platform_asset_id, custom_platform_artwork_path,
     paint_game_row_artwork, paint_platform_artwork_at, platform_asset_category, platform_asset_id,
 };
+use crate::platform_artwork_manager::PlatformArtworkManager;
 use ui::{components as widgets, layout as ui_layout, theme};
 // Brings `String`'s char-index-safe insert/delete/slice methods into
 // scope - see `show_text_edit_with_context_menu` and its helpers, the
@@ -4382,6 +4386,7 @@ struct ArchiveFsApp {
     /// session. It is invalidated by directory or file-metadata changes.
     platform_artwork_cache: PlatformArtworkCache,
     platform_artwork_manager: PlatformArtworkManagerState,
+    platform_artwork: PlatformArtworkManager,
     /// RomM cover artwork for the Gamer View game list: what has been asked
     /// for, what has been answered, and which library generation those
     /// answers belong to. Holds no thread of its own - see `gamer_cover_worker`.
@@ -4423,6 +4428,8 @@ struct ArchiveFsApp {
     /// `gamer_covers`) because it caches a sort/bucket rebuild across
     /// frames, rebuilding only when the visible result set changes.
     gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex,
+    es_de_media: crate::es_de_media_state::EsDeMediaState,
+    launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -4753,6 +4760,10 @@ impl ArchiveFsApp {
                 archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
             platform_artwork_cache: PlatformArtworkCache::default(),
             platform_artwork_manager: PlatformArtworkManagerState::default(),
+            platform_artwork: PlatformArtworkManager::new(
+                archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
+                open_folder_in_file_manager,
+            ),
 
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
             gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
@@ -4763,6 +4774,8 @@ impl ArchiveFsApp {
             game_metadata_worker: None,
             game_metadata_worker_allowed: true,
             gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
+            es_de_media: crate::es_de_media_state::EsDeMediaState::default(),
+            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(),
         }
     }
 
@@ -7603,6 +7616,22 @@ impl ArchiveFsApp {
     /// nothing here re-implements source management, DAT handling, cheat
     /// provisioning, or collection discovery.
     fn show_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui, tab: SourcesTab) {
+        self.es_de_media.start(context.clone());
+        if self.es_de_media.poll() {
+            self.gamer_covers.identity_refreshed();
+            self.gamer_screenshots.identity_refreshed();
+            if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                worker.update_esde(self.es_de_media.snapshot().cloned());
+            }
+        }
+        self.launchbox_local_media.start(context.clone());
+        if self.launchbox_local_media.poll() {
+            self.gamer_covers.identity_refreshed();
+            self.gamer_screenshots.identity_refreshed();
+            if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                worker.update_launchbox(self.launchbox_local_media.snapshot().cloned());
+            }
+        }
         if let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
             self.navigate_to_sources_tab(clicked);
         }
@@ -7611,7 +7640,21 @@ impl ArchiveFsApp {
             SourcesTab::Dats => self.show_dat_sources_page(ui),
             SourcesTab::Cheats => self.show_cheat_sources_page(context, ui),
             SourcesTab::Discovery => {
-                sources_page::show_sources_discovery_tab(ui, &self.database_state)
+                if let Some(action) = sources_page::show_sources_discovery_tab(
+                    ui,
+                    &self.database_state,
+                    &self.es_de_media,
+                    &self.launchbox_local_media,
+                ) {
+                    match action {
+                        sources_page::LocalProviderRefreshAction::EsDe => {
+                            self.es_de_media.refresh(context.clone());
+                        }
+                        sources_page::LocalProviderRefreshAction::LaunchBoxLocal => {
+                            self.launchbox_local_media.refresh(context.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -19073,6 +19116,10 @@ impl ArchiveFsApp {
                     // is drawn in this one. Anything from a superseded generation
                     // is dropped inside `absorb`.
                     if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                        for update in worker.drain_delivery() {
+                            self.gamer_covers.absorb_delivery(&update);
+                            self.gamer_screenshots.absorb_delivery(&update);
+                        }
                         for reply in worker.drain() {
                             if !self.gamer_covers.absorb(ui.ctx(), reply.clone()) {
                                 self.gamer_screenshots.absorb(ui.ctx(), reply);
@@ -19174,6 +19221,8 @@ impl ArchiveFsApp {
                             crate::gamer_artwork::CoverWorker::start(
                                 ui.ctx().clone(),
                                 self.gui_config.source_roots().ok().map(<[PathBuf]>::to_vec),
+                                self.es_de_media.snapshot().cloned(),
+                                self.launchbox_local_media.snapshot().cloned(),
                             )
                         });
                         let generation = self.gamer_covers.generation();
@@ -33344,6 +33393,8 @@ fn load_romm_snapshot() -> Result<RommSnapshot, String> {
         token_problem: token.err().map(|refusal| refusal.detail()),
         cache_format_version,
         verify_summary,
+        media_coverage: None,
+        platform_media_coverage: Default::default(),
     })
 }
 

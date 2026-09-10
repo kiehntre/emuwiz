@@ -1246,6 +1246,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         custom_platform_artwork_directory: None,
         platform_artwork_cache: PlatformArtworkCache::default(),
         platform_artwork_manager: PlatformArtworkManagerState::default(),
+        platform_artwork: PlatformArtworkManager::new(None, |_path| Ok(())),
 
         gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
         gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
@@ -1258,6 +1259,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         gamer_cover_worker_allowed: false,
         gamer_cover_library: None,
         gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
+        es_de_media: crate::es_de_media_state::EsDeMediaState::default(),
+        launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(),
         selected_game_metadata: None,
         game_metadata_worker: None,
         // Never true in tests, for the same reason as `gamer_cover_worker_allowed`.

@@ -52,6 +52,8 @@ fn real_counts() -> IdentityImportCounts {
         unmatched: 4,
         with_hashes: 36_000,
         with_artwork: 29_759,
+        with_cover: 0,
+        with_screenshot: 0,
         multi_file: 198,
         with_game_information: 30_412,
     }
@@ -114,6 +116,8 @@ fn snapshot(state: ProviderState, enabled: bool, configured: bool) -> RommSnapsh
         token_problem: None,
         cache_format_version: ready.then_some(1),
         verify_summary: None,
+        media_coverage: None,
+        platform_media_coverage: Default::default(),
     }
 }
 

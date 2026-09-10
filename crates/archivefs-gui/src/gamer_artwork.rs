@@ -18,14 +18,12 @@
 //! scheduling a list needs: which records to ask about, in what order, how many at
 //! once, and how to hold the answers so scrolling back does not ask again.
 //!
-//! # Only RomM's own artwork
+//! # Approved artwork references
 //!
-//! The same rule the core enforces applies here and is checked again before a
-//! request is made: only `path_cover_small`, a path on the approved RomM instance,
-//! is ever fetched. `url_cover` points at IGDB or RetroAchievements and is recorded
-//! for provenance only - a record carrying nothing else resolves to
-//! [`NoCover::PublicOnly`] and draws the placeholder without any request being
-//! made.
+//! The core artwork cache remains the authority for fetch policy. The GUI only
+//! schedules records whose artwork is either hosted by RomM or carries the exact
+//! LaunchBox reference shape approved by the core. Other public scraper URLs stay
+//! provenance-only and are never handed to the worker.
 //!
 //! # Answers belong to records, not to rows
 //!
@@ -37,7 +35,95 @@
 //! replaced is discarded rather than stored.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
+use std::time::Instant;
+
+#[cfg(debug_assertions)]
+mod cover_timing {
+    use super::{GamerArtworkKind, HashMap, Instant, Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static ENQUEUED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+    fn enabled() -> bool {
+        std::env::var_os("EMUWIZ_COVER_TIMING").is_some()
+    }
+
+    fn key(generation: u64, path: &Path, kind: GamerArtworkKind) -> String {
+        format!("{generation}:{}:{kind:?}", path.display())
+    }
+
+    fn name(path: &Path) -> &str {
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("<unnamed>")
+    }
+
+    pub(super) fn enqueued(generation: u64, path: &Path, kind: GamerArtworkKind) {
+        if !enabled() {
+            return;
+        }
+        let pending = ENQUEUED.get_or_init(|| Mutex::new(HashMap::new()));
+        let Ok(mut pending) = pending.lock() else {
+            return;
+        };
+        if pending.len() >= 1024 {
+            pending.clear();
+        }
+        pending.insert(key(generation, path, kind), Instant::now());
+    }
+
+    pub(super) fn worker_started(
+        generation: u64,
+        path: &Path,
+        kind: GamerArtworkKind,
+    ) -> Option<Instant> {
+        if !enabled() {
+            return None;
+        }
+        ENQUEUED
+            .get()
+            .and_then(|pending| pending.lock().ok())
+            .and_then(|mut pending| pending.remove(&key(generation, path, kind)))
+    }
+
+    pub(super) fn stage(path: &Path, kind: GamerArtworkKind, label: &str, started: Instant) {
+        if enabled() {
+            eprintln!(
+                "[cover-timing] file={} kind={kind:?} stage={label} ms={:.1}",
+                name(path),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    pub(super) fn completed(
+        generation: u64,
+        path: &PathBuf,
+        kind: GamerArtworkKind,
+        queued: Option<Instant>,
+        started: Instant,
+        answer: &str,
+    ) {
+        if !enabled() {
+            return;
+        }
+        let queue_ms = queued
+            .map(|time| started.duration_since(time).as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        eprintln!(
+            "[cover-timing] generation={generation} file={} kind={kind:?} answer={answer} enqueue_to_worker_ms={queue_ms:.1} worker_ms={:.1}",
+            name(path),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    pub(super) fn upload(path: &Path, kind: GamerArtworkKind, started: Instant) {
+        stage(path, kind, "texture_upload", started);
+    }
+}
 
 use eframe::egui;
 
@@ -196,6 +282,17 @@ pub(crate) struct CoverReply {
     pub(crate) answer: CoverAnswer,
 }
 
+/// Delivery state projected by the core resolver for a selected record. This is
+/// separate from decoded artwork so the UI can represent provider-level pending
+/// work before a concrete image answer arrives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MediaDeliveryUpdate {
+    pub(crate) generation: u64,
+    pub(crate) local_path: PathBuf,
+    pub(crate) cover: archivefs_core::identity_source::media_resolver::MediaDelivery,
+    pub(crate) screenshots: archivefs_core::identity_source::media_resolver::MediaDelivery,
+}
+
 /// What one row's cover area is showing.
 #[derive(Clone)]
 pub(crate) enum CoverSlot {
@@ -240,6 +337,7 @@ pub(crate) struct GamerCoverCache {
     /// generation are discarded: the same path may now be a different file.
     generation: u64,
     slots: HashMap<PathBuf, CoverSlot>,
+    delivery: HashMap<PathBuf, archivefs_core::identity_source::media_resolver::MediaDelivery>,
     /// The frame each slot was last drawn or asked for, for eviction order.
     last_used: HashMap<PathBuf, u64>,
     frame: u64,
@@ -262,6 +360,7 @@ impl GamerCoverCache {
     pub(crate) fn library_changed(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.slots.clear();
+        self.delivery.clear();
         self.last_used.clear();
     }
 
@@ -303,6 +402,7 @@ impl GamerCoverCache {
     /// catalogue.
     pub(crate) fn identity_refreshed(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.delivery.clear();
         let mut retained = HashMap::with_capacity(self.slots.len());
         for (path, slot) in self.slots.drain() {
             match slot {
@@ -337,6 +437,22 @@ impl GamerCoverCache {
             }
         }
         self.slots = retained;
+    }
+
+    pub(crate) fn absorb_delivery(&mut self, update: &MediaDeliveryUpdate) -> bool {
+        if update.generation != self.generation {
+            return false;
+        }
+        self.delivery
+            .insert(update.local_path.clone(), update.cover);
+        true
+    }
+
+    pub(crate) fn delivery(
+        &self,
+        path: &Path,
+    ) -> Option<archivefs_core::identity_source::media_resolver::MediaDelivery> {
+        self.delivery.get(path).copied()
     }
 
     /// Declares the window of records on screen and returns the ones to ask about.
@@ -485,6 +601,8 @@ impl GamerCoverCache {
                     // A cover with no record to attach it to cannot be drawn safely.
                     return false;
                 };
+                #[cfg(debug_assertions)]
+                cover_timing::upload(&reply.local_path, reply.kind, Instant::now());
                 CoverSlot::Ready {
                     texture: context.load_texture(
                         format!("archivefs-gamer-cover-{}", image.key),
@@ -532,16 +650,49 @@ pub(crate) struct GamerScreenshotCache {
     generation: u64,
     screenshot_count: HashMap<PathBuf, usize>,
     slots: HashMap<(PathBuf, usize), CoverSlot>,
+    delivery: HashMap<PathBuf, archivefs_core::identity_source::media_resolver::MediaDelivery>,
 }
 
 pub(crate) const MAX_DETAILS_SCREENSHOTS: usize = 5;
 const MAX_TRACKED_SCREENSHOTS: usize = 32;
 
 impl GamerScreenshotCache {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn library_changed(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.screenshot_count.clear();
         self.slots.clear();
+        self.delivery.clear();
+    }
+
+    /// Refresh provider bindings without blanking an already-visible gallery.
+    /// Ready slots remain available; obsolete in-flight slots are released so
+    /// the current generation can request them again from the refreshed
+    /// provider snapshot.
+    pub(crate) fn identity_refreshed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.delivery.clear();
+        self.slots
+            .retain(|_, slot| matches!(slot, CoverSlot::Ready { .. }));
+    }
+
+    pub(crate) fn absorb_delivery(&mut self, update: &MediaDeliveryUpdate) -> bool {
+        if update.generation != self.generation {
+            return false;
+        }
+        self.delivery
+            .insert(update.local_path.clone(), update.screenshots);
+        true
+    }
+
+    pub(crate) fn delivery(
+        &self,
+        path: &Path,
+    ) -> Option<archivefs_core::identity_source::media_resolver::MediaDelivery> {
+        self.delivery.get(path).copied()
     }
 
     pub(crate) fn screenshot_count(&self, path: &Path) -> Option<usize> {
@@ -550,12 +701,32 @@ impl GamerScreenshotCache {
 
     /// Returns the bounded number of screenshot cells the Details view should
     /// reserve, including the initial probe while RomM's screenshot count is
-    /// still being resolved. Once that probe reports no screenshots, the
-    /// section disappears instead of leaving an empty gallery behind.
+    /// still being resolved. A confirmed zero is retained as an intentional
+    /// empty state so a completed cover request cannot make the section vanish.
     pub(crate) fn section_count(&self, path: &Path) -> Option<usize> {
         let count = self
             .screenshot_count(path)
             .map_or(1, |count| count.min(MAX_DETAILS_SCREENSHOTS));
+        let pending = self.delivery(path)
+            == Some(archivefs_core::identity_source::media_resolver::MediaDelivery::RemotePending);
+        if count == 0 && !pending {
+            return Some(0);
+        }
+        let count = if pending { count.max(1) } else { count };
+        if pending
+            && !(0..count).any(|index| {
+                matches!(
+                    self.slot_for(path, index),
+                    Some(
+                        CoverSlot::Loading
+                            | CoverSlot::Ready { .. }
+                            | CoverSlot::Revalidating { .. }
+                    )
+                )
+            })
+        {
+            return Some(count);
+        }
         (0..count)
             .any(|index| {
                 matches!(
@@ -568,6 +739,21 @@ impl GamerScreenshotCache {
                 )
             })
             .then_some(count)
+    }
+
+    pub(crate) fn has_loading(&self, path: &Path) -> bool {
+        self.slots.iter().any(|((slot_path, _), slot)| {
+            slot_path == path && matches!(slot, CoverSlot::Loading | CoverSlot::Revalidating { .. })
+        })
+    }
+
+    pub(crate) fn ready_count(&self, path: &Path) -> usize {
+        self.slots
+            .iter()
+            .filter(|((slot_path, _), slot)| {
+                slot_path == path && matches!(slot, CoverSlot::Ready { .. })
+            })
+            .count()
     }
 
     /// Requests only the selected game's first screenshot until the imported
@@ -775,8 +961,8 @@ pub(crate) fn look_ahead_range(
 /// scraper URL has no plan that reaches a fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CoverPlan {
-    /// Look in the cache, and request RomM's own `path_cover_small` if it misses.
-    /// The only variant from which any request is possible.
+    /// Look in the shared cache, then request an artwork reference that the core
+    /// resolver has a policy for (RomM-hosted or approved LaunchBox).
     UseRommHostedCover,
     /// Draw the placeholder. No request is made.
     Placeholder(NoCover),
@@ -793,10 +979,155 @@ pub(crate) fn plan_for(
     match crate::romm_game::availability_of(record) {
         crate::romm_game::ArtworkAvailability::Fetchable => CoverPlan::UseRommHostedCover,
         crate::romm_game::ArtworkAvailability::None => CoverPlan::Placeholder(NoCover::NoArtwork),
+        crate::romm_game::ArtworkAvailability::PublicOnly
+            if record
+                .artwork
+                .as_ref()
+                .is_some_and(|artwork| is_approved_launchbox_reference(&artwork.reference)) =>
+        {
+            CoverPlan::UseRommHostedCover
+        }
         crate::romm_game::ArtworkAvailability::PublicOnly => {
             CoverPlan::Placeholder(NoCover::PublicOnly)
         }
     }
+}
+
+/// The core cache performs the complete URL validation before any request. This
+/// narrow scheduling check keeps unrelated public scraper URLs out of the worker
+/// while allowing the one approved external media source through the same cache.
+fn is_approved_launchbox_reference(reference: &str) -> bool {
+    reference.starts_with("https://images.launchbox-app.com/")
+}
+
+/// Projects the already-imported RomM artwork record into the core resolver's
+/// provider snapshots. This is intentionally a pure projection: it does not
+/// refresh RomM, touch ES-DE, or perform any filesystem/network work.
+fn resolver_input_for_record(
+    record: &archivefs_core::identity_source::model::ExternalIdentityRecord,
+    selection_generation: u64,
+    esde: Option<&archivefs_core::emulator_environment::es_de_metadata::EsDeResolvedEntry>,
+    provider_generation: u64,
+    launchbox_index: Option<
+        &archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex,
+    >,
+) -> archivefs_core::identity_source::media_resolver::MediaResolverInput {
+    use archivefs_core::identity_source::media_resolver::{
+        MediaDelivery, MediaProvider, MediaResolverInput, ProviderMediaSnapshot,
+    };
+    use archivefs_core::identity_source::model::MediaReference;
+
+    let mut romm = ProviderMediaSnapshot::new(MediaProvider::RommDirect);
+    let mut launchbox = ProviderMediaSnapshot::new(MediaProvider::LaunchBoxViaRomm);
+    romm.delivery = MediaDelivery::RemoteReady;
+    launchbox.delivery = MediaDelivery::RemoteReady;
+    if let Some(artwork) = record.artwork.as_ref() {
+        let cover = MediaReference {
+            hosted_reference: artwork
+                .small_reference
+                .clone()
+                .or_else(|| artwork.large_reference.clone()),
+            public_reference: Some(artwork.reference.clone()),
+        };
+        if is_approved_launchbox_reference(&artwork.reference) {
+            launchbox.cover = Some(cover);
+        } else if cover.hosted_reference.is_some() {
+            romm.cover = Some(cover);
+        }
+        for screenshot in &artwork.screenshots {
+            if screenshot.hosted_reference.is_some() {
+                romm.screenshots.push(screenshot.clone());
+            } else if screenshot
+                .public_reference
+                .as_deref()
+                .is_some_and(is_approved_launchbox_reference)
+            {
+                launchbox.screenshots.push(screenshot.clone());
+            }
+        }
+    }
+    if let Some(esde) = esde {
+        let mut local = ProviderMediaSnapshot::new(MediaProvider::EsDe);
+        local.delivery = MediaDelivery::LocalReady;
+        if esde
+            .media
+            .cover
+            .is_some_and(|media| media.exists && media.readable)
+        {
+            local.cover = esde.entry.media.cover.as_ref().map(|path| MediaReference {
+                hosted_reference: Some(path.to_string_lossy().into_owned()),
+                public_reference: None,
+            });
+        }
+        if esde
+            .media
+            .screenshot
+            .is_some_and(|media| media.exists && media.readable)
+        {
+            if let Some(path) = esde.entry.media.screenshot.as_ref() {
+                local.screenshots.push(MediaReference {
+                    hosted_reference: Some(path.to_string_lossy().into_owned()),
+                    public_reference: None,
+                });
+            }
+        }
+        if esde
+            .media
+            .video
+            .is_some_and(|media| media.exists && media.readable)
+        {
+            local.video = esde.entry.media.video.as_ref().map(|path| MediaReference {
+                hosted_reference: Some(path.to_string_lossy().into_owned()),
+                public_reference: None,
+            });
+        }
+        let local_launchbox = launchbox_snapshot(record, launchbox_index);
+        return MediaResolverInput {
+            providers: [Some(romm), Some(launchbox), Some(local), local_launchbox]
+                .into_iter()
+                .flatten()
+                .collect(),
+            pending_providers: Vec::new(),
+            failed_providers: Vec::new(),
+            selection_generation,
+            provider_generation,
+        };
+    }
+    let local_launchbox = launchbox_snapshot(record, launchbox_index);
+    MediaResolverInput {
+        providers: [Some(romm), Some(launchbox), local_launchbox]
+            .into_iter()
+            .flatten()
+            .collect(),
+        pending_providers: Vec::new(),
+        failed_providers: Vec::new(),
+        selection_generation,
+        provider_generation,
+    }
+}
+
+fn launchbox_snapshot<'a>(
+    record: &archivefs_core::identity_source::model::ExternalIdentityRecord,
+    index: Option<
+        &'a archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex,
+    >,
+) -> Option<archivefs_core::identity_source::media_resolver::ProviderMediaSnapshot> {
+    let index = index?;
+    let launchbox_id = record
+        .metadata_provider_ids
+        .iter()
+        .find(|id| id.provider.eq_ignore_ascii_case("launchbox"))
+        .map(|id| id.id.as_str());
+    let lookup = index.lookup(
+        launchbox_id,
+        record.archivefs_path.as_deref(),
+        record
+            .platform_candidate
+            .as_deref()
+            .or(record.provider_platform_name.as_deref()),
+        None,
+    )?;
+    Some(index.media_snapshot(&lookup))
 }
 
 /// Turns a local path into a cover, using the core's cache for everything.
@@ -816,6 +1147,9 @@ pub(crate) struct RommCoverSource {
     source: Option<Result<archivefs_core::identity_source::romm::config::ValidatedRommSource, ()>>,
     transport: archivefs_core::identity_source::romm::client::UreqTransport,
     trusted_roots: Option<Vec<PathBuf>>,
+    esde: Option<archivefs_core::emulator_environment::es_de_metadata::EsDeProviderCollection>,
+    launchbox:
+        Option<archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex>,
 }
 
 /// The page size the catalogue is walked in.
@@ -844,7 +1178,7 @@ pub(crate) fn index_by_path(
         }
         for record in page {
             if let Some(path) = record.archivefs_path.as_deref() {
-                by_path.insert(path.to_path_buf(), record.clone());
+                by_path.insert(normalized_selected_path(path), record.clone());
             }
         }
         offset += page.len();
@@ -852,9 +1186,70 @@ pub(crate) fn index_by_path(
     by_path
 }
 
+/// Canonicalizes only lexical path syntax for provider association. It does not
+/// resolve symlinks or touch the filesystem: the selected catalogue path and
+/// the provider's mapped path must remain the same source item, not merely two
+/// paths that happen to resolve to the same inode.
+fn normalized_selected_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 impl RommCoverSource {
+    fn delivery(&self, generation: u64, local_path: &Path) -> Option<MediaDeliveryUpdate> {
+        let record = self.by_path.get(&normalized_selected_path(local_path))?;
+        let platform = record
+            .platform_candidate
+            .as_deref()
+            .or(record.provider_platform_name.as_deref());
+        let esde = platform.and_then(|platform| {
+            self.esde
+                .as_ref()
+                .and_then(|collection| collection.lookup_path(platform, local_path))
+        });
+        let provider_generation = self
+            .esde
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.generation)
+            .max(
+                self.launchbox
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.generation),
+            );
+        let resolved = archivefs_core::identity_source::media_resolver::resolve_media(
+            &resolver_input_for_record(
+                record,
+                generation,
+                esde.as_ref(),
+                provider_generation,
+                self.launchbox.as_ref(),
+            ),
+        );
+        Some(MediaDeliveryUpdate {
+            generation,
+            local_path: local_path.to_path_buf(),
+            cover: resolved.cover_delivery,
+            screenshots: resolved.screenshots_delivery,
+        })
+    }
+
     /// Opens the published cache and indexes it. Touches no network.
-    pub(crate) fn open(trusted_roots: Option<Vec<PathBuf>>) -> Result<Self, String> {
+    pub(crate) fn open(
+        trusted_roots: Option<Vec<PathBuf>>,
+        esde: Option<archivefs_core::emulator_environment::es_de_metadata::EsDeProviderCollection>,
+        launchbox: Option<
+            archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex,
+        >,
+    ) -> Result<Self, String> {
         use archivefs_core::identity_source::artwork::ArtworkCache;
         use archivefs_core::identity_source::hashing::LocalHashCache;
         use archivefs_core::identity_source::model::IdentityProvider;
@@ -881,6 +1276,8 @@ impl RommCoverSource {
             source: None,
             transport: archivefs_core::identity_source::romm::client::UreqTransport::new(),
             trusted_roots,
+            esde,
+            launchbox,
         })
     }
 
@@ -899,6 +1296,9 @@ impl RommCoverSource {
     ) -> CoverReply {
         use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
 
+        #[cfg(debug_assertions)]
+        let resolve_started = Instant::now();
+
         let reply = |provider_game_id: Option<String>,
                      screenshot_count: Option<usize>,
                      answer: CoverAnswer| CoverReply {
@@ -910,32 +1310,117 @@ impl RommCoverSource {
             answer,
         };
 
-        let Some(record) = self.by_path.get(local_path).cloned() else {
+        let Some(record) = self
+            .by_path
+            .get(&normalized_selected_path(local_path))
+            .cloned()
+        else {
             return reply(None, None, CoverAnswer::None(NoCover::NoRommIdentity));
         };
         let game_id = record.provider_game_id.clone();
-
-        let screenshot_count = record
-            .artwork
-            .as_ref()
-            .map(|artwork| artwork.screenshots.len());
+        let platform = record
+            .platform_candidate
+            .as_deref()
+            .or(record.provider_platform_name.as_deref());
+        let esde = platform.and_then(|platform| {
+            self.esde
+                .as_ref()
+                .and_then(|collection| collection.lookup_path(platform, local_path))
+        });
+        let resolved_media = archivefs_core::identity_source::media_resolver::resolve_media(
+            &resolver_input_for_record(
+                &record,
+                generation,
+                esde.as_ref(),
+                self.esde
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.generation)
+                    .max(
+                        self.launchbox
+                            .as_ref()
+                            .map_or(0, |snapshot| snapshot.generation),
+                    ),
+                self.launchbox.as_ref(),
+            ),
+        );
+        #[cfg(debug_assertions)]
+        cover_timing::stage(local_path, kind, "resolver", resolve_started);
+        let screenshot_count = Some(resolved_media.screenshots.len());
+        let selected_media = match kind {
+            GamerArtworkKind::Cover => resolved_media.cover.as_ref(),
+            GamerArtworkKind::Screenshot(index) => resolved_media.screenshots.get(index),
+        };
+        if let Some(item) = selected_media.filter(|item| {
+            matches!(
+                item.provider,
+                archivefs_core::identity_source::media_resolver::MediaProvider::EsDe
+                    | archivefs_core::identity_source::media_resolver::MediaProvider::LaunchBoxLocal
+            )
+        }) {
+            let path = Path::new(
+                item.reference
+                    .hosted_reference
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            #[cfg(debug_assertions)]
+            let local_started = Instant::now();
+            let thumbnail = fs::metadata(path).ok().map(|metadata| {
+                archivefs_core::identity_source::artwork::CachedThumbnail {
+                    key: format!("local:{}", path.display()),
+                    path: path.to_path_buf(),
+                    width: 0,
+                    height: 0,
+                    bytes: metadata.len(),
+                }
+            });
+            return match thumbnail
+                .as_ref()
+                .and_then(|thumbnail| crate::romm_game::decode_thumbnail(thumbnail, false).ok())
+            {
+                Some(image) => {
+                    #[cfg(debug_assertions)]
+                    cover_timing::stage(local_path, kind, "local_read_decode", local_started);
+                    reply(
+                        Some(game_id),
+                        screenshot_count,
+                        CoverAnswer::Ready(Box::new(image)),
+                    )
+                }
+                None => {
+                    #[cfg(debug_assertions)]
+                    cover_timing::stage(
+                        local_path,
+                        kind,
+                        "local_read_decode_failed",
+                        local_started,
+                    );
+                    reply(
+                        Some(game_id),
+                        screenshot_count,
+                        CoverAnswer::None(NoCover::Failed),
+                    )
+                }
+            };
+        }
         let request = match kind {
             GamerArtworkKind::Cover => {
-                // The same rule the core enforces, checked before anything is
-                // asked for: public scraper URLs are provenance only.
-                match plan_for(&record) {
-                    CoverPlan::Placeholder(reason) => {
-                        return reply(Some(game_id), screenshot_count, CoverAnswer::None(reason));
-                    }
-                    CoverPlan::UseRommHostedCover => {}
+                if resolved_media.cover.is_none() {
+                    // Preserve the existing human-facing distinction for a
+                    // missing cover versus a public, non-approved reference.
+                    let reason = match plan_for(&record) {
+                        CoverPlan::Placeholder(reason) => reason,
+                        CoverPlan::UseRommHostedCover => NoCover::NoArtwork,
+                    };
+                    return reply(Some(game_id), screenshot_count, CoverAnswer::None(reason));
                 }
                 ArtworkRequest::from_record(&record)
             }
             GamerArtworkKind::Screenshot(index) => {
-                let Some(media) = record
-                    .artwork
-                    .as_ref()
-                    .and_then(|artwork| artwork.screenshots.get(index))
+                let Some(media) = resolved_media
+                    .screenshots
+                    .get(index)
+                    .map(|item| &item.reference)
                 else {
                     return reply(
                         Some(game_id),
@@ -943,13 +1428,6 @@ impl RommCoverSource {
                         CoverAnswer::None(NoCover::NoArtwork),
                     );
                 };
-                if media.hosted_reference.is_none() {
-                    return reply(
-                        Some(game_id),
-                        screenshot_count,
-                        CoverAnswer::None(NoCover::PublicOnly),
-                    );
-                }
                 ArtworkRequest::from_media(&record.provider_game_id, media)
             }
         };
@@ -970,20 +1448,36 @@ impl RommCoverSource {
                 CoverAnswer::Unchanged { key },
             );
         }
+        #[cfg(debug_assertions)]
+        let lookup_started = Instant::now();
         if let Some(thumbnail) = self.artwork.lookup(&self.server_id, &request) {
+            #[cfg(debug_assertions)]
+            cover_timing::stage(local_path, kind, "cache_lookup_hit", lookup_started);
+            #[cfg(debug_assertions)]
+            let decode_started = Instant::now();
             return match crate::romm_game::decode_thumbnail(&thumbnail, true) {
-                Ok(image) => reply(
-                    Some(game_id),
-                    screenshot_count,
-                    CoverAnswer::Ready(Box::new(image)),
-                ),
-                Err(_) => reply(
-                    Some(game_id),
-                    screenshot_count,
-                    CoverAnswer::None(NoCover::Failed),
-                ),
+                Ok(image) => {
+                    #[cfg(debug_assertions)]
+                    cover_timing::stage(local_path, kind, "cache_decode", decode_started);
+                    reply(
+                        Some(game_id),
+                        screenshot_count,
+                        CoverAnswer::Ready(Box::new(image)),
+                    )
+                }
+                Err(_) => {
+                    #[cfg(debug_assertions)]
+                    cover_timing::stage(local_path, kind, "cache_decode_failed", decode_started);
+                    reply(
+                        Some(game_id),
+                        screenshot_count,
+                        CoverAnswer::None(NoCover::Failed),
+                    )
+                }
             };
         }
+        #[cfg(debug_assertions)]
+        cover_timing::stage(local_path, kind, "cache_lookup_miss", lookup_started);
 
         if self.validated_source().is_none() {
             return reply(
@@ -1005,23 +1499,46 @@ impl RommCoverSource {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|value| value.as_secs() as i64)
             .unwrap_or_default();
+        #[cfg(debug_assertions)]
+        let fetch_started = Instant::now();
         match self
             .artwork
             .fetch(source, &self.transport, &request, now, None)
         {
-            Ok(thumbnail) => match crate::romm_game::decode_thumbnail(&thumbnail, false) {
-                Ok(image) => reply(
-                    Some(game_id),
-                    screenshot_count,
-                    CoverAnswer::Ready(Box::new(image)),
-                ),
-                Err(_) => reply(
-                    Some(game_id),
-                    screenshot_count,
-                    CoverAnswer::None(NoCover::Failed),
-                ),
-            },
+            Ok(thumbnail) => {
+                #[cfg(debug_assertions)]
+                cover_timing::stage(local_path, kind, "fetch", fetch_started);
+                #[cfg(debug_assertions)]
+                let decode_started = Instant::now();
+                match crate::romm_game::decode_thumbnail(&thumbnail, false) {
+                    Ok(image) => {
+                        #[cfg(debug_assertions)]
+                        cover_timing::stage(local_path, kind, "remote_decode", decode_started);
+                        reply(
+                            Some(game_id),
+                            screenshot_count,
+                            CoverAnswer::Ready(Box::new(image)),
+                        )
+                    }
+                    Err(_) => {
+                        #[cfg(debug_assertions)]
+                        cover_timing::stage(
+                            local_path,
+                            kind,
+                            "remote_decode_failed",
+                            decode_started,
+                        );
+                        reply(
+                            Some(game_id),
+                            screenshot_count,
+                            CoverAnswer::None(NoCover::Failed),
+                        )
+                    }
+                }
+            }
             Err(refusal) => {
+                #[cfg(debug_assertions)]
+                cover_timing::stage(local_path, kind, "fetch_refused", fetch_started);
                 use archivefs_core::identity_source::artwork::ArtworkRefusal;
                 let reason = match refusal {
                     ArtworkRefusal::Request(_) | ArtworkRefusal::Cancelled => NoCover::Unavailable,
@@ -1115,6 +1632,7 @@ impl RommCoverSource {
 pub(crate) struct CoverWorker {
     requests: std::sync::mpsc::Sender<WorkerMessage>,
     replies: std::sync::mpsc::Receiver<CoverReply>,
+    delivery: std::sync::mpsc::Receiver<MediaDeliveryUpdate>,
 }
 
 /// One job waiting on the worker, with what it needs to be ordered.
@@ -1207,16 +1725,33 @@ enum WorkerMessage {
     /// 36,259 records and rebuilding it speculatively would be the reload storm this
     /// message exists to avoid.
     Reindex,
+    UpdateEsDe(
+        Option<archivefs_core::emulator_environment::es_de_metadata::EsDeProviderCollection>,
+    ),
+    UpdateLaunchBox(
+        Option<archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex>,
+    ),
 }
 
 impl CoverWorker {
     /// Starts the worker. Opening the catalogue happens on the thread, so a large
     /// library never delays the first frame.
-    pub(crate) fn start(context: egui::Context, trusted_roots: Option<Vec<PathBuf>>) -> Self {
+    pub(crate) fn start(
+        context: egui::Context,
+        trusted_roots: Option<Vec<PathBuf>>,
+        esde: Option<archivefs_core::emulator_environment::es_de_metadata::EsDeProviderCollection>,
+        launchbox: Option<
+            archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex,
+        >,
+    ) -> Self {
         let (request_sender, request_receiver) = std::sync::mpsc::channel::<WorkerMessage>();
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel::<CoverReply>();
+        let (delivery_sender, delivery_receiver) =
+            std::sync::mpsc::channel::<MediaDeliveryUpdate>();
         std::thread::spawn(move || {
             let mut source: Option<RommCoverSource> = None;
+            let mut esde_snapshot = esde;
+            let mut launchbox_snapshot = launchbox;
             let mut opened = false;
             let mut queue: Vec<QueuedJob> = Vec::new();
             let mut served_high = 0_u32;
@@ -1248,7 +1783,12 @@ impl CoverWorker {
                                 // may have created what was missing, so try again.
                                 None => {
                                     opened = true;
-                                    source = RommCoverSource::open(trusted_roots.clone()).ok();
+                                    source = RommCoverSource::open(
+                                        trusted_roots.clone(),
+                                        esde_snapshot.clone(),
+                                        launchbox_snapshot.clone(),
+                                    )
+                                    .ok();
                                 }
                             }
                             // Everything queued was resolved against the previous
@@ -1256,6 +1796,20 @@ impl CoverWorker {
                             // has already moved its slots to `Revalidating` and
                             // re-asks for what is on screen.
                             queue.clear();
+                            context.request_repaint();
+                        }
+                        WorkerMessage::UpdateEsDe(snapshot) => {
+                            esde_snapshot = snapshot.clone();
+                            if let Some(source) = source.as_mut() {
+                                source.esde = snapshot;
+                            }
+                            context.request_repaint();
+                        }
+                        WorkerMessage::UpdateLaunchBox(snapshot) => {
+                            launchbox_snapshot = snapshot.clone();
+                            if let Some(source) = source.as_mut() {
+                                source.launchbox = snapshot;
+                            }
                             context.request_repaint();
                         }
                         WorkerMessage::Resolve { generation, job } => {
@@ -1273,17 +1827,37 @@ impl CoverWorker {
                 let Some(queued) = next_job(&mut queue, &mut served_high) else {
                     continue;
                 };
+                #[cfg(debug_assertions)]
+                let queued_at = cover_timing::worker_started(
+                    queued.generation,
+                    &queued.job.local_path,
+                    queued.job.kind,
+                );
+                #[cfg(debug_assertions)]
+                let worker_started = Instant::now();
                 if !opened {
                     opened = true;
-                    source = RommCoverSource::open(trusted_roots.clone()).ok();
+                    source = RommCoverSource::open(
+                        trusted_roots.clone(),
+                        esde_snapshot.clone(),
+                        launchbox_snapshot.clone(),
+                    )
+                    .ok();
                 }
                 let reply = match source.as_mut() {
-                    Some(source) => source.resolve(
-                        queued.generation,
-                        &queued.job.local_path,
-                        queued.job.kind,
-                        queued.job.held_key.as_deref(),
-                    ),
+                    Some(source) => {
+                        if let Some(update) =
+                            source.delivery(queued.generation, &queued.job.local_path)
+                        {
+                            let _ = delivery_sender.send(update);
+                        }
+                        source.resolve(
+                            queued.generation,
+                            &queued.job.local_path,
+                            queued.job.kind,
+                            queued.job.held_key.as_deref(),
+                        )
+                    }
                     // The catalogue itself could not be opened - RomM has never been
                     // imported, or the published cache is unreadable. That is not the
                     // same as a record having no identity, and saying so would send
@@ -1297,6 +1871,23 @@ impl CoverWorker {
                         answer: CoverAnswer::None(NoCover::Unavailable),
                     },
                 };
+                #[cfg(debug_assertions)]
+                {
+                    let answer = match &reply.answer {
+                        CoverAnswer::Ready(image) if image.from_cache => "ready-cache-or-local",
+                        CoverAnswer::Ready(_) => "ready",
+                        CoverAnswer::Unchanged { .. } => "unchanged",
+                        CoverAnswer::None(_) => "none",
+                    };
+                    cover_timing::completed(
+                        reply.generation,
+                        &reply.local_path,
+                        reply.kind,
+                        queued_at,
+                        worker_started,
+                        answer,
+                    );
+                }
                 if reply_sender.send(reply).is_err() {
                     return;
                 }
@@ -1306,11 +1897,14 @@ impl CoverWorker {
         Self {
             requests: request_sender,
             replies: reply_receiver,
+            delivery: delivery_receiver,
         }
     }
 
     /// Asks about one record. Dropped silently if the worker has gone.
     pub(crate) fn request(&self, generation: u64, job: CoverJob) {
+        #[cfg(debug_assertions)]
+        cover_timing::enqueued(generation, &job.local_path, job.kind);
         let _ = self
             .requests
             .send(WorkerMessage::Resolve { generation, job });
@@ -1321,10 +1915,32 @@ impl CoverWorker {
         let _ = self.requests.send(WorkerMessage::Reindex);
     }
 
+    pub(crate) fn update_esde(
+        &self,
+        snapshot: Option<
+            archivefs_core::emulator_environment::es_de_metadata::EsDeProviderCollection,
+        >,
+    ) {
+        let _ = self.requests.send(WorkerMessage::UpdateEsDe(snapshot));
+    }
+
+    pub(crate) fn update_launchbox(
+        &self,
+        snapshot: Option<
+            archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex,
+        >,
+    ) {
+        let _ = self.requests.send(WorkerMessage::UpdateLaunchBox(snapshot));
+    }
+
     /// Every answer that has arrived. Never blocks, so the UI thread never waits on
     /// a decode or a request.
     pub(crate) fn drain(&self) -> Vec<CoverReply> {
         self.replies.try_iter().collect()
+    }
+
+    pub(crate) fn drain_delivery(&self) -> Vec<MediaDeliveryUpdate> {
+        self.delivery.try_iter().collect()
     }
 }
 

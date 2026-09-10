@@ -19,6 +19,8 @@
 //! visibly disabled with an honest label, because a card that silently lacks them
 //! is harder to understand than one that says what is coming.
 
+pub(crate) mod worker;
+
 use std::path::PathBuf;
 
 use archivefs_core::identity_source::artwork::ArtworkCacheStats;
@@ -214,6 +216,9 @@ pub(crate) struct RommSnapshot {
     /// Aggregate identity facts prepared with the snapshot, never recomputed
     /// while Verify is repainting.
     pub(crate) verify_summary: Option<VerifyRommSummary>,
+    pub(crate) media_coverage: Option<archivefs_core::identity_source::model::MediaCoverage>,
+    pub(crate) platform_media_coverage:
+        std::collections::BTreeMap<String, archivefs_core::identity_source::model::MediaCoverage>,
 }
 
 /// The small RomM aggregate consumed by Verify. This contains only counts
@@ -567,7 +572,7 @@ pub(crate) fn build_card_view(
         ));
     }
 
-    let summary_rows = vec![
+    let mut summary_rows = vec![
         row(
             "URL",
             if configured {
@@ -612,6 +617,22 @@ pub(crate) fn build_card_view(
                 .unwrap_or_else(|| "never".to_string()),
         ),
     ];
+    if let Some(coverage) = snapshot.media_coverage {
+        summary_rows.push(row(
+            "Media coverage",
+            format!(
+                "Covers {} / {}; screenshots {} / {}; videos {}",
+                coverage.covers_available,
+                coverage.total_games,
+                coverage.screenshots_available,
+                coverage.total_games,
+                coverage
+                    .videos_available
+                    .map(|count| format!("{count} / {}", coverage.total_games))
+                    .unwrap_or_else(|| "not indexed".to_string())
+            ),
+        ));
+    }
 
     let verdict_rows = vec![
         row("Confirmed", counts.confirmed.to_string()),
@@ -770,6 +791,16 @@ fn build_actions(
     });
 
     let (full_enabled, full_reason) = gate(import_allowed, &import_reason);
+    if has_cache {
+        actions.push(CardAction {
+            label: "Preview update".to_string(),
+            operation: Some(RommOperation::Preview { limit: 100 }),
+            enabled: full_enabled,
+            disabled_reason: full_reason.clone(),
+            style: CardActionStyle::Secondary,
+            coming_next: false,
+        });
+    }
     actions.push(CardAction {
         label: if has_cache {
             "Refresh".to_string()
@@ -1546,6 +1577,16 @@ pub(crate) fn show_romm_source_card(
         ui.label(format!("State: {}", view.state_label));
         if let Some(detail) = &view.state_detail {
             ui.label(detail);
+        }
+        if view.state_label == "Stale" {
+            ui.label("RomM has changed since this snapshot was imported.");
+            ui.weak(
+                "Detailed per-item changes are not currently indexed; review before refreshing.",
+            );
+        } else if view.state_label == "Ready (offline)" {
+            ui.label(
+                "The imported snapshot is available, but the RomM source is currently unavailable.",
+            );
         }
         if view.offline_browsing {
             ui.label("Imported identity is browsable without reaching RomM.");

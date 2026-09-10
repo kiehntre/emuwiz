@@ -94,6 +94,8 @@ fn snapshot(configured: bool, kind: ProviderPathKind, mappings: Vec<PathMapping>
         token_problem: None,
         cache_format_version: None,
         verify_summary: None,
+        media_coverage: None,
+        platform_media_coverage: Default::default(),
     }
 }
 

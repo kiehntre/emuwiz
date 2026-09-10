@@ -2546,7 +2546,86 @@ pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Optio
 /// (`collection_discovery_page::show_collection_discovery_panel`) and the
 /// data it reads are unchanged - only the routing mechanism moved from an
 /// overlay to a Sources tab.
-pub(super) fn show_sources_discovery_tab(ui: &mut egui::Ui, database_state: &DatabaseState) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LocalProviderRefreshAction {
+    EsDe,
+    LaunchBoxLocal,
+}
+
+fn show_provider_state(
+    ui: &mut egui::Ui,
+    name: &str,
+    state: &str,
+    generation: u64,
+    indexed: usize,
+    error: Option<&str>,
+    action: LocalProviderRefreshAction,
+) -> Option<LocalProviderRefreshAction> {
+    let mut refresh = None;
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.strong(name);
+            ui.label(state);
+            ui.label(format!("{indexed} games indexed"));
+        });
+        ui.label(format!("Provider generation: {generation}"));
+        if let Some(error) = error {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Last error: {error}"));
+        }
+        if ui.button("Refresh").clicked() {
+            refresh = Some(action);
+        }
+    });
+    refresh
+}
+
+pub(super) fn show_sources_discovery_tab(
+    ui: &mut egui::Ui,
+    database_state: &DatabaseState,
+    es_de_media: &crate::es_de_media_state::EsDeMediaState,
+    launchbox_local_media: &crate::launchbox_local_state::LaunchBoxLocalMediaState,
+) -> Option<LocalProviderRefreshAction> {
+    ui.heading("Local media providers");
+    let esde_indexed = es_de_media
+        .snapshot()
+        .map(|snapshot| snapshot.indexes.iter().map(|index| index.entries.len()).sum())
+        .unwrap_or(0);
+    let esde_state = match es_de_media.state() {
+        crate::es_de_media_state::EsDeProviderState::NotStarted => "Not configured",
+        crate::es_de_media_state::EsDeProviderState::Loading => "Loading",
+        crate::es_de_media_state::EsDeProviderState::Ready(_) => "Ready",
+        crate::es_de_media_state::EsDeProviderState::Error(_) => "Last refresh failed",
+    };
+    let mut refresh = show_provider_state(
+        ui,
+        "ES-DE",
+        esde_state,
+        es_de_media.generation(),
+        esde_indexed,
+        es_de_media.error(),
+        LocalProviderRefreshAction::EsDe,
+    );
+    let launchbox_indexed = launchbox_local_media
+        .snapshot()
+        .map(|snapshot| snapshot.games.len())
+        .unwrap_or(0);
+    let launchbox_state = match launchbox_local_media.state() {
+        crate::launchbox_local_state::LaunchBoxLocalState::NotConfigured => "Not configured",
+        crate::launchbox_local_state::LaunchBoxLocalState::Loading => "Loading",
+        crate::launchbox_local_state::LaunchBoxLocalState::Ready(_) => "Ready",
+        crate::launchbox_local_state::LaunchBoxLocalState::Error(_) => "Last refresh failed",
+    };
+    if refresh.is_none() {
+        refresh = show_provider_state(
+            ui,
+            "LaunchBox Local",
+            launchbox_state,
+            launchbox_local_media.generation(),
+            launchbox_indexed,
+            launchbox_local_media.error(),
+            LocalProviderRefreshAction::LaunchBoxLocal,
+        );
+    }
     sources_content_column(ui, |ui| {
         widgets::section_header(
             ui,
@@ -2574,6 +2653,7 @@ pub(super) fn show_sources_discovery_tab(ui: &mut egui::Ui, database_state: &Dat
         };
         collection_discovery_page::show_collection_discovery_panel(ui, summary, discovery_run);
     });
+    refresh
 }
 
 #[cfg(test)]
