@@ -85,6 +85,11 @@ pub const THUMBNAIL_MAX_HEIGHT: u32 = 280;
 
 /// The most one artwork response may be. A real small cover is about 55 KB.
 pub const MAX_ARTWORK_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// The one public image host explicitly approved for provider-derived
+/// LaunchBox references. This is deliberately exact: no wildcard subdomains
+/// or caller-supplied hosts are accepted.
+pub const APPROVED_LAUNCHBOX_IMAGE_HOST: &str = "images.launchbox-app.com";
+const MAX_EXTERNAL_IMAGE_PATH_BYTES: usize = 2048;
 
 /// The largest source image this will decode, per side and in total allocation.
 /// A decompression bomb is a small file that decodes to an enormous buffer, so the
@@ -800,21 +805,24 @@ impl ArtworkCache {
         // not offered first. It is only used if the instance actually refuses -
         // there is no reason to hand a credential to a request that does not want
         // one.
+        let launchbox = is_launchbox_url(&url);
         let response = match transport.get(&url, None, MAX_ARTWORK_RESPONSE_BYTES, REQUEST_TIMEOUT)
         {
-            Ok(response) if response.status == 401 || response.status == 403 => source
-                .token()
-                .with_header_value(|header| {
-                    transport.get(
-                        &url,
-                        Some(header),
-                        MAX_ARTWORK_RESPONSE_BYTES,
-                        REQUEST_TIMEOUT,
-                    )
-                })
-                .map_err(ArtworkRefusal::Request)?,
+            Ok(response) if !launchbox && (response.status == 401 || response.status == 403) => {
+                source
+                    .token()
+                    .with_header_value(|header| {
+                        transport.get(
+                            &url,
+                            Some(header),
+                            MAX_ARTWORK_RESPONSE_BYTES,
+                            REQUEST_TIMEOUT,
+                        )
+                    })
+                    .map_err(ArtworkRefusal::Request)?
+            }
             Ok(response) => response,
-            Err(RommRequestError::Unauthorised { .. }) => source
+            Err(RommRequestError::Unauthorised { .. }) if !launchbox => source
                 .token()
                 .with_header_value(|header| {
                     transport.get(
@@ -829,6 +837,11 @@ impl ArtworkCache {
         };
         if cancelled(cancel) {
             return Err(ArtworkRefusal::Cancelled);
+        }
+        if let Some(location) = response.location.as_deref() {
+            return Err(ArtworkRefusal::Endpoint(EndpointRefusal::RedirectRefused {
+                location: location.to_string(),
+            }));
         }
         if response.status != 200 {
             return Err(ArtworkRefusal::Request(RommRequestError::HttpStatus {
@@ -959,6 +972,7 @@ impl ArtworkCache {
                 .map(str::trim)
                 .filter(|r| !r.is_empty())
             {
+                Some(public) if validate_launchbox_url(public).is_ok() => Ok(public.to_string()),
                 Some(public) => Err(ArtworkRefusal::RemoteHostNotAllowed {
                     host: host_of(public).unwrap_or_else(|| "an external host".to_string()),
                 }),
@@ -1242,6 +1256,54 @@ fn host_of(reference: &str) -> Option<String> {
     url::Url::parse(reference)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
+}
+
+/// Validates the narrowly approved LaunchBox image URL shape. LaunchBox is a
+/// public CDN exception to RomM's private-origin policy, so it has its own
+/// exact-host check; direct/private IP literals are still refused.
+fn validate_launchbox_url(reference: &str) -> Result<(), ArtworkRefusal> {
+    let url = url::Url::parse(reference).map_err(|error| ArtworkRefusal::UnsupportedReference {
+        detail: error.to_string(),
+    })?;
+    if url.scheme() != "https" {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media must use HTTPS".to_string(),
+        });
+    }
+    if url.username() != "" || url.password().is_some() {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media URLs must not contain credentials".to_string(),
+        });
+    }
+    if url.host_str() != Some(APPROVED_LAUNCHBOX_IMAGE_HOST) {
+        return Err(ArtworkRefusal::RemoteHostNotAllowed {
+            host: url.host_str().unwrap_or("missing host").to_string(),
+        });
+    }
+    if url.port_or_known_default() != Some(443) {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media must use the default HTTPS port".to_string(),
+        });
+    }
+    if url.path().len() > MAX_EXTERNAL_IMAGE_PATH_BYTES {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media URL path is too long".to_string(),
+        });
+    }
+    if url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some()
+    {
+        return Err(ArtworkRefusal::UnsupportedReference {
+            detail: "LaunchBox media must use its approved hostname".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn is_launchbox_url(reference: &str) -> bool {
+    validate_launchbox_url(reference).is_ok()
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

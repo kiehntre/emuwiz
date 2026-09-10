@@ -166,10 +166,16 @@ pub fn normalise_rom(
         .collect();
 
     // Artwork references only - never bytes, and never fetched here.
-    let screenshots = media_references(value, "path_screenshots", "url_screenshots");
+    let mut screenshots = media_references(value, "path_screenshots", "url_screenshots");
+    let launchbox_media = launchbox_media(value);
+    if screenshots.is_empty() {
+        screenshots = launchbox_media.screenshots;
+    }
     let manual = media_reference(value, "path_manual", "url_manual");
     let large_reference = string_field(value, "path_cover_large");
-    let cover_reference = string_field(value, "url_cover").or_else(|| large_reference.clone());
+    let cover_reference = string_field(value, "url_cover")
+        .or_else(|| large_reference.clone())
+        .or(launchbox_media.cover);
     let artwork =
         (cover_reference.is_some() || !screenshots.is_empty() || manual.is_some()).then(|| {
             ArtworkReference {
@@ -330,6 +336,56 @@ pub fn normalise_rom(
         release_year,
         howlongtobeat,
     })
+}
+
+/// Projects the already-selected LaunchBox media object that RomM includes in
+/// its ROM response.  This is deliberately a projection only: it does not
+/// query Redis, fetch bytes, or participate in identity matching.  Direct
+/// RomM screenshot/cover fields remain higher priority; LaunchBox fills only
+/// the gaps they leave behind.
+#[derive(Default)]
+struct LaunchboxMediaProjection {
+    cover: Option<String>,
+    screenshots: Vec<MediaReference>,
+}
+
+fn launchbox_media(value: &Value) -> LaunchboxMediaProjection {
+    let Some(images) = value
+        .get("launchbox_metadata")
+        .and_then(|metadata| metadata.get("images"))
+        .and_then(Value::as_array)
+    else {
+        return LaunchboxMediaProjection::default();
+    };
+
+    const MAX_SCREENSHOTS: usize = 32;
+    let mut projection = LaunchboxMediaProjection::default();
+    let mut seen = std::collections::HashSet::new();
+    for image in images {
+        let Some(file_name) = image.get("url").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if file_name.is_empty() {
+            continue;
+        }
+        let image_type = image
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if image_type == "Box - Front" && projection.cover.is_none() {
+            projection.cover = Some(file_name.to_string());
+        }
+        if image_type.starts_with("Screenshot")
+            && projection.screenshots.len() < MAX_SCREENSHOTS
+            && seen.insert(file_name.to_string())
+        {
+            projection.screenshots.push(MediaReference {
+                hosted_reference: None,
+                public_reference: Some(file_name.to_string()),
+            });
+        }
+    }
+    projection
 }
 
 fn hltb_duration_seconds(value: &Value, field: &str) -> Option<u64> {
@@ -720,6 +776,15 @@ mod tests {
             "url_screenshots": ["https://public.example/second.jpg", "https://public.example/first.png"],
             "path_manual": "assets/manuals/game.pdf",
             "url_manual": "https://public.example/game.pdf",
+            "launchbox_metadata": {
+                "images": [
+                    {"url": "https://images.launchbox-app.com/box-front.jpg", "type": "Box - Front"},
+                    {"url": "https://images.launchbox-app.com/gameplay.png", "type": "Screenshot - Gameplay"},
+                    {"url": "https://images.launchbox-app.com/title.png", "type": "Screenshot - Game Title"},
+                    {"url": "https://images.launchbox-app.com/logo.png", "type": "Clear Logo"}
+                ],
+                "video_url": "https://www.youtube.com/watch?v=example"
+            },
             "summary": "A short adventure across five islands.",
             "hltb_id": 12345,
             "hltb_metadata": {
@@ -777,6 +842,41 @@ mod tests {
                 .iter()
                 .any(|id| { id.provider == "howlongtobeat" && id.id == "12345" })
         );
+    }
+
+    #[test]
+    fn launchbox_media_fills_missing_cover_and_screenshots_without_overriding_identity() {
+        let mut fixture = rom_with_enrichment();
+        fixture
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("path_screenshots");
+        fixture
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("url_screenshots");
+        let mut report = NormalisationReport::default();
+        let record = normalise_rom(&fixture, "server", &no_mappings(), 1, &mut report)
+            .expect("a record with an id normalises");
+
+        let artwork = record.artwork.expect("LaunchBox images produce artwork");
+        assert_eq!(
+            artwork.reference,
+            "https://images.launchbox-app.com/box-front.jpg"
+        );
+        assert_eq!(artwork.screenshots.len(), 2);
+        assert!(artwork.screenshots.iter().any(|media| {
+            media.public_reference.as_deref()
+                == Some("https://images.launchbox-app.com/gameplay.png")
+        }));
+        assert!(artwork.screenshots.iter().any(|media| {
+            media.public_reference.as_deref() == Some("https://images.launchbox-app.com/title.png")
+        }));
+        assert!(!artwork.screenshots.iter().any(|media| {
+            media.public_reference.as_deref() == Some("https://images.launchbox-app.com/logo.png")
+        }));
+        assert_eq!(record.platform_candidate.as_deref(), Some("Game Boy"));
+        assert_eq!(record.provider_game_id, "42");
     }
 
     #[test]

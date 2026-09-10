@@ -31,6 +31,7 @@
 //! does not import from, or get imported by, [`retroarch`].
 
 pub mod es_de;
+pub mod es_de_metadata;
 pub mod fbneo;
 pub mod mame;
 pub mod retroarch;

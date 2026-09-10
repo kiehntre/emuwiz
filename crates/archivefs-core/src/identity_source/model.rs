@@ -436,6 +436,16 @@ pub struct IdentityImportCounts {
     pub unmatched: usize,
     pub with_hashes: usize,
     pub with_artwork: usize,
+    /// Records whose [`ArtworkReference::reference`] (the cover) is
+    /// non-empty - independent of `with_screenshot` below. A record with
+    /// screenshots but no cover reference counts here as 0, not 1: cover and
+    /// screenshot presence are never conflated with each other or with
+    /// `with_artwork` (which only says *some* artwork reference exists).
+    pub with_cover: usize,
+    /// Records with at least one screenshot reference - a game with five
+    /// screenshots still counts once here, matching "coverage is per game,
+    /// not per file."
+    pub with_screenshot: usize,
     pub multi_file: usize,
     /// Records carrying at least one enrichment field (synopsis, genre,
     /// players, rating, or release year) - see
@@ -464,8 +474,14 @@ impl IdentityImportCounts {
             if !record.hashes.is_empty() {
                 counts.with_hashes += 1;
             }
-            if record.artwork.is_some() {
+            if let Some(artwork) = &record.artwork {
                 counts.with_artwork += 1;
+                if !artwork.reference.is_empty() {
+                    counts.with_cover += 1;
+                }
+                if !artwork.screenshots.is_empty() {
+                    counts.with_screenshot += 1;
+                }
             }
             if !record.related_files.is_empty() {
                 counts.multi_file += 1;
@@ -480,5 +496,80 @@ impl IdentityImportCounts {
     /// Records that are usable as identity.
     pub fn usable(&self) -> usize {
         self.confirmed + self.strong + self.probable
+    }
+
+    /// One [`IdentityImportCounts`] per [`ExternalIdentityRecord::platform_candidate`],
+    /// computed in the same single pass as [`Self::of`] (grouped first, then
+    /// each group counted) - never a second scan or per-platform query.
+    /// Records with no resolved platform candidate are grouped together
+    /// under `None` so they are still accounted for, never silently
+    /// dropped from the total.
+    pub fn grouped_by_platform(
+        records: &[ExternalIdentityRecord],
+    ) -> std::collections::BTreeMap<Option<String>, Self> {
+        let mut by_platform: std::collections::BTreeMap<
+            Option<String>,
+            Vec<&ExternalIdentityRecord>,
+        > = std::collections::BTreeMap::new();
+        for record in records {
+            by_platform
+                .entry(record.platform_candidate.clone())
+                .or_default()
+                .push(record);
+        }
+        by_platform
+            .into_iter()
+            .map(|(platform, group)| {
+                let owned: Vec<ExternalIdentityRecord> = group.into_iter().cloned().collect();
+                (platform, Self::of(&owned))
+            })
+            .collect()
+    }
+}
+
+/// A per-game media-completeness projection, derived from
+/// [`IdentityImportCounts`] - never a second scan, never a second source of
+/// truth. See `docs/research/LIBRARY_MEDIA_COVERAGE_V1.md` for the full
+/// design and exactly which media types are authoritatively countable today.
+///
+/// Coverage is per logical record (one imported title), matching
+/// [`IdentityImportCounts::with_cover`]/[`IdentityImportCounts::with_screenshot`]'s
+/// own per-record counting - five screenshots on one game still count that
+/// game once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaCoverage {
+    pub total_games: usize,
+    pub covers_available: usize,
+    pub screenshots_available: usize,
+    /// `None` means video presence is not tracked by any currently
+    /// integrated provider - this is never fabricated as `Some(0)`. See the
+    /// module doc / design note for why: no current identity source
+    /// publishes a video reference at all.
+    pub videos_available: Option<usize>,
+}
+
+impl MediaCoverage {
+    pub fn from_counts(counts: &IdentityImportCounts) -> Self {
+        Self {
+            total_games: counts.total,
+            covers_available: counts.with_cover,
+            screenshots_available: counts.with_screenshot,
+            videos_available: None,
+        }
+    }
+
+    pub fn covers_missing(&self) -> usize {
+        self.total_games.saturating_sub(self.covers_available)
+    }
+
+    pub fn screenshots_missing(&self) -> usize {
+        self.total_games.saturating_sub(self.screenshots_available)
+    }
+
+    /// `None` when video coverage itself is not indexed - never a claim
+    /// that every game is missing video.
+    pub fn videos_missing(&self) -> Option<usize> {
+        self.videos_available
+            .map(|available| self.total_games.saturating_sub(available))
     }
 }
