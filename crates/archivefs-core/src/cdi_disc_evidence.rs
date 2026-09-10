@@ -267,7 +267,7 @@ mod tests {
         p[156] = 34;
         p[158..166].copy_from_slice(&both32(18));
         p[166..174].copy_from_slice(&both32(2048));
-        let t = &mut d[17 * 2048..18 * 2048];
+        let t = &mut d[18 * 2048..19 * 2048];
         let root_record = record(&[0], 18, 2048, true);
         t[..root_record.len()].copy_from_slice(&root_record);
         let startup_record = record(b"STARTUP", 19, 10, false);
