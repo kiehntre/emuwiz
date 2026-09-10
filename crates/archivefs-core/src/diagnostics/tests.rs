@@ -1467,13 +1467,14 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 /// Doctor stores nothing, so it must not add, renumber, or modify a
 /// migration. Unrelated additions already accounted for as legitimate
 /// (see `database.rs`): 0006 (Wii identity), 0007 (Collection Discovery
-/// paging), 0008 (library DAT identities), 0009 (set-audit persistence), and
-/// 0010 (verified identity facts). This guard still proves Doctor itself
+/// paging), 0008 (library DAT identities), 0009 (set-audit persistence),
+/// 0010 (verified identity facts), 0011 (named expected DAT inventory), and
+/// 0012 (expected-inventory metadata). This guard still proves Doctor itself
 /// introduced no migration of its own
 /// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 10] = [
+    const EXPECTED: [&str; 12] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1484,6 +1485,8 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0008_library_dat_identities.sql"),
         include_str!("../migrations/0009_set_audit_verdicts.sql"),
         include_str!("../migrations/0010_verified_identity_facts.sql"),
+        include_str!("../migrations/0011_dat_expected_entries.sql"),
+        include_str!("../migrations/0012_dat_expected_inventory_meta.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
