@@ -191,6 +191,7 @@ pub(crate) mod mount_batch;
 use mount_batch::*;
 pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
+pub(crate) mod feature_discovery;
 pub(crate) mod game_metadata;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
@@ -199,6 +200,7 @@ pub(crate) mod identity_sources_page;
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
+pub(crate) mod museum_page;
 pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
@@ -3061,6 +3063,9 @@ enum MainView {
     /// Doctor scan's "Emulators" and "Emulator profiles" categories carry the
     /// per-emulator rows.
     EmulatorSetup,
+    /// Curated, read-only collection view backed by the loaded catalogue and
+    /// existing evidence/artwork state.
+    Museum,
     /// Library View History: a read-only view of the durable, append-only
     /// Library View apply/remove history
     /// (`archivefs_core::library_view_history`), re-read from disk on every
@@ -3137,7 +3142,12 @@ enum LibraryTab {
 /// provably converges on the same destination - see
 /// `major_workflows_are_reachable_from_home_sidebar_and_top_menu`. RomM is
 /// exposed under the "Sources" menu instead (it has no `MainView` of its own).
-const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 3] = [
+const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 4] = [
+    (
+        "Museum",
+        "Browse your collection by platform: what EmuWiz knows about each system.",
+        MainView::Museum,
+    ),
     (
         "Duplicate Finder",
         "Find identical or equivalent copies and quarantine the extras.",
@@ -3203,6 +3213,54 @@ fn setup_check_summary(state: &DoctorScanState) -> home_page::SetupCheckSummary 
 /// destination is directly assertable without a frame buffer. `BuildLibrary`
 /// and `RomM` both land on Sources - there is no dedicated RomM `MainView`,
 /// since RomM is a card embedded on the Sources page, not its own
+/// `MainView`.
+///
+/// Projects the already-loaded catalogue into the small collection summary
+/// Museum's platform grid consumes. This is deliberately an in-memory
+/// projection: it never scans source folders, opens media, or asks RomM for
+/// fresh data while rendering.
+///
+/// RomM per-platform media coverage is not enriched here - that requires the
+/// RomM/Home-Intelligence snapshot's `media_coverage`/`platform_media_coverage`
+/// fields, which are a separate, not-yet-reconciled batch; every
+/// `romm_media_coverage` this function produces is `None` until that lands.
+fn home_library_snapshot(snapshot: &CachedLibrarySnapshot) -> home_page::HomeLibrarySnapshot {
+    let mut by_platform: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    for archive in &snapshot.archives {
+        let Some(platform) = archive.platform.as_deref() else {
+            continue;
+        };
+        let entry = by_platform.entry(platform.to_string()).or_default();
+        entry.0 += 1;
+        entry.1 += 1;
+        entry.2 += usize::from(archive.last_verified_missing_at.is_some());
+    }
+    let mut platforms = by_platform
+        .into_iter()
+        .map(
+            |(name, (total, identified, missing))| home_page::HomePlatformSummary {
+                name,
+                total,
+                identified,
+                missing,
+                romm_media_coverage: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    platforms.sort_by(|left, right| left.name.cmp(&right.name));
+
+    home_page::HomeLibrarySnapshot {
+        total: snapshot.stats.total_archives.max(0) as usize,
+        present: snapshot.stats.present_archives.max(0) as usize,
+        identified: snapshot.stats.archives_with_platform.max(0) as usize,
+        unresolved: snapshot.stats.archives_unknown_platform.max(0) as usize,
+        missing: snapshot.stats.missing_archives.max(0) as usize,
+        duplicate_groups: snapshot.duplicate_report.groups.len(),
+        platforms,
+        romm_media_coverage: None,
+    }
+}
+
 /// destination.
 fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
     match card {
@@ -3569,6 +3627,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::ExactDuplicateReview => "Duplicate Finder",
         MainView::DiscConversion => "Disc Conversion",
         MainView::EmulatorSetup => "Emulator Setup",
+        MainView::Museum => "Museum",
         MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
@@ -3597,6 +3656,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::RepairHistory
         | MainView::ExactDuplicateReview
         | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
+        MainView::Museum => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
         | MainView::IdentifyRename
@@ -4396,6 +4456,9 @@ struct ArchiveFsApp {
     gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache,
     /// The thread that resolves those covers, started on the first frame that
     /// actually draws the list so a session that never opens Gamer View never
+    /// Museum's own navigation state (grid vs. one platform's detail view) -
+    /// see `museum_page`'s own module doc.
+    museum_page: museum_page::MuseumPageState,
     /// opens the catalogue. `None` until then.
     gamer_cover_worker: Option<crate::gamer_artwork::CoverWorker>,
     /// Whether a cover worker may be started at all. Always true in the running
@@ -4764,6 +4827,7 @@ impl ArchiveFsApp {
                 archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
                 open_folder_in_file_manager,
             ),
+            museum_page: museum_page::MuseumPageState::default(),
 
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
             gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
@@ -4874,6 +4938,224 @@ impl ArchiveFsApp {
             self.view = target;
             self.tools_overlay = ToolsOverlay::None;
         }
+    }
+
+    /// "What you can do with this item" for the currently selected path -
+    /// see `feature_discovery`'s own module doc. A plain projection over
+    /// already-loaded state (cheat workflow, RomM snapshot, emulator setup
+    /// readiness, cover/screenshot cache); it never scans or contacts a
+    /// provider itself.
+    fn feature_discovery_context(
+        &self,
+        selected_path: Option<&std::path::Path>,
+    ) -> feature_discovery::FeatureDiscoveryContext {
+        use feature_discovery::{FeatureDiscoveryContext, FeatureStatus};
+
+        let cheats = selected_path
+            .and_then(|path| {
+                self.cheat_workflow
+                    .as_ref()
+                    .filter(|w| w.archive_path == path)
+            })
+            .map(|_| FeatureStatus::Available {
+                label: "Cheat workflow available".to_string(),
+                action_label: Some("Review cheats"),
+                action: Some(feature_discovery::FeatureDiscoveryAction::OpenCheats),
+            });
+
+        let romm = self.romm_snapshot.as_deref().map(|snapshot| {
+            let stale = snapshot
+                .verify_summary
+                .map(|summary| summary.stale + summary.unmatched)
+                .unwrap_or(0);
+            use archivefs_core::identity_source::status::ProviderState;
+            match (&snapshot.status.state, stale) {
+                (ProviderState::Ready | ProviderState::ReadyOffline, 0) => {
+                    FeatureStatus::Available {
+                        label: "RomM is up to date".to_string(),
+                        action_label: Some("Open RomM"),
+                        action: Some(feature_discovery::FeatureDiscoveryAction::OpenRomm),
+                    }
+                }
+                (ProviderState::Ready | ProviderState::ReadyOffline, count) => {
+                    FeatureStatus::NeedsAttention {
+                        label: format!("RomM needs updating ({count} records)"),
+                        action_label: Some("Review RomM"),
+                        action: Some(feature_discovery::FeatureDiscoveryAction::OpenRomm),
+                    }
+                }
+                (state, _) => FeatureStatus::Unavailable {
+                    label: "RomM status".to_string(),
+                    reason: format!("RomM is {}.", state.label()),
+                },
+            }
+        });
+
+        let emulator = Some(match setup_check_summary(&self.doctor_scan) {
+            home_page::SetupCheckSummary::Healthy => FeatureStatus::Available {
+                label: "Emulator setup checks passed".to_string(),
+                action_label: Some("Open Emulator Setup"),
+                action: Some(feature_discovery::FeatureDiscoveryAction::OpenEmulatorSetup),
+            },
+            home_page::SetupCheckSummary::Warnings(count)
+            | home_page::SetupCheckSummary::NeedsAttention(count) => {
+                FeatureStatus::NeedsAttention {
+                    label: format!("Emulator setup needs attention ({count})"),
+                    action_label: Some("Set up emulator"),
+                    action: Some(feature_discovery::FeatureDiscoveryAction::OpenEmulatorSetup),
+                }
+            }
+            home_page::SetupCheckSummary::NeverRun
+            | home_page::SetupCheckSummary::Running
+            | home_page::SetupCheckSummary::NoChecksRun => FeatureStatus::Unavailable {
+                label: "Emulator readiness".to_string(),
+                reason: "Emulator setup has not completed a usable check yet.".to_string(),
+            },
+        });
+
+        let media = selected_path.map(|path| FeatureDiscoveryContext {
+            cheats,
+            romm,
+            emulator,
+            cover_available: Some(matches!(
+                self.gamer_covers.slot_for(path, None),
+                Some(crate::gamer_artwork::CoverSlot::Ready { .. })
+            )),
+            screenshot_count: self.gamer_screenshots.screenshot_count(path),
+            video_available: None,
+        });
+        media.unwrap_or_default()
+    }
+
+    /// Museum's selected-game showcase, built from the exact same selected-
+    /// path/evidence/cache state Selected Evidence and Gamer View already
+    /// use - never a second lookup. Binds strictly on `archive_path`
+    /// equality (never title), so artwork/evidence can never cross-
+    /// contaminate between two differently named games.
+    fn museum_selected_game(&self) -> Option<museum_page::MuseumSelectedGameView> {
+        let path = self.archive_context.focused.as_ref()?;
+        let record = match &self.state {
+            LoadState::Ready(data) => data
+                .records
+                .iter()
+                .find(|record| record.mount_plan.archive.path == *path)?,
+            _ => return None,
+        };
+        let platform = record
+            .identity
+            .platform
+            .as_deref()
+            .or(record.metadata.platform.as_deref())?
+            .to_string();
+        let video_available = match &self.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                if report.path == *path =>
+            {
+                report.structural_media.as_ref().map(|media| {
+                    matches!(
+                        media,
+                        selected_evidence_page::StructuralMediaDetails::LaserDisc(details)
+                            if !details.media.starts_with("0 present")
+                    )
+                })
+            }
+            _ => None,
+        };
+        let evidence_report = match &self.selected_evidence {
+            selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                if report.path == *path =>
+            {
+                Some(report)
+            }
+            _ => None,
+        };
+        let discovery_context = self.feature_discovery_context(Some(path));
+        let feature_view = evidence_report.map(|report| {
+            feature_discovery::build_feature_discovery_with_context(report, &discovery_context)
+        });
+        let mut facts = vec![
+            (
+                "Media format".to_string(),
+                archive_kind_name(record.mount_plan.archive.kind).to_string(),
+            ),
+            (
+                "File size".to_string(),
+                format_size(record.identity.size_bytes),
+            ),
+            (
+                "Identity strength".to_string(),
+                evidence_report
+                    .map(|report| {
+                        gamer_identity_status_from_verdict(report.identity.status)
+                            .label()
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "Evidence not loaded".to_string()),
+            ),
+        ];
+        if let Some(region) = record
+            .metadata
+            .region
+            .as_deref()
+            .or(record.identity.region.as_deref())
+        {
+            facts.push(("Region".to_string(), region.to_string()));
+        }
+        if let Some(version) = record.metadata.version.as_deref() {
+            facts.push(("Version".to_string(), version.to_string()));
+        }
+        if let Some(preferred_emulator) = archivefs_core::platform::PLATFORMS
+            .iter()
+            .find(|registered| registered.display_name == platform)
+            .and_then(|registered| registered.preferred_emulator)
+        {
+            facts.push((
+                "Preferred emulator".to_string(),
+                preferred_emulator.to_string(),
+            ));
+        }
+        let evidence_highlights = evidence_report
+            .map(|report| {
+                let mut highlights = Vec::new();
+                if matches!(
+                    report.identity.status,
+                    archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus::VerifiedByDat
+                        | archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus::ContentAndDatAgree
+                ) {
+                    highlights.push("DAT identity verified".to_string());
+                }
+                if report.hashes.is_some() {
+                    highlights.push("Checksums computed".to_string());
+                }
+                if report.tape_analysis.is_some() {
+                    highlights.push("Tape analysis available".to_string());
+                }
+                highlights.extend(report.structural_facts.iter().take(2).map(|fact| {
+                    format!("{}: {}", fact.detail, fact.value)
+                }));
+                highlights
+            })
+            .unwrap_or_default();
+        Some(museum_page::MuseumSelectedGameView {
+            archive_path: path.clone(),
+            title: gamer_view::gamer_display_title(record),
+            platform,
+            facts,
+            evidence_highlights,
+            feature_view,
+            screenshot_count: self.gamer_screenshots.screenshot_count(path),
+            video_available,
+            dat_verified: matches!(
+                &self.selected_evidence,
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                    if report.path == *path
+                        && matches!(
+                            report.identity.status,
+                            archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus::VerifiedByDat
+                                | archivefs_core::platform_evidence_fusion::identity_presentation::IdentityStatus::ContentAndDatAgree
+                        )
+            ),
+        })
     }
 
     /// Gamer View's gear menu has no sidebar behind it, so "Advanced View"
@@ -19363,6 +19645,70 @@ impl ArchiveFsApp {
                 if let Some(batch) = self.unmount_all.as_ref() {
                     stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
                     ui.separator();
+                }
+
+                if self.view == MainView::Museum {
+                    let library = self.database_state.snapshot().map(home_library_snapshot);
+                    let selected_game = self.museum_selected_game();
+                    let mut artwork = self.platform_artwork.render_assets();
+                    if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                        for update in worker.drain_delivery() {
+                            self.gamer_covers.absorb_delivery(&update);
+                            self.gamer_screenshots.absorb_delivery(&update);
+                        }
+                        for reply in worker.drain() {
+                            if !self.gamer_covers.absorb(ui.ctx(), reply.clone()) {
+                                self.gamer_screenshots.absorb(ui.ctx(), reply);
+                            }
+                        }
+                    }
+                    let mut screenshot_requests = Vec::new();
+                    let action = museum_page::show_with_selected_game_and_artwork(
+                        ui,
+                        &mut self.museum_page,
+                        library.as_ref(),
+                        selected_game.as_ref(),
+                        Some(&self.gamer_covers),
+                        Some(&mut self.gamer_screenshots),
+                        Some(&mut artwork),
+                        &mut screenshot_requests,
+                    );
+                    if !screenshot_requests.is_empty() && self.gamer_cover_worker_allowed {
+                        let worker = self.gamer_cover_worker.get_or_insert_with(|| {
+                            crate::gamer_artwork::CoverWorker::start(
+                                ui.ctx().clone(),
+                                self.gui_config.source_roots().ok().map(<[PathBuf]>::to_vec),
+                                self.es_de_media.snapshot().cloned(),
+                                self.launchbox_local_media.snapshot().cloned(),
+                            )
+                        });
+                        let generation = self.gamer_covers.generation();
+                        for job in screenshot_requests {
+                            worker.request(generation, job);
+                        }
+                    }
+                    match action {
+                        Some(museum_page::MuseumAction::BrowseLibraryForPlatform(_)) => {
+                            self.navigate_to_library_tab(LibraryTab::Archives);
+                        }
+                        Some(museum_page::MuseumAction::OpenEmulatorSetup) => {
+                            self.navigate_to_main_view(MainView::EmulatorSetup);
+                        }
+                        Some(museum_page::MuseumAction::OpenSelectedEvidence) => {
+                            self.navigate_to_main_view(MainView::Selected);
+                        }
+                        Some(museum_page::MuseumAction::OpenCheats(path)) => {
+                            self.open_cheats_mods_workspace(context, path);
+                        }
+                        Some(museum_page::MuseumAction::OpenRomm) => {
+                            self.navigate_to_sources_tab(SourcesTab::Libraries);
+                        }
+                        Some(museum_page::MuseumAction::OpenDiscConversion) => {
+                            self.navigate_to_main_view(MainView::DiscConversion);
+                        }
+                        None => {}
+                    }
+                    return;
                 }
 
                 if self.view == MainView::Home {

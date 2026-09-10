@@ -19,8 +19,40 @@
 //! user visits that page. Home omits those badges until their real state is
 //! known rather than presenting an ordinary lazy load as a problem.
 
+use archivefs_core::identity_source::model::MediaCoverage;
 use crate::ui::{components as widgets, theme};
 use eframe::egui;
+
+/// One platform's collection-centric summary within [`HomeLibrarySnapshot`].
+/// A minimal typed shape - see `main.rs::home_library_snapshot` for how it is
+/// built from the already-loaded catalogue and (when present) the existing
+/// RomM snapshot. This crosses no provider boundary itself: `romm_media_coverage`
+/// is read from an already-computed RomM snapshot field, never recomputed
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomePlatformSummary {
+    pub(crate) name: String,
+    pub(crate) total: usize,
+    pub(crate) identified: usize,
+    pub(crate) missing: usize,
+    pub(crate) romm_media_coverage: Option<MediaCoverage>,
+}
+
+/// A projection of the already-loaded catalogue, keyed by platform. `None`
+/// on [`HomeInputs::library`] means no catalogue snapshot is available; this
+/// type never triggers a scan or provider request of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HomeLibrarySnapshot {
+    pub(crate) total: usize,
+    pub(crate) present: usize,
+    pub(crate) identified: usize,
+    pub(crate) unresolved: usize,
+    pub(crate) missing: usize,
+    pub(crate) duplicate_groups: usize,
+    pub(crate) platforms: Vec<HomePlatformSummary>,
+    /// Coverage is authoritative only for records imported from RomM.
+    pub(crate) romm_media_coverage: Option<MediaCoverage>,
+}
 
 /// One of the task-oriented destinations Home can send a user to.
 /// `main.rs` maps each variant to the `MainView` (and, for the two that
