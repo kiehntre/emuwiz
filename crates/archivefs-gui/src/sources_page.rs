@@ -2517,11 +2517,11 @@ pub(super) fn show_sources_recent_activity(ui: &mut egui::Ui, history: &Operatio
 /// (`ArchiveFsApp::show_sources_page`) applies it via
 /// `navigate_to_sources_tab`.
 pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Option<SourcesTab> {
-    widgets::page_header_with_icon(
+    widgets::workshop_light_header(
         ui,
-        crate::ui::icons::SOURCES,
-        "Sources",
+        "Sources / Discovery",
         "Manage where EmuWiz finds games, DAT catalogues, and cheats.",
+        |_ui| {},
     );
     let tab_options: [(SourcesTab, &str); 4] = [
         (

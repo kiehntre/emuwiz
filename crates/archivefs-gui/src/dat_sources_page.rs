@@ -7174,6 +7174,13 @@ pub(crate) fn show_dat_sources_page(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
 
+    widgets::workshop_light_header(
+        ui,
+        "DAT Sources",
+        "Manage the catalogues EmuWiz uses to identify and organise your collection.",
+        |_ui| {},
+    );
+
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::VERIFY,

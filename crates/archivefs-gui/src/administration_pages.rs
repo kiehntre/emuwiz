@@ -283,13 +283,11 @@ pub(super) fn show_library_views_page(
 ) -> Option<LibraryViewAction> {
     let mut action = None;
 
-    widgets::section_header(
+    widgets::workshop_light_header(
         ui,
-        "Views",
-        Some(
-            "Organised, symlink-based folder trees that point at your existing archives. \
-             EmuWiz never moves, copies, renames, or deletes an original archive file.",
-        ),
+        "Library Views",
+        "Organised, symlink-based folder trees that point at your existing archives.",
+        |_ui| {},
     );
     ui.add_space(2.0);
     if let Some(archive_path) = focus_archive {
@@ -970,11 +968,11 @@ pub(super) fn show_mount_page(
         block_reason,
     } = view_state;
     let mut action = None;
-    widgets::page_header_with_icon(
+    widgets::workshop_light_header(
         ui,
-        crate::ui::icons::MOUNT,
-        "Mount",
+        "Mounts",
         "Choose archives, review validated destinations, and mount the ready queue.",
+        |_ui| {},
     );
     if let Some(result) = mount_all_result {
         show_mount_all_result(ui, result);
@@ -1637,11 +1635,11 @@ pub(super) fn show_history_logs_page(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<HistoryPageAction> {
     let mut action = None;
-    widgets::page_header_with_icon(
+    widgets::workshop_light_header(
         ui,
-        crate::ui::icons::HISTORY,
-        "History & Logs",
+        "History",
         "Filter, inspect, copy, or export operations from this application session.",
+        |_ui| {},
     );
     widgets::section_header(
         ui,
@@ -3545,13 +3543,17 @@ pub(super) fn show_health_dashboard_panel(
     } = view_state;
 
     let mut action = None;
-    widgets::section_header(
+    widgets::workshop_light_header(
         ui,
         "Health",
-        Some(
-            "Read-only overview of archive and catalogue health. Filtering, sorting, and \
-             selection here are independent of the ordinary library view and Duplicate Review.",
-        ),
+        "See what needs attention and what is already healthy.",
+        |ui| {
+            if live_data.is_some() {
+                widgets::status_badge(ui, "Live health snapshot", widgets::StatusTone::Active);
+            } else {
+                widgets::status_badge(ui, "Scan required", widgets::StatusTone::Pending);
+            }
+        },
     );
     if widgets::action_button(ui, "Back to Library", widgets::ActionStyle::Quiet, true).clicked() {
         action = Some(HealthDashboardAction::BackToLibrary);

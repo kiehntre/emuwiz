@@ -105,21 +105,29 @@ pub(crate) fn show_doctor_page(
             ..Default::default()
         });
 
-    widgets::hero_card(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("System Health").size(24.0).strong());
-            match displayed {
-                Some(outcome) if outcome.scan.is_healthy() => {
-                    widgets::status_badge(ui, "No problems found", widgets::StatusTone::Success)
-                }
-                Some(outcome) => widgets::status_badge(
-                    ui,
-                    outcome.scan.overall_severity().label(),
-                    doctor_severity_tone(outcome.scan.overall_severity()),
-                ),
-                None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
+    widgets::workshop_light_header(
+        ui,
+        "Doctor",
+        "Check your setup and find anything that needs attention.",
+        |ui| match displayed {
+            Some(_) if health.blocking > 0 => {
+                widgets::status_badge(ui, "Action required", widgets::StatusTone::Blocked)
             }
-        });
+            Some(_) if health.warnings > 0 => {
+                widgets::status_badge(ui, "Needs review", widgets::StatusTone::Warning)
+            }
+            Some(_) if health.unknown > 0 => {
+                widgets::status_badge(ui, "Checks incomplete", widgets::StatusTone::Pending)
+            }
+            Some(_) => widgets::status_badge(
+                ui,
+                "No current problems found",
+                widgets::StatusTone::Success,
+            ),
+            None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
+        },
+    );
+    {
         if displayed.is_some() {
             ui.add_space(8.0);
             let health_grid = doctor_health_grid_layout(ui.available_width());
@@ -197,7 +205,7 @@ pub(crate) fn show_doctor_page(
                 });
             });
         }
-    });
+    }
 
     let Some(outcome) = displayed else {
         ui.add_space(theme::SECTION_GAP);
