@@ -6,9 +6,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use archivefs_core::emulator_environment::es_de_metadata::{
-    EsDeProviderCollection, discover_provider_snapshot,
-};
+use archivefs_core::emulator_environment::es_de_metadata::EsDeProviderCollection;
 
 #[derive(Debug)]
 pub(crate) enum EsDeProviderState {
@@ -52,6 +50,9 @@ impl EsDeMediaState {
             return;
         };
         let root = PathBuf::from(home).join("ES-DE");
+        let canonical_rom_root = archivefs_core::Config::load_default()
+            .ok()
+            .and_then(|config| config.master_rom_root);
         let (sender, receiver) = mpsc::channel();
         self.state = EsDeProviderState::Loading;
         self.receiver = Some(receiver);
@@ -59,7 +60,12 @@ impl EsDeMediaState {
         self.generation = generation;
         std::thread::spawn(move || {
             let result = if root.is_dir() {
-                Ok(discover_provider_snapshot(&root, generation))
+                Ok(archivefs_core::emulator_environment::es_de_metadata::
+                    discover_provider_snapshot_with_rom_root(
+                        &root,
+                        generation,
+                        canonical_rom_root.as_deref(),
+                    ))
             } else {
                 Err(format!("ES-DE root is not configured: {}", root.display()))
             };
@@ -155,5 +161,25 @@ mod tests {
         state.state = EsDeProviderState::Error("fixture refresh failed".into());
         assert_eq!(state.snapshot().map(|value| value.generation), Some(7));
         assert_eq!(state.error(), Some("fixture refresh failed"));
+    }
+
+    #[test]
+    fn late_generation_cannot_replace_the_current_refresh_snapshot() {
+        let (old_sender, old_receiver) = mpsc::channel::<Result<EsDeProviderCollection, String>>();
+        let (current_sender, current_receiver) =
+            mpsc::channel::<Result<EsDeProviderCollection, String>>();
+        let old = fixture_snapshot(1);
+        let current = fixture_snapshot(2);
+        let mut state = EsDeMediaState {
+            state: EsDeProviderState::Loading,
+            snapshot: None,
+            receiver: Some(old_receiver),
+            generation: 2,
+        };
+        state.receiver = Some(current_receiver);
+        assert!(old_sender.send(Ok(old)).is_err());
+        current_sender.send(Ok(current)).unwrap();
+        assert!(state.poll());
+        assert_eq!(state.snapshot().map(|value| value.generation), Some(2));
     }
 }

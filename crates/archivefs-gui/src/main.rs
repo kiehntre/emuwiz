@@ -8332,6 +8332,14 @@ impl ArchiveFsApp {
                 // unreachable while `ui_mode` is `GamerView`, since
                 // nothing in this mode's UI ever sets `self.view` to one.
                 if self.ui_mode == GuiMode::GamerView && self.view != MainView::CheatsMods {
+                    self.es_de_media.start(ui.ctx().clone());
+                    if self.es_de_media.poll() {
+                        self.gamer_covers.identity_refreshed();
+                        self.gamer_screenshots.identity_refreshed();
+                        if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                            worker.update_esde(self.es_de_media.snapshot().cloned());
+                        }
+                    }
                     if let Some(path) = self.archive_context.focused.clone() {
                         let evidence_is_stale = match &self.selected_evidence {
                             selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
