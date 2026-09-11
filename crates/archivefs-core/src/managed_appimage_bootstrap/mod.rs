@@ -9,6 +9,9 @@ pub(crate) mod model;
 pub(crate) mod process;
 pub(crate) mod safety;
 
+pub mod pcsx2;
+pub mod ppsspp;
+
 mod legacy;
 
 pub use legacy::{
