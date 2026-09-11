@@ -112,6 +112,9 @@ use crate::dat_coverage_panel::{
 use crate::repair_history_page::presentation::{self, Tier};
 use crate::ui::{components as widgets, theme};
 
+mod save_result;
+use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
+
 #[path = "verify_summary.rs"]
 mod verify_summary;
 
@@ -537,6 +540,7 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) dirty: bool,
     pub(crate) config_path: PathBuf,
     pub(crate) save_state: DatSaveState,
+    pub(crate) save_results: Vec<DatSaveResult>,
     pub(crate) load_error: Option<String>,
     /// The last add/remove attempt that was refused, with its reason.
     pub(crate) action_error: Option<String>,
@@ -1905,6 +1909,10 @@ pub(crate) struct ArchiveRecoveryOutcome {
 // ---------------------------------------------------------------------------
 
 enum JobMessage {
+    SaveResult {
+        generation: Option<u64>,
+        result: DatSaveResult,
+    },
     Progress(String),
     /// Structured audit progress, kept structured so the page can compute
     /// percentages and an ETA instead of only echoing text.
@@ -2135,34 +2143,33 @@ fn send_progress(sender: &SyncSender<JobMessage>, message: JobMessage) {
 /// or cancelled-partial validation writes nothing, leaving any previously
 /// persisted good inventory for this source exactly as it was (see
 /// `crate::dat::expected_inventory`'s doc on why a failed/partial parse
-/// must never destroy prior good inventory). Persistence failure is
-/// reported as a progress note; it never blocks or hides the validation
-/// result itself, which the caller sends regardless.
+/// must never destroy prior good inventory). The persistence outcome is sent
+/// reliably and retained separately from the validation report.
 fn persist_expected_inventory_if_valid(
     database_path: Option<&std::path::Path>,
     report: &archivefs_core::dat::sources::validation::DatValidationReport,
     expected: &archivefs_core::dat::expected_inventory::ExpectedDatInventoryProjection,
     sender: &SyncSender<JobMessage>,
 ) {
+    let mut final_result = DatSaveResult::validation(report);
     if !matches!(
         report.state,
         DatHealthState::Valid | DatHealthState::ValidWithWarnings
     ) {
-        return;
-    }
-    let Some(database_path) = database_path else {
-        return;
-    };
-    let ecosystem = report.files.iter().find_map(|file| match &file.outcome {
-        DatFileOutcome::Parsed { ecosystem, .. } => Some(*ecosystem),
-        DatFileOutcome::Failed { .. } => None,
-    });
-    let source_revision = report.files.iter().find_map(|file| match &file.outcome {
-        DatFileOutcome::Parsed { version, .. } => version.clone(),
-        DatFileOutcome::Failed { .. } => None,
-    });
-    let result =
-        archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
+        final_result.outcome = DatSaveOutcome::PartialFailure;
+        final_result.explanation = "Catalogue validation failed. Expected DAT inventory was not saved; any previous inventory was kept. Fix the source and validate it again.".to_string();
+        final_result.technical_details.push(report.summary.clone());
+    } else if let Some(database_path) = database_path {
+        final_result.private_database_path(database_path);
+        let ecosystem = report.files.iter().find_map(|file| match &file.outcome {
+            DatFileOutcome::Parsed { ecosystem, .. } => Some(*ecosystem),
+            DatFileOutcome::Failed { .. } => None,
+        });
+        let source_revision = report.files.iter().find_map(|file| match &file.outcome {
+            DatFileOutcome::Parsed { version, .. } => version.clone(),
+            DatFileOutcome::Failed { .. } => None,
+        });
+        let result = archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
             database.replace_expected_dat_inventory(
                 &report.source_id,
                 source_revision.as_deref(),
@@ -2171,27 +2178,30 @@ fn persist_expected_inventory_if_valid(
                 expected.duplicate_names_skipped as u64,
             )
         });
-    match result {
-        Ok(written) => {
-            if expected.duplicate_names_skipped > 0 {
-                send_progress(
-                    sender,
-                    JobMessage::Progress(format!(
-                        "Expected DAT inventory: {written} identit(y/ies) persisted, {} duplicate name(s) in the catalogue skipped.",
-                        expected.duplicate_names_skipped
-                    )),
-                );
+        match result {
+            Ok(written) => {
+                final_result.technical_details.push(format!(
+                    "{written} expected identity row(s) saved."
+                ));
+                if report.state == DatHealthState::ValidWithWarnings
+                    || expected.duplicate_names_skipped > 0
+                {
+                    final_result.warn(format!(
+                        "{} duplicate name(s) skipped. {}",
+                        expected.duplicate_names_skipped, report.summary
+                    ));
+                }
             }
+            Err(error) => final_result.failed("saving expected DAT inventory", error),
         }
-        Err(error) => {
-            send_progress(
-                sender,
-                JobMessage::Progress(format!(
-                    "Expected DAT inventory could not be updated: {error}"
-                )),
-            );
-        }
+    } else {
+        final_result.outcome = DatSaveOutcome::NotSaved;
+        final_result.explanation = "Catalogue validation finished, but no catalogue database was available. Open a catalogue and validate again to save expected inventory.".to_string();
     }
+    let _ = sender.send(JobMessage::SaveResult {
+        generation: None,
+        result: final_result,
+    });
 }
 
 /// The percentage, as a whole number, or `None` when the total is unknown or
@@ -2693,6 +2703,7 @@ pub(crate) struct DatSourcesPageState {
     load_error: Option<String>,
     load_problems: Vec<String>,
     save_state: DatSaveState,
+    save_results: BTreeMap<(DatSaveOperation, String), DatSaveResult>,
     action_error: Option<String>,
     /// The last validation report for each source, this session.
     validations: BTreeMap<String, DatValidationReport>,
@@ -2940,6 +2951,7 @@ impl DatSourcesPageState {
             load_error,
             load_problems,
             save_state: DatSaveState::Idle,
+            save_results: BTreeMap::new(),
             action_error: None,
             validations: BTreeMap::new(),
             diagnostic_groups: BTreeMap::new(),
@@ -3297,6 +3309,17 @@ impl DatSourcesPageState {
         let mut last_audit_progress: Option<DatAuditProgress> = None;
         loop {
             match job.messages.try_recv() {
+                Ok(JobMessage::SaveResult { generation, result }) => {
+                    if generation.is_none_or(|generation| generation == self.audit_generation) {
+                        let previous = self.save_results.get(&result.key());
+                        if result.outcome != DatSaveOutcome::NotSaved
+                            || !previous.is_some_and(DatSaveResult::is_failure)
+                        {
+                            self.save_results.insert(result.key(), result);
+                        }
+                        changed = true;
+                    }
+                }
                 Ok(JobMessage::Progress(line)) => {
                     // Once cancellation has been requested, stale progress must
                     // not restore an active-looking detail line.
@@ -5333,66 +5356,21 @@ impl DatSourcesPageState {
             });
             let _ = match outcome {
                 Ok(outcome) => {
-                    // Cancellation may race with the audit's final comparison.
-                    // Re-check at the metadata-write boundary so a result the
-                    // page will discard cannot still enrich the catalogue.
-                    let enrichment = if worker_cancel.load(Ordering::Acquire) {
-                        None
-                    } else if let Some(database_path) = database_path {
-                        match archivefs_core::Database::open_or_create(&database_path).and_then(
-                            |mut database| {
-                                let persisted = database.persist_dat_audit_results(&outcome)?;
-                                // A projection of the audit already above -
-                                // no additional scan, hash, or match. See
-                                // `Database::persist_library_dat_identities_from_audit`
-                                // for exactly what is/is not safe to persist
-                                // (a combined audit is refused the same way
-                                // `persist_dat_audit_results` already is,
-                                // never called for one - see
-                                // `start_combined_audit`).
-                                let identities =
-                                    database.persist_library_dat_identities_from_audit(&outcome)?;
-                                let enrichment = database
-                                    .enrich_platforms_from_dat_audit(&outcome, generation)?;
-                                Ok((persisted, identities, enrichment))
-                            },
-                        ) {
-                            Ok((persisted, identities, enrichment)) => {
-                                send_progress(
-                                    &sender,
-                                    JobMessage::Progress(format!(
-                                        "Persisted {persisted} set verdict(s) and {} library DAT identity row(s) ({} updated{}). Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
-                                        identities.inserted,
-                                        identities.updated,
-                                        if identities.unassociated > 0 || identities.ambiguous > 0 {
-                                            format!(
-                                                ", {} unmatched, {} ambiguous",
-                                                identities.unassociated, identities.ambiguous
-                                            )
-                                        } else {
-                                            String::new()
-                                        },
-                                        enrichment.applied,
-                                        enrichment.unchanged,
-                                        enrichment.manual_preserved,
-                                        enrichment.conflicts,
-                                    )),
-                                );
-                                Some(Box::new(enrichment))
-                            }
-                            Err(error) => {
-                                send_progress(
-                                    &sender,
-                                    JobMessage::Progress(format!(
-                                        "DAT audit completed, but its results could not be fully saved to the catalogue database: {error}"
-                                    )),
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    let (save_result, enrichment) = save_result::persist_audit(
+                        database_path.as_deref(),
+                        &outcome,
+                        generation,
+                        &worker_cancel,
+                    );
+                    if sender
+                        .send(JobMessage::SaveResult {
+                            generation: Some(generation),
+                            result: save_result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                     // Build the read-only rename plan from the finished audit.
                     // This is cheap (no re-scan, no hashing) but cancellable and
                     // runs on the worker, never on the UI thread.
@@ -5480,6 +5458,15 @@ impl DatSourcesPageState {
             });
             let _ = match outcome {
                 Ok(outcome) => {
+                    if sender
+                        .send(JobMessage::SaveResult {
+                            generation: Some(generation),
+                            result: save_result::combined_result(&outcome, &request.sources),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                     send_progress(
                         &sender,
                         JobMessage::Progress("Building combined rename plan…".to_string()),
@@ -5646,6 +5633,7 @@ impl DatSourcesPageState {
             dirty: self.is_dirty(),
             config_path: self.config_path.clone(),
             save_state: self.save_state.clone(),
+            save_results: self.save_results.values().cloned().collect(),
             load_error: self.load_error.clone(),
             action_error: self.action_error.clone(),
             pending_consequences: self.pending_consequences(&rows),
@@ -7279,6 +7267,8 @@ pub(crate) fn show_dat_sources_page(
     }
     ui.add_space(10.0);
 
+    save_result::show(ui, &view.save_results);
+
     if let Some(running) = &view.running
         && let Some(job_action) = show_running_job(ui, running)
     {
@@ -8087,6 +8077,8 @@ pub(crate) fn show_identify_rename_page(
     );
     ui.add_space(8.0);
 
+    save_result::show(ui, &view.save_results);
+
     if let Some(running) = &view.running
         && let Some(job_action) = show_running_job(ui, running)
     {
@@ -8248,6 +8240,8 @@ pub(crate) fn show_quick_rename_page(
         "Scanning is read-only. Renaming still requires review, fresh safety checks, and a recovery journal.",
         widgets::StatusTone::Info,
     );
+
+    save_result::show(ui, &view.save_results);
 
     if let Some(running) = &view.running
         && let Some(job_action) = show_running_job(ui, running)

@@ -32,6 +32,8 @@ use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
 
+mod save_results;
+
 fn row_for_visibility(
     platform_display: Option<&str>,
     platform_unresolved: bool,
