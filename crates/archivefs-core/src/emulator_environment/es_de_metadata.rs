@@ -6,12 +6,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
 const MAX_GAMELIST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SYSTEM_DIRECTORIES: usize = 256;
+const AMBIGUOUS_INDEX: usize = usize::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EsDeProviderStatus {
@@ -41,6 +43,10 @@ pub struct EsDeMediaRefs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EsDeGameEntry {
     pub path: PathBuf,
+    /// Canonical ROM-root binding when discovery was given an explicit
+    /// EmuWiz ROM root. The raw path remains the provider's original
+    /// gamelist-relative path.
+    pub canonical_path: Option<PathBuf>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub rating: Option<String>,
@@ -86,6 +92,14 @@ pub struct EsDeProviderCollection {
 /// bounded directory listing.  This is refresh-time work; callers retain the
 /// returned collection and never parse XML during selected-game lookup.
 pub fn discover_provider_snapshot(root: &Path, generation: u64) -> EsDeProviderCollection {
+    discover_provider_snapshot_with_rom_root(root, generation, None)
+}
+
+pub fn discover_provider_snapshot_with_rom_root(
+    root: &Path,
+    generation: u64,
+    canonical_rom_root: Option<&Path>,
+) -> EsDeProviderCollection {
     let mut result = EsDeProviderCollection {
         root: root.to_path_buf(),
         generation,
@@ -111,21 +125,20 @@ pub fn discover_provider_snapshot(root: &Path, generation: u64) -> EsDeProviderC
         }
         let system = directory.file_name().to_string_lossy().into_owned();
         let path = directory.path().join("gamelist.xml");
-        let Ok(xml) = fs::read(&path) else {
+        let Ok(xml) = read_bounded_gamelist(&path) else {
             result
                 .warnings
                 .push(format!("could not read {}", path.display()));
             continue;
         };
-        result
-            .indexes
-            .push(parse_and_index_gamelist_with_media_root(
-                &path,
-                &xml,
-                &system,
-                generation,
-                &root.join("downloaded_media"),
-            ));
+        result.indexes.push(parse_and_index_gamelist_with_roots(
+            &path,
+            &xml,
+            &system,
+            generation,
+            &root.join("downloaded_media"),
+            canonical_rom_root,
+        ));
     }
     result
 }
@@ -187,7 +200,20 @@ pub fn index_snapshot(snapshot: &EsDeProviderSnapshot, generation: u64) -> EsDeP
         if let Some(platform) = entry.canonical_platform.as_deref() {
             index
                 .by_platform_path
-                .entry(provider_path_key(platform, &entry.path))
+                .entry(provider_path_key(
+                    platform,
+                    entry.canonical_path.as_deref().unwrap_or(&entry.path),
+                ))
+                .and_modify(|existing| {
+                    if *existing != AMBIGUOUS_INDEX
+                        && snapshot
+                            .entries
+                            .get(*existing)
+                            .is_some_and(|prior| !same_entry(prior, entry))
+                    {
+                        *existing = AMBIGUOUS_INDEX;
+                    }
+                })
                 .or_insert(position);
         }
         for path in [
@@ -256,6 +282,9 @@ impl EsDeProviderIndex {
         let position = *self
             .by_platform_path
             .get(&provider_path_key(platform, source))?;
+        if position == AMBIGUOUS_INDEX {
+            return None;
+        }
         let entry = self.entries.get(position)?.clone();
         let media = EsDeMediaAvailabilitySet {
             cover: entry
@@ -336,12 +365,24 @@ pub fn parse_and_index_gamelist_with_media_root(
     generation: u64,
     media_root: &Path,
 ) -> EsDeProviderIndex {
+    parse_and_index_gamelist_with_roots(gamelist_path, xml, system, generation, media_root, None)
+}
+
+pub fn parse_and_index_gamelist_with_roots(
+    gamelist_path: &Path,
+    xml: &[u8],
+    system: &str,
+    generation: u64,
+    media_root: &Path,
+    canonical_rom_root: Option<&Path>,
+) -> EsDeProviderIndex {
     let snapshot = parse_gamelist_with_media_root(
         gamelist_path,
         xml,
         system,
         |name| canonical_platform_for_system(name).map(str::to_string),
         Some(media_root),
+        canonical_rom_root,
     );
     index_snapshot(&snapshot, generation)
 }
@@ -379,7 +420,7 @@ pub fn parse_gamelist(
     system: &str,
     system_map: impl Fn(&str) -> Option<String>,
 ) -> EsDeProviderSnapshot {
-    parse_gamelist_with_media_root(gamelist_path, xml, system, system_map, None)
+    parse_gamelist_with_media_root(gamelist_path, xml, system, system_map, None, None)
 }
 
 fn parse_gamelist_with_media_root(
@@ -388,6 +429,7 @@ fn parse_gamelist_with_media_root(
     system: &str,
     system_map: impl Fn(&str) -> Option<String>,
     media_root: Option<&Path>,
+    canonical_rom_root: Option<&Path>,
 ) -> EsDeProviderSnapshot {
     let mut snapshot = EsDeProviderSnapshot {
         status: EsDeProviderStatus::Found,
@@ -464,6 +506,8 @@ fn parse_gamelist_with_media_root(
         };
         snapshot.entries.push(EsDeGameEntry {
             path,
+            canonical_path: canonical_rom_root
+                .and_then(|root| canonical_game_path(root, &system, &game.path)),
             name: game.name.filter(|value| !value.trim().is_empty()),
             description: game.desc,
             rating: game.rating,
@@ -480,6 +524,67 @@ fn parse_gamelist_with_media_root(
     }
     snapshot.status = EsDeProviderStatus::Ready;
     snapshot
+}
+
+fn canonical_game_path(root: &Path, system: &str, raw: &str) -> Option<PathBuf> {
+    let value = raw.trim();
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.contains('\0')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    let system_path = Path::new(system);
+    if system.is_empty()
+        || system_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(root.join(system_path).join(path))
+}
+
+fn same_entry(left: &EsDeGameEntry, right: &EsDeGameEntry) -> bool {
+    left.path == right.path
+        && left.canonical_path == right.canonical_path
+        && left.name == right.name
+        && left.description == right.description
+        && left.rating == right.rating
+        && left.release_date == right.release_date
+        && left.developer == right.developer
+        && left.publisher == right.publisher
+        && left.genre == right.genre
+        && left.players == right.players
+        && left.media == right.media
+        && left.system == right.system
+        && left.canonical_platform == right.canonical_platform
+}
+
+fn read_bounded_gamelist(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("gamelist symlink refused".into());
+    }
+    if !metadata.file_type().is_file() {
+        return Err("gamelist is not a regular file".into());
+    }
+    if metadata.len() > MAX_GAMELIST_BYTES as u64 {
+        return Err("gamelist exceeds the bounded size limit".into());
+    }
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_GAMELIST_BYTES as u64) as usize);
+    file.take(MAX_GAMELIST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_GAMELIST_BYTES {
+        return Err("gamelist grew beyond the bounded size limit".into());
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,5 +848,159 @@ mod tests {
             .unwrap();
         assert_eq!(hit.media.cover.unwrap().exists, true);
         assert_eq!(index.generation, 33);
+    }
+
+    #[test]
+    fn discovered_gamelist_reads_are_bounded_at_the_exact_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gamelist.xml");
+        std::fs::write(&path, b"<gameList/>").unwrap();
+        assert_eq!(read_bounded_gamelist(&path).unwrap(), b"<gameList/>");
+        std::fs::write(&path, vec![b'x'; MAX_GAMELIST_BYTES]).unwrap();
+        assert_eq!(
+            read_bounded_gamelist(&path).unwrap().len(),
+            MAX_GAMELIST_BYTES
+        );
+        std::fs::write(&path, vec![b'x'; MAX_GAMELIST_BYTES + 1]).unwrap();
+        assert!(read_bounded_gamelist(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_symlinked_gamelist_is_refused_without_following_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("gamelists/nes");
+        std::fs::create_dir_all(&system).unwrap();
+        let target = dir.path().join("target.xml");
+        std::fs::write(
+            &target,
+            b"<gameList><game><path>./game.rom</path></game></gameList>",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, system.join("gamelist.xml")).unwrap();
+        let snapshot = discover_provider_snapshot(dir.path(), 1);
+        assert!(snapshot.indexes.is_empty());
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not read"))
+        );
+    }
+
+    #[test]
+    fn canonical_rom_root_binds_different_installation_roots_by_platform_and_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = dir.path().join("emuwiz-roms");
+        let list = dir.path().join("esde/gamelists/nes/gamelist.xml");
+        let xml = br#"<gameList><game><path>./Lemmings.zip</path><name>Lemmings</name></game></gameList>"#;
+        let index = parse_and_index_gamelist_with_roots(
+            &list,
+            xml,
+            "nes",
+            2,
+            &dir.path().join("esde/downloaded_media"),
+            Some(&canonical_root),
+        );
+        let hit = index.lookup_path("NES", &canonical_root.join("nes/Lemmings.zip"));
+        assert_eq!(hit.unwrap().entry.name.as_deref(), Some("Lemmings"));
+        assert!(
+            index
+                .lookup_path("NES", &dir.path().join("other-root/Lemmings.zip"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn identical_duplicates_deduplicate_but_conflicting_duplicates_become_ambiguous() {
+        let list = Path::new("/esde/gamelists/nes/gamelist.xml");
+        let identical = br#"<gameList><game><path>./game.rom</path><name>Same</name></game><game><path>./game.rom</path><name>Same</name></game></gameList>"#;
+        let index = parse_and_index_gamelist(list, identical, "nes", 1);
+        assert!(
+            index
+                .lookup_path("NES", &list.parent().unwrap().join("game.rom"))
+                .is_some()
+        );
+        let conflicting = br#"<gameList><game><path>./game.rom</path><name>One</name></game><game><path>./game.rom</path><name>Two</name></game></gameList>"#;
+        let index = parse_and_index_gamelist(list, conflicting, "nes", 1);
+        assert!(
+            index
+                .lookup_path("NES", &list.parent().unwrap().join("game.rom"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_system_does_not_discard_a_valid_system_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("gamelists/nes")).unwrap();
+        std::fs::create_dir_all(dir.path().join("gamelists/snes")).unwrap();
+        std::fs::write(
+            dir.path().join("gamelists/nes/gamelist.xml"),
+            b"<gameList><game><path>./good.rom</path></game></gameList>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("gamelists/snes/gamelist.xml"),
+            b"<gameList>",
+        )
+        .unwrap();
+        let snapshot = discover_provider_snapshot(dir.path(), 4);
+        assert_eq!(snapshot.indexes.len(), 2);
+        assert_eq!(snapshot.indexes[0].entries.len(), 1);
+        assert_eq!(snapshot.indexes[1].entries.len(), 0);
+    }
+
+    #[test]
+    fn downloaded_media_projection_covers_all_supported_local_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("downloaded_media");
+        for (category, name) in [
+            ("miximages", "Game.png"),
+            ("covers", "Game.png"),
+            ("marquees", "Game.png"),
+            ("screenshots", "Game.png"),
+            ("videos", "Game.mp4"),
+        ] {
+            let path = media_root.join("nes").join(category);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(name), b"media").unwrap();
+        }
+        let list = dir.path().join("gamelists/nes/gamelist.xml");
+        let xml = br#"<gameList><game><path>./Game.zip</path><image>./images/Game-image.png</image><thumbnail>./images/Game-thumb.png</thumbnail><marquee>./images/Game-marquee.png</marquee><screenshot>./images/Game-image.png</screenshot><video>./videos/Game-video.mp4</video></game></gameList>"#;
+        let index = parse_and_index_gamelist_with_media_root(&list, xml, "nes", 5, &media_root);
+        let entry = &index.entries[0];
+        assert_eq!(
+            entry.media.cover,
+            Some(media_root.join("nes/miximages/Game.png"))
+        );
+        assert_eq!(
+            entry.media.thumbnail,
+            Some(media_root.join("nes/covers/Game.png"))
+        );
+        assert_eq!(
+            entry.media.marquee,
+            Some(media_root.join("nes/marquees/Game.png"))
+        );
+        assert_eq!(
+            entry.media.screenshot,
+            Some(media_root.join("nes/screenshots/Game.png"))
+        );
+        assert_eq!(
+            entry.media.video,
+            Some(media_root.join("nes/videos/Game.mp4"))
+        );
+        for path in [
+            entry.media.cover.as_ref(),
+            entry.media.thumbnail.as_ref(),
+            entry.media.marquee.as_ref(),
+            entry.media.screenshot.as_ref(),
+            entry.media.video.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(path.starts_with(&media_root));
+        }
     }
 }
