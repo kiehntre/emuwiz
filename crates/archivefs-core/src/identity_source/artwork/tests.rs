@@ -250,6 +250,70 @@ fn a_public_screenshot_reference_is_refused_without_a_request() {
 }
 
 #[test]
+fn approved_launchbox_screenshot_is_fetched_without_romm_credentials() {
+    let tree = Tree::new("launchbox-approved");
+    let server = FakeArtworkServer::serving(synthetic_png(20, 20));
+    let result = tree
+        .cache()
+        .fetch(
+            &source(),
+            &server,
+            &request(
+                "launchbox-game",
+                None,
+                Some("https://images.launchbox-app.com/screens/19538-1.png"),
+            ),
+            1_000,
+            None,
+        )
+        .expect("approved LaunchBox host should use the existing fetch/cache path");
+    assert!(result.path.exists());
+    assert_eq!(server.request_count(), 1);
+    assert!(!server.requests()[0].1, "public CDN requests never carry RomM credentials");
+}
+
+#[test]
+fn launchbox_policy_rejects_http_lookalikes_ports_and_oversized_paths() {
+    for url in [
+        "http://images.launchbox-app.com/a.png",
+        "https://evil.images.launchbox-app.com/a.png",
+        "https://images.launchbox-app.com.evil.test/a.png",
+        "https://user:pass@images.launchbox-app.com/a.png",
+        "https://images.launchbox-app.com:8443/a.png",
+    ] {
+        assert!(validate_launchbox_url(url).is_err(), "{url} must be refused");
+    }
+    let oversized = format!("https://images.launchbox-app.com/{}", "a".repeat(2049));
+    assert!(validate_launchbox_url(&oversized).is_err());
+}
+
+#[test]
+fn launchbox_redirect_statuses_are_refused_without_following() {
+    for status in [301, 302, 307, 308] {
+        let tree = Tree::new(&format!("launchbox-redirect-{status}"));
+        let server = FakeArtworkServer::scripted(vec![Ok(RommHttpResponse {
+            status,
+            body: Vec::new(),
+            location: Some("https://evil.example/redirected.png".to_string()),
+        })]);
+        let refusal = tree
+            .cache()
+            .fetch(
+                &source(),
+                &server,
+                &request("redirected", None, Some("https://images.launchbox-app.com/a.png")),
+                1_000,
+                None,
+            )
+            .expect_err("redirects must fail closed");
+        assert_eq!(refusal.code(), "endpoint_refused");
+        assert!(refusal.detail().contains("redirect"));
+        assert_eq!(server.request_count(), 1);
+        assert!(!server.requests()[0].1);
+    }
+}
+
+#[test]
 fn a_valid_large_cover_is_preferred_over_the_small_cover() {
     let tree = Tree::new("large-preferred");
     let cache = tree.cache();
