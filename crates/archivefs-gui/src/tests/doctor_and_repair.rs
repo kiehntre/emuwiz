@@ -3969,7 +3969,7 @@ fn convert_discs_home_card_lands_on_the_first_class_disc_conversion_page() {
 
     let output = render_problems_repair_app(&mut app);
     assert!(
-        rendered_text_contains(&output, "Convert Disc Images"),
+        rendered_text_contains(&output, "Disc Conversion"),
         "the optical conversion page's own heading must render immediately"
     );
     assert!(rendered_text_contains(&output, "Source folder:"));

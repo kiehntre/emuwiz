@@ -5620,9 +5620,24 @@ impl ArchiveFsApp {
 
 
     fn show_optical_conversion_page(&mut self, ui: &mut egui::Ui) {
+        let selected_context = self.archive_context.focused.as_ref().map(|path| {
+            let platform = match &self.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                    if report.path == *path =>
+                {
+                    report.identity.platform.map(str::to_string)
+                }
+                _ => None,
+            };
+            optical_conversion_page::SelectedConversionContext {
+                path: path.clone(),
+                platform,
+            }
+        });
         let page = self
             .optical_conversion_page
             .get_or_insert_with(optical_conversion_page::OpticalConversionPageState::default);
+        page.set_selected_context(selected_context);
         optical_conversion_page::show_optical_conversion_page(ui, page);
     }
 

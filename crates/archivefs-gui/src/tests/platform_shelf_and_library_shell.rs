@@ -487,7 +487,7 @@ fn duplicate_finder_and_disc_conversion_render_standalone_from_the_sidebar_route
     // page, never Repair Review / Repair History framing.
     for (target, own_content) in [
         (MainView::ExactDuplicateReview, "Duplicate Finder"),
-        (MainView::DiscConversion, "Convert Disc Images"),
+        (MainView::DiscConversion, "Disc Conversion"),
     ] {
         let mut app = app_for_operation_tests();
         app.ui_mode = GuiMode::AdvancedView;
