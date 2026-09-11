@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -438,13 +438,43 @@ fn isolated_config_path() -> PathBuf {
     ))
 }
 
+const MAX_TEXT_BUSY_RETRIES: usize = 250;
+
+fn retry_transient_text_busy<T, F, S>(mut operation: F, mut delay: S) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+    S: FnMut(),
+{
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && retries < MAX_TEXT_BUSY_RETRIES =>
+            {
+                retries += 1;
+                delay();
+            }
+            other => return other,
+        }
+    }
+}
+
+fn spawn_tolerating_transient_text_busy(command: &mut Command) -> io::Result<std::process::Child> {
+    retry_transient_text_busy(
+        || command.spawn(),
+        || thread::sleep(Duration::from_millis(1)),
+    )
+}
+
 fn run_detector(executable: &Path, args: &[OsString]) -> Result<Vec<u8>, ScummVmDetectionError> {
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = spawn_tolerating_transient_text_busy(&mut command)
         .map_err(|error| ScummVmDetectionError::DetectorFailed(error.to_string()))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -1206,5 +1236,57 @@ mod tests {
         // what actually exercises both branches. This just pins that
         // `NotInstalled` is a real, reachable variant and not dead code.
         let _ = ScummVmCompatibility::NotInstalled;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_text_busy_retries_then_succeeds() {
+        let mut attempts = 0;
+        let result = retry_transient_text_busy(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+                } else {
+                    Ok("detected")
+                }
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(result, "detected");
+        assert_eq!(attempts, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_text_busy_retries_are_bounded() {
+        let mut attempts = 0;
+        let error = retry_transient_text_busy(
+            || {
+                attempts += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(attempts, MAX_TEXT_BUSY_RETRIES + 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permanent_spawn_error_is_not_retried() {
+        let mut attempts = 0;
+        let error = retry_transient_text_busy(
+            || {
+                attempts += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOENT))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(attempts, 1);
     }
 }
