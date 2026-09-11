@@ -135,6 +135,29 @@ pub fn match_loose_files_against_dat(
         }
     }
 
+    combine_verified_matches(dat, candidates, file_game, trusted, cancel)
+}
+
+/// Combines CUE/GDI/M3U launchers structurally given an already-established
+/// `file_game` mapping - never hashes or re-verifies `file_game` itself, and
+/// never guesses a mapping the caller did not already establish.
+///
+/// [`match_loose_files_against_dat`] is the ordinary caller, building
+/// `file_game` by whole-file hashing (pass 1) above. The other caller is
+/// [`super::verified_evidence_bridge`], which builds `file_game` instead from
+/// freshness-validated *persisted* DAT evidence - reusing this exact
+/// structural-combination code rather than re-implementing CUE/GDI/M3U
+/// grouping a second time. Splitting this out is the whole reason the bridge
+/// never needs its own rematcher: identity comes from whichever caller built
+/// `file_game`; this function only ever resolves *structural* references
+/// (which files does this CUE/GDI/M3U name) against it.
+pub(crate) fn combine_verified_matches(
+    dat: &ParsedDat,
+    candidates: &[PathBuf],
+    file_game: BTreeMap<PathBuf, usize>,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> MatchOutcome {
     // Pass 2: M3U launchers, resolved *before* CUE/GDI so that a disc an
     // M3U claims - whether it successfully combines or is rejected - is
     // excluded before pass 3 gets a chance to treat that same CUE/GDI file

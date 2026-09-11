@@ -31,6 +31,7 @@ pub mod model;
 pub mod retrodeck_projection;
 pub mod romm_library_plan;
 pub mod romm_projection;
+pub mod verified_evidence_bridge;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,9 @@ pub use romm_library_plan::{
 pub use romm_projection::{
     RommLibraryProjectionPlan, RommProjectedGame, RommVisibility, build_romm_projection,
     build_romm_projection_transaction, build_romm_projection_with_visibility,
+};
+pub use verified_evidence_bridge::{
+    BridgeSkipReason, VerifiedEvidenceBridgeOutcome, bridge_verified_evidence,
 };
 
 /// How far a clone chain may be walked while resolving one family root.
