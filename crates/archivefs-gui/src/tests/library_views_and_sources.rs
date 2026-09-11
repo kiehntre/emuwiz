@@ -3910,6 +3910,23 @@ fn sources_dats_tab_still_renders_dat_controls() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.view = MainView::DatSources;
+    // Pre-populate the page from an isolated temp directory so rendering
+    // never lazily triggers the production `DatSourcesPageState::load`'s
+    // real home/XDG lookups (registry, managed config, no-intro pack
+    // state) - the same `load_with_transaction_dir` seam
+    // `dat_sources_page::tests`'s own `Fixture` already uses for exactly
+    // this reason. Without this, `show_dat_sources_page_mode`'s
+    // `if self.dat_sources_page.is_none()` branch calls the real `load`
+    // on first render.
+    let temp = tempfile::tempdir().unwrap();
+    let journal = temp.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    app.dat_sources_page = Some(dat_sources_page::DatSourcesPageState::load_with_transaction_dir(
+        temp.path().join("dat_sources.toml"),
+        Vec::new(),
+        archivefs_core::safe_read::TrustedRoots::none(),
+        journal,
+    ));
     let output = render_sources_app(&mut app);
 
     assert!(rendered_text_contains(&output, "Sources"));
