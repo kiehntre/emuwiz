@@ -231,6 +231,7 @@ mod tests {
                         ino: 1,
                         #[cfg(unix)]
                         dev: 1,
+                        freshness: None,
                     },
                     operation: Default::default(),
                     preflight_passed: true,

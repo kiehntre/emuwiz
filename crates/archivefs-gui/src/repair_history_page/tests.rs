@@ -641,6 +641,7 @@ fn bare_transaction(
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: false,
             preflight_failures: Vec::new(),
@@ -679,6 +680,7 @@ fn bare_entry(
             ino: 1,
             #[cfg(unix)]
             dev: 1,
+            freshness: None,
         },
         preflight_passed: false,
         preflight_failures: Vec::new(),

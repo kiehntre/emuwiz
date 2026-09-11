@@ -5320,6 +5320,7 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: false,
             preflight_failures: Vec::new(),
@@ -5390,6 +5391,7 @@ fn a_transaction_stuck_applying_with_an_applied_entry_loads_as_applied_after_res
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: true,
             preflight_failures: Vec::new(),
@@ -5433,6 +5435,7 @@ fn fixture_identity() -> archivefs_core::dat::rename_apply::ObjectIdentity {
         ino: 0,
         #[cfg(unix)]
         dev: 0,
+        freshness: None,
     }
 }
 
@@ -7041,6 +7044,7 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: true,
             preflight_failures: Vec::new(),
@@ -7080,6 +7084,7 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: false,
             preflight_failures: Vec::new(),
@@ -7401,6 +7406,7 @@ fn quick_rename_reset_clears_only_session_state_and_preserves_config_and_history
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: true,
             preflight_failures: Vec::new(),
@@ -7512,6 +7518,7 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
                     ino: 1,
                     #[cfg(unix)]
                     dev: 1,
+                    freshness: None,
                 },
                 preflight_passed: false,
                 preflight_failures: Vec::new(),
@@ -7586,6 +7593,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: false,
             preflight_failures: Vec::new(),
@@ -7696,6 +7704,7 @@ fn leave_untouched_removes_needs_attention_state_across_subsequent_polls() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: false,
             preflight_failures: Vec::new(),
@@ -7874,6 +7883,7 @@ fn applied_journals_are_never_touched_by_recovery_resolution() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: true,
             preflight_failures: Vec::new(),
@@ -7965,6 +7975,7 @@ fn hide_settled_history_never_deletes_a_journal() {
                 ino: 1,
                 #[cfg(unix)]
                 dev: 1,
+                freshness: None,
             },
             preflight_passed: true,
             preflight_failures: Vec::new(),

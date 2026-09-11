@@ -85,6 +85,7 @@ fn make_proposal(index: usize) -> RepairProposal {
             ino: 1,
             #[cfg(unix)]
             dev: 1,
+            freshness: None,
         }),
         originating_audit: None,
         safety: SafetyState::Safe,
