@@ -1140,7 +1140,24 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         selected_health_issue: None,
         diagnostics_refresh_generation: RefreshGeneration::INITIAL,
         health_report_cache: None,
-        clipboard: NativeClipboard::new(),
+        // Not `NativeClipboard::new()`: that opens a real arboard
+        // connection, which times out for ~15s against X11 in a headless
+        // test environment before falling back to `Unavailable`. Every
+        // consumer that actually exercises clipboard *behavior* takes
+        // `&mut dyn ClipboardBackend` and is tested against
+        // `InMemoryClipboard` directly (see this module's own doc
+        // comment on that type); this fixture only needs a `NativeClipboard`
+        // value to satisfy `ArchiveFsApp`'s field type, so it is built
+        // directly in the already-`Unavailable` state instead - the same
+        // outcome `NativeClipboard::new()` reaches in this environment,
+        // just without the real connection attempt. Real end-to-end
+        // clipboard construction is still exercised by
+        // `native_clipboard_never_panics_regardless_of_the_real_environment`.
+        clipboard: NativeClipboard {
+            inner: None,
+            init_error: None,
+            last_logged_error: None,
+        },
         view: MainView::default(),
         library_tab: LibraryTab::default(),
         problems_repair_tab: ProblemsRepairTab::default(),
