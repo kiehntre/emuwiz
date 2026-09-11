@@ -7101,6 +7101,8 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
         recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
+    std::fs::write(roms.join("mid-a.bin"), b"source").unwrap();
+    std::fs::write(roms.join("mid-alpha.bin"), b"destination").unwrap();
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &interrupted).unwrap();
     page.refresh_recovery();
 
@@ -7110,7 +7112,7 @@ fn quick_rename_hides_settled_history_but_surfaces_blocking_recovery() {
     let output = render_quick_rename(&view, &mut ui_state);
 
     assert!(
-        rendered_text_contains(&output, "Unresolved rename transaction"),
+        rendered_text_contains(&output, "Action needed to finish a previous change"),
         "the blocking, unresolved transaction must be surfaced directly"
     );
     assert!(!rendered_text_contains(
@@ -7490,7 +7492,7 @@ fn quick_rename_reset_clears_only_session_state_and_preserves_config_and_history
 /// other, not just in isolation.
 #[test]
 fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery() {
-    let (_fixture, roms, mut page) = page_with_apply_plan(1);
+    let (fixture, roms, mut page) = page_with_apply_plan(1);
     let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
 
     fn interrupted_transaction(
@@ -7539,10 +7541,13 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
 
     let roms_str = roms.to_string_lossy().into_owned();
     let current = interrupted_transaction("current-library-interrupted", &roms_str);
-    let other = interrupted_transaction(
-        "other-library-interrupted",
-        "/tmp/some-unrelated-test-folder",
-    );
+    let other_root = fixture.dir("other-library");
+    let other_root_str = other_root.to_string_lossy().into_owned();
+    let other = interrupted_transaction("other-library-interrupted", &other_root_str);
+    std::fs::write(roms.join("a.bin"), b"source").unwrap();
+    std::fs::write(roms.join("alpha.bin"), b"destination").unwrap();
+    std::fs::write(other_root.join("a.bin"), b"source").unwrap();
+    std::fs::write(other_root.join("alpha.bin"), b"destination").unwrap();
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &current).unwrap();
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &other).unwrap();
     page.refresh_recovery();
@@ -7553,7 +7558,7 @@ fn unrelated_unresolved_transaction_does_not_dominate_current_library_recovery()
     let output = render_quick_rename(&view, &mut ui_state);
 
     assert!(
-        rendered_text_contains(&output, "Unresolved rename transaction"),
+        rendered_text_contains(&output, "Action needed to finish a previous change"),
         "the current library's own unresolved transaction must surface directly"
     );
     assert!(
@@ -7572,7 +7577,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
     let journal_dir = PathBuf::from(page.view().rename_apply.journal_dir.clone());
     let roms_str = roms.to_string_lossy().into_owned();
 
-    let interrupted = archivefs_core::dat::rename_apply::RenameTransaction {
+    let mut interrupted = archivefs_core::dat::rename_apply::RenameTransaction {
         transaction_id: "current-library-interrupted".to_string(),
         plan_generation: 1,
         classifier_version: Some(
@@ -7580,7 +7585,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
         ),
         created_at_unix: 1,
         source_scan_root: roms_str.clone(),
-        state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+        state: archivefs_core::dat::rename_apply::TransactionState::RollbackFailed,
         entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
             operation: Default::default(),
             source_path: roms.join("a.bin"),
@@ -7610,6 +7615,14 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
         recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
+    std::fs::write(roms.join("alpha.bin"), b"destination").unwrap();
+    interrupted.entries[0].state = archivefs_core::dat::rename_apply::EntryState::Applied;
+    interrupted.entries[0].preflight_passed = true;
+    interrupted.entries[0].applied_at_unix = Some(1);
+    interrupted.entries[0].identity = archivefs_core::dat::rename_apply::capture_identity(
+        &interrupted.entries[0].destination_path,
+    )
+    .unwrap();
     archivefs_core::dat::rename_apply::write_journal(&journal_dir, &interrupted).unwrap();
     page.refresh_recovery();
 
@@ -7619,7 +7632,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
         let mut ui_state = DatSourcesPageUi::default();
         let output = render_quick_rename(&view, &mut ui_state);
         assert!(
-            rendered_text_contains(&output, "Unresolved rename transaction"),
+            rendered_text_contains(&output, "Action needed to finish a previous change"),
             "an unresolved, unacknowledged transaction for this library must still block"
         );
     }
@@ -7639,7 +7652,7 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
     let mut ui_state = DatSourcesPageUi::default();
     let output = render_quick_rename(&view, &mut ui_state);
     assert!(
-        !rendered_text_contains(&output, "Unresolved rename transaction"),
+        !rendered_text_contains(&output, "Action needed to finish a previous change"),
         "an acknowledged Leave untouched must no longer block Quick Rename"
     );
     assert!(
@@ -7665,11 +7678,11 @@ fn resolved_leave_untouched_no_longer_blocks_but_unresolved_still_does() {
         },
     );
     assert!(
-        rendered_text_contains(&adv_output, "Roll back transaction"),
+        rendered_text_contains(&adv_output, "Roll back completed steps"),
         "a still-rollbackable transaction must keep its rollback control after acknowledgement"
     );
     assert!(
-        rendered_text_contains(&adv_output, "left untouched by user"),
+        rendered_text_contains(&adv_output, "Historical transaction"),
         "the advanced view must show the resolution, never hide it"
     );
 }

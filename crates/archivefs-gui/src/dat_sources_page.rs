@@ -8285,7 +8285,7 @@ pub(crate) fn show_quick_rename_page(
             // folder: only that combination genuinely still needs a
             // decision right now. An acknowledged "Leave untouched" moves
             // here regardless of folder, exactly like settled history.
-            if recovery.presentation.tier == Tier::NeedsAttention
+            if recovery.state.needs_recovery()
                 && recovery.resolution.is_none()
                 && current_root
                     .is_none_or(|root| transaction_targets_root(&recovery.source_scan_root, root))
@@ -8319,7 +8319,7 @@ pub(crate) fn show_quick_rename_page(
                 blocking.len()
             ))
             .id_salt("quick-rename-blocking-recovery")
-            .default_open(false)
+            .default_open(true)
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
