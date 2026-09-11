@@ -1289,6 +1289,42 @@ pub struct DiscoveredProfiles {
     pub rpcs3: Result<Rpcs3ProfileDiscovery, String>,
 }
 
+/// Caller-confirmed executable/configuration-root overrides
+/// [`DiscoveredProfiles::from_environment_with_overrides`] can accept, one
+/// per adapter. Every field is *additive*: a supplied path is pushed onto
+/// that adapter's own `explicit_executables`/`explicit_configuration_roots`
+/// alongside whatever `*ProfileDiscoveryRoots::from_environment()` already
+/// finds automatically - this never suppresses or replaces automatic
+/// discovery, it only supplies one more already-confirmed candidate for the
+/// adapter's own discovery/preflight to accept or refuse on its own terms
+/// (matching the existing `explicit_executables` convention every one of
+/// these adapters already documents - see e.g.
+/// [`crate::patch_manager::Pcsx2ProfileDiscoveryRoots::explicit_executables`]).
+///
+/// PCSX2 has no `explicit_configuration_roots` field today (only
+/// `portable_configuration_roots`, which must come from an already-known
+/// PCSX2 configuration, never a blind user pick) - so there is deliberately
+/// no `pcsx2_configuration_root` here.
+///
+/// Dolphin has no executable-override channel today either:
+/// `DolphinProfileDiscoveryRoots::selected_executable` only breaks a tie
+/// among *already-running* Dolphin processes - it never introduces a new
+/// executable candidate to profile discovery - so there is deliberately no
+/// `dolphin_executable` here, only `dolphin_configuration_root`.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredProfilesOverrides {
+    pub dolphin_configuration_root: Option<PathBuf>,
+    pub pcsx2_executable: Option<PathBuf>,
+    pub ppsspp_executable: Option<PathBuf>,
+    pub ppsspp_configuration_root: Option<PathBuf>,
+    pub duckstation_executable: Option<PathBuf>,
+    pub duckstation_configuration_root: Option<PathBuf>,
+    pub xemu_executable: Option<PathBuf>,
+    pub xemu_configuration_root: Option<PathBuf>,
+    pub rpcs3_executable: Option<PathBuf>,
+    pub rpcs3_configuration_root: Option<PathBuf>,
+}
+
 impl DiscoveredProfiles {
     /// Discovers Dolphin, PCSX2, PPSSPP, DuckStation, xemu and RPCS3
     /// profiles from their documented paths, plus Xenia from the supplied
@@ -1297,15 +1333,36 @@ impl DiscoveredProfiles {
     /// Read-only: each adapter's discovery inspects metadata of documented
     /// paths and never creates a directory or a profile.
     pub fn from_environment(explicit_xenia_roots: Vec<PathBuf>) -> Self {
+        Self::from_environment_with_overrides(
+            explicit_xenia_roots,
+            &DiscoveredProfilesOverrides::default(),
+        )
+    }
+
+    /// Like [`Self::from_environment`], but also folds in any
+    /// caller-confirmed [`DiscoveredProfilesOverrides`] - see that type's
+    /// own doc comment for exactly what "additive" means here.
+    pub fn from_environment_with_overrides(
+        explicit_xenia_roots: Vec<PathBuf>,
+        overrides: &DiscoveredProfilesOverrides,
+    ) -> Self {
         let dolphin = DolphinProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("Dolphin profiles could not be discovered: {error}"))
-            .and_then(|roots| {
+            .and_then(|mut roots| {
+                if let Some(configuration_root) = &overrides.dolphin_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
                 discover_dolphin_profiles(&roots)
                     .map_err(|error| format!("Dolphin profiles could not be discovered: {error}"))
             });
         let pcsx2 = Pcsx2ProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("PCSX2 profiles could not be discovered: {error}"))
-            .and_then(|roots| {
+            .and_then(|mut roots| {
+                if let Some(executable) = &overrides.pcsx2_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
                 discover_pcsx2_profiles(&roots)
                     .map_err(|error| format!("PCSX2 profiles could not be discovered: {error}"))
             });
@@ -1318,16 +1375,56 @@ impl DiscoveredProfiles {
         };
         let ppsspp = PpssppProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("PPSSPP profiles could not be discovered: {error}"))
-            .map(|roots| discover_ppsspp_profiles(&roots));
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.ppsspp_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.ppsspp_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_ppsspp_profiles(&roots)
+            });
         let duckstation = DuckStationProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("DuckStation profiles could not be discovered: {error}"))
-            .map(|roots| discover_duckstation_profiles(&roots));
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.duckstation_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.duckstation_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_duckstation_profiles(&roots)
+            });
         let xemu = XemuProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("xemu profiles could not be discovered: {error}"))
-            .map(|roots| discover_xemu_profiles(&roots));
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.xemu_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.xemu_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_xemu_profiles(&roots)
+            });
         let rpcs3 = Rpcs3ProfileDiscoveryRoots::from_environment()
             .map_err(|error| format!("RPCS3 profiles could not be discovered: {error}"))
-            .map(|roots| discover_rpcs3_profiles(&roots));
+            .map(|mut roots| {
+                if let Some(executable) = &overrides.rpcs3_executable {
+                    roots.explicit_executables.push(executable.clone());
+                }
+                if let Some(configuration_root) = &overrides.rpcs3_configuration_root {
+                    roots
+                        .explicit_configuration_roots
+                        .push(configuration_root.clone());
+                }
+                discover_rpcs3_profiles(&roots)
+            });
         let preferred_dolphin = dolphin.as_ref().ok().and_then(|discovery| {
             match select_dolphin_profile(discovery, None) {
                 EmulatorProfileSelection::Auto { profile_id, .. } => Some(profile_id),
@@ -4224,5 +4321,51 @@ mod tests {
             managed_appimage_executable_for(&slice, "PPSSPP"),
             Some(binary),
         );
+    }
+
+    /// A GUI-supplied executable override reaches PCSX2 discovery as one
+    /// more real candidate, additive to whatever automatic discovery finds
+    /// - exactly the "no readiness-authority bypass" requirement from the
+    /// 0.8.2 UX pass task: this is the same `explicit_executables` channel
+    /// managed-AppImage installs already use, not a new one.
+    #[test]
+    fn pcsx2_executable_override_is_folded_into_discovery() {
+        let dir = TempTree::new("pcsx2-override-fixture");
+        let executable = dir.path().join("pcsx2-qt");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let overrides = DiscoveredProfilesOverrides {
+            pcsx2_executable: Some(executable.clone()),
+            ..Default::default()
+        };
+        let discovered =
+            DiscoveredProfiles::from_environment_with_overrides(Vec::new(), &overrides);
+        let discovery = discovered.pcsx2.expect("PCSX2 discovery must succeed");
+        assert!(
+            discovery.profiles.iter().any(|profile| profile
+                .executable_candidates
+                .iter()
+                .any(|candidate| candidate.path == executable)),
+            "the overridden executable must appear as a candidate on at least one profile"
+        );
+
+        // Without the override, that exact temp path is never a candidate -
+        // proving the override is additive, not something automatic
+        // discovery would have found on its own.
+        let without_override = DiscoveredProfiles::from_environment(Vec::new());
+        let discovery_without = without_override
+            .pcsx2
+            .expect("PCSX2 discovery must succeed");
+        assert!(!discovery_without.profiles.iter().any(|profile| {
+            profile
+                .executable_candidates
+                .iter()
+                .any(|candidate| candidate.path == executable)
+        }),);
     }
 }

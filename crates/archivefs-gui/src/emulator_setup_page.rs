@@ -13,6 +13,10 @@ use archivefs_core::emulator_environment::es_de::{
 use archivefs_core::launch::{LAUNCH_COMPATIBILITY, LaunchCompatibility};
 use eframe::egui;
 
+use crate::emulator_setup_overrides::{
+    EmulatorPathOverrides, OverridableEmulator, PickedConfigurationFolder, PickedExecutable,
+    classify_picked_configuration_folder, classify_picked_executable,
+};
 use crate::ui::{components as widgets, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +69,10 @@ pub(crate) struct EmulatorSetupPageState {
     /// (e.g. the "Check emulators" flow does not currently refresh this -
     /// see [`show_frontends`]).
     frontend_report: Option<Result<EsDeEnvironmentReport, DiscoveryError>>,
+    /// The most recent invalid-picker rejection, shown inline on the
+    /// offending emulator's card until the next pick attempt replaces or
+    /// clears it. Never persisted - purely a same-session UI message.
+    picker_rejection: Option<(OverridableEmulator, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,9 +105,21 @@ impl RetroArchSetupStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EmulatorSetupAction {
     CheckEmulators,
+    /// A validated executable was picked for this adapter - persist it and
+    /// recheck. Never carries a path this module has not already validated
+    /// with [`classify_picked_executable`].
+    SetExecutableOverride(OverridableEmulator, std::path::PathBuf),
+    /// A validated configuration folder was picked for this adapter -
+    /// persist it and recheck.
+    SetConfigurationFolderOverride(OverridableEmulator, std::path::PathBuf),
+    /// Remove the executable override and re-run automatic detection.
+    ResetExecutableOverride(OverridableEmulator),
+    /// Remove the configuration-folder override and re-run automatic
+    /// detection.
+    ResetConfigurationFolderOverride(OverridableEmulator),
 }
 
 fn adapter_name(adapter_id: &str) -> &'static str {
@@ -301,6 +321,152 @@ fn candidate_grid_layout(available_width: f32, candidate_count: usize) -> Candid
     }
 }
 
+/// Native-dialog file filter for an executable pick - no extension
+/// restriction (Linux executables commonly carry no extension, e.g.
+/// `pcsx2-qt`, or an unusual one, e.g. `.AppImage`), but still a *file*
+/// picker, never a folder picker.
+fn pick_executable_candidate() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Executable", &["*"])
+        .pick_file()
+}
+
+fn pick_configuration_folder_candidate() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+
+/// A compact "Executable"/"Configuration folder" remediation row for one
+/// adapter. Renders nothing for a kind [`OverridableEmulator`] does not
+/// actually support (never a fake picker), validates a picked path *before*
+/// returning an action (never save junk just because a dialog returned a
+/// path), and never itself persists anything - the caller (`main.rs`) owns
+/// [`EmulatorPathOverrides`] and re-runs the existing Doctor/readiness check
+/// after applying whichever action comes back.
+fn show_path_override_controls(
+    ui: &mut egui::Ui,
+    emulator: OverridableEmulator,
+    overrides: &EmulatorPathOverrides,
+    picker_rejection: &mut Option<(OverridableEmulator, String)>,
+) -> Option<EmulatorSetupAction> {
+    let mut action = None;
+    if emulator.supports_executable_override() {
+        ui.add_space(theme::SPACE_XS);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Executable");
+            match overrides.executable(emulator) {
+                Some(path) => ui.label(egui::RichText::new(path.display().to_string()).small()),
+                None => ui.label(
+                    egui::RichText::new("Not set - using automatic detection")
+                        .small()
+                        .color(theme::muted(ui)),
+                ),
+            };
+        });
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(
+                ui,
+                "Choose executable…",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+                && let Some(picked) = pick_executable_candidate()
+            {
+                match classify_picked_executable(&picked) {
+                    PickedExecutable::Usable => {
+                        *picker_rejection = None;
+                        action = Some(EmulatorSetupAction::SetExecutableOverride(emulator, picked));
+                    }
+                    PickedExecutable::NotAFile => {
+                        *picker_rejection = Some((
+                            emulator,
+                            "That is not a file - choose the emulator's executable file itself."
+                                .to_string(),
+                        ));
+                    }
+                    PickedExecutable::NotExecutable => {
+                        *picker_rejection = Some((
+                            emulator,
+                            "That file is not marked executable, so EmuWiz cannot launch it."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if overrides.executable(emulator).is_some()
+                && widgets::action_button(
+                    ui,
+                    "Reset to automatic",
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
+            {
+                *picker_rejection = None;
+                action = Some(EmulatorSetupAction::ResetExecutableOverride(emulator));
+            }
+        });
+        if let Some((rejected_emulator, message)) = picker_rejection.as_ref()
+            && *rejected_emulator == emulator
+        {
+            widgets::banner(
+                ui,
+                "Executable not usable",
+                message,
+                widgets::StatusTone::Warning,
+            );
+        }
+    }
+    if emulator.supports_configuration_folder_override() {
+        ui.add_space(theme::SPACE_XS);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Configuration folder");
+            match overrides.configuration_folder(emulator) {
+                Some(path) => ui.label(egui::RichText::new(path.display().to_string()).small()),
+                None => ui.label(
+                    egui::RichText::new("Not set - using automatic detection")
+                        .small()
+                        .color(theme::muted(ui)),
+                ),
+            };
+        });
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Choose folder…", widgets::ActionStyle::Secondary, true)
+                .clicked()
+                && let Some(picked) = pick_configuration_folder_candidate()
+            {
+                match classify_picked_configuration_folder(&picked) {
+                    PickedConfigurationFolder::Directory => {
+                        action = Some(EmulatorSetupAction::SetConfigurationFolderOverride(
+                            emulator, picked,
+                        ));
+                    }
+                    PickedConfigurationFolder::Unusable => {
+                        *picker_rejection = Some((
+                            emulator,
+                            "That is not a folder EmuWiz can read.".to_string(),
+                        ));
+                    }
+                }
+            }
+            if overrides.configuration_folder(emulator).is_some()
+                && widgets::action_button(
+                    ui,
+                    "Reset to automatic",
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
+            {
+                action = Some(EmulatorSetupAction::ResetConfigurationFolderOverride(
+                    emulator,
+                ));
+            }
+        });
+    }
+    action
+}
+
 pub(crate) fn show(
     ui: &mut egui::Ui,
     state: &mut EmulatorSetupPageState,
@@ -308,6 +474,7 @@ pub(crate) fn show(
     checking: bool,
     retroarch: RetroArchSetupStatus,
     focused_emulator: Option<&str>,
+    overrides: &EmulatorPathOverrides,
 ) -> Option<EmulatorSetupAction> {
     widgets::section_header(
         ui,
@@ -408,6 +575,17 @@ pub(crate) fn show(
                             });
                             ui.label(egui::RichText::new(candidate.platform_id).color(theme::muted(ui)));
                             ui.label(&candidate.reason);
+                            if let Some(emulator) =
+                                OverridableEmulator::from_adapter_id(candidate.adapter_id)
+                                && let Some(remediation_action) = show_path_override_controls(
+                                    ui,
+                                    emulator,
+                                    overrides,
+                                    &mut state.picker_rejection,
+                                )
+                            {
+                                action = Some(remediation_action);
+                            }
                             if candidate.state == CandidateState::Ready {
                                 ui.label(egui::RichText::new("Eligible evidence was found; final launch checks still run when you play.").small().color(theme::muted(ui)));
                             }
@@ -959,6 +1137,7 @@ mod tests {
                         false,
                         RetroArchSetupStatus::Ready,
                         None,
+                        &EmulatorPathOverrides::default(),
                     );
                 });
             },
@@ -1073,6 +1252,207 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| walk(&clipped.shape, needle))
+    }
+
+    // --- Remediation controls (per-emulator executable/configuration-folder
+    // overrides) ---------------------------------------------------------
+
+    fn render_override_controls(
+        emulator: OverridableEmulator,
+        overrides: &EmulatorPathOverrides,
+        picker_rejection: &mut Option<(OverridableEmulator, String)>,
+        screen: egui::Vec2,
+    ) -> egui::FullOutput {
+        let context = egui::Context::default();
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ = show_path_override_controls(ui, emulator, overrides, picker_rejection);
+                });
+            },
+        )
+    }
+
+    /// The executable picker appears only for an adapter that actually
+    /// supports it.
+    #[test]
+    fn executable_picker_appears_only_when_supported() {
+        let overrides = EmulatorPathOverrides::default();
+        let mut rejection = None;
+        let with_executable = render_override_controls(
+            OverridableEmulator::Pcsx2,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(output_contains(&with_executable, "Choose executable…"));
+
+        let without_executable = render_override_controls(
+            OverridableEmulator::Dolphin,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(!output_contains(&without_executable, "Choose executable…"));
+    }
+
+    /// The configuration-folder picker appears only for an adapter that
+    /// actually supports it.
+    #[test]
+    fn config_folder_picker_appears_only_when_supported() {
+        let overrides = EmulatorPathOverrides::default();
+        let mut rejection = None;
+        let with_folder = render_override_controls(
+            OverridableEmulator::Dolphin,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(output_contains(&with_folder, "Choose folder…"));
+
+        let without_folder = render_override_controls(
+            OverridableEmulator::Pcsx2,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(!output_contains(&without_folder, "Choose folder…"));
+    }
+
+    /// An adapter this pass does not cover (ScummVM, RetroArch - which keeps
+    /// its own dedicated core-folder card) never gets a fake picker:
+    /// `OverridableEmulator::from_adapter_id` is the only gate `show`
+    /// consults before calling `show_path_override_controls` at all.
+    #[test]
+    fn unsupported_adapter_never_maps_to_an_overridable_emulator() {
+        assert_eq!(OverridableEmulator::from_adapter_id("scummvm"), None);
+        assert_eq!(OverridableEmulator::from_adapter_id("retroarch"), None);
+        assert_eq!(
+            OverridableEmulator::from_adapter_id("rpcs3"),
+            Some(OverridableEmulator::Rpcs3)
+        );
+    }
+
+    /// A set override shows its path and a "Reset to automatic" action; an
+    /// unset one shows neither the path nor the reset action.
+    #[test]
+    fn override_path_and_reset_action_reflect_real_state() {
+        let mut overrides = EmulatorPathOverrides::default();
+        let mut rejection = None;
+        let unset = render_override_controls(
+            OverridableEmulator::Pcsx2,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(output_contains(
+            &unset,
+            "Not set - using automatic detection"
+        ));
+        assert!(!output_contains(&unset, "Reset to automatic"));
+
+        overrides.pcsx2_executable = Some(std::path::PathBuf::from("/opt/PCSX2/pcsx2-qt"));
+        let set = render_override_controls(
+            OverridableEmulator::Pcsx2,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(output_contains(&set, "/opt/PCSX2/pcsx2-qt"));
+        assert!(output_contains(&set, "Reset to automatic"));
+    }
+
+    /// An invalid executable pick is reported inline, never silently saved -
+    /// this exercises the exact rejection path `classify_picked_executable`
+    /// feeds.
+    #[test]
+    fn invalid_executable_rejection_is_shown_only_on_the_offending_card() {
+        let overrides = EmulatorPathOverrides::default();
+        let mut rejection = Some((
+            OverridableEmulator::Pcsx2,
+            "That file is not marked executable, so EmuWiz cannot launch it.".to_string(),
+        ));
+        let pcsx2_output = render_override_controls(
+            OverridableEmulator::Pcsx2,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(output_contains(&pcsx2_output, "Executable not usable"));
+
+        let mut rejection_for_other = Some((
+            OverridableEmulator::Pcsx2,
+            "That file is not marked executable, so EmuWiz cannot launch it.".to_string(),
+        ));
+        let rpcs3_output = render_override_controls(
+            OverridableEmulator::Rpcs3,
+            &overrides,
+            &mut rejection_for_other,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(!output_contains(&rpcs3_output, "Executable not usable"));
+    }
+
+    /// Remediation controls remain reachable at a small (~1024x600)
+    /// viewport.
+    #[test]
+    fn remediation_controls_are_reachable_at_a_small_viewport() {
+        let overrides = EmulatorPathOverrides::default();
+        let mut rejection = None;
+        let output = render_override_controls(
+            OverridableEmulator::Rpcs3,
+            &overrides,
+            &mut rejection,
+            egui::vec2(1024.0, 600.0),
+        );
+        assert!(output_contains(&output, "Choose executable…"));
+        assert!(output_contains(&output, "Choose folder…"));
+    }
+
+    /// A blocked PCSX2 candidate, driven through the real `show` entrypoint
+    /// with a genuine `Finding`, still surfaces its remediation action - the
+    /// same wiring `main.rs` uses, not just the helper in isolation.
+    #[test]
+    fn blocked_candidate_shows_remediation_action_through_the_real_entrypoint() {
+        let findings = vec![finding(
+            "PCSX2",
+            DoctorSeverity::Error,
+            "PCSX2 executable was not found",
+        )];
+        let mut state = EmulatorSetupPageState {
+            platform_filter: "PS2".to_string(),
+            search: String::new(),
+            ..Default::default()
+        };
+        let overrides = EmulatorPathOverrides::default();
+        let context = egui::Context::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ = show(
+                        ui,
+                        &mut state,
+                        Some(&findings),
+                        false,
+                        RetroArchSetupStatus::NotChecked,
+                        None,
+                        &overrides,
+                    );
+                });
+            },
+        );
+        assert!(output_contains(&output, "Choose executable…"));
     }
 
     #[test]
@@ -1298,6 +1678,7 @@ mod tests {
                         false,
                         RetroArchSetupStatus::Ready,
                         None,
+                        &EmulatorPathOverrides::default(),
                     );
                 });
             },

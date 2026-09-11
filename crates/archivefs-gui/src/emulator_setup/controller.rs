@@ -152,6 +152,52 @@ impl ArchiveFsApp {
         }
     }
 
+    /// Applies the pure [`emulator_setup_page::EmulatorSetupAction`] the page
+    /// returned this frame - the only thing it can ever ask for. An override
+    /// change is persisted through `emulator_setup_overrides` and always
+    /// followed by the same read-only Doctor rescan a manual "Check
+    /// emulators" click starts, so remediation and manual checks share one
+    /// code path and one notion of "up to date".
+    pub(crate) fn handle_emulator_setup_action(
+        &mut self,
+        action: Option<emulator_setup_page::EmulatorSetupAction>,
+        context: &egui::Context,
+    ) {
+        match action {
+            Some(emulator_setup_page::EmulatorSetupAction::CheckEmulators) => {
+                self.start_doctor_scan(context.clone());
+            }
+            Some(emulator_setup_page::EmulatorSetupAction::SetExecutableOverride(
+                emulator,
+                path,
+            )) => {
+                self.emulator_setup_overrides
+                    .set_executable(emulator, Some(path));
+                self.start_doctor_scan(context.clone());
+            }
+            Some(emulator_setup_page::EmulatorSetupAction::SetConfigurationFolderOverride(
+                emulator,
+                path,
+            )) => {
+                self.emulator_setup_overrides
+                    .set_configuration_folder(emulator, Some(path));
+                self.start_doctor_scan(context.clone());
+            }
+            Some(emulator_setup_page::EmulatorSetupAction::ResetExecutableOverride(emulator)) => {
+                self.emulator_setup_overrides.set_executable(emulator, None);
+                self.start_doctor_scan(context.clone());
+            }
+            Some(emulator_setup_page::EmulatorSetupAction::ResetConfigurationFolderOverride(
+                emulator,
+            )) => {
+                self.emulator_setup_overrides
+                    .set_configuration_folder(emulator, None);
+                self.start_doctor_scan(context.clone());
+            }
+            None => {}
+        }
+    }
+
     /// The dedicated "Emulator Setup" destination: the same read-only Doctor
     /// readiness check the Diagnostics tab runs, presented as its own
     /// clearly-named page so emulator setup is discoverable without entering
@@ -187,36 +233,32 @@ impl ArchiveFsApp {
              for each one. This page keeps library diagnostics out of the way.",
         );
         ui.add_space(theme::SECTION_GAP);
-        let check_emulators = matches!(
-            emulator_setup_page::show(
-                ui,
-                &mut self.emulator_setup_page,
-                self.doctor_scan
-                    .displayed()
-                    .map(|outcome| outcome.scan.findings.as_slice()),
-                self.doctor_scan.is_running(),
-                match &self.retroarch_profiles {
-                    RetroArchProfilesState::NotScanned =>
-                        emulator_setup_page::RetroArchSetupStatus::NotChecked,
-                    RetroArchProfilesState::Scanning { .. } =>
-                        emulator_setup_page::RetroArchSetupStatus::Checking,
-                    RetroArchProfilesState::Error(_) =>
-                        emulator_setup_page::RetroArchSetupStatus::Blocked,
-                    RetroArchProfilesState::Ready(discovery) => {
-                        if discovery.profiles.iter().any(|profile| profile.eligible) {
-                            emulator_setup_page::RetroArchSetupStatus::Ready
-                        } else {
-                            emulator_setup_page::RetroArchSetupStatus::NeedsSetup
-                        }
+        let setup_action = emulator_setup_page::show(
+            ui,
+            &mut self.emulator_setup_page,
+            self.doctor_scan
+                .displayed()
+                .map(|outcome| outcome.scan.findings.as_slice()),
+            self.doctor_scan.is_running(),
+            match &self.retroarch_profiles {
+                RetroArchProfilesState::NotScanned =>
+                    emulator_setup_page::RetroArchSetupStatus::NotChecked,
+                RetroArchProfilesState::Scanning { .. } =>
+                    emulator_setup_page::RetroArchSetupStatus::Checking,
+                RetroArchProfilesState::Error(_) =>
+                    emulator_setup_page::RetroArchSetupStatus::Blocked,
+                RetroArchProfilesState::Ready(discovery) => {
+                    if discovery.profiles.iter().any(|profile| profile.eligible) {
+                        emulator_setup_page::RetroArchSetupStatus::Ready
+                    } else {
+                        emulator_setup_page::RetroArchSetupStatus::NeedsSetup
                     }
-                },
-                focus_emulator.as_deref(),
-            ),
-            Some(emulator_setup_page::EmulatorSetupAction::CheckEmulators)
+                }
+            },
+            focus_emulator.as_deref(),
+            &self.emulator_setup_overrides,
         );
-        if check_emulators {
-            self.start_doctor_scan(context.clone());
-        }
+        self.handle_emulator_setup_action(setup_action, context);
         ui.add_space(theme::SECTION_GAP);
         // The managed-emulator download catalogue is always shown: a beginner
         // must be able to see whether an emulator is installed, available to

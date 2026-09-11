@@ -15,9 +15,10 @@ impl ArchiveFsApp {
     pub(crate) fn start_doctor_scan(&mut self, context: egui::Context) {
         let generation = self.doctor_scan_generation.next();
         self.doctor_scan_generation = generation;
+        let emulator_overrides = self.emulator_setup_overrides.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send((generation, gather_doctor_inputs()));
+            let _ = sender.send((generation, gather_doctor_inputs(&emulator_overrides)));
             context.request_repaint();
         });
         let previous = match std::mem::replace(&mut self.doctor_scan, DoctorScanState::NotRun) {
@@ -560,7 +561,9 @@ impl ArchiveFsApp {
 /// bounded, no-shell `mame -version` query (output- and timeout-capped, no
 /// config written). It is a diagnostic probe, not an emulator launch - see
 /// that module's docs.
-pub(crate) fn gather_doctor_inputs() -> DoctorGathered {
+pub(crate) fn gather_doctor_inputs(
+    emulator_overrides: &emulator_setup_overrides::EmulatorPathOverrides,
+) -> DoctorGathered {
     let config = Config::load_default();
 
     let transactions = match default_shared_history_root() {
@@ -574,7 +577,10 @@ pub(crate) fn gather_doctor_inputs() -> DoctorGathered {
     // which managed files matter. Xenia has no documented native path, so it
     // is never guessed at.
     let mount_table = mount_table();
-    let discovered = DiscoveredProfiles::from_environment(Vec::new());
+    let discovered = DiscoveredProfiles::from_environment_with_overrides(
+        Vec::new(),
+        &emulator_overrides.as_core_overrides(),
+    );
     let profile_report = assess_emulator_profiles(&discovered.borrowed(), mount_table.as_deref());
     let managed_targets = managed_scan_targets(&profile_report);
     // Launch readiness (native executable binding, plus - xemu only - the

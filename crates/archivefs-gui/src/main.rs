@@ -156,6 +156,7 @@ mod emulator_download_page;
 mod emulator_setup;
 use emulator_setup::*;
 mod emulator_setup_page;
+mod emulator_setup_overrides;
 mod gamer_platform_shelf;
 mod onframe_install_session;
 mod onframe_install_state;
@@ -3483,6 +3484,11 @@ struct ArchiveFsApp {
     emulator_setup_focus: Option<EmulatorSetupFocus>,
     /// Local presentation state for the candidate-first Emulator Setup page.
     emulator_setup_page: emulator_setup_page::EmulatorSetupPageState,
+    /// GUI-only per-emulator executable/configuration-folder overrides for
+    /// Emulator Setup remediation controls; see
+    /// `emulator_setup_overrides` for exactly which adapter/kind pairs are
+    /// supported and how each is persisted.
+    emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides,
     /// Read-only PCSX2 profile discovery shared by every PS2 archive
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
@@ -4180,6 +4186,7 @@ impl ArchiveFsApp {
             retroarch_core_folder_rejected_pick: None,
             emulator_setup_focus: None,
             emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
+            emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::load(),
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
