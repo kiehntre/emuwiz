@@ -135,6 +135,15 @@ Failure signs: partial unjournalled mutation, source deletion, wrong link target
 rollback offered after manual tampering, stale UI claiming success, or a second
 apply duplicating files/links.
 
+DAT limitation: the automated deterministic known-gap regression documents an
+open Linux regular-file race between final preflight and pathname-based rename.
+An external source replacement in that interval can be moved before the
+post-rename identity mismatch is detected. Manual QA must not attempt to induce
+this timing race against valuable data. Treat the normal preview, confirmation,
+no-clobber, journal, stale-plan refusal, rollback, and recovery checks above as
+the physical coverage for this release; DAT regular-file apply is not fully
+race-closed when an external writer can modify the source tree.
+
 State/files: target links/copies, transaction journal, database projection,
 history, and recovery records. Network is not required. Emulator installation
 is not required. Recovery check is the purpose of this journey; retain before

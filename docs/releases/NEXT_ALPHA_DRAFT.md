@@ -57,6 +57,17 @@
 - Recovery and rollback continue to use the journalled, no-clobber safety
   model rather than silently moving, overwriting, or deleting user content.
 
+### Known DAT rename limitation
+
+DAT rename/apply includes durable identity, freshness, no-clobber, journaling,
+recovery, and rollback protections. A last-mile Linux regular-file race remains
+open: an external source replacement between final preflight and pathname-based
+rename can cause mutation of the replacement object. This is documented and not
+fully fixed in this release. The deterministic known-gap regression covers this
+sequence; planning and preview are unaffected. Users requiring strict source
+immutability should avoid regular-file apply while another process may modify
+the source tree.
+
 ## ES-DE integration
 
 - ES-DE export/publication coverage now includes additional safe canonical
