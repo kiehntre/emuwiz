@@ -1,27 +1,5 @@
 use super::*;
 
-/// 9F-Museum: this page must carry no hero/poster presentation at all - see
-/// `museum_page.rs`'s module doc. A source-level check catches even an
-/// accidental re-introduction that a runtime test's rendered text might miss
-/// (e.g. a hero asset loaded but never painted).
-#[test]
-fn neutral_museum_page_has_no_hero_asset_or_poster_code() {
-    let source = include_str!("../museum_page.rs");
-    for forbidden in [
-        "MuseumHeroState",
-        "MUSEUM_HERO_PNG",
-        "emuwiz_hero_museum.png",
-        "hero_rendered",
-        "poster_texture",
-        "poster_load_attempted",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "found forbidden hero/poster symbol in the neutral Museum page: {forbidden:?}"
-        );
-    }
-}
-
 fn snapshot(platforms: Vec<home_page::HomePlatformSummary>) -> home_page::HomeLibrarySnapshot {
     home_page::HomeLibrarySnapshot {
         total: platforms.iter().map(|p| p.total).sum(),
@@ -163,6 +141,56 @@ fn no_identified_platforms_shows_an_explained_empty_state() {
     let library = snapshot(vec![]);
     let (output, _) = run(&mut state, Some(&library));
     assert!(output_contains(&output, "No platforms identified yet"));
+}
+
+#[test]
+fn approved_museum_hero_uses_the_source_aspect_ratio_and_cached_texture() {
+    let decoded = image::load_from_memory(MUSEUM_HERO_PNG).expect("approved Museum hero asset");
+    let width = 1_024.0_f32;
+    let height = museum_hero_height(width);
+
+    assert!((width / height - decoded.width() as f32 / decoded.height() as f32).abs() < 0.01);
+    assert_eq!((decoded.width(), decoded.height()), (1916, 821));
+
+    let context = egui::Context::default();
+    let mut state = MuseumHeroState::default();
+    let _ = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            assert!(cached_museum_hero(ui, &mut state));
+            assert!(state.poster_load_attempted);
+            assert!(state.poster_texture.is_some());
+        });
+    });
+}
+
+#[test]
+fn poster_mode_owns_the_museum_header_and_keeps_empty_state_functional() {
+    let context = egui::Context::default();
+    let mut hero = MuseumHeroState::default();
+    let mut state = MuseumPageState::default();
+    let mut requests = Vec::new();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_with_selected_game_and_artwork_with_hero(
+                ui,
+                &mut hero,
+                &mut state,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut requests,
+            );
+        });
+    });
+
+    assert!(hero.poster_texture.is_some());
+    assert!(output_contains(&output, "No library loaded yet"));
+    assert!(!output_contains(
+        &output,
+        "Browse your collection by platform"
+    ));
 }
 
 #[test]

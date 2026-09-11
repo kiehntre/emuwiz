@@ -4013,6 +4013,7 @@ struct ArchiveFsApp {
     /// Museum's own navigation state (grid vs. one platform's detail view) -
     /// see `museum_page`'s own module doc.
     museum_page: museum_page::MuseumPageState,
+    museum_hero: museum_page::MuseumHeroState,
     /// opens the catalogue. `None` until then.
     gamer_cover_worker: Option<crate::gamer_artwork::CoverWorker>,
     /// Whether a cover worker may be started at all. Always true in the running
@@ -4360,6 +4361,7 @@ impl ArchiveFsApp {
                 open_folder_in_file_manager,
             ),
             museum_page: museum_page::MuseumPageState::default(),
+            museum_hero: museum_page::MuseumHeroState::default(),
 
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
             gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
@@ -8609,8 +8611,9 @@ impl ArchiveFsApp {
                         }
                     }
                     let mut screenshot_requests = Vec::new();
-                    let action = museum_page::show_with_selected_game_and_artwork(
+                    let action = museum_page::show_with_selected_game_and_artwork_with_hero(
                         ui,
+                        &mut self.museum_hero,
                         &mut self.museum_page,
                         library.as_ref(),
                         selected_game.as_ref(),

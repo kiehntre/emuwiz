@@ -32,6 +32,14 @@ pub(crate) struct MuseumPageState {
     pub(crate) selected_platform: Option<String>,
 }
 
+#[derive(Default)]
+pub(crate) struct MuseumHeroState {
+    poster_texture: Option<egui::TextureHandle>,
+    poster_load_attempted: bool,
+}
+
+const MUSEUM_HERO_PNG: &[u8] = include_bytes!("../assets/emuwiz_hero_museum.png");
+
 /// Where a Museum action should navigate. Museum never performs the
 /// destination's own work (launching, editing cheats, ...) - it only picks
 /// where to send the user, exactly like Home's `HomeCard` action channel.
@@ -203,10 +211,71 @@ pub(crate) fn show_with_selected_game_and_artwork(
     selected_game: Option<&MuseumSelectedGameView>,
     covers: Option<&crate::gamer_artwork::GamerCoverCache>,
     screenshots: Option<&mut crate::gamer_artwork::GamerScreenshotCache>,
+    artwork: Option<&mut crate::platform_artwork_manager::ArtworkRenderAssets<'_>>,
+    screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
+) -> Option<MuseumAction> {
+    show_with_selected_game_and_artwork_inner(
+        ui,
+        None,
+        state,
+        library,
+        selected_game,
+        covers,
+        screenshots,
+        artwork,
+        screenshot_requests,
+    )
+}
+
+pub(crate) fn show_with_selected_game_and_artwork_with_hero(
+    ui: &mut egui::Ui,
+    hero_state: &mut MuseumHeroState,
+    state: &mut MuseumPageState,
+    library: Option<&home_page::HomeLibrarySnapshot>,
+    selected_game: Option<&MuseumSelectedGameView>,
+    covers: Option<&crate::gamer_artwork::GamerCoverCache>,
+    screenshots: Option<&mut crate::gamer_artwork::GamerScreenshotCache>,
+    artwork: Option<&mut crate::platform_artwork_manager::ArtworkRenderAssets<'_>>,
+    screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
+) -> Option<MuseumAction> {
+    show_with_selected_game_and_artwork_inner(
+        ui,
+        Some(hero_state),
+        state,
+        library,
+        selected_game,
+        covers,
+        screenshots,
+        artwork,
+        screenshot_requests,
+    )
+}
+
+fn show_with_selected_game_and_artwork_inner(
+    ui: &mut egui::Ui,
+    mut hero_state: Option<&mut MuseumHeroState>,
+    state: &mut MuseumPageState,
+    library: Option<&home_page::HomeLibrarySnapshot>,
+    selected_game: Option<&MuseumSelectedGameView>,
+    covers: Option<&crate::gamer_artwork::GamerCoverCache>,
+    screenshots: Option<&mut crate::gamer_artwork::GamerScreenshotCache>,
     mut artwork: Option<&mut crate::platform_artwork_manager::ArtworkRenderAssets<'_>>,
     screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
 ) -> Option<MuseumAction> {
-    show_museum_native_header(ui);
+    if let Some(hero_state) = hero_state.as_deref_mut() {
+        let hero_rendered = show_museum_hero(
+            ui,
+            hero_state,
+            library.is_some(),
+            state.selected_platform.is_some(),
+            selected_game.is_some(),
+        );
+        if !hero_rendered {
+            show_museum_native_header(ui);
+        }
+    } else {
+        show_museum_native_header(ui);
+    }
     ui.add_space(theme::SECTION_GAP);
 
     let Some(library) = library else {
@@ -234,6 +303,9 @@ pub(crate) fn show_with_selected_game_and_artwork(
         match platforms.iter().find(|view| view.name == selected) {
             Some(view) => {
                 let view = view.clone();
+                if consume_museum_scroll(ui, museum_platform_scroll_id()) {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
                 show_platform_detail(
                     ui,
                     state,
@@ -254,6 +326,9 @@ pub(crate) fn show_with_selected_game_and_artwork(
             }
         }
     } else {
+        if consume_museum_scroll(ui, museum_platform_scroll_id()) {
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
+        }
         show_platform_grid(ui, state, &platforms, artwork.as_deref_mut())
     }
 }
@@ -267,6 +342,116 @@ fn show_museum_native_header(ui: &mut egui::Ui) {
          complete your library is. Nothing here is rescanned - it reflects your most recent \
          library load.",
     );
+}
+
+fn cached_museum_hero(ui: &egui::Ui, state: &mut MuseumHeroState) -> bool {
+    if !state.poster_load_attempted {
+        state.poster_load_attempted = true;
+        if let Ok(decoded) = image::load_from_memory(MUSEUM_HERO_PNG) {
+            let rgba = decoded.to_rgba8();
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            state.poster_texture = Some(ui.ctx().load_texture(
+                "emuwiz-museum-hero",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+    state.poster_texture.is_some()
+}
+
+fn museum_hero_height(width: f32) -> f32 {
+    width * 821.0 / 1916.0
+}
+
+fn show_museum_hero(
+    ui: &mut egui::Ui,
+    state: &mut MuseumHeroState,
+    has_library: bool,
+    has_platform: bool,
+    has_selected_game: bool,
+) -> bool {
+    if !cached_museum_hero(ui, state) {
+        return false;
+    }
+    let width = ui.available_width().max(1.0);
+    let height = museum_hero_height(width);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let texture = state.poster_texture.as_ref().expect("cached hero texture");
+    ui.painter().image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+
+    // The poster's illustrated panels are real egui hit regions, while the
+    // artwork remains the only visible button treatment. Only expose a hit
+    // target when the corresponding existing Museum flow can act on it.
+    let panel_top = rect.top() + height * 0.648;
+    let panel_height = height * 0.177;
+    let panel = |left: f32, right: f32| {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + width * left, panel_top),
+            egui::pos2(rect.left() + width * right, panel_top + panel_height),
+        )
+    };
+    let transparent = || {
+        egui::Button::new("")
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+    };
+    if has_library
+        && ui
+            .put(panel(0.025, 0.219), transparent())
+            .on_hover_text("Browse the platforms in your Museum")
+            .clicked()
+    {
+        ui.data_mut(|data| data.insert_temp(museum_platform_scroll_id(), true));
+    }
+    if has_platform
+        && has_selected_game
+        && ui
+            .put(panel(0.226, 0.435), transparent())
+            .on_hover_text("View the selected game's Museum showcase")
+            .clicked()
+    {
+        ui.data_mut(|data| data.insert_temp(museum_game_scroll_id(), true));
+    }
+    if has_platform
+        && has_selected_game
+        && ui
+            .put(panel(0.442, 0.642), transparent())
+            .on_hover_text("Discover features available for the selected game")
+            .clicked()
+    {
+        ui.data_mut(|data| data.insert_temp(museum_feature_scroll_id(), true));
+    }
+    true
+}
+
+fn museum_platform_scroll_id() -> egui::Id {
+    egui::Id::new("museum-hero-platform-scroll")
+}
+
+fn museum_game_scroll_id() -> egui::Id {
+    egui::Id::new("museum-hero-game-scroll")
+}
+
+fn museum_feature_scroll_id() -> egui::Id {
+    egui::Id::new("museum-hero-feature-scroll")
+}
+
+fn consume_museum_scroll(ui: &mut egui::Ui, id: egui::Id) -> bool {
+    if ui.data_mut(|data| data.get_temp::<bool>(id).unwrap_or(false)) {
+        ui.data_mut(|data| data.remove::<bool>(id));
+        true
+    } else {
+        false
+    }
 }
 
 fn show_platform_grid(
@@ -415,6 +600,11 @@ fn show_platform_detail(
             });
         }
         if let Some(game) = selected_game.filter(|game| game.platform == view.name) {
+            if consume_museum_scroll(ui, museum_game_scroll_id())
+                || consume_museum_scroll(ui, museum_feature_scroll_id())
+            {
+                ui.scroll_to_cursor(Some(egui::Align::TOP));
+            }
             action =
                 show_selected_game_showcase(ui, game, covers, screenshots, screenshot_requests)
                     .or(action.clone());
@@ -475,7 +665,7 @@ fn show_selected_game_showcase(
     let mut action = None;
     ui.add_space(theme::SPACE_MD);
     widgets::section_header(ui, "Selected game", None);
-    widgets::card(ui, |ui| {
+    widgets::hero_card(ui, |ui| {
         ui.horizontal_top(|ui| {
             let cover = covers.and_then(|cache| cache.slot_for(&game.archive_path, None));
             let cover_size = egui::vec2(150.0, 210.0);
