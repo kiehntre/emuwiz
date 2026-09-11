@@ -192,4 +192,65 @@ mod tests {
         assert!(state.snapshot().is_none());
         assert_eq!(state.error(), None);
     }
+
+    fn fixture_snapshot(generation: u64) -> LaunchBoxLocalProviderIndex {
+        LaunchBoxLocalProviderIndex {
+            root: PathBuf::from("/fixture/LaunchBox"),
+            generation,
+            games: Vec::new(),
+            by_database_id: Default::default(),
+            by_exact_path: Default::default(),
+            by_platform_path: Default::default(),
+            media_files_indexed: 0,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn retained_snapshot_survives_a_refresh_entering_loading() {
+        let snapshot = fixture_snapshot(7);
+        let mut state = LaunchBoxLocalMediaState {
+            state: LaunchBoxLocalState::Ready(snapshot.clone()),
+            snapshot: Some(snapshot),
+            receiver: None,
+            generation: 7,
+        };
+        state.state = LaunchBoxLocalState::Loading;
+        assert_eq!(state.snapshot().map(|value| value.generation), Some(7));
+    }
+
+    #[test]
+    fn retained_snapshot_survives_a_refresh_that_errors() {
+        let snapshot = fixture_snapshot(7);
+        let mut state = LaunchBoxLocalMediaState {
+            state: LaunchBoxLocalState::Ready(snapshot.clone()),
+            snapshot: Some(snapshot),
+            receiver: None,
+            generation: 7,
+        };
+        state.state = LaunchBoxLocalState::Error("fixture refresh failed".into());
+        assert_eq!(state.snapshot().map(|value| value.generation), Some(7));
+        assert_eq!(state.error(), Some("fixture refresh failed"));
+    }
+
+    #[test]
+    fn late_generation_cannot_replace_the_current_refresh_snapshot() {
+        let (old_sender, old_receiver) =
+            mpsc::channel::<Result<LaunchBoxLocalProviderIndex, String>>();
+        let (current_sender, current_receiver) =
+            mpsc::channel::<Result<LaunchBoxLocalProviderIndex, String>>();
+        let old = fixture_snapshot(1);
+        let current = fixture_snapshot(2);
+        let mut state = LaunchBoxLocalMediaState {
+            state: LaunchBoxLocalState::Loading,
+            snapshot: None,
+            receiver: Some(old_receiver),
+            generation: 2,
+        };
+        old_sender.send(Ok(old)).unwrap();
+        state.receiver = Some(current_receiver);
+        current_sender.send(Ok(current)).unwrap();
+        assert!(state.poll());
+        assert_eq!(state.snapshot().map(|value| value.generation), Some(2));
+    }
 }
