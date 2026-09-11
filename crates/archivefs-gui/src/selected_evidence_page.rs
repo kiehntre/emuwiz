@@ -85,6 +85,7 @@ use archivefs_core::sms_gg_header_evidence::{
 };
 
 use crate::ui::components as widgets;
+mod laserdisc_details;
 
 // ---------------------------------------------------------------------
 // Structural detection dispatch
@@ -227,7 +228,7 @@ pub(crate) enum StructuralMediaDetails {
     Optical(OpticalMediaDetails),
     Chd(ChdMediaDetails),
     Cdi(CdiMediaDetails),
-    LaserDisc(LaserDiscMediaDetails),
+    LaserDisc(archivefs_core::laserdisc_set::LaserdiscSetEvidence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,16 +273,6 @@ pub(crate) struct CdiMediaDetails {
     pub integrity: String,
     pub sector_limitation: String,
     pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaserDiscMediaDetails {
-    pub family: String,
-    pub framefile: Option<String>,
-    pub components: String,
-    pub media: String,
-    pub mapping: String,
-    pub readiness: String,
 }
 
 fn dat_status(no_intro: &NoIntroLookupResult) -> String {
@@ -380,25 +371,7 @@ fn structural_media_details(
     if path.is_dir() {
         return archivefs_core::laserdisc_set::verify_laserdisc_set(path)
             .ok()
-            .map(|evidence| {
-                StructuralMediaDetails::LaserDisc(LaserDiscMediaDetails {
-                    family: format!("{:#?}", evidence.detected_family),
-                    framefile: evidence.framefile_path.map(|p| p.display().to_string()),
-                    components: format!(
-                        "ROM {}, script {}, config {}",
-                        evidence.rom_components.len(),
-                        evidence.script_components.len(),
-                        evidence.config_components.len()
-                    ),
-                    media: format!(
-                        "{} present, {} missing",
-                        evidence.present_media.len(),
-                        evidence.missing_media.len()
-                    ),
-                    mapping: format!("{} frame mappings", evidence.mappings.len()),
-                    readiness: format!("{:#?}", evidence.readiness),
-                })
-            });
+            .map(StructuralMediaDetails::LaserDisc);
     }
     let extension = path
         .extension()
@@ -1375,26 +1348,7 @@ fn show_structural_media_details(ui: &mut egui::Ui, details: &StructuralMediaDet
             });
         }
         StructuralMediaDetails::LaserDisc(details) => {
-            ui.label("LaserDisc set");
-            widgets::status_rows(
-                ui,
-                &[
-                    ("Family", &details.family, widgets::StatusTone::Info),
-                    (
-                        "Readiness",
-                        &details.readiness,
-                        widgets::StatusTone::Pending,
-                    ),
-                    ("Media", &details.media, widgets::StatusTone::Info),
-                ],
-            );
-            widgets::technical_details(ui, "structural-laserdisc-details", |ui| {
-                if let Some(framefile) = &details.framefile {
-                    ui.label(format!("Framefile: {framefile}"));
-                }
-                ui.label(&details.components);
-                ui.label(&details.mapping);
-            });
+            laserdisc_details::show(ui, details);
         }
     }
 }

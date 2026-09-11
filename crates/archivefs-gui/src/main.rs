@@ -4603,7 +4603,7 @@ impl ArchiveFsApp {
                     matches!(
                         media,
                         selected_evidence_page::StructuralMediaDetails::LaserDisc(details)
-                            if !details.media.starts_with("0 present")
+                            if !details.present_media.is_empty()
                     )
                 })
             }
