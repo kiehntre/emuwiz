@@ -2418,7 +2418,13 @@ fn bsfree_gui_result_shows_count_and_rollback_after_success() {
 
 #[test]
 fn bsfree_gui_apply_and_rollback_reuse_the_shared_backend() {
+    // The dispatch match arm stays in `main.rs`; the workflow methods it
+    // routes to (`start_bsfree_gamecube_install_preview`,
+    // `update_pcsx2_cheat_selection`, `start_cheat_apply`,
+    // `start_cheat_install_rollback`) live in
+    // `cheats_mods::controller` since the Cheats & Mods extraction.
     let source = include_str!("../main.rs");
+    let controller = include_str!("../cheats_mods/controller.rs");
     let dispatch = source
         .split("Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube) =>")
         .nth(1)
@@ -2427,7 +2433,7 @@ fn bsfree_gui_apply_and_rollback_reuse_the_shared_backend() {
         dispatch.contains("self.start_bsfree_gamecube_install_preview()"),
         "Install routes through the BSFree install-preview path"
     );
-    let preview = source
+    let preview = controller
         .split("fn start_bsfree_gamecube_install_preview")
         .nth(1)
         .unwrap()
@@ -2445,12 +2451,12 @@ fn bsfree_gui_apply_and_rollback_reuse_the_shared_backend() {
     assert!(preview.contains("self.review_cheat_apply()"));
     // The shared transaction layer performs the actual mutation.
     assert!(
-        source.contains("fn start_cheat_apply") && source.contains("execute_shared_apply("),
+        controller.contains("fn start_cheat_apply") && controller.contains("execute_shared_apply("),
         "Confirm drives the shared apply/backup/journal machinery"
     );
     assert!(
-        source.contains("fn start_cheat_install_rollback")
-            && source.contains("start_shared_rollback_preview"),
+        controller.contains("fn start_cheat_install_rollback")
+            && controller.contains("start_shared_rollback_preview"),
         "Undo drives the shared rollback/history flow"
     );
 }
