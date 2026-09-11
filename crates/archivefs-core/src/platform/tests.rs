@@ -686,6 +686,29 @@ fn a_zip_file_never_identifies_a_platform_by_itself() {
     );
 }
 
+#[test]
+fn sis_is_weak_n_gage_evidence_but_n_gage_extension_remains_strong() {
+    let sis = detect("/roms/unsorted/game.sis");
+    assert_eq!(sis.platform, None);
+    assert_eq!(sis.deciding_source, Some(DetectionSource::SharedExtension));
+    assert!(sis.evidence.iter().any(|e| {
+        e.platform == "NGage" && e.source == DetectionSource::SharedExtension
+    }));
+    assert!(sis.requires_confirmation);
+
+    let n_gage = detect("/roms/unsorted/game.n-gage");
+    assert_eq!(n_gage.platform, Some("NGage"));
+    assert_eq!(n_gage.deciding_source, Some(DetectionSource::StrongExtension));
+    assert_eq!(n_gage.confidence, DetectionConfidence::Probable);
+
+    let contextual_sis = detect("/roms/ngage/game.sis");
+    assert_eq!(contextual_sis.platform, Some("NGage"));
+    assert_eq!(
+        contextual_sis.deciding_source,
+        Some(DetectionSource::FolderAlias)
+    );
+}
+
 /// Test 22
 #[test]
 fn a_strong_extension_carries_a_detection_on_its_own() {
