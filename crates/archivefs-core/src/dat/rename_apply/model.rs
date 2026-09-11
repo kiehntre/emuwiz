@@ -214,9 +214,9 @@ impl ObjectKind {
 }
 
 /// A snapshot of a source file's identity at the moment the transaction was
-/// built. Preflight and post-rename verification compare against this so that
-/// a file replaced, resized, or swapped for a symlink after review is never
-/// renamed by mistake.
+/// built. Preflight, post-rename verification and recovery compare both the
+/// filesystem object and its persisted content freshness proof. This does
+/// not make a later pathname mutation atomic with the check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectIdentity {
     pub size_bytes: u64,
@@ -231,6 +231,22 @@ pub struct ObjectIdentity {
     #[cfg(unix)]
     #[serde(default)]
     pub dev: u64,
+    /// Missing in legacy journals. Those remain readable for history, but
+    /// cannot authorize mutation by silently capturing a new baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<ObjectFreshness>,
+}
+
+/// Versioned content proof captured from a stable open regular file, or from
+/// the raw target text of a symlink object (never the target file's contents).
+/// Modification time retains full filesystem precision. ctime is used only
+/// during capture: rename legitimately changes it, so it is not persisted as
+/// a pre/post-rename equality requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectFreshness {
+    pub version: u32,
+    pub modified: std::time::SystemTime,
+    pub sha256: [u8; 32],
 }
 
 /// The filesystem operation explicitly authorised for one journal entry.

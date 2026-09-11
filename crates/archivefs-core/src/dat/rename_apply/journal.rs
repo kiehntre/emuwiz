@@ -319,6 +319,7 @@ mod tests {
             original_basename: "old.bin".to_string(),
             proposed_basename: "new.bin".to_string(),
             identity: ObjectIdentity {
+                freshness: None,
                 size_bytes: 100,
                 modified_unix: 1,
                 kind: ObjectKind::RegularFile,

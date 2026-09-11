@@ -11,6 +11,7 @@ use crate::source_root_migration::MigrationClassification;
 
 fn identity() -> ObjectIdentity {
     ObjectIdentity {
+        freshness: None,
         size_bytes: 1,
         modified_unix: 1,
         kind: ObjectKind::RegularFile,

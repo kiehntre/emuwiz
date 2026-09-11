@@ -1069,6 +1069,7 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
             original_basename: "a.bin".to_string(),
             proposed_basename: "b.bin".to_string(),
             identity: ObjectIdentity {
+                freshness: None,
                 size_bytes: 1,
                 modified_unix: 1,
                 kind: ObjectKind::RegularFile,
@@ -1127,6 +1128,7 @@ fn crash_after_first_of_n_renames_is_recoverable() {
         original_basename: source.rsplit('/').next().unwrap().to_string(),
         proposed_basename: "x.bin".to_string(),
         identity: ObjectIdentity {
+            freshness: None,
             size_bytes: 1,
             modified_unix: 1,
             kind: ObjectKind::RegularFile,
@@ -2108,6 +2110,7 @@ fn stress_crash_recovery_fixtures_are_detected() {
             original_basename: "a.bin".to_string(),
             proposed_basename: "b.bin".to_string(),
             identity: ObjectIdentity {
+                freshness: None,
                 size_bytes: 1,
                 modified_unix: 1,
                 kind: ObjectKind::RegularFile,

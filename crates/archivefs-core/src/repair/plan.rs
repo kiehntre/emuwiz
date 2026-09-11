@@ -624,6 +624,7 @@ mod tests {
             // Test proposals are executable, so they carry a synthetic audited
             // identity (these are fake paths; nothing is captured).
             expected_source_identity: Some(crate::dat::rename_apply::ObjectIdentity {
+                freshness: None,
                 size_bytes: 1,
                 modified_unix: 1,
                 kind: crate::dat::rename_apply::ObjectKind::RegularFile,

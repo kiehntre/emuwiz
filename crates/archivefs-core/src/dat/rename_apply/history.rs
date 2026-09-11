@@ -301,6 +301,7 @@ mod tests {
                 original_basename: "source.bin".to_string(),
                 proposed_basename: "destination.bin".to_string(),
                 identity: super::super::model::ObjectIdentity {
+                    freshness: None,
                     size_bytes: 1,
                     modified_unix: 1,
                     kind: super::super::model::ObjectKind::RegularFile,

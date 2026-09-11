@@ -376,6 +376,7 @@ mod tests {
     #[test]
     fn a_blocked_or_review_proposal_is_not_actionable() {
         let identity = crate::dat::rename_apply::ObjectIdentity {
+            freshness: None,
             size_bytes: 10,
             modified_unix: 1,
             kind: crate::dat::rename_apply::ObjectKind::RegularFile,
@@ -449,6 +450,7 @@ mod tests {
 
     fn identity_fixture() -> crate::dat::rename_apply::ObjectIdentity {
         crate::dat::rename_apply::ObjectIdentity {
+            freshness: None,
             size_bytes: 4,
             modified_unix: 1,
             kind: crate::dat::rename_apply::ObjectKind::RegularFile,

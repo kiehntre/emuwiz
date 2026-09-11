@@ -430,6 +430,7 @@ mod tests {
         // then force the stale one to simulate evidence going stale.
         proposed.expected_source_identity = Some(identity_of(&source));
         let stale_identity = crate::dat::rename_apply::ObjectIdentity {
+            freshness: None,
             size_bytes: 3,
             modified_unix: 1,
             kind: crate::dat::rename_apply::ObjectKind::RegularFile,
