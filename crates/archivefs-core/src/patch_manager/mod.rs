@@ -27,6 +27,7 @@ mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
 mod cheat_catalogue;
+mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
 mod cheat_install_plan;
@@ -210,6 +211,10 @@ pub use cheat_catalogue::{
     JsonManifestSource, MAX_CATALOGUE_EXCLUDED_ENTRIES, MAX_CATALOGUE_EXCLUSION_EXAMPLES,
     RetroarchChtDirectorySource, build_cheat_availability_report, load_cheat_catalogue_snapshot,
     match_cheat_game_record, matching_excluded_entry,
+};
+pub use cheat_conversion::{
+    CheatConversionMismatchReason, CheatConversionPlan, CheatConversionRequest,
+    CheatConversionVerification, verify_conversion,
 };
 pub use cheat_coverage::{
     CHEAT_PROVIDER_COVERAGE_FORMAT_VERSION, CheatCoverageEntry, CheatCoverageSummary,
