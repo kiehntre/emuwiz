@@ -54,9 +54,11 @@ impl IdentityResult {
     /// archive ([`ArchiveSetIdentity::MultiPlatform`]). A caller checking
     /// "is this trustworthy" should check this before anything else.
     pub fn has_conflict(&self) -> bool {
-        self.combined
-            .as_ref()
-            .is_some_and(|c| c.relationship.is_conflict())
+        self.content.outcome == super::FusionOutcome::Conflict
+            || self
+                .combined
+                .as_ref()
+                .is_some_and(|c| c.relationship.is_conflict())
             || self
                 .representation_match
                 .as_ref()

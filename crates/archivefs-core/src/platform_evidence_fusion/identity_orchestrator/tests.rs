@@ -40,6 +40,40 @@ fn content_only_input_yields_a_content_only_result() {
 }
 
 #[test]
+fn direct_content_conflict_is_reported_without_other_conflict_sources() {
+    let conflicting = inspect_identity(IdentityInspectionInput {
+        content_evidence: vec![
+            strong(ContentEvidenceKind::BootStructure, "SEGA SEGASATURN"),
+            strong(ContentEvidenceKind::Filesystem, "XDVDFS"),
+            strong(ContentEvidenceKind::ContentSignature, "XBEH"),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(
+        conflicting.content.outcome,
+        super::super::FusionOutcome::Conflict
+    );
+    assert!(conflicting.dat.is_none());
+    assert!(conflicting.combined.is_none());
+    assert!(conflicting.representation_match.is_none());
+    assert!(conflicting.set_identity.is_none());
+    assert!(conflicting.has_conflict());
+
+    let non_conflicting = inspect_identity(IdentityInspectionInput {
+        content_evidence: vec![strong(
+            ContentEvidenceKind::BootStructure,
+            "SEGA SEGASATURN",
+        )],
+        ..Default::default()
+    });
+    assert_eq!(
+        non_conflicting.content.outcome,
+        super::super::FusionOutcome::Resolved
+    );
+    assert!(!non_conflicting.has_conflict());
+}
+
+#[test]
 fn empty_input_is_unknown_with_no_caveats() {
     let result = inspect_identity(IdentityInspectionInput::default());
     assert_eq!(result.content.outcome, super::super::FusionOutcome::Unknown);
