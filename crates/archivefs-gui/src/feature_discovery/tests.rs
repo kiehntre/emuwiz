@@ -19,6 +19,7 @@ fn base_report(path: &str) -> SelectedEvidenceReport {
         structural_facts: Vec::new(),
         identity: present_identity(&identity_result),
         identity_result,
+        dat_identity: None,
         game_identity_report: archivefs_core::game_identity::GameIdentityReport {
             archive_path: PathBuf::from(path),
             platform: archivefs_core::game_identity::IdentityPlatform::Other,

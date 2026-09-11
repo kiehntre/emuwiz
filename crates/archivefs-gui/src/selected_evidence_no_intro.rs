@@ -34,8 +34,7 @@ use std::sync::Arc;
 
 use archivefs_core::dat::sources::DatSourceRegistry;
 use archivefs_core::identity_source::no_intro::{
-    ImportedNoIntroSource, NoIntroSourceLabel, NoIntroSourceSelection,
-    no_intro_selection_fingerprint, select_no_intro_source,
+    ImportedNoIntroSource, NoIntroSourceLabel, no_intro_selection_fingerprint,
 };
 
 /// The cached, display-ready shape of [`NoIntroSourceSelection`]. `Selected`
@@ -59,6 +58,7 @@ pub(crate) struct NoIntroSourceCache {
     fingerprint: Option<u64>,
     platform: Option<String>,
     state: NoIntroSourceState,
+    sources: Vec<(NoIntroSourceLabel, Arc<ImportedNoIntroSource>)>,
 }
 
 impl NoIntroSourceCache {
@@ -67,6 +67,7 @@ impl NoIntroSourceCache {
             fingerprint: None,
             platform: None,
             state: NoIntroSourceState::NotImported,
+            sources: Vec::new(),
         }
     }
 
@@ -81,17 +82,30 @@ impl NoIntroSourceCache {
         let fingerprint = no_intro_selection_fingerprint(registry, platform_id);
         let platform_changed = self.platform.as_deref() != platform_id;
         if platform_changed || self.fingerprint != Some(fingerprint) {
-            self.state = match select_no_intro_source(registry, platform_id) {
-                NoIntroSourceSelection::NotImported => NoIntroSourceState::NotImported,
-                NoIntroSourceSelection::Selected(imported) => {
-                    NoIntroSourceState::Selected(Arc::new(*imported))
-                }
-                NoIntroSourceSelection::Ambiguous(labels) => NoIntroSourceState::Ambiguous(labels),
+            self.sources = archivefs_core::identity_source::no_intro::registry::load_no_intro_sources(registry, platform_id)
+                .into_iter()
+                .map(|(label, source)| (label, Arc::new(source)))
+                .collect();
+            self.state = match self.sources.as_slice() {
+                [] => NoIntroSourceState::NotImported,
+                [(_, source)] => NoIntroSourceState::Selected(Arc::clone(source)),
+                sources => NoIntroSourceState::Ambiguous(
+                    sources.iter().map(|(label, _)| label.clone()).collect(),
+                ),
             };
             self.fingerprint = Some(fingerprint);
             self.platform = platform_id.map(str::to_string);
         }
         &self.state
+    }
+
+    pub(crate) fn resolve_all(
+        &mut self,
+        registry: &DatSourceRegistry,
+        platform_id: Option<&str>,
+    ) -> &[(NoIntroSourceLabel, Arc<ImportedNoIntroSource>)] {
+        self.resolve(registry, platform_id);
+        &self.sources
     }
 }
 

@@ -4169,6 +4169,7 @@ fn ready_selected_evidence_state(
             structural_facts: Vec::new(),
             identity,
             identity_result,
+            dat_identity: None,
             game_identity_report: archivefs_core::game_identity::GameIdentityReport {
                 archive_path: path.to_path_buf(),
                 platform: archivefs_core::game_identity::IdentityPlatform::Other,

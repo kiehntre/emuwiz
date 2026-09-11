@@ -40,6 +40,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+mod dat_identity;
+use dat_identity::{SelectedDatIdentity, VerifiedSelectedDat};
+
 use eframe::egui;
 
 use archivefs_core::chd_identity::{
@@ -193,6 +196,7 @@ pub(crate) struct SelectedEvidenceReport {
     /// existing library planner without recomputing it and risking drift
     /// between what the evidence panel shows and what gets planned.
     pub identity_result: IdentityResult,
+    pub dat_identity: Option<SelectedDatIdentity>,
     /// The existing authoritative per-file identity report used by launch
     /// planning. Kept alongside the presentation so the GUI can show the
     /// same evidence while the core launch bridge consumes the original
@@ -649,6 +653,7 @@ pub(crate) fn gather_selected_evidence_fast(
         structural_facts,
         identity,
         identity_result,
+        dat_identity: None,
         game_identity_report,
         hashes: None,
         no_intro: NoIntroLookupResult::NotImported,
@@ -671,6 +676,7 @@ pub(crate) struct SelectedEvidenceEnrichment {
     pub hashes: LocalHashes,
     pub no_intro: NoIntroLookupResult,
     pub extra_observations: Vec<EvidenceObservation>,
+    dat_sources: Vec<VerifiedSelectedDat>,
 }
 
 /// Computes the whole-file checksum for `path` (the expensive step for a
@@ -690,20 +696,42 @@ pub(crate) fn compute_selected_evidence_enrichment_cancellable(
     no_intro_source: Option<&ImportedNoIntroSource>,
     cancel: Option<&AtomicBool>,
 ) -> Result<SelectedEvidenceEnrichment, String> {
+    let sources: Vec<_> = no_intro_source.into_iter().map(|source| (None, source)).collect();
+    compute_selected_evidence_enrichment_from_sources(path, &sources, cancel)
+}
+
+pub(crate) fn compute_selected_evidence_enrichment_from_sources(
+    path: &Path,
+    sources: &[(Option<&archivefs_core::identity_source::no_intro::NoIntroSourceLabel>, &ImportedNoIntroSource)],
+    cancel: Option<&AtomicBool>,
+) -> Result<SelectedEvidenceEnrichment, String> {
     let trusted_root = path.parent().unwrap_or(path).to_path_buf();
     let trusted = TrustedRoots::from_paths([trusted_root.as_path()]);
     let hashes = hash_file(path, &trusted, cancel)
         .map_err(|refusal| format!("could not hash {}: {}", path.display(), refusal.detail()))?;
-    let no_intro = lookup_no_intro_for(no_intro_source, &hashes);
-    let extra_observations = match &no_intro {
-        NoIntroLookupResult::Matched { observations, .. } => observations.clone(),
-        _ => Vec::new(),
+    Ok(enrichment_from_hashes(hashes, sources))
+}
+
+fn enrichment_from_hashes(
+    hashes: LocalHashes,
+    sources: &[(Option<&archivefs_core::identity_source::no_intro::NoIntroSourceLabel>, &ImportedNoIntroSource)],
+) -> SelectedEvidenceEnrichment {
+    let mut matched_names = Vec::new();
+    let dat_sources: Vec<_> = sources.iter().filter_map(|(label, source)| {
+        let verified = VerifiedSelectedDat::lookup(*label, source, &hashes)?;
+        matched_names.push(source.system_name.as_str());
+        Some(verified)
+    }).collect();
+    let extra_observations = dat_sources.iter().flat_map(|source| source.observations().iter().cloned()).collect::<Vec<_>>();
+    let system_name = sources.iter().map(|(_, source)| source.system_name.as_str()).collect::<Vec<_>>().join("; ");
+    let no_intro = if sources.is_empty() {
+        NoIntroLookupResult::NotImported
+    } else if dat_sources.is_empty() {
+        NoIntroLookupResult::NoMatch { system_name }
+    } else {
+        NoIntroLookupResult::Matched { system_name: matched_names.join("; "), observations: extra_observations.clone() }
     };
-    Ok(SelectedEvidenceEnrichment {
-        hashes,
-        no_intro,
-        extra_observations,
-    })
+    SelectedEvidenceEnrichment { hashes, no_intro, extra_observations, dat_sources }
 }
 
 /// Merges a completed [`SelectedEvidenceEnrichment`] into a report the panel
@@ -712,7 +740,21 @@ pub(crate) fn compute_selected_evidence_enrichment_cancellable(
 pub(crate) fn apply_selected_evidence_enrichment(
     report: &mut SelectedEvidenceReport,
     enrichment: SelectedEvidenceEnrichment,
-) {
+) -> bool {
+    if report.dat_identity.is_some()
+        || dat_identity::has_verified_dat_identity(&report.identity_result)
+        || enrichment.hashes.fingerprint.path != report.path
+        || enrichment.dat_sources.iter().any(|source| !source.matches_hashes(&enrichment.hashes))
+    {
+        return false;
+    }
+    if !enrichment.dat_sources.is_empty() {
+        let base = report.identity_result.clone();
+        let fused = dat_identity::fuse(&base, &enrichment.dat_sources);
+        report.identity = present_identity(&fused);
+        report.identity_result = fused;
+        report.dat_identity = Some(SelectedDatIdentity { base, sources: enrichment.dat_sources });
+    }
     report.hashes = Some(enrichment.hashes);
     report.no_intro = enrichment.no_intro;
     if let Some(details) = report.structural_media.as_mut() {
@@ -722,6 +764,25 @@ pub(crate) fn apply_selected_evidence_enrichment(
     report
         .base_observations
         .extend(enrichment.extra_observations);
+    true
+}
+
+pub(crate) fn apply_selected_evidence_enrichment_bound(
+    report: &mut SelectedEvidenceReport,
+    enrichment: SelectedEvidenceEnrichment,
+    selected: Option<&Path>,
+    current_generation: u64,
+    result_generation: u64,
+) -> bool {
+    current_generation == result_generation
+        && selected == Some(report.path.as_path())
+        && apply_selected_evidence_enrichment(report, enrichment)
+}
+
+pub(crate) fn needs_selected_evidence_enrichment(report: &SelectedEvidenceReport) -> bool {
+    matches!(report.enrichment, SelectedEvidenceEnrichmentStatus::Pending)
+        && report.dat_identity.is_none()
+        && !dat_identity::has_verified_dat_identity(&report.identity_result)
 }
 
 pub(crate) fn apply_selected_evidence_enrichment_error(
@@ -801,6 +862,7 @@ pub(crate) fn gather_selected_evidence_with_platform(
         structural_facts,
         identity,
         identity_result,
+        dat_identity: None,
         game_identity_report,
         hashes,
         no_intro,
@@ -2026,6 +2088,7 @@ mod tests {
                     &identity_result,
                 ),
             identity_result,
+            dat_identity: None,
             game_identity_report: archivefs_core::game_identity::GameIdentityReport {
                 archive_path: PathBuf::from("test.gb"),
                 platform: archivefs_core::game_identity::IdentityPlatform::Other,

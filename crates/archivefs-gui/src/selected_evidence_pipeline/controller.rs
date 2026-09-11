@@ -128,7 +128,7 @@ impl ArchiveFsApp {
                     );
                 }
                 let config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
-                let no_intro_state = config_path
+                let resolved_sources = config_path
                     .as_deref()
                     .ok()
                     .and_then(|config_path| {
@@ -141,23 +141,22 @@ impl ArchiveFsApp {
                         no_intro_source_cache
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .resolve(&registry, platform.as_deref())
-                            .clone()
-                    });
+                            .resolve_all(&registry, platform.as_deref())
+                            .to_vec()
+                    })
+                    .unwrap_or_default();
                 if cancel.load(Ordering::Relaxed) {
                     return Err(
                         "additional evidence was cancelled after the selection changed".to_string(),
                     );
                 }
-                let resolved_source = match &no_intro_state {
-                    Some(selected_evidence_no_intro::NoIntroSourceState::Selected(imported)) => {
-                        Some(imported.as_ref())
-                    }
-                    _ => None,
-                };
-                selected_evidence_page::compute_selected_evidence_enrichment_cancellable(
+                let source_refs: Vec<_> = resolved_sources
+                    .iter()
+                    .map(|(label, source)| (Some(label), source.as_ref()))
+                    .collect();
+                selected_evidence_page::compute_selected_evidence_enrichment_from_sources(
                     &path,
-                    resolved_source,
+                    &source_refs,
                     Some(&cancel),
                 )
             }))

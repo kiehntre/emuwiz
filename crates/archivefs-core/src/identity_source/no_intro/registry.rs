@@ -111,26 +111,7 @@ pub fn select_no_intro_source(
     registry: &DatSourceRegistry,
     platform_id: Option<&str>,
 ) -> NoIntroSourceSelection {
-    let entries = match platform_id {
-        Some(id) => registry.sorted_enabled_for_platform(id),
-        None => registry.sorted_enabled(),
-    };
-
-    let mut matches: Vec<(NoIntroSourceLabel, ImportedNoIntroSource)> = Vec::new();
-    for candidate in candidates_for(&entries) {
-        match import_no_intro_dat(&candidate.path) {
-            Ok(imported) => matches.push((
-                NoIntroSourceLabel {
-                    source_id: candidate.source_id,
-                    display_name: candidate.display_name,
-                    artifact_path: candidate.path,
-                },
-                imported,
-            )),
-            Err(NoIntroImportError::NotNoIntro { .. } | NoIntroImportError::Io { .. }) => {}
-            Err(NoIntroImportError::Parse(_)) => {}
-        }
-    }
+    let matches = load_no_intro_sources(registry, platform_id);
 
     match matches.len() {
         0 => NoIntroSourceSelection::NotImported,
@@ -149,6 +130,40 @@ pub fn select_no_intro_source(
             NoIntroSourceSelection::Ambiguous(labels)
         }
     }
+}
+
+/// Loads every relevant No-Intro source without selecting a winner. This is
+/// used by selected-file verification, where source provenance and genuine
+/// disagreement must survive the lookup.
+pub fn load_no_intro_sources(
+    registry: &DatSourceRegistry,
+    platform_id: Option<&str>,
+) -> Vec<(NoIntroSourceLabel, ImportedNoIntroSource)> {
+    let entries = match platform_id {
+        Some(id) => registry.sorted_enabled_for_platform(id),
+        None => registry.sorted_enabled(),
+    };
+    let mut matches = Vec::new();
+    for candidate in candidates_for(&entries) {
+        match import_no_intro_dat(&candidate.path) {
+            Ok(imported) => matches.push((
+                NoIntroSourceLabel {
+                    source_id: candidate.source_id,
+                    display_name: candidate.display_name,
+                    artifact_path: candidate.path,
+                },
+                imported,
+            )),
+            Err(NoIntroImportError::NotNoIntro { .. } | NoIntroImportError::Io { .. })
+            | Err(NoIntroImportError::Parse(_)) => {}
+        }
+    }
+    matches.sort_by(|(a, _), (b, _)| {
+        a.source_id
+            .cmp(&b.source_id)
+            .then_with(|| a.artifact_path.cmp(&b.artifact_path))
+    });
+    matches
 }
 
 /// A cheap fingerprint of exactly the registry state
