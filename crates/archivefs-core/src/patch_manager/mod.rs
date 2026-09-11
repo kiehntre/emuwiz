@@ -35,6 +35,7 @@ mod cheat_installer;
 mod cheat_ir;
 mod cheat_journey;
 mod cheat_provider;
+mod cheat_reconciliation_plan;
 mod cheat_rollback;
 mod cheat_rollback_result;
 mod cheat_source_registry;
@@ -269,6 +270,11 @@ pub use cheat_provider::{
     ImmutableSourceFingerprint, PageRequest, PlatformMappingStatus, ProviderDeviceMapping,
     ProviderGameMatchConfidence, ProviderPage, ProviderPlatformMapping, ProviderValidationResult,
     ProviderValidationStatus, ReadOnlyCheatCatalogue,
+};
+pub use cheat_reconciliation_plan::{
+    CheatReviewChoice, ResolvedCheatApplyEligibility, ResolvedCheatDiagnostic, ResolvedCheatEntry,
+    ResolvedCheatPlan, ResolvedCheatPlanDestination, ResolvedCheatPlanRequest,
+    resolve_reviewed_cheat_plan,
 };
 pub use cheat_rollback::{
     CHEAT_ROLLBACK_RUNS_DIRECTORY_NAME, CheatRollbackOptions, CheatRollbackRunOutcome,
