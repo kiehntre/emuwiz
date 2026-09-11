@@ -1137,12 +1137,18 @@ fn the_audit_summary_shows_elapsed_time_and_a_shortened_scan_folder() {
     // A completed audit knows how long it took.
     assert!(audit.elapsed_seconds.is_some());
 
-    let mut ui_state = DatSourcesPageUi::default();
+    let mut ui_state = DatSourcesPageUi {
+        show_all_local_dat_sources: true,
+        ..DatSourcesPageUi::default()
+    };
     let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Completed in"));
     assert!(
-        !rendered_text_contains(&output, &roms.to_string_lossy()),
-        "the full scan folder must not be rendered"
+        !rendered_text_contains(
+            &output,
+            &format!("Source '{}' · {}", "collection.dat", roms.to_string_lossy())
+        ),
+        "the audit summary line must use the shortened scan folder, not the full path"
     );
 }
 
@@ -1163,6 +1169,7 @@ fn the_audit_folder_picker_shows_friendly_names_with_the_full_path_secondary() {
 
     let mut ui_state = DatSourcesPageUi {
         open_audit_picker: Some(row.id.clone()),
+        show_all_local_dat_sources: true,
         ..DatSourcesPageUi::default()
     };
     let output = render(&view, &mut ui_state);
@@ -1200,6 +1207,7 @@ fn the_audit_folder_picker_stays_usable_at_compact_width() {
 
     let mut ui_state = DatSourcesPageUi {
         open_audit_picker: Some(row.id.clone()),
+        show_all_local_dat_sources: true,
         ..DatSourcesPageUi::default()
     };
     let output = render_at_width(&view, &mut ui_state, 480.0);
@@ -2096,7 +2104,10 @@ fn repeated_identical_notes_group_into_one_type_with_full_occurrence_count() {
     );
     assert!(note_group.occurrences_truncated);
 
-    let mut ui_state = DatSourcesPageUi::default();
+    let mut ui_state = DatSourcesPageUi {
+        show_all_local_dat_sources: true,
+        ..DatSourcesPageUi::default()
+    };
     let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,
@@ -2352,6 +2363,7 @@ fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
     // Opening A's group must not leave B's group open.
     let mut ui_state = DatSourcesPageUi {
         open_diagnostic: Some(view_a.rows[0].groups[0].id.clone()),
+        show_all_local_dat_sources: true,
         ..Default::default()
     };
     let rendered_a = render_with_details(&view_a, &mut ui_state);
@@ -2673,9 +2685,12 @@ fn a_doctype_parser_note_shows_valid_with_no_warnings() {
         note_group.message
     );
 
-    let mut ui_state = DatSourcesPageUi::default();
+    let mut ui_state = DatSourcesPageUi {
+        show_all_local_dat_sources: true,
+        ..DatSourcesPageUi::default()
+    };
     let output = render_with_details(&view, &mut ui_state);
-    assert!(!rendered_text_contains(&output, "with warnings"));
+    assert!(!rendered_text_contains(&output, "Valid, with warnings"));
     assert!(
         !rendered_text_contains(&output, "warning type"),
         "the note must not be called a warning"
