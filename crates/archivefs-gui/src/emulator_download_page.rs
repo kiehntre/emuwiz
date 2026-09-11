@@ -144,6 +144,12 @@ impl EmulatorDownloadPageState {
             .filter(|spec| spec.distribution == EmulatorDistribution::GithubAppImage)
     }
 
+    /// The approval-bound bootstrap view is deliberately limited to the two
+    /// policy lanes integrated in the clean release branch.
+    fn managed_bootstrap_specs() -> impl Iterator<Item = &'static EmulatorDownloadSpec> {
+        Self::managed_specs().filter(|spec| matches!(spec.id, "pcsx2" | "ppsspp"))
+    }
+
     /// Recompute every non-transient entry from on-disk discovery. Called
     /// on first show and after an install completes. Never disturbs an
     /// in-flight or terminal-in-this-session entry.
@@ -472,9 +478,14 @@ impl EmulatorDownloadPageState {
         });
     }
 
-    /// Render the managed-emulator download section. Returns at most one
-    /// action; the caller passes it back to [`Self::handle`].
-    pub(crate) fn show(&self, ui: &mut egui::Ui) -> Option<EmulatorDownloadPageAction> {
+    fn show_specs<I>(
+        &self,
+        ui: &mut egui::Ui,
+        specs: I,
+    ) -> Option<EmulatorDownloadPageAction>
+    where
+        I: Iterator<Item = &'static EmulatorDownloadSpec>,
+    {
         let mut action = None;
         widgets::card(ui, |ui| {
             ui.heading("Download managed emulators");
@@ -485,7 +496,7 @@ impl EmulatorDownloadPageState {
                  the checks above.",
             );
             ui.add_space(theme::SECTION_GAP);
-            for spec in Self::managed_specs() {
+            for spec in specs {
                 let state = self
                     .entries
                     .get(spec.id)
@@ -508,6 +519,20 @@ impl EmulatorDownloadPageState {
             }
         });
         action
+    }
+
+    /// Render the complete managed-emulator catalogue.
+    pub(crate) fn show(&self, ui: &mut egui::Ui) -> Option<EmulatorDownloadPageAction> {
+        self.show_specs(ui, Self::managed_specs())
+    }
+
+    /// Render the approval-bound workflow for the two integrated policy
+    /// targets. Other catalogue entries are intentionally not presented here.
+    pub(crate) fn show_bootstrap(
+        &self,
+        ui: &mut egui::Ui,
+    ) -> Option<EmulatorDownloadPageAction> {
+        self.show_specs(ui, Self::managed_bootstrap_specs())
     }
 
     fn show_entry(
@@ -988,6 +1013,14 @@ mod tests {
         assert!(!ids.contains(&"scummvm"));
         assert!(!ids.contains(&"shadps4"));
         assert!(!ids.contains(&"retroarch"));
+    }
+
+    #[test]
+    fn managed_bootstrap_view_contains_only_pcsx2_and_ppsspp() {
+        let ids: Vec<_> = EmulatorDownloadPageState::managed_bootstrap_specs()
+            .map(|spec| spec.id)
+            .collect();
+        assert_eq!(ids, vec!["pcsx2", "ppsspp"]);
     }
 
     #[test]

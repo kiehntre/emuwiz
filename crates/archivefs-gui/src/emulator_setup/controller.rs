@@ -267,7 +267,7 @@ impl ArchiveFsApp {
         // discovery (`EmulatorDownloadPageState::poll` -> `refresh`); it never
         // depends on `doctor_scan`, and the readiness checks above (and Doctor)
         // remain authoritative for whether Play is available.
-        if let Some(action) = self.emulator_download_page.show(ui) {
+        if let Some(action) = self.emulator_download_page.show_bootstrap(ui) {
             self.emulator_download_page.handle(action, context.clone());
         }
         ui.add_space(theme::SECTION_GAP);
