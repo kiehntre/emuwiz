@@ -2603,6 +2603,8 @@ enum MainView {
     /// "Repair" to convert a disc image. Reuses the exact same
     /// `OpticalConversionPageState` and backend the Repair tab used before.
     DiscConversion,
+    /// Read-only presentation of bounded tape analysis for the selected game.
+    TapeInspector,
     /// Emulator Setup: the read-only emulator readiness / profile check.
     /// Renders `doctor_page::show_doctor_page` over the shared
     /// `ArchiveFsApp::doctor_scan` - the same engine and state the Problems &
@@ -2691,7 +2693,7 @@ enum LibraryTab {
 /// provably converges on the same destination - see
 /// `major_workflows_are_reachable_from_home_sidebar_and_top_menu`. RomM is
 /// exposed under the "Sources" menu instead (it has no `MainView` of its own).
-const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 4] = [
+const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 5] = [
     (
         "Museum",
         "Browse your collection by platform: what EmuWiz knows about each system.",
@@ -2701,6 +2703,11 @@ const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 4] = [
         "Duplicate Finder",
         "Find identical or equivalent copies and quarantine the extras.",
         MainView::ExactDuplicateReview,
+    ),
+    (
+        "Tape Inspector",
+        "Inspect supported cassette and tape-image structure without modifying the source.",
+        MainView::TapeInspector,
     ),
     (
         "Disc Conversion",
@@ -3175,6 +3182,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::RepairHistory => "Repair History",
         MainView::ExactDuplicateReview => "Duplicate Finder",
         MainView::DiscConversion => "Disc Conversion",
+        MainView::TapeInspector => "Tape Inspector",
         MainView::EmulatorSetup => "Emulator Setup",
         MainView::Museum => "Museum",
         MainView::LibraryViewHistory => "Library View History",
@@ -3211,6 +3219,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::IdentifyRename
         | MainView::RepairReview
         | MainView::DiscConversion
+        | MainView::TapeInspector
         | MainView::EmulatorSetup
         | MainView::DatSources
         | MainView::Doctor
@@ -3260,6 +3269,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::Doctor
             | MainView::EmulatorSetup
             | MainView::DiscConversion
+            | MainView::TapeInspector
             | MainView::HistoryLogs
             | MainView::Settings
             | MainView::About
@@ -3489,6 +3499,9 @@ struct ArchiveFsApp {
     /// `emulator_setup_overrides` for exactly which adapter/kind pairs are
     /// supported and how each is persisted.
     emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides,
+    /// The Tape Inspector library browser's persisted search/platform/format
+    /// filter state, retained across page re-renders.
+    tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState,
     /// Read-only PCSX2 profile discovery shared by every PS2 archive
     /// context. Inventory results remain archive-bound inside
     /// `CheatWorkflowState`.
@@ -4188,6 +4201,7 @@ impl ArchiveFsApp {
             emulator_setup_focus: None,
             emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
             emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::load(),
+            tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
             dolphin_profiles: DolphinProfilesState::NotScanned,
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
@@ -9456,6 +9470,67 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::DiscConversion {
                     self.show_optical_conversion_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::TapeInspector {
+                    let selected_path = self.archive_context.focused.clone();
+                    if let Some(path) = selected_path
+                        .as_ref()
+                        .filter(|path| tape_analysis_page::is_tape_path(path))
+                    {
+                        let evidence_is_stale = match &self.selected_evidence {
+                            selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
+                                report.path != *path
+                            }
+                            selected_evidence_page::SelectedEvidenceState::Loading {
+                                path: loading_path, ..
+                            } => loading_path != path,
+                            selected_evidence_page::SelectedEvidenceState::Idle => true,
+                            selected_evidence_page::SelectedEvidenceState::Error {
+                                path: error_path, ..
+                            } => error_path != path,
+                        };
+                        if evidence_is_stale {
+                            self.start_selected_evidence_load(context.clone(), path.clone());
+                        }
+                    }
+                    let (analysis, analysis_error) = match &self.selected_evidence {
+                        selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                            if Some(report.path.as_path()) == selected_path.as_deref() =>
+                        {
+                            (report.tape_analysis.as_ref(), None)
+                        }
+                        selected_evidence_page::SelectedEvidenceState::Error {
+                            path: error_path,
+                            message,
+                            ..
+                        } if Some(error_path.as_path()) == selected_path.as_deref() => {
+                            (None, Some(message.as_str()))
+                        }
+                        _ => (None, None),
+                    };
+                    let live_records = match &self.state {
+                        LoadState::Ready(data) => Some(data.records.as_slice()),
+                        _ => None,
+                    };
+                    let tape_action = tape_analysis_page::show_page_with_error(
+                        ui,
+                        selected_path
+                            .as_deref()
+                            .filter(|path| tape_analysis_page::is_tape_path(path)),
+                        analysis,
+                        analysis_error,
+                        live_records,
+                        &mut self.tape_inspector_filter,
+                    );
+                    if let Some(
+                        tape_analysis_page::TapeInspectorAction::ChooseFile(path)
+                        | tape_analysis_page::TapeInspectorAction::SelectLibraryTape(path),
+                    ) = tape_action
+                    {
+                        self.archive_context.select_only(path);
+                    }
                     return;
                 }
 
