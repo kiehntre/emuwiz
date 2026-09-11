@@ -1988,3 +1988,121 @@ impl ArchiveFsApp {
 
 
 }
+
+/// The bridge from the persisted DAT source registry
+/// (`archivefs_core::dat::sources::DatSourceRegistry` - the same one
+/// [`gather_selected_evidence_with_registry`] reads) into
+/// [`archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord`]
+/// values PCSX2 Launch Readiness needs to genuinely verify a BIOS - see
+/// `launch_readiness_page`'s Launch PCSX2 doc comment.
+///
+/// Never downloads anything and never invents a record: every registered,
+/// enabled source's file(s) are parsed with the exact same
+/// [`archivefs_core::dat::parsers::parse_dat_file`] the DAT Sources page
+/// itself uses, then handed to
+/// [`archivefs_core::dat::firmware_evidence::ps2_bios_evidence_from_dat`],
+/// which only ever yields records for a DAT it can itself prove is the
+/// Redump PS2 BIOS dataset (ecosystem plus dataset-identifying header text) -
+/// an unrelated ROM-set DAT, or one that fails to parse, silently
+/// contributes nothing rather than erroring the whole scan. A source's own
+/// `platform` label is never trusted as extraction authority here, for the
+/// same "never treat an arbitrary DAT as authoritative" reason
+/// `ps2_bios_evidence_from_dat` itself documents - every enabled source is
+/// tried, and only what genuinely re-parses as the right dataset survives.
+///
+/// Runs entirely off the UI thread (see
+/// [`App::start_pcsx2_firmware_evidence_load`]) - registered DAT files can
+/// be large, so this is never called from `build_launch_readiness_input`,
+/// which runs every frame the Selected page is shown.
+pub(crate) fn pcsx2_firmware_evidence_from_registry(
+    registry: &archivefs_core::dat::sources::DatSourceRegistry,
+) -> Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord> {
+    use archivefs_core::dat::firmware_evidence::ps2_bios_evidence_from_dat;
+    use archivefs_core::dat::limits::DatLimits;
+    use archivefs_core::dat::parsers::parse_dat_file;
+    use archivefs_core::dat::sources::{DatSourceKind, discover_dat_files};
+
+    let mut evidence = Vec::new();
+    for entry in registry.sorted_enabled() {
+        let files: Vec<PathBuf> = match entry.kind {
+            DatSourceKind::File => vec![entry.path.clone()],
+            DatSourceKind::Folder => discover_dat_files(&entry.path)
+                .map(|scan| scan.files)
+                .unwrap_or_default(),
+        };
+        for file in files {
+            if let Ok(outcome) = parse_dat_file(&file, DatLimits::default())
+                && let Ok(records) = ps2_bios_evidence_from_dat(&outcome.dat)
+            {
+                evidence.extend(records);
+            }
+        }
+    }
+    evidence
+}
+
+/// [`pcsx2_firmware_evidence_from_registry`] with the registry loaded fresh
+/// from `default_dat_sources_config_path()` - the same on-disk file the DAT
+/// Sources page reads and writes, never a second persistent registry. An
+/// absent config file (nothing registered yet) or an unresolvable path
+/// (e.g. `HOME` unset) both honestly resolve to zero evidence records,
+/// mirroring `gather_selected_evidence_with_registry`'s own fallback -
+/// never an error banner for the ordinary "nothing configured yet" case.
+/// Only a genuine read/parse failure of the registry file itself is
+/// reported as `Err`.
+pub(crate) fn load_pcsx2_firmware_evidence_from_registry()
+-> Result<Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord>, String> {
+    let Ok(config_path) = archivefs_core::dat::sources::default_dat_sources_config_path() else {
+        return Ok(Vec::new());
+    };
+    let config = archivefs_core::dat::sources::load_dat_sources_config_from(&config_path)
+        .map_err(|error| error.to_string())?;
+    let (registry, _warnings) =
+        archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
+    Ok(pcsx2_firmware_evidence_from_registry(&registry))
+}
+
+/// The caller-confirmed local executable paths to add to a standalone
+/// adapter's `explicit_executables` for `emulator` (a
+/// [`LinuxEmulatorInstallationEvidence::emulator`] display name, e.g.
+/// `"PPSSPP"` / `"PCSX2"`), taken **only** from an `install.json`-backed
+/// EmuWiz-managed AppImage already present in `installations` - see
+/// [`managed_appimage_executable_for`] for the exact trust rule (managed
+/// form only; never a plain `~/Applications` AppImage, a Flatpak,
+/// `$APPIMAGE`, `PATH`, config-only evidence, a lossy path, or an ambiguous
+/// multi-match).
+///
+/// Returns an empty vec whenever no such validated install exists, so
+/// feeding it into `ProfileDiscoveryRoots` is a no-op on any machine that
+/// does not have one - launch readiness there is byte-for-byte unchanged.
+pub(crate) fn managed_appimage_explicit_executables(
+    installations: &[LinuxEmulatorInstallationEvidence],
+    emulator: &str,
+) -> Vec<PathBuf> {
+    managed_appimage_executable_for(installations, emulator)
+        .into_iter()
+        .collect()
+}
+
+/// Writes (or, for `None`, removes) the override at an explicit file path.
+/// Best-effort: a persistence failure never blocks the in-memory value
+/// from taking effect for the session, exactly like `save_gui_mode`.
+pub(crate) fn save_retroarch_core_directory_override_at(path: &Path, value: Option<&Path>) {
+    match value {
+        Some(dir) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, dir.to_string_lossy().as_ref());
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn save_retroarch_core_directory_override(value: Option<&Path>) {
+    if let Some(path) = retroarch_core_directory_override_path() {
+        save_retroarch_core_directory_override_at(&path, value);
+    }
+}

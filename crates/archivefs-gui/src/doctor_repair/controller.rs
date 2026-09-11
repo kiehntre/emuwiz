@@ -539,3 +539,173 @@ impl ArchiveFsApp {
 
 
 }
+
+/// Collects the path-based Doctor inputs. Runs on a worker thread.
+///
+/// Every call here is read-only by the callee's own documented contract:
+/// `assess_mount_root_safety` wraps `validate_destination_root` (which
+/// "never creates a directory or file"), `diagnose_database` performs no
+/// migration/recovery/checkpoint, `list_source_folder_views_default` reads
+/// config plus the catalogue read-only, and `discover_shared_apply_history`
+/// only reads existing journal files.
+///
+/// Nothing here scans archives, mounts anything, or writes. In particular
+/// `run_setup_diagnostics` is deliberately **not** called: its "Mount root
+/// is writable" check probes by creating and removing a file, which changes
+/// the mount root's modification time. Doctor borrows the already-computed
+/// `SetupDiagnostics` from `self.diagnostics` instead, so opening Doctor
+/// never performs that write.
+///
+/// The one child process started from here is `arcade_version_probe`'s
+/// bounded, no-shell `mame -version` query (output- and timeout-capped, no
+/// config written). It is a diagnostic probe, not an emulator launch - see
+/// that module's docs.
+pub(crate) fn gather_doctor_inputs() -> DoctorGathered {
+    let config = Config::load_default();
+
+    let transactions = match default_shared_history_root() {
+        Ok(root) => Gathered::Ready(discover_shared_apply_history(&root)),
+        Err(error) => Gathered::Failed(format!(
+            "install history root is unavailable: {}",
+            error.detail
+        )),
+    };
+    // Emulator profiles first: where they live decides which filesystems and
+    // which managed files matter. Xenia has no documented native path, so it
+    // is never guessed at.
+    let mount_table = mount_table();
+    let discovered = DiscoveredProfiles::from_environment(Vec::new());
+    let profile_report = assess_emulator_profiles(&discovered.borrowed(), mount_table.as_deref());
+    let managed_targets = managed_scan_targets(&profile_report);
+    // Launch readiness (native executable binding, plus - xemu only - the
+    // four required system files) is a distinct question from the
+    // writability assessment above, so it is gathered separately - see
+    // `diagnostics::profiles`'s own "xemu / Xenia launch readiness" module
+    // doc section.
+    let xemu_readiness = match &discovered.xemu {
+        Ok(discovery) => Gathered::Ready(assess_xemu_readiness(Some(discovery))),
+        Err(error) => Gathered::Failed(error.clone()),
+    };
+    let xenia_readiness = Gathered::Ready(assess_xenia_readiness(discovered.xenia.as_ref()));
+    let ppsspp_readiness = match &discovered.ppsspp {
+        Ok(discovery) => Gathered::Ready(assess_ppsspp_readiness(Some(discovery))),
+        Err(error) => Gathered::Failed(error.clone()),
+    };
+    let rpcs3_readiness = match &discovered.rpcs3 {
+        Ok(discovery) => Gathered::Ready(assess_rpcs3_readiness(Some(discovery))),
+        Err(error) => Gathered::Failed(error.clone()),
+    };
+    let installations = discover_linux_emulator_installations();
+    // Advisory arcade emulator / DAT version compatibility, now on live inputs:
+    //
+    // - DAT revision: the arcade `<version>` headers persisted on each DAT
+    //   source's health record the last time it was validated. Read from the
+    //   already-saved registry; no DAT file is reopened here
+    //   (`arcade_dat_catalogues_from_source_health` is pure).
+    // - Emulator version: a bounded, no-shell `mame -version` probe
+    //   (`arcade_version_probe`) with output and timeout caps - a diagnostic
+    //   query, never a normal launch. FinalBurn Neo is not probed, so it stays
+    //   "detected, version unknown" unless a version is supplied another way.
+    //
+    // Both sides fail soft to "unknown"; a version difference is only ever an
+    // Info finding and never changes ROM-set completeness.
+    let arcade_dat_catalogues = archivefs_core::dat::sources::load_dat_sources_config_default()
+        .ok()
+        .map(|config| {
+            let (registry, _warnings) =
+                archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
+            archivefs_core::diagnostics::arcade_dat_version::arcade_dat_catalogues_from_source_health(
+                registry
+                    .entries()
+                    .iter()
+                    .flat_map(|entry| entry.health.arcade_catalogue_revisions.iter()),
+            )
+        })
+        .unwrap_or_default();
+    let arcade_version_outputs =
+        archivefs_core::diagnostics::arcade_version_probe::probe_arcade_emulator_versions(
+            &installations,
+        );
+    let arcade_dat_version = Gathered::Ready(
+        archivefs_core::diagnostics::arcade_dat_version::arcade_dat_version_readiness(
+            &installations,
+            &arcade_dat_catalogues,
+            &arcade_version_outputs,
+        ),
+    );
+    let linux_emulator_installations = Gathered::Ready(installations);
+
+    DoctorGathered {
+        mount_root_safety: match &config {
+            Ok(config) => Gathered::Ready(assess_mount_root_safety(&config.mount_root)),
+            Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+        },
+        // Read-only: walks only EmuWiz's own mount root, never an archive,
+        // and shares its removability predicate with the remover.
+        stale_mount_directories: match &config {
+            Ok(config) => match plan_stale_mount_directories(config) {
+                Ok(stale) => Gathered::Ready(stale),
+                Err(error) => {
+                    Gathered::Failed(format!("the mount root could not be inspected: {error}"))
+                }
+            },
+            Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
+        },
+        index_freshness: match default_index_path() {
+            Ok(path) => match read_archive_index(&path) {
+                Ok(index) => Gathered::Ready((check_archive_index_freshness(&index), path)),
+                // No index yet is not a failure - there is simply nothing to
+                // report about its freshness.
+                Err(_) => Gathered::NotLoaded(
+                    "No archive index has been built yet, so its freshness was not checked.",
+                ),
+            },
+            Err(error) => Gathered::Failed(format!("index path could not be resolved: {error}")),
+        },
+        database: match default_database_path() {
+            Ok(path) => Gathered::Ready(diagnose_database(&path)),
+            Err(error) => Gathered::Failed(format!("database path could not be resolved: {error}")),
+        },
+        source_health: match list_source_folder_views_default() {
+            Ok(views) => Gathered::Ready(source_health_issues(views.as_slice())),
+            Err(error) => Gathered::Failed(format!("source folders could not be listed: {error}")),
+        },
+        transactions: transactions.clone(),
+        // Free space and mount state for every location EmuWiz depends on,
+        // read from `statvfs` and `/proc/self/mountinfo`. No probe file.
+        storage: Gathered::Ready(assess_storage(&storage_resources(
+            config.as_ref().ok(),
+            default_database_path().ok().as_deref(),
+            default_index_path().ok().as_deref(),
+            default_shared_history_root().ok().as_deref(),
+            &profile_destination_directories(&profile_report),
+        ))),
+        emulator_profiles: Gathered::Ready(profile_report),
+        linux_emulator_installations,
+        arcade_dat_version,
+        xemu_readiness,
+        xenia_readiness,
+        ppsspp_readiness,
+        rpcs3_readiness,
+        managed_entries: match &transactions {
+            Gathered::Ready(history) => {
+                Gathered::Ready(scan_managed_entries(history, &managed_targets))
+            }
+            Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+            Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+        },
+    }
+}
+
+/// Borrows an owned gathered value as the runner's input, preserving the
+/// unavailable/failed reason unchanged.
+pub(crate) fn borrowed<'a, T, B: ?Sized>(
+    gathered: &'a Gathered<T>,
+    borrow: impl FnOnce(&'a T) -> &'a B,
+) -> Gathered<&'a B> {
+    match gathered {
+        Gathered::Ready(value) => Gathered::Ready(borrow(value)),
+        Gathered::Failed(reason) => Gathered::Failed(reason.clone()),
+        Gathered::NotLoaded(reason) => Gathered::NotLoaded(reason),
+    }
+}

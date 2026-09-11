@@ -1011,3 +1011,33 @@ impl ArchiveFsApp {
 
 
 }
+
+/// The initial and maximum size for one RomM tool window, clamped to the
+/// current viewport.
+///
+/// Shared by every RomM window so none of them can open larger than the
+/// screen - the failure mode that puts a fixed footer, and therefore the
+/// only visible way out, past the bottom edge at TV resolution. `maximum`
+/// leaves a 32px margin so the title bar (and its close control) stays
+/// reachable; `preferred` is only honoured up to that maximum.
+/// The tallest a RomM window's scrolling body may be, given the window's
+/// maximum size. The remainder pays for the title bar, the frame margins,
+/// the separator and the footer itself.
+pub(crate) fn romm_window_body_cap(maximum: egui::Vec2) -> f32 {
+    (maximum.y - 100.0).max(120.0)
+}
+
+pub(crate) fn romm_dialog_sizes(viewport: egui::Vec2, preferred: egui::Vec2) -> (egui::Vec2, egui::Vec2) {
+    // The margin is the window's own chrome plus the room it needs to sit
+    // somewhere other than exactly (0, 0). A 32px margin was not enough: a
+    // window whose content filled its maximum height became as tall as the
+    // screen less 32, and egui then placed it below the top edge, pushing its
+    // fixed footer - and therefore the only visible way out - off the bottom.
+    const MARGIN: f32 = 96.0;
+    let maximum = egui::vec2(
+        (viewport.x - MARGIN).max(240.0).min(viewport.x.max(1.0)),
+        (viewport.y - MARGIN).max(240.0).min(viewport.y.max(1.0)),
+    );
+    let initial = egui::vec2(preferred.x.min(maximum.x), preferred.y.min(maximum.y));
+    (initial, maximum)
+}

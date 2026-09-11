@@ -562,3 +562,298 @@ impl ArchiveFsApp {
 
 
 }
+
+/// Opens the default library database and applies one `PlatformAction`
+/// to the archive at `archive_path` - the production entry point run on
+/// the background thread `ArchiveFsApp::start_platform_action` spawns.
+/// See [`apply_platform_action_at`] (the testable core, taking an
+/// explicit database path - mirrors `load_database_snapshot`/
+/// `load_database_snapshot_at`) for the actual logic.
+pub(crate) fn apply_platform_action(
+    archive_path: &Path,
+    action: &PlatformAction,
+) -> archivefs_core::Result<PlatformAssignmentChange> {
+    let database_path = default_database_path()?;
+    apply_platform_action_at(&database_path, archive_path, action)
+}
+
+/// Resolves `archive_path` to a stable persisted archive id by exact
+/// path bytes first (never a lossy display string - see
+/// `Database::find_archive_id_by_absolute_path`), then applies `action`.
+/// Errors clearly if the archive has no persisted catalogue row (nothing to
+/// assign a platform to) rather than silently doing nothing.
+pub(crate) fn apply_platform_action_at(
+    database_path: &Path,
+    archive_path: &Path,
+    action: &PlatformAction,
+) -> archivefs_core::Result<PlatformAssignmentChange> {
+    let mut database = Database::open_or_create(database_path)?;
+    let archive_id = database
+        .find_archive_id_by_absolute_path(archive_path)?
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "{} is not yet in the saved library catalogue - run a library scan before assigning a platform",
+                archive_path.display()
+            ))
+        })?;
+    match action {
+        PlatformAction::Set(platform) => database.set_manual_platform(archive_id, platform),
+        PlatformAction::Clear => database.clear_manual_platform(archive_id),
+    }
+}
+
+/// Opens the default library database and applies one
+/// `BulkPlatformActionKind` to `archive_paths` - the production entry
+/// point run on the background thread `ArchiveFsApp::start_bulk_platform_action`
+/// spawns. See [`apply_bulk_platform_action_at`] (the testable core,
+/// mirrors `apply_platform_action`/`apply_platform_action_at`) for the
+/// actual logic.
+pub(crate) fn apply_bulk_platform_action(
+    archive_paths: &[PathBuf],
+    kind: &BulkPlatformActionKind,
+) -> archivefs_core::Result<BulkPlatformActionOutcome> {
+    let database_path = default_database_path()?;
+    apply_bulk_platform_action_at(&database_path, archive_paths, kind)
+}
+
+/// Resolves every path in `archive_paths` to a stable persisted archive
+/// id by exact path bytes (never a lossy display string - see
+/// `Database::find_archive_id_by_absolute_path`), then applies `kind` to
+/// every id that resolved in one database transaction (see
+/// `Database::set_manual_platform_for_archives`/
+/// `clear_manual_platform_for_archives`). Unlike the single-row
+/// `apply_platform_action_at`, a path that does not resolve to any
+/// database archive id (a live-only/not-yet-scanned row, for example) is
+/// not a hard error here - it is counted in the returned
+/// `BulkPlatformActionOutcome::unresolved_paths` instead, so one
+/// unresolvable row in a large selection never blocks every other,
+/// resolvable row in the same selection from being updated. This mirrors
+/// the database bulk API's own "skip and report, don't abort" policy for
+/// an archive id that turns out not to exist.
+pub(crate) fn apply_bulk_platform_action_at(
+    database_path: &Path,
+    archive_paths: &[PathBuf],
+    kind: &BulkPlatformActionKind,
+) -> archivefs_core::Result<BulkPlatformActionOutcome> {
+    let mut database = Database::open_or_create(database_path)?;
+    let mut ids = Vec::with_capacity(archive_paths.len());
+    let mut unresolved_paths = 0usize;
+    for path in archive_paths {
+        match database.find_archive_id_by_absolute_path(path)? {
+            Some(id) => ids.push(id),
+            None => unresolved_paths += 1,
+        }
+    }
+    let result = match kind {
+        BulkPlatformActionKind::Set(platform) => {
+            database.set_manual_platform_for_archives(&ids, platform)?
+        }
+        BulkPlatformActionKind::Clear => database.clear_manual_platform_for_archives(&ids)?,
+    };
+    Ok(BulkPlatformActionOutcome {
+        result,
+        unresolved_paths,
+    })
+}
+
+/// Opens the default library database and applies one `AliasAction` -
+/// the production entry point run on the background thread
+/// `ArchiveFsApp::start_alias_action` spawns. See
+/// [`apply_alias_action_at`] (the testable core, taking an explicit
+/// database path - mirrors `apply_platform_action`/
+/// `apply_platform_action_at`) for the actual logic. Uses
+/// `Database::open_or_create` (creating the database if it does not
+/// exist yet) rather than requiring a pre-existing one: unlike manual
+/// platform assignment, an alias is not attached to any specific
+/// already-scanned archive, so there is nothing that requires the
+/// database - or a scan - to already exist first. This matches
+/// `library-scan`'s existing "open or create" write-command convention
+/// on the CLI side.
+pub(crate) fn apply_alias_action(action: &AliasAction) -> archivefs_core::Result<()> {
+    let database_path = default_database_path()?;
+    apply_alias_action_at(&database_path, action)
+}
+
+pub(crate) fn apply_alias_action_at(database_path: &Path, action: &AliasAction) -> archivefs_core::Result<()> {
+    let mut database = Database::open_or_create(database_path)?;
+    match action {
+        AliasAction::Add { alias, platform } => {
+            database.add_platform_alias(alias, platform)?;
+        }
+        AliasAction::Remove { alias } => {
+            if !database.remove_platform_alias(alias)? {
+                return Err(ArchiveFsError::Database(format!(
+                    "no platform alias matches '{alias}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Formats a platform assignment for display as `"<platform>
+/// (<provenance>)"`, or `"Unknown"` when there is none - the same shape
+/// as the CLI's `format_platform_and_source`, kept as a small separate
+/// copy here rather than a shared crate dependency between the two
+/// binaries for two lines of formatting.
+pub(crate) fn describe_platform_assignment(platform: Option<&str>, source: Option<&str>) -> String {
+    match (platform, source) {
+        (Some(platform), Some(source)) => format!("{platform} ({source})"),
+        _ => "Unknown".to_string(),
+    }
+}
+
+pub(crate) fn source_action_log_category(action: &SourceAction) -> ActivityAction {
+    match action {
+        SourceAction::Add(_) => ActivityAction::SourceAdded,
+        SourceAction::SetEnabled { enabled: true, .. } => ActivityAction::SourceEnabled,
+        SourceAction::SetEnabled { enabled: false, .. } => ActivityAction::SourceDisabled,
+        SourceAction::ScanOne(_) | SourceAction::ScanAll | SourceAction::AssignPlatform { .. } => {
+            ActivityAction::SourceScan
+        }
+        SourceAction::Remove { .. } => ActivityAction::SourceRemoved,
+    }
+}
+
+pub(crate) fn source_action_path(action: &SourceAction) -> Option<PathBuf> {
+    match action {
+        SourceAction::Add(path)
+        | SourceAction::SetEnabled { path, .. }
+        | SourceAction::ScanOne(path)
+        | SourceAction::AssignPlatform { path, .. }
+        | SourceAction::Remove { path, .. } => Some(path.clone()),
+        SourceAction::ScanAll => None,
+    }
+}
+
+pub(crate) fn source_action_started_message(action: &SourceAction) -> String {
+    match action {
+        SourceAction::Add(path) => format!("Adding source '{}'.", path.display()),
+        SourceAction::SetEnabled {
+            path,
+            enabled: true,
+        } => format!("Enabling source '{}'.", path.display()),
+        SourceAction::SetEnabled {
+            path,
+            enabled: false,
+        } => format!("Disabling source '{}'.", path.display()),
+        SourceAction::ScanOne(path) => format!("Scanning source '{}'.", path.display()),
+        SourceAction::ScanAll => "Scanning all enabled sources.".to_string(),
+        SourceAction::AssignPlatform { path, platform } => format!(
+            "Assigning {platform} to source '{}' and rescanning compatible entries.",
+            path.display()
+        ),
+        SourceAction::Remove {
+            path,
+            keep_catalogue: true,
+        } => format!(
+            "Removing source '{}' (keeping catalogue entries).",
+            path.display()
+        ),
+        SourceAction::Remove {
+            path,
+            keep_catalogue: false,
+        } => format!(
+            "Removing source '{}' and its catalogue entries.",
+            path.display()
+        ),
+    }
+}
+
+pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> String {
+    match outcome {
+        SourceActionOutcome::Added(source) => format!(
+            "Source added: {}. Use Scan to catalogue it.",
+            source.path.display()
+        ),
+        SourceActionOutcome::SetEnabled(outcome) => match &outcome.scan {
+            Some(scan) => format!(
+                "Source enabled: {}. Scan found {} archive(s), {} missing.",
+                outcome.source.path.display(),
+                scan.counts.archives_seen,
+                scan.counts.archives_missing
+            ),
+            None => format!(
+                "Source disabled: {}. Catalogue entries were preserved.",
+                outcome.source.path.display()
+            ),
+        },
+        SourceActionOutcome::Scanned(summary) => {
+            let succeeded = summary.counts.source_folders_scanned;
+            let failed = summary.folder_errors.len();
+            if failed == 0 {
+                format!(
+                    "Scan complete: {succeeded} source(s) scanned, {} archive(s) found, {} \
+                     missing.",
+                    summary.counts.archives_seen, summary.counts.archives_missing
+                )
+            } else {
+                format!(
+                    "Scan complete: {succeeded} source(s) succeeded, {failed} failed. Existing \
+                     catalogue entries were preserved for the failed source(s)."
+                )
+            }
+        }
+        SourceActionOutcome::PlatformAssigned { platform, scan } => format!(
+            "Source assigned {platform}. Rescan found {} item(s); compatible Unknown entries were reclassified. {} incompatible item(s) remained visible and Unknown.",
+            scan.counts.archives_seen,
+            scan.platform_assignment_warnings.len()
+        ),
+        SourceActionOutcome::Removed(outcome) => match outcome.catalogue_rows_removed {
+            Some(count) => format!(
+                "Source removed: {}. {count} catalogue row(s) removed.",
+                outcome.removed_source.path.display()
+            ),
+            None => format!(
+                "Source removed: {}. Catalogue entries were preserved.",
+                outcome.removed_source.path.display()
+            ),
+        },
+    }
+}
+
+/// The one continuation decision behind Gamer View's seamless Add games
+/// journey. It deliberately returns the existing `ScanOne` action only for
+/// the exact path whose successful Add set the pending marker; Advanced View
+/// adds and unrelated source results cannot start or steal this scan.
+pub(crate) fn gamer_first_scan_after_add(
+    pending_path: Option<&Path>,
+    added: &SourceFolderConfig,
+) -> Option<SourceAction> {
+    (pending_path == Some(added.path.as_path())).then(|| SourceAction::ScanOne(added.path.clone()))
+}
+
+/// Runs one [`SourceAction`] against the default config/database paths -
+/// the production entry point `ArchiveFsApp::start_source_action` runs on
+/// a background thread. Every arm calls straight into the same, already
+/// tested `archivefs_core` function the CLI's matching `source`/`sources`
+/// subcommand calls (see `crates/archivefs-cli/src/main.rs`'s `source
+/// add`/`enable`/`disable`/`scan`/`sources scan-all`/`source remove`
+/// handlers) - never a second implementation of validation, scanning, or
+/// persistence.
+pub(crate) fn run_source_action(action: &SourceAction) -> archivefs_core::Result<SourceActionOutcome> {
+    match action {
+        SourceAction::Add(path) => add_source_folder_default(path).map(SourceActionOutcome::Added),
+        SourceAction::SetEnabled { path, enabled } => {
+            set_source_folder_enabled_default(path, *enabled).map(SourceActionOutcome::SetEnabled)
+        }
+        SourceAction::ScanOne(path) => {
+            scan_source_folder_default(path).map(SourceActionOutcome::Scanned)
+        }
+        SourceAction::ScanAll => {
+            scan_all_enabled_sources_default().map(SourceActionOutcome::Scanned)
+        }
+        SourceAction::AssignPlatform { path, platform } => {
+            assign_source_platform_default(path, platform).map(|scan| {
+                SourceActionOutcome::PlatformAssigned {
+                    platform: platform.clone(),
+                    scan,
+                }
+            })
+        }
+        SourceAction::Remove {
+            path,
+            keep_catalogue,
+        } => remove_source_folder_default(path, *keep_catalogue).map(SourceActionOutcome::Removed),
+    }
+}

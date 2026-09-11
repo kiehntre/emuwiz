@@ -5564,3 +5564,173 @@ impl ArchiveFsApp {
 
 
 }
+
+/// Runs the legacy CRC-only PNACH migration (staged alongside the primary
+/// install as `workflow.preview`'s `pcsx2_generated.legacy_migration_report`)
+/// as its own chained shared-apply operation, immediately after the
+/// primary install this belongs to succeeds. Deliberately a *separate*
+/// `execute_shared_apply` call with its own operation ID and journal: two
+/// verified-exact entries for one identity in a single PCSX2 preview/plan
+/// is treated as an unresolvable ambiguity elsewhere in this pipeline (see
+/// `PreviewBlockerKind::MultipleExactMatches`), so migration cleanup can
+/// never be folded into the primary plan. Its journal lands in the same
+/// shared history root as the primary apply, so it is already visible and
+/// independently undoable from History & Logs without any bespoke UI.
+/// Returns the `HistoryEntry` to record, or `None` if no migration was
+/// pending.
+pub(crate) fn apply_pcsx2_pending_legacy_migration(
+    workflow: &CheatWorkflowState,
+    primary_result: &SharedApplyResult,
+) -> Option<HistoryEntry> {
+    let CheatStepResource::Ready(response) = &workflow.preview else {
+        return None;
+    };
+    let legacy_report = response
+        .pcsx2_generated
+        .as_ref()
+        .and_then(|generated| generated.legacy_migration_report.clone())?;
+    let archive_path = Some(workflow.archive_path.clone());
+    let approved_source_root = match primary_result.journal.approved_source_root.to_path_buf() {
+        Ok(path) => path,
+        Err(message) => {
+            return Some(HistoryEntry::new(
+                ActivityAction::CheatInstall,
+                archive_path,
+                ActivityOutcome::Failed,
+                format!("Legacy PNACH migration path could not be reconstructed: {message:?}"),
+            ));
+        }
+    };
+    let plan = match build_shared_transaction_plan(
+        &legacy_report,
+        &primary_result.journal.context.profile_id,
+        &primary_result.journal.context.source_mode,
+        &approved_source_root,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Some(HistoryEntry::new(
+                ActivityAction::CheatInstall,
+                archive_path,
+                ActivityOutcome::Failed,
+                format!(
+                    "Legacy PNACH migration could not be planned: {}",
+                    error.detail
+                ),
+            ));
+        }
+    };
+    let (history_root, backup_root) =
+        match (default_shared_history_root(), default_shared_backup_root()) {
+            (Ok(history_root), Ok(backup_root)) => (history_root, backup_root),
+            _ => {
+                return Some(HistoryEntry::new(
+                    ActivityAction::CheatInstall,
+                    archive_path,
+                    ActivityOutcome::Failed,
+                    "Legacy PNACH migration could not resolve the shared history/backup root"
+                        .to_string(),
+                ));
+            }
+        };
+    let operation_id = format!("{}-legacy-migration", primary_result.journal.operation_id);
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let result = execute_shared_apply(
+        &plan,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: operation_id.clone(),
+            timestamp_unix_seconds: timestamp,
+            current_context: plan.context.clone(),
+            history_root,
+            backup_root,
+        },
+    );
+    let outcome = match result.journal.status {
+        SharedApplyStatus::Success => ActivityOutcome::Completed,
+        SharedApplyStatus::PartialFailure | SharedApplyStatus::Failed => ActivityOutcome::Failed,
+        SharedApplyStatus::DryRun => ActivityOutcome::Skipped,
+    };
+    Some(HistoryEntry::new(
+        ActivityAction::CheatInstall,
+        archive_path,
+        outcome,
+        format!(
+            "Legacy PNACH migration '{}' finished with {:?} (undo available from History & Logs).",
+            result.journal.operation_id, result.journal.status
+        ),
+    ))
+}
+
+pub(crate) fn run_bsfree_operation(
+    operation: &BsFreeOperation,
+) -> Result<BsFreeOperationResult, archivefs_core::patch_manager::BsFreeError> {
+    let paths = BsFreePaths::at(default_bsfree_source_root()?);
+    match operation {
+        BsFreeOperation::LoadStatus => inspect_bsfree_source(&paths)
+            .map(Box::new)
+            .map(BsFreeOperationResult::Status),
+        BsFreeOperation::Download => download_bsfree_database(
+            &paths,
+            &BsFreeDownloadOptions::default(),
+            &HttpsCheatSourceTransport::new(),
+        )
+        .map(|result| BsFreeOperationResult::Status(Box::new(result.status))),
+        BsFreeOperation::Import(source) => import_local_bsfree_database(&paths, source)
+            .map(|result| BsFreeOperationResult::Status(Box::new(result.status))),
+        BsFreeOperation::Validate => validate_installed_bsfree_source(&paths)
+            .map(Box::new)
+            .map(BsFreeOperationResult::Status),
+        BsFreeOperation::SetEnabled(enabled) => set_bsfree_enabled(&paths, *enabled)
+            .map(Box::new)
+            .map(BsFreeOperationResult::Status),
+        BsFreeOperation::Remove => {
+            remove_local_bsfree_source(&paths, true)?;
+            Ok(BsFreeOperationResult::Removed)
+        }
+        BsFreeOperation::Search(request) => BsFreeCatalogue::open_installed(&paths)?
+            .search_games(request)
+            .map(BsFreeOperationResult::Search),
+        BsFreeOperation::LoadSystems => BsFreeCatalogue::open_installed(&paths)?
+            .systems(PageRequest {
+                offset: 0,
+                limit: PageRequest::HARD_LIMIT,
+            })
+            .map(BsFreeOperationResult::Systems),
+        BsFreeOperation::LoadGame {
+            upstream_uid,
+            offset,
+        } => {
+            let catalogue = BsFreeCatalogue::open_installed(&paths)?;
+            let game = catalogue.game(*upstream_uid)?.ok_or_else(|| {
+                archivefs_core::patch_manager::BsFreeError {
+                    kind: archivefs_core::patch_manager::BsFreeErrorKind::Query,
+                    message: "BSFree game is no longer present".to_string(),
+                }
+            })?;
+            let cheats = catalogue.cheats(*upstream_uid, PageRequest::cheats(*offset))?;
+            Ok(BsFreeOperationResult::Game(game, cheats))
+        }
+    }
+}
+
+/// The design's per-archive validation label on the Mount page - a pure
+/// mapping from the live `MountState`, so the preview can never disagree
+/// with what the batch engine will actually do (`Pending` is the only
+/// state `queued_pending_paths` lets through to a mount attempt).
+pub(crate) fn mount_validation_label(state: MountState) -> &'static str {
+    match state {
+        MountState::Pending => "Ready to mount",
+        MountState::Mounted => "Already mounted — will be skipped",
+        MountState::MountPathExists => "Destination already exists — will be skipped",
+        MountState::NotMountable => "Loose ROM · no EmuWiz mount required",
+    }
+}
