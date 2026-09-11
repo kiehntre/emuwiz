@@ -4883,6 +4883,28 @@ fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egu
         .find_map(|clipped| find_in_shape(&clipped.shape, needle))
 }
 
+fn find_last_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn collect(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Pos2>) {
+        match shape {
+            egui::Shape::Text(text_shape) if text_shape.galley.text() == needle => {
+                *out = Some(text_shape.pos + text_shape.galley.size() / 2.0);
+            }
+            egui::Shape::Vec(nested) => {
+                for shape in nested {
+                    collect(shape, needle, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut result = None;
+    for clipped in &output.shapes {
+        collect(&clipped.shape, needle, &mut result);
+    }
+    result
+}
+
 fn fixture_recovery_transaction(
     transaction_id: &str,
     state: TransactionState,
@@ -4904,6 +4926,14 @@ fn fixture_recovery_transaction(
     let mut view = RecoveryTransactionView::from_transaction(
         &transaction,
         ExactResumeStatusView::NeedsCurrentPlan,
+    );
+    // These synthetic rows intentionally model cleanup already proved
+    // actionable; filesystem-uncertainty cases have dedicated real-journal
+    // fixtures elsewhere.
+    view.cleanup = RecoveryCleanupClassification::Actionable;
+    view.presentation = presentation::classify(
+        &transaction,
+        RecoveryCleanupClassification::Actionable,
     );
     view.human_summary = human_summary.to_string();
     view
@@ -4949,7 +4979,7 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
             ),
             fixture_recovery_transaction(
                 "tx-interrupted-3",
-                TransactionState::ApplyFailed,
+                TransactionState::RollbackFailed,
                 "Renamed 3 files",
             ),
         ],
@@ -5009,16 +5039,34 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
         })
     };
 
-    // Frame 1: settle. Every row's own "Technical classification details"
-    // header renders once, and every recovery transaction's rollback
-    // control renders with the right label for its own state.
+    // The plan rows are intentionally bounded by a ScrollArea, so not every
+    // row's disclosure header is visible in the first frame.
     let mut action = None;
     let first = render(&ctx, base_input.clone(), &mut ui_state, &mut action);
-    assert_eq!(
-        rendered_text_count(&first, "Technical classification details"),
-        3,
-        "every plan row must render its own disclosure header"
+    let unscrolled_headers = rendered_text_count(&first, "Technical classification details");
+    assert!(
+        (1..3).contains(&unscrolled_headers),
+        "expected some but not all plan row headers to fit unscrolled (got {unscrolled_headers})"
     );
+    let scroll_into_list = egui::RawInput {
+        screen_rect: Some(screen),
+        events: vec![
+            egui::Event::PointerMoved(egui::pos2(500.0, 950.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -20.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    let mut scrolled = first.clone();
+    for _ in 0..20 {
+        scrolled = render(&ctx, scroll_into_list.clone(), &mut ui_state, &mut action);
+    }
+    assert!(rendered_text_contains(&scrolled, "two equally-scored candidates"));
+    assert!(rendered_text_count(&scrolled, "Technical classification details") >= 1);
     assert!(rendered_text_contains(&first, "Roll back transaction"));
     assert!(rendered_text_contains(&first, "Roll back completed steps"));
     assert!(rendered_text_contains(&first, "Leave untouched"));
@@ -5027,9 +5075,8 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
     assert!(rendered_text_contains(&first, "Already canonical"));
     assert!(rendered_text_contains(&first, "Ambiguous"));
 
-    // Click the FIRST plan row's "Technical classification details"
-    // header open.
-    let header_pos = find_exact_text_center(&first, "Technical classification details")
+    // Click a currently visible plan row's disclosure header.
+    let header_pos = find_last_exact_text_center(&scrolled, "Technical classification details")
         .expect("expected at least one disclosure header to render");
     let click = egui::RawInput {
         screen_rect: Some(screen),

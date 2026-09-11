@@ -12175,7 +12175,9 @@ fn show_rename_plan_section(
             .id_salt("dat-rename-plan-rows")
             .show(ui, |ui| {
                 for row in &visible[start..end] {
-                    widgets::card(ui, |ui| show_rename_plan_row(ui, row, &mut action));
+                    ui.push_id(("dat-rename-plan-row", &row.source_path), |ui| {
+                        widgets::card(ui, |ui| show_rename_plan_row(ui, row, &mut action));
+                    });
                     ui.add_space(6.0);
                 }
             });
