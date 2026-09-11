@@ -8,8 +8,8 @@
 //! - the proposal is `Suggested`, actionable, collision-free, and explicitly
 //!   approved by the user;
 //! - at apply time the source is still the very same regular file that was
-//!   reviewed (same size and, where supported, same inode/device; never a
-//!   symlink);
+//!   reviewed (same content digest, full-precision mtime, size and, where
+//!   supported, inode/device; never a symlink);
 //! - the destination does not exist, shares the source's directory, and lies
 //!   inside the configured trusted roots;
 //! - every preflight check passes immediately before the rename.
@@ -66,9 +66,9 @@ pub use journal::{
     resolve_leave_untouched, write_journal,
 };
 pub use model::{
-    EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectIdentity,
-    ObjectKind, RecoveryResolution, RenameTransaction, RollbackResult, RollbackStatus,
-    TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
+    EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectFreshness,
+    ObjectIdentity, ObjectKind, RecoveryResolution, RenameTransaction, RollbackResult,
+    RollbackStatus, TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{
@@ -79,3 +79,6 @@ pub use rollback::{RollbackOutcome, rollback_transaction, rollback_transaction_c
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod integrity_audit_tests;
