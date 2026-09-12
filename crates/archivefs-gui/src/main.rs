@@ -142,8 +142,11 @@ use archivefs_core::patch_manager::{
 };
 use collection_discovery_page::*;
 mod administration_pages;
+#[allow(dead_code)]
 mod es_de_media_state;
+#[allow(dead_code)]
 mod launchbox_local_state;
+#[allow(dead_code)]
 mod platform_artwork_manager;
 mod cheats_mods;
 mod cheats_mods_preview;
@@ -152,13 +155,16 @@ use cheats_mods::*;
 use cheats_mods_preview::*;
 mod cheatbase_page;
 mod cheat_reconciliation_review;
+#[allow(dead_code)]
 mod emulator_download_page;
 mod emulator_setup;
 use emulator_setup::*;
 mod emulator_setup_page;
 mod emulator_setup_overrides;
 mod gamer_platform_shelf;
+#[allow(dead_code)]
 mod onframe_install_session;
+#[allow(dead_code)]
 mod onframe_install_state;
 mod user_cheat_import_page;
 use gamer_platform_shelf::*;
@@ -179,6 +185,7 @@ pub(crate) mod cheat_sources_page;
 mod collection_discovery_page;
 pub(crate) mod dat_catalogue_picker;
 pub(crate) mod dat_coverage_panel;
+#[allow(dead_code)]
 pub(crate) mod dat_sources_page;
 mod doctor_repair;
 use doctor_repair::*;
@@ -199,15 +206,19 @@ use mount_batch::*;
 mod mount_operations;
 pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
+#[allow(dead_code)]
 pub(crate) mod feature_discovery;
 pub(crate) mod game_metadata;
 pub mod game_presentation;
+#[allow(dead_code)]
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
 pub(crate) mod identity_sources_page;
+#[allow(dead_code)]
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
+#[allow(dead_code)]
 pub(crate) mod museum_page;
 pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
@@ -217,6 +228,7 @@ use platform_source_actions::*;
 pub(crate) mod playing_library_page;
 pub(crate) mod problems_repair_page;
 pub(crate) mod repair_history_page;
+#[allow(dead_code)]
 pub(crate) mod repair_review_page;
 pub(crate) mod retroarch_core_setup;
 pub(crate) mod rom_organisation_page;
@@ -225,9 +237,11 @@ use romm::*;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_game;
+#[allow(dead_code)]
 pub(crate) mod romm_source;
 pub(crate) mod rpcs3_page;
 pub(crate) mod selected_evidence_no_intro;
+#[allow(dead_code)]
 pub(crate) mod selected_evidence_page;
 mod selected_evidence_pipeline;
 use selected_evidence_pipeline::*;
@@ -235,7 +249,9 @@ pub mod selection_guard;
 mod source_state;
 mod sources_page;
 pub mod status_wording;
+#[allow(dead_code)]
 pub(crate) mod tape_analysis_page;
+#[allow(dead_code)]
 mod ui;
 pub mod view_mode;
 

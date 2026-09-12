@@ -316,6 +316,7 @@ impl std::fmt::Display for LaserdiscVerificationError {
 }
 impl std::error::Error for LaserdiscVerificationError {}
 
+#[expect(dead_code, reason = "retained for future laserdisc media classification")]
 fn is_video(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -381,11 +382,10 @@ fn safe_reference(root: &Path, value: &str) -> Result<PathBuf, String> {
     let joined = root.join(candidate);
     let canonical_root = fs::canonicalize(root).map_err(|e| e.to_string())?;
     let canonical_parent = joined.parent().and_then(|p| fs::canonicalize(p).ok());
-    if let Some(parent) = canonical_parent {
-        if !parent.starts_with(&canonical_root) {
+    if let Some(parent) = canonical_parent
+        && !parent.starts_with(&canonical_root) {
             return Err("media reference escapes set root".into());
         }
-    }
     Ok(joined)
 }
 
@@ -483,7 +483,7 @@ fn verify_frame_ranges(
             match asset.and_then(|asset| asset.metadata.as_ref()) {
                 Some(metadata) if metadata.probe_status == LaserdiscProbeStatus::Available => {
                     match metadata.reported_frame_count {
-                        Some(frame_count) if frame_count == 0 => {
+                        Some(0) => {
                             LaserdiscFrameRangeStatus::RangeExceedsMedia
                         }
                         Some(frame_count) if mappings.len() == 1 => {
@@ -551,11 +551,11 @@ fn verify_frame_ranges(
             status,
         });
     }
-    let overall = if malformed_mapping || mappings.is_empty() {
-        LaserdiscFrameRangeStatus::MalformedMapping
-    } else if ranges
-        .iter()
-        .any(|range| range.status == LaserdiscFrameRangeStatus::MalformedMapping)
+    let overall = if malformed_mapping
+        || mappings.is_empty()
+        || ranges
+            .iter()
+            .any(|range| range.status == LaserdiscFrameRangeStatus::MalformedMapping)
     {
         LaserdiscFrameRangeStatus::MalformedMapping
     } else if ranges

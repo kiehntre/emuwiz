@@ -326,8 +326,8 @@ pub fn decode_spectrum_wav(bytes: &[u8]) -> Result<SpectrumWavRecovery, WavError
             }
             let a = intervals[i];
             let b = intervals[i + 1];
-            let target0 = 855u64.saturating_mul(scale as u64) / 1_000_000;
-            let target1 = 1710u64.saturating_mul(scale as u64) / 1_000_000;
+            let target0 = 855u64.saturating_mul(scale) / 1_000_000;
+            let target1 = 1710u64.saturating_mul(scale) / 1_000_000;
             let value = if close(a, target0, 0.22) && close(b, target0, 0.22) {
                 Some(0)
             } else if close(a, target1, 0.22) && close(b, target1, 0.22) {
@@ -453,8 +453,8 @@ pub fn decode_custom_wav(bytes: &[u8]) -> Result<CustomWavRecovery, WavError> {
             confidence,
         };
         stages.push(stage);
-        if let (Some(mode), Some(bytes)) = (mode, recovered) {
-            if !bytes.is_empty() {
+        if let (Some(mode), Some(bytes)) = (mode, recovered)
+            && !bytes.is_empty() {
                 let checksum =
                     (bytes.len() >= 2).then(|| bytes.iter().fold(0u8, |acc, byte| acc ^ byte) == 0);
                 blocks.push(CustomRecoveredBlock {
@@ -474,7 +474,6 @@ pub fn decode_custom_wav(bytes: &[u8]) -> Result<CustomWavRecovery, WavError> {
                     confidence,
                 });
             }
-        }
         cursor = data_end.max(pilot_end + 1);
     }
     let loader_class = if stages.len() > 1 {
@@ -573,7 +572,7 @@ pub fn decode_commodore_wav(bytes: &[u8]) -> Result<CommodoreWavRecovery, WavErr
         let duplicate_of = blocks
             .iter()
             .rposition(|previous: &CommodoreRecoveredBlock| previous.payload == payload)
-            .filter(|_| blocks.len() > 0);
+            .filter(|_| !blocks.is_empty());
         let start_edge = audio.edges.get(leader_start).copied();
         let end_edge = audio
             .edges
@@ -1046,8 +1045,8 @@ fn decode_cpc_custom_intervals(
             end_sample: end.sample,
             timing_scale_millionths: (pilot_cluster.saturating_mul(1_000_000) / 1000) as u32,
         });
-        if let (Some(mode), Some(bytes)) = (mode, recovered) {
-            if !bytes.is_empty() {
+        if let (Some(mode), Some(bytes)) = (mode, recovered)
+            && !bytes.is_empty() {
                 blocks.push(AmstradCpcCustomBlock {
                     bytes,
                     start_sample: start.sample,
@@ -1066,7 +1065,6 @@ fn decode_cpc_custom_intervals(
                     confidence,
                 });
             }
-        }
         cursor = data_end.max(pilot_end + 1);
     }
     (stages, blocks)
@@ -1186,7 +1184,9 @@ fn cpc_crc16(bytes: &[u8]) -> u16 {
     crc
 }
 
-fn cpc_header(payload: &[u8]) -> Option<(u8, bool, bool, String, u8, u16, u16, u16)> {
+type CpcHeader = (u8, bool, bool, String, u8, u16, u16, u16);
+
+fn cpc_header(payload: &[u8]) -> Option<CpcHeader> {
     if payload.len() < 28 {
         return None;
     }
@@ -1376,7 +1376,7 @@ fn find_commodore_leader(intervals: &[u64], from: usize) -> Option<(usize, usize
     let mut start = from;
     while start + COMMODORE_LEADER_PULSES <= intervals.len() {
         let candidate = intervals[start];
-        if candidate < 80 || candidate > 600 {
+        if !(80..=600).contains(&candidate) {
             start += 1;
             continue;
         }

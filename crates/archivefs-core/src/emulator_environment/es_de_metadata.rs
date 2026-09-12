@@ -337,7 +337,7 @@ pub fn canonical_platform_for_system(system: &str) -> Option<&'static str> {
         // ES-DE has both `genesis` and `megadrive` folders for the same
         // Mega Drive hardware; the reviewed forward mapping intentionally
         // chooses `megadrive`, so this reverse synonym reuses that row.
-        .or_else(|| system.eq_ignore_ascii_case("genesis").then(|| "MegaDrive"))
+        .or_else(|| system.eq_ignore_ascii_case("genesis").then_some("MegaDrive"))
 }
 
 /// Parse one explicitly supplied gamelist using the reviewed mapping, then
@@ -466,35 +466,35 @@ fn parse_gamelist_with_media_root(
             cover: resolve_media_ref(
                 base,
                 media_root,
-                &system,
+                system,
                 game.image.as_deref(),
                 MediaKind::Image,
             ),
             thumbnail: resolve_media_ref(
                 base,
                 media_root,
-                &system,
+                system,
                 game.thumbnail.as_deref(),
                 MediaKind::Thumbnail,
             ),
             marquee: resolve_media_ref(
                 base,
                 media_root,
-                &system,
+                system,
                 game.marquee.as_deref(),
                 MediaKind::Marquee,
             ),
             screenshot: resolve_media_ref(
                 base,
                 media_root,
-                &system,
+                system,
                 game.screenshot.as_deref(),
                 MediaKind::Screenshot,
             ),
             video: resolve_media_ref(
                 base,
                 media_root,
-                &system,
+                system,
                 game.video.as_deref(),
                 MediaKind::Video,
             ),
@@ -507,7 +507,7 @@ fn parse_gamelist_with_media_root(
         snapshot.entries.push(EsDeGameEntry {
             path,
             canonical_path: canonical_rom_root
-                .and_then(|root| canonical_game_path(root, &system, &game.path)),
+                .and_then(|root| canonical_game_path(root, system, &game.path)),
             name: game.name.filter(|value| !value.trim().is_empty()),
             description: game.desc,
             rating: game.rating,
@@ -801,9 +801,9 @@ mod tests {
             hit.entry.media.video,
             Some(media_root.join("nes/videos/Example.mp4"))
         );
-        assert_eq!(hit.media.cover.unwrap().exists, true);
-        assert_eq!(hit.media.screenshot.unwrap().exists, true);
-        assert_eq!(hit.media.video.unwrap().exists, true);
+        assert!(hit.media.cover.unwrap().exists);
+        assert!(hit.media.screenshot.unwrap().exists);
+        assert!(hit.media.video.unwrap().exists);
         assert_eq!(index.generation, 9);
     }
 
@@ -820,12 +820,12 @@ mod tests {
         let exact = index
             .lookup_path("NES", &dir.path().join("gamelists/nes/exact.rom"))
             .unwrap();
-        assert_eq!(exact.media.cover.unwrap().exists, true);
-        assert!(exact.media.video.unwrap().exists == false);
+        assert!(exact.media.cover.unwrap().exists);
+        assert!(!exact.media.video.unwrap().exists);
         let case = index
             .lookup_path("NES", &dir.path().join("gamelists/nes/case.rom"))
             .unwrap();
-        assert_eq!(case.media.cover.unwrap().exists, false);
+        assert!(!case.media.cover.unwrap().exists);
         let escaped = index
             .lookup_path("NES", &dir.path().join("gamelists/nes/escape.rom"))
             .unwrap();
@@ -846,7 +846,7 @@ mod tests {
         let hit = index
             .lookup_path("NES", &dir.path().join("gamelists/nes/game.rom"))
             .unwrap();
-        assert_eq!(hit.media.cover.unwrap().exists, true);
+        assert!(hit.media.cover.unwrap().exists);
         assert_eq!(index.generation, 33);
     }
 

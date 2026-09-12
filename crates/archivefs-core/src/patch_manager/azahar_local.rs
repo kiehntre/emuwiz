@@ -76,7 +76,7 @@ pub struct AzaharDiscoveryRoots {
 }
 
 pub fn discover_azahar_executable(roots: &AzaharDiscoveryRoots) -> Option<PathBuf> {
-    let candidates = roots.explicit_executable.iter().cloned().chain(
+    let mut candidates = roots.explicit_executable.iter().cloned().chain(
         roots
             .path
             .as_ref()
@@ -84,7 +84,7 @@ pub fn discover_azahar_executable(roots: &AzaharDiscoveryRoots) -> Option<PathBu
             .flat_map(std::env::split_paths)
             .map(|p| p.join("azahar")),
     );
-    candidates.filter(|p| safe_executable(p)).next()
+    candidates.find(|p| safe_executable(p))
 }
 
 fn safe_executable(path: &Path) -> bool {

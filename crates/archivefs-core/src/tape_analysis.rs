@@ -192,11 +192,10 @@ pub fn analyze_tape(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisError> {
     if bytes.starts_with(b"UEF File!") || bytes.starts_with(&[0x1f, 0x8b]) {
         return crate::uef_tape::parse_uef(bytes);
     }
-    if bytes.windows(2).any(|window| window == [0x55, 0x3c]) {
-        if let Ok(analysis) = crate::dragon_coco_tape::parse_dragon_coco_cas(bytes) {
+    if bytes.windows(2).any(|window| window == [0x55, 0x3c])
+        && let Ok(analysis) = crate::dragon_coco_tape::parse_dragon_coco_cas(bytes) {
             return Ok(analysis);
         }
-    }
     if crate::oric_tape::has_oric_leader(bytes) {
         let observation = crate::oric_tape::parse_oric_tap(bytes)
             .map_err(|error| TapeAnalysisError::Malformed(format!("{error:?}")))?;

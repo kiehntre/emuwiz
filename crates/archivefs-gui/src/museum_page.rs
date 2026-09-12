@@ -146,8 +146,7 @@ fn museum_grid_layout(available_width: f32, card_count: usize) -> MuseumGridLayo
         .min(card_count.max(1));
     let card_width = ((available_width - MUSEUM_CARD_GAP * columns.saturating_sub(1) as f32)
         / columns as f32)
-        .min(MUSEUM_CARD_MAX_WIDTH)
-        .max(0.0);
+        .clamp(0.0, MUSEUM_CARD_MAX_WIDTH);
     MuseumGridLayout {
         columns,
         card_width,
@@ -173,6 +172,7 @@ pub(crate) fn show(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_with_selected_game(
     ui: &mut egui::Ui,
     state: &mut MuseumPageState,
@@ -204,6 +204,7 @@ pub(crate) fn show_with_selected_game(
 /// for anything not already requested by some other screen this session,
 /// which is why a game never opened through Gamer View's Details screen
 /// showed no screenshots here even when the provider genuinely had them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_with_selected_game_and_artwork(
     ui: &mut egui::Ui,
     state: &mut MuseumPageState,
@@ -227,6 +228,7 @@ pub(crate) fn show_with_selected_game_and_artwork(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_with_selected_game_and_artwork_with_hero(
     ui: &mut egui::Ui,
     hero_state: &mut MuseumHeroState,
@@ -251,9 +253,10 @@ pub(crate) fn show_with_selected_game_and_artwork_with_hero(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_with_selected_game_and_artwork_inner(
     ui: &mut egui::Ui,
-    mut hero_state: Option<&mut MuseumHeroState>,
+    hero_state: Option<&mut MuseumHeroState>,
     state: &mut MuseumPageState,
     library: Option<&home_page::HomeLibrarySnapshot>,
     selected_game: Option<&MuseumSelectedGameView>,
@@ -262,7 +265,7 @@ fn show_with_selected_game_and_artwork_inner(
     mut artwork: Option<&mut crate::platform_artwork_manager::ArtworkRenderAssets<'_>>,
     screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
 ) -> Option<MuseumAction> {
-    if let Some(hero_state) = hero_state.as_deref_mut() {
+    if let Some(hero_state) = hero_state {
         let hero_rendered = show_museum_hero(
             ui,
             hero_state,
@@ -329,7 +332,7 @@ fn show_with_selected_game_and_artwork_inner(
         if consume_museum_scroll(ui, museum_platform_scroll_id()) {
             ui.scroll_to_cursor(Some(egui::Align::TOP));
         }
-        show_platform_grid(ui, state, &platforms, artwork.as_deref_mut())
+        show_platform_grid(ui, state, &platforms, artwork)
     }
 }
 
@@ -531,6 +534,7 @@ fn show_platform_grid(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_platform_detail(
     ui: &mut egui::Ui,
     state: &mut MuseumPageState,
@@ -538,7 +542,7 @@ fn show_platform_detail(
     selected_game: Option<&MuseumSelectedGameView>,
     covers: Option<&crate::gamer_artwork::GamerCoverCache>,
     screenshots: Option<&mut crate::gamer_artwork::GamerScreenshotCache>,
-    mut artwork: Option<&mut crate::platform_artwork_manager::ArtworkRenderAssets<'_>>,
+    artwork: Option<&mut crate::platform_artwork_manager::ArtworkRenderAssets<'_>>,
     screenshot_requests: &mut Vec<crate::gamer_artwork::CoverJob>,
 ) -> Option<MuseumAction> {
     let mut action = None;
@@ -551,7 +555,7 @@ fn show_platform_detail(
 
     widgets::section_header(ui, &view.name, None);
     widgets::card(ui, |ui| {
-        if let Some(artwork) = artwork.as_deref_mut() {
+        if let Some(artwork) = artwork {
             let art_rect = ui.allocate_space(egui::vec2(ui.available_width(), 96.0)).1;
             let asset_id =
                 crate::ui::platform_artwork::platform_asset_id(&view.name, view.registry.is_none());
@@ -842,8 +846,8 @@ fn show_selected_game_showcase(
         });
     }
 
-    if let Some(feature_view) = &game.feature_view {
-        if let Some(feature_action) = crate::feature_discovery::show(ui, feature_view) {
+    if let Some(feature_view) = &game.feature_view
+        && let Some(feature_action) = crate::feature_discovery::show(ui, feature_view) {
             action = Some(match feature_action {
                 crate::feature_discovery::FeatureDiscoveryAction::OpenCheats => {
                     MuseumAction::OpenCheats(game.archive_path.clone())
@@ -859,7 +863,6 @@ fn show_selected_game_showcase(
                 }
             });
         }
-    }
     action
 }
 

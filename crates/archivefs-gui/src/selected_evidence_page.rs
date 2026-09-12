@@ -427,11 +427,10 @@ fn structural_media_details(
             None,
         ));
     }
-    if extension == "chd" {
-        if let Ok(observation) = observe_chd_identity(bytes) {
+    if extension == "chd"
+        && let Ok(observation) = observe_chd_identity(bytes) {
             return Some(chd_details(observation, no_intro));
         }
-    }
     if extension == "cdi"
         && let Ok(media) = archivefs_core::dreamcast_cdi::open_dreamcast_cdi_logical_media(path)
         && let Ok(evidence) = archivefs_core::cdi_disc_evidence::observe_cdi(&media)

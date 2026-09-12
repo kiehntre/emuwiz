@@ -205,8 +205,9 @@ fn the_grid_lists_every_platform_with_its_real_count() {
 
 #[test]
 fn selecting_a_platform_switches_to_its_detail_view() {
-    let mut state = MuseumPageState::default();
-    state.selected_platform = Some("SNES".to_string());
+    let mut state = MuseumPageState {
+        selected_platform: Some("SNES".to_string()),
+    };
     let library = snapshot(vec![platform("SNES", 42, 40, 2)]);
     let (output, _) = run(&mut state, Some(&library));
     assert!(output_contains(&output, "Games: 42"));
@@ -216,8 +217,9 @@ fn selecting_a_platform_switches_to_its_detail_view() {
 
 #[test]
 fn a_selected_platform_no_longer_in_the_snapshot_falls_back_to_the_grid_without_panicking() {
-    let mut state = MuseumPageState::default();
-    state.selected_platform = Some("Ghost Platform".to_string());
+    let mut state = MuseumPageState {
+        selected_platform: Some("Ghost Platform".to_string()),
+    };
     let library = snapshot(vec![platform("SNES", 1, 1, 0)]);
     let (output, _) = run(&mut state, Some(&library));
     assert_eq!(state.selected_platform, None);
@@ -226,8 +228,9 @@ fn a_selected_platform_no_longer_in_the_snapshot_falls_back_to_the_grid_without_
 
 #[test]
 fn platform_with_no_preferred_emulator_does_not_offer_an_emulator_setup_action() {
-    let mut state = MuseumPageState::default();
-    state.selected_platform = Some("Totally Made Up Platform".to_string());
+    let mut state = MuseumPageState {
+        selected_platform: Some("Totally Made Up Platform".to_string()),
+    };
     let library = snapshot(vec![platform("Totally Made Up Platform", 1, 1, 0)]);
     let (output, _) = run(&mut state, Some(&library));
     assert!(!output_contains(&output, "Emulator Setup"));
@@ -444,9 +447,9 @@ fn museum_schedules_every_known_index_once_count_is_discovered() {
 }
 
 /// 5. Already-ready screenshots are never re-requested - `visible` is a
-/// no-op wherever a slot already exists, so a game whose screenshots were
-/// already fetched (by Museum itself, or previously by Gamer View's Details
-/// screen for the same path) stays free to redraw.
+///    no-op wherever a slot already exists, so a game whose screenshots were
+///    already fetched (by Museum itself, or previously by Gamer View's Details
+///    screen for the same path) stays free to redraw.
 #[test]
 fn museum_does_not_reschedule_an_already_answered_screenshot() {
     let game = selected_game(Some(1), None, false);

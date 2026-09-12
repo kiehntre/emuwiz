@@ -157,7 +157,7 @@ pub fn resolve_media(input: &MediaResolverInput) -> ResolvedMediaSet {
     }
 }
 
-fn ordered_providers<'a>(providers: &'a [ProviderMediaSnapshot]) -> Vec<&'a ProviderMediaSnapshot> {
+fn ordered_providers(providers: &[ProviderMediaSnapshot]) -> Vec<&ProviderMediaSnapshot> {
     PROVIDER_PRIORITY
         .iter()
         .filter_map(|provider| {

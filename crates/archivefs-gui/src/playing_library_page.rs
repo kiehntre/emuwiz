@@ -250,7 +250,7 @@ impl PlayingLibraryPageState {
         });
         #[cfg(test)]
         {
-            return selected || !self.dat_path_draft.trim().is_empty();
+            selected || !self.dat_path_draft.trim().is_empty()
         }
         #[cfg(not(test))]
         selected

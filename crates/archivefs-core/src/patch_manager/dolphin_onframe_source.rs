@@ -66,8 +66,8 @@ pub fn discover_dolphin_onframe_candidates(
                  ops: &mut Vec<CheatOperation>,
                  issues: &mut Vec<CheatIssue>,
                  out: &mut Vec<DolphinOnFrameCandidate>| {
-        if let Some(name) = title.take() {
-            if !ops.is_empty() || !issues.is_empty() {
+        if let Some(name) = title.take()
+            && (!ops.is_empty() || !issues.is_empty()) {
                 let doc = CheatDocument {
                     title: name.clone(),
                     platform: platform.clone(),
@@ -84,7 +84,6 @@ pub fn discover_dolphin_onframe_candidates(
                     warnings: Vec::new(),
                 });
             }
-        }
     };
     for line in text.lines() {
         let t = line.trim();

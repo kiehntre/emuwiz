@@ -94,14 +94,13 @@ impl LaunchBoxLocalProviderIndex {
         platform: Option<&str>,
         title: Option<&str>,
     ) -> Option<LaunchBoxLookup<'a>> {
-        if let Some(id) = database_id.and_then(non_empty) {
-            if let Some(position) = resolve_unambiguous(&self.by_database_id, id) {
+        if let Some(id) = database_id.and_then(non_empty)
+            && let Some(position) = resolve_unambiguous(&self.by_database_id, id) {
                 return self.games.get(position).map(|game| LaunchBoxLookup {
                     game,
                     strength: LaunchBoxMatchStrength::DatabaseId,
                 });
             }
-        }
         if let Some(path) = application_path {
             let key = normalized_path(path);
             if let Some(position) = resolve_unambiguous(&self.by_exact_path, &key) {
@@ -732,14 +731,13 @@ mod tests {
         let (_dir, index) = fixture();
         let lookup = index.lookup(Some("42"), None, None, None).unwrap();
         let snapshot = index.media_snapshot(&lookup);
-        assert_eq!(
+        assert!(
             snapshot
                 .cover
                 .unwrap()
                 .hosted_reference
                 .unwrap()
-                .contains("Box - Front"),
-            true
+                .contains("Box - Front")
         );
         assert!(index.games.iter().all(|game| {
             game.media

@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn firmware_is_never_required() {
-        assert!(!PpssppInspection::FIRMWARE_REQUIRED);
+        const { assert!(!PpssppInspection::FIRMWARE_REQUIRED) };
         let inspection = PpssppInspection {
             profile_ready: true,
             firmware_required: false,

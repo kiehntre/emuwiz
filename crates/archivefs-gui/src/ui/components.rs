@@ -271,6 +271,7 @@ mod workshop_light_header_tests {
 /// status readout next to the hero artwork. Pass an empty closure for pages
 /// that have no such readout yet; this never fabricates a reading - callers
 /// only pass their own real, already-known state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn page_hero(
     ui: &mut egui::Ui,
     motif: impl FnOnce(&mut egui::Ui, egui::Vec2),
@@ -297,6 +298,7 @@ pub(crate) fn page_hero(
 /// Variant of [`page_hero`] for pages whose visual identity needs a larger
 /// bounded illustration. The default remains compact so existing pages keep
 /// their established layout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn page_hero_with_motif_size(
     ui: &mut egui::Ui,
     motif_size: egui::Vec2,

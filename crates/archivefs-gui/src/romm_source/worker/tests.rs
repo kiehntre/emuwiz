@@ -315,7 +315,7 @@ fn verification_refuses_a_symlink_escaping_the_source_roots() {
     let link = fixture.library.join("escape.gb");
     std::os::unix::fs::symlink(fixture.settings().config_path(), &link).unwrap();
     assert!(
-        confine_to_source_roots(&link, &[fixture.library.clone()])
+        confine_to_source_roots(&link, std::slice::from_ref(&fixture.library))
             .unwrap_err()
             .contains("leads out")
     );

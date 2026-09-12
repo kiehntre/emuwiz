@@ -470,8 +470,8 @@ pub enum LaunchBlockerKind {
     /// underlying [`crate::patch_manager::CemuLaunchBlockerKind`].
     CemuBindingUnavailable,
     /// The selected content's shape is not [`crate::patch_manager::CemuContentForm::ExtractedTitle`]
-    /// - the only form this build launches - or is not recognised as a Wii
-    /// U content shape at all (an arbitrary folder, an unrelated file).
+    /// The only form this build launches; it is not recognised as a Wii U
+    /// content shape at all (an arbitrary folder, an unrelated file).
     CemuContentFormatUnsupported,
     /// The selected extracted-title directory does not have the expected
     /// `code`/`content`/`meta` layout, or `code/` does not contain exactly

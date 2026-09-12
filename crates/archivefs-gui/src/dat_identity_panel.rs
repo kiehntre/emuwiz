@@ -225,7 +225,7 @@ pub(crate) fn present_summary(summary: &LibraryDatIdentitySummary) -> DatIdentit
     // one merely to fill a row.
     let variant = (summary.source.ecosystem == Some(DatEcosystem::NoIntro)
         && !summary.is_ambiguous())
-    .then(|| summary.source.variant)
+    .then_some(summary.source.variant)
     .flatten()
     .map(|variant| variant.label().to_string());
     let match_basis = summary

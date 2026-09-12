@@ -37,19 +37,12 @@ enum Stage {
     Failed(String),
 }
 
+#[derive(Default)]
 pub struct LocalModPackagePageState {
     key: Option<(PathBuf, PathBuf)>,
     stage: Option<Stage>,
 }
 
-impl Default for LocalModPackagePageState {
-    fn default() -> Self {
-        Self {
-            key: None,
-            stage: None,
-        }
-    }
-}
 
 impl LocalModPackagePageState {
     pub fn is_busy(&self) -> bool {
@@ -310,26 +303,22 @@ pub fn show_local_mod_package_panel(
             widgets::card(ui, |ui| {
                 widgets::status_badge(ui, presentation.headline, presentation.tone);
                 ui.label(presentation.detail);
-                if can_undo {
-                    if let Some(journal) = result.journal_path.as_ref() {
-                        if widgets::action_button(
+                if can_undo
+                    && let Some(journal) = result.journal_path.as_ref()
+                        && widgets::action_button(
                             ui,
                             "Undo this mod",
                             widgets::ActionStyle::Destructive,
                             true,
                         )
                         .clicked()
-                        {
-                            if let (Ok(backup), Ok(_history)) =
+                            && let (Ok(backup), Ok(_history)) =
                                 (default_shared_backup_root(), default_shared_history_root())
                             {
                                 state.stage = Some(Stage::Rollback(preview_shared_rollback(
                                     journal, &game_root, &backup,
                                 )));
                             }
-                        }
-                    }
-                }
             });
             if !matches!(state.stage, Some(Stage::Rollback(_))) {
                 state.stage = Some(Stage::Applied(result));
@@ -349,8 +338,7 @@ pub fn show_local_mod_package_panel(
                     preview.available,
                 )
                 .clicked()
-                {
-                    if let (Ok(history_root), Ok(backup_root)) =
+                    && let (Ok(history_root), Ok(backup_root)) =
                         (default_shared_history_root(), default_shared_backup_root())
                     {
                         let (sender, receiver) = mpsc::channel();
@@ -372,7 +360,6 @@ pub fn show_local_mod_package_panel(
                         });
                         state.stage = Some(Stage::RollingBack(receiver));
                     }
-                }
             });
         }
         Stage::RollingBack(receiver) => {
@@ -446,8 +433,8 @@ fn show_plan(
                     operation.destination_path.display()
                 ));
             }
-            if let Ok(transaction) = build_local_mod_package_transaction_plan(&plan) {
-                if widgets::action_button(
+            if let Ok(transaction) = build_local_mod_package_transaction_plan(&plan)
+                && widgets::action_button(
                     ui,
                     "Review and apply mod",
                     widgets::ActionStyle::Primary,
@@ -457,7 +444,6 @@ fn show_plan(
                 {
                     state.stage = Some(Stage::Confirm(transaction));
                 }
-            }
         }
         if widgets::action_button(
             ui,

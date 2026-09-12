@@ -1005,7 +1005,7 @@ pub fn reconcile_cheats_for_game(
         groups.push(CheatReconciliationGroup {
             relationship: CheatRelationship::ExactSemanticDuplicate,
             normalized_title: titles[indexes[0]].clone(),
-            entry_indices: indexes.iter().copied().collect(),
+            entry_indices: indexes.to_vec(),
             semantic_fingerprint: Some(fingerprint),
             raw_fingerprint: None,
             differences: Vec::new(),
@@ -1018,14 +1018,13 @@ pub fn reconcile_cheats_for_game(
 
     let mut raw_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, fingerprint) in raws.iter().enumerate() {
-        if !assigned[index] {
-            if let Some(fingerprint) = fingerprint {
+        if !assigned[index]
+            && let Some(fingerprint) = fingerprint {
                 raw_groups
                     .entry(fingerprint.clone())
                     .or_default()
                     .push(index);
             }
-        }
     }
     for (fingerprint, indexes) in raw_groups {
         if indexes.len() < 2 {
@@ -1037,7 +1036,7 @@ pub fn reconcile_cheats_for_game(
         groups.push(CheatReconciliationGroup {
             relationship: CheatRelationship::ExactRawDuplicate,
             normalized_title: titles[indexes[0]].clone(),
-            entry_indices: indexes.iter().copied().collect(),
+            entry_indices: indexes.to_vec(),
             semantic_fingerprint: None,
             raw_fingerprint: Some(fingerprint),
             differences: Vec::new(),
@@ -1079,7 +1078,7 @@ pub fn reconcile_cheats_for_game(
         groups.push(CheatReconciliationGroup {
             relationship,
             normalized_title: title,
-            entry_indices: indexes.iter().copied().collect(),
+            entry_indices: indexes.to_vec(),
             semantic_fingerprint: None,
             raw_fingerprint: None,
             differences,

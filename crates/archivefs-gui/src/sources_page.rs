@@ -6,7 +6,7 @@ use super::*;
 /// cards on one readable column even though the parent Sources view also hosts
 /// wider specialist tabs such as DAT sources and RomM.
 pub(super) fn sources_content_width(available_width: f32) -> f32 {
-    available_width.max(0.0).min(theme::CONTENT_MAX_WIDTH)
+    available_width.clamp(0.0, theme::CONTENT_MAX_WIDTH)
 }
 
 pub(super) fn sources_content_column<R>(

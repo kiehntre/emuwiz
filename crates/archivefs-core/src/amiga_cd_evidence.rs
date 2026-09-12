@@ -149,9 +149,7 @@ pub fn assess_amiga_cd_readiness(
     }
     let mut claimed = identity_evidence.claims.iter().map(|claim| claim.machine);
     if let Some(first) = claimed.next() {
-        if claimed.any(|value| value != first) {
-            blockers.push(AmigaCdReadinessBlocker::PlatformConflict);
-        } else if canonical_machine != Some(first) {
+        if claimed.any(|value| value != first) || canonical_machine != Some(first) {
             blockers.push(AmigaCdReadinessBlocker::PlatformConflict);
         }
     } else if canonical_machine.is_none() {

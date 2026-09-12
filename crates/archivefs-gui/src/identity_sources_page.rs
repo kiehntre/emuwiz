@@ -746,7 +746,7 @@ fn show_scummvm_results(ui: &mut egui::Ui, summary: &ScummVmCheckSummary) {
     ui.horizontal_wrapped(|ui| {
         for (label, tone) in counts {
             let count = summary.count_matching(label);
-            widgets::status_badge(ui, &format!("{label}: {count}"), tone);
+            widgets::status_badge(ui, format!("{label}: {count}"), tone);
         }
     });
 

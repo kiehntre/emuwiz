@@ -15,8 +15,8 @@
 //! `ArchiveFsApp` methods normal navigation already uses
 //! (`show_sources_page`, `show_dat_sources_page`, `show_emulator_setup_page`)
 //! - this module adds no second source/DAT/emulator rendering path, and no
-//! new backend calls. See `docs/FIRST_RUN_ONBOARDING_PLAN.md` for the full
-//! design this implements.
+//!   new backend calls. See `docs/FIRST_RUN_ONBOARDING_PLAN.md` for the full
+//!   design this implements.
 
 use super::*;
 

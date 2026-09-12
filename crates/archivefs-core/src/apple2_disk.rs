@@ -116,7 +116,7 @@ fn parse_dos33(
         let next_sector = bytes[off + 1];
         for slot in 0..7 {
             let e = off + 2 + slot * 35;
-            let first_track = bytes[e + 0];
+            let first_track = bytes[e];
             let first_sector = bytes[e + 1];
             if first_track != 0 || first_sector != 0 {
                 entries += 1;
@@ -156,7 +156,7 @@ fn parse_prodos(
     bytes: &[u8],
     container: Apple2Container,
 ) -> Result<Apple2DiskEvidence, Apple2DiskError> {
-    if bytes.len() % PRODOS_BLOCK_BYTES != 0 || bytes.len() < 3 * PRODOS_BLOCK_BYTES {
+    if !bytes.len().is_multiple_of(PRODOS_BLOCK_BYTES) || bytes.len() < 3 * PRODOS_BLOCK_BYTES {
         return Err(Apple2DiskError::Malformed(
             "ProDOS image is not block aligned".into(),
         ));

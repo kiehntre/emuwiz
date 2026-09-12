@@ -1179,8 +1179,7 @@ fn destination_card_layout(available_width: f32, card_count: usize) -> Destinati
     let columns = fitting.clamp(1, 3).min(card_count.max(1));
     let card_width = ((available_width - DESTINATION_CARD_GAP * columns.saturating_sub(1) as f32)
         / columns as f32)
-        .min(DESTINATION_CARD_MAX_WIDTH)
-        .max(0.0);
+        .clamp(0.0, DESTINATION_CARD_MAX_WIDTH);
     DestinationCardLayout { columns, card_width }
 }
 

@@ -340,8 +340,8 @@ pub fn plan_recovery_state_migration(
         }],
     );
     for reference in &mut references {
-        if reference.disposition == RecoveryMigrationDisposition::Planner {
-            if let Some(proposal) = source_plan.migration.proposals.iter().find(|proposal| {
+        if reference.disposition == RecoveryMigrationDisposition::Planner
+            && let Some(proposal) = source_plan.migration.proposals.iter().find(|proposal| {
                 proposal.reference_id.ends_with(&format!(
                     ":entry:{}:source",
                     reference.entry_index.unwrap_or_default()
@@ -349,7 +349,6 @@ pub fn plan_recovery_state_migration(
             }) {
                 reference.proposal = proposal.clone();
             }
-        }
     }
     for reference in &references {
         if reference.disposition == RecoveryMigrationDisposition::Planner {

@@ -372,46 +372,6 @@ fn doctor_health_metric(
     });
 }
 
-#[cfg(test)]
-mod health_grid_tests {
-    use super::*;
-
-    #[test]
-    fn health_grid_uses_all_four_categories_when_they_fit() {
-        let layout = doctor_health_grid_layout(900.0);
-        assert_eq!(layout.columns, 4);
-        assert!(layout.card_width >= DOCTOR_HEALTH_CARD_MIN_WIDTH);
-        assert_eq!(
-            layout.card_width,
-            doctor_health_grid_layout(900.0).card_width
-        );
-    }
-
-    #[test]
-    fn health_grid_balances_medium_width_into_two_columns() {
-        let layout = doctor_health_grid_layout(500.0);
-        assert_eq!(layout.columns, 2);
-        assert_eq!(layout.card_width, (500.0 - DOCTOR_HEALTH_GRID_GAP) / 2.0);
-    }
-
-    #[test]
-    fn health_grid_stacks_narrow_width_without_overflow() {
-        let layout = doctor_health_grid_layout(240.0);
-        assert_eq!(layout.columns, 1);
-        assert_eq!(layout.card_width, 240.0);
-        assert!(layout.card_width >= 0.0);
-    }
-
-    #[test]
-    fn four_categories_are_preserved_in_the_grid_model() {
-        let labels = ["Blocking", "Warnings", "Informational", "Unknown"];
-        let layout = doctor_health_grid_layout(500.0);
-        let rows = labels.len().div_ceil(layout.columns);
-        assert_eq!(rows, 2);
-        assert_eq!(labels.last(), Some(&"Unknown"));
-    }
-}
-
 /// One category's findings inside a collapsible section, shared by both view
 /// modes so the card rendering is identical wherever it appears.
 fn show_doctor_category_group(
@@ -1118,4 +1078,44 @@ pub(crate) fn doctor_scan_report_text(outcome: &DoctorScanOutcome) -> String {
         lines.push(format!("  {} - {}", deferred.name, deferred.reason));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod health_grid_tests {
+    use super::*;
+
+    #[test]
+    fn health_grid_uses_all_four_categories_when_they_fit() {
+        let layout = doctor_health_grid_layout(900.0);
+        assert_eq!(layout.columns, 4);
+        assert!(layout.card_width >= DOCTOR_HEALTH_CARD_MIN_WIDTH);
+        assert_eq!(
+            layout.card_width,
+            doctor_health_grid_layout(900.0).card_width
+        );
+    }
+
+    #[test]
+    fn health_grid_balances_medium_width_into_two_columns() {
+        let layout = doctor_health_grid_layout(500.0);
+        assert_eq!(layout.columns, 2);
+        assert_eq!(layout.card_width, (500.0 - DOCTOR_HEALTH_GRID_GAP) / 2.0);
+    }
+
+    #[test]
+    fn health_grid_stacks_narrow_width_without_overflow() {
+        let layout = doctor_health_grid_layout(240.0);
+        assert_eq!(layout.columns, 1);
+        assert_eq!(layout.card_width, 240.0);
+        assert!(layout.card_width >= 0.0);
+    }
+
+    #[test]
+    fn four_categories_are_preserved_in_the_grid_model() {
+        let labels = ["Blocking", "Warnings", "Informational", "Unknown"];
+        let layout = doctor_health_grid_layout(500.0);
+        let rows = labels.len().div_ceil(layout.columns);
+        assert_eq!(rows, 2);
+        assert_eq!(labels.last(), Some(&"Unknown"));
+    }
 }

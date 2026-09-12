@@ -238,7 +238,7 @@ pub fn discover_local_dolphin_cheat_file(
             detail: error.to_string(),
         })?;
     let mut bytes = Vec::new();
-    file.take((MAX_LOCAL_DOLPHIN_INI_BYTES + 1) as u64)
+    file.take(MAX_LOCAL_DOLPHIN_INI_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| LocalDolphinFileError::Malformed {
             path: source_path.to_path_buf(),

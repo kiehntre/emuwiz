@@ -671,16 +671,14 @@ impl ArtworkCache {
             return Some(thumbnail);
         }
         let fallback = request.without_large();
-        if fallback.large_reference.is_none() {
-            return None;
-        }
+        fallback.large_reference?;
         self.lookup_key(server_id, &Self::key_for(server_id, &fallback))
     }
 
     fn lookup_key(&self, server_id: &str, key: &str) -> Option<CachedThumbnail> {
         let index = self.load_index(server_id);
         let entry = index.entries.iter().find(|entry| entry.key == key)?;
-        let path = self.thumbnail_path(&key);
+        let path = self.thumbnail_path(key);
         let bytes = fs::read(&path).ok();
         let valid = bytes
             .as_deref()

@@ -32,7 +32,7 @@ impl Fixture {
         let db_path = root.join("library.sqlite3");
         let mut database = Database::open_or_create(&db_path).expect("open database");
         let registered = database
-            .register_source_folders(&[root.clone()])
+            .register_source_folders(std::slice::from_ref(&root))
             .expect("register source folder");
         let source_folder_id = registered[0].id;
         Self {
@@ -148,7 +148,7 @@ fn a_fresh_verified_match_is_bridged_without_any_fallback_hashing_decision() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -172,7 +172,7 @@ fn a_file_never_scanned_needs_fallback() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[missing.clone()],
+        std::slice::from_ref(&missing),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -196,7 +196,7 @@ fn a_scanned_file_with_no_persisted_identity_needs_fallback() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -221,7 +221,7 @@ fn source_file_mutation_invalidates_the_persisted_match() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -253,7 +253,7 @@ fn same_path_replaced_with_different_content_is_treated_as_drift_not_reuse() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -278,7 +278,7 @@ fn a_catalogue_no_longer_containing_the_hash_needs_fallback() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -345,7 +345,7 @@ fn ambiguous_persisted_evidence_is_never_silently_resolved() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -407,7 +407,7 @@ fn a_probable_only_verdict_is_not_strong_enough_to_bridge() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );
@@ -455,7 +455,7 @@ fn a_dat_source_id_mismatch_is_treated_as_no_persisted_identity() {
         &fixture.database,
         "no-intro-test",
         &dat,
-        &[path.clone()],
+        std::slice::from_ref(&path),
         &TrustedRoots::from_paths([fixture.root.as_path()]),
         &AtomicBool::new(false),
     );

@@ -519,10 +519,10 @@ fn timeline_groups(blocks: &[String]) -> Vec<TimelineGroup> {
 /// Tape Inspector's page-hero motif: a small cassette body with a
 /// deterministic sine waveform across it. This is a lightweight placeholder
 /// - drawn with the painter directly (a handful of fixed-size line segments,
-/// no heap allocation, no image decode), not real game/box artwork. The
-/// phase is driven by the UI clock only when `animate` is set, so a static
-/// render (no analysis in flight) costs nothing extra and never requests a
-/// repaint on its own.
+///   no heap allocation, no image decode), not real game/box artwork. The
+///   phase is driven by the UI clock only when `animate` is set, so a static
+///   render (no analysis in flight) costs nothing extra and never requests a
+///   repaint on its own.
 fn draw_tape_motif(ui: &mut egui::Ui, size: egui::Vec2, animate: bool) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
@@ -875,7 +875,7 @@ fn draw_tape_signal_reading(painter: &egui::Painter, rect: egui::Rect, phase: f3
 /// the all-formats filter): it is genuinely ambiguous across those two
 /// platforms, so the filter can only narrow candidates, never claim identity
 /// - actual platform/format identity always comes from analysis (Section 4/5
-/// of the task).
+///   of the task).
 fn pick_tape_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter(
@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     /// 1. The page hero's live controls are present. The approved poster
-    /// supplies its own artwork/title as pixels, not egui text shapes.
+    ///    supplies its own artwork/title as pixels, not egui text shapes.
     #[test]
     fn page_hero_is_present() {
         let output = render_at(egui::vec2(1600.0, 1200.0), None, None);
@@ -1503,7 +1503,7 @@ mod tests {
     }
 
     /// 4. Small viewport (~1024x600) renders the hero without panicking and
-    /// keeps the primary content visible.
+    ///    keeps the primary content visible.
     #[test]
     fn renders_without_panicking_at_a_small_viewport() {
         let output = render_at(egui::vec2(1024.0, 600.0), None, None);
@@ -1513,10 +1513,10 @@ mod tests {
     // --- POSTER CLEANUP + LIBRARY BUTTON FUNCTIONAL FIX V1 -----------------
 
     /// 9. All three poster actions stay reachable at a small viewport, in
-    /// both the calibrated-rect poster layout (available width still above
-    /// the 760px narrow threshold) and the narrow text-button fallback
-    /// (below it) - the poster hero has two layouts and both must expose
-    /// every action.
+    ///    both the calibrated-rect poster layout (available width still above
+    ///    the 760px narrow threshold) and the narrow text-button fallback
+    ///    (below it) - the poster hero has two layouts and both must expose
+    ///    every action.
     #[test]
     fn small_viewport_keeps_all_three_controls_reachable() {
         for width in [1024.0, 700.0] {
@@ -1570,8 +1570,8 @@ mod tests {
     }
 
     /// 4. Clicking the library button when there are genuinely no
-    /// candidates is truthful: the button is disabled, so the click cannot
-    /// register, and no scroll is requested.
+    ///    candidates is truthful: the button is disabled, so the click cannot
+    ///    register, and no scroll is requested.
     #[test]
     fn library_button_click_is_a_no_op_with_zero_candidates() {
         let mut filter = LibraryTapeFilterState::default();
@@ -1621,9 +1621,9 @@ mod tests {
     }
 
     /// 6. The removed step strip ("Choose -> Analyse -> Inspect entries ->
-    /// Review warnings") - the old text/step UI that was bleeding through
-    /// behind the poster hero - is gone; the poster's own three actions and
-    /// CRT status are the only "what do I do next" surface now.
+    ///    Review warnings") - the old text/step UI that was bleeding through
+    ///    behind the poster hero - is gone; the poster's own three actions and
+    ///    CRT status are the only "what do I do next" surface now.
     #[test]
     fn obsolete_workflow_step_text_is_not_rendered() {
         let output = render_at(egui::vec2(1600.0, 1200.0), None, None);
@@ -1636,8 +1636,8 @@ mod tests {
     }
 
     /// 8. The live CRT waveform/status readout still renders alongside the
-    /// poster - the hybrid's dynamic half was not accidentally dropped
-    /// while removing the obsolete step strip.
+    ///    poster - the hybrid's dynamic half was not accidentally dropped
+    ///    while removing the obsolete step strip.
     #[test]
     fn waveform_status_readout_still_renders() {
         let output = render_at(egui::vec2(1600.0, 1200.0), None, None);
@@ -1646,7 +1646,7 @@ mod tests {
     }
 
     /// 6. The poster owns the page title, while live egui controls remain
-    /// separate widgets; no duplicate live heading is introduced.
+    ///    separate widgets; no duplicate live heading is introduced.
     #[test]
     fn no_duplicate_page_title_is_rendered() {
         fn count_occurrences(shape: &egui::Shape, needle: &str, count: &mut usize) {
@@ -1673,7 +1673,7 @@ mod tests {
     }
 
     /// 7. The motif renders without panicking whether or not analysis is in
-    /// flight (the fallback-safe placeholder path).
+    ///    flight (the fallback-safe placeholder path).
     #[test]
     fn motif_rendering_is_fallback_safe() {
         let ctx = egui::Context::default();
@@ -1687,11 +1687,11 @@ mod tests {
     }
 
     /// 8. `show_page` remains a pure presentation function over the same
-    /// `Option<&Path>` / `Option<&Result<TapeAnalysis, String>>` worker
-    /// state, plus the already-loaded catalogue (`Option<&[ArchiveRecord]>`,
-    /// never a filesystem scan of its own) and its own persisted filter
-    /// state for the library browser. This is a structural/compile-level
-    /// assertion: the function signature itself is the contract.
+    ///    `Option<&Path>` / `Option<&Result<TapeAnalysis, String>>` worker
+    ///    state, plus the already-loaded catalogue (`Option<&[ArchiveRecord]>`,
+    ///    never a filesystem scan of its own) and its own persisted filter
+    ///    state for the library browser. This is a structural/compile-level
+    ///    assertion: the function signature itself is the contract.
     #[test]
     fn show_page_signature_takes_only_existing_worker_state() {
         fn _assert_signature(
@@ -1837,7 +1837,7 @@ mod tests {
     }
 
     /// 5. Only actually-supported formats are advertised (never a second,
-    /// independent support table).
+    ///    independent support table).
     #[test]
     fn only_actual_supported_formats_are_advertised() {
         let output = render_at(egui::vec2(1600.0, 1200.0), None, None);
@@ -1846,8 +1846,8 @@ mod tests {
     }
 
     /// 6. `.tap` is treated as a candidate signal, never authoritative
-    /// platform proof: the library browser labels it "TAP candidate", it
-    /// never claims a platform from the extension alone.
+    ///    platform proof: the library browser labels it "TAP candidate", it
+    ///    never claims a platform from the extension alone.
     #[test]
     fn tap_extension_is_a_candidate_not_authoritative_identity() {
         let records = vec![tape_record("game.tap", None)];
@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     /// 9. Unsupported (non-tape) media never appears in the default tape
-    /// browser, even when it is otherwise indexed by the same catalogue.
+    ///    browser, even when it is otherwise indexed by the same catalogue.
     #[test]
     fn unsupported_media_is_excluded_from_the_library_browser() {
         let records = vec![
@@ -1871,7 +1871,7 @@ mod tests {
     }
 
     /// 7. Library filtering by format narrows to only the matching
-    /// extension.
+    ///    extension.
     #[test]
     fn library_filters_by_format() {
         let records = vec![
@@ -1894,7 +1894,7 @@ mod tests {
     }
 
     /// 8. Library filtering by platform narrows to only the matching
-    /// platform.
+    ///    platform.
     #[test]
     fn library_filters_by_platform() {
         let records = vec![
@@ -1917,8 +1917,8 @@ mod tests {
     }
 
     /// 10. The selected tape's existing bounded analysis still renders when
-    /// a library candidate (or any selection) is in place - the library
-    /// browser is additive, not a replacement for the existing presentation.
+    ///     a library candidate (or any selection) is in place - the library
+    ///     browser is additive, not a replacement for the existing presentation.
     #[test]
     fn selected_tape_analysis_still_renders_alongside_the_library_browser() {
         let records = vec![tape_record("spectrum.tzx", Some("ZX Spectrum"))];
@@ -1949,8 +1949,8 @@ mod tests {
     }
 
     /// 13. `tape_candidates` is a pure projection over an already-loaded
-    /// slice - it takes no root path and performs no filesystem traversal of
-    /// its own, unlike a directory-scanning helper.
+    ///     slice - it takes no root path and performs no filesystem traversal of
+    ///     its own, unlike a directory-scanning helper.
     #[test]
     fn tape_candidates_never_scans_the_filesystem() {
         fn _assert_signature(records: &[ArchiveRecord]) -> Vec<LibraryTapeCandidate<'_>> {
@@ -1959,9 +1959,9 @@ mod tests {
     }
 
     /// 11. No source modification: the library browser and file picker only
-    /// ever surface paths - `show_page` never opens a file for writing.
-    /// Structural: `TapeInspectorAction` carries only `PathBuf`s a caller
-    /// applies via the existing read-only selection flow.
+    ///     ever surface paths - `show_page` never opens a file for writing.
+    ///     Structural: `TapeInspectorAction` carries only `PathBuf`s a caller
+    ///     applies via the existing read-only selection flow.
     #[test]
     fn tape_inspector_actions_carry_only_paths() {
         let action = TapeInspectorAction::SelectLibraryTape(PathBuf::from("game.tap"));
@@ -1974,7 +1974,7 @@ mod tests {
     }
 
     /// 12. Small viewport (~1024x600): the library browser section and its
-    /// filters remain reachable, not clipped away.
+    ///     filters remain reachable, not clipped away.
     #[test]
     fn library_browser_is_reachable_at_a_small_viewport() {
         let records = vec![tape_record("spectrum.tzx", Some("ZX Spectrum"))];

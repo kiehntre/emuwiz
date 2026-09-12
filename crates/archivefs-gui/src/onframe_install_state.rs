@@ -11,7 +11,9 @@ use archivefs_core::patch_manager::{
 };
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum OnFrameInstallState {
+    #[default]
     Idle,
     Discovering {
         source: PathBuf,
@@ -57,11 +59,6 @@ pub enum OnFrameInstallState {
     },
 }
 
-impl Default for OnFrameInstallState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 impl OnFrameInstallState {
     pub fn begin_discovery(&mut self, source: PathBuf) {

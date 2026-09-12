@@ -5109,8 +5109,8 @@ impl DatSourcesPageState {
             Ok(()) => {
                 self.saved = self.draft.clone();
                 self.save_state = DatSaveState::Saved;
-                if let Some(database_path) = self.database_path.clone() {
-                    if !stale_sources.is_empty() {
+                if let Some(database_path) = self.database_path.clone()
+                    && !stale_sources.is_empty() {
                         let result = archivefs_core::Database::open_or_create(database_path)
                             .and_then(|mut database| {
                                 for source_id in &stale_sources {
@@ -5126,7 +5126,6 @@ impl DatSourcesPageState {
                             ));
                         }
                     }
-                }
             }
             Err(error) => self.save_state = DatSaveState::Failed(error.to_string()),
         }

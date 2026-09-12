@@ -525,7 +525,7 @@ impl RepairReviewPageState {
         });
         #[cfg(test)]
         {
-            return selected || setup.selected_dat_id.is_some();
+            selected || setup.selected_dat_id.is_some()
         }
         #[cfg(not(test))]
         selected

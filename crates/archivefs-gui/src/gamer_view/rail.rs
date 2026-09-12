@@ -123,8 +123,10 @@ pub(crate) fn show_browsing_rail(
             });
 
             let toolbar_width = ui.available_width();
-            let search_width = toolbar_width.min(220.0).max(150.0);
-            let jump_target = if toolbar_width >= 760.0 {
+            let search_width = toolbar_width.clamp(150.0, 220.0);
+
+
+            if toolbar_width >= 760.0 {
                 ui.horizontal_top(|ui| {
                     let alpha_width = (ui.available_width() - search_width - 8.0).max(0.0);
                     let target = ui
@@ -148,9 +150,7 @@ pub(crate) fn show_browsing_rail(
                     egui::TextEdit::singleline(filter).hint_text("Search games..."),
                 );
                 target
-            };
-
-            jump_target
+            }
         })
         .inner;
 

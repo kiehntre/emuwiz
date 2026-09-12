@@ -20,6 +20,14 @@ use crate::{ArchiveFsError, Result};
 /// Dedicated user configuration, deliberately unrelated to `dat_sources.toml`.
 pub const MANAGED_DAT_SOURCES_CONFIG_FILE: &str = "managed_dat_sources.toml";
 
+type ResolvedFbneoSource = (
+    ManagedFbneoConfigEntry,
+    ManagedDatSourceDescriptor,
+    Option<ManagedDatState>,
+    Option<ManagedDatReadOnlySource>,
+    Option<ManagedDatReadOnlySource>,
+);
+
 /// The complete managed-DAT configuration.  A named table is used rather than
 /// a provider discriminator: MAME software lists, Redump's fixed datasets,
 /// and the single local FBNeo source are the only supported entry types, so
@@ -601,15 +609,7 @@ pub fn resolve_redump_games_sources_default(
 pub fn resolve_fbneo_source(
     sources: &ManagedDatSources,
     managed_root: &Path,
-) -> Result<
-    Option<(
-        ManagedFbneoConfigEntry,
-        ManagedDatSourceDescriptor,
-        Option<ManagedDatState>,
-        Option<ManagedDatReadOnlySource>,
-        Option<ManagedDatReadOnlySource>,
-    )>,
-> {
+) -> Result<Option<ResolvedFbneoSource>> {
     let Some(config) = sources.fbneo_entry() else {
         return Ok(None);
     };

@@ -43,7 +43,7 @@ fn fixture() -> (HatariProfile, HatariGameInspection, LaunchCandidate) {
                 version: None,
                 region: None,
             },
-            machine: machine,
+            machine,
             warnings: Vec::new(),
         },
         selected_game: crate::patch_manager::HatariSelectedGame {

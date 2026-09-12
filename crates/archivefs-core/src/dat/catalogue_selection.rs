@@ -165,7 +165,7 @@ fn managed_provider_token(provider: ManagedDatProvider) -> &'static str {
 /// The exact `dat_source_id` string a managed catalogue's audit results are
 /// persisted under (`library_dat_identities`/`dat_set_audit_results`), for
 /// callers that need to key off it without re-resolving the whole catalogue
-/// - e.g. marking a source's rows stale right after a successful managed
+/// For example, this is used to mark a source's rows stale right after a successful managed
 /// update. This is the single source of truth for that format: it is what
 /// [`resolve_catalogue`]'s own [`CatalogueRef::ManagedCurrent`] arm builds
 /// (`format!("{provider_token}:{source_key}")`) - deliberately **not**

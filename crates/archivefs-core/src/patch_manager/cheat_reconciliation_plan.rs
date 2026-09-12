@@ -353,7 +353,6 @@ fn resolved_entry(
                 source
                     .provenance
                     .iter()
-                    .cloned()
                     .map(|value| format!("{}: {value}", source.source)),
             );
         }
@@ -389,7 +388,6 @@ fn diagnostic(
                 entry
                     .provenance
                     .iter()
-                    .cloned()
                     .map(|value| format!("{}: {value}", entry.source)),
             );
         }

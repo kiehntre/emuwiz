@@ -200,7 +200,8 @@ fn build_wired(label: &str, extra_cores: &[&str]) -> Wired {
 }
 
 fn recommended_retroarch_candidate(plan: &LaunchPlan) -> &LaunchCandidate {
-    let candidate = plan
+
+    (plan
         .candidates
         .iter()
         .find(|candidate| {
@@ -210,8 +211,7 @@ fn recommended_retroarch_candidate(plan: &LaunchPlan) -> &LaunchCandidate {
                 && matches!(candidate.preference, CandidatePreference::SoleEligible)
                 && matches!(candidate.target, LaunchTarget::RetroArchCore { .. })
         })
-        .expect("exactly one clean, recommended RetroArch candidate");
-    candidate
+        .expect("exactly one clean, recommended RetroArch candidate")) as _
 }
 
 fn wait_for_clean_exit(process: &mut crate::launch::LaunchedRetroArchProcess) {

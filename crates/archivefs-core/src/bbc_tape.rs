@@ -108,7 +108,7 @@ pub fn decode_bbc_wav(bytes: &[u8]) -> Result<BbcWavRecovery, WavError> {
         let mut ok = true;
         for bit in 0..8 {
             let (one, width) = symbols[i + 1 + bit];
-            if width < 550 || width > 1_200 {
+            if !(550..=1_200).contains(&width) {
                 ok = false;
             }
             if one {

@@ -4,9 +4,15 @@
 //! construct a [`BootstrapContext`] and provide policy evidence to the
 //! generic plan/execution boundary.
 
+// These pure publication/process helpers are intentionally exposed only to
+// the bootstrap engine and focused tests; some are reserved for later policy
+// wiring rather than being reachable from today's public execution path.
+#[allow(dead_code)]
 pub(crate) mod installer;
 pub(crate) mod model;
+#[allow(dead_code)]
 pub(crate) mod process;
+#[allow(dead_code)]
 pub(crate) mod safety;
 
 pub mod pcsx2;

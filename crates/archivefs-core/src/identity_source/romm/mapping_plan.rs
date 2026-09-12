@@ -391,7 +391,7 @@ fn containing_root(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         .cloned()
 }
 
-fn replace_mapping(mappings: &mut Vec<PathMapping>, prefix: &str, candidate: Option<PathBuf>) {
+fn replace_mapping(mappings: &mut [PathMapping], prefix: &str, candidate: Option<PathBuf>) {
     if let Some(mapping) = mappings
         .iter_mut()
         .find(|mapping| mapping.provider_prefix == prefix)
@@ -530,7 +530,7 @@ mod tests {
             );
         }
         let current = PathMappings::validate(
-            &[
+            [
                 ("n64", "/mnt/games/roms/n64"),
                 ("gb", "/mnt/games/roms/gb"),
                 ("zxs", "/mnt/games/roms/zxs"),

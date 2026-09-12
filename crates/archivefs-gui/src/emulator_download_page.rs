@@ -468,7 +468,7 @@ impl EmulatorDownloadPageState {
         thread::spawn(move || {
             let result = (|| {
                 let root = managed_root()
-                    .map_err(|error| ManagedAppImageBootstrapError::SpawnFailed(error))?;
+                    .map_err(ManagedAppImageBootstrapError::SpawnFailed)?;
                 let spec = emulator_download_spec(spec_id)
                     .ok_or(ManagedAppImageBootstrapError::UnsupportedEmulator)?;
                 initialize_managed_appimage(&root, spec)

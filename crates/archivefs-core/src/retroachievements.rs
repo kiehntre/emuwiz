@@ -250,7 +250,7 @@ mod tests {
         let path = cache_path(dir.path());
         let game = parse_game_response(br#"{"ID":1,"Title":"X","ConsoleID":1}"#, Path::new("x"), 0)
             .unwrap();
-        publish_cache(&path, &[game.clone()]).unwrap();
+        publish_cache(&path, std::slice::from_ref(&game)).unwrap();
         assert_eq!(load_cache(&path).unwrap(), vec![game]);
     }
 }

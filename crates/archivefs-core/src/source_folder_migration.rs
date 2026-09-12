@@ -144,14 +144,13 @@ pub fn plan_source_folder_migration(
     // destination. Compare only exact normalized candidates, never names.
     let mut by_candidate: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
     for (index, proposal) in root_plan.migration.proposals.iter().enumerate() {
-        if proposal.classification == MigrationClassification::SafeRebase {
-            if let Some(candidate) = &proposal.candidate_path {
+        if proposal.classification == MigrationClassification::SafeRebase
+            && let Some(candidate) = &proposal.candidate_path {
                 by_candidate
                     .entry(candidate.clone())
                     .or_default()
                     .push(index);
             }
-        }
     }
     let mut conflicts = 0;
     for indices in by_candidate.values().filter(|indices| indices.len() > 1) {

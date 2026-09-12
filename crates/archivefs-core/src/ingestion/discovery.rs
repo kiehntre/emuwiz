@@ -1820,8 +1820,7 @@ fn discover_d88_image(
         Some(DiskFormat::D88Container) => {
             if let Some(boot) = crate::fmtowns_container_evidence::inspect_fmtowns_container(path)
                 .and_then(|container| container.boot_sector)
-            {
-                if let Some(observation) =
+                && let Some(observation) =
                     crate::fmtowns_boot_evidence::structural_observation(&boot)
                 {
                     structural_evidence.push(DiscoveredStructuralEvidence {
@@ -1861,11 +1860,9 @@ fn discover_d88_image(
                         skip_reason: None,
                     };
                 }
-            }
             if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
                 .and_then(|container| container.boot_sector)
-            {
-                if let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
+                && let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
                 {
                     structural_evidence.push(DiscoveredStructuralEvidence {
                         path: path.to_path_buf(),
@@ -1904,7 +1901,6 @@ fn discover_d88_image(
                         skip_reason: None,
                     };
                 }
-            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary) if summary.platform.is_some() => accepted(
@@ -2038,8 +2034,7 @@ fn discover_hard_disk_image(
         Some(format) if format == expected => {
             if let Some(boot) = crate::fmtowns_container_evidence::inspect_fmtowns_container(path)
                 .and_then(|container| container.boot_sector)
-            {
-                if let Some(observation) =
+                && let Some(observation) =
                     crate::fmtowns_boot_evidence::structural_observation(&boot)
                 {
                     structural_evidence.push(DiscoveredStructuralEvidence {
@@ -2079,11 +2074,9 @@ fn discover_hard_disk_image(
                         skip_reason: None,
                     };
                 }
-            }
             if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
                 .and_then(|container| container.boot_sector)
-            {
-                if let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
+                && let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
                 {
                     structural_evidence.push(DiscoveredStructuralEvidence {
                         path: path.to_path_buf(),
@@ -2122,7 +2115,6 @@ fn discover_hard_disk_image(
                         skip_reason: None,
                     };
                 }
-            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary) if summary.platform.is_some() => accepted(

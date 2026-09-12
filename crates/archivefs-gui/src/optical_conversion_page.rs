@@ -247,11 +247,10 @@ impl OpticalConversionPageState {
         self.transaction = None;
         self.error = None;
         self.conversion_failure = None;
-        if let Some(context) = &self.selected_context {
-            if let Some(parent) = context.path.parent() {
+        if let Some(context) = &self.selected_context
+            && let Some(parent) = context.path.parent() {
                 self.source_root_draft = parent.display().to_string();
             }
-        }
     }
 
     fn scan(&mut self) {
@@ -812,7 +811,7 @@ pub(crate) fn show_optical_conversion_page(
         ui.horizontal_wrapped(|ui| {
             ui.label("Source folder:");
             ui.add_sized(
-                [ui.available_width().min(520.0).max(220.0), 24.0],
+                [ui.available_width().clamp(220.0, 520.0), 24.0],
                 egui::TextEdit::singleline(&mut state.source_root_draft),
             );
             if ui.button("Choose folder").clicked()
@@ -1365,7 +1364,8 @@ mod tests {
     }
 
     /// 4. Detection counts are shown after a scan, from the existing
-    /// planner results only - no extra filesystem scan during render.
+    ///
+    ///   planner results only - no extra filesystem scan during render.
     #[test]
     fn detection_counts_are_shown_after_scan() {
         let directory = tempfile::tempdir().unwrap();
@@ -1377,7 +1377,8 @@ mod tests {
     }
 
     /// 5. A supported item's preview (source/format/destination/status) is
-    /// visible once selected.
+    ///
+    ///   visible once selected.
     #[test]
     fn supported_item_preview_is_visible() {
         let directory = tempfile::tempdir().unwrap();
@@ -1393,7 +1394,8 @@ mod tests {
     }
 
     /// 6. A blocked item's reason is visible, using the existing typed
-    /// `ChdConversionError`, not a raw internal string as the primary cue.
+    ///
+    ///   `ChdConversionError`, not a raw internal string as the primary cue.
     #[test]
     fn blocked_item_reason_is_visible() {
         let directory = tempfile::tempdir().unwrap();
@@ -1431,8 +1433,9 @@ mod tests {
     }
 
     /// 8. Preview never mutates the source, for the selected-game path too
-    /// (the folder-scan path is already covered by
-    /// `scan_exposes_eligible_source_without_mutating_it`).
+    ///
+    ///   (the folder-scan path is already covered by
+    ///   `scan_exposes_eligible_source_without_mutating_it`).
     #[test]
     fn preview_selected_never_mutates_the_source() {
         let directory = tempfile::tempdir().unwrap();
@@ -1449,7 +1452,8 @@ mod tests {
     }
 
     /// 9. The page's primary-action hint changes with state, never staying
-    /// on one generic message regardless of progress.
+    ///
+    ///   on one generic message regardless of progress.
     #[test]
     fn primary_action_hint_changes_by_state() {
         let directory = tempfile::tempdir().unwrap();
@@ -1525,7 +1529,7 @@ mod tests {
     }
 
     /// 12. The primary action is reachable at a small ~1024x600 viewport
-    /// without scrolling - it sits at the very top of the page.
+    ///     without scrolling - it sits at the very top of the page.
     #[test]
     fn primary_action_is_reachable_at_a_small_viewport() {
         let mut state = OpticalConversionPageState::default();
@@ -1535,7 +1539,7 @@ mod tests {
     }
 
     /// 13. The final section (the Result card) is reachable by scrolling
-    /// at a small viewport - never stranded below the max scroll extent.
+    ///     at a small viewport - never stranded below the max scroll extent.
     #[test]
     fn final_section_is_reachable_at_a_small_viewport() {
         let directory = tempfile::tempdir().unwrap();
@@ -1793,7 +1797,7 @@ mod tests {
     }
 
     /// 15. No new conversion format is exposed as supported - CUE remains
-    /// the only recognised extension.
+    ///     the only recognised extension.
     #[test]
     fn no_new_conversion_format_is_exposed() {
         for extension in [

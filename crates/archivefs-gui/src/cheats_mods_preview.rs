@@ -1346,7 +1346,7 @@ fn show_enhancement_summary(ui: &mut egui::Ui, workflow: Option<&CheatWorkflowSt
             }
             Some(_) => ("Workflow available", widgets::StatusTone::Info),
         };
-        widgets::status_badge(ui, &format!("Cheats · {cheats}"), cheat_tone);
+        widgets::status_badge(ui, format!("Cheats · {cheats}"), cheat_tone);
 
         let (mods, mod_tone) = match workflow {
             Some(workflow)
@@ -1360,7 +1360,7 @@ fn show_enhancement_summary(ui: &mut egui::Ui, workflow: Option<&CheatWorkflowSt
             Some(_) => ("No supported mod flow", widgets::StatusTone::Pending),
             None => ("Select a game", widgets::StatusTone::Pending),
         };
-        widgets::status_badge(ui, &format!("Mods · {mods}"), mod_tone);
+        widgets::status_badge(ui, format!("Mods · {mods}"), mod_tone);
 
         let (safety, safety_tone) = match workflow {
             Some(workflow) if matches!(workflow.identity, CheatStepResource::Failed(_)) => {
@@ -1372,10 +1372,11 @@ fn show_enhancement_summary(ui: &mut egui::Ui, workflow: Option<&CheatWorkflowSt
             Some(_) => ("Checked before apply", widgets::StatusTone::Success),
             None => ("Waiting for game", widgets::StatusTone::Pending),
         };
-        widgets::status_badge(ui, &format!("Safety · {safety}"), safety_tone);
+        widgets::status_badge(ui, format!("Safety · {safety}"), safety_tone);
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_cheats_mods_page(
     ui: &mut egui::Ui,
     workflow: Option<&mut CheatWorkflowState>,

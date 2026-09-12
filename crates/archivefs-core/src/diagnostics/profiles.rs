@@ -364,8 +364,8 @@ pub fn discover_linux_emulator_installations() -> Vec<LinuxEmulatorInstallationE
 /// and if zero or more than one managed install matches, or the recorded
 /// path is a lossy (non-UTF-8) rendering, it returns `None` so the caller
 /// stays deterministic and fail-closed. Widening trust is out of scope here
-/// - this is only the wiring that carries an *already*-validated path into
-/// the existing adapter discovery/binding.
+/// This is only the wiring that carries an *already*-validated path into the
+/// existing adapter discovery/binding.
 pub fn managed_appimage_executable_for(
     installations: &[LinuxEmulatorInstallationEvidence],
     emulator: &str,
@@ -4325,9 +4325,9 @@ mod tests {
 
     /// A GUI-supplied executable override reaches PCSX2 discovery as one
     /// more real candidate, additive to whatever automatic discovery finds
-    /// - exactly the "no readiness-authority bypass" requirement from the
-    /// 0.8.2 UX pass task: this is the same `explicit_executables` channel
-    /// managed-AppImage installs already use, not a new one.
+    /// This is exactly the "no readiness-authority bypass" requirement from
+    /// the 0.8.2 UX pass task: this is the same `explicit_executables`
+    /// channel managed-AppImage installs already use, not a new one.
     #[test]
     fn pcsx2_executable_override_is_folded_into_discovery() {
         let dir = TempTree::new("pcsx2-override-fixture");

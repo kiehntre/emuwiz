@@ -256,11 +256,10 @@ fn compare_track(
         ("MD5", &expected.hashes.md5, &actual_hashes.md5),
         ("SHA-1", &expected.hashes.sha1, &actual_hashes.sha1),
     ] {
-        if let Some(wanted) = wanted {
-            if actual.as_deref() != Some(wanted.as_str()) {
+        if let Some(wanted) = wanted
+            && actual.as_deref() != Some(wanted.as_str()) {
                 reasons.push(format!("{label} differs"));
             }
-        }
     }
     let status = if !reasons.is_empty() {
         TrackVerificationStatus::Mismatch

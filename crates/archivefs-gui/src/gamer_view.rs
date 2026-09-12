@@ -1034,6 +1034,7 @@ pub(crate) struct GamerViewViewState<'a> {
 /// exclusively on the action panel (Stage 3), so there is exactly one
 /// place a beginner ever clicks to change a game's state, not two
 /// slightly-different copies of the same buttons.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_gamer_details_panel(
     ui: &mut egui::Ui,
     record: &ArchiveRecord,
@@ -1837,7 +1838,7 @@ mod game_metadata_enrichment_tests {
         assert!(real.y >= 300.0);
         assert!(real.x / real.y > 0.6 && real.x / real.y < 0.8);
         assert!(real.y > fallback.y);
-        assert!(DETAILS_HERO_HORIZONTAL_MIN_WIDTH > 900.0);
+        const { assert!(DETAILS_HERO_HORIZONTAL_MIN_WIDTH > 900.0) };
     }
 
     #[test]

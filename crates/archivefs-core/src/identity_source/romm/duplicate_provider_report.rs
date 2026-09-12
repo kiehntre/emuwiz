@@ -306,9 +306,7 @@ fn matched_mapping(
     let index = mappings.as_slice().iter().position(|mapping| {
         mapping.provider_prefix == matched_prefix
             || mapping
-                .provider_aliases
-                .iter()
-                .any(|alias| *alias == matched_prefix)
+                .provider_aliases.contains(&matched_prefix)
     })?;
     Some((index, matched_prefix))
 }

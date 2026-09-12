@@ -141,7 +141,7 @@ pub fn observe_cdi<M: LogicalMedia>(media: &M) -> Result<CdiDiscEvidence, CdiEvi
         both_u32(&root[10..18]).ok_or(CdiEvidenceError::InconsistentField("root_size"))?;
     let media_blocks = media.len() / logical_block_size as u64;
     if root_extent_lba as u64 >= media_blocks
-        || (root_extent_lba as u64).saturating_add((root_size_bytes as u64 + 2047) / 2048)
+        || (root_extent_lba as u64).saturating_add((root_size_bytes as u64).div_ceil(2048))
             > media_blocks
     {
         return Err(CdiEvidenceError::OutOfBounds("root directory"));
@@ -158,11 +158,10 @@ pub fn observe_cdi<M: LogicalMedia>(media: &M) -> Result<CdiDiscEvidence, CdiEvi
         ("little-endian path table", path_table_lba_le),
         ("big-endian path table", path_table_lba_be),
     ] {
-        if let Some(lba) = lba {
-            if lba as u64 >= media_blocks {
+        if let Some(lba) = lba
+            && lba as u64 >= media_blocks {
                 warnings.push(format!("{name} is out of bounds"));
             }
-        }
     }
     let has_startup = filesystem
         .root_entries

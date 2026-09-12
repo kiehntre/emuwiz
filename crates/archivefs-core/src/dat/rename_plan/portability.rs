@@ -145,7 +145,7 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 fn is_reserved_windows_device_name(name: &str) -> bool {
     // Windows trims trailing dots/spaces before interpreting a device stem and
     // treats an extension-bearing form (CON.txt) as reserved too.
-    let trimmed = name.trim_end_matches(|ch| ch == '.' || ch == ' ');
+    let trimmed = name.trim_end_matches(['.', ' ']);
     let stem = trimmed.split('.').next().unwrap_or_default();
     let upper = stem.to_ascii_uppercase();
     matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")

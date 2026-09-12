@@ -64,6 +64,7 @@ fn blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker 
 
 /// Builds an explicit-profile native Hatari invocation. The profile remains
 /// read-only; the selected disk is passed as a separate argv component.
+#[expect(clippy::too_many_arguments, reason = "matches the explicit Hatari command-plan contract")]
 pub fn build_hatari_command_plan(
     identity: &CanonicalIdentityStatus,
     candidate: &LaunchCandidate,

@@ -54,7 +54,9 @@ pub(crate) struct LocalCheatInstallContext {
 
 /// One local-file install attempt's current stage. Only one is ever active;
 /// starting a new one (a different file, or "Try again") replaces it.
+#[derive(Default)]
 enum LocalInstallStage {
+    #[default]
     Idle,
     Blocked {
         source_path: PathBuf,
@@ -84,11 +86,6 @@ enum LocalInstallStage {
     },
 }
 
-impl Default for LocalInstallStage {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 /// The currently selected game's PCSX2 identity and resolved profile,
 /// bound by the caller exactly as `pcsx2_identity_for_workflow` already
@@ -103,7 +100,9 @@ pub(crate) struct LocalPcsx2InstallContext {
 
 /// One local `.pnach` install attempt's current stage, independent of
 /// `LocalInstallStage` (RetroArch) so the two formats never share state.
+#[derive(Default)]
 enum LocalPcsx2InstallStage {
+    #[default]
     Idle,
     Blocked {
         source_path: PathBuf,
@@ -134,11 +133,6 @@ enum LocalPcsx2InstallStage {
     },
 }
 
-impl Default for LocalPcsx2InstallStage {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 /// The currently selected game's already-resolved Dolphin candidate
 /// (exact game ID, and when applicable exact disc revision, already
@@ -162,7 +156,9 @@ pub(crate) struct LocalXeniaInstallContext {
     pub profile: Option<XeniaProfile>,
 }
 
+#[derive(Default)]
 enum LocalXeniaInstallStage {
+    #[default]
     Idle,
     Blocked {
         source_path: PathBuf,
@@ -193,18 +189,15 @@ enum LocalXeniaInstallStage {
     },
 }
 
-impl Default for LocalXeniaInstallStage {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 /// One local Dolphin `.ini` (Gecko/Action Replay) install attempt's
 /// current stage, independent of the RetroArch/PCSX2 stages so the three
 /// formats never share state. Unlike RetroArch/PCSX2, there is no
 /// directory-wide scan to pick a candidate from - the user picks the file
 /// directly, so this starts from a file path rather than a report row.
+#[derive(Default)]
 enum LocalDolphinInstallStage {
+    #[default]
     Idle,
     Blocked {
         source_path: PathBuf,
@@ -236,11 +229,6 @@ enum LocalDolphinInstallStage {
     },
 }
 
-impl Default for LocalDolphinInstallStage {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 #[derive(Debug)]
 enum TaskResult {
@@ -367,6 +355,7 @@ impl UserCheatImportPageState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -568,11 +557,10 @@ impl UserCheatImportPageState {
             if let Some(index) = clicked_candidate {
                 session.select_candidate(index);
             }
-            if session.selected_candidate.is_some() && session.binding.is_none() {
-                if ui.button("Bind to verified game").clicked() {
+            if session.selected_candidate.is_some() && session.binding.is_none()
+                && ui.button("Bind to verified game").clicked() {
                     session.bind_selected(Some(&game_id), Some(&configuration_path), false);
                 }
-            }
             if let Some(binding) = session.binding.as_ref() {
                 ui.label(format!("Verified game: {}", binding.verified_game_id));
                 ui.label(format!(
@@ -584,11 +572,10 @@ impl UserCheatImportPageState {
                         ui.colored_label(egui::Color32::YELLOW, reason);
                     }
                 }
-                if session.preview.is_none() && binding.can_install {
-                    if ui.button("Build install preview").clicked() {
+                if session.preview.is_none() && binding.can_install
+                    && ui.button("Build install preview").clicked() {
                         session.prepare_preview();
                     }
-                }
             }
             if let Some(plan) = session.plan.as_ref() {
                 egui::CollapsingHeader::new("Install preview")

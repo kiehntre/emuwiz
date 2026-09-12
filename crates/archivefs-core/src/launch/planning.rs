@@ -66,6 +66,7 @@ pub struct ResolvedIdentity {
 
 /// What kind of content this candidate would actually run, when known.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(clippy::large_enum_variant, reason = "preserve the public typed launch content contract")]
 pub enum LaunchContentKind {
     /// A verified WHDLoad package. The package/slave binding is carried by
     /// the typed Amiga launch context; this marker alone never authorizes a

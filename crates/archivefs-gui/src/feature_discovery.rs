@@ -18,6 +18,7 @@ use super::*;
 use crate::selected_evidence_page::SelectedEvidenceReport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum FeatureDiscoveryAction {
     /// Navigate to the existing Disc Conversion destination - never a
     /// second converter.

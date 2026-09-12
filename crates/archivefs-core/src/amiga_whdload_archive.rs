@@ -174,7 +174,6 @@ fn inspect_source(
     let mut candidates = Vec::new();
     let mut diagnostics = Vec::new();
     let mut warnings = Vec::new();
-    let mut inspected = 0_usize;
     let mut total_bytes = 0_u64;
 
     let slave_members: Vec<(String, u64)> = source
@@ -183,7 +182,7 @@ fn inspect_source(
         .map(|member| (member.path.to_string(), member.logical_size))
         .collect();
 
-    for (member_path, logical_size) in slave_members {
+    for (inspected, (member_path, logical_size)) in slave_members.into_iter().enumerate() {
         use std::sync::atomic::Ordering;
         if cancel.load(Ordering::Relaxed) {
             warnings.push("cancelled before every .slave-named member was inspected".to_string());
@@ -196,7 +195,6 @@ fn inspect_source(
             ));
             break;
         }
-        inspected += 1;
         if logical_size > MAX_INDIVIDUAL_SLAVE_BYTES {
             diagnostics.push(ArchiveSlaveDiagnostic {
                 member_path: member_path.clone(),

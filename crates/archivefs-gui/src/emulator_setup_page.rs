@@ -310,8 +310,7 @@ fn candidate_grid_layout(available_width: f32, candidate_count: usize) -> Candid
         .min(candidate_count);
     let card_width = ((available_width - CANDIDATE_CARD_GAP * columns.saturating_sub(1) as f32)
         / columns as f32)
-        .min(CANDIDATE_CARD_MAX_WIDTH)
-        .max(0.0);
+        .clamp(0.0, CANDIDATE_CARD_MAX_WIDTH);
 
     CandidateGridLayout {
         columns,

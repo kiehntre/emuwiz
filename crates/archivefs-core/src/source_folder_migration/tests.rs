@@ -1,7 +1,7 @@
 use super::*;
 use crate::database::{PersistedArchive, SourceFolderRecord};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn folder(id: i64, path: PathBuf) -> SourceFolderRecord {
     SourceFolderRecord {
@@ -39,14 +39,14 @@ fn archive(id: i64, source_id: i64, relative: &str, absolute: PathBuf) -> Persis
 }
 
 fn input(
-    old: &PathBuf,
-    new: &PathBuf,
+    old: &Path,
+    new: &Path,
     folders: Vec<SourceFolderRecord>,
     archives: Vec<PersistedArchive>,
 ) -> SourceFolderMigrationInput {
     SourceFolderMigrationInput {
-        old_root: old.clone(),
-        new_root: new.clone(),
+        old_root: old.to_path_buf(),
+        new_root: new.to_path_buf(),
         source_folders: folders,
         archives,
         historical_paths: vec![old.join("historical.rom")],
