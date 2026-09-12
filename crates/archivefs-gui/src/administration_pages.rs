@@ -2098,7 +2098,20 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
         );
         return;
     };
-    let registry = archivefs_core::operation::OperationRegistry::from_rename_journals(&directory);
+    let mut registry =
+        archivefs_core::operation::OperationRegistry::from_rename_journals(&directory);
+    if let (Ok(shared_history), Ok(shared_backups)) = (
+        archivefs_core::patch_manager::default_shared_history_root(),
+        archivefs_core::patch_manager::default_shared_backup_root(),
+    ) {
+        registry.append_shared_apply_history(&shared_history, &shared_backups);
+    }
+    registry.records.sort_by(|left, right| {
+        right
+            .created_at_unix
+            .cmp(&left.created_at_unix)
+            .then_with(|| left.operation_id.cmp(&right.operation_id))
+    });
     if registry.records.is_empty() && registry.problems.is_empty() {
         widgets::empty_state(
             ui,
