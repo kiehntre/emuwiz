@@ -470,10 +470,10 @@ fn the_tools_menu_opens_and_routes_directly_to_a_first_class_workflow() {
     let menu_item = exact_text_centers(&output, "Emulator Setup")
         .into_iter()
         .min_by(|left, right| {
-            let left_distance = (left.x - platform_aliases.x).abs()
-                + (left.y - platform_aliases.y).abs();
-            let right_distance = (right.x - platform_aliases.x).abs()
-                + (right.y - platform_aliases.y).abs();
+            let left_distance =
+                (left.x - platform_aliases.x).abs() + (left.y - platform_aliases.y).abs();
+            let right_distance =
+                (right.x - platform_aliases.x).abs() + (right.y - platform_aliases.y).abs();
             left_distance.total_cmp(&right_distance)
         })
         .expect("Emulator Setup must render inside the open Tools menu");

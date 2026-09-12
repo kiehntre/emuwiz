@@ -100,14 +100,14 @@ fn unsafe_paths_are_refused() {
 #[test]
 fn marker_binding_rejects_drift() {
     let marker = b"target=ppsspp\nrelease=v1\ndigest=abc\nsource=official\n";
-    assert!(super::super::safety::validate_marker_binding(
-        marker, "ppsspp", "v1", "abc", "official"
-    )
-    .is_ok());
-    assert!(super::super::safety::validate_marker_binding(
-        marker, "pcsx2", "v1", "abc", "official"
-    )
-    .is_err());
+    assert!(
+        super::super::safety::validate_marker_binding(marker, "ppsspp", "v1", "abc", "official")
+            .is_ok()
+    );
+    assert!(
+        super::super::safety::validate_marker_binding(marker, "pcsx2", "v1", "abc", "official")
+            .is_err()
+    );
 }
 
 #[test]
@@ -120,25 +120,29 @@ fn publication_refuses_existing_destination_and_bad_digest() {
     fs::write(&staged, b"payload").unwrap();
     fs::write(&marker_staged, b"marker").unwrap();
     fs::write(&destination, b"user-owned").unwrap();
-    assert!(super::super::installer::publish_no_clobber(
-        &staged,
-        &destination,
-        &marker_staged,
-        &marker,
-        "unused",
-        1,
-    )
-    .is_err());
+    assert!(
+        super::super::installer::publish_no_clobber(
+            &staged,
+            &destination,
+            &marker_staged,
+            &marker,
+            "unused",
+            1,
+        )
+        .is_err()
+    );
     fs::remove_file(&destination).unwrap();
-    assert!(super::super::installer::publish_no_clobber(
-        &staged,
-        &destination,
-        &marker_staged,
-        &marker,
-        "wrong",
-        1,
-    )
-    .is_err());
+    assert!(
+        super::super::installer::publish_no_clobber(
+            &staged,
+            &destination,
+            &marker_staged,
+            &marker,
+            "wrong",
+            1,
+        )
+        .is_err()
+    );
 }
 
 #[test]

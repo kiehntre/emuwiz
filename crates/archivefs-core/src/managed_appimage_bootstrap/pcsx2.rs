@@ -3,11 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::dat::firmware_evidence::FirmwareIdentityRecord;
-use crate::launch::readiness::{pcsx2_firmware_readiness, FirmwareReadiness};
+use crate::launch::readiness::{FirmwareReadiness, pcsx2_firmware_readiness};
 use crate::patch_manager::{
+    Pcsx2BiosVerificationOutcome, Pcsx2GameRequest, Pcsx2ProfileDiscoveryRoots,
     discover_pcsx2_profiles, inspect_pcsx2_game_with_firmware_evidence, parse_pcsx2_version,
-    resolve_pcsx2_native_launch_binding, Pcsx2BiosVerificationOutcome, Pcsx2GameRequest,
-    Pcsx2ProfileDiscoveryRoots,
+    resolve_pcsx2_native_launch_binding,
 };
 
 use super::{BootstrapContext, BootstrapError, BootstrapTarget};

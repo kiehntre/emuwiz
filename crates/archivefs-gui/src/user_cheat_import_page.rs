@@ -86,7 +86,6 @@ enum LocalInstallStage {
     },
 }
 
-
 /// The currently selected game's PCSX2 identity and resolved profile,
 /// bound by the caller exactly as `pcsx2_identity_for_workflow` already
 /// binds it for the GameHacking-catalogue journey.
@@ -132,7 +131,6 @@ enum LocalPcsx2InstallStage {
         message: String,
     },
 }
-
 
 /// The currently selected game's already-resolved Dolphin candidate
 /// (exact game ID, and when applicable exact disc revision, already
@@ -189,7 +187,6 @@ enum LocalXeniaInstallStage {
     },
 }
 
-
 /// One local Dolphin `.ini` (Gecko/Action Replay) install attempt's
 /// current stage, independent of the RetroArch/PCSX2 stages so the three
 /// formats never share state. Unlike RetroArch/PCSX2, there is no
@@ -228,7 +225,6 @@ enum LocalDolphinInstallStage {
         message: String,
     },
 }
-
 
 #[derive(Debug)]
 enum TaskResult {
@@ -557,10 +553,12 @@ impl UserCheatImportPageState {
             if let Some(index) = clicked_candidate {
                 session.select_candidate(index);
             }
-            if session.selected_candidate.is_some() && session.binding.is_none()
-                && ui.button("Bind to verified game").clicked() {
-                    session.bind_selected(Some(&game_id), Some(&configuration_path), false);
-                }
+            if session.selected_candidate.is_some()
+                && session.binding.is_none()
+                && ui.button("Bind to verified game").clicked()
+            {
+                session.bind_selected(Some(&game_id), Some(&configuration_path), false);
+            }
             if let Some(binding) = session.binding.as_ref() {
                 ui.label(format!("Verified game: {}", binding.verified_game_id));
                 ui.label(format!(
@@ -572,10 +570,12 @@ impl UserCheatImportPageState {
                         ui.colored_label(egui::Color32::YELLOW, reason);
                     }
                 }
-                if session.preview.is_none() && binding.can_install
-                    && ui.button("Build install preview").clicked() {
-                        session.prepare_preview();
-                    }
+                if session.preview.is_none()
+                    && binding.can_install
+                    && ui.button("Build install preview").clicked()
+                {
+                    session.prepare_preview();
+                }
             }
             if let Some(plan) = session.plan.as_ref() {
                 egui::CollapsingHeader::new("Install preview")

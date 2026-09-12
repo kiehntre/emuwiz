@@ -25,11 +25,11 @@ use std::time::Duration;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use crate::dat::archive::ArchiveMemberSource;
 use crate::dat::archive::lha::{LhaArchiveSource, LhaError, LhaProvider};
 use crate::dat::archive::limits::ArchiveLimits;
-use crate::dat::archive::ArchiveMemberSource;
 use crate::identity_source::whdload::{
-    parse_whdload_slave, ParsedWHDLoadSlave, SlaveArtifact, SlaveHashes,
+    ParsedWHDLoadSlave, SlaveArtifact, SlaveHashes, parse_whdload_slave,
 };
 use crate::safe_read::TrustedRoots;
 

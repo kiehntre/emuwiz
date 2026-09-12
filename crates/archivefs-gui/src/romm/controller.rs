@@ -6,7 +6,11 @@ impl ArchiveFsApp {
     /// Declining is the point: a second click while something is running must not
     /// launch a duplicate, and a mutating operation must not overlap another. A
     /// status load is allowed to be the exception only because it writes nothing.
-    pub(crate) fn start_romm_operation(&mut self, context: egui::Context, operation: RommOperation) -> bool {
+    pub(crate) fn start_romm_operation(
+        &mut self,
+        context: egui::Context,
+        operation: RommOperation,
+    ) -> bool {
         if let Some(running) = &self.romm_operation {
             // A status load asked for while something else runs is dropped rather
             // than queued: the operation that finishes will refresh anyway.
@@ -438,7 +442,10 @@ impl ArchiveFsApp {
     /// Split out so the borrow of the draft is over before a request is handled -
     /// which is what lets a save or a close mutate the same state the dialog was
     /// just drawn from.
-    pub(crate) fn show_romm_configuration(&mut self, ui: &mut egui::Ui) -> Option<ConfigDialogRequest> {
+    pub(crate) fn show_romm_configuration(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<ConfigDialogRequest> {
         let source_roots_result = self.gui_config.source_roots().map(Vec::from);
         let source_roots = source_roots_result.clone().unwrap_or_default();
         let busy = self
@@ -506,7 +513,10 @@ impl ArchiveFsApp {
     /// body did rather than caching it, because the body may have just changed
     /// a field this frame and a stale `can_save` would be worse than the very
     /// small cost of recomputing it.
-    pub(crate) fn show_romm_configuration_footer(&mut self, ui: &mut egui::Ui) -> Option<ConfigDialogRequest> {
+    pub(crate) fn show_romm_configuration_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<ConfigDialogRequest> {
         let source_roots = self
             .gui_config
             .source_roots()
@@ -1008,8 +1018,6 @@ impl ArchiveFsApp {
             ConfigDialogRequest::Close => self.close_romm_configuration(),
         }
     }
-
-
 }
 
 /// The initial and maximum size for one RomM tool window, clamped to the
@@ -1027,7 +1035,10 @@ pub(crate) fn romm_window_body_cap(maximum: egui::Vec2) -> f32 {
     (maximum.y - 100.0).max(120.0)
 }
 
-pub(crate) fn romm_dialog_sizes(viewport: egui::Vec2, preferred: egui::Vec2) -> (egui::Vec2, egui::Vec2) {
+pub(crate) fn romm_dialog_sizes(
+    viewport: egui::Vec2,
+    preferred: egui::Vec2,
+) -> (egui::Vec2, egui::Vec2) {
     // The margin is the window's own chrome plus the room it needs to sit
     // somewhere other than exactly (0, 0). A 32px margin was not enough: a
     // window whose content filled its maximum height became as tall as the

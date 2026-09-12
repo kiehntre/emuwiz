@@ -21,9 +21,9 @@ pub mod ppsspp;
 mod legacy;
 
 pub use legacy::{
+    ManagedAppImageBootstrapError, ManagedAppImageBootstrapKind, ManagedAppImageBootstrapReceipt,
     initialize_managed_appimage, initialize_managed_appimage_with_timeout,
-    managed_appimage_is_initialized, ManagedAppImageBootstrapError, ManagedAppImageBootstrapKind,
-    ManagedAppImageBootstrapReceipt,
+    managed_appimage_is_initialized,
 };
 pub use model::{
     BootstrapApproval, BootstrapContext, BootstrapError, BootstrapExecutor, BootstrapInspection,

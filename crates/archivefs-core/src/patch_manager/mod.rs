@@ -108,9 +108,9 @@ mod vita3k_local;
 mod xemu_local;
 mod xenia_install_plan;
 mod xenia_local;
-mod xroar_local;
 mod xenia_patch_document;
 mod xenia_provider;
+mod xroar_local;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -414,7 +414,10 @@ pub use dolphin_onframe_install_plan::{
     StagedDolphinOnFrameIni, build_dolphin_onframe_install_preview, plan_dolphin_onframe_install,
     stage_dolphin_onframe_install,
 };
-pub use dolphin_onframe_source::{DolphinOnFrameBinding, DolphinOnFrameCandidate, DolphinOnFrameSourceError, bind_dolphin_onframe_candidate, discover_dolphin_onframe_candidates};
+pub use dolphin_onframe_source::{
+    DolphinOnFrameBinding, DolphinOnFrameCandidate, DolphinOnFrameSourceError,
+    bind_dolphin_onframe_candidate, discover_dolphin_onframe_candidates,
+};
 pub use dolphin_texture_mod::{
     DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DolphinTextureModError, DolphinTextureModErrorKind,
     DolphinTextureModIdentity, DolphinTextureModPlan, DolphinTextureModPreviewRequest,
@@ -830,12 +833,6 @@ pub use xenia_local::{
     discover_local_xenia_patch_file, discover_xenia_profiles, load_local_xenia_destination,
     resolve_xenia_launch_binding, stage_local_xenia_patch_file,
 };
-pub use xroar_local::{
-    XROAR_EXECUTABLE_NAME, XROAR_FIRMWARE_DIRECTORY_ENV, XROAR_MACHINE_ENV, XRoarExecutable,
-    XRoarExplicitProfile, XRoarFirmwareState, XRoarInstallationType, XRoarMachine, XRoarProfile,
-    XRoarProfileDiscovery, XRoarProfileDiscoveryRoots, discover_xroar_profiles,
-    resolve_xroar_native_launch_binding,
-};
 pub use xenia_patch_document::{
     MAX_BYTE_ARRAY_BYTES, MAX_HASHES_PER_FILE, MAX_MEDIA_IDS_PER_FILE, MAX_PATCH_FILE_BYTES,
     MAX_PATCHES_PER_FILE, MAX_STRING_VALUE_BYTES, MAX_WRITES_PER_PATCH, XeniaDocumentWarning,
@@ -852,6 +849,12 @@ pub use xenia_provider::{
     XeniaProviderFetchErrorKind, XeniaProviderFetchOptions, XeniaProviderFetchResult,
     XeniaProviderFetchStatus, XeniaProviderResult, default_xenia_provider_cache_root,
     fetch_xenia_provider_patches, fetch_xenia_provider_patches_with_transport,
+};
+pub use xroar_local::{
+    XROAR_EXECUTABLE_NAME, XROAR_FIRMWARE_DIRECTORY_ENV, XROAR_MACHINE_ENV, XRoarExecutable,
+    XRoarExplicitProfile, XRoarFirmwareState, XRoarInstallationType, XRoarMachine, XRoarProfile,
+    XRoarProfileDiscovery, XRoarProfileDiscoveryRoots, discover_xroar_profiles,
+    resolve_xroar_native_launch_binding,
 };
 
 pub const BUILT_IN_SOURCE_ID: &str = "pcsx2-official-patches-tree";

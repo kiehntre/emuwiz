@@ -19,8 +19,8 @@
 //! user visits that page. Home omits those badges until their real state is
 //! known rather than presenting an ordinary lazy load as a problem.
 
-use archivefs_core::identity_source::model::MediaCoverage;
 use crate::ui::{components as widgets, theme};
+use archivefs_core::identity_source::model::MediaCoverage;
 use eframe::egui;
 
 /// One platform's collection-centric summary within [`HomeLibrarySnapshot`].

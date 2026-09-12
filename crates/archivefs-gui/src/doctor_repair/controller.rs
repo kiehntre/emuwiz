@@ -537,8 +537,6 @@ impl ArchiveFsApp {
         }
         self.doctor_repair_result = Some(Box::new(outcome));
     }
-
-
 }
 
 /// Collects the path-based Doctor inputs. Runs on a worker thread.

@@ -30,9 +30,10 @@ pub fn safe_path(path: &Path) -> Result<(), BootstrapError> {
         .filter(|candidate| candidate.parent().is_some())
     {
         if let Ok(metadata) = fs::symlink_metadata(ancestor)
-            && (metadata.file_type().is_symlink() || (!metadata.is_dir() && ancestor != path)) {
-                return Err(BootstrapError::UnsafePath(ancestor.display().to_string()));
-            }
+            && (metadata.file_type().is_symlink() || (!metadata.is_dir() && ancestor != path))
+        {
+            return Err(BootstrapError::UnsafePath(ancestor.display().to_string()));
+        }
     }
     Ok(())
 }

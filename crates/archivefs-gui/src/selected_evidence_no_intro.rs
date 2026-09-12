@@ -82,7 +82,11 @@ impl NoIntroSourceCache {
         let fingerprint = no_intro_selection_fingerprint(registry, platform_id);
         let platform_changed = self.platform.as_deref() != platform_id;
         if platform_changed || self.fingerprint != Some(fingerprint) {
-            self.sources = archivefs_core::identity_source::no_intro::registry::load_no_intro_sources(registry, platform_id)
+            self.sources =
+                archivefs_core::identity_source::no_intro::registry::load_no_intro_sources(
+                    registry,
+                    platform_id,
+                )
                 .into_iter()
                 .map(|(label, source)| (label, Arc::new(source)))
                 .collect();

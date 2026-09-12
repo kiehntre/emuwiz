@@ -1019,12 +1019,13 @@ pub fn reconcile_cheats_for_game(
     let mut raw_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, fingerprint) in raws.iter().enumerate() {
         if !assigned[index]
-            && let Some(fingerprint) = fingerprint {
-                raw_groups
-                    .entry(fingerprint.clone())
-                    .or_default()
-                    .push(index);
-            }
+            && let Some(fingerprint) = fingerprint
+        {
+            raw_groups
+                .entry(fingerprint.clone())
+                .or_default()
+                .push(index);
+        }
     }
     for (fingerprint, indexes) in raw_groups {
         if indexes.len() < 2 {
@@ -1926,8 +1927,10 @@ mod tests {
         let preview = convert_cheat_document(&document, CheatTargetFormat::DolphinOnFrame);
         assert!(!preview.can_apply);
         assert_eq!(preview.output_preview, None);
-        assert!(supported_targets_for(&document)
-            .iter()
-            .any(|capability| capability.target == CheatTargetFormat::DolphinOnFrame));
+        assert!(
+            supported_targets_for(&document)
+                .iter()
+                .any(|capability| capability.target == CheatTargetFormat::DolphinOnFrame)
+        );
     }
 }

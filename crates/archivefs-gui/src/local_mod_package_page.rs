@@ -43,7 +43,6 @@ pub struct LocalModPackagePageState {
     stage: Option<Stage>,
 }
 
-
 impl LocalModPackagePageState {
     pub fn is_busy(&self) -> bool {
         matches!(
@@ -305,20 +304,20 @@ pub fn show_local_mod_package_panel(
                 ui.label(presentation.detail);
                 if can_undo
                     && let Some(journal) = result.journal_path.as_ref()
-                        && widgets::action_button(
-                            ui,
-                            "Undo this mod",
-                            widgets::ActionStyle::Destructive,
-                            true,
-                        )
-                        .clicked()
-                            && let (Ok(backup), Ok(_history)) =
-                                (default_shared_backup_root(), default_shared_history_root())
-                            {
-                                state.stage = Some(Stage::Rollback(preview_shared_rollback(
-                                    journal, &game_root, &backup,
-                                )));
-                            }
+                    && widgets::action_button(
+                        ui,
+                        "Undo this mod",
+                        widgets::ActionStyle::Destructive,
+                        true,
+                    )
+                    .clicked()
+                    && let (Ok(backup), Ok(_history)) =
+                        (default_shared_backup_root(), default_shared_history_root())
+                {
+                    state.stage = Some(Stage::Rollback(preview_shared_rollback(
+                        journal, &game_root, &backup,
+                    )));
+                }
             });
             if !matches!(state.stage, Some(Stage::Rollback(_))) {
                 state.stage = Some(Stage::Applied(result));
@@ -340,26 +339,26 @@ pub fn show_local_mod_package_panel(
                 .clicked()
                     && let (Ok(history_root), Ok(backup_root)) =
                         (default_shared_history_root(), default_shared_backup_root())
-                    {
-                        let (sender, receiver) = mpsc::channel();
-                        std::thread::spawn(move || {
-                            let result = execute_shared_rollback(
-                                &preview,
-                                &SharedRollbackOptions {
-                                    confirmation: SharedRollbackConfirmation {
-                                        preview_id: preview.preview_id.clone(),
-                                        approved: true,
-                                    },
-                                    rollback_operation_id: generate_shared_operation_id(),
-                                    timestamp_unix_seconds: now(),
-                                    history_root,
-                                    backup_root,
+                {
+                    let (sender, receiver) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = execute_shared_rollback(
+                            &preview,
+                            &SharedRollbackOptions {
+                                confirmation: SharedRollbackConfirmation {
+                                    preview_id: preview.preview_id.clone(),
+                                    approved: true,
                                 },
-                            );
-                            let _ = sender.send(result);
-                        });
-                        state.stage = Some(Stage::RollingBack(receiver));
-                    }
+                                rollback_operation_id: generate_shared_operation_id(),
+                                timestamp_unix_seconds: now(),
+                                history_root,
+                                backup_root,
+                            },
+                        );
+                        let _ = sender.send(result);
+                    });
+                    state.stage = Some(Stage::RollingBack(receiver));
+                }
             });
         }
         Stage::RollingBack(receiver) => {
@@ -441,9 +440,9 @@ fn show_plan(
                     true,
                 )
                 .clicked()
-                {
-                    state.stage = Some(Stage::Confirm(transaction));
-                }
+            {
+                state.stage = Some(Stage::Confirm(transaction));
+            }
         }
         if widgets::action_button(
             ui,

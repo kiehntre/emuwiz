@@ -65,7 +65,11 @@ impl ArchiveFsApp {
         }
     }
 
-    pub(crate) fn start_bsfree_operation(&mut self, context: egui::Context, operation: BsFreeOperation) {
+    pub(crate) fn start_bsfree_operation(
+        &mut self,
+        context: egui::Context,
+        operation: BsFreeOperation,
+    ) {
         if self.bsfree_operation.is_some() {
             return;
         }
@@ -663,7 +667,11 @@ impl ArchiveFsApp {
 
     /// Opens the full-page workspace and starts its read-only trusted
     /// source inventory only when the exact archive context is new.
-    pub(crate) fn open_cheats_mods_workspace(&mut self, context: &egui::Context, archive_path: PathBuf) {
+    pub(crate) fn open_cheats_mods_workspace(
+        &mut self,
+        context: &egui::Context,
+        archive_path: PathBuf,
+    ) {
         if !self.prepare_cheats_mods_workspace(archive_path) {
             return;
         }
@@ -1017,7 +1025,11 @@ impl ArchiveFsApp {
         workflow.transaction = CheatTransactionState::Idle;
     }
 
-    pub(crate) fn start_dolphin_provider_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+    pub(crate) fn start_dolphin_provider_fetch(
+        &mut self,
+        context: egui::Context,
+        force_refresh: bool,
+    ) {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
@@ -1436,7 +1448,11 @@ impl ArchiveFsApp {
         }
     }
 
-    pub(crate) fn start_xenia_provider_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+    pub(crate) fn start_xenia_provider_fetch(
+        &mut self,
+        context: egui::Context,
+        force_refresh: bool,
+    ) {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
@@ -1501,7 +1517,10 @@ impl ArchiveFsApp {
 
     /// Applies one Xenia patch picker edit and invalidates anything
     /// downstream, the same way `update_dolphin_code_selection` does.
-    pub(crate) fn update_xenia_patch_selection(&mut self, edit: impl FnOnce(&mut XeniaPatchSelection)) {
+    pub(crate) fn update_xenia_patch_selection(
+        &mut self,
+        edit: impl FnOnce(&mut XeniaPatchSelection),
+    ) {
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -2381,7 +2400,11 @@ impl ArchiveFsApp {
     /// one every other page considers selected too - archive selection is
     /// authoritative and shared, not a Cheats & Mods-only copy. Queue
     /// membership and mount state are untouched.
-    pub(crate) fn apply_cheat_archive_choice(&mut self, context: &egui::Context, archive_path: PathBuf) {
+    pub(crate) fn apply_cheat_archive_choice(
+        &mut self,
+        context: &egui::Context,
+        archive_path: PathBuf,
+    ) {
         self.confirm_cheat_archive_change = None;
         self.cheat_archive_picker = None;
         let needs_profile_scan = matches!(
@@ -2451,7 +2474,11 @@ impl ArchiveFsApp {
         });
     }
 
-    pub(crate) fn start_pcsx2_gamehacking_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+    pub(crate) fn start_pcsx2_gamehacking_fetch(
+        &mut self,
+        context: egui::Context,
+        force_refresh: bool,
+    ) {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
@@ -2608,7 +2635,11 @@ impl ArchiveFsApp {
 
     /// Matches GameCube or Wii through its platform adapter, while sharing
     /// the existing Dolphin selection/install workflow.
-    pub(crate) fn start_gamecube_gamehacking_fetch(&mut self, context: egui::Context, force_refresh: bool) {
+    pub(crate) fn start_gamecube_gamehacking_fetch(
+        &mut self,
+        context: egui::Context,
+        force_refresh: bool,
+    ) {
         self.start_gamecube_gamehacking_fetch_mode(
             context,
             force_refresh,
@@ -2811,7 +2842,11 @@ impl ArchiveFsApp {
         });
     }
 
-    pub(crate) fn confirm_gamecube_gamehacking_match(&mut self, context: egui::Context, game_id: u64) {
+    pub(crate) fn confirm_gamecube_gamehacking_match(
+        &mut self,
+        context: egui::Context,
+        game_id: u64,
+    ) {
         let Some(workflow) = self.cheat_workflow.as_ref() else {
             return;
         };
@@ -2949,7 +2984,11 @@ impl ArchiveFsApp {
         });
     }
 
-    pub(crate) fn update_gamecube_gamehacking_cheat_selection(&mut self, index: usize, selected: bool) {
+    pub(crate) fn update_gamecube_gamehacking_cheat_selection(
+        &mut self,
+        index: usize,
+        selected: bool,
+    ) {
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };
@@ -3273,7 +3312,11 @@ impl ArchiveFsApp {
     /// Runs one validated import and, on success, refreshes the provider
     /// state so the normal preview/selection/install flow picks the
     /// imported cache up immediately.
-    pub(crate) fn import_browser_content(&mut self, context: egui::Context, source: BrowserImportSource) {
+    pub(crate) fn import_browser_content(
+        &mut self,
+        context: egui::Context,
+        source: BrowserImportSource,
+    ) {
         let Some(state) = self
             .cheat_workflow
             .as_ref()
@@ -3676,7 +3719,11 @@ impl ArchiveFsApp {
     /// re-validates its pinned SHA-256, which is too heavy for the UI thread).
     /// Exactly one match auto-loads its classified cheats; several are shown
     /// as candidates for explicit confirmation; none yields a search box.
-    pub(crate) fn start_bsfree_gamecube_search(&mut self, context: egui::Context, search_title: String) {
+    pub(crate) fn start_bsfree_gamecube_search(
+        &mut self,
+        context: egui::Context,
+        search_title: String,
+    ) {
         let Some((archive_path, game_id, region, platform_ok)) =
             self.cheat_workflow.as_ref().and_then(|workflow| {
                 let identity = gamecube_identity_for_workflow(workflow)?;
@@ -3729,7 +3776,11 @@ impl ArchiveFsApp {
 
     /// Loads the classified cheats for a BSFree GameCube game the user
     /// explicitly confirmed from the search candidates.
-    pub(crate) fn start_bsfree_gamecube_confirm(&mut self, context: egui::Context, upstream_uid: i64) {
+    pub(crate) fn start_bsfree_gamecube_confirm(
+        &mut self,
+        context: egui::Context,
+        upstream_uid: i64,
+    ) {
         let Some((archive_path, game_id, region, archive_title, platform_ok)) =
             self.cheat_workflow.as_ref().and_then(|workflow| {
                 let identity = gamecube_identity_for_workflow(workflow)?;
@@ -5561,8 +5612,6 @@ impl ArchiveFsApp {
             workflow.xenia_show_exact_changes = false;
         }
     }
-
-
 }
 
 /// Runs the legacy CRC-only PNACH migration (staged alongside the primary

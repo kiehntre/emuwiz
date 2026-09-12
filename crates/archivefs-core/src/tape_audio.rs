@@ -454,26 +454,27 @@ pub fn decode_custom_wav(bytes: &[u8]) -> Result<CustomWavRecovery, WavError> {
         };
         stages.push(stage);
         if let (Some(mode), Some(bytes)) = (mode, recovered)
-            && !bytes.is_empty() {
-                let checksum =
-                    (bytes.len() >= 2).then(|| bytes.iter().fold(0u8, |acc, byte| acc ^ byte) == 0);
-                blocks.push(CustomRecoveredBlock {
-                    bytes,
-                    start_micros,
-                    end_micros,
-                    decoded_bits: data.len()
-                        / if mode == CustomSymbolMode::PairedPulse {
-                            16
-                        } else {
-                            8
-                        },
-                    ambiguous_bits: ambiguous,
-                    checksum_valid: checksum,
-                    mode,
-                    bit_order,
-                    confidence,
-                });
-            }
+            && !bytes.is_empty()
+        {
+            let checksum =
+                (bytes.len() >= 2).then(|| bytes.iter().fold(0u8, |acc, byte| acc ^ byte) == 0);
+            blocks.push(CustomRecoveredBlock {
+                bytes,
+                start_micros,
+                end_micros,
+                decoded_bits: data.len()
+                    / if mode == CustomSymbolMode::PairedPulse {
+                        16
+                    } else {
+                        8
+                    },
+                ambiguous_bits: ambiguous,
+                checksum_valid: checksum,
+                mode,
+                bit_order,
+                confidence,
+            });
+        }
         cursor = data_end.max(pilot_end + 1);
     }
     let loader_class = if stages.len() > 1 {
@@ -1046,25 +1047,26 @@ fn decode_cpc_custom_intervals(
             timing_scale_millionths: (pilot_cluster.saturating_mul(1_000_000) / 1000) as u32,
         });
         if let (Some(mode), Some(bytes)) = (mode, recovered)
-            && !bytes.is_empty() {
-                blocks.push(AmstradCpcCustomBlock {
-                    bytes,
-                    start_sample: start.sample,
-                    end_sample: end.sample,
-                    start_micros: start.micros,
-                    end_micros: end.micros,
-                    decoded_bits: data.len()
-                        / if mode == CustomSymbolMode::PairedPulse {
-                            2
-                        } else {
-                            1
-                        },
-                    ambiguous_bits: ambiguous,
-                    mode,
-                    bit_order,
-                    confidence,
-                });
-            }
+            && !bytes.is_empty()
+        {
+            blocks.push(AmstradCpcCustomBlock {
+                bytes,
+                start_sample: start.sample,
+                end_sample: end.sample,
+                start_micros: start.micros,
+                end_micros: end.micros,
+                decoded_bits: data.len()
+                    / if mode == CustomSymbolMode::PairedPulse {
+                        2
+                    } else {
+                        1
+                    },
+                ambiguous_bits: ambiguous,
+                mode,
+                bit_order,
+                confidence,
+            });
+        }
         cursor = data_end.max(pilot_end + 1);
     }
     (stages, blocks)

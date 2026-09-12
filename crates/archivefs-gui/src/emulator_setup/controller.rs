@@ -91,7 +91,10 @@ impl ArchiveFsApp {
     /// per-title mapping for the previous selection is never shown against
     /// the new one. Cheap no-op when the selection has not changed. Called
     /// once per frame right before rendering the panel.
-    pub(crate) fn invalidate_pcsx2_status_if_selection_changed(&mut self, focused_archive: Option<&Path>) {
+    pub(crate) fn invalidate_pcsx2_status_if_selection_changed(
+        &mut self,
+        focused_archive: Option<&Path>,
+    ) {
         if self.pcsx2_status_archive_path.as_deref() != focused_archive {
             self.pcsx2_status = pcsx2_page::Pcsx2StatusState::Idle;
             self.pcsx2_status_archive_path = focused_archive.map(Path::to_path_buf);
@@ -241,12 +244,15 @@ impl ArchiveFsApp {
                 .map(|outcome| outcome.scan.findings.as_slice()),
             self.doctor_scan.is_running(),
             match &self.retroarch_profiles {
-                RetroArchProfilesState::NotScanned =>
-                    emulator_setup_page::RetroArchSetupStatus::NotChecked,
-                RetroArchProfilesState::Scanning { .. } =>
-                    emulator_setup_page::RetroArchSetupStatus::Checking,
-                RetroArchProfilesState::Error(_) =>
-                    emulator_setup_page::RetroArchSetupStatus::Blocked,
+                RetroArchProfilesState::NotScanned => {
+                    emulator_setup_page::RetroArchSetupStatus::NotChecked
+                }
+                RetroArchProfilesState::Scanning { .. } => {
+                    emulator_setup_page::RetroArchSetupStatus::Checking
+                }
+                RetroArchProfilesState::Error(_) => {
+                    emulator_setup_page::RetroArchSetupStatus::Blocked
+                }
                 RetroArchProfilesState::Ready(discovery) => {
                     if discovery.profiles.iter().any(|profile| profile.eligible) {
                         emulator_setup_page::RetroArchSetupStatus::Ready
@@ -1964,7 +1970,11 @@ impl ArchiveFsApp {
     /// `build_retroarch_candidates` -> `build_launch_plan` -> gamer
     /// readiness all update naturally. An unusable pick is reported and
     /// never stored, so the active core folder is unchanged.
-    pub(crate) fn apply_picked_retroarch_core_folder(&mut self, folder: PathBuf, context: egui::Context) {
+    pub(crate) fn apply_picked_retroarch_core_folder(
+        &mut self,
+        folder: PathBuf,
+        context: egui::Context,
+    ) {
         match retroarch_core_setup::classify_picked_core_folder(&folder) {
             retroarch_core_setup::PickedCoreFolder::Directory => {
                 self.retroarch_core_folder_rejected_pick = None;
@@ -2027,8 +2037,6 @@ impl ArchiveFsApp {
             }
         }
     }
-
-
 }
 
 /// The bridge from the persisted DAT source registry

@@ -1,7 +1,11 @@
 use crate::*;
 
 impl ArchiveFsApp {
-    pub(crate) fn start_mount_all(&mut self, context: egui::Context, items: Vec<MountAllItem>) -> bool {
+    pub(crate) fn start_mount_all(
+        &mut self,
+        context: egui::Context,
+        items: Vec<MountAllItem>,
+    ) -> bool {
         if self.is_busy() {
             let message = "Another archive operation is already running.".to_string();
             self.feedback = Some(ActionFeedback {
@@ -539,6 +543,4 @@ impl ArchiveFsApp {
             self.refresh(context);
         }
     }
-
-
 }

@@ -883,10 +883,18 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Enterprise",
         display_name: "Enterprise 64/128",
-        folder_aliases: &["enterprise", "enterprise64", "enterprise128", "ep64", "ep128"],
+        folder_aliases: &[
+            "enterprise",
+            "enterprise64",
+            "enterprise128",
+            "ep64",
+            "ep128",
+        ],
         filename_aliases: &[],
         strong_extensions: &[],
-        weak_extensions: &["tap", "dtf", "dsk", "img", "rom", "com", "trn", "128", "bas"],
+        weak_extensions: &[
+            "tap", "dtf", "dsk", "img", "rom", "com", "trn", "128", "bas",
+        ],
         magic: &[],
         layout: &[],
         conflicts_with: &["ZX Spectrum", "Amstrad CPC"],

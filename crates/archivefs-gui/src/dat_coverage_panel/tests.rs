@@ -189,14 +189,8 @@ fn render_with_visibility(
     let mut captured = None;
     let output = context.run(egui::RawInput::default(), |context| {
         egui::CentralPanel::default().show(context, |ui| {
-            captured = show_coverage_section(
-                ui,
-                entries,
-                open,
-                missing_open,
-                show_all,
-                show_unassigned,
-            );
+            captured =
+                show_coverage_section(ui, entries, open, missing_open, show_all, show_unassigned);
         });
     });
     (output, captured)

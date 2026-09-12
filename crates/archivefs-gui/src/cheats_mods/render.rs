@@ -21,13 +21,11 @@ pub(crate) fn dolphin_gamehacking_request_key(
     })
 }
 
-
 pub(crate) fn gamecube_gamehacking_selection_for(
     cheats: &[GameHackingGameCubeCheat],
 ) -> GameCubeCheatSelection {
     GameCubeCheatSelection::from_cheats(cheats, &parse_dolphin_ini(""))
 }
-
 
 pub(crate) fn dolphin_game_from_wii_game(game: GameHackingWiiGame) -> GameHackingGameCubeGame {
     GameHackingGameCubeGame {
@@ -42,7 +40,6 @@ pub(crate) fn dolphin_game_from_wii_game(game: GameHackingWiiGame) -> GameHackin
     }
 }
 
-
 pub(crate) fn wii_game_from_dolphin_game(game: &GameHackingGameCubeGame) -> GameHackingWiiGame {
     GameHackingWiiGame {
         game_id: game.game_id,
@@ -56,7 +53,6 @@ pub(crate) fn wii_game_from_dolphin_game(game: &GameHackingGameCubeGame) -> Game
         source_url: game.source_url.clone(),
     }
 }
-
 
 pub(crate) fn dolphin_candidate_from_wii(
     candidate: GameHackingWiiMatchCandidate,
@@ -79,7 +75,6 @@ pub(crate) fn dolphin_candidate_from_wii(
         requires_user_confirmation: candidate.requires_user_confirmation,
     }
 }
-
 
 pub(crate) fn dolphin_cheat_from_wii(cheat: GameHackingWiiCheat) -> GameHackingGameCubeCheat {
     let code_format = if !cheat.safety.installable() {
@@ -108,7 +103,6 @@ pub(crate) fn dolphin_cheat_from_wii(cheat: GameHackingWiiCheat) -> GameHackingG
         source_url: cheat.source_url,
     }
 }
-
 
 pub(crate) fn wii_match_state(
     matched: GameHackingWiiMatch,
@@ -142,7 +136,6 @@ pub(crate) fn wii_match_state(
     }
 }
 
-
 pub(crate) fn show_cheat_play_target_warning(
     ui: &mut egui::Ui,
     cheat_target: CheatEmulatorAdapter,
@@ -166,7 +159,6 @@ pub(crate) fn show_cheat_play_target_warning(
         widgets::StatusTone::Warning,
     );
 }
-
 
 pub(crate) fn show_cheat_activation_status(
     ui: &mut egui::Ui,
@@ -217,7 +209,6 @@ pub(crate) fn show_cheat_activation_status(
     }
 }
 
-
 pub(crate) fn cheat_archive_change_requires_confirmation(
     workflow: Option<&CheatWorkflowState>,
     candidate: &Path,
@@ -227,7 +218,6 @@ pub(crate) fn cheat_archive_change_requires_confirmation(
             && !matches!(workflow.source_fetch, CheatStepResource::NotLoaded)
     })
 }
-
 
 /// Drops every candidate-derived stage. Called whenever the archive,
 /// profile, adapter, source mode, or catalogue snapshot changes, so a
@@ -243,7 +233,6 @@ pub(crate) fn clear_cheat_candidate_state(workflow: &mut CheatWorkflowState) {
     workflow.preview = CheatStepResource::NotLoaded;
     workflow.transaction = CheatTransactionState::Idle;
 }
-
 
 pub(crate) fn cheat_picker_row_matches(
     row: &ArchiveRow,
@@ -269,7 +258,6 @@ pub(crate) fn cheat_picker_row_matches(
     source_matches && platform_matches && text_matches
 }
 
-
 pub(crate) fn cheat_picker_visible_indices(
     rows: &[ArchiveRow],
     picker: &CheatArchivePickerState,
@@ -290,7 +278,6 @@ pub(crate) fn cheat_picker_visible_indices(
     indices.sort_by(|left, right| rows[*left].path.cmp(&rows[*right].path));
     indices
 }
-
 
 pub(crate) fn move_cheat_picker_candidate(
     rows: &[ArchiveRow],
@@ -314,7 +301,6 @@ pub(crate) fn move_cheat_picker_candidate(
     };
     Some(rows[visible[position]].path.clone())
 }
-
 
 pub(crate) fn show_cheat_archive_picker(
     context: &egui::Context,
@@ -515,14 +501,12 @@ pub(crate) fn show_cheat_archive_picker(
     action
 }
 
-
 pub(crate) fn cheat_archive_picker_size(screen: egui::Vec2) -> egui::Vec2 {
     egui::vec2(
         (screen.x * 0.82).clamp(620.0, 1080.0),
         (screen.y * 0.82).clamp(480.0, 760.0),
     )
 }
-
 
 /// Display label for a cached trusted-source snapshot's freshness.
 pub(crate) fn cheat_freshness_label(freshness: CheatSourceFreshness) -> &'static str {
@@ -534,7 +518,6 @@ pub(crate) fn cheat_freshness_label(freshness: CheatSourceFreshness) -> &'static
     }
 }
 
-
 pub(crate) fn cheat_freshness_tone(freshness: CheatSourceFreshness) -> widgets::StatusTone {
     match freshness {
         CheatSourceFreshness::Fresh => widgets::StatusTone::Success,
@@ -545,7 +528,6 @@ pub(crate) fn cheat_freshness_tone(freshness: CheatSourceFreshness) -> widgets::
     }
 }
 
-
 /// Display label for how a catalogue retrieval was satisfied.
 pub(crate) fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'static str {
     match status {
@@ -554,7 +536,6 @@ pub(crate) fn cheat_fetch_status_label(status: CheatSourceFetchStatus) -> &'stat
         CheatSourceFetchStatus::OfflineReused => "Offline: reused cached snapshot",
     }
 }
-
 
 /// Builds the destination-bound code selection for a ready Dolphin
 /// provider result - shared by the background-fetch completion handler and
@@ -590,7 +571,6 @@ pub(crate) fn build_dolphin_provider_selection(
     }
 }
 
-
 /// A short, non-technical name for a recognised disc image format, used
 /// only in the beginner-facing "exact Game ID unavailable" message. Full
 /// transport/parse diagnostics remain under Details, never here.
@@ -617,7 +597,6 @@ pub(crate) fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'st
         | IdentityImageFormat::Unsupported => "This file",
     }
 }
-
 
 /// The beginner-facing detail line for `BeginnerCheatStatus::IdentityUnavailable` -
 /// derived entirely from the same `GameIdentityReport` Details already
@@ -647,8 +626,9 @@ pub(crate) fn dolphin_identity_unavailable_detail(report: &GameIdentityReport) -
     }
 }
 
-
-pub(crate) fn dolphin_identity_row_state(workflow: &CheatWorkflowState) -> DolphinIdentityRowState<'_> {
+pub(crate) fn dolphin_identity_row_state(
+    workflow: &CheatWorkflowState,
+) -> DolphinIdentityRowState<'_> {
     match ready_game_identity(workflow) {
         Some(report) => match report.verified_dolphin_game_id() {
             Some(id) => DolphinIdentityRowState::Verified(id),
@@ -658,8 +638,9 @@ pub(crate) fn dolphin_identity_row_state(workflow: &CheatWorkflowState) -> Dolph
     }
 }
 
-
-pub(crate) fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'static str {
+pub(crate) fn dolphin_provider_fetch_status_label(
+    status: GeckoProviderFetchStatus,
+) -> &'static str {
     match status {
         GeckoProviderFetchStatus::Downloaded => "downloaded",
         GeckoProviderFetchStatus::FreshCache => "fresh cache",
@@ -669,7 +650,6 @@ pub(crate) fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStat
         GeckoProviderFetchStatus::NotAvailable => "no upstream file for this game",
     }
 }
-
 
 /// Computes the beginner status for Dolphin from the same state the
 /// technical Details view already reads - no separate tracking, so the
@@ -736,8 +716,9 @@ pub(crate) fn dolphin_beginner_status(workflow: &CheatWorkflowState) -> Beginner
     }
 }
 
-
-pub(crate) fn wii_gamehacking_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus {
+pub(crate) fn wii_gamehacking_beginner_status(
+    workflow: &CheatWorkflowState,
+) -> BeginnerCheatStatus {
     match &workflow.gamecube_gamehacking {
         CheatStepResource::NotLoaded | CheatStepResource::Loading { .. } => {
             BeginnerCheatStatus::FindingCompatibleCheats
@@ -763,7 +744,6 @@ pub(crate) fn wii_gamehacking_beginner_status(workflow: &CheatWorkflowState) -> 
         }
     }
 }
-
 
 /// Xenia's counterpart to `dolphin_beginner_status`.
 pub(crate) fn xenia_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus {
@@ -804,7 +784,6 @@ pub(crate) fn xenia_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCh
     }
 }
 
-
 pub(crate) fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
     warnings
         .iter()
@@ -827,7 +806,6 @@ pub(crate) fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
         })
         .collect()
 }
-
 
 /// Renders catalogue-indexing warnings as a concise, bounded summary
 /// instead of dumping every entry directly into the page - the Sources
@@ -893,7 +871,6 @@ pub(crate) fn show_cheat_warnings_summary(
         });
 }
 
-
 pub(crate) fn import_trust_label(state: ImportTrustState) -> &'static str {
     match state {
         ImportTrustState::Trusted => "Trusted",
@@ -902,7 +879,6 @@ pub(crate) fn import_trust_label(state: ImportTrustState) -> &'static str {
     }
 }
 
-
 pub(crate) fn import_trust_tone(state: ImportTrustState) -> widgets::StatusTone {
     match state {
         ImportTrustState::Trusted => widgets::StatusTone::Success,
@@ -910,7 +886,6 @@ pub(crate) fn import_trust_tone(state: ImportTrustState) -> widgets::StatusTone 
         ImportTrustState::Blocked => widgets::StatusTone::Blocked,
     }
 }
-
 
 pub(crate) fn import_source_presentation(kind: ImportSourceKind) -> (&'static str, &'static str) {
     match kind {
@@ -922,7 +897,6 @@ pub(crate) fn import_source_presentation(kind: ImportSourceKind) -> (&'static st
         ImportSourceKind::RemoteUnverifiedSource => ("Future remote unverified source", "Planned"),
     }
 }
-
 
 pub(crate) fn local_scanning_presentation(
     state: LocalSafetyScanningState,
@@ -944,7 +918,6 @@ pub(crate) fn local_scanning_presentation(
         }
     }
 }
-
 
 pub(crate) fn show_cheats_mods_workflow_states(
     ui: &mut egui::Ui,
@@ -1094,7 +1067,6 @@ pub(crate) fn show_cheats_mods_workflow_states(
     );
 }
 
-
 pub(crate) fn show_pcsx2_workflow_states(
     ui: &mut egui::Ui,
     workflow: &CheatWorkflowState,
@@ -1162,8 +1134,9 @@ pub(crate) fn show_pcsx2_workflow_states(
     );
 }
 
-
-pub(crate) fn pcsx2_integration_presentation(profiles: &Pcsx2ProfilesState) -> (String, widgets::StatusTone) {
+pub(crate) fn pcsx2_integration_presentation(
+    profiles: &Pcsx2ProfilesState,
+) -> (String, widgets::StatusTone) {
     match profiles {
         Pcsx2ProfilesState::NotScanned => (
             "PCSX2 profiles not scanned".to_string(),
@@ -1200,7 +1173,6 @@ pub(crate) fn pcsx2_integration_presentation(profiles: &Pcsx2ProfilesState) -> (
         }
     }
 }
-
 
 pub(crate) fn show_dolphin_workflow_states(
     ui: &mut egui::Ui,
@@ -1271,7 +1243,6 @@ pub(crate) fn show_dolphin_workflow_states(
     );
 }
 
-
 pub(crate) fn dolphin_integration_presentation(
     profiles: &DolphinProfilesState,
 ) -> (String, widgets::StatusTone) {
@@ -1312,7 +1283,6 @@ pub(crate) fn dolphin_integration_presentation(
     }
 }
 
-
 pub(crate) fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
     egui::CollapsingHeader::new("Safety, privacy, and responsible use")
         .default_open(false)
@@ -1351,7 +1321,6 @@ pub(crate) fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
             });
         });
 }
-
 
 pub(crate) fn retroarch_integration_presentation(
     profiles: &RetroArchProfilesState,
@@ -1392,7 +1361,6 @@ pub(crate) fn retroarch_integration_presentation(
         }
     }
 }
-
 
 /// The "Technical details" body for the RetroArch core-folder card. This is
 /// the only place raw `PathFinding` provenance, the `ResolutionState` name,
@@ -1477,7 +1445,6 @@ pub(crate) fn show_retroarch_core_folder_technical(
     }
 }
 
-
 pub(crate) fn show_cheat_archive_context(
     ui: &mut egui::Ui,
     workflow: &CheatWorkflowState,
@@ -1561,7 +1528,6 @@ pub(crate) fn show_cheat_archive_context(
     });
 }
 
-
 pub(crate) fn show_recent_cheat_activity(
     ui: &mut egui::Ui,
     history: &OperationHistory,
@@ -1613,7 +1579,6 @@ pub(crate) fn show_recent_cheat_activity(
         });
 }
 
-
 /// A compact, honest notice - not a full section with its own heading and
 /// card - since Mods has no workflow of its own yet and must not occupy
 /// prime space above the real, working RetroArch cheat workflow. See
@@ -1636,11 +1601,9 @@ pub(crate) fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphi
     widgets::banner(ui, "Mods: planned", detail, tone);
 }
 
-
 pub(crate) fn platform_is_ps2(platform: Option<&str>) -> bool {
     platform.is_some_and(|platform| platform.eq_ignore_ascii_case("PS2"))
 }
-
 
 pub(crate) fn platform_is_dolphin(platform: Option<&str>) -> bool {
     platform.is_some_and(|platform| {
@@ -1649,7 +1612,6 @@ pub(crate) fn platform_is_dolphin(platform: Option<&str>) -> bool {
             .any(|candidate| platform.eq_ignore_ascii_case(candidate))
     })
 }
-
 
 pub(crate) fn detected_platform_counts<'a>(
     platforms: impl Iterator<Item = Option<&'a str>>,
@@ -1671,7 +1633,6 @@ pub(crate) fn detected_platform_counts<'a>(
     }
 }
 
-
 pub(crate) fn platform_is_gamecube(platform: Option<&str>) -> bool {
     platform.is_some_and(|platform| {
         ["GameCube", "Nintendo GameCube"]
@@ -1679,7 +1640,6 @@ pub(crate) fn platform_is_gamecube(platform: Option<&str>) -> bool {
             .any(|candidate| platform.eq_ignore_ascii_case(candidate))
     })
 }
-
 
 /// Whether `poll_cheat_workflow` should quietly start a background
 /// Dolphin Gecko-provider fetch this frame: identity is ready, nothing
@@ -1697,7 +1657,6 @@ pub(crate) fn dolphin_provider_auto_fetch_needed(workflow: &CheatWorkflowState) 
         && matches!(workflow.dolphin_provider, CheatStepResource::NotLoaded)
 }
 
-
 pub(crate) fn wii_gamehacking_auto_match_needed(workflow: &CheatWorkflowState) -> bool {
     workflow.adapter == CheatEmulatorAdapter::Dolphin
         && workflow.platform.as_deref() == Some("Wii")
@@ -1708,14 +1667,12 @@ pub(crate) fn wii_gamehacking_auto_match_needed(workflow: &CheatWorkflowState) -
         && workflow.gamecube_gamehacking_request.is_none()
 }
 
-
 /// Xenia's counterpart to `dolphin_provider_auto_fetch_needed`.
 pub(crate) fn xenia_provider_auto_fetch_needed(workflow: &CheatWorkflowState) -> bool {
     workflow.adapter == CheatEmulatorAdapter::Xenia
         && matches!(workflow.identity, CheatStepResource::Ready(_))
         && matches!(workflow.xenia_provider, CheatStepResource::NotLoaded)
 }
-
 
 pub(crate) fn platform_is_xenia(platform: Option<&str>) -> bool {
     platform.is_some_and(|platform| {
@@ -1724,7 +1681,6 @@ pub(crate) fn platform_is_xenia(platform: Option<&str>) -> bool {
             .any(|candidate| platform.eq_ignore_ascii_case(candidate))
     })
 }
-
 
 /// Routes one canonical library platform to exactly one workflow. This is
 /// intentionally not a UI preference: rendering two adapters against one
@@ -1745,7 +1701,6 @@ pub(crate) fn cheat_adapter_route(platform: Option<&str>) -> CheatEmulatorAdapte
         CheatEmulatorAdapter::Unsupported
     }
 }
-
 
 pub(crate) fn show_pcsx2_workflow(
     ui: &mut egui::Ui,
@@ -1956,7 +1911,6 @@ pub(crate) fn show_pcsx2_workflow(
     show_pcsx2_gamehacking(ui, workflow, cheats_directory.as_deref()).or(action)
 }
 
-
 /// The beginner-facing entry point: a plain-English status, a simplified
 /// compatible-candidate checklist, one-click install, and Undo, with
 /// every technical control from the previous numbered-stage page moved
@@ -1998,7 +1952,6 @@ pub(crate) fn show_dolphin_workflow(
     }
     action
 }
-
 
 /// Renders the plain-English status, the compatible-candidate checklist,
 /// the profile chooser (when one is needed), the one-click "Install
@@ -2188,7 +2141,6 @@ pub(crate) fn show_dolphin_beginner_summary(
     action
 }
 
-
 /// The profile chooser: shown only while `select_emulator_profile` has
 /// found more than one valid Dolphin profile and nothing has been
 /// remembered or explicitly chosen yet. One concise choice, remembered
@@ -2249,7 +2201,6 @@ pub(crate) fn show_dolphin_profile_chooser(
     });
     action
 }
-
 
 /// The beginner confirmation dialog shown once "Install selected" has
 /// built and moved to the review stage - shared verbatim by Dolphin and
@@ -2323,7 +2274,6 @@ pub(crate) fn show_beginner_install_confirm(
     action
 }
 
-
 /// The beginner "installed"/Undo state shown once a beginner install has
 /// been applied - shared by Dolphin and Xenia for the same reason as
 /// `show_beginner_install_confirm`.
@@ -2388,7 +2338,6 @@ pub(crate) fn show_beginner_install_result(
     });
     action
 }
-
 
 pub(crate) fn show_dolphin_workflow_details(
     ui: &mut egui::Ui,
@@ -2592,7 +2541,6 @@ pub(crate) fn show_dolphin_workflow_details(
     action
 }
 
-
 pub(crate) fn ensure_dolphin_provider_destination(
     workflow: &mut CheatWorkflowState,
     profiles: &DolphinProfilesState,
@@ -2639,7 +2587,6 @@ pub(crate) fn ensure_dolphin_provider_destination(
         }
     }
 }
-
 
 pub(crate) fn show_dolphin_external_provider(
     ui: &mut egui::Ui,
@@ -2815,7 +2762,6 @@ pub(crate) fn show_dolphin_external_provider(
     action
 }
 
-
 pub(crate) fn show_dolphin_provider_code_picker(
     ui: &mut egui::Ui,
     workflow: &CheatWorkflowState,
@@ -2926,7 +2872,6 @@ pub(crate) fn show_dolphin_provider_code_picker(
     action
 }
 
-
 pub(crate) fn xenia_compatibility_label(
     compatibility: XeniaCandidateCompatibility,
 ) -> (&'static str, widgets::StatusTone) {
@@ -2941,7 +2886,6 @@ pub(crate) fn xenia_compatibility_label(
     }
 }
 
-
 pub(crate) fn eligible_xenia_profile_ids(discovery: &XeniaProfileDiscovery) -> Vec<&str> {
     discovery
         .profiles
@@ -2951,14 +2895,15 @@ pub(crate) fn eligible_xenia_profile_ids(discovery: &XeniaProfileDiscovery) -> V
         .collect()
 }
 
-
 /// Maps Xenia's own discovery result into the adapter-agnostic shape
 /// `select_emulator_profile` understands. Every Xenia profile EmuWiz
 /// can discover is already an explicit, caller-supplied directory (there
 /// is no single native Xenia Canary path to guess), so none of them are
 /// singled out as "the portable one" - `is_portable` is left `false` for
 /// all of them and the tie-break never fires for this adapter.
-pub(crate) fn xenia_profile_candidates(discovery: &XeniaProfileDiscovery) -> Vec<EmulatorProfileCandidate> {
+pub(crate) fn xenia_profile_candidates(
+    discovery: &XeniaProfileDiscovery,
+) -> Vec<EmulatorProfileCandidate> {
     discovery
         .profiles
         .iter()
@@ -2971,7 +2916,6 @@ pub(crate) fn xenia_profile_candidates(discovery: &XeniaProfileDiscovery) -> Vec
         })
         .collect()
 }
-
 
 /// If exactly one candidate document was returned for this Title ID,
 /// silently selects it - Xenia's provider dataset can legitimately have
@@ -3000,7 +2944,6 @@ pub(crate) fn xenia_auto_select_single_candidate(workflow: &mut CheatWorkflowSta
         workflow.xenia_selected_candidate_index = Some(0);
     }
 }
-
 
 /// Beginner counterpart of `dolphin_beginner_status`/
 /// `show_dolphin_beginner_summary` - see those for the shared design.
@@ -3195,7 +3138,6 @@ pub(crate) fn show_xenia_beginner_summary(
     action
 }
 
-
 /// Xenia's counterpart to `show_dolphin_profile_chooser`.
 pub(crate) fn show_xenia_profile_chooser(
     ui: &mut egui::Ui,
@@ -3235,7 +3177,6 @@ pub(crate) fn show_xenia_profile_chooser(
     action
 }
 
-
 /// Route to Xbox 360/Xenia only: this page never shows Dolphin or
 /// RetroArch controls, matching every other adapter's dedicated workflow.
 pub(crate) fn show_xenia_workflow(
@@ -3263,7 +3204,6 @@ pub(crate) fn show_xenia_workflow(
     }
     action
 }
-
 
 pub(crate) fn show_xenia_workflow_details(
     ui: &mut egui::Ui,
@@ -3384,7 +3324,6 @@ pub(crate) fn show_xenia_workflow_details(
     action
 }
 
-
 pub(crate) fn show_xenia_profile_card(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -3438,12 +3377,14 @@ pub(crate) fn show_xenia_profile_card(
     });
 }
 
-
 /// Recomputes which real destination file the currently chosen candidate
 /// (if any) would install to, and (re)loads it. Called every render, the
 /// same way `ensure_dolphin_provider_destination` is - cheap, bounded,
 /// local reads only.
-pub(crate) fn ensure_xenia_selection_state(workflow: &mut CheatWorkflowState, profiles: &XeniaProfilesState) {
+pub(crate) fn ensure_xenia_selection_state(
+    workflow: &mut CheatWorkflowState,
+    profiles: &XeniaProfilesState,
+) {
     let (Some(profile_id), CheatStepResource::Ready(fetch), Some(candidate_index)) = (
         workflow.selected_xenia_profile_id.as_deref(),
         &workflow.xenia_provider,
@@ -3504,7 +3445,6 @@ pub(crate) fn ensure_xenia_selection_state(workflow: &mut CheatWorkflowState, pr
         }
     }
 }
-
 
 pub(crate) fn show_xenia_external_provider(
     ui: &mut egui::Ui,
@@ -3658,7 +3598,6 @@ pub(crate) fn show_xenia_external_provider(
     action
 }
 
-
 /// Stage 2b: which of the (possibly several) returned candidate documents
 /// to work with. Xenia's own dataset legitimately has multiple files per
 /// Title ID (Title Update / module-hash variants); the user always
@@ -3736,7 +3675,6 @@ pub(crate) fn show_xenia_candidate_picker(
     }
     action
 }
-
 
 /// Stage 3: the chosen candidate's own patches.
 pub(crate) fn show_xenia_patch_picker(
@@ -3853,7 +3791,6 @@ pub(crate) fn show_xenia_patch_picker(
     action
 }
 
-
 /// Stage 4: exactly what installing would write - the Xenia equivalent
 /// of `show_generated_install_preview`/`show_dolphin_generated_install_preview`.
 pub(crate) fn show_xenia_generated_install_preview(
@@ -3881,7 +3818,6 @@ pub(crate) fn show_xenia_generated_install_preview(
         });
     });
 }
-
 
 /// Dolphin Stage 3/4: matches the verified game ID against the inspected
 /// profile's own GameSettings files and, once matched, lets the user pick
@@ -3942,7 +3878,6 @@ pub(crate) fn show_dolphin_candidate_and_selection(
     action
 }
 
-
 #[cfg(any())]
 pub(crate) fn show_dolphin_candidate_evidence(
     ui: &mut egui::Ui,
@@ -3972,7 +3907,6 @@ pub(crate) fn show_dolphin_candidate_evidence(
         }
     });
 }
-
 
 /// Dolphin Stage 4: the matched file's own Gecko codes, in file order.
 #[cfg(any())]
@@ -4084,7 +4018,6 @@ pub(crate) fn show_dolphin_code_picker(
     action
 }
 
-
 /// Stage 5: exactly what installing would write, before anything is
 /// written - the Dolphin equivalent of `show_generated_install_preview`.
 pub(crate) fn show_dolphin_generated_install_preview(
@@ -4135,7 +4068,6 @@ pub(crate) fn show_dolphin_generated_install_preview(
         });
     });
 }
-
 
 pub(crate) fn show_dolphin_profile_card(
     ui: &mut egui::Ui,
@@ -4224,7 +4156,6 @@ pub(crate) fn show_dolphin_profile_card(
     });
 }
 
-
 /// A checked radio button only says which destination the workflow is bound
 /// to. It does not prove Dolphin is running. Runtime wording therefore needs
 /// both the selection reason and the profile's verified runtime confidence.
@@ -4253,7 +4184,6 @@ pub(crate) fn dolphin_profile_selection_badge(
         _ => None,
     }
 }
-
 
 pub(crate) fn show_dolphin_inventory(
     ui: &mut egui::Ui,
@@ -4379,7 +4309,6 @@ pub(crate) fn show_dolphin_inventory(
     }
 }
 
-
 pub(crate) fn show_dolphin_installation_unavailable(ui: &mut egui::Ui) {
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(ui, "Preview and controlled installation", None);
@@ -4391,7 +4320,6 @@ pub(crate) fn show_dolphin_installation_unavailable(ui: &mut egui::Ui) {
     );
 }
 
-
 pub(crate) fn dolphin_installation_label(kind: DolphinInstallationType) -> &'static str {
     match kind {
         DolphinInstallationType::Native => "Native",
@@ -4402,7 +4330,6 @@ pub(crate) fn dolphin_installation_label(kind: DolphinInstallationType) -> &'sta
     }
 }
 
-
 pub(crate) fn dolphin_scope_label(scope: DolphinProfileScope) -> &'static str {
     match scope {
         DolphinProfileScope::User => "User profile",
@@ -4410,7 +4337,6 @@ pub(crate) fn dolphin_scope_label(scope: DolphinProfileScope) -> &'static str {
         DolphinProfileScope::Explicit => "Explicit scope",
     }
 }
-
 
 pub(crate) fn dolphin_directory_state_label(state: DolphinSettingsDirectoryState) -> &'static str {
     match state {
@@ -4422,8 +4348,9 @@ pub(crate) fn dolphin_directory_state_label(state: DolphinSettingsDirectoryState
     }
 }
 
-
-pub(crate) fn dolphin_directory_state_tone(state: DolphinSettingsDirectoryState) -> widgets::StatusTone {
+pub(crate) fn dolphin_directory_state_tone(
+    state: DolphinSettingsDirectoryState,
+) -> widgets::StatusTone {
     match state {
         DolphinSettingsDirectoryState::Available => widgets::StatusTone::Success,
         DolphinSettingsDirectoryState::Missing => widgets::StatusTone::Pending,
@@ -4434,8 +4361,9 @@ pub(crate) fn dolphin_directory_state_tone(state: DolphinSettingsDirectoryState)
     }
 }
 
-
-pub(crate) fn dolphin_match_presentation(state: DolphinMatchState) -> (&'static str, widgets::StatusTone) {
+pub(crate) fn dolphin_match_presentation(
+    state: DolphinMatchState,
+) -> (&'static str, widgets::StatusTone) {
     match state {
         DolphinMatchState::ExactGameIdMatch | DolphinMatchState::ExactGameIdAndRevisionMatch => (
             "Exact verified identity match",
@@ -4456,7 +4384,6 @@ pub(crate) fn dolphin_match_presentation(state: DolphinMatchState) -> (&'static 
         }
     }
 }
-
 
 pub(crate) fn show_pcsx2_profile_card(
     ui: &mut egui::Ui,
@@ -4514,7 +4441,6 @@ pub(crate) fn show_pcsx2_profile_card(
         });
     });
 }
-
 
 pub(crate) fn show_pcsx2_inventory(
     ui: &mut egui::Ui,
@@ -4659,7 +4585,6 @@ pub(crate) fn show_pcsx2_inventory(
         });
     }
 }
-
 
 pub(crate) fn show_pcsx2_gamehacking(
     ui: &mut egui::Ui,
@@ -4947,7 +4872,6 @@ pub(crate) fn show_pcsx2_gamehacking(
     action
 }
 
-
 /// The buttons offered when live GameHacking.org access is blocked. Kept
 /// separate from the banner so the exact required wording lives in one
 /// place and the same row can be reused by both platforms.
@@ -4984,7 +4908,6 @@ pub(crate) fn show_browser_import_blocked_banner(
     action
 }
 
-
 /// Shows why the browser-assisted import panel could not be opened.
 /// These are all local, actionable reasons - never an HTTP failure.
 pub(crate) fn show_browser_import_open_error(ui: &mut egui::Ui, workflow: &CheatWorkflowState) {
@@ -4993,7 +4916,6 @@ pub(crate) fn show_browser_import_open_error(ui: &mut egui::Ui, workflow: &Cheat
         widgets::banner(ui, headline, detail, widgets::StatusTone::Blocked);
     }
 }
-
 
 /// The browser-assisted import panel. Shows every fact the person needs
 /// before handing anything over - platform, local game, verified local
@@ -5213,7 +5135,6 @@ pub(crate) fn show_browser_import(
     });
     action
 }
-
 
 /// GameCube-only GameHacking.org coverage: shows the matched title and
 /// GameHacking game ID, the exact match evidence, and named cheats with
@@ -5680,7 +5601,6 @@ pub(crate) fn show_gamecube_gamehacking(
     action
 }
 
-
 /// The BSFree Archive GameCube section inside Cheats & Mods: search the
 /// optional local SQLite database by the selected archive's title, confirm a
 /// candidate when several match, select supported cheats, and install through
@@ -5923,7 +5843,6 @@ pub(crate) fn show_bsfree_gamecube(
     action
 }
 
-
 /// Per-cheat status for the BSFree Wii list, using the destination-based
 /// analysis computed when the search completed. The finding vocabulary is the
 /// shared generalized one, so the states ("Ready", "Already installed",
@@ -5957,7 +5876,6 @@ pub(crate) fn bsfree_wii_cheat_status(
     ("Ready", widgets::StatusTone::Success)
 }
 
-
 /// Concise browse-only reason for an unsupported/malformed BSFree Wii code.
 pub(crate) fn bsfree_wii_browse_only_reason(code_format: BsFreeWiiCodeFormat) -> &'static str {
     match code_format {
@@ -5972,7 +5890,6 @@ pub(crate) fn bsfree_wii_browse_only_reason(code_format: BsFreeWiiCodeFormat) ->
         }
     }
 }
-
 
 /// The BSFree Wii section in Cheats & Mods. Mirrors `show_bsfree_gamecube`;
 /// only the verified hex-pair subset is selectable, and identity is the
@@ -6216,7 +6133,6 @@ pub(crate) fn show_bsfree_wii(
     action
 }
 
-
 /// Per-cheat status for the BSFree list, using the destination-based analysis
 /// computed when the search completed. Never exposes raw converter terminology
 /// by default.
@@ -6249,7 +6165,6 @@ pub(crate) fn bsfree_cheat_status(
     ("Ready", widgets::StatusTone::Success)
 }
 
-
 /// Concise browse-only reason for an unsupported/malformed BSFree code.
 pub(crate) fn bsfree_browse_only_reason(code_format: BsFreeGameCubeCodeFormat) -> &'static str {
     match code_format {
@@ -6263,7 +6178,6 @@ pub(crate) fn bsfree_browse_only_reason(code_format: BsFreeGameCubeCodeFormat) -
         }
     }
 }
-
 
 /// The BSFree review card: selected game, Dolphin profile, selected cheat
 /// count, files that would change, already-installed items, conflicts, and
@@ -6443,7 +6357,6 @@ pub(crate) fn show_bsfree_review_card(
     action
 }
 
-
 /// The BSFree install result card: how many cheats were added, the
 /// already-installed/skipped/conflict/unsupported details from the provider's
 /// analysis, and Undo (rollback) through the same shared history flow every
@@ -6568,7 +6481,6 @@ pub(crate) fn show_bsfree_install_result(
     action
 }
 
-
 pub(crate) fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static str {
     match kind {
         Pcsx2InstallationType::Native => "Native",
@@ -6579,7 +6491,6 @@ pub(crate) fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static 
     }
 }
 
-
 pub(crate) fn pcsx2_scope_label(scope: Pcsx2ProfileScope) -> &'static str {
     match scope {
         Pcsx2ProfileScope::User => "User profile",
@@ -6587,7 +6498,6 @@ pub(crate) fn pcsx2_scope_label(scope: Pcsx2ProfileScope) -> &'static str {
         Pcsx2ProfileScope::Portable => "Portable scope",
     }
 }
-
 
 pub(crate) fn pcsx2_category_label(category: Pcsx2PatchCategory) -> &'static str {
     match category {
@@ -6598,7 +6508,6 @@ pub(crate) fn pcsx2_category_label(category: Pcsx2PatchCategory) -> &'static str
     }
 }
 
-
 pub(crate) fn pcsx2_directory_state_label(state: Pcsx2PatchDirectoryState) -> &'static str {
     match state {
         Pcsx2PatchDirectoryState::Available => "Exists",
@@ -6608,7 +6517,6 @@ pub(crate) fn pcsx2_directory_state_label(state: Pcsx2PatchDirectoryState) -> &'
         Pcsx2PatchDirectoryState::Unreadable => "Unreadable",
     }
 }
-
 
 pub(crate) fn pcsx2_directory_state_tone(state: Pcsx2PatchDirectoryState) -> widgets::StatusTone {
     match state {
@@ -6621,8 +6529,9 @@ pub(crate) fn pcsx2_directory_state_tone(state: Pcsx2PatchDirectoryState) -> wid
     }
 }
 
-
-pub(crate) fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str, widgets::StatusTone) {
+pub(crate) fn pcsx2_match_presentation(
+    state: Pcsx2MatchState,
+) -> (&'static str, widgets::StatusTone) {
     match state {
         Pcsx2MatchState::ExactCrcMatch => ("Exact CRC match", widgets::StatusTone::Success),
         Pcsx2MatchState::MultiplePnachFilesForSameCrc => {
@@ -6648,7 +6557,6 @@ pub(crate) fn pcsx2_match_presentation(state: Pcsx2MatchState) -> (&'static str,
     }
 }
 
-
 pub(crate) fn ready_game_identity(workflow: &CheatWorkflowState) -> Option<&GameIdentityReport> {
     match &workflow.identity {
         CheatStepResource::Ready((request, report))
@@ -6663,8 +6571,9 @@ pub(crate) fn ready_game_identity(workflow: &CheatWorkflowState) -> Option<&Game
     }
 }
 
-
-pub(crate) fn pcsx2_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<Pcsx2GameIdentity> {
+pub(crate) fn pcsx2_identity_for_workflow(
+    workflow: &CheatWorkflowState,
+) -> Option<Pcsx2GameIdentity> {
     let report = ready_game_identity(workflow)?;
     let mut identity = Pcsx2GameIdentity::from_report(workflow.display_name.clone(), report);
     if workflow.region.is_some() {
@@ -6673,15 +6582,15 @@ pub(crate) fn pcsx2_identity_for_workflow(workflow: &CheatWorkflowState) -> Opti
     Some(identity)
 }
 
-
-pub(crate) fn gamecube_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<GameCubeGameIdentity> {
+pub(crate) fn gamecube_identity_for_workflow(
+    workflow: &CheatWorkflowState,
+) -> Option<GameCubeGameIdentity> {
     let report = ready_game_identity(workflow)?;
     Some(GameCubeGameIdentity::from_report(
         workflow.display_name.clone(),
         report,
     ))
 }
-
 
 /// Opens the installed, validated BSFree Archive SQLite catalogue (the pinned
 /// SHA-256 re-validation makes this too heavy for the UI thread, so it only
@@ -6690,7 +6599,6 @@ pub(crate) fn open_installed_bsfree_catalogue() -> Result<BsFreeCatalogue, Strin
     let paths = BsFreePaths::at(default_bsfree_source_root().map_err(|error| error.to_string())?);
     BsFreeCatalogue::open_installed(&paths).map_err(|error| error.to_string())
 }
-
 
 /// Builds the GUI state from a BSFree search/confirm outcome.
 pub(crate) fn bsfree_gui_state_from_outcome(
@@ -6711,7 +6619,6 @@ pub(crate) fn bsfree_gui_state_from_outcome(
     }
 }
 
-
 pub(crate) fn bsfree_wii_gui_state_from_outcome(
     outcome: BsFreeWiiSearchOutcome,
     search_title: String,
@@ -6729,7 +6636,6 @@ pub(crate) fn bsfree_wii_gui_state_from_outcome(
         search_title,
     }
 }
-
 
 pub(crate) fn bsfree_wii_gui_state_from_matched(
     upstream_uid: i64,
@@ -6758,7 +6664,6 @@ pub(crate) fn bsfree_wii_gui_state_from_matched(
     }
 }
 
-
 pub(crate) fn wii_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<WiiGameIdentity> {
     let report = ready_game_identity(workflow)?;
     Some(WiiGameIdentity::from_report(
@@ -6766,7 +6671,6 @@ pub(crate) fn wii_identity_for_workflow(workflow: &CheatWorkflowState) -> Option
         report,
     ))
 }
-
 
 /// Whether the current shared transaction/preview belongs to the BSFree
 /// GameCube or Wii flow rather than the GameHacking.org flow. The sources
@@ -6780,7 +6684,6 @@ pub(crate) fn bsfree_transaction_active(workflow: &CheatWorkflowState) -> bool {
                 || response.bsfree_wii_generated.is_some()
     )
 }
-
 
 pub(crate) fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
     let profile_id = match workflow.adapter {
@@ -6804,7 +6707,6 @@ pub(crate) fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRe
     }
 }
 
-
 pub(crate) fn preview_identity(
     workflow: &CheatWorkflowState,
     kind: PreviewIdentityKind,
@@ -6824,7 +6726,6 @@ pub(crate) fn preview_identity(
     }
 }
 
-
 /// The selected profile's own resolved cheat directory, or `None` when no
 /// eligible profile is selected or its path cannot be represented exactly.
 /// EmuWiz never invents a default cheat directory.
@@ -6843,7 +6744,6 @@ pub(crate) fn selected_retroarch_cheat_root(
     let root = profile.cheat_destination_root.as_ref()?;
     (!root.lossy).then(|| PathBuf::from(&root.display))
 }
-
 
 /// The content file's basename without extension - the strongest filename
 /// identity available, and the name RetroArch itself shows for the content.
@@ -6868,7 +6768,6 @@ pub(crate) fn cheat_content_basename(workflow: &CheatWorkflowState) -> Option<St
 /// visibly different state for the two ("blocked with an exact reason" vs
 /// "failed with an exact error" - both required, and distinguishable).
 pub(crate) const CHEAT_MATCH_BLOCKED_PREFIX: &str = "\u{1}blocked\u{1}";
-
 
 /// Gathers everything stage 4 needs, or explains exactly why it cannot
 /// start yet. Assumes the caller has already confirmed the adapter and
@@ -6905,7 +6804,6 @@ pub(crate) fn build_cheat_candidate_request(
         },
     ))
 }
-
 
 /// Binds the currently selected RetroArch game into the identity and
 /// destination the local-cheat-file install action needs - the same
@@ -6963,7 +6861,6 @@ pub(crate) fn local_cheat_install_context(
     user_cheat_import_page::LocalCheatInstallContext { game, destination }
 }
 
-
 /// Binds the currently selected PCSX2 game into the identity and profile
 /// the local-`.pnach`-file install action needs, the same way
 /// `local_cheat_install_context` binds RetroArch's. `profile` is `None`
@@ -6989,7 +6886,6 @@ pub(crate) fn local_pcsx2_install_context(
         });
     Some(user_cheat_import_page::LocalPcsx2InstallContext { identity, profile })
 }
-
 
 /// Binds the currently selected Dolphin game into the already-resolved
 /// candidate and profile the local-`.ini`-file install action needs -
@@ -7044,7 +6940,6 @@ pub(crate) fn local_dolphin_install_context(
     })
 }
 
-
 /// Binds the local Xenia picker to the selected game's already-resolved XEX
 /// Title ID and the explicitly selected eligible Xenia profile. No provider
 /// lookup is performed: this context is entirely local and read-only.
@@ -7071,7 +6966,6 @@ pub(crate) fn local_xenia_install_context(
     user_cheat_import_page::LocalXeniaInstallContext { title_id, profile }
 }
 
-
 /// The private directory generated cheat files are staged into before they
 /// enter the transaction pipeline. Kept beside the other managed roots so
 /// it is never a directory the user browses or an emulator reads.
@@ -7084,7 +6978,6 @@ pub(crate) fn default_generated_cheat_staging_root() -> Result<PathBuf, String> 
         })
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
-
 
 /// The private directory staged Dolphin GameSettings files are written
 /// into before they enter the transaction pipeline - the Dolphin
@@ -7103,7 +6996,6 @@ pub(crate) fn default_generated_pcsx2_local_staging_root() -> Result<PathBuf, St
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
-
 /// The private directory a local Dolphin `.ini` install stages its merged
 /// GameSettings output into before it enters the transaction pipeline -
 /// kept separate from the provider-driven `generated-dolphin` staging
@@ -7119,7 +7011,6 @@ pub(crate) fn default_generated_dolphin_local_staging_root() -> Result<PathBuf, 
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
-
 pub(crate) fn default_generated_dolphin_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
         .map(|root| {
@@ -7129,7 +7020,6 @@ pub(crate) fn default_generated_dolphin_staging_root() -> Result<PathBuf, String
         })
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
-
 
 /// The private directory staged GameHacking.org GameCube installs are
 /// written into - kept separate from `generated-dolphin` (the bundled
@@ -7145,8 +7035,9 @@ pub(crate) fn default_generated_gamecube_gamehacking_staging_root() -> Result<Pa
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
-
-pub(crate) fn default_generated_dolphin_gamehacking_staging_root(is_wii: bool) -> Result<PathBuf, String> {
+pub(crate) fn default_generated_dolphin_gamehacking_staging_root(
+    is_wii: bool,
+) -> Result<PathBuf, String> {
     if !is_wii {
         return default_generated_gamecube_gamehacking_staging_root();
     }
@@ -7159,7 +7050,6 @@ pub(crate) fn default_generated_dolphin_gamehacking_staging_root(is_wii: bool) -
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
 
-
 pub(crate) fn default_generated_xenia_staging_root() -> Result<PathBuf, String> {
     default_shared_backup_root()
         .map(|root| {
@@ -7169,7 +7059,6 @@ pub(crate) fn default_generated_xenia_staging_root() -> Result<PathBuf, String> 
         })
         .map_err(|error| format!("Staging root unavailable: {}", error.detail))
 }
-
 
 pub(crate) fn build_cheat_preview_request(
     workflow: &CheatWorkflowState,
@@ -7341,7 +7230,6 @@ pub(crate) fn build_cheat_preview_request(
     }
 }
 
-
 pub(crate) fn identity_status_tone(status: IdentityStatus) -> widgets::StatusTone {
     match status {
         IdentityStatus::Verified => widgets::StatusTone::Success,
@@ -7354,7 +7242,6 @@ pub(crate) fn identity_status_tone(status: IdentityStatus) -> widgets::StatusTon
         IdentityStatus::Invalid | IdentityStatus::Unsupported => widgets::StatusTone::Blocked,
     }
 }
-
 
 pub(crate) fn show_shared_game_identity(
     ui: &mut egui::Ui,
@@ -7505,7 +7392,6 @@ pub(crate) fn show_shared_game_identity(
     }
 }
 
-
 pub(crate) fn show_cheat_source_modes(
     ui: &mut egui::Ui,
     workflow: &mut CheatWorkflowState,
@@ -7590,7 +7476,6 @@ pub(crate) fn show_cheat_source_modes(
     });
     None
 }
-
 
 pub(crate) fn show_existing_retroarch_library(
     ui: &mut egui::Ui,
@@ -7714,7 +7599,6 @@ pub(crate) fn show_existing_retroarch_library(
     }
 }
 
-
 pub(crate) fn retroarch_local_match_presentation(
     state: RetroArchLocalCheatMatchState,
 ) -> (&'static str, widgets::StatusTone) {
@@ -7746,7 +7630,6 @@ pub(crate) fn retroarch_local_match_presentation(
     }
 }
 
-
 pub(crate) fn retroarch_library_state_presentation(
     state: RetroArchCheatLibraryState,
 ) -> (&'static str, widgets::StatusTone) {
@@ -7764,7 +7647,6 @@ pub(crate) fn retroarch_library_state_presentation(
         }
     }
 }
-
 
 /// Step 2 of the cheat workflow: the built-in trusted source list, the
 /// cached snapshot's provenance/digest/freshness, and retrieval
@@ -8045,7 +7927,6 @@ pub(crate) fn show_cheat_workflow_step2(
     action
 }
 
-
 /// Why an exact-archive Cheats & Mods entry point is unavailable. Profile
 /// readiness is deliberately not a navigation gate: the full page owns
 /// profile discovery and truthfully presents blocked states.
@@ -8075,7 +7956,6 @@ pub(crate) fn cheat_entry_blocker(
     None
 }
 
-
 /// The eligible profile IDs in a discovery, in discovery order.
 pub(crate) fn eligible_profile_ids(discovery: &RetroArchCheatSetupDiscovery) -> Vec<&str> {
     discovery
@@ -8086,7 +7966,6 @@ pub(crate) fn eligible_profile_ids(discovery: &RetroArchCheatSetupDiscovery) -> 
         .collect()
 }
 
-
 pub(crate) fn eligible_pcsx2_profile_ids(discovery: &Pcsx2ProfileDiscovery) -> Vec<&str> {
     discovery
         .profiles
@@ -8095,7 +7974,6 @@ pub(crate) fn eligible_pcsx2_profile_ids(discovery: &Pcsx2ProfileDiscovery) -> V
         .map(|profile| profile.profile_id.as_str())
         .collect()
 }
-
 
 /// Resolves the exact cheats directory for the currently selected PCSX2
 /// profile, or `None` when it cannot be confidently identified (profile not
@@ -8117,7 +7995,6 @@ pub(crate) fn resolved_pcsx2_cheats_directory(
         .map(Path::to_path_buf)
 }
 
-
 pub(crate) fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) -> Vec<&str> {
     discovery
         .profiles
@@ -8126,7 +8003,6 @@ pub(crate) fn eligible_dolphin_profile_ids(discovery: &DolphinProfileDiscovery) 
         .map(|profile| profile.profile_id.as_str())
         .collect()
 }
-
 
 /// Standard roots are rediscovered from current filesystem/runtime evidence;
 /// they are not reintroduced as user-confirmed overrides from profile memory.
@@ -8138,7 +8014,6 @@ pub(crate) fn is_dolphin_standard_fallback_root(root: &Path) -> bool {
         || root == home.join(".var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu")
         || root == home.join(".var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu")
 }
-
 
 /// Rebinds an already-fetched Dolphin result to the newly selected local
 /// profile. Provider loading and profile discovery run concurrently, so
@@ -8165,7 +8040,6 @@ pub(crate) fn reconcile_dolphin_provider_selection(
     bind_dolphin_provider_to_configuration(workflow, &configuration_path);
 }
 
-
 pub(crate) fn bind_dolphin_provider_to_configuration(
     workflow: &mut CheatWorkflowState,
     configuration_path: &Path,
@@ -8189,7 +8063,6 @@ pub(crate) fn bind_dolphin_provider_to_configuration(
         }
     }
 }
-
 
 /// Step 1 of the cheat workflow: archive identity plus explicit profile
 /// selection. Renders from the shared `RetroArchProfilesState` (the
@@ -8318,4 +8191,3 @@ pub(crate) fn show_cheat_workflow_step1(
     }
     action
 }
-

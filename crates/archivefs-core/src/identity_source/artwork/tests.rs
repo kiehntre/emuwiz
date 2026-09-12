@@ -269,7 +269,10 @@ fn approved_launchbox_screenshot_is_fetched_without_romm_credentials() {
         .expect("approved LaunchBox host should use the existing fetch/cache path");
     assert!(result.path.exists());
     assert_eq!(server.request_count(), 1);
-    assert!(!server.requests()[0].1, "public CDN requests never carry RomM credentials");
+    assert!(
+        !server.requests()[0].1,
+        "public CDN requests never carry RomM credentials"
+    );
 }
 
 #[test]
@@ -289,7 +292,10 @@ fn launchbox_policy_rejects_http_lookalikes_ports_and_oversized_paths() {
         credential_url.as_str(),
         "https://images.launchbox-app.com:8443/a.png",
     ] {
-        assert!(validate_launchbox_url(url).is_err(), "{url} must be refused");
+        assert!(
+            validate_launchbox_url(url).is_err(),
+            "{url} must be refused"
+        );
     }
     let oversized = format!("https://images.launchbox-app.com/{}", "a".repeat(2049));
     assert!(validate_launchbox_url(&oversized).is_err());
@@ -309,7 +315,11 @@ fn launchbox_redirect_statuses_are_refused_without_following() {
             .fetch(
                 &source(),
                 &server,
-                &request("redirected", None, Some("https://images.launchbox-app.com/a.png")),
+                &request(
+                    "redirected",
+                    None,
+                    Some("https://images.launchbox-app.com/a.png"),
+                ),
                 1_000,
                 None,
             )

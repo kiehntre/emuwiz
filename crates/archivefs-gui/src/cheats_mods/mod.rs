@@ -21,6 +21,6 @@ mod render;
 mod state;
 
 pub(crate) use actions::*;
+pub(crate) use controller::*;
 pub(crate) use render::*;
 pub(crate) use state::*;
-pub(crate) use controller::*;

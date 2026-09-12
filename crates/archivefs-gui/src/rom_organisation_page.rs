@@ -1180,7 +1180,10 @@ fn destination_card_layout(available_width: f32, card_count: usize) -> Destinati
     let card_width = ((available_width - DESTINATION_CARD_GAP * columns.saturating_sub(1) as f32)
         / columns as f32)
         .clamp(0.0, DESTINATION_CARD_MAX_WIDTH);
-    DestinationCardLayout { columns, card_width }
+    DestinationCardLayout {
+        columns,
+        card_width,
+    }
 }
 
 fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
@@ -1194,21 +1197,37 @@ fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisation
                     |ui| {
                         widgets::card(ui, |ui| {
                             ui.label(egui::RichText::new(*title).strong());
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(*description).color(theme::muted(ui)),
-                            ).wrap());
-                            ui.label(egui::RichText::new("Source collection stays where it is.")
-                                .color(theme::muted(ui)).small());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(*description).color(theme::muted(ui)),
+                                )
+                                .wrap(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Source collection stays where it is.")
+                                    .color(theme::muted(ui))
+                                    .small(),
+                            );
                             let selected = state.playing_library.destination == *destination;
                             if selected {
-                                widgets::status_badge(ui, "Current choice", widgets::StatusTone::Active);
+                                widgets::status_badge(
+                                    ui,
+                                    "Current choice",
+                                    widgets::StatusTone::Active,
+                                );
                             }
                             if widgets::action_button(
                                 ui,
                                 "Choose",
-                                if selected { widgets::ActionStyle::Secondary } else { widgets::ActionStyle::Primary },
+                                if selected {
+                                    widgets::ActionStyle::Secondary
+                                } else {
+                                    widgets::ActionStyle::Primary
+                                },
                                 true,
-                            ).clicked() {
+                            )
+                            .clicked()
+                            {
                                 state.showing_playing_library = true;
                                 state.playing_library.set_destination(*destination);
                             }
@@ -2117,8 +2136,14 @@ mod tests {
         });
         assert!(rendered_text_contains(&output, "Build RomM library"));
         assert!(rendered_text_contains(&output, "Build ES-DE library"));
-        assert!(rendered_text_contains(&output, "Build generic playing library"));
-        assert!(rendered_text_contains(&output, "Source collection stays where it is."));
+        assert!(rendered_text_contains(
+            &output,
+            "Build generic playing library"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "Source collection stays where it is."
+        ));
     }
 
     #[test]

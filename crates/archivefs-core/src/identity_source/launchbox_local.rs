@@ -95,12 +95,13 @@ impl LaunchBoxLocalProviderIndex {
         title: Option<&str>,
     ) -> Option<LaunchBoxLookup<'a>> {
         if let Some(id) = database_id.and_then(non_empty)
-            && let Some(position) = resolve_unambiguous(&self.by_database_id, id) {
-                return self.games.get(position).map(|game| LaunchBoxLookup {
-                    game,
-                    strength: LaunchBoxMatchStrength::DatabaseId,
-                });
-            }
+            && let Some(position) = resolve_unambiguous(&self.by_database_id, id)
+        {
+            return self.games.get(position).map(|game| LaunchBoxLookup {
+                game,
+                strength: LaunchBoxMatchStrength::DatabaseId,
+            });
+        }
         if let Some(path) = application_path {
             let key = normalized_path(path);
             if let Some(position) = resolve_unambiguous(&self.by_exact_path, &key) {

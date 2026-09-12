@@ -15,4 +15,3 @@ pub(crate) struct RunningRommOperation {
     pub(crate) progress: Option<RommProgress>,
     pub(crate) cancellation_requested: bool,
 }
-

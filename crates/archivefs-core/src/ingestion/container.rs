@@ -187,7 +187,8 @@ fn list_sevenz_entry_names(path: &Path) -> Option<Vec<ArchiveEntryName>> {
     let parent = path.parent()?.canonicalize().ok()?;
     let trusted = TrustedRoots::from_paths([parent]);
     let cancel = AtomicBool::new(false);
-    let source = SevenZArchiveSource::open(path, &trusted, ArchiveLimits::default(), &cancel).ok()?;
+    let source =
+        SevenZArchiveSource::open(path, &trusted, ArchiveLimits::default(), &cancel).ok()?;
     source
         .member_metadata()
         .map(|(name, _size)| bounded_member_name(name))

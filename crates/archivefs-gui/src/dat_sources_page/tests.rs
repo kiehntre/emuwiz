@@ -4946,10 +4946,8 @@ fn fixture_recovery_transaction(
     // actionable; filesystem-uncertainty cases have dedicated real-journal
     // fixtures elsewhere.
     view.cleanup = RecoveryCleanupClassification::Actionable;
-    view.presentation = presentation::classify(
-        &transaction,
-        RecoveryCleanupClassification::Actionable,
-    );
+    view.presentation =
+        presentation::classify(&transaction, RecoveryCleanupClassification::Actionable);
     view.human_summary = human_summary.to_string();
     view
 }
@@ -5080,7 +5078,10 @@ fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collision
     for _ in 0..20 {
         scrolled = render(&ctx, scroll_into_list.clone(), &mut ui_state, &mut action);
     }
-    assert!(rendered_text_contains(&scrolled, "two equally-scored candidates"));
+    assert!(rendered_text_contains(
+        &scrolled,
+        "two equally-scored candidates"
+    ));
     assert!(rendered_text_count(&scrolled, "Technical classification details") >= 1);
     assert!(rendered_text_contains(&first, "Roll back transaction"));
     assert!(rendered_text_contains(&first, "Roll back completed steps"));

@@ -643,7 +643,7 @@ impl SevenZArchiveSource {
             ArchiveMemberContentResult, MemberProbeOutcome,
         };
         use crate::content_detector::stream_probe::{
-            probe_content_stream, MAX_COMPLETE_INPUT_BYTES,
+            MAX_COMPLETE_INPUT_BYTES, probe_content_stream,
         };
         use crate::inspector::InspectorEntryClassification;
 

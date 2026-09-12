@@ -337,7 +337,11 @@ pub fn canonical_platform_for_system(system: &str) -> Option<&'static str> {
         // ES-DE has both `genesis` and `megadrive` folders for the same
         // Mega Drive hardware; the reviewed forward mapping intentionally
         // chooses `megadrive`, so this reverse synonym reuses that row.
-        .or_else(|| system.eq_ignore_ascii_case("genesis").then_some("MegaDrive"))
+        .or_else(|| {
+            system
+                .eq_ignore_ascii_case("genesis")
+                .then_some("MegaDrive")
+        })
 }
 
 /// Parse one explicitly supplied gamelist using the reviewed mapping, then

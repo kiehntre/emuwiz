@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::diagnostics::profiles::assess_ppsspp_readiness;
 use crate::patch_manager::{
-    discover_ppsspp_profiles, parse_ppsspp_version, PpssppProfileDiscoveryRoots,
+    PpssppProfileDiscoveryRoots, discover_ppsspp_profiles, parse_ppsspp_version,
 };
 
 use super::{BootstrapContext, BootstrapError, BootstrapTarget};

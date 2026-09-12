@@ -2588,7 +2588,13 @@ pub(super) fn show_sources_discovery_tab(
     ui.heading("Local media providers");
     let esde_indexed = es_de_media
         .snapshot()
-        .map(|snapshot| snapshot.indexes.iter().map(|index| index.entries.len()).sum())
+        .map(|snapshot| {
+            snapshot
+                .indexes
+                .iter()
+                .map(|index| index.entries.len())
+                .sum()
+        })
         .unwrap_or(0);
     let esde_state = match es_de_media.state() {
         crate::es_de_media_state::EsDeProviderState::NotStarted => "Not configured",

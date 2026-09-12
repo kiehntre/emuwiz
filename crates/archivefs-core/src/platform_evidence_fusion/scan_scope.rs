@@ -75,9 +75,7 @@ impl ScanScopeCounts {
     pub fn record(&mut self, decision: AncillaryScanDecision) {
         self.files_checked += 1;
         match decision {
-            AncillaryScanDecision::ReuseCurrentClassification => {
-                self.reused_classifications += 1
-            }
+            AncillaryScanDecision::ReuseCurrentClassification => self.reused_classifications += 1,
             AncillaryScanDecision::DeepAnalyse => self.deeply_analysed += 1,
         }
     }
@@ -99,31 +97,61 @@ mod tests {
 
     #[test]
     fn only_current_unchanged_ancillary_roles_reuse() {
-        assert_eq!(facts(SideFileRole::Artwork).decision(ScanMode::Normal, false), AncillaryScanDecision::ReuseCurrentClassification);
-        assert_eq!(facts(SideFileRole::Manual).decision(ScanMode::Normal, false), AncillaryScanDecision::ReuseCurrentClassification);
-        assert_eq!(facts(SideFileRole::CueSheet).decision(ScanMode::Normal, false), AncillaryScanDecision::DeepAnalyse);
-        assert_eq!(facts(SideFileRole::PrimaryContent).decision(ScanMode::Normal, false), AncillaryScanDecision::DeepAnalyse);
+        assert_eq!(
+            facts(SideFileRole::Artwork).decision(ScanMode::Normal, false),
+            AncillaryScanDecision::ReuseCurrentClassification
+        );
+        assert_eq!(
+            facts(SideFileRole::Manual).decision(ScanMode::Normal, false),
+            AncillaryScanDecision::ReuseCurrentClassification
+        );
+        assert_eq!(
+            facts(SideFileRole::CueSheet).decision(ScanMode::Normal, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
+        assert_eq!(
+            facts(SideFileRole::PrimaryContent).decision(ScanMode::Normal, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
     }
 
     #[test]
     fn full_and_targeted_always_bypass_fast_path() {
         let f = facts(SideFileRole::Artwork);
-        assert_eq!(f.decision(ScanMode::Full, false), AncillaryScanDecision::DeepAnalyse);
-        assert_eq!(f.decision(ScanMode::Targeted, false), AncillaryScanDecision::DeepAnalyse);
-        assert_eq!(f.decision(ScanMode::Normal, true), AncillaryScanDecision::DeepAnalyse);
+        assert_eq!(
+            f.decision(ScanMode::Full, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
+        assert_eq!(
+            f.decision(ScanMode::Targeted, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
+        assert_eq!(
+            f.decision(ScanMode::Normal, true),
+            AncillaryScanDecision::DeepAnalyse
+        );
     }
 
     #[test]
     fn stale_changed_or_related_files_reanalyse() {
         let mut f = facts(SideFileRole::Artwork);
         f.file_unchanged = false;
-        assert_eq!(f.decision(ScanMode::Normal, false), AncillaryScanDecision::DeepAnalyse);
+        assert_eq!(
+            f.decision(ScanMode::Normal, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
         let mut f = facts(SideFileRole::Artwork);
         f.producer_current = false;
-        assert_eq!(f.decision(ScanMode::Normal, false), AncillaryScanDecision::DeepAnalyse);
+        assert_eq!(
+            f.decision(ScanMode::Normal, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
         let mut f = facts(SideFileRole::Artwork);
         f.dependency_required = true;
-        assert_eq!(f.decision(ScanMode::Normal, false), AncillaryScanDecision::DeepAnalyse);
+        assert_eq!(
+            f.decision(ScanMode::Normal, false),
+            AncillaryScanDecision::DeepAnalyse
+        );
     }
 
     #[test]
@@ -132,6 +160,9 @@ mod tests {
         c.record(AncillaryScanDecision::ReuseCurrentClassification);
         c.record(AncillaryScanDecision::DeepAnalyse);
         assert_eq!(c.files_checked, 2);
-        assert_eq!(c.reused_classifications + c.deeply_analysed, c.files_checked);
+        assert_eq!(
+            c.reused_classifications + c.deeply_analysed,
+            c.files_checked
+        );
     }
 }

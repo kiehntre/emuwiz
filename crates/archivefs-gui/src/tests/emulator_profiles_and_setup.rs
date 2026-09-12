@@ -1493,10 +1493,7 @@ fn cheats_mods_final_section_is_reachable_at_maximum_scroll() {
     };
     run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
     let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
-    assert_final_content_reachable(
-        &output,
-        "Recent related activity",
-    );
+    assert_final_content_reachable(&output, "Recent related activity");
 }
 
 #[test]
@@ -1512,10 +1509,7 @@ fn cheats_mods_final_section_is_reachable_at_a_smaller_viewport() {
     };
     run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
     let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
-    assert_final_content_reachable(
-        &output,
-        "Recent related activity",
-    );
+    assert_final_content_reachable(&output, "Recent related activity");
 }
 
 #[test]
@@ -1541,10 +1535,7 @@ fn resizing_the_window_does_not_reintroduce_clipping() {
     };
     run_settle_frames(&ctx, &mut app, &mut frame, &small_input, 3);
     let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &small_input, small);
-    assert_final_content_reachable(
-        &output,
-        "Recent related activity",
-    );
+    assert_final_content_reachable(&output, "Recent related activity");
 }
 
 /// Root-cause regression test for the bottom-clipping bug: egui's

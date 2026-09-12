@@ -2282,7 +2282,10 @@ fn doctor_page_shows_an_incomplete_result_rather_than_an_empty_screen() {
     let state = doctor_outcome(doctor_scan_from(&[]));
     let output = render_doctor_page(&state, &mut None);
     assert!(rendered_text_contains(&output, "Checks incomplete"));
-    assert!(!rendered_text_contains(&output, "No current problems found"));
+    assert!(!rendered_text_contains(
+        &output,
+        "No current problems found"
+    ));
     assert!(!rendered_text_contains(&output, "Critical: 0"));
 }
 

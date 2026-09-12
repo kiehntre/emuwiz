@@ -103,8 +103,7 @@ pub fn parse_dragon_coco_cas(bytes: &[u8]) -> Result<TapeAnalysis, TapeAnalysisE
     if blocks == MAX_BLOCKS {
         warnings.push("CAS block count reached the safety limit".into());
     }
-    let checksum = if checksums.contains(&ChecksumState::Invalid)
-    {
+    let checksum = if checksums.contains(&ChecksumState::Invalid) {
         ChecksumState::Invalid
     } else if checksums.contains(&ChecksumState::Valid) {
         ChecksumState::Valid

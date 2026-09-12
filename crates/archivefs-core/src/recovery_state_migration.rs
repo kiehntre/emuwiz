@@ -346,9 +346,10 @@ pub fn plan_recovery_state_migration(
                     ":entry:{}:source",
                     reference.entry_index.unwrap_or_default()
                 )) && proposal.reference_id.starts_with(&reference.transaction_id)
-            }) {
-                reference.proposal = proposal.clone();
-            }
+            })
+        {
+            reference.proposal = proposal.clone();
+        }
     }
     for reference in &references {
         if reference.disposition == RecoveryMigrationDisposition::Planner {

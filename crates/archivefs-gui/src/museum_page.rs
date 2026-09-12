@@ -847,22 +847,21 @@ fn show_selected_game_showcase(
     }
 
     if let Some(feature_view) = &game.feature_view
-        && let Some(feature_action) = crate::feature_discovery::show(ui, feature_view) {
-            action = Some(match feature_action {
-                crate::feature_discovery::FeatureDiscoveryAction::OpenCheats => {
-                    MuseumAction::OpenCheats(game.archive_path.clone())
-                }
-                crate::feature_discovery::FeatureDiscoveryAction::OpenRomm => {
-                    MuseumAction::OpenRomm
-                }
-                crate::feature_discovery::FeatureDiscoveryAction::OpenEmulatorSetup => {
-                    MuseumAction::OpenEmulatorSetup
-                }
-                crate::feature_discovery::FeatureDiscoveryAction::OpenDiscConversion => {
-                    MuseumAction::OpenDiscConversion
-                }
-            });
-        }
+        && let Some(feature_action) = crate::feature_discovery::show(ui, feature_view)
+    {
+        action = Some(match feature_action {
+            crate::feature_discovery::FeatureDiscoveryAction::OpenCheats => {
+                MuseumAction::OpenCheats(game.archive_path.clone())
+            }
+            crate::feature_discovery::FeatureDiscoveryAction::OpenRomm => MuseumAction::OpenRomm,
+            crate::feature_discovery::FeatureDiscoveryAction::OpenEmulatorSetup => {
+                MuseumAction::OpenEmulatorSetup
+            }
+            crate::feature_discovery::FeatureDiscoveryAction::OpenDiscConversion => {
+                MuseumAction::OpenDiscConversion
+            }
+        });
+    }
     action
 }
 

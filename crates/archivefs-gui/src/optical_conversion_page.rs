@@ -248,9 +248,10 @@ impl OpticalConversionPageState {
         self.error = None;
         self.conversion_failure = None;
         if let Some(context) = &self.selected_context
-            && let Some(parent) = context.path.parent() {
-                self.source_root_draft = parent.display().to_string();
-            }
+            && let Some(parent) = context.path.parent()
+        {
+            self.source_root_draft = parent.display().to_string();
+        }
     }
 
     fn scan(&mut self) {

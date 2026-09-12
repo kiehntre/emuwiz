@@ -1043,7 +1043,11 @@ fn lha_with_one_valid_slave_is_discovered_as_amiga_whdload_archive() {
     assert_eq!(item.content, Some(ContentKind::AmigaImage));
     assert_eq!(item.validation_state, ValidationState::Accepted);
     assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
-    assert!(item.explanation.contains("Turrican2.Slave"), "{}", item.explanation);
+    assert!(
+        item.explanation.contains("Turrican2.Slave"),
+        "{}",
+        item.explanation
+    );
     assert_eq!(report.structural_evidence.len(), 1);
     assert_eq!(
         report.structural_evidence[0]
@@ -1073,8 +1077,16 @@ fn lha_with_two_valid_slaves_is_ambiguous_never_auto_picked() {
     let item = &report.items[0];
     assert_eq!(item.validation_state, ValidationState::Accepted);
     assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
-    assert!(item.explanation.contains("ambiguous"), "{}", item.explanation);
-    assert!(item.explanation.contains("2 candidate"), "{}", item.explanation);
+    assert!(
+        item.explanation.contains("ambiguous"),
+        "{}",
+        item.explanation
+    );
+    assert!(
+        item.explanation.contains("2 candidate"),
+        "{}",
+        item.explanation
+    );
     // Both candidates surface as structural evidence - neither is dropped.
     assert_eq!(report.structural_evidence.len(), 2);
 }
@@ -1143,10 +1155,13 @@ fn lzh_extension_is_inspected_the_same_way_as_lha() {
 #[test]
 fn adz_with_valid_gzipped_adf_is_discovered_as_amiga_image() {
     let dir = source_dir("adz-valid");
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut encoder, &minimal_flat_adf(0, b"PuzzleDisk")).unwrap();
-    std::fs::write(dir.path().join("Puzzle Game.adz"), encoder.finish().unwrap()).unwrap();
+    std::fs::write(
+        dir.path().join("Puzzle Game.adz"),
+        encoder.finish().unwrap(),
+    )
+    .unwrap();
 
     let report = discover_source(dir.path()).unwrap();
     let item = &report.items[0];
@@ -1165,7 +1180,10 @@ fn adz_that_is_not_gzip_is_refused_not_guessed() {
     let report = discover_source(dir.path()).unwrap();
     let item = &report.items[0];
     assert_eq!(item.validation_state, ValidationState::Skipped);
-    assert!(matches!(item.skip_reason, Some(SkipReason::InvalidContent(_))));
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::InvalidContent(_))
+    ));
     assert!(report.structural_evidence.is_empty());
 }
 

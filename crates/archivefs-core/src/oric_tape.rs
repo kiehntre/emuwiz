@@ -44,7 +44,11 @@ pub struct OricTapeObservation {
 }
 
 pub fn has_oric_leader(bytes: &[u8]) -> bool {
-    let Some(sync_end) = bytes.iter().take(MAX_ORIC_LEADER_BYTES + 1).position(|byte| *byte != 0x16) else {
+    let Some(sync_end) = bytes
+        .iter()
+        .take(MAX_ORIC_LEADER_BYTES + 1)
+        .position(|byte| *byte != 0x16)
+    else {
         return false;
     };
     sync_end >= 3 && bytes.get(sync_end) == Some(&0x24)

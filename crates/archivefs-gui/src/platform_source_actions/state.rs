@@ -139,4 +139,3 @@ pub(crate) struct SourcesLastScan {
     /// archive scanner - see `ScanPersistSummary::ingestion_stats`.
     pub(crate) ingestion_stats: archivefs_core::ingestion::DiscoveryStats,
 }
-

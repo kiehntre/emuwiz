@@ -90,9 +90,9 @@ pub mod fbneo_command;
 pub mod fbneo_execution;
 pub mod flycast_command;
 pub mod flycast_execution;
-pub mod fuse_command;
 pub mod fsuae_command;
 pub mod fsuae_execution;
+pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
 pub mod input_projection;
@@ -270,10 +270,6 @@ pub use flycast_execution::{
     FlycastLaunchSpawnError, LaunchedFlycastProcess, preflight_and_launch_flycast,
     preflight_flycast_launch, spawn_flycast,
 };
-pub use fuse_command::{
-    FUSE_SUPPORTED_PLATFORM_ID, FuseCommand, FuseCommandPlan, FuseCommandSelection,
-    build_fuse_command_plan,
-};
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,
     FsUaeLaunchBlocker, FsUaeLaunchBlockerKind, FsUaeNativeLaunchBinding, build_fsuae_command_plan,
@@ -282,6 +278,10 @@ pub use fsuae_command::{
 pub use fsuae_execution::{
     FsUaeLaunchPreflightError, FsUaeLaunchPreflightErrorKind, FsUaeLaunchRequest,
     preflight_fsuae_launch, spawn_fsuae,
+};
+pub use fuse_command::{
+    FUSE_SUPPORTED_PLATFORM_ID, FuseCommand, FuseCommandPlan, FuseCommandSelection,
+    build_fuse_command_plan,
 };
 pub use hatari_command::{
     HATARI_SUPPORTED_PLATFORM_ID, HatariCommand, HatariCommandPlan, HatariCommandSelection,
@@ -440,8 +440,7 @@ pub use tsugaru_command::{
 };
 pub use tsugaru_execution::{
     TsugaruLaunchExecutionError, TsugaruLaunchPreflightError, TsugaruLaunchPreflightErrorKind,
-    TsugaruLaunchRequest, preflight_and_launch_tsugaru, preflight_tsugaru_launch,
-    spawn_tsugaru,
+    TsugaruLaunchRequest, preflight_and_launch_tsugaru, preflight_tsugaru_launch, spawn_tsugaru,
 };
 pub use vice_command::{
     VICE_ATTACH_CRT, VICE_AUTOSTART, VICE_DISABLE_SAVE_RESOURCES, VICE_SUPPORTED_PLATFORM_ID,
@@ -450,14 +449,6 @@ pub use vice_command::{
 pub use vice_execution::{
     ViceLaunchPreflightError, ViceLaunchPreflightErrorKind, ViceLaunchRequest,
     preflight_vice_launch, spawn_vice,
-};
-pub use xroar_command::{
-    XROAR_SUPPORTED_TAPE_PLATFORM_IDS, XRoarCommand, XRoarCommandPlan, XRoarMediaFormat,
-    build_xroar_command_plan, xroar_media_format,
-};
-pub use xroar_execution::{
-    XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
-    XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
 };
 pub use vita3k_command::{
     VITA3K_SUPPORTED_PLATFORM_ID, Vita3kCommand, Vita3kCommandPlan, Vita3kCommandSelection,
@@ -485,4 +476,12 @@ pub use xenia_execution::{
     XeniaLaunchExitReport, XeniaLaunchPreflightError, XeniaLaunchPreflightErrorKind,
     XeniaLaunchRequest, XeniaLaunchSpawnError, preflight_and_launch_xenia, preflight_xenia_launch,
     spawn_xenia,
+};
+pub use xroar_command::{
+    XROAR_SUPPORTED_TAPE_PLATFORM_IDS, XRoarCommand, XRoarCommandPlan, XRoarMediaFormat,
+    build_xroar_command_plan, xroar_media_format,
+};
+pub use xroar_execution::{
+    XRoarLaunchExecutionError, XRoarLaunchPreflightError, XRoarLaunchPreflightErrorKind,
+    XRoarLaunchRequest, preflight_and_launch_xroar, preflight_xroar_launch, spawn_xroar,
 };

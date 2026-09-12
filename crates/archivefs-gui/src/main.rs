@@ -142,25 +142,25 @@ use archivefs_core::patch_manager::{
 };
 use collection_discovery_page::*;
 mod administration_pages;
+mod cheats_mods;
+mod cheats_mods_preview;
 #[allow(dead_code)]
 mod es_de_media_state;
 #[allow(dead_code)]
 mod launchbox_local_state;
+mod onboarding;
 #[allow(dead_code)]
 mod platform_artwork_manager;
-mod cheats_mods;
-mod cheats_mods_preview;
-mod onboarding;
 use cheats_mods::*;
 use cheats_mods_preview::*;
-mod cheatbase_page;
 mod cheat_reconciliation_review;
+mod cheatbase_page;
 #[allow(dead_code)]
 mod emulator_download_page;
 mod emulator_setup;
 use emulator_setup::*;
-mod emulator_setup_page;
 mod emulator_setup_overrides;
+mod emulator_setup_page;
 mod gamer_platform_shelf;
 #[allow(dead_code)]
 mod onframe_install_session;
@@ -203,7 +203,6 @@ pub(crate) mod doctor_page;
 use doctor_page::*;
 pub(crate) mod mount_batch;
 use mount_batch::*;
-mod mount_operations;
 pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
@@ -218,6 +217,7 @@ pub(crate) mod identity_sources_page;
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
+mod mount_operations;
 #[allow(dead_code)]
 pub(crate) mod museum_page;
 pub(crate) mod optical_conversion_page;
@@ -266,6 +266,7 @@ use crate::romm_source::{
 use administration_pages::*;
 use sources_page::*;
 
+use crate::platform_artwork_manager::PlatformArtworkManager;
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveMountSession, ArchivePresence, ArchiveRecord,
     ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
@@ -311,7 +312,6 @@ use ui::platform_artwork::{
     bundled_platform_artwork, canonical_platform_asset_id, custom_platform_artwork_path,
     paint_game_row_artwork, paint_platform_artwork_at, platform_asset_category, platform_asset_id,
 };
-use crate::platform_artwork_manager::PlatformArtworkManager;
 use ui::{components as widgets, layout as ui_layout, theme};
 // Brings `String`'s char-index-safe insert/delete/slice methods into
 // scope - see `show_text_edit_with_context_menu` and its helpers, the
@@ -1369,7 +1369,6 @@ impl RefreshGeneration {
     }
 }
 
-
 /// GUI Batch A closeout: wires the persisted DAT source registry
 /// (`archivefs_core::dat::sources::DatSourceRegistry`) into
 /// [`selected_evidence_page::gather_selected_evidence`]'s No-Intro lookup,
@@ -1488,10 +1487,6 @@ fn gather_selected_evidence_with_registry_at_and_platform(
     }
     result
 }
-
-
-
-
 
 type LoadResult = Result<LoadedData, String>;
 type LoadMessage = (RefreshGeneration, LoadResult);
@@ -2105,7 +2100,6 @@ struct RunningSetupAction {
     receiver: Receiver<Result<String, String>>,
 }
 
-
 #[derive(Debug)]
 enum BsFreeManagerState {
     NotLoaded,
@@ -2142,7 +2136,6 @@ struct RunningBsFreeOperation {
     operation: BsFreeOperation,
     receiver: Receiver<Result<BsFreeOperationResult, String>>,
 }
-
 
 #[derive(Debug, Default)]
 struct BsFreeGuiState {
@@ -4150,7 +4143,6 @@ fn drain_file_pick(receiver: &mpsc::Receiver<Option<PathBuf>>) -> FilePickDrain 
 const FILE_PICKER_DISCONNECTED_MESSAGE: &str =
     "The image picker closed unexpectedly. Please try again.";
 
-
 impl ArchiveFsApp {
     fn is_busy(&self) -> bool {
         self.operation.is_some()
@@ -4403,7 +4395,8 @@ impl ArchiveFsApp {
             game_metadata_worker_allowed: true,
             gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
             es_de_media: crate::es_de_media_state::EsDeMediaState::default(),
-            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(),
+            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(
+            ),
         }
     }
 
@@ -5598,18 +5591,6 @@ impl ArchiveFsApp {
 
     // --- Doctor Stage 1A ------------------------------------------------
 
-
-
-
-
-
-
-
-
-
-
-
-
     /// Executes the reviewed repair. The only path that mutates.
     ///
     /// Every safety gate lives in `execute_doctor_repair`, which re-resolves
@@ -5631,9 +5612,6 @@ impl ArchiveFsApp {
             .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
         rom_organisation_page::show_rom_organisation_page(ui, page);
     }
-
-
-
 
     fn show_optical_conversion_page(&mut self, ui: &mut egui::Ui) {
         let selected_context = self.archive_context.focused.as_ref().map(|path| {
@@ -5657,17 +5635,12 @@ impl ArchiveFsApp {
         optical_conversion_page::show_optical_conversion_page(ui, page);
     }
 
-
-
-
-
     fn show_library_view_history_page(&mut self, ui: &mut egui::Ui) {
         let page = self
             .library_view_history_page
             .get_or_insert_with(library_view_history_page::LibraryViewHistoryPageState::load);
         library_view_history_page::show_library_view_history_page(ui, page);
     }
-
 
     /// The consolidated "Sources" destination - one sidebar entry over
     /// Libraries/DATs/Cheats/Discovery tabs (`SourcesTab`). Renders the
@@ -5945,7 +5918,6 @@ impl ArchiveFsApp {
         show_sources_recent_activity(ui, &self.history);
     }
 
-
     /// Draws the DAT Sources page and applies whatever it asked for.
     ///
     /// Loaded on first visit rather than at startup, for the same reason Cheat
@@ -6064,8 +6036,6 @@ impl ArchiveFsApp {
         }
     }
 
-
-
     fn poll_setup_action(&mut self, context: &egui::Context) {
         let result = self.setup_action.as_ref().and_then(|running| {
             running
@@ -6151,38 +6121,6 @@ impl ArchiveFsApp {
             }
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     fn start_catalogue_status_load(&mut self, context: egui::Context) {
         if matches!(self.catalogue_manager, CatalogueManagerState::Loading(_)) {
@@ -6388,11 +6326,6 @@ impl ArchiveFsApp {
         self.catalogue_manager = CatalogueManagerState::NotLoaded;
         self.start_catalogue_status_load(context.clone());
     }
-
-
-
-
-
 
     /// Whether a new Library Views action may start - the same "one
     /// writer at a time" convention `source_action_available` uses
@@ -6911,26 +6844,6 @@ impl ArchiveFsApp {
         }
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// GUI Batch C: starts (or refreshes) the read-only "Plan Preview" load
     /// for the currently-ready selected-evidence report - see
     /// `plan_preview_page`'s own module doc. Explicit only (a button
@@ -7000,20 +6913,6 @@ impl ArchiveFsApp {
             };
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// Phase 5: "Review" on a Gamer View game whose platform couldn't be
     /// confidently identified. Keeps the exact same game selected (so
@@ -7230,60 +7129,6 @@ impl ArchiveFsApp {
         Some(action).flatten()
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Looks up the remembered profile id for an adapter key (`"dolphin"`
     /// or `"xenia"`), if any.
     fn remembered_profile_id(&self, adapter: &str) -> Option<String> {
@@ -7360,34 +7205,7 @@ impl ArchiveFsApp {
             }
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
-
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArchiveAction {
@@ -10219,12 +10037,6 @@ fn load_data() -> LoadResult {
         .map_err(|error| error.to_string())
 }
 
-
-
-
-
-
-
 fn apply_missing_removal(
     archive_paths: &[PathBuf],
 ) -> archivefs_core::Result<MissingArchiveRemovalResult> {
@@ -10257,7 +10069,6 @@ fn apply_missing_removal_at(
     }
     database.remove_missing_archives(&ids)
 }
-
 
 /// The one honest explanation shown everywhere platform detection came up
 /// empty. `detect_platform_with_details` (archivefs-core) only ever
@@ -11506,13 +11317,6 @@ fn show_archive_inspector_panel(
     close
 }
 
-
-
-
-
-
-
-
 fn library_view_action_log_category(action: &LibraryViewAction) -> ActivityAction {
     match action {
         LibraryViewAction::Add { .. } => ActivityAction::LibraryViewAdded,
@@ -11822,7 +11626,6 @@ fn source_platform_value_label(state: &SourcePlatformState) -> String {
     }
 }
 
-
 /// Drops queued paths whose archive no longer exists in the live
 /// snapshot (source removed, rescan, etc.). Deliberately keeps queued
 /// archives that are merely no longer `Pending` (mounted meanwhile, or a
@@ -12036,7 +11839,6 @@ fn show_selected_page(
     }
     action
 }
-
 
 /// What the Settings page asks `update` to do - each maps onto an
 /// existing proven workflow (`SetupAction::OpenConfigFolder`, the
@@ -13039,14 +12841,12 @@ fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
-
 /// The default-location counterparts, used by the running app.
 fn load_retroarch_core_directory_override() -> Option<PathBuf> {
     retroarch_core_directory_override_path()
         .as_deref()
         .and_then(load_retroarch_core_directory_override_at)
 }
-
 
 fn parse_gui_mode(contents: &str) -> GuiMode {
     match contents.trim() {
@@ -13083,8 +12883,6 @@ fn save_gui_mode(mode: GuiMode) {
     }
     let _ = std::fs::write(path, gui_mode_file_contents(mode));
 }
-
-
 
 #[cfg(test)]
 mod tests;

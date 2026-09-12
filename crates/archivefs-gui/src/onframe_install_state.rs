@@ -10,8 +10,7 @@ use archivefs_core::patch_manager::{
     bind_dolphin_onframe_candidate,
 };
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum OnFrameInstallState {
     #[default]
     Idle,
@@ -58,7 +57,6 @@ pub enum OnFrameInstallState {
         message: String,
     },
 }
-
 
 impl OnFrameInstallState {
     pub fn begin_discovery(&mut self, source: PathBuf) {

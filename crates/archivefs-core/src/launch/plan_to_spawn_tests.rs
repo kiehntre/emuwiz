@@ -200,7 +200,6 @@ fn build_wired(label: &str, extra_cores: &[&str]) -> Wired {
 }
 
 fn recommended_retroarch_candidate(plan: &LaunchPlan) -> &LaunchCandidate {
-
     (plan
         .candidates
         .iter()

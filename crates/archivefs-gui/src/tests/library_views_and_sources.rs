@@ -3922,12 +3922,14 @@ fn sources_dats_tab_still_renders_dat_controls() {
     let temp = tempfile::tempdir().unwrap();
     let journal = temp.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    app.dat_sources_page = Some(dat_sources_page::DatSourcesPageState::load_with_transaction_dir(
-        temp.path().join("dat_sources.toml"),
-        Vec::new(),
-        archivefs_core::safe_read::TrustedRoots::none(),
-        journal,
-    ));
+    app.dat_sources_page = Some(
+        dat_sources_page::DatSourcesPageState::load_with_transaction_dir(
+            temp.path().join("dat_sources.toml"),
+            Vec::new(),
+            archivefs_core::safe_read::TrustedRoots::none(),
+            journal,
+        ),
+    );
     let output = render_sources_app(&mut app);
 
     assert!(rendered_text_contains(&output, "Sources"));

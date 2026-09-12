@@ -78,12 +78,13 @@ pub fn build_mesen_command_plan(
         }
     };
     if let Some(x) = resolved
-        && !MESEN_SUPPORTED_PLATFORM_IDS.contains(&x.platform_id.as_str()) {
-            blockers.push(block(
-                LaunchBlockerKind::MesenPlatformMismatch,
-                "resolved platform is not supported by Mesen 2",
-            ));
-        }
+        && !MESEN_SUPPORTED_PLATFORM_IDS.contains(&x.platform_id.as_str())
+    {
+        blockers.push(block(
+            LaunchBlockerKind::MesenPlatformMismatch,
+            "resolved platform is not supported by Mesen 2",
+        ));
+    }
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,

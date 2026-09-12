@@ -1,6 +1,5 @@
 use crate::*;
 
-
 /// What `try_resolve_dolphin_provider_from_local_sources` found, kept
 /// distinct from `dolphin_provider` itself because `NotLoaded` alone can no
 /// longer distinguish "hasn't looked yet" from "looked locally and found
@@ -17,7 +16,6 @@ pub(crate) enum DolphinLocalLookupState {
         warnings: Vec<String>,
     },
 }
-
 
 pub(crate) struct CheatWorkflowState {
     /// Exact-byte identity - the same `ArchiveRecord.mount_plan.archive
@@ -185,7 +183,6 @@ pub(crate) struct CheatWorkflowState {
     pub(crate) candidate_load_error: Option<String>,
 }
 
-
 /// One completed candidate match, bound to the exact context that produced
 /// it so a stale result can never be shown against a different archive,
 /// profile, or catalogue snapshot.
@@ -195,15 +192,12 @@ pub(crate) struct CheatCandidateStage {
     pub(crate) list: CheatCandidateList,
 }
 
-
 /// The chosen candidate and everything derived from it.
 pub(crate) struct CheatCandidateSelection {
     pub(crate) candidate: CheatCandidate,
     pub(crate) loaded: LoadedCandidate,
     pub(crate) selection: CheatSelection,
 }
-
-
 
 /// What one generated-install preview produced, alongside the shared
 /// report. Retained so review, confirmation, and the result view can all
@@ -216,16 +210,12 @@ pub(crate) struct GeneratedCheatInstall {
     pub(crate) candidate_display_name: String,
 }
 
-
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DolphinProviderRequestKey {
     pub(crate) archive_path: PathBuf,
     pub(crate) game_id: String,
     pub(crate) revision: u16,
 }
-
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DolphinGameHackingRequestKey {
@@ -236,15 +226,11 @@ pub(crate) struct DolphinGameHackingRequestKey {
     pub(crate) generation: u64,
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WiiGameHackingFetchMode {
     CacheOnly,
     ExplicitNetworkAllowed,
 }
-
-
 
 /// Adapter-owned state derived from inert provider results plus the selected
 /// Dolphin destination. Provider retrieval never receives either of these paths.
@@ -254,15 +240,11 @@ pub(crate) struct DolphinProviderSelectionState {
     pub(crate) selection: DolphinProviderCodeSelection,
 }
 
-
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct XeniaProviderRequestKey {
     pub(crate) archive_path: PathBuf,
     pub(crate) title_id: String,
 }
-
-
 
 /// Adapter-owned state derived from the chosen candidate document plus
 /// the real destination file it would install to.
@@ -272,8 +254,6 @@ pub(crate) struct XeniaSelectionState {
     pub(crate) destination: LoadedXeniaDestination,
     pub(crate) selection: XeniaPatchSelection,
 }
-
-
 
 /// The Dolphin equivalent of `GeneratedCheatInstall`: the same matched file,
 /// re-written with only `[Gecko_Enabled]` replaced.
@@ -285,8 +265,6 @@ pub(crate) struct GeneratedDolphinInstall {
     pub(crate) staged: StagedDolphinIni,
 }
 
-
-
 /// The GameHacking.org GameCube counterpart to `GeneratedDolphinInstall`:
 /// the staged, surgically edited GameSettings file for a selection of
 /// externally sourced `ActionReplay`/`Gecko` cheats, rather than the
@@ -297,7 +275,6 @@ pub(crate) struct GeneratedGameCubeGameHackingInstall {
     pub(crate) staged: StagedGameCubeIni,
     pub(crate) profile: DolphinProfile,
 }
-
 
 /// The BSFree Archive GameCube equivalent of
 /// `GeneratedGameCubeGameHackingInstall`, additionally carrying the two-pass
@@ -313,8 +290,6 @@ pub(crate) struct GeneratedBsFreeGameCubeInstall {
     pub(crate) skipped_unselectable: Vec<String>,
 }
 
-
-
 /// The BSFree Wii equivalent of [`GeneratedBsFreeGameCubeInstall`]: the staged
 /// Dolphin GameSettings INI (produced by the shared Wii adapter) plus the
 /// dedup/conflict findings. The staged artifact type is the same, because both
@@ -329,8 +304,6 @@ pub(crate) struct GeneratedBsFreeWiiInstall {
     pub(crate) skipped_unselectable: Vec<String>,
 }
 
-
-
 /// The Xenia equivalent of `GeneratedDolphinInstall`: the exact chosen
 /// candidate document, staged as a real merged `.patch.toml`.
 #[derive(Clone)]
@@ -341,7 +314,6 @@ pub(crate) struct GeneratedXeniaInstall {
     pub(crate) staged: StagedXeniaPatchFile,
 }
 
-
 pub(crate) struct Pcsx2GameHackingState {
     pub(crate) status: GameHackingMatchStatus,
     pub(crate) detail: String,
@@ -351,7 +323,6 @@ pub(crate) struct Pcsx2GameHackingState {
     pub(crate) selection: Pcsx2CheatSelection,
     pub(crate) cached_fallback: bool,
 }
-
 
 /// GameCube-only GameHacking.org coverage: matched title, named cheats,
 /// and - unlike the initial preview-only milestone - a selection of
@@ -368,7 +339,6 @@ pub(crate) struct GameCubeGameHackingState {
     pub(crate) cached_fallback: bool,
 }
 
-
 /// State for the explicitly user-mediated GameHacking.org browser import.
 /// No content is fetched or applied by this state; the core importer owns
 /// validation, cache writes, and provenance.
@@ -383,7 +353,6 @@ pub(crate) struct BrowserImportState {
     pub(crate) failure: Option<(String, String)>,
     pub(crate) outcome: Option<BrowserImportOutcome>,
 }
-
 
 impl BrowserImportState {
     pub(crate) fn new(
@@ -411,7 +380,6 @@ impl BrowserImportState {
     }
 }
 
-
 /// BSFree GameCube coverage inside Cheats & Mods: the matched BSFree game,
 /// its classified cheats, and the user's explicit per-cheat selection. Only
 /// the installable formats (`GeckoEquivalent`, `ActionReplayNative`) can be
@@ -434,7 +402,6 @@ pub(crate) struct BsFreeGameCubeGuiState {
     pub(crate) search_title: String,
 }
 
-
 /// BSFree Wii coverage inside Cheats & Mods, mirroring the GameCube state.
 /// Only the verified hex-pair subset is selectable; every other BSFree Wii
 /// record (encrypted, unverified device, malformed) stays browse-only.
@@ -451,8 +418,6 @@ pub(crate) struct BsFreeWiiGuiState {
     pub(crate) search_title: String,
 }
 
-
-
 #[derive(Clone)]
 pub(crate) struct GeneratedPcsx2Install {
     pub(crate) staging_root: PathBuf,
@@ -468,16 +433,12 @@ pub(crate) struct GeneratedPcsx2Install {
     pub(crate) legacy_migration_report: Option<SharedPreviewReport>,
 }
 
-
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GameIdentityRequest {
     pub(crate) archive_path: PathBuf,
     pub(crate) platform: Option<String>,
     pub(crate) adapter: CheatEmulatorAdapter,
 }
-
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CheatPreviewRequestKey {
@@ -490,15 +451,11 @@ pub(crate) struct CheatPreviewRequestKey {
     pub(crate) snapshot_id: Option<String>,
 }
 
-
-
 #[derive(Debug)]
 pub(crate) enum CheatPreviewOutcome {
     Ready(SharedPreviewReport),
     Failed(CheatPreviewFailure),
 }
-
-
 
 #[derive(Debug)]
 pub(crate) enum CheatPreviewFailure {
@@ -520,7 +477,6 @@ pub(crate) enum CheatPreviewFailure {
     BsFreeGameCubeInstallPlan(BsFreeGameCubeError),
 }
 
-
 impl std::fmt::Display for CheatPreviewFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -535,7 +491,6 @@ impl std::fmt::Display for CheatPreviewFailure {
         }
     }
 }
-
 
 pub(crate) struct CheatPreviewResponse {
     pub(crate) key: CheatPreviewRequestKey,
@@ -562,12 +517,10 @@ pub(crate) struct CheatPreviewResponse {
     pub(crate) bsfree_wii_generated: Option<GeneratedBsFreeWiiInstall>,
 }
 
-
 pub(crate) enum CheatPreviewWork {
     Shared(SharedPreviewRequest),
     RetroArch(RetroArchMaterializationRequest),
 }
-
 
 pub(crate) enum CheatTransactionState {
     Idle,
@@ -586,8 +539,6 @@ pub(crate) enum CheatTransactionState {
     },
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheatEmulatorAdapter {
     RetroArch,
@@ -597,15 +548,12 @@ pub(crate) enum CheatEmulatorAdapter {
     Unsupported,
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheatActivationReadiness {
     Enabled,
     Disabled,
     Unknown,
 }
-
 
 impl CheatActivationReadiness {
     pub(crate) const fn from_bool(value: Option<bool>) -> Self {
@@ -616,7 +564,6 @@ impl CheatActivationReadiness {
         }
     }
 }
-
 
 impl CheatEmulatorAdapter {
     pub(crate) const fn display_name(self) -> Option<&'static str> {
@@ -630,14 +577,11 @@ impl CheatEmulatorAdapter {
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheatSourceMode {
     ExistingRetroArchLibrary,
     ArchiveFsTrustedCatalogue,
 }
-
 
 impl CheatSourceMode {
     pub(crate) fn label(self) -> &'static str {
@@ -648,8 +592,6 @@ impl CheatSourceMode {
     }
 }
 
-
-
 #[derive(Default)]
 pub(crate) struct CheatArchivePickerState {
     pub(crate) search: String,
@@ -657,7 +599,6 @@ pub(crate) struct CheatArchivePickerState {
     pub(crate) source_filter: Option<PathBuf>,
     pub(crate) candidate: Option<PathBuf>,
 }
-
 
 impl CheatArchivePickerState {
     pub(crate) fn for_current(current: Option<&Path>, platform_filter: Option<String>) -> Self {
@@ -668,7 +609,6 @@ impl CheatArchivePickerState {
         }
     }
 }
-
 
 /// A background-loaded cheat-workflow resource. Stale-result protection
 /// is ownership, the app's existing pattern: starting a new load
@@ -685,7 +625,6 @@ pub(crate) enum CheatStepResource<T> {
     Failed(String),
 }
 
-
 pub(crate) enum SharedHistoryState {
     NotLoaded,
     Loading {
@@ -694,7 +633,6 @@ pub(crate) enum SharedHistoryState {
     Ready(SharedHistoryReport),
     Failed(String),
 }
-
 
 pub(crate) enum SharedRollbackState {
     Idle,
@@ -713,7 +651,6 @@ pub(crate) enum SharedRollbackState {
     Failed(String),
 }
 
-
 pub(crate) enum HistoryPageAction {
     PreviewRollback {
         journal_path: PathBuf,
@@ -724,7 +661,6 @@ pub(crate) enum HistoryPageAction {
     Refresh,
 }
 
-
 /// The Details "Game ID" row's three-way state - distinct from
 /// `BeginnerCheatStatus::IdentityUnavailable` only in that it does not
 /// require `dolphin_profile_selection` to be resolved first, matching what
@@ -734,8 +670,6 @@ pub(crate) enum DolphinIdentityRowState<'a> {
     Pending,
     Unavailable,
 }
-
-
 
 /// The beginner page's plain-English status - one of the exact statuses
 /// the milestone specifies. Every adapter maps its own technical state
@@ -774,7 +708,6 @@ pub(crate) enum BeginnerCheatStatus {
         detail: String,
     },
 }
-
 
 impl BeginnerCheatStatus {
     pub(crate) fn label(&self) -> String {
@@ -817,8 +750,6 @@ impl BeginnerCheatStatus {
     }
 }
 
-
-
 /// Every distinct platform actually present with a non-zero count, sorted
 /// alphabetically, plus a separate `Unknown` count - the shared "All /
 /// <platform> (count) / Unknown" data behind the platform strip on
@@ -833,15 +764,12 @@ pub(crate) struct DetectedPlatformCounts {
     pub(crate) unknown: usize,
 }
 
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CheatCandidatePrerequisite {
     ProfileCheatDirectoryUnresolved,
     CatalogueNotRetrieved,
     CatalogueLocalPathUnavailable,
 }
-
 
 impl CheatCandidatePrerequisite {
     pub(crate) fn message(self) -> &'static str {
@@ -858,4 +786,3 @@ impl CheatCandidatePrerequisite {
         }
     }
 }
-

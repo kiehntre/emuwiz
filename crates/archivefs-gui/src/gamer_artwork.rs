@@ -1063,12 +1063,13 @@ fn resolver_input_for_record(
             .media
             .screenshot
             .is_some_and(|media| media.exists && media.readable)
-            && let Some(path) = esde.entry.media.screenshot.as_ref() {
-                local.screenshots.push(MediaReference {
-                    hosted_reference: Some(path.to_string_lossy().into_owned()),
-                    public_reference: None,
-                });
-            }
+            && let Some(path) = esde.entry.media.screenshot.as_ref()
+        {
+            local.screenshots.push(MediaReference {
+                hosted_reference: Some(path.to_string_lossy().into_owned()),
+                public_reference: None,
+            });
+        }
         if esde
             .media
             .video
@@ -1106,9 +1107,7 @@ fn resolver_input_for_record(
 
 fn launchbox_snapshot(
     record: &archivefs_core::identity_source::model::ExternalIdentityRecord,
-    index: Option<
-        &archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex,
-    >,
+    index: Option<&archivefs_core::identity_source::launchbox_local::LaunchBoxLocalProviderIndex>,
 ) -> Option<archivefs_core::identity_source::media_resolver::ProviderMediaSnapshot> {
     let index = index?;
     let launchbox_id = record

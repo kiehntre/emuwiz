@@ -159,9 +159,10 @@ pub fn observe_cdi<M: LogicalMedia>(media: &M) -> Result<CdiDiscEvidence, CdiEvi
         ("big-endian path table", path_table_lba_be),
     ] {
         if let Some(lba) = lba
-            && lba as u64 >= media_blocks {
-                warnings.push(format!("{name} is out of bounds"));
-            }
+            && lba as u64 >= media_blocks
+        {
+            warnings.push(format!("{name} is out of bounds"));
+        }
     }
     let has_startup = filesystem
         .root_entries
@@ -180,9 +181,9 @@ pub fn observe_cdi<M: LogicalMedia>(media: &M) -> Result<CdiDiscEvidence, CdiEvi
     if path_table_lba_le.is_none() && path_table_lba_be.is_none() {
         warnings.push("no path table location recorded".into());
     }
-    let invalid_geometry = warnings.iter().any(|w| {
-        w.contains("out of bounds") || w.contains("exceeds logical media")
-    });
+    let invalid_geometry = warnings
+        .iter()
+        .any(|w| w.contains("out of bounds") || w.contains("exceeds logical media"));
     Ok(CdiDiscEvidence {
         status: if !is_cdi {
             CdiStatus::NotCdi

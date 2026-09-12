@@ -67,23 +67,24 @@ pub fn discover_dolphin_onframe_candidates(
                  issues: &mut Vec<CheatIssue>,
                  out: &mut Vec<DolphinOnFrameCandidate>| {
         if let Some(name) = title.take()
-            && (!ops.is_empty() || !issues.is_empty()) {
-                let doc = CheatDocument {
-                    title: name.clone(),
-                    platform: platform.clone(),
-                    source_format: CheatSourceFormat::DolphinOnFrame,
-                    operations: std::mem::take(ops),
-                    issues: std::mem::take(issues),
-                    provenance: vec![path.display().to_string()],
-                };
-                out.push(DolphinOnFrameCandidate {
-                    title: name,
-                    source_path: path.to_path_buf(),
-                    platform: platform.clone(),
-                    document: doc,
-                    warnings: Vec::new(),
-                });
-            }
+            && (!ops.is_empty() || !issues.is_empty())
+        {
+            let doc = CheatDocument {
+                title: name.clone(),
+                platform: platform.clone(),
+                source_format: CheatSourceFormat::DolphinOnFrame,
+                operations: std::mem::take(ops),
+                issues: std::mem::take(issues),
+                provenance: vec![path.display().to_string()],
+            };
+            out.push(DolphinOnFrameCandidate {
+                title: name,
+                source_path: path.to_path_buf(),
+                platform: platform.clone(),
+                document: doc,
+                warnings: Vec::new(),
+            });
+        }
     };
     for line in text.lines() {
         let t = line.trim();

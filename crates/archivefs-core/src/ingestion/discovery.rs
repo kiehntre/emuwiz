@@ -1822,85 +1822,85 @@ fn discover_d88_image(
                 .and_then(|container| container.boot_sector)
                 && let Some(observation) =
                     crate::fmtowns_boot_evidence::structural_observation(&boot)
-                {
-                    structural_evidence.push(DiscoveredStructuralEvidence {
-                        path: path.to_path_buf(),
-                        observation,
-                    });
-                    let identity = identity_for(path, source_root);
-                    let conflicting = identity
-                        .as_ref()
-                        .and_then(|summary| summary.platform.as_deref())
-                        .filter(|platform| *platform != "FM Towns");
-                    if let Some(platform) = conflicting {
-                        let platform = platform.to_string();
-                        return GameDiscovery {
-                            path: path.to_path_buf(),
-                            container: ContainerKind::DirectFile,
-                            content: Some(ContentKind::ComputerDisk),
-                            platform_hint: None,
-                            identity_candidate: identity,
-                            validation_state: ValidationState::Skipped,
-                            explanation: format!(
-                                "Strong FM Towns IPL4 evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
-                            ),
-                            skip_reason: Some(SkipReason::AmbiguousPlatform),
-                        };
-                    }
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "FM Towns");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
                     return GameDiscovery {
                         path: path.to_path_buf(),
                         container: ContainerKind::DirectFile,
                         content: Some(ContentKind::ComputerDisk),
-                        platform_hint: Some("FM Towns".to_string()),
+                        platform_hint: None,
                         identity_candidate: identity,
-                        validation_state: ValidationState::Accepted,
+                        validation_state: ValidationState::Skipped,
                         explanation: format!(
-                            "Valid D88 container with strong FM Towns IPL4 evidence. {detail}."
+                            "Strong FM Towns IPL4 evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
                         ),
-                        skip_reason: None,
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
                     };
                 }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("FM Towns".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid D88 container with strong FM Towns IPL4 evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
             if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
                 .and_then(|container| container.boot_sector)
                 && let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
-                {
-                    structural_evidence.push(DiscoveredStructuralEvidence {
-                        path: path.to_path_buf(),
-                        observation,
-                    });
-                    let identity = identity_for(path, source_root);
-                    let conflicting = identity
-                        .as_ref()
-                        .and_then(|summary| summary.platform.as_deref())
-                        .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
-                    if let Some(platform) = conflicting {
-                        let platform = platform.to_string();
-                        return GameDiscovery {
-                            path: path.to_path_buf(),
-                            container: ContainerKind::DirectFile,
-                            content: Some(ContentKind::ComputerDisk),
-                            platform_hint: None,
-                            identity_candidate: identity,
-                            validation_state: ValidationState::Skipped,
-                            explanation: format!(
-                                "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
-                            ),
-                            skip_reason: Some(SkipReason::AmbiguousPlatform),
-                        };
-                    }
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
                     return GameDiscovery {
                         path: path.to_path_buf(),
                         container: ContainerKind::DirectFile,
                         content: Some(ContentKind::ComputerDisk),
-                        platform_hint: Some("PC-98".to_string()),
+                        platform_hint: None,
                         identity_candidate: identity,
-                        validation_state: ValidationState::Accepted,
+                        validation_state: ValidationState::Skipped,
                         explanation: format!(
-                            "Valid D88 container with strong PC-98 boot evidence. {detail}."
+                            "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
                         ),
-                        skip_reason: None,
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
                     };
                 }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("PC-98".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid D88 container with strong PC-98 boot evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary) if summary.platform.is_some() => accepted(
@@ -2036,85 +2036,85 @@ fn discover_hard_disk_image(
                 .and_then(|container| container.boot_sector)
                 && let Some(observation) =
                     crate::fmtowns_boot_evidence::structural_observation(&boot)
-                {
-                    structural_evidence.push(DiscoveredStructuralEvidence {
-                        path: path.to_path_buf(),
-                        observation,
-                    });
-                    let identity = identity_for(path, source_root);
-                    let conflicting = identity
-                        .as_ref()
-                        .and_then(|summary| summary.platform.as_deref())
-                        .filter(|platform| *platform != "FM Towns");
-                    if let Some(platform) = conflicting {
-                        let platform = platform.to_string();
-                        return GameDiscovery {
-                            path: path.to_path_buf(),
-                            container: ContainerKind::DirectFile,
-                            content: Some(ContentKind::ComputerDisk),
-                            platform_hint: None,
-                            identity_candidate: identity,
-                            validation_state: ValidationState::Skipped,
-                            explanation: format!(
-                                "Strong FM Towns IPL4 evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
-                            ),
-                            skip_reason: Some(SkipReason::AmbiguousPlatform),
-                        };
-                    }
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "FM Towns");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
                     return GameDiscovery {
                         path: path.to_path_buf(),
                         container: ContainerKind::DirectFile,
                         content: Some(ContentKind::ComputerDisk),
-                        platform_hint: Some("FM Towns".to_string()),
+                        platform_hint: None,
                         identity_candidate: identity,
-                        validation_state: ValidationState::Accepted,
+                        validation_state: ValidationState::Skipped,
                         explanation: format!(
-                            "Valid .{extension} container with strong FM Towns IPL4 evidence. {detail}."
+                            "Strong FM Towns IPL4 evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
                         ),
-                        skip_reason: None,
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
                     };
                 }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("FM Towns".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid .{extension} container with strong FM Towns IPL4 evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
             if let Some(boot) = crate::pc98_container_evidence::inspect_pc98_container(path)
                 .and_then(|container| container.boot_sector)
                 && let Some(observation) = crate::pc98_boot_evidence::structural_observation(&boot)
-                {
-                    structural_evidence.push(DiscoveredStructuralEvidence {
-                        path: path.to_path_buf(),
-                        observation,
-                    });
-                    let identity = identity_for(path, source_root);
-                    let conflicting = identity
-                        .as_ref()
-                        .and_then(|summary| summary.platform.as_deref())
-                        .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
-                    if let Some(platform) = conflicting {
-                        let platform = platform.to_string();
-                        return GameDiscovery {
-                            path: path.to_path_buf(),
-                            container: ContainerKind::DirectFile,
-                            content: Some(ContentKind::ComputerDisk),
-                            platform_hint: None,
-                            identity_candidate: identity,
-                            validation_state: ValidationState::Skipped,
-                            explanation: format!(
-                                "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
-                            ),
-                            skip_reason: Some(SkipReason::AmbiguousPlatform),
-                        };
-                    }
+            {
+                structural_evidence.push(DiscoveredStructuralEvidence {
+                    path: path.to_path_buf(),
+                    observation,
+                });
+                let identity = identity_for(path, source_root);
+                let conflicting = identity
+                    .as_ref()
+                    .and_then(|summary| summary.platform.as_deref())
+                    .filter(|platform| *platform != "PC-98" && *platform != "NEC PC-9801");
+                if let Some(platform) = conflicting {
+                    let platform = platform.to_string();
                     return GameDiscovery {
                         path: path.to_path_buf(),
                         container: ContainerKind::DirectFile,
                         content: Some(ContentKind::ComputerDisk),
-                        platform_hint: Some("PC-98".to_string()),
+                        platform_hint: None,
                         identity_candidate: identity,
-                        validation_state: ValidationState::Accepted,
+                        validation_state: ValidationState::Skipped,
                         explanation: format!(
-                            "Valid .{extension} container with strong PC-98 boot evidence. {detail}."
+                            "Strong PC-98 boot evidence conflicts with surrounding {platform} evidence; EmuWiz kept the platform ambiguous. {detail}."
                         ),
-                        skip_reason: None,
+                        skip_reason: Some(SkipReason::AmbiguousPlatform),
                     };
                 }
+                return GameDiscovery {
+                    path: path.to_path_buf(),
+                    container: ContainerKind::DirectFile,
+                    content: Some(ContentKind::ComputerDisk),
+                    platform_hint: Some("PC-98".to_string()),
+                    identity_candidate: identity,
+                    validation_state: ValidationState::Accepted,
+                    explanation: format!(
+                        "Valid .{extension} container with strong PC-98 boot evidence. {detail}."
+                    ),
+                    skip_reason: None,
+                };
+            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary) if summary.platform.is_some() => accepted(

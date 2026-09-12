@@ -14,19 +14,19 @@ use std::fmt;
 use std::path::Path;
 
 use md5::Md5;
-use sha1::digest::Digest;
 use sha1::Sha1;
+use sha1::digest::Digest;
 
 use crate::chd_identity::{
-    needs_specialist_optical_backend, observe_chd_identity_file, CdromTrackFact, ChdMetadataFact,
-    ChdMetadataOutcome, GdromTrackFact,
+    CdromTrackFact, ChdMetadataFact, ChdMetadataOutcome, GdromTrackFact,
+    needs_specialist_optical_backend, observe_chd_identity_file,
 };
 use crate::chd_logical_media::open_chd_track_logical_media_file;
 use crate::dat::model::DatChecksum;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
 use crate::optical_fingerprint::{
-    compare_optical_fingerprints, fingerprint_chd, fingerprint_cue_bin,
-    OpticalFingerprintComparison,
+    OpticalFingerprintComparison, compare_optical_fingerprints, fingerprint_chd,
+    fingerprint_cue_bin,
 };
 
 /// Fixed memory bound for logical hashing.  CHD hunks are separately bounded
@@ -257,9 +257,10 @@ fn compare_track(
         ("SHA-1", &expected.hashes.sha1, &actual_hashes.sha1),
     ] {
         if let Some(wanted) = wanted
-            && actual.as_deref() != Some(wanted.as_str()) {
-                reasons.push(format!("{label} differs"));
-            }
+            && actual.as_deref() != Some(wanted.as_str())
+        {
+            reasons.push(format!("{label} differs"));
+        }
     }
     let status = if !reasons.is_empty() {
         TrackVerificationStatus::Mismatch

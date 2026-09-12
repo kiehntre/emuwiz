@@ -5,7 +5,6 @@ pub(crate) enum CheatArchivePickerAction {
     Select(PathBuf),
 }
 
-
 /// What the cheat workflow panel asks `update` to do.
 #[derive(Clone)]
 pub(crate) enum CheatWorkflowAction {
@@ -171,4 +170,3 @@ pub(crate) const ETHICAL_USE_COPY: &str = "EmuWiz is intended for preservation, 
 pub(crate) const USER_RESPONSIBILITY_COPY: &str = "You are responsible for ensuring that you have the right to use, modify, import, and distribute cheats, patches, mods, textures, or related files. EmuWiz does not verify ownership or licensing.";
 pub(crate) const SCANNING_DISABLED_WARNING: &str =
     "Turning this off does not make unsafe files safe. It only stops EmuWiz checking them.";
-

@@ -2169,20 +2169,21 @@ fn persist_expected_inventory_if_valid(
             DatFileOutcome::Parsed { version, .. } => version.clone(),
             DatFileOutcome::Failed { .. } => None,
         });
-        let result = archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
-            database.replace_expected_dat_inventory(
-                &report.source_id,
-                source_revision.as_deref(),
-                ecosystem,
-                &expected.entries,
-                expected.duplicate_names_skipped as u64,
-            )
-        });
+        let result =
+            archivefs_core::Database::open_or_create(database_path).and_then(|mut database| {
+                database.replace_expected_dat_inventory(
+                    &report.source_id,
+                    source_revision.as_deref(),
+                    ecosystem,
+                    &expected.entries,
+                    expected.duplicate_names_skipped as u64,
+                )
+            });
         match result {
             Ok(written) => {
-                final_result.technical_details.push(format!(
-                    "{written} expected identity row(s) saved."
-                ));
+                final_result
+                    .technical_details
+                    .push(format!("{written} expected identity row(s) saved."));
                 if report.state == DatHealthState::ValidWithWarnings
                     || expected.duplicate_names_skipped > 0
                 {
@@ -5110,22 +5111,23 @@ impl DatSourcesPageState {
                 self.saved = self.draft.clone();
                 self.save_state = DatSaveState::Saved;
                 if let Some(database_path) = self.database_path.clone()
-                    && !stale_sources.is_empty() {
-                        let result = archivefs_core::Database::open_or_create(database_path)
-                            .and_then(|mut database| {
-                                for source_id in &stale_sources {
-                                    database
-                                        .mark_library_dat_identities_stale_for_source(source_id)?;
-                                    database.mark_dat_set_results_stale_for_source(source_id)?;
-                                }
-                                Ok(())
-                            });
-                        if let Err(error) = result {
-                            self.action_error = Some(format!(
-                                "DAT sources were saved, but prior audit results could not be marked stale: {error}"
-                            ));
-                        }
+                    && !stale_sources.is_empty()
+                {
+                    let result = archivefs_core::Database::open_or_create(database_path).and_then(
+                        |mut database| {
+                            for source_id in &stale_sources {
+                                database.mark_library_dat_identities_stale_for_source(source_id)?;
+                                database.mark_dat_set_results_stale_for_source(source_id)?;
+                            }
+                            Ok(())
+                        },
+                    );
+                    if let Err(error) = result {
+                        self.action_error = Some(format!(
+                            "DAT sources were saved, but prior audit results could not be marked stale: {error}"
+                        ));
                     }
+                }
             }
             Err(error) => self.save_state = DatSaveState::Failed(error.to_string()),
         }

@@ -69,12 +69,13 @@ pub fn build_mgba_command_plan(
         }
     };
     if let Some(r) = resolved
-        && !MGBA_SUPPORTED_PLATFORM_IDS.contains(&r.platform_id.as_str()) {
-            blockers.push(block(
-                LaunchBlockerKind::MgbaPlatformMismatch,
-                "resolved platform is not supported by native mGBA",
-            ));
-        }
+        && !MGBA_SUPPORTED_PLATFORM_IDS.contains(&r.platform_id.as_str())
+    {
+        blockers.push(block(
+            LaunchBlockerKind::MgbaPlatformMismatch,
+            "resolved platform is not supported by native mGBA",
+        ));
+    }
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,

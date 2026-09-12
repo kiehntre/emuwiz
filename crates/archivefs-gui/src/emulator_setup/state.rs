@@ -143,4 +143,3 @@ pub(crate) fn profile_presentation_tone(eligible: bool) -> widgets::StatusTone {
         widgets::StatusTone::Pending
     }
 }
-

@@ -23,4 +23,3 @@ pub(crate) enum SelectedEvidenceEnrichmentState {
         path: PathBuf,
     },
 }
-

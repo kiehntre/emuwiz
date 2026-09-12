@@ -428,9 +428,10 @@ fn structural_media_details(
         ));
     }
     if extension == "chd"
-        && let Ok(observation) = observe_chd_identity(bytes) {
-            return Some(chd_details(observation, no_intro));
-        }
+        && let Ok(observation) = observe_chd_identity(bytes)
+    {
+        return Some(chd_details(observation, no_intro));
+    }
     if extension == "cdi"
         && let Ok(media) = archivefs_core::dreamcast_cdi::open_dreamcast_cdi_logical_media(path)
         && let Ok(evidence) = archivefs_core::cdi_disc_evidence::observe_cdi(&media)
@@ -668,13 +669,19 @@ pub(crate) fn compute_selected_evidence_enrichment_cancellable(
     no_intro_source: Option<&ImportedNoIntroSource>,
     cancel: Option<&AtomicBool>,
 ) -> Result<SelectedEvidenceEnrichment, String> {
-    let sources: Vec<_> = no_intro_source.into_iter().map(|source| (None, source)).collect();
+    let sources: Vec<_> = no_intro_source
+        .into_iter()
+        .map(|source| (None, source))
+        .collect();
     compute_selected_evidence_enrichment_from_sources(path, &sources, cancel)
 }
 
 pub(crate) fn compute_selected_evidence_enrichment_from_sources(
     path: &Path,
-    sources: &[(Option<&archivefs_core::identity_source::no_intro::NoIntroSourceLabel>, &ImportedNoIntroSource)],
+    sources: &[(
+        Option<&archivefs_core::identity_source::no_intro::NoIntroSourceLabel>,
+        &ImportedNoIntroSource,
+    )],
     cancel: Option<&AtomicBool>,
 ) -> Result<SelectedEvidenceEnrichment, String> {
     let trusted_root = path.parent().unwrap_or(path).to_path_buf();
@@ -686,24 +693,45 @@ pub(crate) fn compute_selected_evidence_enrichment_from_sources(
 
 fn enrichment_from_hashes(
     hashes: LocalHashes,
-    sources: &[(Option<&archivefs_core::identity_source::no_intro::NoIntroSourceLabel>, &ImportedNoIntroSource)],
+    sources: &[(
+        Option<&archivefs_core::identity_source::no_intro::NoIntroSourceLabel>,
+        &ImportedNoIntroSource,
+    )],
 ) -> SelectedEvidenceEnrichment {
     let mut matched_names = Vec::new();
-    let dat_sources: Vec<_> = sources.iter().filter_map(|(label, source)| {
-        let verified = VerifiedSelectedDat::lookup(*label, source, &hashes)?;
-        matched_names.push(source.system_name.as_str());
-        Some(verified)
-    }).collect();
-    let extra_observations = dat_sources.iter().flat_map(|source| source.observations().iter().cloned()).collect::<Vec<_>>();
-    let system_name = sources.iter().map(|(_, source)| source.system_name.as_str()).collect::<Vec<_>>().join("; ");
+    let dat_sources: Vec<_> = sources
+        .iter()
+        .filter_map(|(label, source)| {
+            let verified = VerifiedSelectedDat::lookup(*label, source, &hashes)?;
+            matched_names.push(source.system_name.as_str());
+            Some(verified)
+        })
+        .collect();
+    let extra_observations = dat_sources
+        .iter()
+        .flat_map(|source| source.observations().iter().cloned())
+        .collect::<Vec<_>>();
+    let system_name = sources
+        .iter()
+        .map(|(_, source)| source.system_name.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
     let no_intro = if sources.is_empty() {
         NoIntroLookupResult::NotImported
     } else if dat_sources.is_empty() {
         NoIntroLookupResult::NoMatch { system_name }
     } else {
-        NoIntroLookupResult::Matched { system_name: matched_names.join("; "), observations: extra_observations.clone() }
+        NoIntroLookupResult::Matched {
+            system_name: matched_names.join("; "),
+            observations: extra_observations.clone(),
+        }
     };
-    SelectedEvidenceEnrichment { hashes, no_intro, extra_observations, dat_sources }
+    SelectedEvidenceEnrichment {
+        hashes,
+        no_intro,
+        extra_observations,
+        dat_sources,
+    }
 }
 
 /// Merges a completed [`SelectedEvidenceEnrichment`] into a report the panel
@@ -716,7 +744,10 @@ pub(crate) fn apply_selected_evidence_enrichment(
     if report.dat_identity.is_some()
         || dat_identity::has_verified_dat_identity(&report.identity_result)
         || enrichment.hashes.fingerprint.path != report.path
-        || enrichment.dat_sources.iter().any(|source| !source.matches_hashes(&enrichment.hashes))
+        || enrichment
+            .dat_sources
+            .iter()
+            .any(|source| !source.matches_hashes(&enrichment.hashes))
     {
         return false;
     }
@@ -725,7 +756,10 @@ pub(crate) fn apply_selected_evidence_enrichment(
         let fused = dat_identity::fuse(&base, &enrichment.dat_sources);
         report.identity = present_identity(&fused);
         report.identity_result = fused;
-        report.dat_identity = Some(SelectedDatIdentity { base, sources: enrichment.dat_sources });
+        report.dat_identity = Some(SelectedDatIdentity {
+            base,
+            sources: enrichment.dat_sources,
+        });
     }
     report.hashes = Some(enrichment.hashes);
     report.no_intro = enrichment.no_intro;

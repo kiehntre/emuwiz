@@ -467,8 +467,7 @@ impl EmulatorDownloadPageState {
         let spec_id = spec.id;
         thread::spawn(move || {
             let result = (|| {
-                let root = managed_root()
-                    .map_err(ManagedAppImageBootstrapError::SpawnFailed)?;
+                let root = managed_root().map_err(ManagedAppImageBootstrapError::SpawnFailed)?;
                 let spec = emulator_download_spec(spec_id)
                     .ok_or(ManagedAppImageBootstrapError::UnsupportedEmulator)?;
                 initialize_managed_appimage(&root, spec)
@@ -478,11 +477,7 @@ impl EmulatorDownloadPageState {
         });
     }
 
-    fn show_specs<I>(
-        &self,
-        ui: &mut egui::Ui,
-        specs: I,
-    ) -> Option<EmulatorDownloadPageAction>
+    fn show_specs<I>(&self, ui: &mut egui::Ui, specs: I) -> Option<EmulatorDownloadPageAction>
     where
         I: Iterator<Item = &'static EmulatorDownloadSpec>,
     {
@@ -528,10 +523,7 @@ impl EmulatorDownloadPageState {
 
     /// Render the approval-bound workflow for the two integrated policy
     /// targets. Other catalogue entries are intentionally not presented here.
-    pub(crate) fn show_bootstrap(
-        &self,
-        ui: &mut egui::Ui,
-    ) -> Option<EmulatorDownloadPageAction> {
+    pub(crate) fn show_bootstrap(&self, ui: &mut egui::Ui) -> Option<EmulatorDownloadPageAction> {
         self.show_specs(ui, Self::managed_bootstrap_specs())
     }
 

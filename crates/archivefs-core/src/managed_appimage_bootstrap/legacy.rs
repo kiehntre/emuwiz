@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::emulator_download::{
-    managed_appimage_install, EmulatorDistribution, EmulatorDownloadSpec,
+    EmulatorDistribution, EmulatorDownloadSpec, managed_appimage_install,
 };
 
 pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -396,16 +396,18 @@ mod tests {
                 evidence.display()
             ),
         );
-        assert!(initialize_executable(
-            ManagedAppImageBootstrapKind::Pcsx2,
-            installed,
-            RequiredConfig {
-                root: config_root,
-                evidence: vec![evidence],
-            },
-            Duration::from_secs(1),
-        )
-        .is_ok());
+        assert!(
+            initialize_executable(
+                ManagedAppImageBootstrapKind::Pcsx2,
+                installed,
+                RequiredConfig {
+                    root: config_root,
+                    evidence: vec![evidence],
+                },
+                Duration::from_secs(1),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

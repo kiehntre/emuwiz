@@ -80,9 +80,9 @@ use archivefs_core::{
 use serde::Serialize;
 
 mod bsfree;
+mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
-mod cheat_reconcile;
 mod dat;
 mod platform_artwork;
 mod repair;

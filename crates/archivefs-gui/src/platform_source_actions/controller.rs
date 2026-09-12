@@ -559,8 +559,6 @@ impl ArchiveFsApp {
             }
         }
     }
-
-
 }
 
 /// Opens the default library database and applies one `PlatformAction`
@@ -674,7 +672,10 @@ pub(crate) fn apply_alias_action(action: &AliasAction) -> archivefs_core::Result
     apply_alias_action_at(&database_path, action)
 }
 
-pub(crate) fn apply_alias_action_at(database_path: &Path, action: &AliasAction) -> archivefs_core::Result<()> {
+pub(crate) fn apply_alias_action_at(
+    database_path: &Path,
+    action: &AliasAction,
+) -> archivefs_core::Result<()> {
     let mut database = Database::open_or_create(database_path)?;
     match action {
         AliasAction::Add { alias, platform } => {
@@ -831,7 +832,9 @@ pub(crate) fn gamer_first_scan_after_add(
 /// add`/`enable`/`disable`/`scan`/`sources scan-all`/`source remove`
 /// handlers) - never a second implementation of validation, scanning, or
 /// persistence.
-pub(crate) fn run_source_action(action: &SourceAction) -> archivefs_core::Result<SourceActionOutcome> {
+pub(crate) fn run_source_action(
+    action: &SourceAction,
+) -> archivefs_core::Result<SourceActionOutcome> {
     match action {
         SourceAction::Add(path) => add_source_folder_default(path).map(SourceActionOutcome::Added),
         SourceAction::SetEnabled { path, enabled } => {

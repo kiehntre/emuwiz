@@ -72,4 +72,3 @@ impl DoctorScanState {
         matches!(self, Self::Running { .. })
     }
 }
-

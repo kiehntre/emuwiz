@@ -125,7 +125,6 @@ pub(crate) fn show_browsing_rail(
             let toolbar_width = ui.available_width();
             let search_width = toolbar_width.clamp(150.0, 220.0);
 
-
             if toolbar_width >= 760.0 {
                 ui.horizontal_top(|ui| {
                     let alpha_width = (ui.available_width() - search_width - 8.0).max(0.0);

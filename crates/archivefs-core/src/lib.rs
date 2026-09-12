@@ -26,21 +26,16 @@ pub mod amiga_disk;
 /// Bounded WHDLoad `.slave` discovery inside LHA/LZH archives, reusing the
 /// existing archive-member reader and WHDLoad slave parser.
 pub mod amiga_whdload_archive;
-/// Bounded, read-only Apple II disk structural evidence.
-pub mod apple2_disk;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
 pub mod app_dirs;
+/// Bounded, read-only Apple II disk structural evidence.
+pub mod apple2_disk;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
 pub mod atari_tape;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
-/// Bounded MSX standard cassette WAV evidence.
-pub mod msx_tape;
-/// Bounded Oric media structure and read-only source bindings.
-pub mod oric_media;
-pub mod oric_tape;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -49,15 +44,20 @@ pub mod diagnostics;
 pub mod dragon_coco_tape;
 pub mod emulator_download;
 pub mod managed_appimage_bootstrap;
+/// Bounded MSX standard cassette WAV evidence.
+pub mod msx_tape;
+/// Bounded Oric media structure and read-only source bindings.
+pub mod oric_media;
+pub mod oric_tape;
 /// Optional, read-only RetroAchievements game metadata and bounded cache.
 pub mod retroachievements;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
+/// Bounded PCM/WAV pulse evidence for tape recordings.
+pub mod tape_audio;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
 pub mod uef_tape;
-/// Bounded PCM/WAV pulse evidence for tape recordings.
-pub mod tape_audio;
 use database::scan_and_persist_folders;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
