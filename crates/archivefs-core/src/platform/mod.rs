@@ -865,6 +865,22 @@ pub const PLATFORMS: &[Platform] = &[
         explanation: "The VIC-20 shares `.prg`/`.crt`/`.tap` with the rest of the Commodore range and has no extension of its own, so it is recognised from folder evidence.",
     },
     Platform {
+        id: "Dragon / Tandy CoCo",
+        display_name: "Dragon / Tandy CoCo",
+        folder_aliases: &[],
+        filename_aliases: &[],
+        // Ordinary CAS evidence is deliberately family-level. It does not
+        // identify a Dragon/CoCo machine variant, so no extension or magic
+        // rule is allowed to manufacture one here.
+        strong_extensions: &[],
+        weak_extensions: &[],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &[],
+        preferred_emulator: Some("XRoar"),
+        explanation: "Family-level Dragon/CoCo cassette evidence is available; machine selection remains an explicit launch requirement.",
+    },
+    Platform {
         id: "Enterprise",
         display_name: "Enterprise 64/128",
         folder_aliases: &["enterprise", "enterprise64", "enterprise128", "ep64", "ep128"],
