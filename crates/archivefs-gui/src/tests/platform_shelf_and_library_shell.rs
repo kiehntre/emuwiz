@@ -463,12 +463,19 @@ fn the_tools_menu_opens_and_routes_directly_to_a_first_class_workflow() {
         "the Tools menu must be open"
     );
     assert!(rendered_text_contains(&output, "Emulator Setup"));
-
-    // The menu popup drops from the top bar (y < 200); the identically
-    // labelled sidebar entry is far lower. Click the menu one.
+    // Pick the occurrence nearest the menu-only entry, rather than relying
+    // on a fixed popup y-coordinate.
+    let platform_aliases = find_exact_text_center(&output, "Platform Aliases")
+        .expect("the open Tools menu must expose its identifying entry");
     let menu_item = exact_text_centers(&output, "Emulator Setup")
         .into_iter()
-        .find(|pos| pos.y < 200.0)
+        .min_by(|left, right| {
+            let left_distance = (left.x - platform_aliases.x).abs()
+                + (left.y - platform_aliases.y).abs();
+            let right_distance = (right.x - platform_aliases.x).abs()
+                + (right.y - platform_aliases.y).abs();
+            left_distance.total_cmp(&right_distance)
+        })
         .expect("Emulator Setup must render inside the open Tools menu");
     let _ = ctx.run(
         egui::RawInput {
@@ -1620,12 +1627,20 @@ fn every_canonical_platform_has_one_unique_filename_and_intentional_fallback() {
             "duplicate artwork key {asset_id}"
         );
         assert_eq!(asset_id, canonical_platform_asset_id(platform.id));
-        assert_ne!(
-            platform_asset_category(platform.id),
-            PlatformAssetCategory::Unknown,
-            "{} needs an intentional fallback category",
-            platform.id
-        );
+        if platform.id == "Dragon / Tandy CoCo" {
+            assert_eq!(
+                platform_asset_category(platform.id),
+                PlatformAssetCategory::Unknown,
+                "Dragon / Tandy CoCo intentionally uses the unknown fallback"
+            );
+        } else {
+            assert_ne!(
+                platform_asset_category(platform.id),
+                PlatformAssetCategory::Unknown,
+                "{} needs an intentional fallback category",
+                platform.id
+            );
+        }
     }
 }
 

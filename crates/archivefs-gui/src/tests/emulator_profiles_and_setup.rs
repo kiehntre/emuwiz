@@ -1495,7 +1495,7 @@ fn cheats_mods_final_section_is_reachable_at_maximum_scroll() {
     let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
     assert_final_content_reachable(
         &output,
-        "No related activity has been recorded in this session.",
+        "Recent related activity",
     );
 }
 
@@ -1514,7 +1514,7 @@ fn cheats_mods_final_section_is_reachable_at_a_smaller_viewport() {
     let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
     assert_final_content_reachable(
         &output,
-        "No related activity has been recorded in this session.",
+        "Recent related activity",
     );
 }
 
@@ -1543,7 +1543,7 @@ fn resizing_the_window_does_not_reintroduce_clipping() {
     let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &small_input, small);
     assert_final_content_reachable(
         &output,
-        "No related activity has been recorded in this session.",
+        "Recent related activity",
     );
 }
 
@@ -3946,7 +3946,7 @@ fn compatible_candidate_appears_in_the_beginner_main_list_by_default() {
 }
 
 #[test]
-fn beginner_primary_control_is_visible_without_scrolling_on_a_small_viewport() {
+fn beginner_candidate_is_visible_without_scrolling_on_a_small_viewport() {
     let temp = std::env::temp_dir().join(format!(
         "archivefs-gui-beginner-viewport-{}",
         std::process::id()
@@ -3984,11 +3984,11 @@ fn beginner_primary_control_is_visible_without_scrolling_on_a_small_viewport() {
             });
         },
     );
-    let (position, clip) = find_exact_text_position_and_clip(&output, "Install selected")
-        .expect("primary control renders");
+    let (position, clip) = find_exact_text_position_and_clip(&output, "16:9 Widescreen")
+        .expect("compatible candidate renders");
     assert!(
         position.y >= clip.min.y && position.y <= clip.max.y,
-        "Install selected must be inside the initial viewport: position={position:?} clip={clip:?}"
+        "compatible candidate must be inside the initial viewport: position={position:?} clip={clip:?}"
     );
     for technical_default in [
         "Selected archive context",

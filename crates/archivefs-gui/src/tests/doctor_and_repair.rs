@@ -2278,11 +2278,11 @@ fn doctor_page_names_an_existing_repair_without_offering_it() {
 }
 
 #[test]
-fn doctor_page_shows_a_healthy_result_rather_than_an_empty_screen() {
+fn doctor_page_shows_an_incomplete_result_rather_than_an_empty_screen() {
     let state = doctor_outcome(doctor_scan_from(&[]));
     let output = render_doctor_page(&state, &mut None);
-    assert!(rendered_text_contains(&output, "No problems found"));
-    assert!(!rendered_text_contains(&output, "Healthy"));
+    assert!(rendered_text_contains(&output, "Checks incomplete"));
+    assert!(!rendered_text_contains(&output, "No current problems found"));
     assert!(!rendered_text_contains(&output, "Critical: 0"));
 }
 
@@ -2465,7 +2465,7 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
 
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&on_diagnostics, "No problems found"));
+    assert!(rendered_text_contains(&on_diagnostics, "Checks incomplete"));
 }
 
 // --- Increment 3: RetroArch core-folder repair flow in Emulator Setup ---

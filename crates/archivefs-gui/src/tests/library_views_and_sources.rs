@@ -457,8 +457,9 @@ fn mount_root_success_feedback_renders_a_plain_confirmation_in_the_sources_card(
         &output,
         "Temporary game preparation folder updated to /srv/prep."
     ));
-    // No failure affordance on a success.
-    assert!(!rendered_text_contains(&output, "Technical details"));
+    // Other source cards may have their own collapsed details disclosure;
+    // this successful operation must not expose a failure detail.
+    assert!(!rendered_text_contains(&output, "config error"));
 }
 
 #[test]

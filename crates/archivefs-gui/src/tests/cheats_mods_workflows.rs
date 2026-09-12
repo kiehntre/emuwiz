@@ -2044,7 +2044,7 @@ fn wii_cloudflare_state_offers_offline_import_without_retry() {
     ));
     assert!(rendered_text_contains(
         &output,
-        "gamehacking-wii-import-page"
+        "import it with the existing Wii page importer"
     ));
     assert_eq!(count_exact_text_occurrences(&output, "Try again"), 0);
 }

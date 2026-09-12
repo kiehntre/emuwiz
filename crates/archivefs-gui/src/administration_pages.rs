@@ -285,7 +285,7 @@ pub(super) fn show_library_views_page(
 
     widgets::workshop_light_header(
         ui,
-        "Library Views",
+        "Views",
         "Organised, symlink-based folder trees that point at your existing archives.",
         |_ui| {},
     );
