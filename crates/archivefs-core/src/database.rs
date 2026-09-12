@@ -1150,13 +1150,23 @@ fn open_connection(path: &Path) -> Result<Connection> {
 }
 
 fn open_read_only_connection(path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
-    .map_err(|error| read_only_database_error(path, "open database", &error))
+    .map_err(|error| read_only_database_error(path, "open database", &error))?;
+    // Read-only callers share the writer's bounded wait policy. Without a
+    // busy handler SQLite can report SQLITE_BUSY immediately while a normal
+    // catalogue refresh briefly owns the database lock, making Sources and
+    // Discovery look broken even though the database is healthy.
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            read_only_database_error(path, "configure database busy timeout", &error)
+        })?;
+    Ok(connection)
 }
 
 fn read_only_database_error(
@@ -10673,6 +10683,36 @@ mod tests {
         first.rollback_catalogue_refresh();
         second.begin_catalogue_refresh().unwrap();
         second.rollback_catalogue_refresh();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_schema_check_waits_for_a_short_writer_lock() {
+        let root = temp_dir("read-only-schema-lock");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path).unwrap();
+
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let writer_path = database_path.clone();
+        let writer = std::thread::spawn(move || {
+            let connection = Connection::open(&writer_path).unwrap();
+            connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            ready_sender.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            connection.execute_batch("ROLLBACK").unwrap();
+        });
+        ready_receiver.recv().unwrap();
+
+        // The read-only schema/version path must wait for the bounded,
+        // transient writer lock and then succeed. It must not attempt a
+        // write or report a healthy database as permanently unavailable.
+        let result = Database::open_read_only(&database_path);
+        writer.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "short writer lock should be retried: {result:?}"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
