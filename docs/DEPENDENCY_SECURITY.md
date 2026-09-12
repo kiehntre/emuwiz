@@ -4,7 +4,7 @@ This note records the dependency-advisory remediation performed for the
 EmuWiz v0.7 alpha candidate on 2026-07-29. It covers the resolved Cargo
 graph; it does not claim that all future dependency versions are safe.
 
-## Current v0.8.1-alpha audit disposition
+## Current v0.8.3 audit disposition
 
 The current candidate's `cargo audit` run succeeds with two unmaintained-crate
 warnings and no vulnerability, unsoundness, or yanked-package finding:

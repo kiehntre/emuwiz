@@ -1,17 +1,16 @@
 # EmuWiz Fedora/Nobara RPM packaging foundation.
 #
-# Pre-release versioning follows Fedora convention for an alpha snapshot:
-#   Cargo:  0.8.1-alpha
-#   RPM:    Version 0.8.1, Release 0.1.alpha%{?dist}
-# ("0.1." keeps this sorting BELOW the eventual 0.8.1-1 final release, per
-# Fedora's pre-release packaging guidelines.)
+# Cargo workspace version 0.8.3 is a plain pre-1.0 release (not an alpha
+# snapshot), so this uses Fedora's ordinary final-release convention:
+#   Cargo:  0.8.3
+#   RPM:    Version 0.8.3, Release 1%{?dist}
 
 %global app_id io.github.kiehntre.emuwiz
 %global forgeurl https://github.com/kiehntre/emuwiz
 
 Name:           emuwiz
-Version:        0.8.1
-Release:        0.1.alpha%{?dist}
+Version:        0.8.3
+Release:        1%{?dist}
 Summary:        Verify, organise, and play a retro-game library
 
 License:        MIT
@@ -146,6 +145,10 @@ appstream-util validate-relax --nonet \
 %{_bindir}/emuwiz-cli
 
 %changelog
+* Sat Sep 12 2026 David Armstrong <kiehntre@users.noreply.github.com> - 0.8.3-1
+- Version bump to 0.8.3 (packaging only; not yet released). See
+  docs/LINUX_PACKAGING.md.
+
 * Mon Sep 07 2026 David Armstrong <kiehntre@users.noreply.github.com> - 0.8.1-0.1.alpha
 - Initial Fedora/Nobara RPM packaging foundation (packaging only; not yet
   released). See docs/LINUX_PACKAGING.md.

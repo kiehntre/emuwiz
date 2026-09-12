@@ -5,9 +5,10 @@ inputs and (where host tooling allows) built artifacts. It never publishes a
 release, tags a version, or installs anything onto the authoring host. See
 each build script's `--help` for the exact flags.
 
-Current project version: `0.8.1-alpha` (pre-1.0). Nothing here fabricates a
-1.0 release; the alpha status is carried through every packaging format's own
-pre-release versioning convention.
+Current project version: `0.8.3` (pre-1.0). Nothing here fabricates a
+1.0 release; `0.8.3` is a plain final pre-1.0 release, not an alpha snapshot,
+so each packaging format uses its own ordinary final-release versioning
+convention.
 
 ## Formats
 
@@ -80,12 +81,12 @@ grouping, and avoids needless fragmentation (no separate `-common`,
 
 ## Version mapping
 
-Cargo workspace version (`Cargo.toml`): **`0.8.1-alpha`**.
+Cargo workspace version (`Cargo.toml`): **`0.8.3`**.
 
 | Format | Field(s) | Value | Why |
 | --- | --- | --- | --- |
-| Debian | `debian/changelog` version | `0.8.1~alpha-1` | `~` sorts *before* nothing, so `0.8.1~alpha-1 < 0.8.1-1`: an eventual final `0.8.1` release correctly supersedes this alpha in `dpkg --compare-versions`. |
-| Fedora/RPM | `Version:` / `Release:` | `0.8.1` / `0.1.alpha%{?dist}` | Fedora's pre-release convention: `Release` starting `0.` sorts below the eventual `1%{?dist}` final release of the same `Version`. |
+| Debian | `debian/changelog` version | `0.8.3-1` | Plain final-release Debian versioning: no `~alpha` pre-release suffix, since `0.8.3` is not an alpha snapshot. |
+| Fedora/RPM | `Version:` / `Release:` | `0.8.3` / `1%{?dist}` | Fedora's ordinary final-release convention: no `0.` pre-release `Release` prefix, since `0.8.3` is not an alpha snapshot. |
 
 When the upstream version changes, update **both**
 `packaging/debian/changelog` (new stanza) and `packaging/rpm/emuwiz.spec`

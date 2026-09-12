@@ -11,7 +11,7 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.8.1-alpha (unreleased)
+## v0.8.3 (unreleased)
 
 Identity, launch, optical, and whole-collection library release
 ("Alpha 2.1"). **Not yet tagged or published.** The currently published
