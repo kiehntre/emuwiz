@@ -1,5 +1,11 @@
 # EmuWiz release engineering
 
+> **Current release:** EmuWiz `v0.8.3` is published. It is a Linux-only,
+> pre-1.0 alpha release. The published canonical bundle is
+> `archivefs-v0.8.3-x86_64-linux.tar.gz` with the adjacent
+> `.tar.gz.sha256` sidecar. Examples below using older versions are historical
+> procedure examples, not current release claims.
+
 This document is the maintained release procedure for EmuWiz. The scripts
 described here build and inspect artifacts; they do not create tags, push
 branches, or publish releases.
@@ -84,7 +90,7 @@ Keep the archive and its `.sha256` file together, then run:
 
 ```sh
 scripts/verify-release-artifact.sh \
-  target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz
+  target/release-artifacts/archivefs-v0.8.3-x86_64-linux.tar.gz
 ```
 
 The verifier checks the checksum filename and record, exact root layout,
@@ -99,7 +105,7 @@ Its negative regression suite uses generated fixtures and must also pass:
 
 ```sh
 scripts/test-release-artifact-verifier.sh \
-  target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz
+  target/release-artifacts/archivefs-v0.8.3-x86_64-linux.tar.gz
 ```
 
 This proves rejection of a bad checksum, unexpected member, traversal path,
@@ -144,8 +150,8 @@ For a built artifact, also check both binaries and filenames:
 ```sh
 scripts/check-version-consistency.sh \
   --binary-dir target/release \
-  --artifact target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz \
-  --checksum target/release-artifacts/archivefs-v0.7.0-x86_64-linux.tar.gz.sha256
+  --artifact target/release-artifacts/archivefs-v0.8.3-x86_64-linux.tar.gz \
+  --checksum target/release-artifacts/archivefs-v0.8.3-x86_64-linux.tar.gz.sha256
 ```
 
 The workspace packages, CLI output, GUI output, archive, checksum, README

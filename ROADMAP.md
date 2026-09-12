@@ -194,13 +194,12 @@ These are implemented, tested, and in current use today:
 
 ## Current development
 
-The current workspace is post-`v0.7.0` `main`; `v0.7.0` remains the latest
-published release. Direct-image discovery, canonical platform aliases, source
-platform assignment, platform-first navigation, Dolphin and supported BSFree
+The current workspace is post-`v0.8.3` `main`; `v0.8.3` is the latest published
+release. Direct-image discovery, canonical platform aliases, source platform
+assignment, platform-first navigation, Dolphin and supported BSFree
 installation, Xenia Canary patch support, Games-only DAT selection, and EmuWiz
-Linux desktop integration are present on `main`. Release publication is handled
-by the tag-only workflow; post-release work is not retroactively part of
-`v0.7.0`.
+Linux desktop integration are present on `main`. Post-release work is not
+retroactively part of `v0.8.3`.
 
 The shared `patch_manager` orchestration layer (platform filtering,
 ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
@@ -223,14 +222,18 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **PCSX2 provider content** - safe PNACH selection, preview, merge, apply, and
-   rollback are implemented; the remaining blocker is a separately licensed,
-   reviewed ordinary-cheat provider.
-2. **Performance profiling beyond smoke scale** - investigate larger
-   catalogues only if measured traces identify a concrete bottleneck.
-3. **Mods work** - no general mod installation path exists yet.
-4. **Further adapters** - PPSSPP, RPCS3, Switch, MAME, and Amiga/WHDLoad
-   remain research-only candidates and are not scheduled.
+1. **Unified recovery and operation receipts** - make recovery, refresh,
+   reconcile, and mutation outcomes explainable through one receipt model;
+   completion remains subject to implementation and tests.
+2. **DAT completeness and authority** - strengthen completeness reporting and
+   make authority/provenance boundaries clearer across the current DAT flows.
+3. **Needs Attention and refresh/reconcile** - provide one actionable queue for
+   unresolved identity, stale state, incomplete DAT evidence, and recoverable
+   operations; completion is not yet claimed.
+4. **First-run comprehension** - guide new users through Understand → Fix →
+   Organise → Play without changing the safety boundaries.
+5. **100k profiling** - measure realistic 100,000-item collections and address
+   bottlenecks found by traces rather than assuming scale characteristics.
 
 Release process discipline (a documented, repeatable release checklist
 tied to the pinned toolchain) already exists at
@@ -240,6 +243,10 @@ tied to the pinned toolchain) already exists at
 
 Directions consistent with the architecture already in place, not yet
 scheduled:
+
+- **1.0 reliability/comprehension milestone.** A later 1.0 milestone remains
+  focused on dependable recovery, clear state/comprehension, and measured
+  large-library operation. It is not a promise that the 0.9 work is complete.
 
 - **Emulator adapter expansion pauses after Xenia.** The immediate priority
   is hardening the existing RetroArch, PCSX2, Dolphin, and Xenia workflows,

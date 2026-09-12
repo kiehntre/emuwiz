@@ -121,6 +121,12 @@ Ubuntu 24.04 and Fedora 41 containers.
 
 ## DEB packaging
 
+> **Historical packaging snapshot.** The procedure and artifact examples in
+> this section and the following RPM/QA sections preserve earlier packaging
+> work for provenance. They are not the published v0.8.3 release contract;
+> see the current version mapping above and the published tarball procedure in
+> [`docs/RELEASE_ENGINEERING.md`](RELEASE_ENGINEERING.md).
+
 ```
 packaging/debian/
 ├── build-deb.sh          # wrapper: stages an isolated git-archive copy, runs dpkg-buildpackage
@@ -153,6 +159,10 @@ real working tree is never touched, and no root-level `debian/` is ever
 committed.
 
 ## RPM packaging (Fedora/Nobara)
+
+> **Historical packaging snapshot.** The commands and package names below
+> describe earlier local packaging QA and are retained for provenance. They
+> are not current published-release artifacts.
 
 ```
 packaging/rpm/
@@ -194,6 +204,9 @@ production route: before a real Fedora/COPR submission, switch `%build` to
 - `shellcheck`: not installed on this host; not run. No script uses anything shellcheck commonly flags (unquoted globs, word-splitting-sensitive expansions); re-run before a production release if available.
 
 ## Package builds: real containerised attempts (packaging QA V3)
+
+> **Historical QA record.** This section records an earlier packaging attempt;
+> its old version strings and blockers are not current v0.8.3 release claims.
 
 Real builds were run in disposable, network-pulled `ubuntu:24.04` and
 `fedora:41` containers (never against the host - `docker run --rm`, repo
@@ -301,6 +314,9 @@ can succeed.
 
 ## Package inspection / install QA: blocked in V3 (superseded)
 
+> **Historical QA record.** Superseded by later packaging work; preserved as
+> provenance, not as current release status.
+
 Tasks A2/B (DEB inspection, install/uninstall QA) and D2/E (RPM inspection,
 install/uninstall QA) could not run - there is no artifact to inspect or
 install. `dist/packages/` is empty; nothing was faked. Once the blocker
@@ -344,6 +360,9 @@ run - there is nothing to lint without a built package.
 
 ## Static validation performed (V3)
 
+> **Historical QA record.** Preserved for provenance; not a current v0.8.3
+> artifact/status statement.
+
 - `desktop-file-validate` on the rendered `.desktop` file: **pass**.
 - `appstreamcli validate --no-net` on `assets/linux/io.github.kiehntre.emuwiz.metainfo.xml`: **pass** (1 pre-existing pedantic note).
 - `bash -n` on both build scripts: **pass**.
@@ -351,6 +370,9 @@ run - there is nothing to lint without a built package.
 - `lintian`/`rpmlint`: not installed; moot without a built package (see above).
 
 ## Package builds and install QA (V4)
+
+> **Historical QA record.** This section describes older local package QA and
+> retains its original artifact names for provenance.
 
 V4 reran the real packaging scripts after the OnFrame compile fix (`acb3fbc`)
 in fresh, disposable containers. The repository was bind-mounted read-only;
@@ -405,7 +427,11 @@ V4 is local artifact/install QA, not a claim of official Debian or Fedora
 repository compliance. RPM still builds with live Cargo dependency access;
 vendoring remains the documented prerequisite for a Fedora/COPR submission.
 
-## Package builds and install QA (V5 current release-candidate HEAD)
+## Package builds and install QA (V5 historical QA snapshot)
+
+> **Historical QA record.** Despite the original heading, this is not the
+> current release status. V5 predates the published v0.8.3 release and its
+> artifact names/results are retained only as historical evidence.
 
 V5 rebuilt the packages from the current committed authority
 `a2d51bbbac0088a56c4de53a323b57c6ece21c87` (`feat(identity): add PC-98 boot

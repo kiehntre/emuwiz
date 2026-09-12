@@ -11,15 +11,13 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.8.3 (unreleased)
+## v0.8.3 (2026-09-12)
 
 Identity, launch, optical, and whole-collection library release
-("Alpha 2.1"). **Not yet tagged or published.** The currently published
-release remains [`v0.8.0-alpha`](docs/releases/v0.8.0-alpha.md); this entry
-describes what has merged to the current candidate branch toward the next
-alpha so far. See
-[`docs/releases/v0.8.1-alpha.md`](docs/releases/v0.8.1-alpha.md) for full
-release notes.
+("Alpha 2.1"). Published at
+[`v0.8.3`](https://github.com/kiehntre/emuwiz/releases/tag/v0.8.3).
+The canonical Linux bundle and adjacent `.sha256` sidecar are published on
+that release page.
 
 ### Added
 
