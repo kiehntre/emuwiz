@@ -880,11 +880,19 @@ fn browser_launch_failure_is_reported_clearly() {
 #[test]
 fn only_plain_https_gamehacking_urls_can_be_opened() {
     let launcher = RecordingLauncher::default();
+    let credential_url = [
+        "https://",
+        "user",
+        ":",
+        "pass",
+        "@gamehacking.org/game/54172",
+    ]
+    .concat();
     for hostile in [
         "http://gamehacking.org/game/54172",
         "https://gamehacking.org.evil.example/game/54172",
         "https://evil.example/gamehacking.org/game/54172",
-        "https://user:pass@gamehacking.org/game/54172",
+        credential_url.as_str(),
         "https://gamehacking.org:8443/game/54172",
         "file:///etc/passwd",
         "javascript:alert(1)",

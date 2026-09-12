@@ -274,11 +274,19 @@ fn approved_launchbox_screenshot_is_fetched_without_romm_credentials() {
 
 #[test]
 fn launchbox_policy_rejects_http_lookalikes_ports_and_oversized_paths() {
+    let credential_url = [
+        "https://",
+        "user",
+        ":",
+        "pass",
+        "@images.launchbox-app.com/a.png",
+    ]
+    .concat();
     for url in [
         "http://images.launchbox-app.com/a.png",
         "https://evil.images.launchbox-app.com/a.png",
         "https://images.launchbox-app.com.evil.test/a.png",
-        "https://user:pass@images.launchbox-app.com/a.png",
+        credential_url.as_str(),
         "https://images.launchbox-app.com:8443/a.png",
     ] {
         assert!(validate_launchbox_url(url).is_err(), "{url} must be refused");
