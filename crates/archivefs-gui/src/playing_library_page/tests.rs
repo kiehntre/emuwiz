@@ -137,6 +137,25 @@ fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egu
         .find_map(|clipped| find_in_shape(&clipped.shape, needle))
 }
 
+fn find_last_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+            egui::Shape::Vec(nested) => nested
+                .iter()
+                .rev()
+                .find_map(|shape| find_in_shape(shape, needle)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .rev()
+        .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+}
+
 fn click_event(pos: egui::Pos2) -> Vec<egui::Event> {
     vec![
         egui::Event::PointerMoved(pos),
@@ -167,7 +186,7 @@ fn click_text(
     let (before, _) = render(ctx, state, base_input());
     let pos = find_exact_text_center(&before, needle)
         .unwrap_or_else(|| panic!("expected to find rendered text {needle:?} to click"));
-    render(
+    let (_, action) = render(
         ctx,
         state,
         egui::RawInput {
@@ -175,7 +194,33 @@ fn click_text(
             events: click_event(pos),
             ..Default::default()
         },
-    )
+    );
+    // egui applies the click during this frame, but the newly expanded
+    // widget is emitted on the next frame. Return that settled frame so
+    // assertions inspect the same state a real event loop would display.
+    let (settled, _) = render(ctx, state, base_input());
+    (settled, action)
+}
+
+fn click_last_text(
+    ctx: &egui::Context,
+    state: &mut PlayingLibraryPageState,
+    needle: &str,
+) -> (egui::FullOutput, Option<PlayingLibraryPageAction>) {
+    let (before, _) = render(ctx, state, base_input());
+    let pos = find_last_exact_text_center(&before, needle)
+        .unwrap_or_else(|| panic!("expected to find rendered text {needle:?} to click"));
+    let (_, action) = render(
+        ctx,
+        state,
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            events: click_event(pos),
+            ..Default::default()
+        },
+    );
+    let (settled, _) = render(ctx, state, base_input());
+    (settled, action)
 }
 
 /// Types `text` into the field with widget id `field_id` by giving it
@@ -485,7 +530,7 @@ fn the_page_shows_a_plain_winner_explanation_and_why_the_loser_lost_with_technic
         "CandidateEvidenceSummary {"
     ));
 
-    let (with_technical_detail, _) = click_text(&ctx, &mut state, "Technical details");
+    let (with_technical_detail, _) = click_last_text(&ctx, &mut state, "Technical details");
     assert!(rendered_text_contains(
         &with_technical_detail,
         "CandidateEvidenceSummary {"
