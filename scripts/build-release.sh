@@ -76,6 +76,17 @@ trap cleanup EXIT INT TERM
 STAGE_ROOT="$TEMP_ROOT/$BUNDLE_NAME"
 mkdir -p "$STAGE_ROOT"
 
+# Always build through a disposable target directory.  Besides keeping
+# release staging separate from a developer's incremental target tree, this
+# makes generated bindings and other include!-produced artifacts see one
+# canonical remapped target path in every environment.  Previously the
+# default target was "$REPO_ROOT/target" while --target-dir builds used a
+# temporary path, producing different GUI build IDs despite identical source,
+# toolchain, and archive metadata.
+if [[ -z "$TARGET_DIR" ]]; then
+    TARGET_DIR="$TEMP_ROOT/target"
+fi
+
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --format=%ct)}"
 [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || release_die "SOURCE_DATE_EPOCH must be an integer"
 export SOURCE_DATE_EPOCH
@@ -83,14 +94,12 @@ export LC_ALL=C
 export TZ=UTC
 
 BUILD_ARGS=(build --workspace --release --locked)
-if [[ -n "$TARGET_DIR" ]]; then
-    if [[ "$TARGET_DIR" != /* ]]; then
-        TARGET_DIR="$PWD/$TARGET_DIR"
-    fi
-    mkdir -p "$TARGET_DIR"
-    TARGET_DIR="$(CDPATH= cd -- "$TARGET_DIR" && pwd -P)"
-    export CARGO_TARGET_DIR="$TARGET_DIR"
+if [[ "$TARGET_DIR" != /* ]]; then
+    TARGET_DIR="$PWD/$TARGET_DIR"
 fi
+mkdir -p "$TARGET_DIR"
+TARGET_DIR="$(CDPATH= cd -- "$TARGET_DIR" && pwd -P)"
+export CARGO_TARGET_DIR="$TARGET_DIR"
 
 RUST_REMAP=""
 if [[ -n "${HOME:-}" ]]; then

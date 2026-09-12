@@ -114,14 +114,18 @@ jobs:
           VERSION="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "archivefs-cli"))')"
           test "${{ steps.vars.outputs.tag }}" = "v${VERSION}"
 
-      - name: Build and verify canonical release artifact
-        run: scripts/build-release.sh --output-dir dist
+      # Build twice in independent disposable target trees and publish only
+      # the artifact produced by that byte-for-byte reproducibility check.
+      # This prevents a tag release from auto-publishing a one-off build that
+      # was never compared against an identical second build.
+      - name: Build and verify reproducible release artifacts
+        run: scripts/compare-release-builds.sh --output-dir "$RUNNER_TEMP/reproducibility"
 
       - name: Resolve artifact paths
         id: artifact
         run: |
           set -euo pipefail
-          ARTIFACT="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          ARTIFACT="$(find "$RUNNER_TEMP/reproducibility/run1" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
           test -n "$ARTIFACT"
           test -f "$ARTIFACT.sha256"
           echo "archive=$ARTIFACT" >> "$GITHUB_OUTPUT"
