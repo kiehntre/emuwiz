@@ -46,6 +46,9 @@ pub mod emulator_download;
 pub mod managed_appimage_bootstrap;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
+/// Shared read-only projections of workflow journals into operation receipts
+/// and conservative recovery capabilities.
+pub mod operation;
 /// Bounded Oric media structure and read-only source bindings.
 pub mod oric_media;
 pub mod oric_tape;

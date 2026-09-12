@@ -1837,6 +1837,7 @@ pub(super) fn show_history_logs_page(
             }
         }
     }
+    show_operation_receipts(ui);
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
@@ -2076,6 +2077,85 @@ pub(super) fn show_history_logs_page(
             }
         });
     action
+}
+
+/// Read-only presentation of the shared operation projections. The existing
+/// journals remain authoritative and this surface deliberately offers no
+/// generic resume/rollback button: an adapter must expose a proven action
+/// before a workflow can make one available.
+fn show_operation_receipts(ui: &mut egui::Ui) {
+    widgets::section_header(
+        ui,
+        "Operations & recovery",
+        Some("Saved operation receipts and the safest next action, when one is known."),
+    );
+    let Ok(directory) = archivefs_core::dat::rename_apply::default_rename_transaction_dir() else {
+        widgets::empty_state(
+            ui,
+            "Operations unavailable",
+            "EmuWiz could not locate the saved operation journal directory.",
+            None,
+        );
+        return;
+    };
+    let registry = archivefs_core::operation::OperationRegistry::from_rename_journals(&directory);
+    if registry.records.is_empty() && registry.problems.is_empty() {
+        widgets::empty_state(
+            ui,
+            "No saved operations yet",
+            "Completed, interrupted, or failed operations will appear here after they run.",
+            None,
+        );
+        return;
+    }
+    if !registry.problems.is_empty() {
+        widgets::banner(
+            ui,
+            "Some operation records need attention",
+            &format!(
+                "{} saved record(s) could not be read.",
+                registry.problems.len()
+            ),
+            widgets::StatusTone::Warning,
+        );
+    }
+    for record in registry.records.iter().take(200) {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                widgets::status_badge(
+                    ui,
+                    record.state.label(),
+                    if record.state == archivefs_core::operation::OperationState::Completed {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Warning
+                    },
+                );
+                ui.strong(record.kind.label());
+                ui.label(format!("· {}", record.operation_id));
+            });
+            ui.label(record.output.summary.as_str());
+            ui.label(format!("Next: {}", record.recovery.classification.label()));
+            if let Some(destination) = &record.destination {
+                ui.label(format!("Destination: {destination}"));
+            }
+            widgets::technical_details(
+                ui,
+                ("operation-receipt-details", &record.operation_id),
+                |ui| {
+                    ui.label(format!(
+                        "Plan generation: {:?}",
+                        record.input.plan_generation
+                    ));
+                    ui.label(format!("Rollback: {:?}", record.recovery.actions.rollback));
+                    ui.label(format!("Resume: {:?}", record.recovery.actions.resume));
+                    if let Some(error) = &record.error {
+                        ui.label(format!("Recorded error: {error}"));
+                    }
+                },
+            );
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
