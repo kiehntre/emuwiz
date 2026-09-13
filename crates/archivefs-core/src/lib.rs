@@ -44,6 +44,9 @@ mod database;
 pub mod diagnostics;
 pub mod dragon_coco_tape;
 pub mod emulator_download;
+/// Deterministic, read-only reconciliation of existing identity, topology and
+/// readiness evidence. This derived layer never mutates the catalogue.
+pub mod evidence_resolution;
 pub mod managed_appimage_bootstrap;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
