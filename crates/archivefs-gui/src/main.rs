@@ -2570,6 +2570,9 @@ enum MainView {
     /// Canonical organisation: planning and (only after explicit approval)
     /// applying moves of identified games into a configured master ROM root.
     CanonicalOrganisation,
+    /// Read-only frontend publisher projections over the existing Playing
+    /// Library / 1G1R plan. This destination has no execution path.
+    PublisherProfiles,
     /// Evidence-backed filename cleanup for one chosen library folder. This
     /// is a task-oriented entry point over the existing DAT audit, rename
     /// plan, review, and journalled apply flow; DAT Sources remains the
@@ -3195,6 +3198,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::CheatsMods => "Cheats & Mods",
         MainView::CheatSources => "Cheat Sources",
         MainView::CanonicalOrganisation => "Library organisation",
+        MainView::PublisherProfiles => "Publisher / Frontend Library",
         MainView::IdentifyRename => "Identify & Rename",
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
@@ -3236,6 +3240,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         MainView::Museum => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
+        | MainView::PublisherProfiles
         | MainView::IdentifyRename
         | MainView::RepairReview
         | MainView::DiscConversion
@@ -3318,6 +3323,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             // the window with no way to reach the rest of it or the footer
             // controls.
             | MainView::CanonicalOrganisation
+            | MainView::PublisherProfiles
     )
 }
 
@@ -3676,6 +3682,7 @@ struct ArchiveFsApp {
     /// click; installing an emulator never implies it is launch-ready.
     emulator_download_page: emulator_download_page::EmulatorDownloadPageState,
     rom_organisation_page: Option<rom_organisation_page::RomOrganisationPageState>,
+    publisher_profile_page: Option<publisher_profile_page::PublisherProfilePageState>,
     /// The Repair Review page, loaded lazily on first visit. Preview-only;
     /// it never applies anything.
     repair_review_page: Option<repair_review_page::RepairReviewPageState>,
@@ -4197,6 +4204,7 @@ impl ArchiveFsApp {
             cheatbase_page: cheatbase_page::CheatBasePageState::default(),
             emulator_download_page: emulator_download_page::EmulatorDownloadPageState::default(),
             rom_organisation_page: None,
+            publisher_profile_page: None,
             repair_review_page: None,
             repair_history_page: None,
             exact_duplicate_review_page: None,
@@ -5637,6 +5645,27 @@ impl ArchiveFsApp {
             .rom_organisation_page
             .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
         rom_organisation_page::show_rom_organisation_page(ui, page);
+    }
+
+    /// Draws the read-only publisher projection page. The source is only the
+    /// already-built Playing Library plan from Library Organisation; this
+    /// page never scans or re-elects games itself.
+    fn show_publisher_profile_page(&mut self, ui: &mut egui::Ui) {
+        let source_plan = self
+            .rom_organisation_page
+            .as_ref()
+            .and_then(|page| page.playing_library.plan().cloned());
+        let page = self
+            .publisher_profile_page
+            .get_or_insert_with(publisher_profile_page::PublisherProfilePageState::default);
+        page.source_plan = source_plan;
+        if let Some(action) = publisher_profile_page::show_publisher_profile_page(ui, page) {
+            match action {
+                publisher_profile_page::PublisherProfilePageAction::OpenLibraryOrganisation => {
+                    self.navigate_to_main_view(MainView::CanonicalOrganisation)
+                }
+            }
+        }
     }
 
     fn show_optical_conversion_page(&mut self, ui: &mut egui::Ui) {
@@ -8660,6 +8689,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::CanonicalOrganisation {
                     self.show_rom_organisation_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::PublisherProfiles {
+                    self.show_publisher_profile_page(ui);
                     return;
                 }
 

@@ -177,27 +177,43 @@ Plus two determinism tests (§13) and the two zero-side-effect tests (§9).
 
 `crates/archivefs-gui/src/publisher_profile_page.rs`: a target-profile picker (plain-language "Create a RomM-ready library" / "Create an ES-DE-ready library" per task section 20), a destination-root and canonical-platform-id input, a "Preview plan" button, the exact `Ready`/`Already present`/`Review required`/`Blocked`/`Unsupported` filter set, an "Advanced" toggle revealing slug/canonical-platform/action/destination-path detail, and the required "PREVIEW ONLY — nothing will be changed." banner. **There is no Apply/Publish button anywhere in this file.** 6 focused tests cover the page's own state/filter logic (`preview()` error paths, RomM/ES-DE resolution, filter partitioning) — the same testing style this codebase's other GUI pages already use (state-logic tests, not simulated egui clicks).
 
-**Honest limitation**: this page is not yet reachable from `MainView`/the app sidebar. `crates/archivefs-gui/src/main.rs`'s navigation enum and routing are a large (4,000+ line), unfamiliar surface for this pass to touch safely without a much larger review budget than Phase 1's own scope warrants; the module is complete, compiles, and is unit-tested standing alone, but wiring in one new navigation entry (and threading an already-built `PlayingLibraryPlan` into `PublisherProfilePageState::source_plan`) is left as a small, mechanical follow-up.
+The page is now reachable as **Library → Publisher / Frontend Library** in the normal Advanced View sidebar. The page routes as its own `MainView::PublisherProfiles`, has selected-state highlighting, uses the shared page-scroll policy, and returns to **Library Organisation** through its explicit handoff when no 1G1R plan is available. It receives only the already-built `PlayingLibraryPlan` retained by the existing Library Organisation page; it never creates a second source-election flow. The profile cards read **Create a RomM-ready library** and **Create an ES-DE-ready library**, with plain-language descriptions.
 
-## 15. Phase 2 execution boundary (not implemented here)
+The destination root is an explicitly entered preview root. When a preview is requested, the planner passes that same root to its optional read-only inspection path, classifying existing destinations as missing, already correct, conflicting, stale, or unknown. It never creates the root. The summary and filters are rendered from the single plan result, and selecting **Details** shows title, canonical platform, target, source/destination paths, planned future action, mapping, media-set companion count, warnings, conflicts, and safety.
+
+## 15. GUI integration and bounded real sample findings
+
+The bounded platform sample uses the representative systems available in the collection audit: PS1, PS2, Amiga, Atari ST, ZX Spectrum, Dreamcast, Saturn, Sharp X68000, and GBA. It is a mapping-level sample, not a fabricated full-library audit and not a hash-verified whole-library run.
+
+| Result | RomM | ES-DE |
+|---|---:|---:|
+| Mapped | 6/9 | 9/9 |
+| Unmapped | Atari ST, ZX Spectrum, Sharp X68000 | 0 |
+| Review required / blocked | No additional cases in the mapping sample | No additional cases in the mapping sample |
+| Collision cases | 0 in the bounded mapping sample | 0 in the bounded mapping sample |
+| Existing destination cases | Not supplied for the real sample | Not supplied for the real sample |
+
+RomM and ES-DE therefore differ for the three RomM mapping gaps; ES-DE has reviewed folders for all nine representative systems. Synthetic planner and destination-inspection tests cover mapped/unmapped, exact/case-fold collisions, already-correct destinations, stale destinations, and conflicting existing content.
+
+GUI smoke verification was performed at the state/render-test level: the page route, profile labels, preview-only banner, filters, detail selection, empty/degraded handoff, and no-apply surface compile and are covered by focused tests. A full Xvfb click-through was not available in this environment, so actual mouse automation and visual no-crash startup were not claimed. `cargo check --workspace` is run with a temporary target directory because this checkout's tracked build target is mounted read-only.
+
+## 16. Phase 2 execution boundary (not implemented here)
 
 A future Phase 2 would consume a `PublisherPlan` whose items are all `PublisherActionSafety::SafeToAct`, and turn each into a real filesystem operation — most likely by converting accepted items back into `LinkedLibraryOperation`s and reusing the existing, reviewed `playing_library::apply_adapter::build_playing_library_transaction` journal engine, exactly the reuse-not-reinvent seam `playing_library`'s own module doc comment already describes for its own apply path. Concretely, Phase 2 would need to:
 
-- Add a real hardlink-capable transaction operation (today's apply engine only ever creates symlinks — see §16 below) before `PublisherActionKind::Hardlink` could ever be selected in practice.
+- Add a real hardlink-capable transaction operation (today's apply engine only ever creates symlinks — see §17 below) before `PublisherActionKind::Hardlink` could ever be selected in practice.
 - Decide same-filesystem evidence for the hardlink/symlink/copy preference order (task section 7) — Phase 1 deliberately never guesses this.
 - Wire BIOS-requirement detection into `PublisherBiosRequirement` (currently always empty — task section 12's "unknown policy" default).
-- Wire the GUI page into `MainView` and thread a real `PlayingLibraryPlan` into it.
+No such conversion function, hardlink transaction type, BIOS destination projection, metadata/config writer, playlist generator, or publish/apply button exists; Phase 1 stops at `PublisherPlan` and the GUI's preview-only rendering.
 
-No such conversion function, hardlink transaction type, or navigation wiring exists yet; Phase 1 stops at `PublisherPlan`.
-
-## 16. Why every Phase 1 planned action defaults to Symlink, never Hardlink
+## 17. Why every Phase 1 planned action defaults to Symlink, never Hardlink
 
 Measured, not assumed: the only real, apply-capable filesystem-write paths in this codebase today (`playing_library::apply_adapter::build_playing_library_transaction`, `dat::rom_organisation`'s `CreateSymlink` transaction operations) create symlinks exclusively. The only `std::fs::hard_link` calls anywhere in `archivefs-core/src` are inside test-fixture setup code, never inside a real, reviewed execution path. Task section 7 explicitly says "do not decide automatically where evidence is insufficient" — since no real hardlink-capable execution engine exists to justify it, `planner::default_planned_action` always proposes `Symlink`, exactly matching what every other reviewed profile in this codebase already does.
 
 ## Validation
 
-- `cargo fmt --check` — clean on both touched crates.
-- `cargo check --workspace` — clean.
+- `cargo fmt --check` — clean.
+- `CARGO_BUILD_JOBS=4 cargo check --workspace` — clean using a temporary target directory because the checkout's `target/debug` is read-only.
 - `cargo test -p archivefs-core publisher_profile` — 24/24 passing.
 - `cargo test -p archivefs-gui publisher_profile_page` — 6/6 passing (×3 binary targets).
 - `cargo test -p archivefs-core playing_library` / `rom_organisation` / `media_set` / `romm` / `es_de` — all passing, zero regression.
@@ -206,4 +222,4 @@ Measured, not assumed: the only real, apply-capable filesystem-write paths in th
 
 ## Is Publisher Profiles Phase 1 complete?
 
-Yes, for its own stated scope: a generic, reusable, read-only planning model; a first-class RomM profile and a first-class ES-DE profile, both built on the existing reviewed platform-mapping tables; typed conflict/warning/safety semantics; deterministic, `O(N log N)` planning verified at 100k items; a real (if platform-mapping-scoped, not full-hash-verified) collection audit; and a structurally-proven zero-side-effect guarantee. The GUI page and a full hash-verified real-library run are both real, working, but not yet *wired in* — named explicitly above, not silently absent.
+Yes, for its stated Phase 1 product scope: a generic, reusable, read-only planning model; first-class RomM and ES-DE profiles built on the existing reviewed mapping tables; typed conflict/warning/safety semantics; deterministic `O(N log N)` planning verified at 100k items; a bounded real mapping audit; a structurally-proven zero-side-effect guarantee; and a reachable, preview-only GUI destination integrated with Library Organisation's existing Playing Library handoff. A full hash-verified real-library publisher audit and execution remain outside this phase.

@@ -7,20 +7,6 @@
 //! root, and shows what `build_publisher_plan` reports. **There is no
 //! Apply/Publish button anywhere in this file** - Phase 1 is preview only.
 //!
-//! # Wiring status (honest limitation)
-//!
-//! This module is complete and unit-tested on its own, but is not yet
-//! wired into `MainView`/the app sidebar - see
-//! `docs/research/PUBLISHER_PROFILES_PHASE1.md`'s GUI section for why that
-//! last step was left as a small, mechanical follow-up rather than risking
-//! an unreviewed change to the main navigation file in this pass.
-
-// Not yet reachable from `MainView`/the sidebar (see this module's own doc
-// comment) - allowed here rather than papered over with an unused `_`
-// prefix on every public item, since this module's own tests already
-// exercise the real code paths below.
-#![allow(dead_code)]
-
 use archivefs_core::platform_evidence_fusion::romm_platform_mapping::FrontendPlatformMapping;
 use archivefs_core::playing_library::PlayingLibraryPlan;
 use archivefs_core::publisher_profile::es_de::{es_de_profile, resolve_es_de_platform_mapping};
@@ -101,6 +87,11 @@ pub(crate) struct PublisherProfilePageState {
     pub(crate) selected_item: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublisherProfilePageAction {
+    OpenLibraryOrganisation,
+}
+
 impl PublisherProfilePageState {
     /// Builds the read-only preview. Never called automatically - only
     /// from an explicit "Preview plan" button.
@@ -140,7 +131,10 @@ impl PublisherProfilePageState {
             playing_library_plan: plan,
             platform_mapping: mapping,
             destination_root,
-            existing_destination_root: None,
+            // The explicitly entered root is also the read-only inspection
+            // root. `build_publisher_plan` only checks existing paths; it
+            // never creates the root or any parent directories.
+            existing_destination_root: Some(std::path::Path::new(self.destination_root.trim())),
         };
         match build_publisher_plan(&request) {
             Ok(result) => self.result = Some(result),
@@ -155,7 +149,8 @@ impl PublisherProfilePageState {
 pub(crate) fn show_publisher_profile_page(
     ui: &mut egui::Ui,
     state: &mut PublisherProfilePageState,
-) {
+) -> Option<PublisherProfilePageAction> {
+    let mut action = None;
     widgets::section_header(
         ui,
         "Publisher / Frontend Library",
@@ -207,6 +202,9 @@ pub(crate) fn show_publisher_profile_page(
                 )
                 .color(theme::muted(ui)),
             );
+            if ui.button("Open Library Organisation").clicked() {
+                action = Some(PublisherProfilePageAction::OpenLibraryOrganisation);
+            }
         }
         if ui.button("Preview plan").clicked() {
             state.preview();
@@ -217,7 +215,7 @@ pub(crate) fn show_publisher_profile_page(
     });
 
     let Some(result) = &state.result else {
-        return;
+        return action;
     };
 
     ui.add_space(10.0);
@@ -285,6 +283,46 @@ pub(crate) fn show_publisher_profile_page(
     if filtered.is_empty() {
         ui.label(egui::RichText::new("No items match this filter.").color(theme::muted(ui)));
     }
+
+    if let Some(index) = state.selected_item
+        && let Some(item) = result.items.get(index)
+    {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Item details").strong());
+            ui.label(format!("Title: {}", item.dat_entry_name));
+            ui.label(format!(
+                "Canonical platform: {}",
+                item.platform_mapping.canonical_platform_id()
+            ));
+            ui.label(format!("Target profile: {}", result.frontend.label()));
+            ui.label(format!("Source path: {}", item.source_path.display()));
+            ui.label(format!(
+                "Destination path: {}",
+                item.planned_destination.as_deref().map_or_else(
+                    || "Not available".to_string(),
+                    |path| path.display().to_string()
+                )
+            ));
+            ui.label(format!("Planned action: {:?}", item.planned_action.kind));
+            ui.label(format!("Action safety: {:?}", item.safety));
+            ui.label(format!("Destination state: {:?}", item.destination_state));
+            ui.label(format!("Mapping: {:?}", item.platform_mapping));
+            ui.label(format!(
+                "Media-set state: {} companion item(s)",
+                item.companions.len()
+            ));
+            if !item.warnings.is_empty() {
+                ui.label(format!("Warnings: {:?}", item.warnings));
+            }
+            if !item.conflicts.is_empty() {
+                ui.label(format!("Conflicts: {:?}", item.conflicts));
+            }
+            ui.label(format!("Reason: {}", item.reason));
+        });
+    }
+
+    action
 }
 
 #[cfg(test)]

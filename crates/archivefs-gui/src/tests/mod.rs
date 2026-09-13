@@ -1037,6 +1037,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         local_mod_package: Default::default(),
         emulator_download_page: Default::default(),
         rom_organisation_page: None,
+        publisher_profile_page: None,
         repair_review_page: None,
         repair_history_page: None,
         exact_duplicate_review_page: None,

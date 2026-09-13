@@ -20,7 +20,7 @@ use super::*;
 // those tests assert against; `--all-targets` clippy's non-test pass does
 // not see that usage.
 #[allow(dead_code)]
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 22] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 23] = [
     (MainView::Home, "Home"),
     (MainView::NeedsAttention, "Needs Attention"),
     (MainView::Mount, "Mount"),
@@ -38,6 +38,7 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 22] = [
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::Sources, "Sources"),
+    (MainView::PublisherProfiles, "Publisher / Frontend Library"),
     (MainView::SourcesDiscovery, "Collection Discovery"),
     (MainView::Doctor, "Doctor"),
     (MainView::HistoryLogs, "History & Logs"),
@@ -217,6 +218,7 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
             nav_view(MainView::Library, "Library"),
             nav_quick_rename("Quick Rename"),
             nav_view(MainView::CanonicalOrganisation, "Library Organisation"),
+            nav_view(MainView::PublisherProfiles, "Publisher / Frontend Library"),
         ],
     },
     // 0.8.1 "core workflows directly discoverable": the major task-oriented
