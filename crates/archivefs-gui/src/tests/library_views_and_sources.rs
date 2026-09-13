@@ -3863,6 +3863,14 @@ fn sources_tab_covers_every_consolidated_view() {
         Some(SourcesTab::Discovery)
     );
     assert_eq!(sources_tab_for_main_view(MainView::Home), None);
+    for view in [
+        MainView::Sources,
+        MainView::DatSources,
+        MainView::CheatSources,
+        MainView::SourcesDiscovery,
+    ] {
+        assert!(navigation_destination_selected(view, MainView::Sources));
+    }
 }
 
 #[test]

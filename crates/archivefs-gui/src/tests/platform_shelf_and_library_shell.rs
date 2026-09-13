@@ -3578,20 +3578,18 @@ fn only_one_sidebar_entry_highlights_for_a_shared_destination() {
 }
 
 /// Regression test for a live-QA bug: opening a `ToolsOverlay` (e.g.
-/// Database Status) left the previously active `MainView` (e.g. DAT
-/// Sources) still highlighted in the sidebar at the same time as the
+/// Database Status) left the previously active `MainView` (e.g. a Sources
+/// tab) still highlighted in the sidebar at the same time as the
 /// overlay's own entry, because the overlay replaces the main view's content
 /// without ever changing `self.view`. A `View` entry must stop rendering
 /// selected the moment any overlay is open.
 #[test]
 fn view_entries_do_not_stay_highlighted_once_an_overlay_is_open() {
-    let (_, selected_without_overlay) = (
-        (),
-        navigation_destination_selected(MainView::DatSources, MainView::DatSources),
-    );
+    let selected_without_overlay =
+        navigation_destination_selected(MainView::DatSources, MainView::Sources);
     assert!(
         selected_without_overlay,
-        "sanity check: DAT Sources must normally render selected while active"
+        "sanity check: Sources must render selected while its DAT tab is active"
     );
 
     // `show_primary_navigation`'s selection computation gates every `View`
@@ -3599,13 +3597,13 @@ fn view_entries_do_not_stay_highlighted_once_an_overlay_is_open() {
     // directly the way the render loop does.
     let current = MainView::DatSources;
     let current_overlay = ToolsOverlay::DatabaseStatus;
-    let dat_sources_selected = current_overlay == ToolsOverlay::None
-        && navigation_destination_selected(current, MainView::DatSources);
+    let sources_selected = current_overlay == ToolsOverlay::None
+        && navigation_destination_selected(current, MainView::Sources);
     let database_status_selected = current_overlay == ToolsOverlay::DatabaseStatus;
 
     assert!(
-        !dat_sources_selected,
-        "DAT Sources must not stay highlighted once another overlay is open"
+        !sources_selected,
+        "Sources must not stay highlighted once another overlay is open"
     );
     assert!(
         database_status_selected,
@@ -3753,10 +3751,9 @@ fn sources_still_covers_every_consolidated_view() {
         MainView::CheatSources,
         MainView::SourcesDiscovery,
     ] {
-        assert_eq!(
-            sidebar_views.contains(&view),
-            view == MainView::DatSources,
-            "only DAT Sources has a direct sidebar route now"
+        assert!(
+            !sidebar_views.contains(&view),
+            "{view:?} must be reached through the consolidated Sources tabs"
         );
     }
     // The old Collection Discovery overlay entry must not survive under a

@@ -151,8 +151,8 @@ pub(crate) struct NavGroup {
 ///   rename/reorganisation workflow over identified games - so it is no
 ///   longer reachable only via a single Home card.
 /// - `CheatSources`/`DatSources`: config pages for their respective
-///   workflows, placed alongside them rather than invented a "Config"
-///   group the locked design doesn't have.
+///   workflows, exposed as tabs inside Sources rather than as competing
+///   sidebar destinations.
 /// - `CollectionDiscovery` (a `ToolsOverlay`, not a `MainView`): placed in
 ///   Sources per the newer UX work's finding that it was "buried in
 ///   generic Tools" - it now lives where a person is already looking when
@@ -248,10 +248,7 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     },
     NavGroup {
         heading: Some("SOURCES"),
-        entries: &[
-            nav_view(MainView::Sources, "Sources"),
-            nav_view(MainView::DatSources, "DAT Sources"),
-        ],
+        entries: &[nav_view(MainView::Sources, "Sources")],
     },
     NavGroup {
         heading: Some("MEDIA"),
@@ -319,7 +316,7 @@ pub(crate) fn navigation_destination_selected(current: MainView, candidate: Main
     } else if candidate == MainView::Problems {
         problems_repair_tab_for_main_view(current).is_some()
     } else if candidate == MainView::Sources {
-        current == MainView::Sources
+        sources_tab_for_main_view(current).is_some()
     } else {
         current == candidate
     }

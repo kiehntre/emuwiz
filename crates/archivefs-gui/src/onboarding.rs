@@ -484,7 +484,7 @@ impl ArchiveFsApp {
         } else {
             ui.label(
                 "No DAT catalogue was added, so there is nothing to verify yet - that's fine. \
-                 You can add one later from DAT Sources whenever you want.",
+                 You can add one later from Sources -> DATs whenever you want.",
             );
             ui.add_space(12.0);
         }
