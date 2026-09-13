@@ -3477,6 +3477,9 @@ struct ArchiveFsApp {
     shared_history: SharedHistoryState,
     shared_history_operation: Option<String>,
     shared_rollback: SharedRollbackState,
+    database_restore_plan: Option<archivefs_core::DatabaseRestorePlan>,
+    database_restore_confirmation: String,
+    database_restore_feedback: Option<String>,
     /// The Settings page's RetroArch profile discovery state. Never
     /// scanned automatically - filesystem probing only happens on an
     /// explicit "Scan/Rescan Profiles" click.
@@ -4203,6 +4206,9 @@ impl ArchiveFsApp {
             shared_history: SharedHistoryState::NotLoaded,
             shared_history_operation: None,
             shared_rollback: SharedRollbackState::Idle,
+            database_restore_plan: None,
+            database_restore_confirmation: String::new(),
+            database_restore_feedback: None,
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             retroarch_core_directory_override: load_retroarch_core_directory_override(),
             retroarch_core_folder_rejected_pick: None,
@@ -9410,6 +9416,10 @@ impl ArchiveFsApp {
                         &mut self.history,
                         &mut self.history_filters,
                         &mut self.clipboard,
+                        &mut self.database_restore_plan,
+                        &mut self.database_restore_confirmation,
+                        &mut self.database_restore_feedback,
+                        self.database_state.is_loading() || busy,
                     );
                     match history_action {
                         Some(HistoryPageAction::PreviewRollback {
@@ -9428,6 +9438,37 @@ impl ArchiveFsApp {
                         }
                         Some(HistoryPageAction::Refresh) => {
                             self.shared_history = SharedHistoryState::NotLoaded;
+                        }
+                        Some(HistoryPageAction::ReviewDatabaseRestore { backup_path }) => {
+                            match default_database_path()
+                                .and_then(|live| archivefs_core::prepare_database_restore(live, backup_path))
+                            {
+                                Ok(plan) => {
+                                    self.database_restore_plan = Some(plan);
+                                    self.database_restore_confirmation.clear();
+                                    self.database_restore_feedback = None;
+                                }
+                                Err(error) => self.database_restore_feedback = Some(error.to_string()),
+                            }
+                        }
+                        Some(HistoryPageAction::ExecuteDatabaseRestore) => {
+                            if self.database_state.is_loading() || self.is_busy() {
+                                self.database_restore_feedback = Some("Database is busy loading or scanning; restore remains blocked until it is idle.".into());
+                            } else if let Some(plan) = self.database_restore_plan.clone() {
+                                match archivefs_core::restore_database(&plan, &self.database_restore_confirmation) {
+                                    Ok(result) => {
+                                        self.database_restore_feedback = Some(format!("{} Emergency backup: {}", result.receipt.message, result.emergency_backup_path.display()));
+                                        self.database_restore_plan = None;
+                                        self.database_restore_confirmation.clear();
+                                        self.database_generation = self.database_generation.next();
+                                        let generation = self.database_generation;
+                                        let previous = self.database_state.snapshot().cloned().map(Box::new);
+                                        self.database_state = start_database_load(context.clone(), generation, previous, false);
+                                        self.shared_history = SharedHistoryState::NotLoaded;
+                                    }
+                                    Err(error) => self.database_restore_feedback = Some(error.to_string()),
+                                }
+                            }
                         }
                         None => {}
                     }

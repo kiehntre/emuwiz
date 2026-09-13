@@ -659,6 +659,10 @@ pub(crate) enum HistoryPageAction {
     ConfirmRollback,
     CancelRollback,
     Refresh,
+    ReviewDatabaseRestore {
+        backup_path: PathBuf,
+    },
+    ExecuteDatabaseRestore,
 }
 
 /// The Details "Game ID" row's three-way state - distinct from

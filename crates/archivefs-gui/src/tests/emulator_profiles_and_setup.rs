@@ -3825,6 +3825,10 @@ fn render_shared_history(details_open: bool) -> egui::FullOutput {
                 &mut history,
                 &mut filters,
                 &mut clipboard,
+                &mut None,
+                &mut String::new(),
+                &mut None,
+                false,
             );
         });
     })

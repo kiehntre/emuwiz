@@ -67,7 +67,8 @@ pub use database::{
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
     DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseCheckOutcome, DatabaseCheckStatus,
     DatabaseDiagnostic, DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding,
-    DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseSidecarFinding,
+    DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan,
+    DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding,
     DatabaseSidecarKind, DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord,
     DiscoveryDetailsPage, DiscoveryRunId, DiscoveryRunStatus, MANUAL_PLATFORM_SOURCE,
     MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult, PersistedArchive,
@@ -78,7 +79,8 @@ pub use database::{
     ScanPersistSummary, ScanRunCounts, SourceFolderRecord, SourceScanStatus,
     VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
     format_unix_timestamp_utc, latest_schema_version, pending_schema_migration_versions,
-    persisted_archive_has_unknown_platform, scan_and_persist, upgrade_library_database,
+    persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
+    rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 
 mod inspector;

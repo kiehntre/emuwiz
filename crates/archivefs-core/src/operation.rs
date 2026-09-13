@@ -305,6 +305,43 @@ impl OperationRegistry {
         }
     }
 
+    /// Reads durable database-restore receipts. Unlike legacy backup names,
+    /// these records contain the selected hash, live-database freshness, and
+    /// the mandatory emergency-backup evidence needed for reviewed recovery.
+    pub fn append_database_restore_history(&mut self, database_path: &Path) {
+        let Some(parent) = database_path.parent() else {
+            return;
+        };
+        let Some(database_name) = database_path.file_name().and_then(|v| v.to_str()) else {
+            return;
+        };
+        let prefix = format!("{database_name}.restore-");
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten().take(200) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            match fs::read(&path).ok().and_then(|bytes| {
+                serde_json::from_slice::<crate::DatabaseRestoreReceipt>(&bytes).ok()
+            }) {
+                Some(receipt) => self.records.push(database_restore_receipt_operation(
+                    &receipt,
+                    Some(path.display().to_string()),
+                )),
+                None => self.problems.push(format!(
+                    "{}: malformed database restore receipt",
+                    path.display()
+                )),
+            }
+        }
+    }
+
     /// Adds shared cheat/mod journals to this index. The existing shared
     /// history reader remains authoritative; this only supplies a common
     /// read-only projection and rollback capability check.
@@ -338,6 +375,91 @@ impl OperationRegistry {
                 OperationState::Completed | OperationState::RolledBack
             )
         })
+    }
+}
+
+fn database_restore_receipt_operation(
+    receipt: &crate::DatabaseRestoreReceipt,
+    journal_reference: Option<String>,
+) -> OperationRecord {
+    let state = match receipt.state {
+        crate::DatabaseRestoreState::Completed => OperationState::Completed,
+        crate::DatabaseRestoreState::RolledBack => OperationState::RolledBack,
+        crate::DatabaseRestoreState::Failed | crate::DatabaseRestoreState::RollbackFailed => {
+            OperationState::Failed
+        }
+        _ => OperationState::Stale,
+    };
+    let recoverable =
+        receipt.emergency_backup_path.is_some() && receipt.emergency_backup_sha256.is_some();
+    OperationRecord {
+        schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
+        operation_id: receipt.operation_id.clone(),
+        kind: OperationKind::DatabaseRecovery,
+        state,
+        created_at_unix: receipt.created_at_unix,
+        started_at_unix: Some(receipt.created_at_unix),
+        completed_at_unix: Some(receipt.updated_at_unix),
+        input: OperationInputSnapshot {
+            source_root: Some(
+                receipt
+                    .plan
+                    .selected_backup_path
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            plan_generation: None,
+            plan_hash: Some(format!("sha256:{}", receipt.plan.selected_backup_sha256)),
+            freshness_evidence: vec![
+                format!("live_size:{}", receipt.plan.expected_live_size_bytes),
+                format!("live_sha256:{}", receipt.plan.expected_live_sha256),
+                format!("backup_schema:{}", receipt.plan.backup_schema_version),
+            ],
+            destination_occupancy_checked: true,
+        },
+        destination: Some(
+            receipt
+                .plan
+                .live_database_path
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        output: OperationOutputReceipt {
+            outputs: receipt
+                .emergency_backup_path
+                .iter()
+                .map(|path| OperationOutput {
+                    path: path.to_string_lossy().into_owned(),
+                    changed: true,
+                    verified: recoverable,
+                    before_state: Some("live database".into()),
+                    after_state: Some(receipt.state.label().into()),
+                })
+                .collect(),
+            journal_reference,
+            summary: receipt.message.clone(),
+        },
+        recovery: OperationRecoveryStatus {
+            classification: if recoverable {
+                RecoveryClassification::RequiresReview
+            } else {
+                RecoveryClassification::Unrecoverable
+            },
+            explanation: if recoverable {
+                "Review this database restore receipt before any further recovery action. A rollback is only allowed after fresh validation.".into()
+            } else {
+                "Restore evidence is incomplete; no automatic recovery action is available.".into()
+            },
+            actions: OperationActionAvailability {
+                review: if recoverable {
+                    ActionAvailability::Available
+                } else {
+                    ActionAvailability::Unavailable
+                },
+                ..Default::default()
+            },
+        },
+        error: matches!(state, OperationState::Failed).then_some(receipt.message.clone()),
     }
 }
 

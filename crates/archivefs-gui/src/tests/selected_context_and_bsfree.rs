@@ -1485,6 +1485,10 @@ fn history_logs_page_has_a_recovery_heading_above_its_rollback_card() {
                 &mut history,
                 &mut filters,
                 &mut clipboard,
+                &mut None,
+                &mut String::new(),
+                &mut None,
+                false,
             );
         });
     });

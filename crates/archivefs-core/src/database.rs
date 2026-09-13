@@ -51,6 +51,12 @@ use crate::{
     normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
 };
 
+mod restore;
+pub use restore::{
+    DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,
+    prepare_database_restore, restore_database, rollback_database_restore,
+};
+
 /// Resolves the default library database path: `library.sqlite3` under the
 /// effective data directory (EmuWiz's `~/.local/share/emuwiz`, or the legacy
 /// `~/.local/share/archivefs` when that is where the user's data lives), next

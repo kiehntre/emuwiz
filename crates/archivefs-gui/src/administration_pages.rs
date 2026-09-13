@@ -1625,6 +1625,7 @@ pub(super) fn format_shared_history_time(timestamp: u64, now: SystemTime) -> Str
 /// "Changes you can undo" section above already uses.
 const HISTORY_ACTIVITY_RENDER_CAP: usize = 200;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn show_history_logs_page(
     ui: &mut egui::Ui,
     shared_history: &SharedHistoryState,
@@ -1633,6 +1634,10 @@ pub(super) fn show_history_logs_page(
     history: &mut OperationHistory,
     filters: &mut HistoryLogFilters,
     clipboard: &mut dyn ClipboardBackend,
+    database_restore_plan: &mut Option<archivefs_core::DatabaseRestorePlan>,
+    database_restore_confirmation: &mut String,
+    database_restore_feedback: &mut Option<String>,
+    database_busy: bool,
 ) -> Option<HistoryPageAction> {
     let mut action = None;
     widgets::workshop_light_header(
@@ -1837,7 +1842,14 @@ pub(super) fn show_history_logs_page(
             }
         }
     }
-    show_operation_receipts(ui);
+    show_operation_receipts(
+        ui,
+        database_restore_plan,
+        database_restore_confirmation,
+        database_restore_feedback,
+        database_busy,
+        &mut action,
+    );
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
@@ -2083,7 +2095,14 @@ pub(super) fn show_history_logs_page(
 /// journals remain authoritative and this surface deliberately offers no
 /// generic resume/rollback button: an adapter must expose a proven action
 /// before a workflow can make one available.
-fn show_operation_receipts(ui: &mut egui::Ui) {
+fn show_operation_receipts(
+    ui: &mut egui::Ui,
+    restore_plan: &mut Option<archivefs_core::DatabaseRestorePlan>,
+    confirmation: &mut String,
+    feedback: &mut Option<String>,
+    database_busy: bool,
+    action: &mut Option<HistoryPageAction>,
+) {
     widgets::section_header(
         ui,
         "Operations & recovery",
@@ -2105,6 +2124,7 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
     }
     if let Ok(database_path) = archivefs_core::default_database_path() {
         registry.append_database_backup_history(&database_path);
+        registry.append_database_restore_history(&database_path);
     }
     if let (Ok(shared_history), Ok(shared_backups)) = (
         archivefs_core::patch_manager::default_shared_history_root(),
@@ -2138,6 +2158,52 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
             widgets::StatusTone::Warning,
         );
     }
+    if let Some(plan) = restore_plan.as_ref() {
+        let mut cancel_review = false;
+        widgets::card(ui, |ui| {
+            widgets::status_badge(ui, "Review restore", widgets::StatusTone::Warning);
+            ui.strong("Database restore requires a controlled close and catalogue reload.");
+            ui.label(format!(
+                "Selected backup: {}",
+                plan.selected_backup_path.display()
+            ));
+            ui.label(format!("Backup SHA-256: {}", plan.selected_backup_sha256));
+            ui.label(format!(
+                "Backup schema: {} · Current schema: {}",
+                plan.backup_schema_version, plan.current_live_schema_version
+            ));
+            ui.label("A fresh emergency backup of the current database will be mandatory immediately before replacement.");
+            ui.label("Risks: the application must be idle; restart may be required for other processes holding the database.");
+            ui.add(egui::TextEdit::singleline(confirmation).hint_text("Type RESTORE DATABASE"));
+            if widgets::action_button(
+                ui,
+                "Restore database",
+                widgets::ActionStyle::Destructive,
+                !database_busy && confirmation == "RESTORE DATABASE",
+            )
+            .clicked()
+            {
+                *action = Some(HistoryPageAction::ExecuteDatabaseRestore);
+            }
+            if widgets::action_button(ui, "Cancel review", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                cancel_review = true;
+            }
+        });
+        if cancel_review {
+            *restore_plan = None;
+            confirmation.clear();
+        }
+    }
+    if let Some(message) = feedback.as_deref() {
+        widgets::banner(
+            ui,
+            "Database recovery",
+            message,
+            widgets::StatusTone::Warning,
+        );
+    }
     for record in registry.records.iter().take(200) {
         widgets::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -2154,6 +2220,21 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
                 ui.label(format!("· {}", record.operation_id));
             });
             ui.label(record.output.summary.as_str());
+            if record.kind == archivefs_core::operation::OperationKind::DatabaseBackup {
+                let backup_path = record.destination.as_ref().map(PathBuf::from);
+                if widgets::action_button(
+                    ui,
+                    "Review restore",
+                    widgets::ActionStyle::Secondary,
+                    backup_path.is_some() && !database_busy,
+                )
+                .clicked()
+                {
+                    *action = Some(HistoryPageAction::ReviewDatabaseRestore {
+                        backup_path: backup_path.expect("enabled backup path"),
+                    });
+                }
+            }
             ui.label(format!("Next: {}", record.recovery.classification.label()));
             if let Some(destination) = &record.destination {
                 ui.label(format!("Destination: {destination}"));
