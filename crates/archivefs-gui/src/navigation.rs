@@ -20,8 +20,9 @@ use super::*;
 // those tests assert against; `--all-targets` clippy's non-test pass does
 // not see that usage.
 #[allow(dead_code)]
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 20] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 21] = [
     (MainView::Home, "Home"),
+    (MainView::NeedsAttention, "Needs Attention"),
     (MainView::Mount, "Mount"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::CheatSources, "Cheat Sources"),
@@ -204,7 +205,10 @@ pub(crate) struct NavGroup {
 pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
     NavGroup {
         heading: None,
-        entries: &[nav_view(MainView::Home, "Home")],
+        entries: &[
+            nav_view(MainView::Home, "Home"),
+            nav_view(MainView::NeedsAttention, "Needs Attention"),
+        ],
     },
     NavGroup {
         heading: Some("LIBRARY"),

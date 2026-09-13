@@ -220,6 +220,7 @@ pub(crate) mod local_mod_package_page;
 mod mount_operations;
 #[allow(dead_code)]
 pub(crate) mod museum_page;
+pub(crate) mod needs_attention;
 pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
@@ -2539,6 +2540,7 @@ struct HealthReportCache {
 enum MainView {
     #[default]
     Home,
+    NeedsAttention,
     Library,
     RecentlyFound,
     Health,
@@ -3174,6 +3176,7 @@ fn catalogue_status_load_needed(view: MainView, catalogue_manager: &CatalogueMan
 fn main_view_title(view: MainView) -> &'static str {
     match view {
         MainView::Home => "Home",
+        MainView::NeedsAttention => "Needs Attention",
         MainView::Library => "Library",
         MainView::RecentlyFound => "Recently Found",
         MainView::Health => "Health",
@@ -3208,6 +3211,7 @@ fn main_view_title(view: MainView) -> &'static str {
 fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
     match view {
         MainView::Home
+        | MainView::NeedsAttention
         | MainView::Mount
         | MainView::Selected
         | MainView::CheatsMods
@@ -3268,6 +3272,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
     matches!(
         view,
         MainView::Home
+            | MainView::NeedsAttention
             | MainView::Selected
             | MainView::Sources
             | MainView::SourcesDiscovery
@@ -3708,6 +3713,10 @@ struct ArchiveFsApp {
     snapshot_generation: Option<RefreshGeneration>,
     database_state: DatabaseState,
     database_generation: DatabaseGeneration,
+    needs_attention_operations: Vec<archivefs_core::operation::OperationRecord>,
+    needs_attention_operations_loaded: bool,
+    needs_attention_filters: needs_attention::AttentionFilters,
+    needs_attention_cache: Option<(usize, usize, u64, Vec<needs_attention::AttentionItem>)>,
     /// A `ScanPersistSummary` from a just-completed Sources-page scan
     /// (`SourceActionOutcome::Scanned`), waiting to be carried into the
     /// `DatabaseState::Ready.last_scan_summary` produced by the plain
@@ -4170,6 +4179,10 @@ impl ArchiveFsApp {
             state: start_load(context.clone(), generation, None),
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
+            needs_attention_operations: Vec::new(),
+            needs_attention_operations_loaded: false,
+            needs_attention_filters: needs_attention::AttentionFilters::default(),
+            needs_attention_cache: None,
             pending_source_scan_summary: None,
             sources_last_scan: None,
             cheat_sources_page: None,
@@ -5491,6 +5504,80 @@ impl ArchiveFsApp {
         }
 
         &self.health_report_cache.as_ref().unwrap().issues
+    }
+
+    fn load_needs_attention_operations(&mut self) {
+        let Ok(directory) = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
+        else {
+            self.needs_attention_operations_loaded = true;
+            return;
+        };
+        let mut registry =
+            archivefs_core::operation::OperationRegistry::from_rename_journals(&directory);
+        if let Ok(history) = archivefs_core::default_library_view_history_dir() {
+            registry.append_library_view_history(&history);
+        }
+        if let Ok(database) = archivefs_core::default_database_path() {
+            registry.append_database_backup_history(&database);
+            registry.append_database_restore_history(&database);
+        }
+        if let (Ok(history), Ok(backups)) = (
+            archivefs_core::patch_manager::default_shared_history_root(),
+            archivefs_core::patch_manager::default_shared_backup_root(),
+        ) {
+            registry.append_shared_apply_history(&history, &backups);
+        }
+        self.needs_attention_operations = registry.records;
+        self.needs_attention_operations_loaded = true;
+        self.needs_attention_cache = None;
+    }
+
+    fn current_attention_items(&mut self) -> &[needs_attention::AttentionItem] {
+        let key = (
+            match &self.state {
+                LoadState::Ready(data) => std::ptr::from_ref(data.as_ref()) as usize,
+                LoadState::Loading { .. } | LoadState::Error(_) => 0,
+            },
+            self.database_state
+                .snapshot()
+                .map(std::ptr::from_ref)
+                .map(|ptr| ptr as usize)
+                .unwrap_or_default(),
+            self.diagnostics.generation().0,
+        );
+        let fresh = self
+            .needs_attention_cache
+            .as_ref()
+            .is_some_and(|cache| cache.0 == key.0 && cache.1 == key.1 && cache.2 == key.2);
+        if !fresh {
+            let health = self.cached_health_issues().to_vec();
+            let sources = self
+                .database_state
+                .snapshot()
+                .map(|snapshot| archivefs_core::source_health_issues(&snapshot.source_views))
+                .unwrap_or_default();
+            let duplicates = self
+                .database_state
+                .snapshot()
+                .map(|snapshot| &snapshot.duplicate_report);
+            let diagnostics = match &self.diagnostics {
+                DiagnosticsState::Ready { report, .. } => Some(report),
+                DiagnosticsState::Loading { .. } | DiagnosticsState::Error { .. } => None,
+            };
+            let items = needs_attention::build_attention_items(
+                &health,
+                &sources,
+                &self.needs_attention_operations,
+                duplicates,
+                diagnostics,
+            );
+            self.needs_attention_cache = Some((key.0, key.1, key.2, items));
+        }
+        &self
+            .needs_attention_cache
+            .as_ref()
+            .expect("attention cache")
+            .3
     }
 
     fn poll_diagnostics(&mut self) {
@@ -7532,6 +7619,9 @@ impl ArchiveFsApp {
         self.reconcile_sources_tab();
         self.reconcile_selected_evidence_selection();
         self.reconcile_archive_preparation();
+        if self.view == MainView::NeedsAttention && !self.needs_attention_operations_loaded {
+            self.load_needs_attention_operations();
+        }
         self.poll_platform_artwork_task(context);
         self.poll_shared_history();
         // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
@@ -8585,6 +8675,18 @@ impl ArchiveFsApp {
                         self.quick_rename_mode = card == home_page::HomeCard::QuickRename;
                         self.navigate_to_home_card(card);
                     }
+                }
+
+                if self.view == MainView::NeedsAttention {
+                    let items = self.current_attention_items().to_vec();
+                    if let Some(destination) = needs_attention::show_needs_attention_page(
+                        ui,
+                        &items,
+                        &mut self.needs_attention_filters,
+                    ) {
+                        self.navigate_to_main_view(destination);
+                    }
+                    return;
                 }
 
                 if let Some(tab) = sources_tab_for_main_view(self.view) {
