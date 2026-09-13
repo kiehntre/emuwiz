@@ -165,6 +165,12 @@ pub mod dat;
 /// rule, election contract, and apply seam.
 pub mod playing_library;
 
+/// Universal Library Publisher Profiles (Phase 1: read-only planning
+/// only). Projects an existing Playing Library plan into a frontend's own
+/// destination layout (RomM, ES-DE) - see the module documentation for the
+/// exact read-only boundary and the Phase 2 execution seam.
+pub mod publisher_profile;
+
 /// Generic, read-only contract for auditing and planning source-root changes.
 pub mod source_root_migration;
 

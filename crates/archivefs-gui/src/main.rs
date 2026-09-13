@@ -230,6 +230,7 @@ mod platform_source_actions;
 use platform_source_actions::*;
 pub(crate) mod playing_library_page;
 pub(crate) mod problems_repair_page;
+pub(crate) mod publisher_profile_page;
 pub(crate) mod repair_history_page;
 #[allow(dead_code)]
 pub(crate) mod repair_review_page;
