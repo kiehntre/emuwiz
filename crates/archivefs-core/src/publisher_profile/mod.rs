@@ -18,15 +18,15 @@
 //! the single, frontend-agnostic engine that turns any profile plus a
 //! `PlayingLibraryPlan` into a [`model::PublisherPlan`].
 //!
-//! # Phase 1 boundary - read this before adding an execution path
+//! # Phase 1 boundary - read this before adding or using execution
 //!
-//! **No file is created, hardlinked, symlinked, copied, renamed, or
-//! deleted anywhere in this module or its submodules.** No `es_systems.xml`
-//! or other frontend configuration file is ever written. The only I/O this
-//! module performs is an *optional, explicitly opted-in, read-only*
-//! inspection of an existing destination path (see
-//! [`destination_inspection`]) - never a write. See `tests.rs`'s
-//! `zero_side_effects` module for the structural proof.
+//! Phase 1 planning itself never creates, hardlinks, symlinks, copies,
+//! renames, or deletes files. The Phase 2A [`execution`] adapter only builds
+//! an unwritten transaction; it does not journal or execute it. No
+//! `es_systems.xml` or other frontend configuration file is ever written by
+//! Publisher Profiles. The only planning I/O is an optional, explicitly
+//! opted-in, read-only inspection of an existing destination path (see
+//! [`destination_inspection`]).
 //!
 //! # Relationship with the existing 1G1R / Playing Library planner
 //!
@@ -65,10 +65,12 @@
 
 pub mod destination_inspection;
 pub mod es_de;
+pub mod execution;
 pub mod model;
 pub mod planner;
 pub mod romm;
 
+pub use execution::{PublisherExecutionError, build_publisher_transaction};
 pub use model::{
     BiosPublishPolicy, DestinationState, PathSegment, PublisherActionKind, PublisherActionSafety,
     PublisherBiosRequirement, PublisherCompanionItem, PublisherConflict, PublisherFrontend,

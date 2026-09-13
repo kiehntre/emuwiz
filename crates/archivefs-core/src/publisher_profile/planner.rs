@@ -439,6 +439,14 @@ fn compute_plan_hash(plan: &PublisherPlan) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Verifies the plan fingerprint before an execution adapter consumes the
+/// preview. This is not a content hash; source identities are re-captured by
+/// the reused Playing Library transaction builder and again by executor
+/// preflight.
+pub(crate) fn publisher_plan_hash_matches(plan: &PublisherPlan) -> bool {
+    plan.plan_hash == compute_plan_hash(plan)
+}
+
 /// A small, dependency-free, deterministic 64-bit hash. Not cryptographic -
 /// only used as a stable plan fingerprint for the determinism guarantee in
 /// task section 23, never as a security or content-integrity check.

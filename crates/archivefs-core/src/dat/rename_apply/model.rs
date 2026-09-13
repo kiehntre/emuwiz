@@ -262,6 +262,14 @@ pub enum TransactionOperation {
         /// its destination link. It is journalled for restart-safe rollback.
         destination_root: PathBuf,
     },
+    /// Create a hardlink to the recorded regular source. The source remains
+    /// in place; the destination is the only mutation target.
+    CreateHardlink {
+        expected_source: PathBuf,
+        /// The sole root beneath which this transaction may create or remove
+        /// its destination hardlink.
+        destination_root: PathBuf,
+    },
 }
 
 /// One step of a rename transaction: one approved proposal.

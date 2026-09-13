@@ -12,17 +12,16 @@
 //! [`build_playing_library_plan`] performs zero I/O - it works purely on
 //! caller-supplied parsed-DAT facts.
 //!
-//! # Apply seam (report, intentionally unwired)
+//! # Apply seam
 //!
 //! Elected operations map onto the existing linked-library apply path:
 //! [`crate::dat::rename_apply`]'s durable-journal engine with
 //! [`crate::dat::rom_organisation::OrganisationMode::BuildLinkedLibrary`]
 //! produces exactly the needed no-clobber, crash-reconcilable,
 //! rollback-safe symlink transactions for an approved subset of proposals.
-//! Wiring that conversion (including platform resolution for organised
-//! destinations) is a deliberate follow-up so this planning model lands
-//! independently mergeable without touching `rename_apply`,
-//! `rom_organisation`, or any GUI page.
+//! Publisher Profiles Phase 2A reuses this builder as the transaction-shape
+//! seam, then selects an explicit hardlink operation in the shared executor.
+//! It still does not expose a GUI apply path or execute a transaction.
 
 pub mod apply_adapter;
 pub mod evidence;

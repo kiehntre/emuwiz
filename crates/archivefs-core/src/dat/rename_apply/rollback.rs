@@ -262,6 +262,30 @@ fn rollback_mutation(
         })?;
         return Ok(());
     }
+    if let TransactionOperation::CreateHardlink {
+        expected_source,
+        destination_root,
+    } = &entry.operation
+    {
+        if !expected_source.is_absolute()
+            || expected_source != &entry.source_path
+            || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+        {
+            return Err("rollback refused: invalid journalled hardlink source".to_string());
+        }
+        let source = capture_identity(&entry.source_path)
+            .map_err(|_| "rollback refused: hardlink source no longer exists".to_string())?;
+        let destination = capture_identity(&entry.destination_path)
+            .map_err(|_| "rollback refused: hardlink destination no longer exists".to_string())?;
+        if !identity_matches(&entry.identity, &source)
+            || !identity_matches(&entry.identity, &destination)
+        {
+            return Err("rollback refused: hardlink identity changed".to_string());
+        }
+        std::fs::remove_file(&entry.destination_path)
+            .map_err(|error| format!("rollback refused: could not remove hardlink: {error}"))?;
+        return Ok(());
+    }
     // Destination must still exist and still be the recorded object.
     match capture_identity(&entry.destination_path) {
         Err(_) => {

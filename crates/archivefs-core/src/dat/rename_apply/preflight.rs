@@ -156,6 +156,18 @@ pub fn run_preflight(
             }
             Some(expected_target)
         }
+        TransactionOperation::CreateHardlink {
+            expected_source,
+            destination_root,
+        } => {
+            if expected_source != &entry.source_path
+                || !expected_source.is_absolute()
+                || !destination_is_confined(&entry.destination_path, destination_root)
+            {
+                failures.push(PreflightFailure::OutsideTrustedRoot);
+            }
+            Some(expected_source)
+        }
     };
 
     if options.plan_generation != options.current_generation {
@@ -296,7 +308,7 @@ pub fn run_preflight(
 
 /// Proves a mutation destination is beneath a single persisted library root,
 /// with no `.`/`..` components and no symlinked ancestor between root and leaf.
-pub(crate) fn destination_is_confined(destination: &Path, root: &Path) -> bool {
+pub fn destination_is_confined(destination: &Path, root: &Path) -> bool {
     if !root.is_absolute() || !destination.is_absolute() || !destination.starts_with(root) {
         return false;
     }

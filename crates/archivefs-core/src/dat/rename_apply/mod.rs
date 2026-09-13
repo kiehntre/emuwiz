@@ -1,5 +1,5 @@
-//! Safe, gated application of explicitly approved rename plans, with durable
-//! transaction journaling and rollback.
+//! Safe, gated application of explicitly approved rename and linked-library
+//! plans, with durable transaction journaling and rollback.
 //!
 //! This is the apply side of the read-only rename planning (PR #14). It may
 //! rename a file **only** when every gate holds:
@@ -16,8 +16,8 @@
 //!
 //! # The hard safety boundary
 //!
-//! The executor is the **only** place renames happen; the GUI never calls
-//! `std::fs::rename`. Mutations use a no-clobber primitive
+//! The executor is the **only** place rename/link mutations happen; the GUI
+//! never calls `std::fs::rename`. Mutations use a no-clobber primitive
 //! (`renameat2(RENAME_NOREPLACE)` on Linux) so an existing destination is
 //! never overwritten, there is no copy+delete fallback, and a destination that
 //! appears between preflight and rename is refused atomically. A batch is
@@ -72,7 +72,8 @@ pub use model::{
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{
-    DirectoryPolicy, PreflightFailure, PreflightOptions, batch_destinations, run_preflight,
+    DirectoryPolicy, PreflightFailure, PreflightOptions, batch_destinations,
+    destination_is_confined, run_preflight,
 };
 pub use reconcile::{RecoveryIssue, RecoveryIssueKind, reconcile_recovery};
 pub use rollback::{RollbackOutcome, rollback_transaction, rollback_transaction_confined};

@@ -221,6 +221,56 @@ fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
             }
         };
     }
+    if let TransactionOperation::CreateHardlink {
+        expected_source,
+        destination_root,
+    } = &entry.operation
+    {
+        if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+            || !expected_source.is_absolute()
+            || expected_source != &entry.source_path
+        {
+            return RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail: "journalled hardlink destination authority is invalid; manual review is required".to_string(),
+            };
+        }
+        let source_matches = capture_identity(&entry.source_path)
+            .ok()
+            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
+        let destination_matches = capture_identity(&entry.destination_path)
+            .ok()
+            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
+        return if source_matches && destination_matches {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameConfirmed,
+                detail: "hardlink creation confirmed; source intentionally remains present"
+                    .to_string(),
+            }
+        } else if !source_matches {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::SourceIdentityChanged,
+                detail: "hardlink source changed or disappeared; manual review is required"
+                    .to_string(),
+            }
+        } else if std::fs::symlink_metadata(&entry.destination_path).is_err() {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameDidNotHappen,
+                detail: "hardlink destination is absent; link creation did not happen".to_string(),
+            }
+        } else {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail: "hardlink destination identity changed; manual review is required"
+                    .to_string(),
+            }
+        };
+    }
     let source_present = std::fs::symlink_metadata(&entry.source_path).is_ok();
     let destination_present = std::fs::symlink_metadata(&entry.destination_path).is_ok();
     let source_matches = source_present

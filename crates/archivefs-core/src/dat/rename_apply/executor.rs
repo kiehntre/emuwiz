@@ -466,6 +466,13 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
     {
         return apply_symlink_mutation(entry, expected_target, destination_root);
     }
+    if let TransactionOperation::CreateHardlink {
+        expected_source,
+        destination_root,
+    } = &entry.operation
+    {
+        return apply_hardlink_mutation(entry, expected_source, destination_root);
+    }
     match rename_noreplace(&entry.source_path, &entry.destination_path) {
         Ok(()) => {
             // The filesystem must confirm the rename before Applied.
@@ -479,6 +486,70 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
             "the destination appeared during apply and was never overwritten".to_string(),
         )),
         Err(error) => Err((EntryState::ApplyFailed, error.to_string())),
+    }
+}
+
+fn apply_hardlink_mutation(
+    entry: &TransactionEntry,
+    expected_source: &std::path::Path,
+    destination_root: &std::path::Path,
+) -> Result<(), (EntryState, String)> {
+    if !expected_source.is_absolute()
+        || expected_source != entry.source_path
+        || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+    {
+        return Err((
+            EntryState::ApplyFailed,
+            "invalid journalled hardlink source or destination".to_string(),
+        ));
+    }
+    let source = capture_identity(&entry.source_path).map_err(|_| {
+        (
+            EntryState::ApplyFailed,
+            "hardlink source no longer exists".to_string(),
+        )
+    })?;
+    if source.kind != super::model::ObjectKind::RegularFile
+        || !super::identity::identity_matches(&entry.identity, &source)
+    {
+        return Err((
+            EntryState::ApplyFailed,
+            "hardlink source changed since review".to_string(),
+        ));
+    }
+    match std::fs::symlink_metadata(&entry.destination_path) {
+        Ok(_) => {
+            return Err((
+                EntryState::ApplyFailed,
+                "destination already exists and was not replaced".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err((EntryState::ApplyFailed, error.to_string())),
+    }
+    std::fs::hard_link(expected_source, &entry.destination_path)
+        .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
+    let source_after = capture_identity(&entry.source_path).map_err(|_| {
+        (
+            EntryState::ApplyFailed,
+            "hardlink source disappeared".to_string(),
+        )
+    })?;
+    let destination_after = capture_identity(&entry.destination_path).map_err(|_| {
+        (
+            EntryState::ApplyFailed,
+            "created hardlink destination disappeared".to_string(),
+        )
+    })?;
+    if super::identity::identity_matches(&entry.identity, &source_after)
+        && super::identity::identity_matches(&entry.identity, &destination_after)
+    {
+        Ok(())
+    } else {
+        Err((
+            EntryState::ApplyFailed,
+            "created hardlink failed identity verification".to_string(),
+        ))
     }
 }
 
