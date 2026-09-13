@@ -36,6 +36,8 @@ pub enum OperationKind {
     LibraryViewPublish,
     RommPublish,
     EsDePublish,
+    DatabaseRecovery,
+    DatabaseBackup,
 }
 
 impl OperationKind {
@@ -50,6 +52,8 @@ impl OperationKind {
             Self::LibraryViewPublish => "Library View publication",
             Self::RommPublish => "RomM publication",
             Self::EsDePublish => "ES-DE publication",
+            Self::DatabaseRecovery => "Database recovery",
+            Self::DatabaseBackup => "Database backup",
         }
     }
 }
@@ -230,6 +234,69 @@ impl OperationRegistry {
         }
     }
 
+    /// Enumerates retained database backup files as historical operations.
+    /// Their presence is useful history, but their original hash and
+    /// pre-operation state are not persisted by the legacy naming format, so
+    /// rollback is never advertised.
+    pub fn append_database_backup_history(&mut self, database_path: &Path) {
+        let Some(parent) = database_path.parent() else {
+            return;
+        };
+        let Some(database_name) = database_path.file_name() else {
+            return;
+        };
+        let prefix = format!("{}.schema-", database_name.to_string_lossy());
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten().take(200) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&prefix) || !name.contains(".before-") || !name.contains(".backup")
+            {
+                continue;
+            }
+            let hash = sha256_path(&path).unwrap_or_else(|| "unavailable".into());
+            let record = OperationRecord {
+                schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
+                operation_id: format!("database-backup:{hash}"),
+                kind: OperationKind::DatabaseBackup,
+                state: OperationState::Completed,
+                created_at_unix: 0,
+                started_at_unix: None,
+                completed_at_unix: None,
+                input: OperationInputSnapshot {
+                    source_root: Some(database_path.to_string_lossy().into_owned()),
+                    plan_generation: None,
+                    plan_hash: None,
+                    freshness_evidence: vec!["legacy_backup_filename".into()],
+                    destination_occupancy_checked: false,
+                },
+                destination: Some(path.to_string_lossy().into_owned()),
+                output: OperationOutputReceipt {
+                    outputs: vec![OperationOutput {
+                        path: path.to_string_lossy().into_owned(),
+                        changed: true,
+                        verified: hash != "unavailable",
+                        before_state: None,
+                        after_state: Some(format!("sha256:{hash}")),
+                    }],
+                    journal_reference: None,
+                    summary: "Historical database backup retained; recovery evidence is incomplete".into(),
+                },
+                recovery: OperationRecoveryStatus {
+                    classification: RecoveryClassification::Unrecoverable,
+                    explanation: "Historical database operation; recovery unavailable because the legacy record lacks the original hash and before-state evidence.".into(),
+                    actions: OperationActionAvailability::default(),
+                },
+                error: None,
+            };
+            self.records.push(record);
+        }
+    }
+
     /// Adds shared cheat/mod journals to this index. The existing shared
     /// history reader remains authoritative; this only supplies a common
     /// read-only projection and rollback capability check.
@@ -300,6 +367,124 @@ pub fn repair_operation(
     journal_reference: Option<String>,
 ) -> OperationRecord {
     operation_from_transaction(transaction, OperationKind::RepairApply, journal_reference)
+}
+
+/// Projects the existing migration/upgrade result. The retained backup is
+/// verified again by hash, while the live database is diagnosed read-only.
+/// No restore action is advertised because the current database API has no
+/// operation-safe restore executor.
+pub fn database_recovery_operation(
+    report: &crate::DatabaseUpgradeReport,
+    journal_reference: Option<String>,
+) -> OperationRecord {
+    let backup_hash = sha256_path(&report.backup_path);
+    let health = crate::diagnose_database(&report.database_path);
+    let backup_valid = backup_hash.as_deref() == Some(report.backup_sha256.as_str());
+    let live_valid = health.database_present
+        && health.open_outcome == crate::DatabaseOpenOutcome::OpenedReadOnly
+        && health.quick_check.status == crate::DatabaseCheckStatus::Ok
+        && health.schema_version == Some(report.to_version);
+    let verified = backup_valid && live_valid;
+    let state = if verified {
+        OperationState::Completed
+    } else {
+        OperationState::Failed
+    };
+    let reason = if !backup_valid {
+        "The retained backup no longer matches its recorded SHA-256."
+    } else if !live_valid {
+        "The recovered database did not pass the recorded read-only verification."
+    } else {
+        "Database upgrade completed; the retained pre-upgrade backup remains available for reviewed recovery."
+    };
+    OperationRecord {
+        schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
+        operation_id: format!("database-recovery:{}", report.backup_sha256),
+        kind: OperationKind::DatabaseRecovery,
+        state,
+        created_at_unix: unix_now(),
+        started_at_unix: None,
+        completed_at_unix: Some(unix_now()),
+        input: OperationInputSnapshot {
+            source_root: Some(report.database_path.to_string_lossy().into_owned()),
+            plan_generation: None,
+            plan_hash: Some(format!("sha256:{}", report.backup_sha256)),
+            freshness_evidence: vec![
+                format!("source_size_before:{}", report.source_size_bytes_before),
+                format!(
+                    "source_mtime_before:{}",
+                    report
+                        .source_modified_unix_seconds_before
+                        .map_or_else(|| "unknown".into(), |value| value.to_string())
+                ),
+                format!("schema:{}->{}", report.from_version, report.to_version),
+            ],
+            destination_occupancy_checked: true,
+        },
+        destination: Some(report.database_path.to_string_lossy().into_owned()),
+        output: OperationOutputReceipt {
+            outputs: vec![
+                OperationOutput {
+                    path: report.backup_path.to_string_lossy().into_owned(),
+                    changed: true,
+                    verified: backup_valid,
+                    before_state: Some(format!("schema {}", report.from_version)),
+                    after_state: Some(format!("sha256:{}", report.backup_sha256)),
+                },
+                OperationOutput {
+                    path: report.database_path.to_string_lossy().into_owned(),
+                    changed: true,
+                    verified: live_valid,
+                    before_state: Some(format!("schema {}", report.from_version)),
+                    after_state: Some(format!("schema {}", report.to_version)),
+                },
+            ],
+            journal_reference,
+            summary: if verified {
+                format!(
+                    "Database recovery completed and verified; backup retained at {}",
+                    report.backup_path.display()
+                )
+            } else {
+                format!(
+                    "Database recovery verification failed; review {}",
+                    report.backup_path.display()
+                )
+            },
+        },
+        recovery: OperationRecoveryStatus {
+            classification: if verified {
+                RecoveryClassification::RequiresReview
+            } else {
+                RecoveryClassification::Stale
+            },
+            explanation: reason.into(),
+            actions: OperationActionAvailability {
+                review: ActionAvailability::Available,
+                ..Default::default()
+            },
+        },
+        error: (!verified).then_some(reason.into()),
+    }
+}
+
+fn sha256_path(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    Some(
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 /// Projects the durable Library View receipt without replacing its history
@@ -1203,6 +1388,52 @@ mod tests {
             stale.recovery.actions.rollback,
             ActionAvailability::Unavailable
         );
+        assert_eq!(stale.recovery.actions.review, ActionAvailability::Available);
+    }
+
+    #[test]
+    fn database_recovery_requires_intact_backup_and_verified_live_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("library.sqlite3");
+        let backup_path = temp.path().join("library.sqlite3.backup");
+        let database = crate::Database::open_or_create(&database_path).unwrap();
+        database.close().unwrap();
+        std::fs::copy(&database_path, &backup_path).unwrap();
+        let bytes = std::fs::read(&backup_path).unwrap();
+        let mut digest = Sha256::new();
+        digest.update(bytes);
+        let backup_sha256 = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let report = crate::DatabaseUpgradeReport {
+            database_path: database_path.clone(),
+            backup_path: backup_path.clone(),
+            backup_sha256,
+            source_size_bytes_before: std::fs::metadata(&database_path).unwrap().len(),
+            source_modified_unix_seconds_before: None,
+            from_version: crate::latest_schema_version(),
+            to_version: crate::latest_schema_version(),
+            applied_versions: Vec::new(),
+        };
+        let record = database_recovery_operation(&report, Some("db-upgrade".into()));
+        assert_eq!(record.kind, OperationKind::DatabaseRecovery);
+        assert_eq!(record.state, OperationState::Completed);
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::RequiresReview
+        );
+        assert_eq!(
+            record.recovery.actions.rollback,
+            ActionAvailability::Unavailable
+        );
+        assert!(record.output.summary.contains("completed and verified"));
+
+        std::fs::write(&backup_path, b"changed").unwrap();
+        let stale = database_recovery_operation(&report, None);
+        assert_eq!(stale.state, OperationState::Failed);
+        assert_eq!(stale.recovery.classification, RecoveryClassification::Stale);
         assert_eq!(stale.recovery.actions.review, ActionAvailability::Available);
     }
 }

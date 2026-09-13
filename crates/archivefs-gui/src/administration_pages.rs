@@ -2103,6 +2103,9 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
     if let Ok(library_view_history) = archivefs_core::default_library_view_history_dir() {
         registry.append_library_view_history(&library_view_history);
     }
+    if let Ok(database_path) = archivefs_core::default_database_path() {
+        registry.append_database_backup_history(&database_path);
+    }
     if let (Ok(shared_history), Ok(shared_backups)) = (
         archivefs_core::patch_manager::default_shared_history_root(),
         archivefs_core::patch_manager::default_shared_backup_root(),

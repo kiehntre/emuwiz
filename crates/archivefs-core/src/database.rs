@@ -36,6 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::info;
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::emulator_environment::EncodedPath;
 use crate::game_identity::{
@@ -261,6 +262,9 @@ pub struct Database {
 pub struct DatabaseUpgradeReport {
     pub database_path: PathBuf,
     pub backup_path: PathBuf,
+    pub backup_sha256: String,
+    pub source_size_bytes_before: u64,
+    pub source_modified_unix_seconds_before: Option<i64>,
     pub from_version: i64,
     pub to_version: i64,
     pub applied_versions: Vec<i64>,
@@ -472,6 +476,11 @@ fn upgrade_library_database_with_migrations(
              changed: {error}"
         ))
     })?;
+    let source_metadata = fs::metadata(path).map_err(|error| {
+        ArchiveFsError::Database(format!(
+            "could not snapshot pre-upgrade database metadata. Nothing was changed: {error}"
+        ))
+    })?;
 
     let backup_path = reserve_database_backup_path(path, from_version, to_version)?;
     if let Err(error) = source.backup(MAIN_DB, &backup_path, None) {
@@ -490,6 +499,7 @@ fn upgrade_library_database_with_migrations(
              changed: {error}"
         )));
     }
+    let backup_sha256 = sha256_file(&backup_path)?;
 
     let migration_result = (|| {
         let mut connection = open_connection(path)?;
@@ -521,10 +531,39 @@ fn upgrade_library_database_with_migrations(
     Ok(DatabaseUpgradeReport {
         database_path: path.to_path_buf(),
         backup_path,
+        backup_sha256,
+        source_size_bytes_before: source_metadata.len(),
+        source_modified_unix_seconds_before: source_metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64),
         from_version,
         to_version,
         applied_versions,
     })
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).map_err(|error| {
+        ArchiveFsError::Database(format!("could not hash {}: {error}", path.display()))
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            ArchiveFsError::Database(format!("could not hash {}: {error}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn reserve_database_backup_path(
