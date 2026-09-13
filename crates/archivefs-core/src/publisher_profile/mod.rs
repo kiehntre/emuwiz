@@ -18,14 +18,15 @@
 //! the single, frontend-agnostic engine that turns any profile plus a
 //! `PlayingLibraryPlan` into a [`model::PublisherPlan`].
 //!
-//! # Phase 1 boundary - read this before adding or using execution
+//! # Planning and execution boundary - read this before using execution
 //!
-//! Phase 1 planning itself never creates, hardlinks, symlinks, copies,
-//! renames, or deletes files. The Phase 2A [`execution`] adapter only builds
-//! an unwritten transaction; it does not journal or execute it. No
-//! `es_systems.xml` or other frontend configuration file is ever written by
-//! Publisher Profiles. The only planning I/O is an optional, explicitly
-//! opted-in, read-only inspection of an existing destination path (see
+//! Planning and transaction building never creates, hardlinks, symlinks,
+//! copies, renames, or deletes files. Phase 2A/2B adds an explicit core apply
+//! helper that delegates to the existing journaled transaction engine; no GUI
+//! Apply path calls it yet. No `es_systems.xml` or other frontend
+//! configuration file is ever written by Publisher Profiles. The only I/O
+//! during planning/building is an optional, explicitly opted-in, read-only
+//! inspection of an existing destination path (see
 //! [`destination_inspection`]).
 //!
 //! # Relationship with the existing 1G1R / Playing Library planner
@@ -49,19 +50,16 @@
 //! *destination projection only* - it never mutates, reinterprets, or
 //! contaminates the source library's own truth.
 //!
-//! # Phase 2 execution boundary (not implemented here)
+//! # Phase 2 execution boundary
 //!
-//! A future Phase 2 would consume a [`model::PublisherPlan`] whose items
-//! are all [`model::PublisherActionSafety::SafeToAct`] and turn each
-//! [`model::PublisherPlannedAction`] into a real filesystem operation,
-//! most likely by converting accepted items back into
-//! [`crate::playing_library::LinkedLibraryOperation`]s and reusing the
-//! existing, reviewed
-//! [`crate::playing_library::apply_adapter::build_playing_library_transaction`]
-//! journal engine - exactly the same reuse-not-reinvent seam
-//! `playing_library`'s own module doc comment already describes for its
-//! own apply path. No such conversion function exists yet; Phase 1 stops
-//! at [`model::PublisherPlan`].
+//! Phase 2A/2B consumes only [`model::PublisherActionSafety::SafeToAct`]
+//! items, converts them back into
+//! [`crate::playing_library::LinkedLibraryOperation`]s, and reuses the
+//! existing reviewed transaction builder, journal, executor, rollback, and
+//! reconciliation seams. The explicit publisher apply helper supports only
+//! hardlinks or caller-selected symlinks plus owned destination directories.
+//! Copy publishing, frontend metadata/configuration, confirmation UI, and
+//! GUI Apply remain outside this phase.
 
 pub mod destination_inspection;
 pub mod es_de;
@@ -70,7 +68,12 @@ pub mod model;
 pub mod planner;
 pub mod romm;
 
-pub use execution::{PublisherExecutionError, build_publisher_transaction};
+pub use execution::{
+    PublisherDestinationRootIdentity, PublisherDirectory, PublisherDirectoryState,
+    PublisherExecutionError, PublisherLinkMode, PublisherTransaction, apply_publisher_transaction,
+    build_publisher_transaction, build_publisher_transaction_with_policy,
+    rollback_publisher_transaction,
+};
 pub use model::{
     BiosPublishPolicy, DestinationState, PathSegment, PublisherActionKind, PublisherActionSafety,
     PublisherBiosRequirement, PublisherCompanionItem, PublisherConflict, PublisherFrontend,

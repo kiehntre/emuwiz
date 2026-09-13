@@ -1,16 +1,17 @@
-//! Phase 2A PublisherPlan-to-transaction adapter.
+//! Phase 2A/2B PublisherPlan-to-transaction adapter.
 //!
 //! This is a foundation only. It reuses the existing Playing Library
-//! transaction builder and shared rename executor model; it does not write a
-//! journal or execute anything. Publisher items are deliberately converted to
-//! hardlink operations only when the destination is already available and
-//! same-filesystem evidence is present. There is no copy or symlink fallback.
+//! transaction builder and shared rename executor model. Building remains
+//! inspection-only; the separate explicit apply helper delegates execution to
+//! the existing journaled transaction pipeline. Hardlink and symlink are
+//! distinct caller-selected modes, with no automatic fallback or copy mode.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::dat::rename_apply::{
-    RenameTransaction, TransactionOperation, capture_identity, destination_is_confined,
+    ApplyError, ApplyOutcome, RenameTransaction, TransactionOperation, capture_identity,
+    destination_is_confined,
 };
 use crate::playing_library::{
     CandidateEvidenceSummary, ElectedGame, ElectionExplanation, LinkedLibraryOperation,
@@ -21,7 +22,48 @@ use super::destination_inspection::inspect_destination;
 use super::model::{DestinationState, PublisherActionKind, PublisherActionSafety, PublisherPlan};
 use super::planner::publisher_plan_hash_matches;
 
-/// A typed refusal from the Phase 2A adapter. Every variant is fail-closed:
+/// Explicit link selection. There is no implicit hardlink-to-symlink
+/// fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublisherLinkMode {
+    Hardlink,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublisherDirectoryState {
+    PreExisting,
+    CreatedByTransaction,
+    NotCreated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublisherDirectory {
+    pub path: PathBuf,
+    pub state: PublisherDirectoryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublisherDestinationRootIdentity {
+    pub modified: std::time::SystemTime,
+    #[cfg(unix)]
+    pub ino: u64,
+    #[cfg(unix)]
+    pub dev: u64,
+}
+
+/// Publisher-specific directory plan wrapped around the existing shared
+/// transaction. The shared transaction's `created_directories` remains the
+/// durable ownership record after apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublisherTransaction {
+    pub transaction: RenameTransaction,
+    pub directories: Vec<PublisherDirectory>,
+    pub link_mode: PublisherLinkMode,
+    pub destination_root_identity: PublisherDestinationRootIdentity,
+}
+
+/// A typed refusal from the publisher adapter. Every variant is fail-closed:
 /// no transaction is returned and no filesystem mutation occurs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublisherExecutionError {
@@ -32,6 +74,10 @@ pub enum PublisherExecutionError {
     UnsupportedAction {
         title: String,
         action: PublisherActionKind,
+    },
+    HardlinkUnavailable {
+        title: String,
+        detail: String,
     },
     DestinationDirectoryMissing {
         path: PathBuf,
@@ -48,6 +94,10 @@ pub enum PublisherExecutionError {
         detail: String,
     },
     TransactionBuild(String),
+    DirectoryConflict {
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 /// Builds an unwritten, unapplied shared transaction from the safe subset of
@@ -57,12 +107,40 @@ pub enum PublisherExecutionError {
 ///
 /// The adapter performs a fresh plan-hash, source, destination, case-fold, and
 /// same-filesystem check immediately before constructing the transaction.
-/// Missing destination directories are unsupported in Phase 2A: the adapter
-/// never performs implicit `mkdir` and never populates `created_directories`.
+/// The compatibility hardlink-only entry point retains Phase 2A's existing
+/// destination-directory requirement; the policy entry point explicitly plans
+/// missing directories for Phase 2B's shared directory orchestrator.
 pub fn build_publisher_transaction(
     plan: &PublisherPlan,
     generation: u64,
 ) -> Result<RenameTransaction, PublisherExecutionError> {
+    if std::fs::symlink_metadata(&plan.destination_root).is_err() {
+        return Err(PublisherExecutionError::DestinationDirectoryMissing {
+            path: plan.destination_root.clone(),
+        });
+    }
+    let publisher =
+        build_publisher_transaction_with_policy(plan, generation, PublisherLinkMode::Hardlink)?;
+    if let Some(directory) = publisher
+        .directories
+        .iter()
+        .find(|directory| directory.state == PublisherDirectoryState::NotCreated)
+    {
+        return Err(PublisherExecutionError::DestinationDirectoryMissing {
+            path: directory.path.clone(),
+        });
+    }
+    Ok(publisher.transaction)
+}
+
+/// Builds a Publisher transaction with an explicit hardlink or symlink mode.
+/// This function only inspects the filesystem and returns an unwritten
+/// transaction; directory creation happens only in the explicit apply helper.
+pub fn build_publisher_transaction_with_policy(
+    plan: &PublisherPlan,
+    generation: u64,
+    link_mode: PublisherLinkMode,
+) -> Result<PublisherTransaction, PublisherExecutionError> {
     if !publisher_plan_hash_matches(plan) {
         return Err(PublisherExecutionError::StalePlan {
             detail: "publisher preview fingerprint no longer matches its contents".to_string(),
@@ -73,6 +151,11 @@ pub fn build_publisher_transaction(
             detail: "publisher destination root is not absolute".to_string(),
         });
     }
+    let destination_root_identity = capture_destination_root_identity(&plan.destination_root)
+        .map_err(|error| PublisherExecutionError::DirectoryConflict {
+            path: plan.destination_root.clone(),
+            detail: error.to_string(),
+        })?;
 
     let mut selected: Vec<_> = plan
         .items
@@ -118,14 +201,12 @@ pub fn build_publisher_transaction(
                 path: destination.clone(),
             });
         };
-        let Ok(parent_metadata) = std::fs::metadata(parent) else {
-            return Err(PublisherExecutionError::DestinationDirectoryMissing {
+        if let Ok(parent_metadata) = std::fs::metadata(parent)
+            && !parent_metadata.is_dir()
+        {
+            return Err(PublisherExecutionError::DirectoryConflict {
                 path: parent.to_path_buf(),
-            });
-        };
-        if !parent_metadata.is_dir() {
-            return Err(PublisherExecutionError::DestinationDirectoryMissing {
-                path: parent.to_path_buf(),
+                detail: "required destination parent is not a directory".to_string(),
             });
         }
         let source = capture_identity(&item.source_path).map_err(|error| {
@@ -140,10 +221,12 @@ pub fn build_publisher_transaction(
                 detail: "source is not a regular file".to_string(),
             });
         }
-        if !same_filesystem(&item.source_path, parent) {
-            return Err(PublisherExecutionError::UnsupportedAction {
+        if link_mode == PublisherLinkMode::Hardlink
+            && !same_filesystem(&item.source_path, parent, &plan.destination_root)
+        {
+            return Err(PublisherExecutionError::HardlinkUnavailable {
                 title: item.dat_entry_name.clone(),
-                action: PublisherActionKind::Hardlink,
+                detail: "source and destination are on different filesystems; choose explicit SYMLINK mode".to_string(),
             });
         }
         if !destination_is_confined(destination, &plan.destination_root) {
@@ -160,7 +243,7 @@ pub fn build_publisher_transaction(
                 state: live_state,
             });
         }
-        if has_casefold_sibling(parent, destination) {
+        if parent.exists() && has_casefold_sibling(parent, destination) {
             return Err(PublisherExecutionError::Collision {
                 detail: format!(
                     "live case-fold destination collision for {}",
@@ -203,7 +286,7 @@ pub fn build_publisher_transaction(
                 family_root_name: item.dat_entry_name.clone(),
                 explanation: ElectionExplanation {
                     steps: vec![
-                        "publisher plan item accepted by the Phase 2A safety filter".to_string(),
+                        "publisher plan item accepted by the publisher safety filter".to_string(),
                     ],
                     rejected: Vec::new(),
                     winner_evidence: CandidateEvidenceSummary::unknown(),
@@ -266,17 +349,23 @@ pub fn build_publisher_transaction(
                 path: entry.destination_path.clone(),
             });
         };
-        if !destination_is_confined(&entry.destination_path, &plan.destination_root)
-            || !same_filesystem(&entry.source_path, parent)
-        {
-            return Err(PublisherExecutionError::UnsupportedAction {
+        if !destination_is_confined(&entry.destination_path, &plan.destination_root) {
+            return Err(PublisherExecutionError::SourceInvalid {
                 title: entry.original_basename.clone(),
-                action: PublisherActionKind::Hardlink,
+                detail: "destination is outside the publisher root".to_string(),
+            });
+        }
+        if link_mode == PublisherLinkMode::Hardlink
+            && !same_filesystem(&entry.source_path, parent, &plan.destination_root)
+        {
+            return Err(PublisherExecutionError::HardlinkUnavailable {
+                title: entry.original_basename.clone(),
+                detail: "source and destination are on different filesystems; choose explicit SYMLINK mode".to_string(),
             });
         }
         if inspect_destination(&entry.destination_path, &entry.source_path)
             != DestinationState::Missing
-            || has_casefold_sibling(parent, &entry.destination_path)
+            || (parent.exists() && has_casefold_sibling(parent, &entry.destination_path))
         {
             return Err(PublisherExecutionError::DestinationChanged {
                 title: entry.original_basename.clone(),
@@ -312,12 +401,183 @@ pub fn build_publisher_transaction(
                 entry.original_basename.clone(),
             ),
         );
-        entry.operation = TransactionOperation::CreateHardlink {
-            expected_source: entry.source_path.clone(),
-            destination_root: plan.destination_root.clone(),
+        entry.operation = match link_mode {
+            PublisherLinkMode::Hardlink => TransactionOperation::CreateHardlink {
+                expected_source: entry.source_path.clone(),
+                destination_root: plan.destination_root.clone(),
+            },
+            // The shared transaction convention uses absolute targets. A
+            // relative-link policy would need separate portability evidence.
+            PublisherLinkMode::Symlink => TransactionOperation::CreateSymlink {
+                expected_target: entry.source_path.clone(),
+                destination_root: plan.destination_root.clone(),
+            },
         };
     }
-    Ok(transaction)
+    let directories = required_directories(&transaction, &plan.destination_root)?;
+    Ok(PublisherTransaction {
+        transaction,
+        directories,
+        link_mode,
+        destination_root_identity,
+    })
+}
+
+/// Applies using the existing journaled directory orchestration and shared
+/// executor. No GUI caller is added in Phase 2B.
+pub fn apply_publisher_transaction(
+    publisher: &mut PublisherTransaction,
+    current_generation: u64,
+    trusted: crate::safe_read::TrustedRoots,
+    journal_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ApplyOutcome, ApplyError> {
+    let root = PathBuf::from(&publisher.transaction.source_scan_root);
+    let root_now = capture_destination_root_identity(&root).map_err(|error| {
+        ApplyError::HardConflicts(vec![(
+            root.clone(),
+            vec![format!(
+                "publisher destination root changed or disappeared: {error}"
+            )],
+        )])
+    })?;
+    if publisher.destination_root_identity != root_now {
+        return Err(ApplyError::HardConflicts(vec![(
+            root,
+            vec!["publisher destination root changed since preview".to_string()],
+        )]));
+    }
+    let outcome = crate::platform_evidence_fusion::plan_transaction::apply_plan_transaction(
+        &mut publisher.transaction,
+        current_generation,
+        &root,
+        trusted,
+        journal_dir,
+        cancel,
+        false,
+    )?;
+    for directory in &mut publisher.directories {
+        directory.state = if publisher
+            .transaction
+            .created_directories
+            .contains(&directory.path)
+        {
+            PublisherDirectoryState::CreatedByTransaction
+        } else {
+            PublisherDirectoryState::PreExisting
+        };
+    }
+    Ok(outcome)
+}
+
+fn capture_destination_root_identity(
+    path: &Path,
+) -> std::io::Result<PublisherDestinationRootIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "publisher destination root is not a directory",
+        ));
+    }
+    Ok(PublisherDestinationRootIdentity {
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        ino: std::os::unix::fs::MetadataExt::ino(&metadata),
+        #[cfg(unix)]
+        dev: std::os::unix::fs::MetadataExt::dev(&metadata),
+    })
+}
+
+/// Rolls back through the existing shared rollback engine and owned-directory
+/// cleanup. Only transaction-created empty directories can be removed.
+pub fn rollback_publisher_transaction(
+    publisher: &mut PublisherTransaction,
+    journal_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    trusted: &crate::safe_read::TrustedRoots,
+) -> Result<crate::platform_evidence_fusion::plan_transaction::PlanRollbackOutcome, String> {
+    let outcome = crate::platform_evidence_fusion::plan_transaction::rollback_plan_transaction(
+        &mut publisher.transaction,
+        journal_dir,
+        cancel,
+        trusted,
+    )?;
+    for directory in &mut publisher.directories {
+        directory.state = if outcome.directories_removed.contains(&directory.path) {
+            PublisherDirectoryState::NotCreated
+        } else {
+            PublisherDirectoryState::PreExisting
+        };
+    }
+    Ok(outcome)
+}
+
+fn required_directories(
+    transaction: &RenameTransaction,
+    root: &Path,
+) -> Result<Vec<PublisherDirectory>, PublisherExecutionError> {
+    let root_metadata = std::fs::symlink_metadata(root).map_err(|_| {
+        PublisherExecutionError::DirectoryConflict {
+            path: root.to_path_buf(),
+            detail: "publisher destination root must already exist as a directory".to_string(),
+        }
+    })?;
+    if !root_metadata.is_dir() {
+        return Err(PublisherExecutionError::DirectoryConflict {
+            path: root.to_path_buf(),
+            detail: "publisher destination root is not a directory".to_string(),
+        });
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in &transaction.entries {
+        let Some(mut parent) = entry.destination_path.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        let mut chain = Vec::new();
+        while parent.starts_with(root) && parent != root {
+            chain.push(parent.clone());
+            parent = parent
+                .parent()
+                .ok_or_else(|| PublisherExecutionError::DirectoryConflict {
+                    path: entry.destination_path.clone(),
+                    detail: "destination directory chain escaped its root".to_string(),
+                })?
+                .to_path_buf();
+        }
+        if parent != root {
+            return Err(PublisherExecutionError::DirectoryConflict {
+                path: entry.destination_path.clone(),
+                detail: "destination directory escaped its approved root".to_string(),
+            });
+        }
+        chain.reverse();
+        paths.extend(chain);
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let state = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => PublisherDirectoryState::PreExisting,
+                Ok(_) => {
+                    return Err(PublisherExecutionError::DirectoryConflict {
+                        path,
+                        detail: "required destination path is not a directory".to_string(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    PublisherDirectoryState::NotCreated
+                }
+                Err(error) => {
+                    return Err(PublisherExecutionError::DirectoryConflict {
+                        path,
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            Ok(PublisherDirectory { path, state })
+        })
+        .collect()
 }
 
 fn has_casefold_sibling(parent: &Path, destination: &Path) -> bool {
@@ -475,6 +735,201 @@ mod tests {
     }
 
     #[test]
+    fn symlink_mode_creates_nested_directories_and_rolls_back_safely() {
+        use crate::safe_read::TrustedRoots;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        std::fs::create_dir(&destination).unwrap();
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        let mut publisher =
+            build_publisher_transaction_with_policy(&plan, 11, PublisherLinkMode::Symlink).unwrap();
+        assert_eq!(publisher.directories.len(), 2);
+        assert!(
+            publisher
+                .directories
+                .iter()
+                .all(|directory| directory.state == PublisherDirectoryState::NotCreated)
+        );
+
+        let journal = temp.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+        let cancel = AtomicBool::new(false);
+        apply_publisher_transaction(
+            &mut publisher,
+            11,
+            TrustedRoots::from_paths([temp.path()]),
+            &journal,
+            &cancel,
+        )
+        .unwrap();
+        let destination_path = publisher.transaction.entries[0].destination_path.clone();
+        assert!(destination_path.is_symlink());
+        assert_eq!(std::fs::read_link(&destination_path).unwrap(), source);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert!(
+            publisher
+                .directories
+                .iter()
+                .all(|directory| directory.state == PublisherDirectoryState::CreatedByTransaction)
+        );
+
+        rollback_publisher_transaction(
+            &mut publisher,
+            &journal,
+            &cancel,
+            &TrustedRoots::from_paths([temp.path()]),
+        )
+        .unwrap();
+        assert!(source.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert!(!destination_path.exists());
+        assert!(
+            publisher
+                .directories
+                .iter()
+                .all(|directory| directory.state == PublisherDirectoryState::NotCreated)
+        );
+        assert!(destination.exists());
+        assert!(!destination.join("roms").exists());
+    }
+
+    #[test]
+    fn symlink_mode_preserves_pre_existing_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        std::fs::create_dir_all(destination.join("roms")).unwrap();
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        let publisher =
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink).unwrap();
+        assert_eq!(
+            publisher.directories[0].state,
+            PublisherDirectoryState::PreExisting
+        );
+        assert_eq!(
+            publisher.directories[1].state,
+            PublisherDirectoryState::NotCreated
+        );
+    }
+
+    #[test]
+    fn symlink_wrong_target_broken_link_and_file_are_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        let other = temp.path().join("Other.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(&other, b"other bytes").unwrap();
+        let destination = temp.path().join("published");
+        prepare_destination(&destination);
+
+        for (kind, setup) in [("wrong", 0u8), ("broken", 1u8), ("file", 2u8)] {
+            let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+            let planned = plan.items[0].planned_destination.clone().unwrap();
+            match setup {
+                0 => std::os::unix::fs::symlink(&other, &planned).unwrap(),
+                1 => std::os::unix::fs::symlink(temp.path().join("gone"), &planned).unwrap(),
+                _ => std::fs::write(&planned, b"occupied").unwrap(),
+            }
+            let error =
+                build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink)
+                    .expect_err(kind);
+            assert!(matches!(
+                error,
+                PublisherExecutionError::DestinationChanged { .. }
+            ));
+            std::fs::remove_file(&planned).unwrap();
+        }
+    }
+
+    #[test]
+    fn symlink_mode_blocks_when_source_disappears_after_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        prepare_destination(&destination);
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        std::fs::remove_file(&source).unwrap();
+        assert!(matches!(
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink),
+            Err(PublisherExecutionError::SourceInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn symlink_mode_blocks_when_destination_root_changes_after_preview() {
+        use crate::safe_read::TrustedRoots;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        prepare_destination(&destination);
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        let mut publisher =
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink).unwrap();
+        std::fs::remove_dir_all(&destination).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+        let error = apply_publisher_transaction(
+            &mut publisher,
+            1,
+            TrustedRoots::from_paths([temp.path()]),
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .expect_err("changed destination root must block apply");
+        assert!(matches!(error, ApplyError::HardConflicts(_)));
+        assert!(!destination.join("roms").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_mode_supports_a_cross_filesystem_destination_when_available() {
+        use crate::safe_read::TrustedRoots;
+        use std::sync::atomic::AtomicBool;
+
+        let Ok(destination_temp) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let source_temp = tempfile::tempdir().unwrap();
+        let source = source_temp.path().join("Game.rom");
+        std::fs::write(&source, b"cross filesystem bytes").unwrap();
+        let destination = destination_temp.path().join("published");
+        std::fs::create_dir(&destination).unwrap();
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        assert!(matches!(
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Hardlink),
+            Err(PublisherExecutionError::HardlinkUnavailable { .. })
+        ));
+        let mut publisher =
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink).unwrap();
+        let journal = source_temp.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+        apply_publisher_transaction(
+            &mut publisher,
+            1,
+            TrustedRoots::from_paths([source_temp.path(), &destination]),
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            publisher.transaction.entries[0]
+                .destination_path
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"cross filesystem bytes");
+    }
+
+    #[test]
     fn review_or_unsupported_items_never_enter_a_transaction() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("Game.rom");
@@ -604,21 +1059,23 @@ mod tests {
     }
 }
 
-fn same_filesystem(source: &Path, destination_parent: &Path) -> bool {
+fn same_filesystem(source: &Path, destination_parent: &Path, fallback_root: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let Ok(source_metadata) = std::fs::metadata(source) else {
             return false;
         };
-        let Ok(destination_metadata) = std::fs::metadata(destination_parent) else {
+        let destination_metadata =
+            std::fs::metadata(destination_parent).or_else(|_| std::fs::metadata(fallback_root));
+        let Ok(destination_metadata) = destination_metadata else {
             return false;
         };
         source_metadata.dev() == destination_metadata.dev()
     }
     #[cfg(not(unix))]
     {
-        let _ = (source, destination_parent);
+        let _ = (source, destination_parent, fallback_root);
         false
     }
 }

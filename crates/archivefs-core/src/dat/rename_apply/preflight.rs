@@ -312,9 +312,11 @@ pub fn destination_is_confined(destination: &Path, root: &Path) -> bool {
     if !root.is_absolute() || !destination.is_absolute() || !destination.starts_with(root) {
         return false;
     }
-    if root
-        .components()
-        .chain(destination.components())
+    if destination
+        .strip_prefix(root)
+        .ok()
+        .into_iter()
+        .flat_map(Path::components)
         .any(|component| {
             matches!(
                 component,
@@ -335,14 +337,14 @@ pub fn destination_is_confined(destination: &Path, root: &Path) -> bool {
     };
     let mut current = parent;
     loop {
-        let Ok(meta) = std::fs::symlink_metadata(current) else {
-            return false;
-        };
-        if !meta.file_type().is_dir() {
-            return false;
-        }
         if current == root {
             return true;
+        }
+        match std::fs::symlink_metadata(current) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
         }
         let Some(next) = current.parent() else {
             return false;

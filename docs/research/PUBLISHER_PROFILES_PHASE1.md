@@ -197,18 +197,43 @@ RomM and ES-DE therefore differ for the three RomM mapping gaps; ES-DE has revie
 
 GUI smoke verification was performed at the state/render-test level: the page route, profile labels, preview-only banner, filters, detail selection, empty/degraded handoff, and no-apply surface compile and are covered by focused tests. A full Xvfb click-through was not available in this environment, so actual mouse automation and visual no-crash startup were not claimed. `cargo check --workspace` is run with a temporary target directory because this checkout's tracked build target is mounted read-only.
 
-## 16. Phase 2 execution boundary (not implemented here)
+## 16. Phase 2A/2B execution boundary
 
-A future Phase 2 would consume a `PublisherPlan` whose items are all `PublisherActionSafety::SafeToAct`, and turn each into a real filesystem operation — most likely by converting accepted items back into `LinkedLibraryOperation`s and reusing the existing, reviewed `playing_library::apply_adapter::build_playing_library_transaction` journal engine, exactly the reuse-not-reinvent seam `playing_library`'s own module doc comment already describes for its own apply path. Concretely, Phase 2 would need to:
+Phase 2A/2B now has an explicit, core-only transaction foundation. It converts
+only `SafeToAct` items back into `LinkedLibraryOperation`s and reuses
+`playing_library::apply_adapter::build_playing_library_transaction`, the shared
+`RenameTransaction` model, journal, preflight, executor, rollback, and
+reconciliation. Phase 2B adds explicitly planned destination directories and
+explicit caller-selected `CreateSymlink` operations. There is no automatic
+hardlink-to-symlink fallback.
 
-- Add a real hardlink-capable transaction operation (today's apply engine only ever creates symlinks — see §17 below) before `PublisherActionKind::Hardlink` could ever be selected in practice.
-- Decide same-filesystem evidence for the hardlink/symlink/copy preference order (task section 7) — Phase 1 deliberately never guesses this.
-- Wire BIOS-requirement detection into `PublisherBiosRequirement` (currently always empty — task section 12's "unknown policy" default).
-No such conversion function, hardlink transaction type, BIOS destination projection, metadata/config writer, playlist generator, or publish/apply button exists; Phase 1 stops at `PublisherPlan` and the GUI's preview-only rendering.
+The compatibility `build_publisher_transaction` entry point remains hardlink
+only and requires existing destination directories. The policy entry point
+accepts `HARDLINK` or `SYMLINK`; hardlinks fail closed when same-filesystem
+evidence is unavailable, with a typed message directing the caller to choose
+SYMLINK explicitly. Symlink targets use the shared transaction convention of
+absolute source paths; relative links were not guessed because no portability
+contract exists in the shared engine.
 
-## 17. Why every Phase 1 planned action defaults to Symlink, never Hardlink
+Directory creation is represented before apply as `PreExisting` or
+`NotCreated`, and after apply as `CreatedByTransaction`. Only directories
+recorded in the shared transaction's `created_directories` ownership list are
+eligible for deepest-first rollback, and only when empty. The destination root
+identity, source identities, exact destinations, case-fold collisions, source
+presence, and destination state are rechecked before an executable transaction
+is produced or applied. Existing correct links are excluded; wrong links,
+broken links, ordinary files, stale plans, and root changes fail closed.
 
-Measured, not assumed: the only real, apply-capable filesystem-write paths in this codebase today (`playing_library::apply_adapter::build_playing_library_transaction`, `dat::rom_organisation`'s `CreateSymlink` transaction operations) create symlinks exclusively. The only `std::fs::hard_link` calls anywhere in `archivefs-core/src` are inside test-fixture setup code, never inside a real, reviewed execution path. Task section 7 explicitly says "do not decide automatically where evidence is insufficient" — since no real hardlink-capable execution engine exists to justify it, `planner::default_planned_action` always proposes `Symlink`, exactly matching what every other reviewed profile in this codebase already does.
+The publisher apply helper is deliberately not wired to the GUI. Copy,
+reflink, BIOS projection, metadata/configuration, playlists, confirmation UI,
+rollback UI, and any GUI Apply button are Phase 2C/future work.
+
+## 17. Why Phase 1 still defaults to Symlink
+
+The generic planner still proposes `Symlink` because profile planning does not
+choose an execution mode. Phase 2B exposes hardlink and symlink as a separate
+explicit policy at the transaction boundary; it never silently changes the
+user's selected mode.
 
 ## Validation
 
