@@ -51,6 +51,10 @@ use crate::{
     normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
 };
 
+mod attention;
+#[cfg(test)]
+#[path = "database/attention_tests.rs"]
+mod attention_tests;
 mod restore;
 pub use restore::{
     DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,

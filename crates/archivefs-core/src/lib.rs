@@ -34,6 +34,7 @@ pub mod app_dirs;
 pub mod apple2_disk;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
 pub mod atari_tape;
+pub mod attention;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
 mod database;

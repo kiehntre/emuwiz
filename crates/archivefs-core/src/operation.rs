@@ -28,6 +28,9 @@ use crate::{LibraryViewHistoryOperation, LibraryViewHistoryRecord};
 
 pub const OPERATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
+mod attention;
+pub use attention::{AttentionReceiptPaths, attention_receipt_snapshot};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
@@ -1128,6 +1131,61 @@ fn shared_recovery(
     }
 }
 
+/// A persisted successful rollback is stronger than the original apply's
+/// outcome. The shared executor writes this marker only after all entries are
+/// restored/removed; a preview, failed marker, or another destination cannot
+/// resolve an operation. No fresh recovery capability is advertised here.
+fn project_completed_shared_rollback(
+    record: &mut OperationRecord,
+    receipt: &SharedRollbackPreview,
+) {
+    if receipt.schema_version != 1
+        || receipt.original_operation_id != record.operation_id
+        || record.destination.as_deref() != Some(&receipt.destination_root.display)
+        || !receipt.entries.iter().all(|entry| {
+            matches!(
+                entry.outcome,
+                SharedRollbackOutcome::RemovedInstalledFile
+                    | SharedRollbackOutcome::RestoredBackup
+                    | SharedRollbackOutcome::NoChangeRequired
+            )
+        })
+    {
+        return;
+    }
+    let restored: std::collections::BTreeSet<_> = receipt
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                SharedRollbackOutcome::RemovedInstalledFile | SharedRollbackOutcome::RestoredBackup
+            )
+        })
+        .filter_map(|entry| entry.destination.as_ref().map(|path| path.display.as_str()))
+        .collect();
+    if !record
+        .output
+        .outputs
+        .iter()
+        .filter(|output| output.changed)
+        .all(|output| restored.contains(output.path.as_str()))
+    {
+        // A syntactically valid but truncated marker is not proof that every
+        // changed output was restored. Keep the original unresolved state.
+        return;
+    }
+    record.state = OperationState::RolledBack;
+    record.error = None;
+    record.output.summary =
+        "The saved rollback receipt records all changes restored or removed.".into();
+    record.recovery = OperationRecoveryStatus {
+        classification: RecoveryClassification::Unrecoverable,
+        explanation: "Rollback completed according to its durable receipt; no further recovery action is required.".into(),
+        actions: OperationActionAvailability::default(),
+    };
+}
+
 fn shared_summary(journal: &SharedApplyJournal) -> String {
     let written = journal
         .entries
@@ -1355,7 +1413,10 @@ mod tests {
         }
     }
 
-    fn shared_journal(adapter: PreviewAdapter, status: SharedApplyStatus) -> SharedApplyJournal {
+    pub(super) fn shared_journal(
+        adapter: PreviewAdapter,
+        status: SharedApplyStatus,
+    ) -> SharedApplyJournal {
         let source = SharedTransactionPath::from_path(Path::new("/source/cheat.txt"));
         let destination_root = SharedTransactionPath::from_path(Path::new("/emulator"));
         SharedApplyJournal {

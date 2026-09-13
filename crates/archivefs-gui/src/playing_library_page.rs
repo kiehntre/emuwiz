@@ -243,6 +243,65 @@ fn split_preference_list(draft: &str) -> Vec<String> {
 }
 
 impl PlayingLibraryPageState {
+    /// Projects current workflow-owned errors without repeating a preview or
+    /// checking a destination. A refreshed workflow replaces these facts.
+    pub(crate) fn attention_snapshot(&self) -> archivefs_core::attention::AttentionSnapshot {
+        use archivefs_core::attention::*;
+        let mut snapshot = AttentionSnapshot::default();
+        if let Some(transaction) = &self.romm_applied {
+            if let Some(item) = operation_attention(
+                &archivefs_core::operation::romm_publication_operation(transaction, None),
+            ) {
+                snapshot.insert(item);
+            }
+        } else if let Some(error) = &self.romm_error {
+            let mut item = AttentionItem::new(
+                format!("romm-preview:{}", self.destination_root_draft),
+                AttentionCategory::Publication,
+                AttentionSeverity::ActionNeeded,
+                "RomM publication needs review".into(),
+                AttentionDestination::Romm,
+            );
+            item.summary = error.clone();
+            item.source_workflow = "RomM publication".into();
+            item.provenance =
+                "Current publication workflow error, not an inferred destination check".into();
+            snapshot.insert(item);
+        }
+        let esde_error = self
+            .esde_recovery_error
+            .as_ref()
+            .or(self.esde_publish_error.as_ref())
+            .or(self.esde_preview_error.as_ref());
+        let recovery_pending =
+            self.esde_recovery_gamelist_path.is_some() && !self.esde_recovery_done;
+        if esde_error.is_some() || recovery_pending {
+            let mut item = AttentionItem::new(
+                format!("esde-publication:{}", self.destination_root_draft),
+                AttentionCategory::Publication,
+                AttentionSeverity::ActionNeeded,
+                "ES-DE publication needs review".into(),
+                AttentionDestination::EsDe,
+            );
+            item.summary = esde_error.map(|e| e.0.clone()).unwrap_or_else(|| {
+                "The existing ES-DE preview found an unresolved publication recovery record.".into()
+            });
+            item.platform = self.esde_platform_id.map(str::to_owned);
+            item.affected = self
+                .esde_recovery_gamelist_path
+                .as_ref()
+                .or(self.esde_publication.as_ref().map(|p| &p.gamelist_path))
+                .map(|p| p.display().to_string());
+            item.source_workflow = "ES-DE publication".into();
+            item.provenance = "Current ES-DE publication/recovery workflow result".into();
+            if let Some((_, Some(detail))) = esde_error {
+                item.source_records.push(detail.clone());
+            }
+            snapshot.insert(item);
+        }
+        snapshot
+    }
+
     fn has_catalogue_selection(&self) -> bool {
         let selected = self.selected_catalogue.as_ref().is_some_and(|reference| {
             self.catalogue_picker

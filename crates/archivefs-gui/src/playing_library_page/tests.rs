@@ -15,6 +15,40 @@ use archivefs_core::playing_library::{RetroDeckVisibility, build_retrodeck_proje
 
 use super::*;
 
+#[test]
+fn attention_publication_errors_deduplicate_and_follow_workflow_resolution() {
+    use archivefs_core::attention::*;
+    let mut state = PlayingLibraryPageState {
+        romm_error: Some(
+            "The destination changed; review the existing publication preview.".into(),
+        ),
+        esde_preview_error: Some(("Publication is stale".into(), None)),
+        esde_recovery_error: Some(("Recovery review is required".into(), None)),
+        esde_recovery_gamelist_path: Some("/disposable/gamelist.xml".into()),
+        ..Default::default()
+    };
+    let snapshot = state.attention_snapshot();
+    assert_eq!(snapshot.page(&AttentionFilters::default()).total, 2);
+    assert_eq!(
+        snapshot
+            .items()
+            .filter(|i| i.destination == AttentionDestination::EsDe)
+            .count(),
+        1
+    );
+    state.romm_error = None;
+    state.esde_preview_error = None;
+    state.esde_recovery_error = None;
+    state.esde_recovery_done = true;
+    assert_eq!(
+        state
+            .attention_snapshot()
+            .page(&AttentionFilters::default())
+            .total,
+        0
+    );
+}
+
 /// SHA-1 of `b"test"` (4 bytes).
 const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
 /// SHA-1 of `b"abc"` (3 bytes).

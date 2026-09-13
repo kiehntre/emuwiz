@@ -242,6 +242,12 @@ impl ExactDuplicateReviewPageState {
         self.rollback_error.as_deref()
     }
 
+    /// Remaining exact groups in the workflow-owned review list. Successfully
+    /// quarantined groups are already removed by `confirm_apply`.
+    pub(crate) fn attention_group_count(&self) -> usize {
+        self.report.as_ref().map_or(0, |report| report.groups.len())
+    }
+
     #[cfg(test)]
     pub(crate) fn report(&self) -> Option<&ExactDuplicateScanReport> {
         self.report.as_ref()
