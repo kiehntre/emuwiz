@@ -20,7 +20,7 @@ use super::*;
 // those tests assert against; `--all-targets` clippy's non-test pass does
 // not see that usage.
 #[allow(dead_code)]
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 21] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 22] = [
     (MainView::Home, "Home"),
     (MainView::NeedsAttention, "Needs Attention"),
     (MainView::Mount, "Mount"),
@@ -34,6 +34,7 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 21] = [
     (MainView::EmulatorSetup, "Emulator Setup"),
     (MainView::LibraryViewHistory, "Library View History"),
     (MainView::DatSources, "DAT Sources"),
+    (MainView::MediaSets, "Media Sets"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::Sources, "Sources"),
@@ -251,6 +252,10 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
             nav_view(MainView::Sources, "Sources"),
             nav_view(MainView::DatSources, "DAT Sources"),
         ],
+    },
+    NavGroup {
+        heading: Some("MEDIA"),
+        entries: &[nav_view(MainView::MediaSets, "Media Sets")],
     },
     NavGroup {
         heading: Some("HISTORY & JOURNALS"),

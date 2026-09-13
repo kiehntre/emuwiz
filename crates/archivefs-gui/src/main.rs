@@ -188,6 +188,7 @@ pub(crate) mod dat_coverage_panel;
 #[allow(dead_code)]
 pub(crate) mod dat_sources_page;
 mod doctor_repair;
+pub(crate) mod media_sets_page;
 use doctor_repair::*;
 pub(crate) mod doctor_page;
 // Existing tests (`tests/doctor_and_repair.rs`, and this file's own unit
@@ -2641,6 +2642,9 @@ enum MainView {
     /// same reason Cheat Sources is: it is configuration that outlives any
     /// one archive being worked on.
     DatSources,
+    /// Read-only presentation of the existing media-set topology and swap
+    /// plan. This page derives only from the loaded catalogue snapshot.
+    MediaSets,
     ActiveMounts,
     /// The consolidated "Problems & Repair" destination: one sidebar entry
     /// over Overview/Diagnostics/Repair tabs - see `problems_repair_page`'s
@@ -3200,6 +3204,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Museum => "Museum",
         MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
+        MainView::MediaSets => "Media Sets",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Problems => "Problems & Repair",
         MainView::Doctor => "Doctor",
@@ -3236,6 +3241,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::TapeInspector
         | MainView::EmulatorSetup
         | MainView::DatSources
+        | MainView::MediaSets
         | MainView::Doctor
         | MainView::Settings
         | MainView::About
@@ -3279,6 +3285,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::SourcesDiscovery
             | MainView::CheatSources
             | MainView::DatSources
+            | MainView::MediaSets
             | MainView::IdentifyRename
             | MainView::Problems
             | MainView::Doctor
@@ -3693,6 +3700,7 @@ struct ArchiveFsApp {
     /// Cheat Sources is: starting the GUI should not read a registry file for
     /// a page nobody has opened.
     dat_sources_page: Option<dat_sources_page::DatSourcesPageState>,
+    media_sets_page: media_sets_page::MediaSetsPageState,
     quick_rename_mode: bool,
     /// Unsubmitted DAT Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy.
@@ -4195,6 +4203,7 @@ impl ArchiveFsApp {
             library_view_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
+            media_sets_page: media_sets_page::MediaSetsPageState::default(),
             quick_rename_mode: false,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
             library_filters: LibraryRowFilters::default(),
@@ -7053,6 +7062,21 @@ impl ArchiveFsApp {
         );
         self.handle_selected_evidence_action(context, evidence_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
+        if let Some(path) = self
+            .archive_context
+            .focused
+            .as_deref()
+            .map(Path::to_path_buf)
+        {
+            if let Some(snapshot) = self.database_state.snapshot() {
+                self.media_sets_page
+                    .refresh(&snapshot.archives, self.database_generation.0);
+            }
+            if media_sets_page::show_selected_item_link(ui, &self.media_sets_page, &path) {
+                self.navigate_to_main_view(MainView::MediaSets);
+            }
+            ui.add_space(crate::ui::theme::SECTION_GAP);
+        }
         let live_for_launch_readiness = match &self.state {
             LoadState::Ready(data) => Some(data.as_ref()),
             _ => None,
@@ -8645,6 +8669,15 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::LibraryViewHistory {
                     self.show_library_view_history_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::MediaSets {
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        self.media_sets_page
+                            .refresh(&snapshot.archives, self.database_generation.0);
+                    }
+                    media_sets_page::show_media_sets_page(ui, &mut self.media_sets_page);
                     return;
                 }
 
