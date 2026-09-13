@@ -35,6 +35,38 @@ pub(crate) enum OnboardingStep {
 
 pub(crate) const ONBOARDING_STEP_COUNT: usize = 5;
 
+/// The five ideas a new user should remember.  These are deliberately a
+/// presentation model, not another persisted state machine: the existing
+/// five setup steps remain the source/DAT/emulator implementation boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JourneyStage {
+    Scan,
+    Understand,
+    Fix,
+    Organise,
+    Play,
+}
+
+impl JourneyStage {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Scan,
+        Self::Understand,
+        Self::Fix,
+        Self::Organise,
+        Self::Play,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "Scan",
+            Self::Understand => "Understand",
+            Self::Fix => "Fix",
+            Self::Organise => "Organise",
+            Self::Play => "Play",
+        }
+    }
+}
+
 impl OnboardingStep {
     const ORDER: [OnboardingStep; ONBOARDING_STEP_COUNT] = [
         OnboardingStep::Welcome,
@@ -64,6 +96,17 @@ impl OnboardingStep {
             OnboardingStep::DatSetup => "Optional: DAT / identification setup",
             OnboardingStep::EmulatorSetup => "Emulator discovery & readiness",
             OnboardingStep::Verify => "Verify & finish",
+        }
+    }
+
+    /// The user-facing stage currently being introduced.  This is only a
+    /// compact orientation cue; it does not alter which existing page is
+    /// rendered or create a second source of truth for readiness.
+    pub(crate) fn journey_stage(self) -> JourneyStage {
+        match self {
+            Self::Welcome | Self::AddSource => JourneyStage::Scan,
+            Self::DatSetup | Self::Verify => JourneyStage::Understand,
+            Self::EmulatorSetup => JourneyStage::Play,
         }
     }
 
@@ -277,6 +320,30 @@ impl ArchiveFsApp {
                 }
             });
         });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for stage in JourneyStage::ALL {
+                let active = stage == step.journey_stage();
+                let text = if active {
+                    format!("● {}", stage.label())
+                } else {
+                    format!("○ {}", stage.label())
+                };
+                ui.label(text);
+            }
+        });
+        ui.label(match step.journey_stage() {
+            JourneyStage::Scan =>
+                "Read-only scan first: choose where your games live and let EmuWiz understand them.",
+            JourneyStage::Understand =>
+                "Understand the evidence and attention items before deciding whether anything needs changing.",
+            JourneyStage::Fix =>
+                "Fixes are previews first and require your explicit confirmation; nothing changes here automatically.",
+            JourneyStage::Organise =>
+                "Organisation creates a separate plan for a playing or published library; your source stays separate.",
+            JourneyStage::Play =>
+                "Launch readiness is shown from verified evidence. Starting a game is always your explicit action.",
+        });
         if skip_entirely_clicked {
             self.onboarding_skip_entirely(context);
             return;
@@ -300,8 +367,9 @@ impl ArchiveFsApp {
         step: OnboardingStep,
     ) {
         ui.label(
-            "EmuWiz will never do the following without an explicit, reviewed confirmation step:",
+            "EmuWiz scans and understands your game library, explains problems, and helps you prepare a safe playing library.",
         );
+        ui.label("It is read-only by default. It will never do the following without an explicit, reviewed confirmation step:");
         ui.label("  \u{2022} rename, move, or delete a ROM");
         ui.label("  \u{2022} download anything from the internet");
         ui.label("  \u{2022} configure an emulator on your behalf");
@@ -314,9 +382,14 @@ impl ArchiveFsApp {
              library.",
         );
         ui.add_space(12.0);
-        if ui.button("Continue").clicked() {
-            self.onboarding_advance_from(context, step);
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Choose a game library").clicked() {
+                self.onboarding_advance_from(context, step);
+            }
+            if ui.button("Explore without scanning").clicked() {
+                self.onboarding_skip_entirely(context);
+            }
+        });
     }
 
     fn show_onboarding_add_source_step(
@@ -333,6 +406,11 @@ impl ArchiveFsApp {
         self.show_sources_page(context, ui, SourcesTab::Libraries);
         ui.add_space(12.0);
         let has_source = self.onboarding_has_source();
+        if has_source {
+            ui.label("Library selected. The next step will help you understand what EmuWiz found.");
+        } else {
+            ui.label("No folder selected yet. You can continue later, but EmuWiz cannot identify games until a source is chosen.");
+        }
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(has_source, egui::Button::new("Continue"))
@@ -410,6 +488,11 @@ impl ArchiveFsApp {
             );
             ui.add_space(12.0);
         }
+        ui.label(
+            "When you finish, use Needs Attention to review conflicts or missing dependencies, \
+             Library organisation to preview a separate playing library, and the selected \
+             game's readiness panel when you are ready to play.",
+        );
         if ui.button("Finish").clicked() {
             self.onboarding_advance_from(context, step);
         }
@@ -431,6 +514,29 @@ mod tests {
                 OnboardingStep::EmulatorSetup,
                 OnboardingStep::Verify,
             ]
+        );
+    }
+
+    #[test]
+    fn novice_roadmap_contains_the_five_product_stages() {
+        assert_eq!(
+            JourneyStage::ALL,
+            [
+                JourneyStage::Scan,
+                JourneyStage::Understand,
+                JourneyStage::Fix,
+                JourneyStage::Organise,
+                JourneyStage::Play,
+            ]
+        );
+        assert_eq!(OnboardingStep::Welcome.journey_stage(), JourneyStage::Scan);
+        assert_eq!(
+            OnboardingStep::DatSetup.journey_stage(),
+            JourneyStage::Understand
+        );
+        assert_eq!(
+            OnboardingStep::EmulatorSetup.journey_stage(),
+            JourneyStage::Play
         );
     }
 
