@@ -1,15 +1,15 @@
 # EmuWiz Fedora/Nobara RPM packaging foundation.
 #
-# Cargo workspace version 0.8.3 is a plain pre-1.0 release (not an alpha
+# Cargo workspace version 0.9.0 is a plain pre-1.0 release (not an alpha
 # snapshot), so this uses Fedora's ordinary final-release convention:
-#   Cargo:  0.8.3
-#   RPM:    Version 0.8.3, Release 1%{?dist}
+#   Cargo:  0.9.0
+#   RPM:    Version 0.9.0, Release 1%{?dist}
 
 %global app_id io.github.kiehntre.emuwiz
 %global forgeurl https://github.com/kiehntre/emuwiz
 
 Name:           emuwiz
-Version:        0.8.3
+Version:        0.9.0
 Release:        1%{?dist}
 Summary:        Verify, organise, and play a retro-game library
 
@@ -18,7 +18,7 @@ URL:            %{forgeurl}
 # Local/offline packaging source: a plain tarball of the committed tree,
 # produced by build-rpm.sh via `git archive` (see that script and
 # docs/LINUX_PACKAGING.md - Task B3, "Source / build model"). This is not
-# yet a published release tarball.
+# a published release tarball.
 Source0:        emuwiz-%{version}.tar.gz
 
 # NOT listing cargo/rust here: this workspace's rust-toolchain.toml pins

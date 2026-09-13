@@ -11,6 +11,48 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
+## v0.9.0 (2026-09-13)
+
+EmuWiz's first unified 0.9 workflow release. Linux-only and pre-1.0.
+
+### Added
+
+- **Unified Evidence Resolution** reconciles identity, authority, topology,
+  readiness, and launch evidence with explicit explanations, conflicts, and
+  fail-closed action safety.
+- **DAT Authority and Collection Completeness** shows per-platform authority,
+  expected/matched/missing/ambiguous counts, and read-only preparation and
+  refresh impact.
+- **Needs Attention and recovery** provides one issue-review entry point for
+  identity, DAT, BIOS, topology, repair, publication, and recovery states.
+- **Media Sets and MediaSwapPlan inspection** presents optical, floppy, and
+  tape members, completeness, ambiguity, competing candidates, and declarative
+  swap plans without executing swaps.
+- **Topology-aware launch planning** projects proven start media and media
+  requirements into existing launch readiness while keeping BIOS/profile
+  blockers separate.
+- **First-run novice journey and navigation coherence** guide users through
+  Scan -> Understand -> Fix -> Organise -> Play with read-only explanations
+  and clearer Sources, Library, and issue handoffs.
+
+### Safety and performance
+
+- Existing repair, organisation, recovery, and launch boundaries remain
+  explicit, reviewable, and fail-closed; viewing and planning do not mutate
+  source media or catalogue truth.
+- Indexed DAT dashboard reads measured 638-799 ms on a 100k-record fixture
+  (median 746 ms), with cached GUI rendering measured at 117 ms.
+
+### Known limitations
+
+- Automatic emulator media swapping is not implemented.
+- Persisted topology evidence is not available catalogue-wide.
+- Literal interactive GUI click automation is unavailable in the validation
+  environment.
+- The repository retains 9 known baseline test failures and 2 known baseline
+  clippy warnings documented in release validation.
+- Publisher/front-end profiles and other post-0.9 work remain deferred.
+
 ## v0.8.3 (2026-09-12)
 
 Identity, launch, optical, and whole-collection library release

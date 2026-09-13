@@ -170,7 +170,7 @@ Prebuilt Linux release bundles and checksums are published on the
 version you want, then run:
 
 ```sh
-VERSION=v0.8.3
+VERSION=v0.9.0
 curl -LO https://github.com/kiehntre/emuwiz/releases/download/$VERSION/archivefs-$VERSION-x86_64-linux.tar.gz
 curl -LO https://github.com/kiehntre/emuwiz/releases/download/$VERSION/archivefs-$VERSION-x86_64-linux.tar.gz.sha256
 sha256sum -c archivefs-$VERSION-x86_64-linux.tar.gz.sha256
@@ -300,12 +300,11 @@ EmuWiz is dedicated to [my dad](DEDICATION.md).
 
 ## Release status
 
-The latest published release is [`v0.8.3`](https://github.com/kiehntre/emuwiz/releases/tag/v0.8.3).
+The latest release is [`v0.9.0`](https://github.com/kiehntre/emuwiz/releases/tag/v0.9.0).
 It is a Linux-only, pre-1.0 alpha release. The canonical x86_64 bundle is
-`archivefs-v0.8.3-x86_64-linux.tar.gz` with its adjacent
+`archivefs-v0.9.0-x86_64-linux.tar.gz` with its adjacent
 `.tar.gz.sha256` checksum sidecar; verify that sidecar with `sha256sum -c`
-before extraction. The published v0.8.3 asset currently documented here is
-the x86_64 Linux bundle.
+before extraction. The v0.9.0 asset is the x86_64 Linux bundle.
 
 EmuWiz was previously known as ArchiveFS. Legacy executable names,
 configuration paths, data paths, and release artifact names remain supported
