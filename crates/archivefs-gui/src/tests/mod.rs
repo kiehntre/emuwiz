@@ -1023,6 +1023,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         database_restore_confirmation: String::new(),
         database_restore_feedback: None,
         needs_attention: needs_attention::AttentionWorkspace::default(),
+        dat_authority: dat_authority_dashboard::DashboardState::default(),
         pending_source_scan_summary: None,
         sources_last_scan: None,
         // Left unloaded: these tests never open the Cheat Sources page,

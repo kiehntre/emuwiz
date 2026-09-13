@@ -203,6 +203,7 @@ pub(crate) mod doctor_page;
 use doctor_page::*;
 pub(crate) mod mount_batch;
 use mount_batch::*;
+mod dat_authority_dashboard;
 pub(crate) mod dolphin_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
@@ -3714,6 +3715,7 @@ struct ArchiveFsApp {
     database_state: DatabaseState,
     database_generation: DatabaseGeneration,
     needs_attention: needs_attention::AttentionWorkspace,
+    dat_authority: dat_authority_dashboard::DashboardState,
     /// A `ScanPersistSummary` from a just-completed Sources-page scan
     /// (`SourceActionOutcome::Scanned`), waiting to be carried into the
     /// `DatabaseState::Ready.last_scan_summary` produced by the plain
@@ -4177,6 +4179,7 @@ impl ArchiveFsApp {
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
             needs_attention: needs_attention::AttentionWorkspace::default(),
+            dat_authority: dat_authority_dashboard::DashboardState::default(),
             pending_source_scan_summary: None,
             sources_last_scan: None,
             cheat_sources_page: None,
@@ -5955,6 +5958,10 @@ impl ArchiveFsApp {
     }
 
     fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
+        if !identify_rename {
+            self.dat_authority
+                .show(ui, database_state_path(&self.database_state));
+        }
         if self.dat_sources_page.is_none() {
             let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
                 Ok(path) => path,
@@ -5991,7 +5998,12 @@ impl ArchiveFsApp {
         };
         // Drained before the view is built, so the view stays a pure function
         // of state. A running job repaints continuously; an idle page does not.
-        if page.poll() || page.is_busy() {
+        let dat_changed = page.poll();
+        if dat_changed {
+            self.dat_authority.invalidate();
+            self.needs_attention.invalidate();
+        }
+        if dat_changed || page.is_busy() {
             ui.ctx().request_repaint();
         }
         let view = page.view_with_romm_summary(self.verify_romm_summary);
@@ -6013,6 +6025,8 @@ impl ArchiveFsApp {
                 action,
                 dat_sources_page::DatSourcesPageAction::OpenAdvancedIdentifyRename
             );
+            self.dat_authority.invalidate();
+            self.needs_attention.invalidate();
             if matches!(action, dat_sources_page::DatSourcesPageAction::Revert) {
                 self.dat_sources_ui.clear();
             }
@@ -7567,6 +7581,15 @@ impl ArchiveFsApp {
         }
         self.poll_load(context);
         self.poll_database_load(context);
+        if self.dat_authority.tick(
+            self.database_generation.0,
+            database_state_path(&self.database_state),
+            matches!(self.view, MainView::DatSources | MainView::NeedsAttention)
+                && !self.database_state.is_loading(),
+            context,
+        ) {
+            self.invalidate_needs_attention();
+        }
         self.poll_diagnostics();
         self.poll_setup_action(context);
         self.poll_doctor_scan();

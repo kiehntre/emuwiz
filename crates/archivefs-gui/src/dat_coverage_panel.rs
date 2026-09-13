@@ -458,10 +458,18 @@ fn render_canonical(
     });
     ui.add_space(6.0);
 
-    // Headline: completion + full set.
-    completion_bar(ui, view.completion_percent);
-    ui.add_space(4.0);
-    full_set_badge(ui, &view.full_set);
+    // This older drill-down counts recorded flat identities, not complete
+    // multi-member sets or proven missing entries. The authority dashboard
+    // above supplies those stronger, ambiguity-aware collection claims.
+    ui.label("Recorded identity coverage only. For source freshness, ambiguity and collection completeness, use the authority dashboard above.");
+    if let Some(percent) = view.completion_percent {
+        ui.label(format!(
+            "{percent:.1}% of expected identities have recorded matches"
+        ));
+    }
+    if let FullSetView::NotProvable { reason } = &view.full_set {
+        ui.label(reason);
+    }
     ui.add_space(10.0);
 
     // Expected / Missing (gated).
@@ -471,15 +479,19 @@ fn render_canonical(
     if view.expected.is_available() {
         match view.missing_count {
             Some(missing) => {
-                metric_row(ui, "Missing", &group_thousands(missing));
+                metric_row(
+                    ui,
+                    "Without verified identity (includes unresolved)",
+                    &group_thousands(missing),
+                );
                 if missing > 0 {
                     let is_open = missing_open.contains(source_id);
                     if widgets::action_button(
                         ui,
                         if is_open {
-                            "Hide missing games"
+                            "Hide unresolved identities"
                         } else {
-                            "View missing games"
+                            "View unresolved identities"
                         },
                         ActionStyle::Quiet,
                         true,
@@ -497,7 +509,7 @@ fn render_canonical(
                     }
                 }
             }
-            None => dash_row(ui, "Missing"),
+            None => dash_row(ui, "Without verified identity"),
         }
     }
 
@@ -551,7 +563,7 @@ fn render_missing_list(
 ) {
     widgets::card(ui, |ui| {
         if list.names.is_empty() {
-            ui.label(egui::RichText::new("Loading missing games…").color(theme::muted(ui)));
+            ui.label(egui::RichText::new("Loading unresolved identities…").color(theme::muted(ui)));
             return;
         }
         egui::ScrollArea::vertical()
@@ -698,8 +710,10 @@ pub(crate) fn show_coverage_section(
 
     widgets::section_header(
         ui,
-        "Collection coverage",
-        Some("How much of each platform's catalogue your library covers, per source."),
+        "Per-source verification details",
+        Some(
+            "Recorded identity/set audit details. Unresolved identities are not necessarily missing files.",
+        ),
     );
 
     if entries.is_empty() {

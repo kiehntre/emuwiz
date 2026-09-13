@@ -7,6 +7,89 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+/// Projects the DAT authority dashboard into the current unified attention
+/// snapshot. DAT remains a read-only producer; deduplication and filtering are
+/// owned by `archivefs_core::attention::AttentionSnapshot`.
+pub(crate) fn append_dat_attention(
+    snapshot: &mut AttentionSnapshot,
+    data: &archivefs_core::dat::authority::DatAuthorityDashboard,
+) {
+    use archivefs_core::dat::authority::{AuthorityFreshness, CompletenessState};
+
+    for row in &data.collections {
+        let authority = data
+            .authorities
+            .iter()
+            .find(|a| Some(&a.source.id) == row.source_id.as_ref());
+        let freshness_unknown =
+            authority.is_some_and(|a| !matches!(a.freshness, AuthorityFreshness::Current));
+        if row.state == CompletenessState::Complete && !freshness_unknown {
+            continue;
+        }
+        let severity = if row.counts.bios_missing.is_some_and(|n| n > 0) {
+            AttentionSeverity::Blocking
+        } else if matches!(
+            row.state,
+            CompletenessState::Incomplete
+                | CompletenessState::Ambiguous
+                | CompletenessState::NoAuthority
+        ) {
+            AttentionSeverity::ActionNeeded
+        } else {
+            AttentionSeverity::Warning
+        };
+        let mut item = AttentionItem::new(
+            format!(
+                "dat-authority:{}:{}",
+                row.platform,
+                row.source_id.as_deref().unwrap_or("unassigned")
+            ),
+            AttentionCategory::Dat,
+            severity,
+            format!("{}: {}", row.platform, row.state.label()),
+            AttentionDestination::DatReview,
+        );
+        item.summary = row.explanations.join(" ");
+        if freshness_unknown {
+            item.summary.push_str(
+                " Publisher freshness is unknown or the authority changed; review source provenance in DAT Sources.",
+            );
+        }
+        item.source_workflow = "DAT authority & completeness".into();
+        item.source_records
+            .push(row.source_id.clone().unwrap_or_else(|| "unassigned".into()));
+        item.platform = Some(row.platform.clone());
+        item.recommended_action =
+            "Review authority, completeness and BIOS evidence in DAT Sources".into();
+        item.recoverability =
+            "Read-only evidence; use the existing DAT review and verification workflows.".into();
+        item.provenance = "Recorded DAT inventory, catalogue identity and set-audit evidence; no filesystem scan or automatic fix.".into();
+        item.affected_count = row.counts.local;
+        snapshot.insert(item);
+    }
+    for authority in data
+        .authorities
+        .iter()
+        .filter(|a| a.source.platform.is_none())
+    {
+        let mut item = AttentionItem::new(
+            format!("dat-authority:unlinked:{}", authority.source.id),
+            AttentionCategory::Dat,
+            AttentionSeverity::Warning,
+            format!("{}: DAT is not linked to a platform", authority.source.name),
+            AttentionDestination::DatReview,
+        );
+        item.summary = authority.preparation.join(" ");
+        item.source_workflow = "DAT authority & completeness".into();
+        item.source_records.push(authority.source.id.clone());
+        item.recommended_action = "Review platform assignment in DAT Sources".into();
+        item.recoverability = "No changes made; authority assignment requires review.".into();
+        item.provenance =
+            "Recorded DAT source configuration and imported inventory metadata.".into();
+        snapshot.insert(item);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct AttentionWorkspace {
     pub(crate) snapshot: AttentionSnapshot,
@@ -19,7 +102,17 @@ pub(crate) struct AttentionWorkspace {
     pub(crate) filters: AttentionFilters,
 }
 
+impl AttentionWorkspace {
+    pub(crate) fn invalidate(&mut self) {
+        self.last_session_refresh = None;
+    }
+}
+
 impl ArchiveFsApp {
+    pub(crate) fn invalidate_needs_attention(&mut self) {
+        self.needs_attention.invalidate();
+    }
+
     /// Independent of the selected page. The page only renders memory.
     pub(crate) fn poll_needs_attention(&mut self, context: &egui::Context) {
         if let Some(receiver) = &self.needs_attention.receiver {
@@ -152,6 +245,10 @@ impl ArchiveFsApp {
                 item.last_observed = Some(plan.created_at_unix as i64);
                 item.provenance = "Current non-stale LibraryRepairPlan".into();
                 snapshot.insert(item);
+            }
+            if let Some(Ok(data)) = &self.dat_authority.data {
+                append_dat_attention(&mut snapshot, data);
+                snapshot.source_rows += (data.collections.len() + data.authorities.len()) as u64;
             }
             self.needs_attention.snapshot = snapshot;
             self.needs_attention.last_session_refresh = Some(Instant::now());

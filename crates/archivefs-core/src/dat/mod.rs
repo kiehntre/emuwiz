@@ -34,6 +34,7 @@
 
 pub mod archive;
 pub mod audit;
+pub mod authority;
 pub mod catalogue_selection;
 pub mod classification;
 pub mod coverage;

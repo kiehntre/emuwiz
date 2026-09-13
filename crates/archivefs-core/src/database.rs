@@ -55,6 +55,7 @@ mod attention;
 #[cfg(test)]
 #[path = "database/attention_tests.rs"]
 mod attention_tests;
+mod authority;
 mod restore;
 pub use restore::{
     DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,
