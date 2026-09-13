@@ -1588,6 +1588,7 @@ mod tests {
                 ready_with_warnings: 0,
                 blocked: 0,
             },
+            media_topology: None,
         };
 
         let outcome = build_es_de_entry_plan(&resolved("PSX"), &usable_content(), Some(&plan));
@@ -1622,6 +1623,7 @@ mod tests {
                 ready_with_warnings: 0,
                 blocked: 0,
             },
+            media_topology: None,
         };
 
         let outcome = build_es_de_entry_plan(&resolved("GameCube"), &usable_content(), Some(&plan));
@@ -1658,6 +1660,7 @@ mod tests {
                 ready_with_warnings: 0,
                 blocked: 1,
             },
+            media_topology: None,
         };
 
         let outcome = build_es_de_entry_plan(&resolved("PSX"), &usable_content(), Some(&plan));

@@ -35,6 +35,7 @@ fn input(firmware: FirmwareReadiness, ready: bool) -> LaunchReadinessInput {
                 ready_with_warnings: 0,
                 blocked: usize::from(!ready),
             },
+            media_topology: None,
         },
         retroarch: None,
         retroarch_scanned: true,

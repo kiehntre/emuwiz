@@ -185,6 +185,9 @@ pub struct LaunchPlan {
     pub game_key: Option<String>,
     pub candidates: Vec<LaunchCandidate>,
     pub summary: LaunchPlanSummary,
+    /// Optional read-only topology projection. `None` preserves the exact
+    /// single-media plan contract for callers that have no media set.
+    pub media_topology: Option<crate::launch::topology::MediaTopologyLaunchProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -520,6 +523,7 @@ pub fn build_launch_plan(
             game_key: None,
             candidates: Vec::new(),
             summary: LaunchPlanSummary::default(),
+            media_topology: None,
         };
     };
 
@@ -550,6 +554,7 @@ pub fn build_launch_plan(
         game_key: Some(resolved.game_key.clone()),
         candidates,
         summary,
+        media_topology: None,
     }
 }
 

@@ -128,6 +128,7 @@ pub mod snes9x_command;
 pub mod snes9x_execution;
 pub mod stella_command;
 pub mod stella_execution;
+pub mod topology;
 pub mod tsugaru_command;
 pub mod tsugaru_execution;
 pub mod vice_command;
@@ -433,6 +434,10 @@ pub use stella_command::{
 pub use stella_execution::{
     StellaLaunchPreflightError, StellaLaunchPreflightErrorKind, StellaLaunchRequest,
     preflight_stella_launch, spawn_stella,
+};
+pub use topology::{
+    MediaTopologyActionSafety, MediaTopologyLaunchProjection, MediaTopologyMissingMedia,
+    build_launch_plan_with_media_set, project_media_set_for_launch,
 };
 pub use tsugaru_command::{
     TSUGARU_SUPPORTED_PLATFORM_ID, TsugaruCommand, TsugaruCommandPlan, TsugaruMediaFormat,

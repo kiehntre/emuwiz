@@ -65,6 +65,10 @@ pub enum LaunchReadiness {
 /// explanation alongside this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchBlockerKind {
+    /// Existing media topology is not safe to project into a launch.
+    MediaTopologyBlocked,
+    /// Topology needs explicit review before a launch start medium is chosen.
+    MediaTopologyReviewRequired,
     /// A native Azahar launch was given a non-Nintendo 3DS identity.
     AzaharPlatformMismatch,
     /// Azahar Phase 1 accepts only a loose `.3dsx` homebrew file.

@@ -162,6 +162,7 @@ fn plan_with(candidates: Vec<LaunchCandidate>) -> LaunchPlan {
             blocked,
         },
         candidates,
+        media_topology: None,
     }
 }
 
@@ -1378,6 +1379,7 @@ fn dolphin_plan_with(candidates: Vec<LaunchCandidate>, game_id: &str) -> LaunchP
             blocked,
         },
         candidates,
+        media_topology: None,
     }
 }
 
@@ -2030,6 +2032,7 @@ fn pcsx2_plan_with(candidates: Vec<LaunchCandidate>) -> LaunchPlan {
             blocked,
         },
         candidates,
+        media_topology: None,
     }
 }
 
