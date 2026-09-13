@@ -84,6 +84,7 @@ mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
 mod dat;
+mod media_set;
 mod platform_artwork;
 mod repair;
 mod retroarch_cheat_cache;
@@ -227,6 +228,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = cli.args.into_iter();
 
     match command.as_str() {
+        "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
             let scanner = ArchiveScanner::new(&config);
@@ -5564,6 +5566,7 @@ fn print_help() {
     println!("  --debug        Show diagnostic logs");
     println!();
     println!("Commands:");
+    println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether EmuWiz is ready to run");
     println!(
