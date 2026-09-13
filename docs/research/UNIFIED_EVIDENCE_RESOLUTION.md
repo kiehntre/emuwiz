@@ -114,7 +114,7 @@ therefore independent of insertion order.
 ## Real collection audit
 
 This pass remains read-only. A bounded inspection of the available local
-catalogue at `/home/davedap/.local/share/archivefs/library.sqlite3` found
+catalogue at `<catalogue-path>` found
 102,343 archive rows, 22 source-folder rows, and schema 12; `quick_check`
 returned `ok`. The current database has 0 `verified_identity_facts`, 0
 `library_dat_identities`, 0 DAT expected entries and 0 DAT audit results, so
