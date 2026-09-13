@@ -49,7 +49,9 @@ mod tests;
 pub use container::{ArchiveFormat, ContainerKind, FolderRole};
 pub use content_registry::ContentKind;
 pub use discovery::{
-    DiscoveredStructuralEvidence, DiscoveryError, DiscoveryStats, GameDiscovery, IdentitySummary,
-    SkipReason, SkipReasonCounts, SourceDiscoveryReport, ValidationState, discover_source,
-    discover_source_with_whdload_dat, is_known_non_game_extension,
+    ArchiveListingEvidence, DiscoveredStructuralEvidence, DiscoveryError, DiscoveryReuseStats,
+    DiscoveryStats, GameDiscovery, INGESTION_PARSER_VERSION, IdentitySummary, SkipReason,
+    SkipReasonCounts, SourceDiscoveryReport, ValidationState, discover_source,
+    discover_source_with_fingerprints, discover_source_with_whdload_dat,
+    is_known_non_game_extension,
 };

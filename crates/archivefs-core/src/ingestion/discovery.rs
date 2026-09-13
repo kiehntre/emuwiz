@@ -19,8 +19,11 @@ use crate::identity_source::whdload::{
 };
 use crate::platform_evidence_fusion::evidence_lineage::EvidenceObservation;
 use crate::psp_pbp_evidence::{PBP_HEADER_BYTES, parse_pbp_header, validate_pbp_offsets};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+
+pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v1";
 
 /// Bounds mirroring the existing archive scanner's own limits (see
 /// `crate::ArchiveScanner`), so a pathological source cannot make
@@ -306,6 +309,32 @@ pub struct SourceDiscoveryReport {
     /// [`structural_amiga_floppy_observation`] output, one per validated
     /// Amiga floppy. Empty when no such file was seen.
     pub structural_evidence: Vec<DiscoveredStructuralEvidence>,
+    pub archive_evidence: Vec<ArchiveListingEvidence>,
+    pub reuse: DiscoveryReuseStats,
+    /// Stable semantic identity of `items`, used by the database to avoid
+    /// rewriting an identical discovery-detail projection.
+    pub detail_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveListingEvidence {
+    pub path: PathBuf,
+    pub listing_hash: String,
+    pub member_count: usize,
+    pub selected_member: Option<String>,
+    pub listing_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryReuseStats {
+    pub archive_candidates: usize,
+    pub archives_reused: usize,
+    pub archives_reopened: usize,
+    pub member_listings_reused: usize,
+    pub member_listings_regenerated: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub fallback_inspections: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +348,31 @@ pub enum DiscoveryError {
 /// (folder-alias matching never looks above it), matching the existing
 /// scanner's behaviour.
 pub fn discover_source(root: &Path) -> Result<SourceDiscoveryReport, DiscoveryError> {
-    discover_source_with_whdload_dat(root, None)
+    discover_source_with_fingerprints(root, &[])
+}
+
+pub fn discover_source_with_fingerprints(
+    root: &Path,
+    fingerprints: &[(i64, crate::ScanFingerprint)],
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    let cache: HashMap<&Path, &crate::ScanFingerprint> = fingerprints
+        .iter()
+        .filter_map(|(_, fingerprint)| {
+            fingerprint
+                .ingestion
+                .as_ref()
+                .map(|_| (fingerprint.relative_path.as_path(), fingerprint))
+        })
+        .collect();
+    let absolute_cache: HashMap<PathBuf, &crate::ScanFingerprint> = cache
+        .into_iter()
+        .map(|(relative, fingerprint)| (root.join(relative), fingerprint))
+        .collect();
+    let cache: HashMap<&Path, &crate::ScanFingerprint> = absolute_cache
+        .iter()
+        .map(|(path, fingerprint)| (path.as_path(), *fingerprint))
+        .collect();
+    discover_source_inner(root, None, &cache)
 }
 
 /// [`discover_source`] with an optional generic DAT context for reconciling
@@ -332,6 +385,14 @@ pub fn discover_source_with_whdload_dat(
     root: &Path,
     whdload_dat: Option<&WhdloadDatContext<'_>>,
 ) -> Result<SourceDiscoveryReport, DiscoveryError> {
+    discover_source_inner(root, whdload_dat, &HashMap::new())
+}
+
+fn discover_source_inner(
+    root: &Path,
+    whdload_dat: Option<&WhdloadDatContext<'_>>,
+    cache: &HashMap<&Path, &crate::ScanFingerprint>,
+) -> Result<SourceDiscoveryReport, DiscoveryError> {
     if !root.is_dir() {
         return Err(DiscoveryError::NotADirectory);
     }
@@ -343,6 +404,8 @@ pub fn discover_source_with_whdload_dat(
     let mut consumed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut items = Vec::new();
     let mut structural_evidence: Vec<DiscoveredStructuralEvidence> = Vec::new();
+    let mut archive_evidence = Vec::new();
+    let mut reuse = DiscoveryReuseStats::default();
 
     for path in &files {
         if extension_lowercase(path).as_deref() != Some("cue") {
@@ -363,6 +426,9 @@ pub fn discover_source_with_whdload_dat(
             root,
             whdload_dat,
             &mut structural_evidence,
+            cache,
+            &mut archive_evidence,
+            &mut reuse,
         ));
     }
 
@@ -374,12 +440,43 @@ pub fn discover_source_with_whdload_dat(
             skip_reasons.record(reason);
         }
     }
+    let detail_fingerprint = discovery_detail_fingerprint(&items);
     Ok(SourceDiscoveryReport {
         items,
         stats,
         skip_reasons,
         structural_evidence,
+        archive_evidence,
+        reuse,
+        detail_fingerprint,
     })
+}
+
+fn discovery_detail_fingerprint(items: &[GameDiscovery]) -> String {
+    let mut hasher = Sha256::new();
+    for item in items {
+        hasher.update(item.path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                item.container,
+                item.content,
+                item.platform_hint,
+                item.validation_state,
+                item.skip_reason,
+                item.explanation,
+                item.identity_candidate
+            )
+            .as_bytes(),
+        );
+        hasher.update([0xff]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Iterative, symlink-refusing, bounded walk collecting every regular
@@ -479,6 +576,9 @@ fn discover_file(
     source_root: &Path,
     whdload_dat: Option<&WhdloadDatContext<'_>>,
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
+    cache: &HashMap<&Path, &crate::ScanFingerprint>,
+    archive_evidence: &mut Vec<ArchiveListingEvidence>,
+    reuse: &mut DiscoveryReuseStats,
 ) -> GameDiscovery {
     let container = detect_container(path, path.is_dir());
     match &container {
@@ -487,7 +587,9 @@ fn discover_file(
         }
         ContainerKind::Folder(FolderRole::ExtractedGame) => discover_extracted_folder(path),
         ContainerKind::Folder(FolderRole::Plain) => unreachable!("plain folders are recursed"),
-        ContainerKind::Archive(format) => discover_archive(path, *format, source_root),
+        ContainerKind::Archive(format) => {
+            discover_archive(path, *format, source_root, cache, archive_evidence, reuse)
+        }
         ContainerKind::DirectFile => discover_direct_file(path, source_root, structural_evidence),
     }
 }
@@ -584,11 +686,65 @@ fn discover_extracted_folder(path: &Path) -> GameDiscovery {
     )
 }
 
-fn discover_archive(path: &Path, format: ArchiveFormat, source_root: &Path) -> GameDiscovery {
+fn discover_archive(
+    path: &Path,
+    format: ArchiveFormat,
+    source_root: &Path,
+    cache: &HashMap<&Path, &crate::ScanFingerprint>,
+    archive_evidence: &mut Vec<ArchiveListingEvidence>,
+    reuse: &mut DiscoveryReuseStats,
+) -> GameDiscovery {
     let container = ContainerKind::Archive(format);
+    reuse.archive_candidates += 1;
+    if let Some(cached) = cache.get(path).filter(|fingerprint| {
+        fingerprint_is_fresh(path, fingerprint)
+            && fingerprint.cache_version == crate::SCAN_CACHE_VERSION
+            && fingerprint.scanner_version == crate::SCANNER_VERSION
+            && fingerprint.parser_version == crate::ARCHIVE_PARSER_VERSION
+            && fingerprint
+                .ingestion
+                .as_ref()
+                .is_some_and(|evidence| evidence.version == INGESTION_PARSER_VERSION)
+    }) {
+        reuse.cache_hits += 1;
+        reuse.archives_reused += 1;
+        reuse.member_listings_reused += 1;
+        let evidence = cached
+            .ingestion
+            .as_ref()
+            .expect("cache hit requires ingestion evidence");
+        let member_count = evidence.member_count;
+        let selected_member = evidence.selected_member.clone();
+        archive_evidence.push(ArchiveListingEvidence {
+            path: path.to_path_buf(),
+            listing_hash: evidence.listing_hash.clone(),
+            member_count,
+            selected_member: selected_member.clone(),
+            listing_available: evidence.listing_available,
+        });
+        return cached_archive_result(
+            path,
+            format,
+            cached,
+            member_count,
+            selected_member.as_deref(),
+            evidence.listing_available,
+        );
+    }
+    reuse.cache_misses += 1;
+    reuse.archives_reopened += 1;
+    reuse.member_listings_regenerated += 1;
+    reuse.fallback_inspections += 1;
     let Some(entries) = list_archive_entry_names(path, format) else {
         // Provider absence or a bounded safety refusal is reported without
         // attempting extraction; see container.rs for the format policy.
+        archive_evidence.push(ArchiveListingEvidence {
+            path: path.to_path_buf(),
+            listing_hash: String::new(),
+            member_count: 0,
+            selected_member: None,
+            listing_available: false,
+        });
         return GameDiscovery {
             path: path.to_path_buf(),
             container,
@@ -610,6 +766,14 @@ fn discover_archive(path: &Path, format: ArchiveFormat, source_root: &Path) -> G
             .and_then(|extension| extension.to_str())
             .map(|extension| content_kind_for_extension(&extension.to_ascii_lowercase()).is_some())
             .unwrap_or(false)
+    });
+    let listing_hash = member_listing_hash(&entries);
+    archive_evidence.push(ArchiveListingEvidence {
+        path: path.to_path_buf(),
+        listing_hash,
+        member_count: entries.len(),
+        selected_member: recognized_member.map(|member| member.0.clone()),
+        listing_available: true,
     });
     let Some(member) = recognized_member else {
         return skipped(
@@ -660,6 +824,125 @@ fn discover_archive(path: &Path, format: ArchiveFormat, source_root: &Path) -> G
             explanation,
             skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
         },
+    }
+}
+
+fn fingerprint_is_fresh(path: &Path, fingerprint: &crate::ScanFingerprint) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Some(modified) = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+    else {
+        return false;
+    };
+    metadata.len() == fingerprint.size_bytes
+        && modified.as_nanos() as i128 == fingerprint.modified_time_ns
+}
+
+fn member_listing_hash(entries: &[super::container::ArchiveEntryName]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        hasher.update((entry.0.len() as u64).to_le_bytes());
+        hasher.update(entry.0.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn cached_archive_result(
+    path: &Path,
+    format: ArchiveFormat,
+    fingerprint: &crate::ScanFingerprint,
+    member_count: usize,
+    selected_member: Option<&str>,
+    listing_available: bool,
+) -> GameDiscovery {
+    let container = ContainerKind::Archive(format);
+    if !listing_available {
+        return GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: None,
+            platform_hint: None,
+            identity_candidate: None,
+            validation_state: ValidationState::Skipped,
+            explanation: format!(
+                "{} - member listing was unavailable or refused safely, so EmuWiz preserves the archive without guessing its contents.",
+                format.label()
+            ),
+            skip_reason: None,
+        };
+    }
+    let Some(member) = selected_member else {
+        return skipped(
+            path.to_path_buf(),
+            container,
+            None,
+            SkipReason::UnsupportedExtension,
+            format!(
+                "{} - none of its {} entries look like recognised game content.",
+                format.label(),
+                member_count
+            ),
+        );
+    };
+    let extension = Path::new(member)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let Some(content) = content_kind_for_extension(&extension) else {
+        return skipped(
+            path.to_path_buf(),
+            container,
+            None,
+            SkipReason::UnsupportedExtension,
+            format!(
+                "{} - none of its {} entries look like recognised game content.",
+                format.label(),
+                member_count
+            ),
+        );
+    };
+    let identity = Some(IdentitySummary {
+        display_name: fingerprint.display_name.clone(),
+        platform: fingerprint.platform.clone(),
+    });
+    let platform_hint = fingerprint.platform.clone();
+    let explanation = format!(
+        "{} containing {} ({}).",
+        format.label(),
+        content.label(),
+        member
+    );
+    if platform_hint.is_some() {
+        GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: Some(content),
+            platform_hint,
+            identity_candidate: identity,
+            validation_state: ValidationState::Accepted,
+            explanation,
+            skip_reason: None,
+        }
+    } else {
+        GameDiscovery {
+            path: path.to_path_buf(),
+            container,
+            content: Some(content),
+            platform_hint: None,
+            identity_candidate: identity,
+            validation_state: ValidationState::Skipped,
+            explanation,
+            skip_reason: Some(SkipReason::RecognizedContentNoIdentityMatch),
+        }
     }
 }
 

@@ -1,12 +1,87 @@
 use super::container::{ContainerKind, FolderRole};
 use super::content_registry::ContentKind;
 use super::content_registry::recognized_extensions;
-use super::discovery::{SkipReason, ValidationState, discover_source};
+use super::discovery::{
+    SkipReason, ValidationState, discover_source, discover_source_with_fingerprints,
+};
+use crate::{
+    ARCHIVE_PARSER_VERSION, Archive, ArchiveKind, IngestionFingerprint, SCAN_CACHE_VERSION,
+    SCANNER_VERSION, ScanFingerprint,
+};
+use std::fs::File;
 use std::path::Path;
 use tempfile::tempdir;
 
 fn source_dir(name: &str) -> tempfile::TempDir {
     tempdir().unwrap_or_else(|error| panic!("failed to create temp source dir {name}: {error}"))
+}
+
+#[test]
+fn unchanged_archive_reuses_ingestion_listing_without_reopening() {
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let dir = source_dir("ingestion-cache");
+    let archive_path = dir.path().join("Game.zip");
+    let mut writer = ZipWriter::new(File::create(&archive_path).unwrap());
+    writer
+        .start_file("Game.nes", SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"rom").unwrap();
+    writer.finish().unwrap();
+
+    let cold = discover_source(dir.path()).unwrap();
+    let archive = Archive::from_path_in_root(&archive_path, dir.path()).unwrap();
+    let evidence = cold
+        .archive_evidence
+        .iter()
+        .find(|evidence| evidence.path == archive_path)
+        .unwrap();
+    let fingerprint = ScanFingerprint {
+        relative_path: archive_path.strip_prefix(dir.path()).unwrap().to_path_buf(),
+        size_bytes: archive.identity.size_bytes.unwrap(),
+        modified_time_ns: archive
+            .identity
+            .modified_time
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128,
+        archive_kind: ArchiveKind::Zip,
+        display_name: archive.identity.display_name,
+        normalized_name: archive.identity.normalized_name,
+        platform: archive.identity.platform,
+        platform_provenance: archive.identity.platform_provenance,
+        scanner_version: SCANNER_VERSION.into(),
+        parser_version: ARCHIVE_PARSER_VERSION.into(),
+        cache_version: SCAN_CACHE_VERSION,
+        ingestion: Some(IngestionFingerprint {
+            version: super::discovery::INGESTION_PARSER_VERSION.into(),
+            listing_hash: evidence.listing_hash.clone(),
+            member_count: evidence.member_count,
+            selected_member: evidence.selected_member.clone(),
+            listing_available: evidence.listing_available,
+        }),
+        non_archive_kind: None,
+    };
+
+    let mut stale = fingerprint.clone();
+    stale.size_bytes += 1;
+    let changed = discover_source_with_fingerprints(dir.path(), &[(1, stale)]).unwrap();
+    assert_eq!(changed.reuse.archives_reused, 0);
+    assert_eq!(changed.reuse.archives_reopened, 1);
+
+    let mut stale_version = fingerprint.clone();
+    stale_version.ingestion.as_mut().unwrap().version = "old-ingestion-parser".into();
+    let invalidated = discover_source_with_fingerprints(dir.path(), &[(1, stale_version)]).unwrap();
+    assert_eq!(invalidated.reuse.cache_misses, 1);
+    assert_eq!(invalidated.reuse.member_listings_regenerated, 1);
+
+    let warm = discover_source_with_fingerprints(dir.path(), &[(1, fingerprint)]).unwrap();
+    assert_eq!(warm.reuse.archives_reused, 1);
+    assert_eq!(warm.reuse.member_listings_reused, 1);
+    assert_eq!(warm.reuse.archives_reopened, 0);
+    assert_eq!(warm.items, cold.items);
 }
 
 fn minimal_hdi() -> Vec<u8> {

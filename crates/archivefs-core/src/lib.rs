@@ -3738,6 +3738,29 @@ pub enum ArchiveKind {
 }
 
 impl ArchiveKind {
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "zip" => Some(Self::Zip),
+            "sevenzip" => Some(Self::SevenZip),
+            "rar" => Some(Self::Rar),
+            "megadrive_rom" => Some(Self::MegaDriveRom),
+            "direct_game_image" => Some(Self::DirectGameImage),
+            _ => None,
+        }
+    }
+
+    pub fn storage_name(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::SevenZip => "sevenzip",
+            Self::Rar => "rar",
+            Self::MegaDriveRom => "megadrive_rom",
+            Self::DirectGameImage => "direct_game_image",
+        }
+    }
+}
+
+impl ArchiveKind {
     /// Whether this library entry is an EmuWiz archive-mount input.
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
@@ -3954,6 +3977,45 @@ pub struct Archive {
 }
 
 impl Archive {
+    fn from_scan_fingerprint(
+        path: &Path,
+        source_root: &Path,
+        fingerprint: &ScanFingerprint,
+        metadata: fs::Metadata,
+    ) -> Self {
+        let identity = ArchiveIdentity {
+            display_name: fingerprint.display_name.clone(),
+            normalized_name: fingerprint.normalized_name.clone(),
+            source_root: source_root.to_path_buf(),
+            size_bytes: Some(fingerprint.size_bytes),
+            modified_time: metadata.modified().ok(),
+            platform: fingerprint.platform.clone(),
+            platform_provenance: fingerprint.platform_provenance,
+            region: None,
+            content_hash: None,
+            archive_hash: None,
+            internal_listing_hash: None,
+            filesystem_device: Some(filesystem_identity(&metadata).device),
+            filesystem_inode: Some(filesystem_identity(&metadata).inode),
+            source_filesystem_device: fs::symlink_metadata(source_root)
+                .ok()
+                .map(|m| filesystem_identity(&m).device),
+            source_filesystem_inode: fs::symlink_metadata(source_root)
+                .ok()
+                .map(|m| filesystem_identity(&m).inode),
+        };
+        Self {
+            path: path.to_path_buf(),
+            kind: fingerprint.archive_kind,
+            identity,
+            health: if fingerprint.archive_kind == ArchiveKind::MegaDriveRom {
+                ArchiveHealth::Unsupported
+            } else {
+                ArchiveHealth::Pending
+            },
+        }
+    }
+
     pub fn from_path(path: impl AsRef<Path>) -> Option<Self> {
         Self::from_path_in_root(path, PathBuf::new())
     }
@@ -5151,6 +5213,64 @@ pub struct ArchiveScanner<'a> {
     config: &'a Config,
 }
 
+// v2 records that stable direct-media classifications are reusable under the
+// same metadata envelope. Existing v1 rows are deliberately stale.
+pub const SCANNER_VERSION: &str = "scan-v2-direct-media";
+pub const ARCHIVE_PARSER_VERSION: &str = "archive-parser-v1";
+pub const SCAN_CACHE_VERSION: i64 = 1;
+
+/// Cheap, versioned evidence used by the incremental scanner. It is
+/// deliberately narrower than a content hash: matching this envelope is the
+/// condition for reusing prior classification evidence, never a replacement
+/// for revalidation of the live path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanFingerprint {
+    pub relative_path: PathBuf,
+    pub size_bytes: u64,
+    pub modified_time_ns: i128,
+    pub archive_kind: ArchiveKind,
+    pub display_name: String,
+    pub normalized_name: String,
+    pub platform: Option<String>,
+    pub platform_provenance: Option<PlatformProvenance>,
+    pub scanner_version: String,
+    pub parser_version: String,
+    pub cache_version: i64,
+    pub ingestion: Option<IngestionFingerprint>,
+    pub non_archive_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestionFingerprint {
+    pub version: String,
+    pub listing_hash: String,
+    pub member_count: usize,
+    pub selected_member: Option<String>,
+    pub listing_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ScanPhaseTimings {
+    pub filesystem_traversal_ns: u128,
+    pub candidate_discovery_ns: u128,
+    pub stat_metadata_ns: u128,
+    pub classification_ns: u128,
+    pub candidates: u64,
+    pub reused: u64,
+    pub re_inspected: u64,
+    pub directories_visited: u64,
+    pub files_statted: u64,
+    pub missing_fingerprint: u64,
+    pub stat_mismatch: u64,
+    pub cache_version_mismatch: u64,
+    pub deliberately_non_cacheable: u64,
+    pub re_inspected_plain_files: u64,
+    pub re_inspected_direct_images: u64,
+    pub re_inspected_archives: u64,
+    pub unsupported_files: u64,
+    pub ambiguous_files: u64,
+}
+
 /// The maximum number of individual [`SkippedFile`] entries
 /// [`ArchiveScanDiscovery::skipped_files`] retains, regardless of how many
 /// files a scan actually skips. The aggregate counters
@@ -5211,6 +5331,10 @@ pub struct ArchiveScanDiscovery {
     /// replacement for them; call [`Self::skipped_files_truncated`] before
     /// presenting it as complete.
     pub skipped_files: Vec<SkippedFile>,
+    pub timings: ScanPhaseTimings,
+    /// Compact fingerprints for deterministic skipped files. This is bounded
+    /// by the scanner's entry limit and contains no file payload.
+    pub non_archive_fingerprints: Vec<ScanFingerprint>,
 }
 
 impl ArchiveScanDiscovery {
@@ -5238,15 +5362,29 @@ impl<'a> ArchiveScanner<'a> {
     }
 
     pub fn scan_archives_with_summary(&self) -> Result<ArchiveScanDiscovery> {
+        self.scan_archives_with_cache(&[])
+    }
+
+    pub fn scan_archives_with_cache(
+        &self,
+        fingerprints: &[(i64, ScanFingerprint)],
+    ) -> Result<ArchiveScanDiscovery> {
         info!(
             "starting archive scan across {} source folder(s)",
             self.config.source_folders.len()
         );
         validate_configured_source_roots(&self.config.source_folders)?;
+        let fingerprint_map: HashMap<(i64, PathBuf), &ScanFingerprint> = fingerprints
+            .iter()
+            .map(|(source_id, fingerprint)| {
+                ((*source_id, fingerprint.relative_path.clone()), fingerprint)
+            })
+            .collect();
         let mut discovery = ArchiveScanDiscovery::default();
-        for source in &self.config.source_folders {
+        for (source_index, source) in self.config.source_folders.iter().enumerate() {
             debug!("scanning source folder {}", source.display());
-            self.scan_source(source, source, &mut discovery)?;
+            let source_id = fingerprints.get(source_index).map(|(id, _)| *id);
+            self.scan_source(source, source, &mut discovery, source_id, &fingerprint_map)?;
         }
         discovery
             .archives
@@ -5315,6 +5453,8 @@ impl<'a> ArchiveScanner<'a> {
         source_root: &Path,
         source: &Path,
         discovery: &mut ArchiveScanDiscovery,
+        source_id: Option<i64>,
+        fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
     ) -> Result<()> {
         const MAX_SCAN_ENTRIES: usize = 250_000;
         const MAX_SCAN_DEPTH: usize = 128;
@@ -5323,6 +5463,8 @@ impl<'a> ArchiveScanner<'a> {
         let mut directories = vec![(source.to_path_buf(), 0_usize)];
         let mut entries_seen = 0_usize;
         while let Some((directory, depth)) = directories.pop() {
+            discovery.timings.directories_visited += 1;
+            let traversal_started = Instant::now();
             let before = fs::symlink_metadata(&directory)
                 .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
             if before.file_type().is_symlink() || !before.is_dir() {
@@ -5349,7 +5491,9 @@ impl<'a> ArchiveScanner<'a> {
             entries.sort_by_key(|entry| entry.path());
 
             let mut child_directories = Vec::new();
+            discovery.timings.filesystem_traversal_ns += traversal_started.elapsed().as_nanos();
             for entry in entries {
+                let candidate_started = Instant::now();
                 let path = entry.path();
                 let file_type = entry
                     .file_type()
@@ -5377,7 +5521,13 @@ impl<'a> ArchiveScanner<'a> {
                     }
                     child_directories.push((path, depth + 1));
                 } else if file_type.is_file()
-                    && let Some(archive) = Archive::from_path_in_root(&path, source_root)
+                    && let Some(archive) = self.archive_from_fingerprint_or_path(
+                        &path,
+                        source_root,
+                        source_id,
+                        fingerprints,
+                        &mut discovery.timings,
+                    )
                 {
                     if archive.identity.size_bytes.is_none() {
                         return Err(ArchiveFsError::Scanner(format!(
@@ -5387,7 +5537,10 @@ impl<'a> ArchiveScanner<'a> {
                     }
                     debug!("discovered archive {}", archive.path.display());
                     discovery.archives.push(archive);
+                    discovery.timings.candidate_discovery_ns +=
+                        candidate_started.elapsed().as_nanos();
                 } else if file_type.is_file() {
+                    discovery.timings.unsupported_files += 1;
                     let extension = path
                         .extension()
                         .and_then(|value| value.to_str())
@@ -5417,6 +5570,42 @@ impl<'a> ArchiveScanner<'a> {
                             reason,
                         });
                     }
+                    if !self.non_archive_fingerprint_is_current(
+                        &path,
+                        source_root,
+                        source_id,
+                        fingerprints,
+                    ) && let Ok(metadata) = fs::metadata(&path)
+                    {
+                        let modified_time_ns = metadata
+                            .modified()
+                            .ok()
+                            .and_then(system_time_to_unix_nanos)
+                            .unwrap_or_default();
+                        if let Ok(relative_path) = path.strip_prefix(source_root) {
+                            discovery.non_archive_fingerprints.push(ScanFingerprint {
+                                relative_path: relative_path.to_path_buf(),
+                                size_bytes: metadata.len(),
+                                modified_time_ns,
+                                archive_kind: ArchiveKind::DirectGameImage,
+                                display_name: String::new(),
+                                normalized_name: String::new(),
+                                platform: None,
+                                platform_provenance: None,
+                                scanner_version: SCANNER_VERSION.to_string(),
+                                parser_version: ARCHIVE_PARSER_VERSION.to_string(),
+                                cache_version: SCAN_CACHE_VERSION,
+                                ingestion: None,
+                                non_archive_kind: Some(
+                                    match reason {
+                                        SkipReason::UnsupportedExtension => "unsupported",
+                                        SkipReason::AmbiguousPlatform => "ambiguous",
+                                    }
+                                    .to_string(),
+                                ),
+                            });
+                        }
+                    }
                 }
             }
             let after = fs::symlink_metadata(&directory)
@@ -5440,6 +5629,118 @@ impl<'a> ArchiveScanner<'a> {
             )));
         }
         Ok(())
+    }
+
+    fn archive_from_fingerprint_or_path(
+        &self,
+        path: &Path,
+        source_root: &Path,
+        source_id: Option<i64>,
+        fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+        timings: &mut ScanPhaseTimings,
+    ) -> Option<Archive> {
+        timings.candidates += 1;
+        let metadata_started = Instant::now();
+        let metadata = fs::metadata(path).ok()?;
+        timings.files_statted += 1;
+        timings.stat_metadata_ns += metadata_started.elapsed().as_nanos();
+        let relative = path.strip_prefix(source_root).ok()?;
+        let cached =
+            source_id.and_then(|id| fingerprints.get(&(id, relative.to_path_buf())).copied());
+        let mtime_ns = metadata.modified().ok().and_then(system_time_to_unix_nanos);
+        if let Some(fingerprint) = cached {
+            if fingerprint.non_archive_kind.is_some()
+                && fingerprint.cache_version == SCAN_CACHE_VERSION
+                && fingerprint.scanner_version == SCANNER_VERSION
+                && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
+                && fingerprint.size_bytes == metadata.len()
+                && Some(fingerprint.modified_time_ns) == mtime_ns
+            {
+                timings.reused += 1;
+                return None;
+            }
+            if fingerprint.cache_version == SCAN_CACHE_VERSION
+                && fingerprint.scanner_version == SCANNER_VERSION
+                && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
+                && fingerprint.size_bytes == metadata.len()
+                && Some(fingerprint.modified_time_ns) == mtime_ns
+            {
+                timings.reused += 1;
+                return Some(Archive::from_scan_fingerprint(
+                    path,
+                    source_root,
+                    fingerprint,
+                    metadata,
+                ));
+            }
+            if fingerprint.cache_version != SCAN_CACHE_VERSION
+                || fingerprint.scanner_version != SCANNER_VERSION
+                || fingerprint.parser_version != ARCHIVE_PARSER_VERSION
+            {
+                timings.cache_version_mismatch += 1;
+            } else if fingerprint.size_bytes != metadata.len()
+                || Some(fingerprint.modified_time_ns) != mtime_ns
+            {
+                timings.stat_mismatch += 1;
+            }
+        } else {
+            timings.missing_fingerprint += 1;
+        }
+        timings.re_inspected += 1;
+        if cached
+            .is_some_and(|fingerprint| fingerprint.archive_kind == ArchiveKind::DirectGameImage)
+        {
+            timings.re_inspected_direct_images += 1;
+        } else if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "zip" | "7z" | "rar" | "lha" | "lzh"
+                )
+            })
+        {
+            timings.re_inspected_archives += 1;
+        } else {
+            timings.re_inspected_plain_files += 1;
+        }
+        let classification_started = Instant::now();
+        let archive = Archive::from_path_in_root(path, source_root);
+        timings.classification_ns += classification_started.elapsed().as_nanos();
+        archive
+    }
+
+    fn non_archive_fingerprint_is_current(
+        &self,
+        path: &Path,
+        source_root: &Path,
+        source_id: Option<i64>,
+        fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+    ) -> bool {
+        let Some(source_id) = source_id else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(source_root) else {
+            return false;
+        };
+        let Some(fingerprint) = fingerprints.get(&(source_id, relative.to_path_buf())) else {
+            return false;
+        };
+        fingerprint.non_archive_kind.is_some()
+            && fingerprint.cache_version == SCAN_CACHE_VERSION
+            && fingerprint.scanner_version == SCANNER_VERSION
+            && fingerprint.parser_version == ARCHIVE_PARSER_VERSION
+            && fingerprint.size_bytes == metadata.len()
+            && fingerprint.modified_time_ns
+                == metadata
+                    .modified()
+                    .ok()
+                    .and_then(system_time_to_unix_nanos)
+                    .unwrap_or_default()
     }
 }
 
@@ -5674,6 +5975,12 @@ pub fn safe_mount_name(path: impl AsRef<Path>) -> String {
 
 fn normalized_title(path: &Path) -> String {
     safe_mount_name(path).to_lowercase()
+}
+
+fn system_time_to_unix_nanos(time: std::time::SystemTime) -> Option<i128> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos() as i128)
 }
 
 /// How a [`detect_platform_with_provenance`] result was determined. This is

@@ -34,6 +34,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use log::info;
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, params};
 
 use crate::emulator_environment::EncodedPath;
@@ -43,9 +44,10 @@ use crate::game_identity::{
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
 use crate::{
-    Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
-    canonical_platform_names, detect_platform_with_details, normalize_path_segment,
-    revalidate_archive_for_catalogue, validate_configured_source_roots,
+    ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config,
+    IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
+    ScanFingerprint, canonical_platform_names, detect_platform_with_details,
+    normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
 };
 
 /// Resolves the default library database path: `library.sqlite3` under the
@@ -160,6 +162,26 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         description: "per-source expected-inventory metadata (dat_expected_inventory_meta): the validation generation, revision, entry count, and duplicate-name-skip count the dat_expected_entries rows describe",
         sql: include_str!("migrations/0012_dat_expected_inventory_meta.sql"),
+    },
+    Migration {
+        version: 13,
+        description: "persist cheap per-file scan fingerprints for safe unchanged-input reuse",
+        sql: include_str!("migrations/0013_scan_fingerprints.sql"),
+    },
+    Migration {
+        version: 14,
+        description: "add compact ingestion archive listing evidence to scan fingerprints",
+        sql: include_str!("migrations/0014_ingestion_fingerprint_evidence.sql"),
+    },
+    Migration {
+        version: 15,
+        description: "reuse unchanged ingestion discovery detail evidence across scan runs",
+        sql: include_str!("migrations/0015_discovery_detail_reuse.sql"),
+    },
+    Migration {
+        version: 16,
+        description: "persist safe deterministic non-archive scanner outcomes",
+        sql: include_str!("migrations/0016_non_archive_fingerprints.sql"),
     },
 ];
 
@@ -2766,6 +2788,125 @@ impl Database {
         Ok(outcome)
     }
 
+    pub(crate) fn load_scan_fingerprints(
+        &self,
+        source_folder_id: i64,
+    ) -> Result<Vec<ScanFingerprint>> {
+        let mut stmt = self.connection.prepare("SELECT relative_path, size_bytes, modified_time_ns, archive_kind, display_name, normalized_name, platform, platform_provenance, scanner_version, parser_version, cache_version, ingestion_version, ingestion_listing_hash, ingestion_member_count, ingestion_member_name, ingestion_listing_available, non_archive_kind FROM scan_fingerprints WHERE source_folder_id = ?1").map_err(|error| db_error("failed to prepare scan fingerprint lookup", error))?;
+        let rows = stmt
+            .query_map([source_folder_id], |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                let kind = ArchiveKind::from_storage(&row.get::<_, String>(3)?)
+                    .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+                Ok(ScanFingerprint {
+                    relative_path: PathBuf::from(OsString::from_vec(bytes)),
+                    size_bytes: row.get::<_, i64>(1)? as u64,
+                    modified_time_ns: row.get::<_, i64>(2)? as i128,
+                    archive_kind: kind,
+                    display_name: row.get(4)?,
+                    normalized_name: row.get(5)?,
+                    platform: row.get(6)?,
+                    platform_provenance: match row.get::<_, Option<String>>(7)?.as_deref() {
+                        Some("header_identity") => Some(PlatformProvenance::HeaderIdentity),
+                        Some("heuristic-path-detector") => Some(PlatformProvenance::Heuristic),
+                        Some("folder_alias") => Some(PlatformProvenance::FolderAlias),
+                        Some("registry_detector") => Some(PlatformProvenance::RegistryDetector),
+                        _ => None,
+                    },
+                    scanner_version: row.get(8)?,
+                    parser_version: row.get(9)?,
+                    cache_version: row.get(10)?,
+                    ingestion: row
+                        .get::<_, Option<String>>(11)?
+                        .zip(row.get::<_, Option<String>>(12)?)
+                        .map(|(version, listing_hash)| IngestionFingerprint {
+                            version,
+                            listing_hash,
+                            member_count: row
+                                .get::<_, Option<i64>>(13)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
+                                as usize,
+                            selected_member: row.get(14).ok().flatten(),
+                            listing_available: row
+                                .get::<_, Option<i64>>(15)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
+                                != 0,
+                        }),
+                    non_archive_kind: row.get(16)?,
+                })
+            })
+            .map_err(|error| db_error("failed to query scan fingerprints", error))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| db_error("failed to read scan fingerprints", error))
+    }
+
+    pub(crate) fn persist_scan_fingerprint(
+        &mut self,
+        source_folder_id: i64,
+        source_root: &Path,
+        archive: &Archive,
+    ) -> Result<()> {
+        let relative = archive
+            .path
+            .strip_prefix(source_root)
+            .map_err(|_| ArchiveFsError::Database("archive is outside source root".into()))?;
+        let modified_time_ns = archive
+            .identity
+            .modified_time
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as i64)
+            .unwrap_or_default();
+        self.connection.execute("INSERT INTO scan_fingerprints (source_folder_id, relative_path, size_bytes, modified_time_ns, archive_kind, display_name, normalized_name, platform, platform_provenance, scanner_version, parser_version, cache_version, non_archive_kind, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13) ON CONFLICT(source_folder_id, relative_path) DO UPDATE SET size_bytes=excluded.size_bytes, modified_time_ns=excluded.modified_time_ns, archive_kind=excluded.archive_kind, display_name=excluded.display_name, normalized_name=excluded.normalized_name, platform=excluded.platform, platform_provenance=excluded.platform_provenance, scanner_version=excluded.scanner_version, parser_version=excluded.parser_version, cache_version=excluded.cache_version, non_archive_kind=NULL, updated_at=excluded.updated_at", params![source_folder_id, relative.as_os_str().as_bytes(), archive.identity.size_bytes.unwrap_or_default() as i64, modified_time_ns, archive.kind.storage_name(), archive.identity.display_name, archive.identity.normalized_name, archive.identity.platform, archive.identity.platform_provenance.map(PlatformProvenance::as_source_str), SCANNER_VERSION, ARCHIVE_PARSER_VERSION, SCAN_CACHE_VERSION, now_utc_string()]).map_err(|error| db_error("failed to persist scan fingerprint", error))?;
+        Ok(())
+    }
+
+    pub(crate) fn persist_non_archive_fingerprints(
+        &mut self,
+        source_folder_id: i64,
+        fingerprints: &[ScanFingerprint],
+    ) -> Result<usize> {
+        if fingerprints.is_empty() {
+            return Ok(0);
+        }
+        let mut statement = self
+            .connection
+            .prepare("INSERT INTO scan_fingerprints (source_folder_id, relative_path, size_bytes, modified_time_ns, archive_kind, display_name, normalized_name, scanner_version, parser_version, cache_version, non_archive_kind, updated_at) VALUES (?1, ?2, ?3, ?4, 'direct_game_image', '', '', ?5, ?6, ?7, ?8, ?9) ON CONFLICT(source_folder_id, relative_path) DO UPDATE SET size_bytes=excluded.size_bytes, modified_time_ns=excluded.modified_time_ns, scanner_version=excluded.scanner_version, parser_version=excluded.parser_version, cache_version=excluded.cache_version, non_archive_kind=excluded.non_archive_kind, updated_at=excluded.updated_at")
+            .map_err(|error| db_error("failed to prepare non-archive fingerprints", error))?;
+        for fingerprint in fingerprints {
+            statement
+                .execute(params![
+                    source_folder_id,
+                    fingerprint.relative_path.as_os_str().as_bytes(),
+                    fingerprint.size_bytes as i64,
+                    fingerprint.modified_time_ns as i64,
+                    SCANNER_VERSION,
+                    ARCHIVE_PARSER_VERSION,
+                    SCAN_CACHE_VERSION,
+                    fingerprint.non_archive_kind,
+                    now_utc_string(),
+                ])
+                .map_err(|error| db_error("failed to persist non-archive fingerprints", error))?;
+        }
+        Ok(fingerprints.len())
+    }
+
+    pub(crate) fn persist_ingestion_fingerprint(
+        &mut self,
+        source_folder_id: i64,
+        source_root: &Path,
+        evidence: &crate::ingestion::ArchiveListingEvidence,
+    ) -> Result<()> {
+        let relative = evidence.path.strip_prefix(source_root).map_err(|_| {
+            ArchiveFsError::Database("ingestion evidence is outside source root".into())
+        })?;
+        self.connection.execute("UPDATE scan_fingerprints SET ingestion_version=?3, ingestion_listing_hash=?4, ingestion_member_count=?5, ingestion_member_name=?6, ingestion_listing_available=?7 WHERE source_folder_id=?1 AND relative_path=?2", params![source_folder_id, relative.as_os_str().as_bytes(), crate::ingestion::INGESTION_PARSER_VERSION, evidence.listing_hash, evidence.member_count as i64, evidence.selected_member, evidence.listing_available as i64]).map_err(|error| db_error("failed to persist ingestion fingerprint", error))?;
+        Ok(())
+    }
+
     /// Appends one row to the append-only `archive_scan_observations` log.
     pub fn record_observation(
         &mut self,
@@ -4372,6 +4513,129 @@ impl Database {
         tx.commit()
             .map_err(|error| db_error("failed to commit mark-missing", error))?;
         Ok(missing.len() as i64)
+    }
+
+    /// Reconciles a fully fingerprint-reused source without touching each
+    /// unchanged catalogue row. The scanner has already completed the
+    /// authoritative filesystem walk, so this read proves that every
+    /// discovered archive still has the expected catalogue identity. A
+    /// mismatch deliberately returns `None`, making the caller use the
+    /// existing full persistence path.
+    fn reconcile_fully_reused_source(
+        &mut self,
+        scan_run_id: i64,
+        source_folder_id: i64,
+        source_root: &Path,
+        archives: &[Archive],
+    ) -> Result<Option<ScanRunCounts>> {
+        let started = std::time::Instant::now();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, relative_path, size_bytes, modified_time_unix_seconds, \
+                 last_verified_missing_at FROM archives WHERE source_folder_id = ?1",
+            )
+            .map_err(|error| {
+                db_error("failed to prepare unchanged-source reconciliation", error)
+            })?;
+        let mut catalogue = HashMap::<Vec<u8>, (i64, Option<i64>, Option<i64>, bool)>::new();
+        let rows = statement
+            .query_map(params![source_folder_id], |row| {
+                let path: Vec<u8> = row.get(1)?;
+                Ok((
+                    path,
+                    (
+                        row.get(0)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, Option<String>>(4)?.is_some(),
+                    ),
+                ))
+            })
+            .map_err(|error| db_error("failed to query unchanged-source catalogue", error))?;
+        for row in rows {
+            let (path, values) =
+                row.map_err(|error| db_error("failed to read unchanged-source catalogue", error))?;
+            catalogue.insert(path, values);
+        }
+        drop(statement);
+
+        let mut seen_ids = Vec::with_capacity(archives.len());
+        let mut seen_paths = HashSet::with_capacity(archives.len());
+        for archive in archives {
+            let relative = archive
+                .path
+                .strip_prefix(source_root)
+                .map_err(|_| ArchiveFsError::Database("archive is outside source root".into()))?;
+            let key = relative.as_os_str().as_bytes().to_vec();
+            let Some((archive_id, size, modified, missing)) = catalogue.get(&key) else {
+                info!(
+                    "unchanged reconciliation source={} result=fallback reason=missing_catalogue_row elapsed_ms={}",
+                    source_root.display(),
+                    started.elapsed().as_millis()
+                );
+                return Ok(None);
+            };
+            let expected_size = archive.identity.size_bytes.map(|value| value as i64);
+            let expected_modified = archive
+                .identity
+                .modified_time
+                .and_then(system_time_to_unix_seconds);
+            if *missing || *size != expected_size || *modified != expected_modified {
+                info!(
+                    "unchanged reconciliation source={} result=fallback reason=catalogue_state_mismatch elapsed_ms={}",
+                    source_root.display(),
+                    started.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
+            seen_ids.push(*archive_id);
+            seen_paths.insert(key);
+        }
+
+        // A source can contain catalogue rows no longer present in the
+        // walk. Preserve the existing missing-file semantics, including the
+        // missing observation, while leaving the common zero-missing path
+        // entirely write-free.
+        let missing = catalogue
+            .iter()
+            .filter(|(path, (_, _, _, already_missing))| {
+                !seen_paths.contains((*path).as_slice()) && !*already_missing
+            })
+            .count();
+        if missing > 0 {
+            let marked =
+                self.mark_unseen_archives_missing(scan_run_id, source_folder_id, &seen_ids)?;
+            let counts = ScanRunCounts {
+                archives_seen: archives.len() as i64,
+                archives_unchanged: archives.len() as i64,
+                archives_missing: marked,
+                ..ScanRunCounts::default()
+            };
+            info!(
+                "unchanged reconciliation source={} result=missing rows_examined={} missing={} observation_rows={} archive_updates={} elapsed_ms={}",
+                source_root.display(),
+                catalogue.len(),
+                marked,
+                marked,
+                marked,
+                started.elapsed().as_millis()
+            );
+            return Ok(Some(counts));
+        }
+
+        let counts = ScanRunCounts {
+            archives_seen: archives.len() as i64,
+            archives_unchanged: archives.len() as i64,
+            ..ScanRunCounts::default()
+        };
+        info!(
+            "unchanged reconciliation source={} result=clean rows_examined={} missing=0 observation_rows=0 archive_updates=0 elapsed_ms={}",
+            source_root.display(),
+            catalogue.len(),
+            started.elapsed().as_millis()
+        );
+        Ok(Some(counts))
     }
 
     /// Completes `scan_run_id` successfully: sets `finished_at`,
@@ -6184,13 +6448,22 @@ impl Database {
             DiscoveryDetailFilter::Tape => "content = 'tape_image'",
         };
 
+        let effective_run_id: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(discovery_details_source_run_id, id) FROM scan_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| db_error("failed to resolve discovery detail source", error))?;
+
         let total_matching: i64 = self
             .connection
             .query_row(
                 &format!(
                     "SELECT COUNT(*) FROM discovery_details WHERE scan_run_id = ?1 AND {filter_sql}"
                 ),
-                params![run_id],
+                params![effective_run_id],
                 |row| row.get(0),
             )
             .map_err(|error| db_error("failed to count discovery details", error))?;
@@ -6207,7 +6480,7 @@ impl Database {
             .map_err(|error| db_error("failed to prepare discovery details page", error))?;
         let rows = statement
             .query_map(
-                params![run_id, limit, offset],
+                params![effective_run_id, limit, offset],
                 discovery_detail_record_from_row,
             )
             .map_err(|error| db_error("failed to load discovery details page", error))?
@@ -6234,7 +6507,12 @@ impl Database {
         self.connection
             .execute(
                 "DELETE FROM discovery_details WHERE scan_run_id NOT IN \
-                 (SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?1)",
+                 (SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?1)
+                 AND scan_run_id NOT IN (
+                     SELECT discovery_details_source_run_id FROM scan_runs
+                     WHERE discovery_details_source_run_id IS NOT NULL
+                       AND id IN (SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?1)
+                 )",
                 params![MAX_RETAINED_DISCOVERY_RUNS],
             )
             .map_err(|error| db_error("failed to prune old discovery details", error))?;
@@ -6283,6 +6561,60 @@ impl Database {
                 ],
             )
             .map_err(|error| db_error("failed to persist discovery detail", error))?;
+        Ok(())
+    }
+
+    /// Reuse the most recent completed detail projection when semantic
+    /// discovery evidence is unchanged. The older payload is retained.
+    fn reuse_discovery_details(
+        &mut self,
+        scan_run_id: i64,
+        source_folder_id: i64,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let source_run: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT id FROM scan_runs
+                 WHERE status = 'completed' AND discovery_details_fingerprint = ?1
+                   AND discovery_details_source_folder_id = ?2 AND id <> ?3
+                   AND discovery_details_source_run_id IS NULL
+                   AND EXISTS (SELECT 1 FROM discovery_details d WHERE d.scan_run_id = scan_runs.id)
+                 ORDER BY id DESC LIMIT 1",
+                params![fingerprint, source_folder_id, scan_run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to find reusable discovery details", error))?;
+        let Some(source_run) = source_run else {
+            return Ok(false);
+        };
+        self.connection
+            .execute(
+                "UPDATE scan_runs SET discovery_details_fingerprint = ?2,
+                 discovery_details_source_run_id = ?3,
+                 discovery_details_source_folder_id = ?4 WHERE id = ?1",
+                params![scan_run_id, fingerprint, source_run, source_folder_id],
+            )
+            .map_err(|error| {
+                db_error("failed to point scan at reusable discovery details", error)
+            })?;
+        Ok(true)
+    }
+
+    fn set_discovery_details_fingerprint(
+        &mut self,
+        scan_run_id: i64,
+        source_folder_id: i64,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE scan_runs SET discovery_details_fingerprint = ?2,
+                 discovery_details_source_folder_id = ?3 WHERE id = ?1",
+                params![scan_run_id, fingerprint, source_folder_id],
+            )
+            .map_err(|error| db_error("failed to persist discovery detail fingerprint", error))?;
         Ok(())
     }
 }
@@ -6455,21 +6787,53 @@ fn scan_and_persist_folders_transaction(
             master_rom_root: None,
         };
 
-        let discovery = match ArchiveScanner::new(&folder_config).scan_archives_with_summary() {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                counts.errors_count += 1;
-                let message = error.to_string();
-                database.record_source_scan_result(
-                    folder.id,
-                    SourceScanStatus::Failed,
-                    Some(&message),
-                    None,
-                )?;
-                folder_errors.push((folder.path.clone(), message));
-                continue;
-            }
-        };
+        let db_read_started = std::time::Instant::now();
+        let fingerprints = database.load_scan_fingerprints(folder.id)?;
+        let db_read_ms = db_read_started.elapsed().as_millis();
+        let fingerprint_refs: Vec<_> = fingerprints
+            .into_iter()
+            .map(|fingerprint| (folder.id, fingerprint))
+            .collect();
+        let discovery_started = std::time::Instant::now();
+        let discovery =
+            match ArchiveScanner::new(&folder_config).scan_archives_with_cache(&fingerprint_refs) {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    counts.errors_count += 1;
+                    let message = error.to_string();
+                    database.record_source_scan_result(
+                        folder.id,
+                        SourceScanStatus::Failed,
+                        Some(&message),
+                        None,
+                    )?;
+                    folder_errors.push((folder.path.clone(), message));
+                    continue;
+                }
+            };
+        let discovery_ms = discovery_started.elapsed().as_millis();
+        info!(
+            "scan phases source={} traversal_ms={} candidate_ms={} stat_ms={} classification_ms={} directories={} files_statted={} candidates={} reused={} re_inspected={} missing_fingerprint={} stat_mismatch={} cache_version_mismatch={} deliberately_non_cacheable={} re_inspected_plain={} re_inspected_direct_images={} re_inspected_archives={} unsupported={} ambiguous={}",
+            folder.path.display(),
+            discovery.timings.filesystem_traversal_ns / 1_000_000,
+            discovery.timings.candidate_discovery_ns / 1_000_000,
+            discovery.timings.stat_metadata_ns / 1_000_000,
+            discovery.timings.classification_ns / 1_000_000,
+            discovery.timings.directories_visited,
+            discovery.timings.files_statted,
+            discovery.timings.candidates,
+            discovery.timings.reused,
+            discovery.timings.re_inspected,
+            discovery.timings.missing_fingerprint,
+            discovery.timings.stat_mismatch,
+            discovery.timings.cache_version_mismatch,
+            discovery.timings.deliberately_non_cacheable,
+            discovery.timings.re_inspected_plain_files,
+            discovery.timings.re_inspected_direct_images,
+            discovery.timings.re_inspected_archives,
+            discovery.timings.unsupported_files,
+            discovery.timings.ambiguous_files,
+        );
         counts.skipped_unsupported_extension += discovery.skipped_unsupported_extension as i64;
         counts.skipped_ambiguous_platform += discovery.skipped_ambiguous_platform as i64;
         // Re-bounded across the whole multi-folder run, not just within one
@@ -6484,9 +6848,45 @@ fn scan_and_persist_folders_transaction(
         // Best-effort second pass: the mixed-collection view (task 3/4 of
         // the ingestion integration) alongside the archive scanner above,
         // never in place of it - see `ScanPersistSummary::ingestion_stats`.
-        if let Ok(report) = crate::ingestion::discover_source(&folder.path) {
+        let mut ingestion_evidence = Vec::new();
+        let ingestion_started = std::time::Instant::now();
+        if let Ok(report) =
+            crate::ingestion::discover_source_with_fingerprints(&folder.path, &fingerprint_refs)
+        {
+            info!(
+                "ingestion phases source={} candidates={} cache_hits={} cache_misses={} archives_reused={} archives_reopened={} listings_reused={} listings_regenerated={} fallback_inspections={} detail_fingerprint={}",
+                folder.path.display(),
+                report.reuse.archive_candidates,
+                report.reuse.cache_hits,
+                report.reuse.cache_misses,
+                report.reuse.archives_reused,
+                report.reuse.archives_reopened,
+                report.reuse.member_listings_reused,
+                report.reuse.member_listings_regenerated,
+                report.reuse.fallback_inspections,
+                report.detail_fingerprint
+            );
+            info!(
+                "ingestion timing source={} discovery_ms={}",
+                folder.path.display(),
+                ingestion_started.elapsed().as_millis()
+            );
+            ingestion_evidence = report.archive_evidence.clone();
             ingestion_stats.merge(&report.stats);
             ingestion_skip_reasons.merge(&report.skip_reasons);
+            let detail_write_started = std::time::Instant::now();
+            let details_reused = database.reuse_discovery_details(
+                scan_run_id,
+                folder.id,
+                &report.detail_fingerprint,
+            )?;
+            if !details_reused {
+                database.set_discovery_details_fingerprint(
+                    scan_run_id,
+                    folder.id,
+                    &report.detail_fingerprint,
+                )?;
+            }
             for item in &report.items {
                 if let Some(platform) = &item.platform_hint {
                     *ingestion_platform_counts
@@ -6499,8 +6899,22 @@ fn scan_and_persist_folders_transaction(
                 // result set later without this function ever holding
                 // more of it in memory than the bounded samples below
                 // already do.
-                database.insert_discovery_detail(scan_run_id, item)?;
+                if !details_reused {
+                    database.insert_discovery_detail(scan_run_id, item)?;
+                }
             }
+            info!(
+                "discovery detail persistence source={} rows={} reused={} writes={} elapsed_ms={}",
+                folder.path.display(),
+                report.items.len(),
+                details_reused,
+                if details_reused {
+                    0
+                } else {
+                    report.items.len()
+                },
+                detail_write_started.elapsed().as_millis()
+            );
             if ingestion_skipped.len() < crate::MAX_RETAINED_SKIPPED_FILES {
                 let remaining = crate::MAX_RETAINED_SKIPPED_FILES - ingestion_skipped.len();
                 ingestion_skipped.extend(
@@ -6527,6 +6941,7 @@ fn scan_and_persist_folders_transaction(
             }
         }
         let archives = discovery.archives;
+        let non_archive_fingerprints = discovery.non_archive_fingerprints;
         if let Some(platform) = folder.assigned_platform.as_deref() {
             for archive in &archives {
                 if !source_assignment_is_compatible(archive, platform) {
@@ -6542,8 +6957,27 @@ fn scan_and_persist_folders_transaction(
         }
 
         database.begin_folder_refresh()?;
-        match persist_one_folder(database, scan_run_id, folder, &archives) {
+        let db_write_started = std::time::Instant::now();
+        let fully_reused =
+            discovery.timings.re_inspected == 0 && non_archive_fingerprints.is_empty();
+        let persisted = if fully_reused {
+            database
+                .reconcile_fully_reused_source(scan_run_id, folder.id, &folder.path, &archives)?
+                .map(Ok)
+                .unwrap_or_else(|| persist_one_folder(database, scan_run_id, folder, &archives))
+        } else {
+            persist_one_folder(database, scan_run_id, folder, &archives)
+        };
+        match persisted {
             Ok(folder_counts) => {
+                let db_write_ms = db_write_started.elapsed().as_millis();
+                info!(
+                    "scan db phases source={} reads_ms={} writes_and_reconciliation_ms={} discovery_ms={}",
+                    folder.path.display(),
+                    db_read_ms,
+                    db_write_ms,
+                    discovery_ms
+                );
                 counts.source_folders_scanned += 1;
                 counts.archives_seen += folder_counts.archives_seen;
                 counts.archives_added += folder_counts.archives_added;
@@ -6559,6 +6993,16 @@ fn scan_and_persist_folders_transaction(
                     Some(archives.len() as i64),
                 )?;
                 database.commit_folder_refresh()?;
+                let non_archive_writes = database
+                    .persist_non_archive_fingerprints(folder.id, &non_archive_fingerprints)?;
+                info!(
+                    "non-archive fingerprint persistence source={} rows={}",
+                    folder.path.display(),
+                    non_archive_writes
+                );
+                for evidence in &ingestion_evidence {
+                    database.persist_ingestion_fingerprint(folder.id, &folder.path, evidence)?;
+                }
             }
             Err(error) => {
                 database.rollback_folder_refresh()?;
@@ -6625,6 +7069,7 @@ fn persist_one_folder(
     for archive in archives {
         revalidate_archive_for_catalogue(archive)?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
+        database.persist_scan_fingerprint(folder.id, &folder.path, archive)?;
         seen_archive_ids.push(outcome.archive_id);
         counts.archives_seen += 1;
         match outcome.change {
@@ -8700,6 +9145,13 @@ mod tests {
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
 
         scan_and_persist(&mut database, &config, "test").unwrap();
+        let fingerprint_rows: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM scan_fingerprints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fingerprint_rows, 1);
         let second = scan_and_persist(&mut database, &config, "test").unwrap();
 
         assert_eq!(second.counts.archives_seen, 1);
