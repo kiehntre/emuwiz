@@ -7,17 +7,20 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::dat::rename_apply::{
     EntryState, RenameTransaction, TransactionOperation, TransactionState, journal_path,
     list_journals,
 };
+use crate::launch::es_de_publish::EsDeGamelistPublication;
 use crate::patch_manager::{
     PreviewAdapter, SharedApplyJournal, SharedApplyOutcome, SharedApplyStatus,
     SharedRollbackOutcome, SharedRollbackPreview, discover_shared_apply_history,
     preview_shared_rollback,
 };
 use crate::repair::quarantine::QUARANTINE_DIRECTORY_NAME;
+use crate::{LibraryViewHistoryOperation, LibraryViewHistoryRecord};
 
 pub const OPERATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
@@ -30,6 +33,9 @@ pub enum OperationKind {
     RepairApply,
     CheatApply,
     ModApply,
+    LibraryViewPublish,
+    RommPublish,
+    EsDePublish,
 }
 
 impl OperationKind {
@@ -41,6 +47,9 @@ impl OperationKind {
             Self::RepairApply => "Repair apply",
             Self::CheatApply => "Cheat apply",
             Self::ModApply => "Mod apply",
+            Self::LibraryViewPublish => "Library View publication",
+            Self::RommPublish => "RomM publication",
+            Self::EsDePublish => "ES-DE publication",
         }
     }
 }
@@ -205,6 +214,22 @@ impl OperationRegistry {
         Self { records, problems }
     }
 
+    /// Adds durable Library View history records. Malformed legacy records
+    /// remain visible as registry problems; no recovery capability is
+    /// invented for history that does not contain it.
+    pub fn append_library_view_history(&mut self, directory: &Path) {
+        for entry in crate::list_library_view_history_at(directory, 200) {
+            match entry {
+                crate::LibraryViewHistoryEntry::Record { path, record } => self.records.push(
+                    library_view_history_operation(&record, Some(path.display().to_string())),
+                ),
+                crate::LibraryViewHistoryEntry::Malformed { path, error } => {
+                    self.problems.push(format!("{}: {error}", path.display()))
+                }
+            }
+        }
+    }
+
     /// Adds shared cheat/mod journals to this index. The existing shared
     /// history reader remains authoritative; this only supplies a common
     /// read-only projection and rollback capability check.
@@ -275,6 +300,198 @@ pub fn repair_operation(
     journal_reference: Option<String>,
 ) -> OperationRecord {
     operation_from_transaction(transaction, OperationKind::RepairApply, journal_reference)
+}
+
+/// Projects the durable Library View receipt without replacing its history
+/// format. Library View history has no before-state for safe rollback, so
+/// this adapter deliberately exposes review only for partial operations.
+pub fn library_view_history_operation(
+    record: &LibraryViewHistoryRecord,
+    journal_reference: Option<String>,
+) -> OperationRecord {
+    let state = if record.success {
+        OperationState::Completed
+    } else if record.created + record.repaired + record.removed > 0 {
+        OperationState::Partial
+    } else {
+        OperationState::Failed
+    };
+    let changed = record.created + record.repaired + record.removed;
+    let summary = match record.operation {
+        LibraryViewHistoryOperation::Apply => format!(
+            "Library View completed; {changed} links created or repaired, {} skipped, {} failed",
+            record.skipped_or_collision.unwrap_or(0),
+            record.failed
+        ),
+        LibraryViewHistoryOperation::Remove => format!(
+            "Library View removed; {} links removed, {} failed",
+            record.removed, record.failed
+        ),
+    };
+    let partial = state == OperationState::Partial;
+    OperationRecord {
+        schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
+        operation_id: format!("library-view:{}:{}", record.view_id, record.timestamp),
+        kind: OperationKind::LibraryViewPublish,
+        state,
+        created_at_unix: 0,
+        started_at_unix: None,
+        completed_at_unix: None,
+        input: OperationInputSnapshot {
+            source_root: Some(record.manifest_path.clone()),
+            plan_generation: None,
+            plan_hash: None,
+            freshness_evidence: vec![format!("history_timestamp:{}", record.timestamp)],
+            destination_occupancy_checked: true,
+        },
+        destination: Some(record.destination_root.clone()),
+        output: OperationOutputReceipt {
+            outputs: vec![OperationOutput {
+                path: record.manifest_path.clone(),
+                changed: changed > 0,
+                verified: record.success,
+                before_state: None,
+                after_state: Some(format!("{} planned entries", record.planned_count)),
+            }],
+            journal_reference,
+            summary,
+        },
+        recovery: OperationRecoveryStatus {
+            classification: if partial {
+                RecoveryClassification::RequiresReview
+            } else {
+                RecoveryClassification::Unrecoverable
+            },
+            explanation: if partial {
+                "Some view entries failed; inspect the saved diagnostics.".into()
+            } else {
+                "Historical record has no safe rollback or resume evidence.".into()
+            },
+            actions: OperationActionAvailability {
+                review: if partial {
+                    ActionAvailability::Available
+                } else {
+                    ActionAvailability::Unavailable
+                },
+                ..Default::default()
+            },
+        },
+        error: record.warnings.first().cloned(),
+    }
+}
+
+/// Explicitly projects a RomM transaction. RomM shares the rename executor,
+/// whose legacy journal cannot identify the publication target afterwards,
+/// so callers must supply this semantic context.
+pub fn romm_publication_operation(
+    transaction: &RenameTransaction,
+    journal_reference: Option<String>,
+) -> OperationRecord {
+    operation_from_transaction(transaction, OperationKind::RommPublish, journal_reference)
+}
+
+/// Projects an ES-DE gamelist publication and checks the live output before
+/// advertising rollback. A changed gamelist is stale/review-required rather
+/// than rollback-capable, even when the in-memory plan is otherwise valid.
+pub fn es_de_publication_operation(
+    publication: &EsDeGamelistPublication,
+    completed: bool,
+    journal_reference: Option<String>,
+) -> OperationRecord {
+    let output_hash = digest_bytes(publication.new_content.as_bytes());
+    let operation_id = format!(
+        "es-de:{}:{output_hash}",
+        publication.gamelist_path.display()
+    );
+    let current = std::fs::read_to_string(&publication.gamelist_path).ok();
+    let matches_output = current.as_deref() == Some(publication.new_content.as_str());
+    let stale = completed && !publication.is_unchanged() && !matches_output;
+    let rollback = completed && !publication.is_unchanged() && matches_output;
+    let state = if !completed {
+        OperationState::Planned
+    } else if stale {
+        OperationState::Stale
+    } else {
+        OperationState::Completed
+    };
+    let classification = if stale {
+        RecoveryClassification::Stale
+    } else if rollback {
+        RecoveryClassification::SafeToRollback
+    } else {
+        RecoveryClassification::Unrecoverable
+    };
+    OperationRecord {
+        schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
+        operation_id,
+        kind: OperationKind::EsDePublish,
+        state,
+        created_at_unix: 0,
+        started_at_unix: None,
+        completed_at_unix: completed.then_some(0),
+        input: OperationInputSnapshot {
+            source_root: None,
+            plan_generation: None,
+            plan_hash: Some(format!("sha256:{output_hash}")),
+            freshness_evidence: vec![format!("system:{}", publication.es_de_system)],
+            destination_occupancy_checked: true,
+        },
+        destination: Some(publication.gamelist_path.to_string_lossy().into_owned()),
+        output: OperationOutputReceipt {
+            outputs: vec![OperationOutput {
+                path: publication.gamelist_path.to_string_lossy().into_owned(),
+                changed: !publication.is_unchanged(),
+                verified: !completed || matches_output,
+                before_state: Some(format!(
+                    "{} existing entries",
+                    publication.already_present.len()
+                )),
+                after_state: Some(format!("{} entries added", publication.added.len())),
+            }],
+            journal_reference,
+            summary: format!(
+                "ES-DE publication planned {} and added {}",
+                publication.added.len() + publication.already_present.len(),
+                publication.added.len()
+            ),
+        },
+        recovery: OperationRecoveryStatus {
+            classification,
+            explanation: if stale {
+                "The gamelist changed after publication; rollback requires review.".into()
+            } else if rollback {
+                "The gamelist still matches this publication and can be rolled back safely.".into()
+            } else if !completed {
+                "Preview only; nothing has been published.".into()
+            } else {
+                "No changed output requires recovery.".into()
+            },
+            actions: OperationActionAvailability {
+                rollback: if rollback {
+                    ActionAvailability::Available
+                } else {
+                    ActionAvailability::Unavailable
+                },
+                review: if stale {
+                    ActionAvailability::Available
+                } else {
+                    ActionAvailability::Unavailable
+                },
+                ..Default::default()
+            },
+        },
+        error: None,
+    }
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn shared_apply_operation(
@@ -900,5 +1117,92 @@ mod tests {
             ActionAvailability::Unavailable
         );
         assert_eq!(record.output.journal_reference.as_deref(), Some("mod.json"));
+    }
+
+    #[test]
+    fn library_view_history_projects_completed_and_partial_receipts() {
+        let mut record = LibraryViewHistoryRecord {
+            schema_version: crate::LIBRARY_VIEW_HISTORY_SCHEMA_VERSION,
+            timestamp: "2026-01-02T03:04:05Z".into(),
+            operation: LibraryViewHistoryOperation::Apply,
+            view_id: "view-1".into(),
+            view_name: "Main".into(),
+            profile_kind: crate::library_views::FrontendProfileKind::Generic,
+            destination_root: "/views/main".into(),
+            manifest_path: "/views/main/manifest.json".into(),
+            planned_count: 3,
+            created: 3,
+            repaired: 0,
+            removed: 0,
+            unchanged: 0,
+            failed: 0,
+            skipped_or_collision: Some(0),
+            success: true,
+            warnings: Vec::new(),
+        };
+        let complete = library_view_history_operation(&record, Some("history.json".into()));
+        assert_eq!(complete.kind, OperationKind::LibraryViewPublish);
+        assert_eq!(complete.state, OperationState::Completed);
+        assert_eq!(
+            complete.recovery.actions.rollback,
+            ActionAvailability::Unavailable
+        );
+        assert!(complete.output.summary.contains("3 links"));
+
+        record.created = 1;
+        record.failed = 2;
+        record.success = false;
+        record.warnings = vec!["missing source".into()];
+        let partial = library_view_history_operation(&record, None);
+        assert_eq!(partial.state, OperationState::Partial);
+        assert_eq!(
+            partial.recovery.classification,
+            RecoveryClassification::RequiresReview
+        );
+    }
+
+    #[test]
+    fn romm_publication_is_explicitly_distinguished_from_legacy_playing_library() {
+        let record = romm_publication_operation(&transaction(TransactionState::Applied), None);
+        assert_eq!(record.kind, OperationKind::RommPublish);
+        assert_eq!(record.state, OperationState::Completed);
+    }
+
+    #[test]
+    fn es_de_publication_only_advertises_rollback_for_unchanged_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gamelist.xml");
+        let publication = EsDeGamelistPublication {
+            es_de_system: "nes",
+            gamelist_path: path.clone(),
+            previous_content: None,
+            new_content: "<gameList/>".into(),
+            added: vec![crate::launch::es_de_publish::EsDePublicationEntry {
+                dat_entry_name: "Game".into(),
+                destination_path: PathBuf::from("/library/Game.zip"),
+            }],
+            already_present: Vec::new(),
+        };
+        std::fs::write(&path, &publication.new_content).unwrap();
+        let safe = es_de_publication_operation(&publication, true, None);
+        assert_eq!(safe.kind, OperationKind::EsDePublish);
+        assert_eq!(
+            safe.recovery.classification,
+            RecoveryClassification::SafeToRollback
+        );
+        assert_eq!(
+            safe.recovery.actions.rollback,
+            ActionAvailability::Available
+        );
+
+        std::fs::write(&path, "<gameList><game/></gameList>").unwrap();
+        let stale = es_de_publication_operation(&publication, true, None);
+        assert_eq!(stale.state, OperationState::Stale);
+        assert_eq!(stale.recovery.classification, RecoveryClassification::Stale);
+        assert_eq!(
+            stale.recovery.actions.rollback,
+            ActionAvailability::Unavailable
+        );
+        assert_eq!(stale.recovery.actions.review, ActionAvailability::Available);
     }
 }

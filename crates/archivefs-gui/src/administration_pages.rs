@@ -2100,6 +2100,9 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
     };
     let mut registry =
         archivefs_core::operation::OperationRegistry::from_rename_journals(&directory);
+    if let Ok(library_view_history) = archivefs_core::default_library_view_history_dir() {
+        registry.append_library_view_history(&library_view_history);
+    }
     if let (Ok(shared_history), Ok(shared_backups)) = (
         archivefs_core::patch_manager::default_shared_history_root(),
         archivefs_core::patch_manager::default_shared_backup_root(),
