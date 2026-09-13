@@ -29,6 +29,19 @@ use crate::safe_read::TrustedRoots;
 
 const CHDMAN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Staging directory name prefix used while `chdman` writes its output.
+/// Named so the operation-receipt projection layer (`crate::operation`) can
+/// recognise a disc-conversion output transaction from its journal alone,
+/// without duplicating this literal or depending on conversion internals
+/// beyond this one stable string.
+pub const DISC_CONVERSION_STAGING_PREFIX: &str = ".emuwiz-chd-";
+
+/// Quarantine sub-directory name used when the user explicitly requests
+/// source replacement (`ChdConversionSourceMode::QuarantineSource`). Named
+/// for the same reason as [`DISC_CONVERSION_STAGING_PREFIX`]: a stable,
+/// single-source-of-truth literal the projection layer can match on.
+pub const DISC_CONVERSION_QUARANTINE_SUBDIR: &str = "optical-conversion";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChdConversionSourceMode {
     KeepSource,
@@ -292,7 +305,10 @@ pub fn execute_chd_conversion(
         .ok_or_else(|| ChdConversionError::InvalidTarget("target has no parent".into()))?;
     let staging = (0..100u32)
         .find_map(|attempt| {
-            let candidate = parent.join(format!(".emuwiz-chd-{}-{attempt}", std::process::id()));
+            let candidate = parent.join(format!(
+                "{DISC_CONVERSION_STAGING_PREFIX}{}-{attempt}",
+                std::process::id()
+            ));
             match fs::create_dir(&candidate) {
                 Ok(()) => Some(candidate),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
@@ -378,7 +394,7 @@ pub fn execute_chd_conversion(
     stage_guard.retain = true;
     let source_quarantine = if plan.source_mode == ChdConversionSourceMode::QuarantineSource {
         let dir = quarantine_root
-            .join("optical-conversion")
+            .join(DISC_CONVERSION_QUARANTINE_SUBDIR)
             .join(&plan.source_fingerprint.canonical_sha256[..16]);
         fs::create_dir_all(&dir).map_err(|e| {
             ChdConversionError::Transaction(RepairExecutionError::Build {

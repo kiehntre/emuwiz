@@ -4,20 +4,24 @@
 //! authoritative; adapters translate them into this stable, read-only shape
 //! for history and recovery surfaces. No executor is called from this module.
 
+use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dat::rename_apply::{
-    EntryState, RenameTransaction, TransactionOperation, TransactionState, journal_path,
-    list_journals,
+    EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
+    journal_path, list_journals,
 };
 use crate::launch::es_de_publish::EsDeGamelistPublication;
 use crate::patch_manager::{
     PreviewAdapter, SharedApplyJournal, SharedApplyOutcome, SharedApplyStatus,
     SharedRollbackOutcome, SharedRollbackPreview, discover_shared_apply_history,
     preview_shared_rollback,
+};
+use crate::repair::optical_conversion::{
+    DISC_CONVERSION_QUARANTINE_SUBDIR, DISC_CONVERSION_STAGING_PREFIX,
 };
 use crate::repair::quarantine::QUARANTINE_DIRECTORY_NAME;
 use crate::{LibraryViewHistoryOperation, LibraryViewHistoryRecord};
@@ -38,6 +42,7 @@ pub enum OperationKind {
     EsDePublish,
     DatabaseRecovery,
     DatabaseBackup,
+    DiscConversion,
 }
 
 impl OperationKind {
@@ -54,6 +59,7 @@ impl OperationKind {
             Self::EsDePublish => "ES-DE publication",
             Self::DatabaseRecovery => "Database recovery",
             Self::DatabaseBackup => "Database backup",
+            Self::DiscConversion => "Disc conversion",
         }
     }
 }
@@ -203,6 +209,8 @@ impl OperationRegistry {
                     matches!(entry.operation, TransactionOperation::CreateSymlink { .. })
                 }) {
                     playing_library_operation(transaction, journal_reference)
+                } else if let Some(role) = disc_conversion_role(transaction) {
+                    disc_conversion_operation(transaction, role, journal_reference)
                 } else if transaction.entries.iter().any(|entry| {
                     entry
                         .destination_path
@@ -367,6 +375,165 @@ pub fn repair_operation(
     journal_reference: Option<String>,
 ) -> OperationRecord {
     operation_from_transaction(transaction, OperationKind::RepairApply, journal_reference)
+}
+
+/// Which half of a disc-conversion attempt a saved transaction represents.
+/// Disc conversion runs the shared Repair engine twice per attempt: once to
+/// finalize the fingerprint-verified CHD output, and, only when the user
+/// chose [`crate::repair::optical_conversion::ChdConversionSourceMode::QuarantineSource`],
+/// a second time to relocate the original CUE/BIN. Both are ordinary
+/// `RenameTransaction` journals; this distinguishes them from every other
+/// adapter that shares the same journal directory, and from each other,
+/// purely from stable path shapes already produced by
+/// `crate::repair::optical_conversion` -- no new journal field, no change to
+/// what that module writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscConversionRole {
+    /// Finalizes the staged, fingerprint-verified CHD at its real destination.
+    Output,
+    /// Relocates the original CUE/BIN into quarantine after verification.
+    SourceQuarantine,
+}
+
+fn disc_conversion_role(transaction: &RenameTransaction) -> Option<DiscConversionRole> {
+    let is_staged_output = transaction.entries.iter().any(|entry| {
+        entry.source_path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with(DISC_CONVERSION_STAGING_PREFIX))
+        })
+    });
+    if is_staged_output {
+        return Some(DiscConversionRole::Output);
+    }
+    let is_source_quarantine = transaction.entries.iter().any(|entry| {
+        entry
+            .destination_path
+            .components()
+            .any(|component| component.as_os_str() == DISC_CONVERSION_QUARANTINE_SUBDIR)
+    });
+    is_source_quarantine.then_some(DiscConversionRole::SourceQuarantine)
+}
+
+/// Projects a disc-conversion transaction (either role) into a receipt with
+/// disc-conversion-specific wording. State and recovery classification reuse
+/// the exact same, already-proven `RenameTransaction` mapping every other
+/// rename-engine adapter uses (`map_state` / `recovery_status`) -- this adds
+/// presentation only, never a new safety rule.
+///
+/// The only additional check beyond that shared mapping is a cheap liveness
+/// check on a completed [`DiscConversionRole::Output`] transaction's
+/// destination: an output that has since been deleted or resized is
+/// reported `Stale` rather than `Completed`, the same principle
+/// `es_de_publication_operation` already applies to a live gamelist. This
+/// never re-reads or re-hashes the (potentially multi-gigabyte) CHD content;
+/// only a `stat` is performed.
+pub fn disc_conversion_operation(
+    transaction: &RenameTransaction,
+    role: DiscConversionRole,
+    journal_reference: Option<String>,
+) -> OperationRecord {
+    let mut record = operation_from_transaction(
+        transaction,
+        OperationKind::DiscConversion,
+        journal_reference,
+    );
+    let format_label = "CUE/BIN to CHD (chdman)";
+    let hash_of = |entry: &TransactionEntry| -> String {
+        entry
+            .identity
+            .freshness
+            .as_ref()
+            .map(|freshness| {
+                format!(
+                    "sha256:{}",
+                    freshness
+                        .sha256
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                )
+            })
+            .unwrap_or_else(|| "hash unavailable (legacy record)".into())
+    };
+    match role {
+        DiscConversionRole::Output => {
+            let applied = transaction
+                .entries
+                .iter()
+                .find(|entry| matches!(entry.state, EntryState::Applied));
+            // Only a transaction that itself reached a genuinely completed
+            // state is a candidate for "stale" (i.e. was true, may no longer
+            // be) -- an interrupted/partial transaction's destination may
+            // legitimately not exist yet, and that is already correctly
+            // described by the shared recovery_status() above, not by this
+            // liveness check.
+            let outcome = if record.state == OperationState::Completed {
+                applied.map(|entry| {
+                    let live = fs::symlink_metadata(&entry.destination_path).ok();
+                    let stale = live.as_ref().is_none_or(|metadata| {
+                        !metadata.is_file() || metadata.len() != entry.identity.size_bytes
+                    });
+                    (entry, stale)
+                })
+            } else {
+                applied.map(|entry| (entry, false))
+            };
+            if let Some((entry, stale)) = outcome {
+                if stale {
+                    record.state = OperationState::Stale;
+                    record.recovery = OperationRecoveryStatus {
+                        classification: RecoveryClassification::Stale,
+                        explanation: "The converted CHD no longer matches the recorded output (moved, resized, or deleted); review before relying on this receipt.".into(),
+                        actions: OperationActionAvailability {
+                            review: ActionAvailability::Available,
+                            ..Default::default()
+                        },
+                    };
+                }
+                record.output.summary = format!(
+                    "Converted {format_label} and verified output ({}). Source preserved: this operation never reads, moves, or deletes the original CUE/BIN.",
+                    hash_of(entry)
+                );
+            } else {
+                record.output.summary = format!(
+                    "Disc conversion output ({format_label}) not completed. Source preserved: this operation never reads, moves, or deletes the original CUE/BIN."
+                );
+            }
+            // This transaction only ever moves the fingerprint-verified staged
+            // file to its destination; it never reads, moves, or deletes the
+            // user's original CUE/BIN, regardless of outcome. A companion
+            // DiscConversionRole::SourceQuarantine record, if one exists,
+            // reports the source's actual disposition -- this record does
+            // not, and must never be read as proof the source still exists
+            // (a separate quarantine transaction may have relocated it).
+            record
+                .input
+                .freshness_evidence
+                .push("source_preservation:not_modified_by_this_transaction".into());
+            record.error = record.error.map(|error| format!("{format_label}: {error}"));
+        }
+        DiscConversionRole::SourceQuarantine => {
+            let moved = transaction
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.state, EntryState::Applied))
+                .count();
+            record.output.summary = if moved > 0 {
+                format!(
+                    "Source replacement requested: original CUE/BIN moved to quarantine after verified conversion ({moved} file(s), recoverable, not deleted)"
+                )
+            } else {
+                "Source replacement requested but not completed; original CUE/BIN unchanged".into()
+            };
+            record
+                .input
+                .freshness_evidence
+                .push("source_preservation:replacement_requested".into());
+        }
+    }
+    record
 }
 
 /// Projects the existing migration/upgrade result. The retained backup is
@@ -1015,7 +1182,7 @@ fn summary(transaction: &RenameTransaction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dat::rename_apply::{ObjectIdentity, ObjectKind, TransactionEntry};
+    use crate::dat::rename_apply::{ObjectFreshness, ObjectIdentity, ObjectKind, TransactionEntry};
     use crate::patch_manager::{
         PreviewDestinationState, PreviewProposedAction, SharedApplyContext, SharedApplyEntry,
         SharedApplyJournal, SharedApplyStatus, SharedPlanEntry, SharedRollbackPreview,
@@ -1435,5 +1602,338 @@ mod tests {
         assert_eq!(stale.state, OperationState::Failed);
         assert_eq!(stale.recovery.classification, RecoveryClassification::Stale);
         assert_eq!(stale.recovery.actions.review, ActionAvailability::Available);
+    }
+
+    // -- Disc conversion --------------------------------------------------
+    //
+    // Fixtures are hand-built RenameTransaction values shaped exactly like
+    // what crate::repair::optical_conversion actually produces (verified by
+    // reading that module directly, not guessed): a single-entry "output"
+    // transaction whose source_path sits under a
+    // DISC_CONVERSION_STAGING_PREFIX-named staging directory, and a
+    // "source quarantine" transaction whose destination_path sits under a
+    // DISC_CONVERSION_QUARANTINE_SUBDIR component. No real chdman/tempdir
+    // execution is needed to test the projection layer, matching every
+    // other adapter's tests in this module.
+
+    fn disc_conversion_output_entry(state: EntryState, size_bytes: u64) -> TransactionEntry {
+        TransactionEntry {
+            source_path: PathBuf::from(format!(
+                "/library/{DISC_CONVERSION_STAGING_PREFIX}4242-0/output.chd"
+            )),
+            destination_path: PathBuf::from("/library/Disc.chd"),
+            original_basename: "output.chd".into(),
+            proposed_basename: "Disc.chd".into(),
+            identity: ObjectIdentity {
+                size_bytes,
+                modified_unix: 100,
+                kind: ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+                freshness: Some(ObjectFreshness {
+                    version: 1,
+                    modified: std::time::UNIX_EPOCH,
+                    sha256: [0xab; 32],
+                }),
+            },
+            operation: Default::default(),
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state,
+            failure_reason: None,
+            applied_at_unix: (state == EntryState::Applied).then_some(101),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }
+    }
+
+    fn disc_conversion_output_transaction(state: TransactionState) -> RenameTransaction {
+        let entry_state = if state == TransactionState::Applied {
+            EntryState::Applied
+        } else {
+            EntryState::Planned
+        };
+        RenameTransaction {
+            transaction_id: "disc-conversion-output-test".into(),
+            plan_generation: 1,
+            classifier_version: Some("classifier-v1".into()),
+            created_at_unix: 100,
+            source_scan_root: "/library".into(),
+            state,
+            entries: vec![disc_conversion_output_entry(entry_state, 2048 * 16)],
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        }
+    }
+
+    fn disc_conversion_quarantine_transaction(state: TransactionState) -> RenameTransaction {
+        let entry_state = if state == TransactionState::Applied {
+            EntryState::Applied
+        } else {
+            EntryState::Planned
+        };
+        let entry = |name: &str| TransactionEntry {
+            source_path: PathBuf::from(format!("/library/{name}")),
+            destination_path: PathBuf::from(format!(
+                "/library/{DISC_CONVERSION_QUARANTINE_SUBDIR}/abcd1234/{name}"
+            )),
+            original_basename: name.into(),
+            proposed_basename: name.into(),
+            identity: ObjectIdentity {
+                size_bytes: 10,
+                modified_unix: 100,
+                kind: ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 2,
+                #[cfg(unix)]
+                dev: 1,
+                freshness: None,
+            },
+            operation: Default::default(),
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: entry_state,
+            failure_reason: None,
+            applied_at_unix: (entry_state == EntryState::Applied).then_some(101),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        };
+        RenameTransaction {
+            transaction_id: "disc-conversion-quarantine-test".into(),
+            plan_generation: 1,
+            classifier_version: Some("classifier-v1".into()),
+            created_at_unix: 100,
+            source_scan_root: "/library".into(),
+            state,
+            entries: vec![entry("Disc.cue"), entry("Disc.bin")],
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        }
+    }
+
+    #[test]
+    fn disc_conversion_role_is_detected_from_stable_path_shapes_only() {
+        assert_eq!(
+            disc_conversion_role(&disc_conversion_output_transaction(
+                TransactionState::Applied
+            )),
+            Some(DiscConversionRole::Output)
+        );
+        assert_eq!(
+            disc_conversion_role(&disc_conversion_quarantine_transaction(
+                TransactionState::Applied
+            )),
+            Some(DiscConversionRole::SourceQuarantine)
+        );
+        assert_eq!(
+            disc_conversion_role(&transaction(TransactionState::Applied)),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_classifies_disc_conversion_transactions_ahead_of_the_dat_rename_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = disc_conversion_output_transaction(TransactionState::Applied);
+        crate::dat::rename_apply::write_journal(temp.path(), &output).unwrap();
+        let registry = OperationRegistry::from_rename_journals(temp.path());
+        assert_eq!(registry.records.len(), 1);
+        assert_eq!(registry.records[0].kind, OperationKind::DiscConversion);
+    }
+
+    #[test]
+    fn completed_output_receipt_reports_verified_hash_and_never_claims_source_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut transaction = disc_conversion_output_transaction(TransactionState::Applied);
+        let destination = temp.path().join("Disc.chd");
+        std::fs::write(&destination, vec![0_u8; 2048 * 16]).unwrap();
+        transaction.entries[0].destination_path = destination;
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.kind, OperationKind::DiscConversion);
+        assert_eq!(record.state, OperationState::Completed);
+        assert!(record.output.summary.contains("verified output"));
+        assert!(record.output.summary.contains("sha256:"));
+        assert!(record.output.summary.to_lowercase().contains("preserved"));
+        // The summary may reassure that the source was NOT deleted (as it
+        // does here); it must never claim deletion occurred.
+        assert!(
+            !record
+                .output
+                .summary
+                .to_lowercase()
+                .contains("source deleted")
+        );
+        assert!(!record.output.summary.to_lowercase().contains("deleted the"));
+    }
+
+    #[test]
+    fn source_quarantine_receipt_states_replacement_requested_never_deletion() {
+        let record = disc_conversion_operation(
+            &disc_conversion_quarantine_transaction(TransactionState::Applied),
+            DiscConversionRole::SourceQuarantine,
+            None,
+        );
+        assert!(
+            record
+                .output
+                .summary
+                .contains("Source replacement requested")
+        );
+        assert!(record.output.summary.contains("recoverable"));
+        assert!(
+            !record
+                .output
+                .summary
+                .to_lowercase()
+                .contains("deleted from disk")
+        );
+        assert!(
+            record
+                .input
+                .freshness_evidence
+                .iter()
+                .any(|entry| entry.contains("replacement_requested"))
+        );
+    }
+
+    #[test]
+    fn stale_destination_overrides_completed_state_without_rehashing_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut transaction = disc_conversion_output_transaction(TransactionState::Applied);
+        let destination = temp.path().join("Disc.chd");
+        transaction.entries[0].destination_path = destination.clone();
+        // Recorded size (2048*16) does not match what is actually on disk.
+        std::fs::write(&destination, b"only a few bytes").unwrap();
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.state, OperationState::Stale);
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::Stale
+        );
+        assert_eq!(
+            record.recovery.actions.review,
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn matching_destination_stays_completed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut transaction = disc_conversion_output_transaction(TransactionState::Applied);
+        let destination = temp.path().join("Disc.chd");
+        let bytes = vec![0_u8; 2048 * 16];
+        std::fs::write(&destination, &bytes).unwrap();
+        transaction.entries[0].destination_path = destination;
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.state, OperationState::Completed);
+    }
+
+    #[test]
+    fn missing_destination_is_stale_not_completed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut transaction = disc_conversion_output_transaction(TransactionState::Applied);
+        transaction.entries[0].destination_path = temp.path().join("never-written.chd");
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.state, OperationState::Stale);
+    }
+
+    #[test]
+    fn partial_output_is_reviewable_and_never_advertises_resume() {
+        let mut transaction = disc_conversion_output_transaction(TransactionState::ApplyFailed);
+        transaction.entries[0].state = EntryState::Applied;
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.state, OperationState::Partial);
+        assert_eq!(
+            record.recovery.actions.resume,
+            ActionAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn interrupted_output_transaction_is_rollback_capable_via_the_shared_engine() {
+        let mut transaction = disc_conversion_output_transaction(TransactionState::Applying);
+        transaction.entries[0].state = EntryState::Applied;
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.state, OperationState::Running);
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::SafeToRollback
+        );
+        assert_eq!(
+            record.recovery.actions.rollback,
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn rollback_failure_requires_review_and_blocks_resume() {
+        let mut transaction = disc_conversion_output_transaction(TransactionState::RollbackFailed);
+        transaction.entries[0].state = EntryState::ApplyFailed;
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert_eq!(record.state, OperationState::RollbackBlocked);
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::RequiresReview
+        );
+        assert_eq!(
+            record.recovery.actions.resume,
+            ActionAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn legacy_output_record_without_a_freshness_proof_reports_hash_unavailable_not_a_fabricated_one()
+     {
+        let mut transaction = disc_conversion_output_transaction(TransactionState::Applied);
+        transaction.entries[0].identity.freshness = None;
+        transaction.entries[0].destination_path = PathBuf::from("/does/not/exist/on/this/host.chd");
+        let record = disc_conversion_operation(&transaction, DiscConversionRole::Output, None);
+        assert!(
+            record
+                .output
+                .summary
+                .contains("hash unavailable (legacy record)")
+        );
+    }
+
+    #[test]
+    fn no_specialist_dreamcast_or_multitrack_conversion_path_exists_today() {
+        // Documents real, current behavior rather than aspirational support:
+        // build_chd_conversion_plan only accepts a single MODE1/2048 data
+        // track (see crate::ingestion::cue_bin::CueLayout::supported_single_mode1_2048),
+        // so a multi-track (e.g. Dreamcast GD-ROM-style) CUE is refused
+        // before any staging, journal, or partial state is ever created --
+        // there is nothing for this projection layer to recover, and this
+        // test exists so a future specialist path is added deliberately,
+        // not accidentally assumed to already work.
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("multitrack.cue");
+        std::fs::write(
+            &cue,
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nFILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("data.bin"), [0_u8; 2048]).unwrap();
+        std::fs::write(dir.path().join("audio.bin"), [0_u8; 2352]).unwrap();
+        let error = crate::repair::optical_conversion::build_chd_conversion_plan(
+            &cue,
+            &dir.path().join("out.chd"),
+            crate::repair::optical_conversion::ChdConversionSourceMode::KeepSource,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::repair::optical_conversion::ChdConversionError::InvalidSource(_)
+                | crate::repair::optical_conversion::ChdConversionError::ChdmanUnavailable(_)
+        ));
+        // No journal directory was ever created for this refused attempt.
+        assert!(!dir.path().join("journal").exists());
     }
 }

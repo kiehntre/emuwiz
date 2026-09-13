@@ -2162,12 +2162,23 @@ fn show_operation_receipts(ui: &mut egui::Ui) {
                 ui,
                 ("operation-receipt-details", &record.operation_id),
                 |ui| {
+                    if let Some(source) = &record.input.source_root {
+                        ui.label(format!("Source: {source}"));
+                    }
                     ui.label(format!(
                         "Plan generation: {:?}",
                         record.input.plan_generation
                     ));
                     ui.label(format!("Rollback: {:?}", record.recovery.actions.rollback));
                     ui.label(format!("Resume: {:?}", record.recovery.actions.resume));
+                    for evidence in record.input.freshness_evidence.iter().take(3) {
+                        ui.label(evidence.as_str());
+                    }
+                    let remaining_evidence =
+                        record.input.freshness_evidence.len().saturating_sub(3);
+                    if remaining_evidence > 0 {
+                        ui.label(format!("… and {remaining_evidence} more evidence item(s)"));
+                    }
                     if let Some(error) = &record.error {
                         ui.label(format!("Recorded error: {error}"));
                     }
