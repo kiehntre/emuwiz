@@ -1081,6 +1081,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         emulator_setup_focus: None,
         emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
         emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState::default(),
+        bios_projection_page: bios_projection_page::BiosProjectionPageState::default(),
+        ready_to_play_page: ready_to_play_page::ReadyToPlayPageState::default(),
         emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::default(),
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
         pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
