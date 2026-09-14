@@ -114,7 +114,10 @@ pub fn probe_conversion_tools() -> ConversionToolInventory {
     }
 }
 
-fn tool(inventory: &ConversionToolInventory, name: &str) -> Option<&ConversionToolRecord> {
+fn tool<'a>(
+    inventory: &'a ConversionToolInventory,
+    name: &str,
+) -> Option<&'a ConversionToolRecord> {
     inventory.tools.iter().find(|t| t.name == name)
 }
 
