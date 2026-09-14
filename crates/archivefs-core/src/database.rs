@@ -47,7 +47,7 @@ use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySour
 use crate::{
     ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config,
     IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
-    ScanFingerprint, canonical_platform_names, detect_platform_with_details,
+    ScanFingerprint, canonical_platform_names, detect_platform_with_details, nested_source_roots,
     normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
 };
 
@@ -1477,6 +1477,8 @@ pub struct RegisteredSourceFolder {
     pub id: i64,
     pub path: PathBuf,
     pub assigned_platform: Option<String>,
+    /// Explicit child roots to shadow during this folder's traversal.
+    pub excluded_source_roots: Vec<PathBuf>,
 }
 
 /// Whether the most recent scan attempt of one source folder succeeded or
@@ -2453,6 +2455,7 @@ impl Database {
         source_folders: &[PathBuf],
     ) -> Result<Vec<RegisteredSourceFolder>> {
         let now = now_utc_string();
+        let configured_paths: Vec<PathBuf> = source_folders.to_vec();
         let tx = self.connection.transaction().map_err(|error| {
             db_error("failed to start register_source_folders transaction", error)
         })?;
@@ -2497,6 +2500,7 @@ impl Database {
                         |row| row.get(0),
                     )
                     .map_err(|error| db_error("failed to read source platform", error))?,
+                excluded_source_roots: nested_source_roots(path, &configured_paths),
             });
         }
 
@@ -6842,22 +6846,23 @@ fn scan_and_persist_folders_transaction(
             .map(|fingerprint| (folder.id, fingerprint))
             .collect();
         let discovery_started = std::time::Instant::now();
-        let discovery =
-            match ArchiveScanner::new(&folder_config).scan_archives_with_cache(&fingerprint_refs) {
-                Ok(discovery) => discovery,
-                Err(error) => {
-                    counts.errors_count += 1;
-                    let message = error.to_string();
-                    database.record_source_scan_result(
-                        folder.id,
-                        SourceScanStatus::Failed,
-                        Some(&message),
-                        None,
-                    )?;
-                    folder_errors.push((folder.path.clone(), message));
-                    continue;
-                }
-            };
+        let discovery = match ArchiveScanner::new(&folder_config)
+            .scan_archives_with_cache_excluding(&fingerprint_refs, &folder.excluded_source_roots)
+        {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                counts.errors_count += 1;
+                let message = error.to_string();
+                database.record_source_scan_result(
+                    folder.id,
+                    SourceScanStatus::Failed,
+                    Some(&message),
+                    None,
+                )?;
+                folder_errors.push((folder.path.clone(), message));
+                continue;
+            }
+        };
         let discovery_ms = discovery_started.elapsed().as_millis();
         info!(
             "scan phases source={} traversal_ms={} candidate_ms={} stat_ms={} classification_ms={} directories={} files_statted={} candidates={} reused={} re_inspected={} missing_fingerprint={} stat_mismatch={} cache_version_mismatch={} deliberately_non_cacheable={} re_inspected_plain={} re_inspected_direct_images={} re_inspected_archives={} unsupported={} ambiguous={}",

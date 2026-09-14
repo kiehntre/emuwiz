@@ -2910,11 +2910,9 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
     for path in paths {
         validate_source_root_shape(path)?;
         let path: PathBuf = path.components().collect();
-        if let Some(existing) = normalized.iter().find(|existing| {
-            path == **existing || path.starts_with(existing) || existing.starts_with(&path)
-        }) {
+        if let Some(existing) = normalized.iter().find(|existing| path == **existing) {
             return Err(ArchiveFsError::Config(format!(
-                "duplicate or overlapping source roots are not supported: {} and {}",
+                "duplicate source roots are not supported: {} and {}",
                 existing.display(),
                 path.display()
             )));
@@ -2924,6 +2922,21 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
     Ok(())
 }
 
+/// Returns explicitly configured roots strictly below `source`, in stable
+/// order. A child source owns its subtree when the parent is scanned, so a
+/// pathological child cannot consume the parent's whole entry budget and no
+/// file is discovered under two source-folder owners.
+pub(crate) fn nested_source_roots(source: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut nested: Vec<PathBuf> = roots
+        .iter()
+        .filter(|root| *root != source && root.starts_with(source))
+        .cloned()
+        .collect();
+    nested.sort();
+    nested.dedup();
+    nested
+}
+
 /// Validates a user-supplied path as a candidate new source folder,
 /// against the currently configured sources - the multi-source
 /// milestone's shared validation, used identically by the GUI's Add
@@ -2931,12 +2944,11 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
 /// Confirms the path exists, is a directory, and is readable (via
 /// `fs::read_dir`, which only lists directory entries - this never opens
 /// or inspects any archive file inside it), then rejects it as a
-/// duplicate or a parent/child overlap of any `existing` source, using
-/// canonicalized paths for that comparison so a trailing separator or a
-/// symlink cannot slip an equivalent path past the check. Overlaps are
-/// rejected outright rather than accepted-with-confirmation, per the
-/// milestone's stated preference, since nothing in this schema
-/// deduplicates a file discovered under two different source folders.
+/// duplicate of any `existing` source, using canonicalized paths for that
+/// comparison so a trailing separator or a symlink cannot slip an equivalent
+/// path past the check. Parent/child roots are allowed because the scanner
+/// gives the explicit child ownership of its subtree and excludes it from the
+/// parent traversal.
 ///
 /// Returns the exact absolute path to store with a harmless trailing
 /// separator removed. Symlink components, traversal, filesystem-root paths,
@@ -3022,22 +3034,9 @@ pub fn validate_new_source_folder(candidate: &Path, existing: &[PathBuf]) -> Res
                 normalized.display()
             )));
         }
-        if candidate_canonical.starts_with(&existing_canonical) {
-            return Err(ArchiveFsError::Config(format!(
-                "{} is inside the already-configured source folder {} - overlapping \
-                 sources are not supported",
-                normalized.display(),
-                existing_path.display()
-            )));
-        }
-        if existing_canonical.starts_with(&candidate_canonical) {
-            return Err(ArchiveFsError::Config(format!(
-                "{} would contain the already-configured source folder {} - overlapping \
-                 sources are not supported",
-                normalized.display(),
-                existing_path.display()
-            )));
-        }
+        // Parent/child roots are safe: the scanner shadows an explicitly
+        // configured child while traversing its parent, then scans the child
+        // independently under the same bounded budget.
     }
 
     Ok(normalized)
@@ -5399,6 +5398,18 @@ impl<'a> ArchiveScanner<'a> {
         &self,
         fingerprints: &[(i64, ScanFingerprint)],
     ) -> Result<ArchiveScanDiscovery> {
+        self.scan_archives_with_cache_excluding(fingerprints, &[])
+    }
+
+    /// Scans configured roots while shadowing any explicitly configured child
+    /// roots from their parent traversal. Each root still has its own bounded
+    /// entry/depth budget; the exclusion only prevents the same filesystem
+    /// subtree from being walked twice.
+    pub fn scan_archives_with_cache_excluding(
+        &self,
+        fingerprints: &[(i64, ScanFingerprint)],
+        additional_excluded_roots: &[PathBuf],
+    ) -> Result<ArchiveScanDiscovery> {
         info!(
             "starting archive scan across {} source folder(s)",
             self.config.source_folders.len()
@@ -5414,7 +5425,23 @@ impl<'a> ArchiveScanner<'a> {
         for (source_index, source) in self.config.source_folders.iter().enumerate() {
             debug!("scanning source folder {}", source.display());
             let source_id = fingerprints.get(source_index).map(|(id, _)| *id);
-            self.scan_source(source, source, &mut discovery, source_id, &fingerprint_map)?;
+            let mut excluded_roots = nested_source_roots(source, &self.config.source_folders);
+            excluded_roots.extend(
+                additional_excluded_roots
+                    .iter()
+                    .filter(|root| root.starts_with(source) && *root != source)
+                    .cloned(),
+            );
+            excluded_roots.sort();
+            excluded_roots.dedup();
+            self.scan_source(
+                source,
+                source,
+                &mut discovery,
+                source_id,
+                &fingerprint_map,
+                &excluded_roots,
+            )?;
         }
         discovery
             .archives
@@ -5485,6 +5512,7 @@ impl<'a> ArchiveScanner<'a> {
         discovery: &mut ArchiveScanDiscovery,
         source_id: Option<i64>,
         fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+        excluded_roots: &[PathBuf],
     ) -> Result<()> {
         const MAX_SCAN_ENTRIES: usize = 250_000;
         const MAX_SCAN_DEPTH: usize = 128;
@@ -5532,6 +5560,13 @@ impl<'a> ArchiveScanner<'a> {
                     continue;
                 }
                 if file_type.is_dir() {
+                    if excluded_roots.iter().any(|root| path == *root) {
+                        debug!(
+                            "not descending into explicitly configured child source {}",
+                            path.display()
+                        );
+                        continue;
+                    }
                     if path
                         .file_name()
                         .is_some_and(|name| is_container_directory(&name.to_string_lossy()))
@@ -12833,7 +12868,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_rejects_duplicate_and_nested_roots_but_not_prefix_siblings() {
+    fn scanner_rejects_duplicate_and_shadows_nested_roots_but_not_prefix_siblings() {
         let root = test_root("scanner_source_overlap");
         let source = root.join("cache");
         let child = source.join("nested");
@@ -12850,19 +12885,22 @@ mod tests {
                 .scan_archives()
                 .unwrap_err()
                 .to_string()
-                .contains("overlapping")
+                .contains("duplicate")
         );
 
         let nested = Config {
-            source_folders: vec![source.clone(), child],
+            source_folders: vec![source.clone(), child.clone()],
             ..scanner_config(&root)
         };
-        assert!(
-            ArchiveScanner::new(&nested)
-                .scan_archives()
-                .unwrap_err()
-                .to_string()
-                .contains("overlapping")
+        fs::write(source.join("parent.zip"), b"parent").unwrap();
+        fs::write(child.join("child.zip"), b"child").unwrap();
+        let archives = ArchiveScanner::new(&nested).scan_archives().unwrap();
+        assert_eq!(
+            archives
+                .iter()
+                .map(|archive| archive.path.clone())
+                .collect::<Vec<_>>(),
+            vec![source.join("parent.zip"), child.join("child.zip")]
         );
 
         let prefix_collision = Config {
@@ -14042,27 +14080,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_new_source_folder_rejects_a_child_of_an_existing_source() {
+    fn validate_new_source_folder_accepts_a_child_of_an_existing_source() {
         let root = test_root("validate_overlap_child");
         let parent = root.join("archives");
         let child = parent.join("nested");
         fs::create_dir_all(&child).unwrap();
 
-        let error = validate_new_source_folder(&child, &[parent]).unwrap_err();
+        let validated = validate_new_source_folder(&child, &[parent]).unwrap();
 
-        assert!(error.to_string().contains("overlapping"));
+        assert_eq!(validated, child);
     }
 
     #[test]
-    fn validate_new_source_folder_rejects_a_parent_of_an_existing_source() {
+    fn validate_new_source_folder_accepts_a_parent_of_an_existing_source() {
         let root = test_root("validate_overlap_parent");
         let parent = root.join("archives");
         let child = parent.join("nested");
         fs::create_dir_all(&child).unwrap();
 
-        let error = validate_new_source_folder(&parent, &[child]).unwrap_err();
+        let validated = validate_new_source_folder(&parent, &[child]).unwrap();
 
-        assert!(error.to_string().contains("overlapping"));
+        assert_eq!(validated, parent);
     }
 
     #[test]
