@@ -7904,7 +7904,7 @@ mod tests {
     }
 
     fn create_representative_older_database(path: &Path, schema_version: usize) {
-        assert!(matches!(schema_version, 3 | 4 | 7));
+        assert!(matches!(schema_version, 3 | 4 | 7 | 16));
         let mut connection = open_connection(path).unwrap();
         apply_migrations(&mut connection, &MIGRATIONS[..schema_version]).unwrap();
         connection
@@ -7988,6 +7988,37 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_sixteen_upgrade_adds_source_roles_without_rewriting_existing_rows() {
+        let root = temp_dir("schema-sixteen-upgrade-source-roles");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 16);
+
+        let report = upgrade_library_database(&database_path).unwrap();
+        assert_eq!(report.from_version, 16);
+        assert_eq!(report.to_version, 17);
+        assert_eq!(report.applied_versions, vec![17]);
+
+        let upgraded = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 17);
+        let source = upgraded.list_source_folders().unwrap();
+        assert_eq!(source.len(), 1);
+        assert_eq!(source[0].role, SourceRole::Games);
+        assert_eq!(upgraded.load_archives().unwrap().len(), 1);
+        assert_eq!(
+            pending_schema_migration_versions(17).unwrap(),
+            Vec::<i64>::new()
+        );
+
+        let quick_check: String = upgraded
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        upgraded.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8333,6 +8364,12 @@ mod tests {
         let db_path = root.join("library.sqlite3");
 
         let database = Database::open_or_create(&db_path).unwrap();
+
+        let quick_check: String = database
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
 
         let table_count: i64 = database
             .connection
@@ -8828,6 +8865,7 @@ mod tests {
                 "library_dat_identities",
                 "platform_aliases",
                 "platform_assignments",
+                "scan_fingerprints",
                 "scan_runs",
                 "schema_migrations",
                 "source_folders",
@@ -16926,7 +16964,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 12);
+            assert_eq!(latest_known_version(MIGRATIONS), 17);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")
