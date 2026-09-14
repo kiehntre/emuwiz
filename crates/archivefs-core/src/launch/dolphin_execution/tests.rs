@@ -87,6 +87,7 @@ fn base_roots(fixture: &Fixture) -> DolphinLocalDiscoveryRoots {
         known_version_outputs: BTreeMap::new(),
         appimage_directory: None,
         dolphin_emu_userpath_override: None,
+        path_override: Some(Vec::new()),
     }
 }
 

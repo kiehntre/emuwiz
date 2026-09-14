@@ -121,6 +121,7 @@ fn base_roots(fixture: &Fixture) -> XemuProfileDiscoveryRoots {
         explicit_executables: Vec::new(),
         known_version_outputs: std::collections::BTreeMap::new(),
         appimage_directory: None,
+        path_override: Some(Vec::new()),
     }
 }
 

@@ -254,6 +254,7 @@ mod tests {
             appimage_directory: None,
             portable_configuration_roots: vec![],
             explicit_executables: vec![],
+            path_override: Some(Vec::new()),
         };
         assert!(inspect(&context, &roots, &[]).is_err());
     }

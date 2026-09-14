@@ -1714,6 +1714,9 @@ pub struct DolphinLocalDiscoveryRoots {
     /// Any value overrides Dolphin's default directory resolution, so its
     /// mere presence - not its content - is what launch-binding cares about.
     pub dolphin_emu_userpath_override: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
 }
 
 impl DolphinLocalDiscoveryRoots {
@@ -1740,6 +1743,7 @@ impl DolphinLocalDiscoveryRoots {
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
             dolphin_emu_userpath_override: env::var_os("DOLPHIN_EMU_USERPATH").map(PathBuf::from),
+            path_override: None,
         })
     }
 }
@@ -2078,8 +2082,12 @@ fn discover_dolphin_local_executables(
             directory.join("dolphin-emu"),
         ]);
     }
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path).take(128) {
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
             paths.extend([directory.join("dolphin-emu"), directory.join("dolphin-qt2")]);
         }
     }
@@ -3432,6 +3440,7 @@ mod tests {
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
             dolphin_emu_userpath_override: None,
+            path_override: Some(Vec::new()),
         }
     }
 

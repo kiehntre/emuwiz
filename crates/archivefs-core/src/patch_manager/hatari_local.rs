@@ -155,6 +155,9 @@ pub struct HatariProfileDiscoveryRoots {
     pub explicit_executables: Vec<PathBuf>,
     pub known_version_outputs: BTreeMap<PathBuf, String>,
     pub appimage_directory: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
 }
 
 impl HatariProfileDiscoveryRoots {
@@ -179,6 +182,7 @@ impl HatariProfileDiscoveryRoots {
             appimage_directory: env::var_os("APPIMAGE")
                 .map(PathBuf::from)
                 .and_then(|p| p.parent().map(Path::to_path_buf)),
+            path_override: None,
         })
     }
 }
@@ -496,8 +500,12 @@ fn discover_executables(roots: &HatariProfileDiscoveryRoots) -> Vec<HatariExecut
             dir.join("hatari"),
         ]);
     }
-    if let Some(value) = env::var_os("PATH") {
-        for dir in env::split_paths(&value).take(128) {
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for dir in path_directories.into_iter().take(128) {
             paths.push(dir.join("hatari"));
         }
     }
@@ -1023,6 +1031,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         }
     }
     fn write(path: &Path, contents: &[u8]) {

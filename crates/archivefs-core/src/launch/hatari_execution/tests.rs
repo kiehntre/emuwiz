@@ -29,6 +29,7 @@ fn setup() -> (
         explicit_executables: vec![executable.clone()],
         known_version_outputs: Default::default(),
         appimage_directory: None,
+        path_override: Some(Vec::new()),
     };
     let request = HatariLaunchRequest {
         selected_content_path: content.clone(),

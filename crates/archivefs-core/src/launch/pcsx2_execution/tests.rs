@@ -132,6 +132,7 @@ fn base_roots(fixture: &Fixture) -> Pcsx2ProfileDiscoveryRoots {
         appimage_directory: None,
         portable_configuration_roots: Vec::new(),
         explicit_executables: Vec::new(),
+        path_override: Some(Vec::new()),
     }
 }
 

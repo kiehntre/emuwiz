@@ -402,6 +402,7 @@ fn appimage_adjacent_portable_profile_installs_named_grouped_cheat_with_journal_
         appimage_directory: Some(fixture.appimage_dir()),
         portable_configuration_roots: Vec::new(),
         explicit_executables: Vec::new(),
+        path_override: Some(Vec::new()),
     };
     let discovery = discover_pcsx2_profiles(&roots).unwrap();
     let profile = confirmed_pcsx2_profile(&discovery, None)

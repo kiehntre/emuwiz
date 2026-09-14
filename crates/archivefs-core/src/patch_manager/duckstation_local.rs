@@ -138,6 +138,9 @@ pub struct DuckStationProfileDiscoveryRoots {
     pub explicit_executables: Vec<PathBuf>,
     pub known_version_outputs: BTreeMap<PathBuf, String>,
     pub appimage_directory: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
 }
 
 impl DuckStationProfileDiscoveryRoots {
@@ -168,6 +171,7 @@ impl DuckStationProfileDiscoveryRoots {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
+            path_override: None,
         })
     }
 }
@@ -625,8 +629,12 @@ fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckSta
             directory.join("duckstation-qt"),
         ]);
     }
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path).take(128) {
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
             candidates.extend([
                 directory.join("duckstation-qt"),
                 directory.join("duckstation"),
@@ -1734,6 +1742,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         }
     }
 
@@ -1755,6 +1764,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         })
         .profiles
         .into_iter()
@@ -2064,6 +2074,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         }
     }
 

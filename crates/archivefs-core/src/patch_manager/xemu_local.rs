@@ -122,6 +122,9 @@ pub struct XemuProfileDiscoveryRoots {
     pub explicit_executables: Vec<PathBuf>,
     pub known_version_outputs: BTreeMap<PathBuf, String>,
     pub appimage_directory: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
 }
 
 impl XemuProfileDiscoveryRoots {
@@ -147,6 +150,7 @@ impl XemuProfileDiscoveryRoots {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
+            path_override: None,
         })
     }
 }
@@ -643,8 +647,12 @@ fn discover_executables(roots: &XemuProfileDiscoveryRoots) -> Vec<XemuExecutable
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([directory.join("xemu.AppImage"), directory.join("xemu")]);
     }
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path).take(128) {
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
             paths.push(directory.join("xemu"));
         }
     }
@@ -1042,6 +1050,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         }
     }
     fn root(roots: &XemuProfileDiscoveryRoots) -> PathBuf {
@@ -1057,6 +1066,35 @@ mod tests {
             .into_iter()
             .find(|profile| profile.eligible)
             .unwrap()
+    }
+
+    #[test]
+    fn controlled_path_isolated_from_host_executables() {
+        let temp = TempDir::new().unwrap();
+        let fixture_bin = temp.path().join("bin");
+        fs::create_dir_all(&fixture_bin).unwrap();
+        let fixture_executable = fixture_bin.join("xemu");
+        fs::write(&fixture_executable, b"fixture executable").unwrap();
+
+        let mut controlled = roots(&temp);
+        controlled.path_override = Some(vec![fixture_bin.clone()]);
+        let discovered = discover_executables(&controlled);
+
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|candidate| &candidate.path)
+                .collect::<Vec<_>>(),
+            vec![&fixture_executable]
+        );
+    }
+
+    #[test]
+    fn empty_controlled_path_does_not_fall_back_to_host() {
+        let temp = TempDir::new().unwrap();
+        let controlled = roots(&temp);
+
+        assert!(discover_executables(&controlled).is_empty());
     }
 
     #[test]

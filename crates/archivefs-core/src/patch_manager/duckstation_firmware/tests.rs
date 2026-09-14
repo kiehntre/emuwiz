@@ -108,6 +108,7 @@ fn build_fixture(label: &str, global_ini: &str) -> Fixture {
         explicit_executables: Vec::new(),
         known_version_outputs: BTreeMap::new(),
         appimage_directory: None,
+        path_override: Some(Vec::new()),
     };
     let profile = discover_duckstation_profiles(&roots)
         .profiles

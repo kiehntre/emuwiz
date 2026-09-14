@@ -165,6 +165,7 @@ mod tests {
             explicit_executables: vec![],
             known_version_outputs: Default::default(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         };
         assert!(first_run_required(&roots));
     }
@@ -195,6 +196,7 @@ mod tests {
             explicit_executables: vec![],
             known_version_outputs: Default::default(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         };
         assert!(inspect(&context, &roots).is_err());
     }

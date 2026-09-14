@@ -3223,6 +3223,7 @@ mod tests {
                 explicit_executables: Vec::new(),
                 known_version_outputs: std::collections::BTreeMap::new(),
                 appimage_directory: None,
+                path_override: Some(Vec::new()),
             },
             duckstation: DuckStationProfileDiscoveryRoots {
                 home,
@@ -3234,6 +3235,7 @@ mod tests {
                 explicit_executables: Vec::new(),
                 known_version_outputs: std::collections::BTreeMap::new(),
                 appimage_directory: None,
+                path_override: Some(Vec::new()),
             },
         }
     }
@@ -3469,6 +3471,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: std::collections::BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         });
         assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
         assert!(discovery.profiles[0].eligible);
@@ -3784,6 +3787,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: std::collections::BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         });
         assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
         assert!(discovery.profiles[0].eligible);
@@ -3812,6 +3816,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: std::collections::BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         });
         assert_eq!(ineligible_discovery.profiles.len(), 1);
         assert!(!ineligible_discovery.profiles[0].eligible);
@@ -4019,6 +4024,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: std::collections::BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         });
         assert_eq!(discovery.profiles.len(), 1, "{discovery:?}");
         assert!(discovery.profiles[0].eligible);

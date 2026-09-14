@@ -314,6 +314,9 @@ pub struct Rpcs3ProfileDiscoveryRoots {
     /// Discovery itself never executes the binary.
     pub known_version_outputs: BTreeMap<PathBuf, String>,
     pub appimage_directory: Option<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
 }
 
 impl Rpcs3ProfileDiscoveryRoots {
@@ -339,6 +342,7 @@ impl Rpcs3ProfileDiscoveryRoots {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
+            path_override: None,
         })
     }
 }
@@ -564,8 +568,12 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([directory.join("RPCS3.AppImage"), directory.join("rpcs3")]);
     }
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path).take(128) {
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
             paths.push(directory.join("rpcs3"));
         }
     }
@@ -1632,6 +1640,7 @@ mod tests {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+            path_override: Some(Vec::new()),
         }
     }
 

@@ -363,6 +363,7 @@ fn fresh_identity_revalidates_a_real_ps1_chd() {
         explicit_executables: vec![executable.clone()],
         known_version_outputs: std::collections::BTreeMap::new(),
         appimage_directory: None,
+        path_override: Some(Vec::new()),
     };
     let request = DuckStationLaunchRequest {
         selected_content_path: content_path,
@@ -440,6 +441,7 @@ fn fresh_identity_revalidates_a_real_ps1_disc() {
         explicit_executables: vec![executable.clone()],
         known_version_outputs: std::collections::BTreeMap::new(),
         appimage_directory: None,
+        path_override: Some(Vec::new()),
     };
     let request = DuckStationLaunchRequest {
         selected_content_path: content_path,
@@ -497,6 +499,7 @@ fn preflight_revalidates_a_real_ps1_cue_bin_disc() {
         explicit_executables: vec![executable.clone()],
         known_version_outputs: std::collections::BTreeMap::new(),
         appimage_directory: None,
+        path_override: Some(Vec::new()),
     };
     let request = DuckStationLaunchRequest {
         selected_content_path: content_path,

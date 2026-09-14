@@ -187,6 +187,9 @@ pub struct Pcsx2ProfileDiscoveryRoots {
     /// without this module ever having to search an arbitrary directory
     /// tree.
     pub explicit_executables: Vec<PathBuf>,
+    /// Optional controlled PATH directories for deterministic callers and
+    /// tests. `None` means use the process environment in production.
+    pub path_override: Option<Vec<PathBuf>>,
 }
 
 impl Pcsx2ProfileDiscoveryRoots {
@@ -213,6 +216,7 @@ impl Pcsx2ProfileDiscoveryRoots {
             appimage_directory,
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
+            path_override: None,
         })
     }
 }
@@ -669,8 +673,12 @@ fn blocked_profile(
 /// this binding ever authorizes.
 fn discover_pcsx2_local_executables(roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<Pcsx2Executable> {
     let mut paths = roots.explicit_executables.clone();
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path).take(128) {
+    let path_directories = roots
+        .path_override
+        .clone()
+        .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
+    if let Some(path_directories) = path_directories {
+        for directory in path_directories.into_iter().take(128) {
             paths.push(directory.join("pcsx2-qt"));
         }
     }
@@ -2538,6 +2546,7 @@ mod tests {
             appimage_directory: None,
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
+            path_override: Some(Vec::new()),
         }
     }
 
