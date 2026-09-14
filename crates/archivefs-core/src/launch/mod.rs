@@ -115,6 +115,7 @@ pub mod ppsspp_command;
 pub mod ppsspp_execution;
 pub mod process_spawn;
 pub mod readiness;
+pub mod resource_grants;
 pub mod retroarch_command;
 pub mod rmg_command;
 pub mod rmg_execution;
@@ -376,6 +377,10 @@ pub use readiness::{
     hatari_firmware_readiness, pcengine_cd_firmware_readiness, pcsx2_firmware_readiness,
     ppsspp_firmware_readiness, retroarch_core_firmware_readiness, rpcs3_firmware_readiness,
     xemu_firmware_readiness, xenia_firmware_readiness,
+};
+pub use resource_grants::{
+    LaunchAccessScope, LaunchProjectionMethod, LaunchResourceAccess, LaunchResourceGrant,
+    LaunchResourceGrantError, LaunchResourceGrantSet, LaunchResourceLifetime, LaunchResourceRole,
 };
 pub use retroarch_command::{
     RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
