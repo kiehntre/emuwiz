@@ -26,6 +26,8 @@ pub mod amiga_disk;
 /// Bounded WHDLoad `.slave` discovery inside LHA/LZH archives, reusing the
 /// existing archive-member reader and WHDLoad slave parser.
 pub mod amiga_whdload_archive;
+/// Read-only per-set compatibility against pinned installed MAME evidence.
+pub mod arcade_mame_compatibility;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
