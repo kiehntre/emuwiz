@@ -531,6 +531,61 @@ mod source_role_tests {
     }
 
     #[test]
+    fn every_source_role_has_one_deterministic_subsystem_owner() {
+        let expected = [
+            (SourceRole::Games, SourceSubsystemRoute::GameDiscovery),
+            (SourceRole::GenericFiles, SourceSubsystemRoute::Generic),
+            (
+                SourceRole::ArcadeRomset,
+                SourceSubsystemRoute::ArcadeDiscovery,
+            ),
+            (
+                SourceRole::IncomingUnsorted,
+                SourceSubsystemRoute::UnsortedReview,
+            ),
+            (SourceRole::BiosFirmware, SourceSubsystemRoute::BiosFirmware),
+            (SourceRole::SaveData, SourceSubsystemRoute::SaveVault),
+            (
+                SourceRole::MemoryCards,
+                SourceSubsystemRoute::MemoryCardInventory,
+            ),
+            (
+                SourceRole::EmulatorConfig,
+                SourceSubsystemRoute::EmulatorConfig,
+            ),
+            (SourceRole::DatMetadata, SourceSubsystemRoute::DatMetadata),
+            (SourceRole::ArtworkMedia, SourceSubsystemRoute::ArtworkMedia),
+            (SourceRole::Ignored, SourceSubsystemRoute::None),
+            (SourceRole::Unknown, SourceSubsystemRoute::Unknown),
+        ];
+
+        for (role, route) in expected {
+            assert_eq!(role.subsystem_route(), route);
+            assert!(!route.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn subsystem_routes_do_not_admit_non_game_roles_to_game_scanning() {
+        for role in [
+            SourceRole::BiosFirmware,
+            SourceRole::SaveData,
+            SourceRole::MemoryCards,
+            SourceRole::EmulatorConfig,
+            SourceRole::DatMetadata,
+            SourceRole::ArtworkMedia,
+            SourceRole::Ignored,
+            SourceRole::Unknown,
+        ] {
+            assert!(!role.may_enter_game_scan());
+        }
+        assert_eq!(
+            SourceRole::ArcadeRomset.subsystem_route(),
+            SourceSubsystemRoute::ArcadeDiscovery
+        );
+    }
+
+    #[test]
     fn skipped_source_is_not_traversed_or_reported_as_scan_failure() {
         let root = std::env::temp_dir().join(format!(
             "archivefs-source-routing-test-{}-{}",
@@ -1687,6 +1742,44 @@ pub enum GameScanDisposition {
     SkipUnknown,
 }
 
+/// The single primary subsystem allowed to inspect a source role in SR3.
+/// This is an ownership description, not an instruction to mutate or
+/// automatically import the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum SourceSubsystemRoute {
+    GameDiscovery,
+    ArcadeDiscovery,
+    BiosFirmware,
+    SaveVault,
+    MemoryCardInventory,
+    DatMetadata,
+    EmulatorConfig,
+    ArtworkMedia,
+    UnsortedReview,
+    Generic,
+    None,
+    Unknown,
+}
+
+impl SourceSubsystemRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GameDiscovery => "Game Discovery",
+            Self::ArcadeDiscovery => "Arcade Discovery",
+            Self::BiosFirmware => "BIOS / Firmware",
+            Self::SaveVault => "Save Vault",
+            Self::MemoryCardInventory => "Save Vault Memory Cards",
+            Self::DatMetadata => "DAT / Catalogue",
+            Self::EmulatorConfig => "Emulator Config",
+            Self::ArtworkMedia => "Artwork / Media",
+            Self::UnsortedReview => "Unsorted Review",
+            Self::Generic => "Generic Files",
+            Self::None => "None",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
 impl Default for SourceRole {
     fn default() -> Self {
         Self::Games
@@ -1772,6 +1865,25 @@ impl SourceRole {
                 | GameScanDisposition::ScanArcade
                 | GameScanDisposition::ScanUnsorted
         )
+    }
+
+    /// Returns the one primary subsystem that owns read-only inspection of
+    /// this source role. Unknown roles never fall back to game discovery.
+    pub fn subsystem_route(self) -> SourceSubsystemRoute {
+        match self {
+            Self::Games => SourceSubsystemRoute::GameDiscovery,
+            Self::GenericFiles => SourceSubsystemRoute::Generic,
+            Self::ArcadeRomset => SourceSubsystemRoute::ArcadeDiscovery,
+            Self::IncomingUnsorted => SourceSubsystemRoute::UnsortedReview,
+            Self::BiosFirmware => SourceSubsystemRoute::BiosFirmware,
+            Self::SaveData => SourceSubsystemRoute::SaveVault,
+            Self::MemoryCards => SourceSubsystemRoute::MemoryCardInventory,
+            Self::EmulatorConfig => SourceSubsystemRoute::EmulatorConfig,
+            Self::DatMetadata => SourceSubsystemRoute::DatMetadata,
+            Self::ArtworkMedia => SourceSubsystemRoute::ArtworkMedia,
+            Self::Ignored => SourceSubsystemRoute::None,
+            Self::Unknown => SourceSubsystemRoute::Unknown,
+        }
     }
 }
 
