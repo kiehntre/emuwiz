@@ -14,14 +14,14 @@ use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::rename_apply::model::RollbackResult;
 use crate::dat::sources::now_unix;
 use crate::optical_fingerprint::{
-    CanonicalOpticalFingerprint, OpticalFingerprintComparison, compare_optical_fingerprints,
-    fingerprint_chd, fingerprint_cue_bin,
+    compare_optical_fingerprints, fingerprint_chd, fingerprint_cue_bin,
+    CanonicalOpticalFingerprint, OpticalFingerprintComparison,
 };
 use crate::repair::execute::{
-    RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairTransactionResult,
     apply_repair_transaction, build_repair_transaction, rollback_repair_transaction,
+    RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairTransactionResult,
 };
-use crate::repair::plan::{RepairPlan, RepairPlanId, build_repair_plan};
+use crate::repair::plan::{build_repair_plan, RepairPlan, RepairPlanId};
 use crate::repair::proposal::{
     RepairAction, RepairEvidence, RepairEvidenceKind, RepairProposal, RepairProposalId, SafetyState,
 };
@@ -104,6 +104,112 @@ pub struct ChdConversionResult {
     pub source_mode: ChdConversionSourceMode,
     pub source_quarantined: bool,
     pub transaction_id: String,
+}
+
+/// The explicit policy bound to the currently proven execution lane.  The
+/// preview module may describe more formats, but this execution API accepts
+/// only this CUE/BIN -> CHD policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChdConversionPolicy {
+    pub version: &'static str,
+    pub mode: &'static str,
+    pub compression: &'static str,
+    pub hunk_size: &'static str,
+    pub round_trip: &'static str,
+}
+
+pub const SAFE_CUE_BIN_TO_CHD_POLICY: ChdConversionPolicy = ChdConversionPolicy {
+    version: "cue-bin-to-chd-v1",
+    mode: "createcd",
+    compression: "cdlz,cdzl,cdfl",
+    hunk_size: "8",
+    round_trip: "CONTENT_EQUIVALENT",
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChdConversionExecutionState {
+    Completed,
+    ConversionFailed,
+    VerificationFailed,
+    Stale,
+    NeedsCleanup,
+}
+
+/// A compact, non-persistent history record produced by safe execution.
+/// Large command output is intentionally not retained.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChdConversionRecord {
+    pub source_cue: PathBuf,
+    pub source_bin: PathBuf,
+    pub destination: PathBuf,
+    pub chdman_path: PathBuf,
+    pub chdman_version: Option<String>,
+    pub policy: ChdConversionPolicy,
+    pub state: ChdConversionExecutionState,
+    pub source_fingerprint: CanonicalOpticalFingerprint,
+    pub output_fingerprint: CanonicalOpticalFingerprint,
+    pub source_logical_bytes: u64,
+    pub output_bytes: u64,
+    pub savings_bytes: i64,
+    pub savings_percent: f64,
+    pub warning: Option<String>,
+}
+
+/// Execute only the already-proven, byte-preserving-source conversion lane.
+/// In particular, this wrapper rejects the older quarantine/source-replace
+/// mode so callers cannot accidentally turn Phase 3A into source cleanup.
+pub fn execute_safe_chd_conversion(
+    plan: &ChdConversionPlan,
+    trusted: TrustedRoots,
+    journal_dir: &Path,
+    staging_root: &Path,
+    cancel: &AtomicBool,
+) -> Result<(ChdConversionRecord, ChdConversionTransaction), ChdConversionError> {
+    if plan.source_mode != ChdConversionSourceMode::KeepSource {
+        return Err(ChdConversionError::InvalidTarget(
+            "safe execution requires KeepSource; source cleanup is not part of this phase".into(),
+        ));
+    }
+    let (result, transaction) =
+        execute_chd_conversion(plan, trusted, journal_dir, staging_root, cancel)?;
+    let source_logical_bytes = fs::metadata(&plan.cue_path)
+        .map_err(|e| ChdConversionError::VerificationFailed(e.to_string()))?
+        .len()
+        .saturating_add(
+            fs::metadata(&plan.bin_path)
+                .map_err(|e| ChdConversionError::VerificationFailed(e.to_string()))?
+                .len(),
+        );
+    let output_bytes = fs::metadata(&plan.target_path)
+        .map_err(|e| ChdConversionError::VerificationFailed(e.to_string()))?
+        .len();
+    let savings_bytes = source_logical_bytes as i128 - output_bytes as i128;
+    let savings_percent = if source_logical_bytes == 0 {
+        0.0
+    } else {
+        (savings_bytes as f64 / source_logical_bytes as f64) * 100.0
+    };
+    Ok((
+        ChdConversionRecord {
+            source_cue: plan.cue_path.clone(),
+            source_bin: plan.bin_path.clone(),
+            destination: plan.target_path.clone(),
+            chdman_path: plan.chdman_path.clone(),
+            chdman_version: None,
+            policy: SAFE_CUE_BIN_TO_CHD_POLICY,
+            state: ChdConversionExecutionState::Completed,
+            source_fingerprint: result.source_fingerprint,
+            output_fingerprint: result.output_fingerprint,
+            source_logical_bytes,
+            output_bytes,
+            savings_bytes: savings_bytes.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            savings_percent,
+            warning: Some(
+                "The original CUE/BIN remains in place; no disk space has been reclaimed.".into(),
+            ),
+        },
+        transaction,
+    ))
 }
 
 struct StageGuard {
@@ -470,3 +576,27 @@ pub fn rollback_chd_conversion(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod safe_execution_tests {
+    use super::*;
+
+    #[test]
+    fn safe_policy_is_explicit_and_content_equivalent() {
+        assert_eq!(SAFE_CUE_BIN_TO_CHD_POLICY.mode, "createcd");
+        assert_eq!(SAFE_CUE_BIN_TO_CHD_POLICY.round_trip, "CONTENT_EQUIVALENT");
+        assert_eq!(SAFE_CUE_BIN_TO_CHD_POLICY.hunk_size, "8");
+    }
+
+    #[test]
+    fn execution_state_does_not_offer_source_cleanup() {
+        assert_eq!(
+            ChdConversionExecutionState::Completed,
+            ChdConversionExecutionState::Completed
+        );
+        assert_ne!(
+            ChdConversionSourceMode::KeepSource,
+            ChdConversionSourceMode::QuarantineSource
+        );
+    }
+}

@@ -86,9 +86,10 @@ pub use n64_equivalent::{
     rollback_n64_equivalent_group, scan_n64_equivalent_duplicates,
 };
 pub use optical_conversion::{
-    ChdConversionError, ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode,
-    ChdConversionTransaction, build_chd_conversion_plan, execute_chd_conversion,
-    rollback_chd_conversion,
+    ChdConversionError, ChdConversionExecutionState, ChdConversionPlan, ChdConversionPolicy,
+    ChdConversionRecord, ChdConversionResult, ChdConversionSourceMode, ChdConversionTransaction,
+    SAFE_CUE_BIN_TO_CHD_POLICY, build_chd_conversion_plan, execute_chd_conversion,
+    execute_safe_chd_conversion, rollback_chd_conversion,
 };
 pub use optical_equivalent::{
     OPTICAL_EQUIVALENT_SCAN_VERSION, OpticalEquivalentFile, OpticalEquivalentGroup,
