@@ -45,6 +45,7 @@ pub mod diagnostics;
 pub mod dragon_coco_tape;
 pub mod emulator_download;
 pub mod emulator_inventory;
+pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;

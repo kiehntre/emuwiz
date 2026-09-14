@@ -2,12 +2,14 @@
 //! lifecycle mutation controls in this page.
 
 use archivefs_core::emulator_inventory::{self, EmulatorInventory, InstallationType};
+use archivefs_core::emulator_update::{self, OfficialMetadataProvider, UpdateReport, UpdateStatus};
 use eframe::egui;
 
 #[derive(Default)]
 pub(crate) struct EmulatorInventoryPageState {
     pub inventory: Option<EmulatorInventory>,
     pub error: Option<String>,
+    pub update_report: Option<UpdateReport>,
 }
 
 impl EmulatorInventoryPageState {
@@ -16,11 +18,25 @@ impl EmulatorInventoryPageState {
         self.error = None;
     }
 
+    pub(crate) fn check_for_updates(&mut self) {
+        let Some(inventory) = &self.inventory else {
+            self.error = Some("Scan the inventory before checking metadata.".into());
+            return;
+        };
+        self.update_report = Some(emulator_update::check_updates(
+            &inventory.installations,
+            &mut OfficialMetadataProvider::default(),
+        ));
+    }
+
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("Emulator Manager");
         ui.label("Read-only inventory of emulator installations already present on this computer.");
         if ui.button("Refresh inventory").clicked() {
             self.refresh();
+        }
+        if ui.button("Check for Updates").clicked() {
+            self.check_for_updates();
         }
         let Some(inventory) = &self.inventory else {
             ui.label("Inventory has not been scanned yet.");
@@ -43,11 +59,18 @@ impl EmulatorInventoryPageState {
                     "Update method",
                     "EmuWiz use",
                     "Warnings",
+                    "Update status",
                 ] {
                     ui.strong(heading);
                 }
                 ui.end_row();
                 for install in &inventory.installations {
+                    let update = self.update_report.as_ref().and_then(|report| {
+                        report
+                            .results
+                            .iter()
+                            .find(|result| result.executable_path == install.executable_path)
+                    });
                     ui.label(install.emulator.label());
                     ui.label(install.version.as_deref().unwrap_or("Unknown"));
                     ui.label(channel_label(install.channel));
@@ -61,6 +84,11 @@ impl EmulatorInventoryPageState {
                         None => "Preferred installation not established",
                     });
                     ui.label(install.warnings.len().to_string());
+                    if let Some(update) = update {
+                        ui.label(update_status_label(update.status));
+                    } else {
+                        ui.label("Not checked");
+                    }
                     ui.end_row();
                 }
             });
@@ -74,6 +102,19 @@ impl EmulatorInventoryPageState {
         }
         ui.separator();
         ui.small("Installation, update, switching, rollback, and deletion actions are not available here.");
+    }
+}
+
+fn update_status_label(status: UpdateStatus) -> &'static str {
+    match status {
+        UpdateStatus::UpToDate => "Up to date",
+        UpdateStatus::UpdateAvailable => "Update available",
+        UpdateStatus::InstalledNewer => "Installed newer",
+        UpdateStatus::VersionUnknown => "Installed version unknown",
+        UpdateStatus::LatestUnknown => "Latest unknown",
+        UpdateStatus::ChannelMismatch => "Channel mismatch",
+        UpdateStatus::ComparisonUnsupported => "Comparison unsupported",
+        UpdateStatus::Offline => "Offline",
     }
 }
 
