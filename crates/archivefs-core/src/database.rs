@@ -472,6 +472,111 @@ mod source_role_tests {
     }
 
     #[test]
+    fn game_scan_routing_is_explicit_and_fails_closed() {
+        assert_eq!(
+            SourceRole::Games.game_scan_disposition(),
+            GameScanDisposition::ScanGames
+        );
+        assert_eq!(
+            SourceRole::GenericFiles.game_scan_disposition(),
+            GameScanDisposition::ScanGames
+        );
+        assert_eq!(
+            SourceRole::ArcadeRomset.game_scan_disposition(),
+            GameScanDisposition::ScanArcade
+        );
+        assert_eq!(
+            SourceRole::IncomingUnsorted.game_scan_disposition(),
+            GameScanDisposition::ScanUnsorted
+        );
+
+        for role in [
+            SourceRole::BiosFirmware,
+            SourceRole::SaveData,
+            SourceRole::MemoryCards,
+            SourceRole::EmulatorConfig,
+            SourceRole::DatMetadata,
+            SourceRole::ArtworkMedia,
+        ] {
+            assert_eq!(
+                role.game_scan_disposition(),
+                GameScanDisposition::SkipNonGame
+            );
+            assert!(!role.may_enter_game_scan());
+        }
+        assert_eq!(
+            SourceRole::Ignored.game_scan_disposition(),
+            GameScanDisposition::SkipIgnored
+        );
+        assert_eq!(
+            SourceRole::Unknown.game_scan_disposition(),
+            GameScanDisposition::SkipUnknown
+        );
+        assert!(!SourceRole::Unknown.may_enter_game_scan());
+    }
+
+    #[test]
+    fn game_scan_routing_is_independent_of_file_extensions() {
+        for role in [
+            SourceRole::BiosFirmware,
+            SourceRole::MemoryCards,
+            SourceRole::EmulatorConfig,
+            SourceRole::DatMetadata,
+            SourceRole::ArtworkMedia,
+        ] {
+            // The role is evaluated before any extension or archive probing;
+            // misleading .bin/.xml/.png names cannot admit the source.
+            assert!(!role.may_enter_game_scan());
+        }
+    }
+
+    #[test]
+    fn skipped_source_is_not_traversed_or_reported_as_scan_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-source-routing-test-{}-{}",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("bios");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("misleading.bin"), b"not a game").unwrap();
+
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        database
+            .set_source_role(&source, SourceRole::BiosFirmware)
+            .unwrap();
+        let folder = database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let summary = scan_and_persist_folders(
+            &mut database,
+            std::slice::from_ref(&folder),
+            "source-routing-test",
+        )
+        .unwrap();
+
+        assert_eq!(summary.counts.source_folders_scanned, 0);
+        assert_eq!(summary.counts.errors_count, 0);
+        assert!(summary.folder_errors.is_empty());
+        assert!(database.load_archives().unwrap().is_empty());
+        assert_eq!(
+            database.list_source_folders().unwrap()[0].last_scan_status,
+            None
+        );
+
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn source_role_defaults_and_round_trips_without_changing_scan_behavior() {
         let root = std::env::temp_dir().join(format!(
             "archivefs-source-role-test-{}-{}",
@@ -1548,9 +1653,7 @@ pub struct RegisteredSourceFolder {
     pub excluded_source_roots: Vec<PathBuf>,
 }
 
-/// The explicit subsystem role of a configured source folder. Roles are
-/// descriptive in SR1: they are persisted and displayed, but do not yet
-/// change which scanner traverses a source.
+/// The explicit subsystem role of a configured source folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SourceRole {
@@ -1566,6 +1669,22 @@ pub enum SourceRole {
     GenericFiles,
     Ignored,
     Unknown,
+}
+
+/// The normal game-library scanner's admission decision for a source folder.
+///
+/// This is deliberately narrower than the full source-role vocabulary: SR2
+/// only decides whether normal game discovery may enter a source. It does not
+/// route the source to BIOS, Save Vault, DAT, artwork, or emulator-config
+/// subsystems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum GameScanDisposition {
+    ScanGames,
+    ScanArcade,
+    ScanUnsorted,
+    SkipNonGame,
+    SkipIgnored,
+    SkipUnknown,
 }
 
 impl Default for SourceRole {
@@ -1624,6 +1743,35 @@ impl SourceRole {
             Self::Ignored => "Ignored",
             Self::Unknown => "Unknown",
         }
+    }
+
+    /// Returns the one authoritative normal-game-scan routing decision for
+    /// this source role. Unknown values fail closed rather than silently
+    /// gaining access to game discovery.
+    pub fn game_scan_disposition(self) -> GameScanDisposition {
+        match self {
+            Self::Games | Self::GenericFiles => GameScanDisposition::ScanGames,
+            Self::ArcadeRomset => GameScanDisposition::ScanArcade,
+            Self::IncomingUnsorted => GameScanDisposition::ScanUnsorted,
+            Self::Ignored => GameScanDisposition::SkipIgnored,
+            Self::Unknown => GameScanDisposition::SkipUnknown,
+            Self::BiosFirmware
+            | Self::SaveData
+            | Self::MemoryCards
+            | Self::EmulatorConfig
+            | Self::DatMetadata
+            | Self::ArtworkMedia => GameScanDisposition::SkipNonGame,
+        }
+    }
+
+    /// Whether the normal game scanner may enter this source at all.
+    pub fn may_enter_game_scan(self) -> bool {
+        matches!(
+            self.game_scan_disposition(),
+            GameScanDisposition::ScanGames
+                | GameScanDisposition::ScanArcade
+                | GameScanDisposition::ScanUnsorted
+        )
     }
 }
 
@@ -6919,8 +7067,8 @@ pub fn pending_schema_migration_versions(current_version: i64) -> Result<Vec<i64
     Ok(pending_migration_versions(MIGRATIONS, current_version))
 }
 
-/// Scans every folder in `config.source_folders` with the existing
-/// [`ArchiveScanner`] (unmodified - one scan per folder, so a single
+/// Scans every game-scan-eligible folder in `config.source_folders` with the
+/// existing [`ArchiveScanner`] (unmodified - one scan per folder, so a single
 /// unreachable folder cannot poison the whole run) and persists the
 /// results into `database`: registers source folders, starts a
 /// `scan_runs` row, upserts each discovered archive with its observation
@@ -7009,6 +7157,20 @@ fn scan_and_persist_folders_transaction(
     let mut ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery> = Vec::new();
 
     for folder in folders {
+        let scan_disposition = folder.role.game_scan_disposition();
+        if !folder.role.may_enter_game_scan() {
+            info!(
+                "source not scanned as games source={} role={} disposition={:?}",
+                folder.path.display(),
+                folder.role.label(),
+                scan_disposition
+            );
+            // This is intentional routing, not a scan failure. In
+            // particular, do not load fingerprints, walk the tree, run
+            // ingestion, or reconcile existing archives for this source.
+            continue;
+        }
+
         let folder_config = Config {
             source_folders: vec![folder.path.clone()],
             mount_root: PathBuf::new(),
