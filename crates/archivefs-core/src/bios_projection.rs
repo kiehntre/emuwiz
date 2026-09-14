@@ -129,6 +129,7 @@ pub enum BiosProjectionAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BiosProjectionPlan {
+    pub master_root: PathBuf,
     pub emulator: String,
     pub requirements: Vec<BiosRequirement>,
     pub matches: Vec<Option<BiosEvidence>>,
@@ -160,6 +161,78 @@ impl std::fmt::Display for BiosInventoryError {
     }
 }
 impl std::error::Error for BiosInventoryError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiosProjectionTransaction {
+    pub journal_id: String,
+    pub emulator: String,
+    pub requirement_ids: Vec<String>,
+    pub applied: Vec<BiosAppliedItem>,
+    pub already_correct: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiosAppliedItem {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub method: BiosProjectionMethod,
+    pub pre_state: BiosTargetState,
+    pub post_state: BiosTargetState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BiosProjectionApplyError {
+    ConfirmationRequired,
+    NoEligibleItems,
+    StalePlan(String),
+    UnsafeTarget(PathBuf),
+    TargetConflict(PathBuf),
+    WritableStateNotSupported(String),
+    UnsupportedMethod(BiosProjectionMethod),
+    SourceInvalid(PathBuf, String),
+    Io(String),
+}
+
+impl std::fmt::Display for BiosProjectionApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConfirmationRequired => write!(f, "typed BIOS plan confirmation is required"),
+            Self::NoEligibleItems => write!(f, "the BIOS plan contains no eligible apply actions"),
+            Self::StalePlan(detail) => write!(f, "BIOS plan is stale: {detail}"),
+            Self::UnsafeTarget(path) => write!(
+                f,
+                "target is outside the approved emulator root: {}",
+                path.display()
+            ),
+            Self::TargetConflict(path) => write!(
+                f,
+                "target already contains unrelated content: {}",
+                path.display()
+            ),
+            Self::WritableStateNotSupported(name) => write!(
+                f,
+                "writable emulator state is not supported in Phase 2: {name}"
+            ),
+            Self::UnsupportedMethod(method) => write!(
+                f,
+                "projection method is not executable in Phase 2: {method:?}"
+            ),
+            Self::SourceInvalid(path, detail) => write!(
+                f,
+                "source is no longer valid ({}): {detail}",
+                path.display()
+            ),
+            Self::Io(detail) => write!(f, "BIOS projection failed: {detail}"),
+        }
+    }
+}
+impl std::error::Error for BiosProjectionApplyError {}
+
+pub const APPLY_CONFIRMATION_PREFIX: &str = "APPLY BIOS PLAN ";
+
+pub fn apply_confirmation(plan_count: usize) -> String {
+    format!("{APPLY_CONFIRMATION_PREFIX}{plan_count}")
+}
 
 /// Inspect a caller-selected master root without following links or writing.
 pub fn inspect_master_root(root: &Path) -> Result<BiosMasterInventory, BiosInventoryError> {
@@ -659,6 +732,7 @@ pub fn plan_for_emulator(inventory: &BiosMasterInventory, emulator: &str) -> Bio
         status = BiosProjectionStatus::Unsupported;
     }
     BiosProjectionPlan {
+        master_root: inventory.root.clone(),
         emulator: emulator.into(),
         requirements,
         matches,
@@ -666,6 +740,291 @@ pub fn plan_for_emulator(inventory: &BiosMasterInventory, emulator: &str) -> Bio
         status,
         warnings,
     }
+}
+
+/// Apply only explicit immutable file/directory-link actions. The approved
+/// root and typed confirmation are mandatory; no implicit emulator path is
+/// ever selected. Direct config paths and writable state are refused.
+pub fn apply_plan(
+    plan: &BiosProjectionPlan,
+    approved_target_root: &Path,
+    confirmation: &str,
+) -> Result<BiosProjectionTransaction, BiosProjectionApplyError> {
+    if confirmation != apply_confirmation(plan.requirements.len()) {
+        return Err(BiosProjectionApplyError::ConfirmationRequired);
+    }
+    if !approved_target_root.is_absolute() {
+        return Err(BiosProjectionApplyError::UnsafeTarget(
+            approved_target_root.to_path_buf(),
+        ));
+    }
+    preflight_apply(plan, approved_target_root)?;
+    let mut transaction = BiosProjectionTransaction {
+        journal_id: format!("bios-{}", plan.requirements.len()),
+        emulator: plan.emulator.clone(),
+        requirement_ids: Vec::new(),
+        applied: Vec::new(),
+        already_correct: Vec::new(),
+    };
+    for (index, requirement) in plan.requirements.iter().enumerate() {
+        if requirement.content_class == BiosContentClass::WritableState {
+            return Err(BiosProjectionApplyError::WritableStateNotSupported(
+                requirement.name.clone(),
+            ));
+        }
+        let action = plan
+            .actions
+            .get(index)
+            .ok_or(BiosProjectionApplyError::NoEligibleItems)?;
+        let BiosProjectionAction::CreateFileLink {
+            source: relative_source,
+            target,
+        } = action
+        else {
+            if matches!(requirement.method, BiosProjectionMethod::NoBiosRequired) {
+                continue;
+            }
+            return Err(BiosProjectionApplyError::UnsupportedMethod(
+                requirement.method,
+            ));
+        };
+        if requirement.method != BiosProjectionMethod::SymlinkFile
+            && requirement.method != BiosProjectionMethod::SymlinkDirectory
+        {
+            return Err(BiosProjectionApplyError::UnsupportedMethod(
+                requirement.method,
+            ));
+        }
+        let Some(target_path) = &target.path else {
+            return Err(BiosProjectionApplyError::StalePlan(format!(
+                "{} has no concrete target path",
+                requirement.name
+            )));
+        };
+        if !confined_path(target_path, approved_target_root) {
+            return Err(BiosProjectionApplyError::UnsafeTarget(target_path.clone()));
+        }
+        let source = plan.master_root.join(relative_source);
+        let source_meta = fs::symlink_metadata(&source).map_err(|error| {
+            BiosProjectionApplyError::SourceInvalid(source.clone(), error.to_string())
+        })?;
+        if !source_meta.is_file() {
+            return Err(BiosProjectionApplyError::SourceInvalid(
+                source,
+                "source is not a regular immutable file".into(),
+            ));
+        }
+        let Some(Some(evidence)) = plan.matches.get(index) else {
+            return Err(BiosProjectionApplyError::SourceInvalid(
+                source,
+                "source evidence is missing".into(),
+            ));
+        };
+        if let Some(expected) = &evidence.sha256 {
+            let mut warnings = Vec::new();
+            let actual = hash_file(&source, &mut warnings).ok_or_else(|| {
+                BiosProjectionApplyError::SourceInvalid(
+                    source.clone(),
+                    "source could not be hashed".into(),
+                )
+            })?;
+            if &actual != expected {
+                return Err(BiosProjectionApplyError::StalePlan(format!(
+                    "source hash changed for {}",
+                    requirement.name
+                )));
+            }
+        }
+        let pre_state = inspect_target(target_path);
+        match pre_state {
+            BiosTargetState::Missing => {
+                if let Some(parent) = target_path.parent() {
+                    create_confined_parents(parent, approved_target_root)?;
+                }
+                create_link(&source, target_path)
+                    .map_err(|error| BiosProjectionApplyError::Io(error.to_string()))?;
+                let post_state = inspect_target(target_path);
+                if post_state != BiosTargetState::ExistingCorrectLink {
+                    return Err(BiosProjectionApplyError::Io(
+                        "created link could not be verified".into(),
+                    ));
+                }
+                transaction.requirement_ids.push(requirement.name.clone());
+                transaction.applied.push(BiosAppliedItem {
+                    source,
+                    target: target_path.clone(),
+                    method: requirement.method,
+                    pre_state,
+                    post_state,
+                });
+            }
+            BiosTargetState::ExistingCorrectLink => {
+                let actual = fs::read_link(target_path)
+                    .map_err(|error| BiosProjectionApplyError::Io(error.to_string()))?;
+                if actual != source {
+                    return Err(BiosProjectionApplyError::TargetConflict(
+                        target_path.clone(),
+                    ));
+                }
+                transaction.already_correct.push(target_path.clone());
+            }
+            _ => {
+                return Err(BiosProjectionApplyError::TargetConflict(
+                    target_path.clone(),
+                ));
+            }
+        }
+    }
+    if transaction.applied.is_empty() && transaction.already_correct.is_empty() {
+        return Err(BiosProjectionApplyError::NoEligibleItems);
+    }
+    Ok(transaction)
+}
+
+pub fn rollback_plan(
+    transaction: &BiosProjectionTransaction,
+) -> Result<(), BiosProjectionApplyError> {
+    for item in transaction.applied.iter().rev() {
+        let metadata = fs::symlink_metadata(&item.target)
+            .map_err(|error| BiosProjectionApplyError::Io(error.to_string()))?;
+        if !metadata.file_type().is_symlink() {
+            return Err(BiosProjectionApplyError::TargetConflict(
+                item.target.clone(),
+            ));
+        }
+        let actual = fs::read_link(&item.target)
+            .map_err(|error| BiosProjectionApplyError::Io(error.to_string()))?;
+        if actual != item.source {
+            return Err(BiosProjectionApplyError::TargetConflict(
+                item.target.clone(),
+            ));
+        }
+        fs::remove_file(&item.target)
+            .map_err(|error| BiosProjectionApplyError::Io(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn confined_path(path: &Path, root: &Path) -> bool {
+    path.is_absolute() && path.strip_prefix(root).is_ok()
+}
+
+fn preflight_apply(
+    plan: &BiosProjectionPlan,
+    approved_target_root: &Path,
+) -> Result<(), BiosProjectionApplyError> {
+    for (index, requirement) in plan.requirements.iter().enumerate() {
+        if requirement.content_class == BiosContentClass::WritableState {
+            return Err(BiosProjectionApplyError::WritableStateNotSupported(
+                requirement.name.clone(),
+            ));
+        }
+        let action = plan
+            .actions
+            .get(index)
+            .ok_or(BiosProjectionApplyError::NoEligibleItems)?;
+        let BiosProjectionAction::CreateFileLink {
+            source: relative_source,
+            target,
+        } = action
+        else {
+            if matches!(requirement.method, BiosProjectionMethod::NoBiosRequired) {
+                continue;
+            }
+            return Err(BiosProjectionApplyError::UnsupportedMethod(
+                requirement.method,
+            ));
+        };
+        if !matches!(
+            requirement.method,
+            BiosProjectionMethod::SymlinkFile | BiosProjectionMethod::SymlinkDirectory
+        ) {
+            return Err(BiosProjectionApplyError::UnsupportedMethod(
+                requirement.method,
+            ));
+        }
+        let Some(target_path) = &target.path else {
+            return Err(BiosProjectionApplyError::StalePlan(format!(
+                "{} has no concrete target path",
+                requirement.name
+            )));
+        };
+        if !confined_path(target_path, approved_target_root) {
+            return Err(BiosProjectionApplyError::UnsafeTarget(target_path.clone()));
+        }
+        let source = plan.master_root.join(relative_source);
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            BiosProjectionApplyError::SourceInvalid(source.clone(), error.to_string())
+        })?;
+        if !metadata.is_file() {
+            return Err(BiosProjectionApplyError::SourceInvalid(
+                source,
+                "source is not a regular immutable file".into(),
+            ));
+        }
+        if let Some(expected) = plan
+            .matches
+            .get(index)
+            .and_then(|item| item.as_ref())
+            .and_then(|item| item.sha256.as_ref())
+        {
+            let mut warnings = Vec::new();
+            let actual = hash_file(&source, &mut warnings).ok_or_else(|| {
+                BiosProjectionApplyError::SourceInvalid(
+                    source.clone(),
+                    "source could not be hashed".into(),
+                )
+            })?;
+            if &actual != expected {
+                return Err(BiosProjectionApplyError::StalePlan(format!(
+                    "source hash changed for {}",
+                    requirement.name
+                )));
+            }
+        }
+        if !matches!(
+            inspect_target(target_path),
+            BiosTargetState::Missing | BiosTargetState::ExistingCorrectLink
+        ) {
+            return Err(BiosProjectionApplyError::TargetConflict(
+                target_path.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_confined_parents(path: &Path, root: &Path) -> Result<(), BiosProjectionApplyError> {
+    if !confined_path(path, root) {
+        return Err(BiosProjectionApplyError::UnsafeTarget(path.to_path_buf()));
+    }
+    let mut current = root.to_path_buf();
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| BiosProjectionApplyError::UnsafeTarget(path.to_path_buf()))?;
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(BiosProjectionApplyError::TargetConflict(current));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|e| BiosProjectionApplyError::Io(e.to_string()))?
+            }
+            Err(error) => return Err(BiosProjectionApplyError::Io(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_link(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+#[cfg(windows)]
+fn create_link(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(source, target)
 }
 
 #[cfg(test)]
@@ -755,5 +1114,54 @@ mod tests {
             BiosTargetState::ExistingRegularFile
         );
         assert_eq!(fs::read(&file_path).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_link_apply_and_rollback_are_source_preserving() {
+        let dir = tempdir().unwrap();
+        file(dir.path(), "mcpx_1.0.bin", b"mcpx");
+        let inventory = inspect_master_root(dir.path()).unwrap();
+        let mut plan = plan_for_emulator(&inventory, "xemu");
+        plan.requirements.truncate(1);
+        plan.matches.truncate(1);
+        plan.actions.truncate(1);
+        plan.requirements[0].target.path = Some(dir.path().join("target").join("mcpx_1.0.bin"));
+        let target_root = dir.path().join("target");
+        let source_before = fs::read(dir.path().join("mcpx_1.0.bin")).unwrap();
+        let transaction = apply_plan(&plan, &target_root, &apply_confirmation(1)).unwrap();
+        assert!(target_root.join("mcpx_1.0.bin").is_symlink());
+        assert_eq!(
+            fs::read_link(target_root.join("mcpx_1.0.bin")).unwrap(),
+            dir.path().join("mcpx_1.0.bin")
+        );
+        rollback_plan(&transaction).unwrap();
+        assert!(!target_root.join("mcpx_1.0.bin").exists());
+        assert_eq!(
+            fs::read(dir.path().join("mcpx_1.0.bin")).unwrap(),
+            source_before
+        );
+    }
+
+    #[test]
+    fn writable_state_is_refused_before_any_target_change() {
+        let dir = tempdir().unwrap();
+        file(dir.path(), "eeprom.bin", b"state");
+        let inventory = inspect_master_root(dir.path()).unwrap();
+        let mut plan = plan_for_emulator(&inventory, "xemu");
+        plan.requirements = vec![plan.requirements[2].clone()];
+        plan.matches = vec![plan.matches[2].clone()];
+        plan.actions = vec![plan.actions[2].clone()];
+        let error = apply_plan(
+            &plan,
+            dir.path(),
+            &apply_confirmation(plan.requirements.len()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BiosProjectionApplyError::WritableStateNotSupported(_)
+        ));
+        assert!(!dir.path().join("eeprom.bin").is_symlink());
     }
 }
