@@ -533,7 +533,7 @@ fn ps2_fat_next(
             "IFC entry is outside the card",
         )
     })?;
-    let fat_cluster_index = indirect_index % entries_per_cluster;
+    let fat_cluster_index = relative_cluster as usize % entries_per_cluster;
     let fat_cluster = ps2_logical_cluster(bytes, geometry, ifc_cluster).ok_or_else(|| {
         ps2_warning(
             Ps2CorruptionKind::ClusterOutOfRange,
@@ -1097,7 +1097,7 @@ mod tests {
         let pages_per_cluster = 2usize;
         let mut card = vec![0u8; clusters * pages_per_cluster * page_stride];
         card[..28].copy_from_slice(b"Sony PS2 Memory Card Format ");
-        card[0x1c..0x24].copy_from_slice(b"1.2.0.0");
+        card[0x1c..0x24].copy_from_slice(b"1.2.0.0\0");
         card[0x28..0x2a].copy_from_slice(&(PS2_PAGE_DATA_BYTES as u16).to_le_bytes());
         card[0x2a..0x2c].copy_from_slice(&(pages_per_cluster as u16).to_le_bytes());
         card[0x2c..0x2e].copy_from_slice(&(16u16).to_le_bytes());
@@ -1107,17 +1107,22 @@ mod tests {
         card[0x3c..0x40].copy_from_slice(&(0u32).to_le_bytes());
         card[0x40..0x44].copy_from_slice(&(1023u32).to_le_bytes());
         card[0x44..0x48].copy_from_slice(&(1022u32).to_le_bytes());
+        card[0x50..0x54].copy_from_slice(&8u32.to_le_bytes());
+        let fat_cluster_offset = 8 * pages_per_cluster * page_stride;
+        card[fat_cluster_offset..fat_cluster_offset + 4]
+            .copy_from_slice(&0xffff_ffffu32.to_le_bytes());
         card
     }
 
     fn ps2_inventory_fixture() -> Vec<u8> {
         let mut card = ps2_fixture(PS2_PAGE_DATA_BYTES);
         card[0x50..0x54].copy_from_slice(&8u32.to_le_bytes());
-        card[8 * 1024..8 * 1024 + 4].copy_from_slice(&9u32.to_le_bytes());
-        for relative in [0usize, 2, 3] {
-            let offset = 9 * 1024 + relative * 4;
+        card[8 * 1024..8 * 1024 + 4].copy_from_slice(&0x8000_0009u32.to_le_bytes());
+        for relative in [3usize, 4, 9] {
+            let offset = 8 * 1024 + relative * 4;
             card[offset..offset + 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
         }
+        card[8 * 1024 + 2 * 4..8 * 1024 + 2 * 4 + 4].copy_from_slice(&0x8000_0004u32.to_le_bytes());
 
         fn entry(
             card: &mut [u8],
@@ -1139,10 +1144,10 @@ mod tests {
 
         entry(&mut card, 0, 0, 0x8427, 3, 0, b".");
         entry(&mut card, 0, 1, 0xa426, 0, 0, b"..");
-        entry(&mut card, 0, 2, 0x8427, 3, 2, b"BASLUS-00001TEST");
+        entry(&mut card, 9, 0, 0x8427, 3, 2, b"BASLUS-00001TEST");
         entry(&mut card, 2, 0, 0x8427, 3, 2, b".");
         entry(&mut card, 2, 1, 0xa426, 0, 0, b"..");
-        entry(&mut card, 2, 2, 0x8497, 100, 3, b"icon.sys");
+        entry(&mut card, 4, 0, 0x8497, 100, 3, b"icon.sys");
         card[3 * 1024..3 * 1024 + 100].fill(0x5a);
         card
     }
@@ -1202,7 +1207,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("loop.ps2");
         let mut bytes = ps2_inventory_fixture();
-        bytes[9 * 1024 + 3 * 4..9 * 1024 + 4 * 4].copy_from_slice(&0x8000_0003u32.to_le_bytes());
+        bytes[8 * 1024 + 3 * 4..8 * 1024 + 4 * 4].copy_from_slice(&0x8000_0003u32.to_le_bytes());
         fs::write(&path, bytes).unwrap();
         let inv = inspect_memory_card(&path).unwrap();
         let ps2 = inv.ps2_inventory.unwrap();
@@ -1215,7 +1220,7 @@ mod tests {
         );
 
         let mut bytes = ps2_inventory_fixture();
-        let file_entry_offset = (41 + 2) * 1024 + 2 * PS2_DIRECTORY_ENTRY_BYTES;
+        let file_entry_offset = (41 + 4) * 1024;
         bytes[file_entry_offset + 4..file_entry_offset + 8].copy_from_slice(&2000u32.to_le_bytes());
         fs::write(&path, bytes).unwrap();
         let inv = inspect_memory_card(&path).unwrap();
@@ -1233,7 +1238,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.ps2");
         let mut bytes = ps2_inventory_fixture();
-        let offset = 41 * 1024 + 2 * PS2_DIRECTORY_ENTRY_BYTES;
+        let offset = (41 + 9) * 1024;
         bytes[offset + 0x08..offset + 0x10].copy_from_slice(&[0, 0, 0, 25, 0, 13, 0, 0]);
         bytes[offset + 0x40..offset + 0x40 + PS2_NAME_BYTES]
             .copy_from_slice(&[0xff; PS2_NAME_BYTES]);
