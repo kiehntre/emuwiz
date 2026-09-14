@@ -1126,8 +1126,12 @@ mod tests {
         plan.requirements.truncate(1);
         plan.matches.truncate(1);
         plan.actions.truncate(1);
-        plan.requirements[0].target.path = Some(dir.path().join("target").join("mcpx_1.0.bin"));
         let target_root = dir.path().join("target");
+        let target_path = target_root.join("mcpx_1.0.bin");
+        plan.requirements[0].target.path = Some(target_path.clone());
+        if let BiosProjectionAction::CreateFileLink { target, .. } = &mut plan.actions[0] {
+            target.path = Some(target_path);
+        }
         let source_before = fs::read(dir.path().join("mcpx_1.0.bin")).unwrap();
         let transaction = apply_plan(&plan, &target_root, &apply_confirmation(1)).unwrap();
         assert!(target_root.join("mcpx_1.0.bin").is_symlink());
