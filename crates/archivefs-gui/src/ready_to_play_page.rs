@@ -4,6 +4,9 @@
 //! result projected from evidence that has already been gathered elsewhere.
 
 use archivefs_core::diagnostics::DoctorSeverity;
+use archivefs_core::mame_input_requirements::{
+    ArcadeInputRequirement, ArcadeInputRequirementFamily, ArcadeInputRequirements,
+};
 use archivefs_core::ready_to_play::{
     Fixability, ReadinessReason, ReadinessReasonFamily, ReadyToPlayResult, ReadyToPlayState,
 };
@@ -25,11 +28,32 @@ pub(crate) enum ReadyToPlayFilter {
 pub(crate) struct ReadyToPlayPageState {
     pub(crate) filter: ReadyToPlayFilter,
     results: Vec<ReadyToPlayResult>,
+    original_controls: Vec<OriginalControlsView>,
+}
+
+struct OriginalControlsView {
+    item_identity: String,
+    requirements: ArcadeInputRequirements,
 }
 
 impl ReadyToPlayPageState {
     pub(crate) fn set_results(&mut self, results: Vec<ReadyToPlayResult>) {
         self.results = results;
+    }
+
+    /// Supplies already-normalized static MAME metadata for display. This is
+    /// intentionally separate from readiness results and performs no probing.
+    pub(crate) fn set_original_controls(
+        &mut self,
+        controls: Vec<(String, ArcadeInputRequirements)>,
+    ) {
+        self.original_controls = controls
+            .into_iter()
+            .map(|(item_identity, requirements)| OriginalControlsView {
+                item_identity,
+                requirements,
+            })
+            .collect();
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
@@ -79,7 +103,12 @@ impl ReadyToPlayPageState {
             .iter()
             .filter(|result| filter_matches(self.filter, result.state))
         {
-            show_result(ui, result);
+            let controls = self
+                .original_controls
+                .iter()
+                .find(|controls| controls.item_identity == result.item_identity)
+                .map(|controls| &controls.requirements);
+            show_result(ui, result, controls);
         }
     }
 }
@@ -104,7 +133,11 @@ fn show_summary(ui: &mut egui::Ui, results: &[ReadyToPlayResult]) {
     ui.add_space(6.0);
 }
 
-fn show_result(ui: &mut egui::Ui, result: &ReadyToPlayResult) {
+fn show_result(
+    ui: &mut egui::Ui,
+    result: &ReadyToPlayResult,
+    controls: Option<&ArcadeInputRequirements>,
+) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.strong(&result.item_identity);
@@ -122,6 +155,109 @@ fn show_result(ui: &mut egui::Ui, result: &ReadyToPlayResult) {
             for reason in &result.reasons {
                 show_reason(ui, reason);
             }
+        }
+        if let Some(controls) = controls {
+            show_original_controls(ui, controls);
+        }
+    });
+}
+
+fn show_original_controls(ui: &mut egui::Ui, controls: &ArcadeInputRequirements) {
+    ui.separator();
+    ui.collapsing("Original Controls", |ui| {
+        ui.label(
+            "Static metadata describing the original machine; not a hardware compatibility check.",
+        );
+        if let Some(players) = controls.supported_players.as_deref() {
+            ui.label(supported_players_label(players));
+        }
+        if controls.requirements.is_empty() {
+            ui.label("Input metadata not available.");
+            return;
+        }
+        for requirement in &controls.requirements {
+            ui.collapsing(control_summary(requirement), |ui| {
+                ui.label(format!(
+                    "Original machine uses {}.",
+                    family_label_input(requirement.family)
+                ));
+                show_input_technical_details(ui, requirement);
+            });
+        }
+        ui.label(format!("Source: {}", controls.provenance));
+    });
+}
+
+fn supported_players_label(players: &str) -> String {
+    format!("Supports up to {players} players")
+}
+
+fn control_summary(requirement: &ArcadeInputRequirement) -> String {
+    match requirement.family {
+        ArcadeInputRequirementFamily::Buttons => requirement
+            .buttons
+            .as_deref()
+            .map(|buttons| format!("{buttons} buttons"))
+            .unwrap_or_else(|| "Buttons".into()),
+        ArcadeInputRequirementFamily::Digital2Way => "2-way directional controls".into(),
+        ArcadeInputRequirementFamily::Digital4Way => "4-way joystick / directional controls".into(),
+        ArcadeInputRequirementFamily::Digital8Way => "8-way joystick / directional controls".into(),
+        family => family_label_input(family).into(),
+    }
+}
+
+fn family_label_input(family: ArcadeInputRequirementFamily) -> &'static str {
+    match family {
+        ArcadeInputRequirementFamily::DigitalDirections => "directional controls",
+        ArcadeInputRequirementFamily::Digital2Way => "2-way directional controls",
+        ArcadeInputRequirementFamily::Digital4Way => "4-way joystick / directional controls",
+        ArcadeInputRequirementFamily::Digital8Way => "8-way joystick / directional controls",
+        ArcadeInputRequirementFamily::DirectionalOther => "other directional controls",
+        ArcadeInputRequirementFamily::Buttons => "buttons",
+        ArcadeInputRequirementFamily::DualStick => "dual-stick controls",
+        ArcadeInputRequirementFamily::AnalogAxis => "analog control",
+        ArcadeInputRequirementFamily::Pedal => "pedal",
+        ArcadeInputRequirementFamily::RelativePointer => "relative pointer control",
+        ArcadeInputRequirementFamily::AbsolutePointer => "absolute pointer control",
+        ArcadeInputRequirementFamily::LightGun => "light gun",
+        ArcadeInputRequirementFamily::Keyboard => "keyboard",
+        ArcadeInputRequirementFamily::Mouse => "mouse",
+        ArcadeInputRequirementFamily::Trackball => "trackball",
+        ArcadeInputRequirementFamily::DialSpinner => "dial / spinner",
+        ArcadeInputRequirementFamily::PositionalControl => "positional control",
+        ArcadeInputRequirementFamily::SpecialPanel => "special control panel",
+        ArcadeInputRequirementFamily::Unknown => "unknown control type",
+    }
+}
+
+fn show_input_technical_details(ui: &mut egui::Ui, requirement: &ArcadeInputRequirement) {
+    ui.collapsing("Technical details", |ui| {
+        if let Some(value) = requirement.raw_control_type.as_deref() {
+            ui.label(format!("Original control type: {value}"));
+        }
+        if let Some(value) = requirement.player.as_deref() {
+            ui.label(format!("Player: {value}"));
+        }
+        for (label, value) in [
+            ("Buttons", requirement.buttons.as_deref()),
+            ("Required buttons", requirement.reqbuttons.as_deref()),
+            ("Ways", requirement.ways.as_deref()),
+            ("Ways 2", requirement.ways2.as_deref()),
+            ("Ways 3", requirement.ways3.as_deref()),
+            ("Minimum", requirement.minimum.as_deref()),
+            ("Maximum", requirement.maximum.as_deref()),
+            ("Sensitivity", requirement.sensitivity.as_deref()),
+            ("Key delta", requirement.keydelta.as_deref()),
+            ("Reverse", requirement.reverse.as_deref()),
+        ] {
+            if let Some(value) = value {
+                ui.label(format!("{label}: {value}"));
+            }
+        }
+        ui.label(format!("Evidence: {:?}", requirement.evidence_strength));
+        ui.label(format!("Source: {}", requirement.provenance));
+        for (key, value) in &requirement.raw_attributes {
+            ui.label(format!("Raw {key}: {value}"));
         }
     });
 }
@@ -256,5 +392,33 @@ mod tests {
             "EmuWiz can guide you"
         );
         assert_eq!(DoctorSeverity::Warning.label(), "Warning");
+    }
+
+    #[test]
+    fn static_input_labels_preserve_original_machine_context() {
+        assert_eq!(supported_players_label("4"), "Supports up to 4 players");
+        assert_eq!(
+            family_label_input(ArcadeInputRequirementFamily::Trackball),
+            "trackball"
+        );
+        assert_eq!(
+            control_summary(&ArcadeInputRequirement {
+                family: ArcadeInputRequirementFamily::Buttons,
+                buttons: Some("3".into()),
+                ..Default::default()
+            }),
+            "3 buttons"
+        );
+        assert!(!family_label_input(ArcadeInputRequirementFamily::LightGun).contains("need"));
+        assert!(!family_label_input(ArcadeInputRequirementFamily::LightGun).contains("require"));
+    }
+
+    #[test]
+    fn unknown_controls_are_shown_as_unknown_not_missing() {
+        assert_eq!(
+            family_label_input(ArcadeInputRequirementFamily::Unknown),
+            "unknown control type"
+        );
+        assert!(!family_label_input(ArcadeInputRequirementFamily::Unknown).contains("missing"));
     }
 }

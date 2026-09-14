@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dat::{MameControlMetadata, MameInputMetadata};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ArcadeInputRequirementFamily {
     DigitalDirections,
@@ -31,19 +31,21 @@ pub enum ArcadeInputRequirementFamily {
     DialSpinner,
     PositionalControl,
     SpecialPanel,
+    #[default]
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ArcadeInputEvidenceStrength {
     AuthoritativeMachineMetadata,
     NormalizedFromMachineMetadata,
     Heuristic,
+    #[default]
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArcadeInputRequirement {
     pub family: ArcadeInputRequirementFamily,
     pub raw_control_type: Option<String>,
