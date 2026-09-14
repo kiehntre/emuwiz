@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::managed_emulator_install::{
+    ManagedInstallInventoryEntry, enumerate_managed_installations,
+};
+
 pub const MAX_PATH_ENTRIES: usize = 64;
 pub const MAX_VERSION_OUTPUT_BYTES: usize = 16 * 1024;
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -130,6 +134,8 @@ pub struct EmulatorInstallation {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EmulatorInventory {
     pub installations: Vec<EmulatorInstallation>,
+    #[serde(default)]
+    pub managed_installations: Vec<ManagedInstallInventoryEntry>,
     pub warnings: Vec<InventoryWarning>,
 }
 
@@ -250,6 +256,7 @@ pub fn inventory_from_candidates(mut candidates: Vec<InventoryCandidate>) -> Emu
         .collect();
     EmulatorInventory {
         installations,
+        managed_installations: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -324,7 +331,18 @@ pub fn discover_installed_emulators() -> EmulatorInventory {
             }
         }
     }
-    inventory_from_candidates(candidates)
+    let mut inventory = inventory_from_candidates(candidates);
+    if let Ok(data_root) = crate::app_dirs::data_dir() {
+        let managed = enumerate_managed_installations(&data_root);
+        inventory.managed_installations = managed.entries;
+        inventory.warnings.extend(
+            managed
+                .warnings
+                .into_iter()
+                .map(|message| InventoryWarning { message }),
+        );
+    }
+    inventory
 }
 
 #[cfg(test)]

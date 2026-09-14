@@ -13,6 +13,9 @@ use archivefs_core::emulator_update::{
     UpdateExecutionPlan, UpdateJournal, UpdateReport, UpdateResult, UpdateStatus,
     execute_staged_update, plan_staged_update, rollback_staged_update,
 };
+use archivefs_core::managed_emulator_install::{
+    ManagedInstallHealth, ManagedInstallVersionRole, ManagedOwnershipState,
+};
 use eframe::egui;
 
 #[derive(Default)]
@@ -163,7 +166,7 @@ impl EmulatorInventoryPageState {
             ui.label("Inventory has not been scanned yet.");
             return;
         };
-        if inventory.installations.is_empty() {
+        if inventory.installations.is_empty() && inventory.managed_installations.is_empty() {
             ui.label("No supported emulator installations were detected.");
             return;
         }
@@ -226,6 +229,43 @@ impl EmulatorInventoryPageState {
                     ui.end_row();
                 }
             });
+        if !inventory.managed_installations.is_empty() {
+            ui.separator();
+            ui.heading("EmuWiz-managed installations");
+            ui.label("Managed versions are shown separately from external installs. No adoption or update controls are available here.");
+            egui::Grid::new("managed_emulator_inventory_grid")
+                .striped(true)
+                .show(ui, |ui| {
+                    for heading in [
+                        "Emulator",
+                        "Version",
+                        "Channel",
+                        "Status",
+                        "Install root",
+                        "Health",
+                        "Provenance",
+                    ] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+                    for managed in &inventory.managed_installations {
+                        ui.label(&managed.emulator_id);
+                        ui.label(managed.installed_version.as_deref().unwrap_or("Unknown"));
+                        ui.label(managed.channel.map(channel_label).unwrap_or("Unknown"));
+                        ui.label(managed_role_label(managed.role));
+                        ui.label(managed.install_root.display().to_string());
+                        ui.label(managed_health_label(managed.health));
+                        ui.label(match managed.ownership {
+                            ManagedOwnershipState::Managed => "Managed by EmuWiz",
+                            ManagedOwnershipState::BrokenManagedState => {
+                                "Managed record needs review"
+                            }
+                            _ => "Unknown ownership",
+                        });
+                        ui.end_row();
+                    }
+                });
+        }
         let unknown = inventory
             .installations
             .iter()
@@ -439,6 +479,28 @@ fn installation_type_label(kind: InstallationType) -> &'static str {
         InstallationType::Manual => "Manual",
         InstallationType::Managed => "Managed",
         InstallationType::Unknown => "Unknown",
+    }
+}
+
+fn managed_role_label(role: ManagedInstallVersionRole) -> &'static str {
+    match role {
+        ManagedInstallVersionRole::Current => "Current managed version",
+        ManagedInstallVersionRole::Previous => "Previous managed version",
+        ManagedInstallVersionRole::Historical => "Historical managed version",
+        ManagedInstallVersionRole::BrokenReference => "Broken current reference",
+        ManagedInstallVersionRole::Unknown => "Unknown managed status",
+    }
+}
+
+fn managed_health_label(health: ManagedInstallHealth) -> &'static str {
+    match health {
+        ManagedInstallHealth::Healthy => "Healthy",
+        ManagedInstallHealth::StaleManifest => "Managed install changed",
+        ManagedInstallHealth::BrokenManagedState => "Broken managed state",
+        ManagedInstallHealth::MissingExecutable => "Executable missing",
+        ManagedInstallHealth::HashMismatch => "Executable hash mismatch",
+        ManagedInstallHealth::InvalidManifest => "Invalid manifest",
+        ManagedInstallHealth::OutsideManagedRoot => "Outside managed root",
     }
 }
 
