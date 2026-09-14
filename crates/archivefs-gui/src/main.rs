@@ -228,6 +228,7 @@ pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
 mod platform_source_actions;
+pub(crate) mod ready_to_play_page;
 pub(crate) mod storage_health_page;
 use platform_source_actions::*;
 pub(crate) mod playing_library_page;
@@ -2547,6 +2548,8 @@ enum MainView {
     Home,
     NeedsAttention,
     Library,
+    /// Read-only view over already-gathered Ready-to-Play projections.
+    ReadyToPlay,
     RecentlyFound,
     Health,
     Duplicates,
@@ -3203,6 +3206,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Home => "Home",
         MainView::NeedsAttention => "Needs Attention",
         MainView::Library => "Library",
+        MainView::ReadyToPlay => "Ready-to-Play",
         MainView::RecentlyFound => "Recently Found",
         MainView::Health => "Health",
         MainView::Duplicates => "Duplicates",
@@ -3245,6 +3249,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Selected
         | MainView::CheatsMods
         | MainView::Library
+        | MainView::ReadyToPlay
         | MainView::RecentlyFound
         | MainView::Health
         | MainView::Duplicates
@@ -3337,6 +3342,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             // top-down record-card list as Repair History, with no
             // internal `ScrollArea` of its own.
             | MainView::LibraryViewHistory
+            | MainView::ReadyToPlay
             // Library Organisation's plan/preview results list has the same
             // shape as Repair History: a plain top-down list of entry rows
             // with no `ScrollArea` of its own. Without the shared page
@@ -3549,6 +3555,8 @@ struct ArchiveFsApp {
     emulator_setup_page: emulator_setup_page::EmulatorSetupPageState,
     /// Read-only installed emulator version/channel inventory.
     emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState,
+    /// Read-only presentation of the core Ready-to-Play projection.
+    ready_to_play_page: ready_to_play_page::ReadyToPlayPageState,
     /// GUI-only per-emulator executable/configuration-folder overrides for
     /// Emulator Setup remediation controls; see
     /// `emulator_setup_overrides` for exactly which adapter/kind pairs are
@@ -4267,6 +4275,7 @@ impl ArchiveFsApp {
             emulator_setup_focus: None,
             emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
             emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState::default(),
+            ready_to_play_page: ready_to_play_page::ReadyToPlayPageState::default(),
             storage_health_page: storage_health_page::StorageHealthPageState::default(),
             emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::load(),
             tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
@@ -9544,6 +9553,28 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::EmulatorSetup {
                     self.show_emulator_setup_page(ui, context);
+                    return;
+                }
+
+                if self.view == MainView::ReadyToPlay {
+                    let selected_identity = self
+                        .archive_context
+                        .focused
+                        .as_ref()
+                        .map(|path| path.display().to_string());
+                    let live = match &self.state {
+                        LoadState::Ready(data) => Some(data.as_ref()),
+                        _ => None,
+                    };
+                    let results = selected_identity
+                        .map(|identity| {
+                            let input = self.build_launch_readiness_input(live);
+                            launch_readiness_page::ready_to_play_result(&input, identity)
+                        })
+                        .into_iter()
+                        .collect();
+                    self.ready_to_play_page.set_results(results);
+                    self.ready_to_play_page.show(ui);
                     return;
                 }
 

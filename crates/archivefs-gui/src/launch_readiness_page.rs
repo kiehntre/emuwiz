@@ -73,6 +73,10 @@ use archivefs_core::patch_manager::{
     Pcsx2ProfileDiscoveryRoots, resolve_dolphin_native_launch_binding,
     resolve_pcsx2_native_launch_binding,
 };
+use archivefs_core::ready_to_play::{
+    EmulatorEvidenceState, IdentityEvidenceState, MediaEvidenceState, ModEvidenceState,
+    ReadinessEvidenceState, ReadyToPlayEvidence, ReadyToPlayResult, project_ready_to_play,
+};
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
@@ -138,6 +142,73 @@ pub(crate) enum LaunchReadinessInput {
         xenia: Option<XeniaLaunchContext>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
     },
+}
+
+/// Projects the already-built launch-readiness input into the shared
+/// Ready-to-Play view.  This is deliberately a pure adapter: it performs no
+/// discovery and never calls the launch planner.
+pub(crate) fn ready_to_play_result(
+    input: &LaunchReadinessInput,
+    item_identity: impl Into<String>,
+) -> ReadyToPlayResult {
+    let item_identity = item_identity.into();
+    let evidence = match input {
+        LaunchReadinessInput::Plan { plan, .. } => {
+            return project_ready_to_play(&ReadyToPlayEvidence::from_launch_plan(
+                item_identity,
+                plan,
+            ));
+        }
+        LaunchReadinessInput::EvidenceNotLoaded => ReadyToPlayEvidence {
+            item_identity,
+            launch_plan: None,
+            launch_plan_state: ReadinessEvidenceState::NotGathered,
+            identity: IdentityEvidenceState::Unknown,
+            emulator: EmulatorEvidenceState::Unknown,
+            firmware: ReadinessEvidenceState::NotGathered,
+            media: MediaEvidenceState::Unknown,
+            mod_state: ModEvidenceState::Unknown,
+            arcade_dependency_blocked: false,
+            save_state_version_sensitive: false,
+        },
+        LaunchReadinessInput::RetroArchNotScanned => ReadyToPlayEvidence {
+            item_identity,
+            launch_plan: None,
+            launch_plan_state: ReadinessEvidenceState::NotGathered,
+            identity: IdentityEvidenceState::Unknown,
+            emulator: EmulatorEvidenceState::Unknown,
+            firmware: ReadinessEvidenceState::Gathered,
+            media: MediaEvidenceState::NotApplicable,
+            mod_state: ModEvidenceState::None,
+            arcade_dependency_blocked: false,
+            save_state_version_sensitive: false,
+        },
+        LaunchReadinessInput::IdentityUnknown => ReadyToPlayEvidence {
+            item_identity,
+            launch_plan: None,
+            launch_plan_state: ReadinessEvidenceState::Gathered,
+            identity: IdentityEvidenceState::Unknown,
+            emulator: EmulatorEvidenceState::Unknown,
+            firmware: ReadinessEvidenceState::Gathered,
+            media: MediaEvidenceState::NotApplicable,
+            mod_state: ModEvidenceState::None,
+            arcade_dependency_blocked: false,
+            save_state_version_sensitive: false,
+        },
+        LaunchReadinessInput::IdentityConflicting => ReadyToPlayEvidence {
+            item_identity,
+            launch_plan: None,
+            launch_plan_state: ReadinessEvidenceState::Gathered,
+            identity: IdentityEvidenceState::Conflicting,
+            emulator: EmulatorEvidenceState::Unknown,
+            firmware: ReadinessEvidenceState::Gathered,
+            media: MediaEvidenceState::NotApplicable,
+            mod_state: ModEvidenceState::None,
+            arcade_dependency_blocked: false,
+            save_state_version_sensitive: false,
+        },
+    };
+    project_ready_to_play(&evidence)
 }
 
 /// A navigation request from the read-only launch-readiness presentation.
