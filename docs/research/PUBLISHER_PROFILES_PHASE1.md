@@ -1,6 +1,6 @@
-# Universal Library Publisher Profiles — Phase 1 (read-only planning)
+# Universal Library Publisher Profiles — Phase 1 and Phase 2C status
 
-Post-0.9.0 feature work. Phase 1 is **preview only**: no file is created, hardlinked, symlinked, copied, renamed, or deleted anywhere in `archivefs_core::publisher_profile` or its GUI page, and no frontend configuration file (`es_systems.xml`, RomM API calls, etc.) is ever written. See §9 for the structural proof.
+Post-0.9.0 feature work. Phase 1 planning remains preview-only. Phase 2C adds an explicit, typed-confirmation GUI Apply/Rollback path for the proven hardlink/symlink transaction foundation; no frontend configuration file (`es_systems.xml`, RomM API calls, etc.) is ever written. See §9 for the planning-side structural proof.
 
 ## 1. Inventory of existing organisation/publishing code (before writing anything new)
 
@@ -175,9 +175,9 @@ Plus two determinism tests (§13) and the two zero-side-effect tests (§9).
 
 ## 14. GUI (task section 19)
 
-`crates/archivefs-gui/src/publisher_profile_page.rs`: a target-profile picker (plain-language "Create a RomM-ready library" / "Create an ES-DE-ready library" per task section 20), a destination-root and canonical-platform-id input, a "Preview plan" button, the exact `Ready`/`Already present`/`Review required`/`Blocked`/`Unsupported` filter set, an "Advanced" toggle revealing slug/canonical-platform/action/destination-path detail, and the required "PREVIEW ONLY — nothing will be changed." banner. **There is no Apply/Publish button anywhere in this file.** 6 focused tests cover the page's own state/filter logic (`preview()` error paths, RomM/ES-DE resolution, filter partitioning) — the same testing style this codebase's other GUI pages already use (state-logic tests, not simulated egui clicks).
+`crates/archivefs-gui/src/publisher_profile_page.rs`: a target-profile picker (plain-language "Create a RomM-ready library" / "Create an ES-DE-ready library" per task section 20), a destination-root and canonical-platform-id input, a "Preview plan" button, the exact `Ready`/`Already present`/`Review required`/`Blocked`/`Unsupported` filter set, an "Advanced" toggle revealing slug/canonical-platform/action/destination-path detail, execution review, explicit HARDLINK/SYMLINK explanations, typed `PUBLISH N ITEMS` confirmation, result reporting, and typed `ROLL BACK N ITEMS` confirmation. COPY is not offered; execution delegates to the core publisher adapter and shared journaled transaction engine.
 
-The page is now reachable as **Library → Publisher / Frontend Library** in the normal Advanced View sidebar. The page routes as its own `MainView::PublisherProfiles`, has selected-state highlighting, uses the shared page-scroll policy, and returns to **Library Organisation** through its explicit handoff when no 1G1R plan is available. It receives only the already-built `PlayingLibraryPlan` retained by the existing Library Organisation page; it never creates a second source-election flow. The profile cards read **Create a RomM-ready library** and **Create an ES-DE-ready library**, with plain-language descriptions.
+The page is reachable as **Library → Publisher / Frontend Library** in the normal Advanced View sidebar. The page routes as its own `MainView::PublisherProfiles`, has selected-state highlighting, uses the shared page-scroll policy, and returns to **Library Organisation** through its explicit handoff when no 1G1R plan is available. It receives only the already-built `PlayingLibraryPlan` retained by the existing Library Organisation page; it never creates a second source-election flow. The profile cards read **Create a RomM-ready library** and **Create an ES-DE-ready library**, with plain-language descriptions. Phase 2C adds explicit execution review, mode selection, typed Apply confirmation, result, and rollback to this same page.
 
 The destination root is an explicitly entered preview root. When a preview is requested, the planner passes that same root to its optional read-only inspection path, classifying existing destinations as missing, already correct, conflicting, stale, or unknown. It never creates the root. The summary and filters are rendered from the single plan result, and selecting **Details** shows title, canonical platform, target, source/destination paths, planned future action, mapping, media-set companion count, warnings, conflicts, and safety.
 
@@ -195,9 +195,18 @@ The bounded platform sample uses the representative systems available in the col
 
 RomM and ES-DE therefore differ for the three RomM mapping gaps; ES-DE has reviewed folders for all nine representative systems. Synthetic planner and destination-inspection tests cover mapped/unmapped, exact/case-fold collisions, already-correct destinations, stale destinations, and conflicting existing content.
 
-GUI smoke verification was performed at the state/render-test level: the page route, profile labels, preview-only banner, filters, detail selection, empty/degraded handoff, and no-apply surface compile and are covered by focused tests. A full Xvfb click-through was not available in this environment, so actual mouse automation and visual no-crash startup were not claimed. `cargo check --workspace` is run with a temporary target directory because this checkout's tracked build target is mounted read-only.
+GUI smoke verification was performed at the state/render-test level: the page
+route, profile labels, preview and execution review, explicit mode selection,
+typed confirmation/result/rollback surfaces, filters, detail selection, and
+empty/degraded handoff are covered by focused tests. The built application was
+also launched on the existing `DISPLAY=:0` under a bounded timeout without a
+crash. A full Xvfb mouse click-through was unavailable because the requested
+display was already occupied, so click automation remains
+`BLOCKED-BY-ENVIRONMENT`. `cargo check --workspace` is run with a temporary
+target directory because this checkout's tracked build target is mounted
+read-only.
 
-## 16. Phase 2A/2B execution boundary
+## 16. Phase 2A/2B/2C execution boundary
 
 Phase 2A/2B now has an explicit, core-only transaction foundation. It converts
 only `SafeToAct` items back into `LinkedLibraryOperation`s and reuses
@@ -224,9 +233,15 @@ presence, and destination state are rechecked before an executable transaction
 is produced or applied. Existing correct links are excluded; wrong links,
 broken links, ordinary files, stale plans, and root changes fail closed.
 
-The publisher apply helper is deliberately not wired to the GUI. Copy,
-reflink, BIOS projection, metadata/configuration, playlists, confirmation UI,
-rollback UI, and any GUI Apply button are Phase 2C/future work.
+Phase 2C wires the explicit core apply and rollback helpers to this existing
+page. Apply is disabled until a fresh transaction can be rebuilt for the
+current plan, root, selected mode, and exact typed `PUBLISH N ITEMS`
+confirmation. Any stale plan, changed source/destination, collision, or
+unavailable hardlink fails closed and requests a fresh review. Results retain
+the shared transaction identifier and state; rollback requires the exact typed
+`ROLL BACK N ITEMS` phrase and removes only confirmed transaction-created
+destination links and empty directories. Copy, reflink, BIOS projection,
+metadata/configuration, playlists, and GUI cancellation remain future work.
 
 ## 17. Why Phase 1 still defaults to Symlink
 

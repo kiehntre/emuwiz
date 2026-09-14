@@ -5658,7 +5658,7 @@ impl ArchiveFsApp {
         let page = self
             .publisher_profile_page
             .get_or_insert_with(publisher_profile_page::PublisherProfilePageState::default);
-        page.source_plan = source_plan;
+        page.set_source_plan(source_plan);
         if let Some(action) = publisher_profile_page::show_publisher_profile_page(ui, page) {
             match action {
                 publisher_profile_page::PublisherProfilePageAction::OpenLibraryOrganisation => {
