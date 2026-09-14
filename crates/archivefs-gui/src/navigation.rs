@@ -20,7 +20,7 @@ use super::*;
 // those tests assert against; `--all-targets` clippy's non-test pass does
 // not see that usage.
 #[allow(dead_code)]
-pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 25] = [
+pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 26] = [
     (MainView::Home, "Home"),
     (MainView::NeedsAttention, "Needs Attention"),
     (MainView::Mount, "Mount"),
@@ -33,6 +33,7 @@ pub(crate) const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 25] = [
     (MainView::DiscConversion, "Disc Conversion"),
     (MainView::EmulatorSetup, "Emulator Setup"),
     (MainView::EmulatorInventory, "Emulator Manager"),
+    (MainView::BiosProjection, "BIOS / Firmware"),
     (MainView::LibraryViewHistory, "Library View History"),
     (MainView::DatSources, "DAT Sources"),
     (MainView::MediaSets, "Media Sets"),
@@ -238,6 +239,7 @@ pub(crate) const ADVANCED_NAV_GROUPS: &[NavGroup] = &[
             nav_view(MainView::DiscConversion, "Disc Conversion"),
             nav_view(MainView::EmulatorSetup, "Emulator Setup"),
             nav_view(MainView::EmulatorInventory, "Emulator Manager"),
+            nav_view(MainView::BiosProjection, "BIOS / Firmware"),
             nav_romm("RomM"),
         ],
     },

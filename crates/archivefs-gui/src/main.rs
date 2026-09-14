@@ -156,6 +156,7 @@ use cheats_mods_preview::*;
 mod cheat_reconciliation_review;
 mod cheatbase_page;
 #[allow(dead_code)]
+mod bios_projection_page;
 mod emulator_download_page;
 mod emulator_setup;
 use emulator_setup::*;
@@ -2640,6 +2641,8 @@ enum MainView {
     EmulatorSetup,
     /// Read-only inventory of installed emulator versions and channels.
     EmulatorInventory,
+    /// Read-only master BIOS inventory and emulator projection planner.
+    BiosProjection,
     /// Curated, read-only collection view backed by the loaded catalogue and
     /// existing evidence/artwork state.
     Museum,
@@ -3228,6 +3231,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::TapeInspector => "Tape Inspector",
         MainView::EmulatorSetup => "Emulator Setup",
         MainView::EmulatorInventory => "Emulator Manager",
+        MainView::BiosProjection => "BIOS / Firmware",
         MainView::Museum => "Museum",
         MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
@@ -3271,6 +3275,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::TapeInspector
         | MainView::EmulatorSetup
         | MainView::EmulatorInventory
+        | MainView::BiosProjection
         | MainView::DatSources
         | MainView::MediaSets
         | MainView::Doctor
@@ -3351,6 +3356,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             // controls.
             | MainView::CanonicalOrganisation
             | MainView::PublisherProfiles
+            | MainView::BiosProjection
     )
 }
 
@@ -3555,6 +3561,8 @@ struct ArchiveFsApp {
     emulator_setup_page: emulator_setup_page::EmulatorSetupPageState,
     /// Read-only installed emulator version/channel inventory.
     emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState,
+    /// Read-only master BIOS inventory and projection planning.
+    bios_projection_page: bios_projection_page::BiosProjectionPageState,
     /// Read-only presentation of the core Ready-to-Play projection.
     ready_to_play_page: ready_to_play_page::ReadyToPlayPageState,
     /// GUI-only per-emulator executable/configuration-folder overrides for
@@ -4275,6 +4283,7 @@ impl ArchiveFsApp {
             emulator_setup_focus: None,
             emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
             emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState::default(),
+            bios_projection_page: bios_projection_page::BiosProjectionPageState::default(),
             ready_to_play_page: ready_to_play_page::ReadyToPlayPageState::default(),
             storage_health_page: storage_health_page::StorageHealthPageState::default(),
             emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::load(),
@@ -9583,6 +9592,11 @@ impl ArchiveFsApp {
                         || self.launch_pcsx2.is_active()
                         || self.launch_standalone.is_active();
                     self.emulator_inventory_page.show(ui, emulator_running);
+                    return;
+                }
+
+                if self.view == MainView::BiosProjection {
+                    self.bios_projection_page.show(ui);
                     return;
                 }
 

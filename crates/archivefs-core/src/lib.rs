@@ -37,6 +37,8 @@ pub mod atari_tape;
 pub mod attention;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
+/// Read-only master BIOS inventory and emulator projection planning.
+pub mod bios_projection;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
