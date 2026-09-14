@@ -301,17 +301,14 @@ impl PublisherProfilePageState {
             self.execution_stage = PublisherExecutionStage::Failed;
             return;
         }
+        let Some(mut transaction) = self.execution_transaction.take() else {
+            self.execution_error = Some("Review the publisher transaction before applying.".into());
+            self.execution_stage = PublisherExecutionStage::Failed;
+            return;
+        };
         self.execution_stage = PublisherExecutionStage::Applying;
-        let mut transaction =
-            match build_publisher_transaction_with_policy(&plan, self.preview_generation, mode) {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    self.execution_error = Some(publisher_execution_error_text(&error));
-                    self.execution_stage = PublisherExecutionStage::Failed;
-                    return;
-                }
-            };
         if let Err(error) = std::fs::create_dir_all(journal_dir) {
+            self.execution_transaction = Some(transaction);
             self.execution_error = Some(format!("Could not prepare transaction journal: {error}"));
             self.execution_stage = PublisherExecutionStage::Failed;
             return;

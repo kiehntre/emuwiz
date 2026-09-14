@@ -222,6 +222,34 @@ fn gui_hardlink_path_applies_and_rolls_back_without_touching_source() {
 }
 
 #[test]
+fn gui_apply_refuses_a_replaced_destination_root_before_any_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("Game.rom");
+    let destination = temp.path().join("published");
+    let journal = temp.path().join("journal");
+    std::fs::write(&source, b"root replacement source").unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let mut state = executable_state(&source, &destination);
+    state.link_mode = Some(archivefs_core::publisher_profile::PublisherLinkMode::Symlink);
+    state.execution_review();
+    state.confirmation_text = state.apply_confirmation_phrase().unwrap();
+
+    std::fs::remove_dir(&destination).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    state.apply_with_journal_dir(&journal);
+
+    assert_eq!(state.execution_stage, PublisherExecutionStage::Failed);
+    assert!(
+        state
+            .execution_error
+            .as_deref()
+            .is_some_and(|error| error.contains("destination root changed"))
+    );
+    assert!(!destination.join("roms").exists());
+    assert_eq!(std::fs::read(&source).unwrap(), b"root replacement source");
+}
+
+#[test]
 fn gui_symlink_path_applies_and_rolls_back_without_touching_source() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("Game.rom");
