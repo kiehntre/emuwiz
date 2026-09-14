@@ -703,6 +703,7 @@ fn emit_game(
             source_file: None,
             comment: None,
             original_metadata: DatOriginalMetadata::default(),
+            mame_input: None,
             content_classification: DatContentClassification::unknown(),
             // Fail-closed for set completeness (see `DatGameEntry::unsupported_structure`):
             // this parser does not currently detect ClrMamePro `disk (...)`,

@@ -1,5 +1,6 @@
 //! Bounded streaming parser for current `mame -listxml` output.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -10,6 +11,7 @@ use quick_xml::events::Event;
 use crate::dat::classification::{DatContentClassification, DatOriginalMetadata};
 use crate::dat::hash::{normalise_crc32, normalise_md5, normalise_sha1};
 use crate::dat::limits::DatLimits;
+use crate::dat::mame_input_metadata::{MameControlMetadata, MameInputMetadata};
 use crate::dat::model::{
     DatDeviceRefEntry, DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy,
     DatRomEntry, DatSource, ParsedDat,
@@ -228,6 +230,7 @@ struct Machine {
     runnable: Option<String>,
     source_file: Option<String>,
     metadata: DatOriginalMetadata,
+    mame_input: Option<MameInputMetadata>,
     roms: Vec<DatRomEntry>,
     disks: Vec<DatDiskEntry>,
     device_refs: Vec<DatDeviceRefEntry>,
@@ -275,6 +278,7 @@ impl Machine {
             manufacturer: self.manufacturer,
             source_file: self.source_file,
             original_metadata: self.metadata,
+            mame_input: self.mame_input,
             content_classification: DatContentClassification::unknown(),
             ..Default::default()
         })
@@ -357,7 +361,20 @@ fn handle_empty_like(
                 m.metadata.fields.insert("driver.status".into(), status);
             }
         }
-        "slot" | "slotoption" | "chip" | "display" | "sound" | "input" | "dipswitch" => {
+        "input" => {
+            let input = MameInputMetadata::from_raw(raw_attributes(e, limits)?);
+            if m.mame_input.is_none() {
+                m.mame_input = Some(input);
+            }
+        }
+        "control" => {
+            let control = MameControlMetadata::from_raw(raw_attributes(e, limits)?);
+            m.mame_input
+                .get_or_insert_with(Default::default)
+                .controls
+                .push(control);
+        }
+        "slot" | "slotoption" | "chip" | "display" | "sound" | "dipswitch" => {
             let key = format!("mame.{tag}");
             m.metadata
                 .fields
@@ -367,6 +384,44 @@ fn handle_empty_like(
         _ => {}
     }
     Ok(())
+}
+
+const MAX_RAW_MAME_ATTRIBUTES: usize = 64;
+
+fn raw_attributes(
+    e: &quick_xml::events::BytesStart<'_>,
+    limits: &DatLimits,
+) -> Result<BTreeMap<String, String>, ParseError> {
+    let mut attributes = BTreeMap::new();
+    for attribute in e.attributes() {
+        if attributes.len() >= MAX_RAW_MAME_ATTRIBUTES {
+            return Err(ParseError::MalformedXml {
+                detail: format!("too many attributes on MAME <{}> element", tag(e)?),
+                byte_offset: None,
+            });
+        }
+        let attribute = attribute.map_err(|error| ParseError::MalformedXml {
+            detail: error.to_string(),
+            byte_offset: None,
+        })?;
+        let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|error| {
+            ParseError::MalformedXml {
+                detail: error.to_string(),
+                byte_offset: None,
+            }
+        })?;
+        let value = attribute
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|error| ParseError::MalformedXml {
+                detail: error.to_string(),
+                byte_offset: None,
+            })?;
+        attributes.insert(
+            name.to_ascii_lowercase(),
+            bounded(&value, limits.max_description_length)?,
+        );
+    }
+    Ok(attributes)
 }
 
 #[cfg(test)]
@@ -462,5 +517,45 @@ mod tests {
             parse_mame_listxml(&path, limits),
             Err(ParseError::FileTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn preserves_raw_input_and_control_metadata_without_fake_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = r#"<mame><machine name="inputs"><input players="2" coins="3" service="yes" tilt="no" custom_input="future"><control type="joy" player="1" buttons="3" reqbuttons="2" ways="4" sensitivity="80" keydelta="10" reverse="yes"/><control type="future-control" player="2" buttons="1" ways="vertical2" ways2="horizontal2" ways3="custom" minimum="0" maximum="255"/></input></machine></mame>"#;
+        let path = write(dir.path(), "input.xml", xml);
+        let outcome = parse_mame_listxml(&path, DatLimits::default()).unwrap();
+        let game = &outcome.dat.games[0];
+        let input = game.mame_input.as_ref().unwrap();
+        assert_eq!(input.players.as_deref(), Some("2"));
+        assert_eq!(input.coins.as_deref(), Some("3"));
+        assert_eq!(input.service.as_deref(), Some("yes"));
+        assert_eq!(input.tilt.as_deref(), Some("no"));
+        assert_eq!(input.raw_attributes["custom_input"], "future");
+        assert_eq!(input.controls.len(), 2);
+        assert_eq!(input.controls[0].control_type.as_deref(), Some("joy"));
+        assert_eq!(input.controls[0].reqbuttons.as_deref(), Some("2"));
+        assert_eq!(input.controls[0].ways.as_deref(), Some("4"));
+        assert_eq!(input.controls[0].reverse.as_deref(), Some("yes"));
+        assert_eq!(
+            input.controls[1].control_type.as_deref(),
+            Some("future-control")
+        );
+        assert_eq!(input.controls[1].ways.as_deref(), Some("vertical2"));
+        assert_eq!(input.controls[1].ways2.as_deref(), Some("horizontal2"));
+        assert_eq!(input.controls[1].ways3.as_deref(), Some("custom"));
+        assert_eq!(input.controls[1].minimum.as_deref(), Some("0"));
+        assert_eq!(input.controls[1].maximum.as_deref(), Some("255"));
+        assert_eq!(input.controls[1].reqbuttons, None);
+        assert_eq!(input.controls[1].raw_attributes["type"], "future-control");
+        assert!(!game.original_metadata.fields.contains_key("mame.input"));
+    }
+
+    #[test]
+    fn input_metadata_is_optional_and_old_entries_can_deserialize() {
+        let old_json = r#"{"name":"old","description":null,"roms":[],"clone_of":null,"sample_of":null,"board":null,"rebuild_to":null,"year":null,"manufacturer":null,"source_file":null,"comment":null,"original_metadata":{"fields":{"mame.input":""}},"content_classification":{"class":"unknown","confidence":"none","evidence":[],"classifier_version":"old"},"unsupported_structure":false}"#;
+        let game: DatGameEntry = serde_json::from_str(old_json).unwrap();
+        assert_eq!(game.mame_input, None);
+        assert_eq!(game.original_metadata.fields["mame.input"], "");
     }
 }

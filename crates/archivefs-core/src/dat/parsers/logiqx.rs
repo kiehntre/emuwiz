@@ -1437,6 +1437,7 @@ fn drop_current_game(
             source_file: None,
             comment: None,
             original_metadata: std::mem::take(metadata),
+            mame_input: None,
             content_classification: DatContentClassification::unknown(),
             unsupported_structure: had_unsupported_structure,
         });

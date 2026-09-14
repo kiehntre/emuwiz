@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::classification::{DatContentClassification, DatOriginalMetadata};
+use super::mame_input_metadata::MameInputMetadata;
 
 /// Which ecosystem a DAT file represents.
 ///
@@ -381,6 +382,10 @@ pub struct DatGameEntry {
     /// Structured upstream fields retained verbatim for technical review.
     #[serde(default)]
     pub original_metadata: DatOriginalMetadata,
+    /// Optional raw static input evidence emitted by the MAME listxml parser.
+    /// This is deliberately MAME-specific and is not a controller requirement.
+    #[serde(default)]
+    pub mame_input: Option<MameInputMetadata>,
     /// Derived EmuWiz annotation. Never changes upstream identity semantics.
     #[serde(default)]
     pub content_classification: DatContentClassification,

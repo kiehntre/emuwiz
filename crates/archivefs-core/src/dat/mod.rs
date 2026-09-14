@@ -49,6 +49,7 @@ pub mod index;
 pub mod library_identity_projection;
 pub mod library_identity_summary;
 pub mod limits;
+pub mod mame_input_metadata;
 pub mod managed_sources;
 pub mod model;
 /// Neo Geo MVS/AES multi-ROM set coherence: a thin, read-only projection
@@ -68,3 +69,5 @@ pub mod sources;
 pub mod tosec_release_pack;
 pub mod trusted_dtd;
 pub mod updates;
+
+pub use mame_input_metadata::{MameControlMetadata, MameInputMetadata};
