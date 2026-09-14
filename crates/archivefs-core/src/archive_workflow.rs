@@ -330,8 +330,8 @@ fn parse_external_entries(
     };
     let mut entries = Vec::new();
     let mut current = std::collections::BTreeMap::<String, String>::new();
-    let mut flush = |fields: &mut std::collections::BTreeMap<String, String>,
-                     entries: &mut Vec<ExternalEntry>|
+    let flush = |fields: &mut std::collections::BTreeMap<String, String>,
+                 entries: &mut Vec<ExternalEntry>|
      -> Result<(), ArchiveEligibility> {
         let Some(path) = fields.remove(path_key) else {
             fields.clear();
@@ -590,7 +590,9 @@ fn extract_external(plan: &ArchivePlan) -> Result<ArchiveOperationResult, String
             ArchiveFormat::SevenZ => {
                 command.args(["x", "-y", "-p-", "-sccUTF-8"]);
             }
-            ArchiveFormat::Rar => command.args(["x", "-y", "-p-"]),
+            ArchiveFormat::Rar => {
+                command.args(["x", "-y", "-p-"]);
+            }
             ArchiveFormat::Zip => return Err("wrong external format".into()),
         }
         if plan.format == ArchiveFormat::SevenZ {
