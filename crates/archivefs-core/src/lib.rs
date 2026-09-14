@@ -30,6 +30,8 @@ pub mod amiga_whdload_archive;
 pub mod arcade_mame_compatibility;
 /// Read-only per-set compatibility against an explicitly pinned FBNeo source.
 pub mod arcade_fbneo_compatibility;
+/// Read-only orchestration of independent MAME and FBNeo compatibility results.
+pub mod arcade_compatibility;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
