@@ -192,6 +192,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist safe deterministic non-archive scanner outcomes",
         sql: include_str!("migrations/0016_non_archive_fingerprints.sql"),
     },
+    Migration {
+        version: 17,
+        description: "persist an explicit source role without changing scan routing",
+        sql: include_str!("migrations/0017_source_roles.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -435,6 +440,67 @@ impl Database {
         self.connection
             .close()
             .map_err(|(_, error)| ArchiveFsError::Database(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod source_role_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn every_source_role_has_stable_storage_and_label() {
+        let roles = [
+            SourceRole::Games,
+            SourceRole::ArcadeRomset,
+            SourceRole::BiosFirmware,
+            SourceRole::SaveData,
+            SourceRole::MemoryCards,
+            SourceRole::EmulatorConfig,
+            SourceRole::DatMetadata,
+            SourceRole::ArtworkMedia,
+            SourceRole::IncomingUnsorted,
+            SourceRole::GenericFiles,
+            SourceRole::Ignored,
+        ];
+        for role in roles {
+            assert_eq!(SourceRole::from_db_str(role.as_db_str()), role);
+            assert!(!role.label().is_empty());
+        }
+        assert_eq!(SourceRole::from_db_str("future_role"), SourceRole::Unknown);
+        assert_eq!(SourceRole::Unknown.as_db_str(), "unknown");
+    }
+
+    #[test]
+    fn source_role_defaults_and_round_trips_without_changing_scan_behavior() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-source-role-test-{}-{}",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("library.sqlite3");
+        let source = root.join("games");
+        let child = source.join("mame");
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let registered = database
+            .register_source_folders(&[source.clone(), child.clone()])
+            .unwrap();
+        assert_eq!(registered[0].role, SourceRole::Games);
+        assert_eq!(registered[1].role, SourceRole::Games);
+        assert_eq!(registered[0].excluded_source_roots, vec![child.clone()]);
+        assert!(registered[1].excluded_source_roots.is_empty());
+
+        database
+            .set_source_role(&child, SourceRole::ArcadeRomset)
+            .unwrap();
+        let rows = database.list_source_folders().unwrap();
+        assert_eq!(rows[0].role, SourceRole::Games);
+        assert_eq!(rows[1].role, SourceRole::ArcadeRomset);
+
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -1476,9 +1542,89 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 pub struct RegisteredSourceFolder {
     pub id: i64,
     pub path: PathBuf,
+    pub role: SourceRole,
     pub assigned_platform: Option<String>,
     /// Explicit child roots to shadow during this folder's traversal.
     pub excluded_source_roots: Vec<PathBuf>,
+}
+
+/// The explicit subsystem role of a configured source folder. Roles are
+/// descriptive in SR1: they are persisted and displayed, but do not yet
+/// change which scanner traverses a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceRole {
+    Games,
+    ArcadeRomset,
+    BiosFirmware,
+    SaveData,
+    MemoryCards,
+    EmulatorConfig,
+    DatMetadata,
+    ArtworkMedia,
+    IncomingUnsorted,
+    GenericFiles,
+    Ignored,
+    Unknown,
+}
+
+impl Default for SourceRole {
+    fn default() -> Self {
+        Self::Games
+    }
+}
+
+impl SourceRole {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Games => "games",
+            Self::ArcadeRomset => "arcade_romset",
+            Self::BiosFirmware => "bios_firmware",
+            Self::SaveData => "save_data",
+            Self::MemoryCards => "memory_cards",
+            Self::EmulatorConfig => "emulator_config",
+            Self::DatMetadata => "dat_metadata",
+            Self::ArtworkMedia => "artwork_media",
+            Self::IncomingUnsorted => "incoming_unsorted",
+            Self::GenericFiles => "generic_files",
+            Self::Ignored => "ignored",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "games" => Self::Games,
+            "arcade_romset" => Self::ArcadeRomset,
+            "bios_firmware" => Self::BiosFirmware,
+            "save_data" => Self::SaveData,
+            "memory_cards" => Self::MemoryCards,
+            "emulator_config" => Self::EmulatorConfig,
+            "dat_metadata" => Self::DatMetadata,
+            "artwork_media" => Self::ArtworkMedia,
+            "incoming_unsorted" => Self::IncomingUnsorted,
+            "generic_files" => Self::GenericFiles,
+            "ignored" => Self::Ignored,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Games => "Games",
+            Self::ArcadeRomset => "Arcade ROMset",
+            Self::BiosFirmware => "BIOS / Firmware",
+            Self::SaveData => "Save Data",
+            Self::MemoryCards => "Memory Cards",
+            Self::EmulatorConfig => "Emulator Config",
+            Self::DatMetadata => "DAT / Metadata",
+            Self::ArtworkMedia => "Artwork / Media",
+            Self::IncomingUnsorted => "Incoming / Unsorted",
+            Self::GenericFiles => "Generic Files",
+            Self::Ignored => "Ignored",
+            Self::Unknown => "Unknown",
+        }
+    }
 }
 
 /// Whether the most recent scan attempt of one source folder succeeded or
@@ -1520,6 +1666,7 @@ impl SourceScanStatus {
 pub struct SourceFolderRecord {
     pub id: i64,
     pub path: PathBuf,
+    pub role: SourceRole,
     pub first_seen_at: String,
     pub last_scan_status: Option<SourceScanStatus>,
     pub last_scan_error: Option<String>,
@@ -2493,6 +2640,16 @@ impl Database {
             registered.push(RegisteredSourceFolder {
                 id,
                 path: path.clone(),
+                role: tx
+                    .query_row(
+                        "SELECT source_role FROM source_folders WHERE id = ?1",
+                        params![id],
+                        |row| {
+                            let value: String = row.get(0)?;
+                            Ok(SourceRole::from_db_str(&value))
+                        },
+                    )
+                    .map_err(|error| db_error("failed to read source role", error))?,
                 assigned_platform: tx
                     .query_row(
                         "SELECT assigned_platform FROM source_folders WHERE id = ?1",
@@ -2546,7 +2703,7 @@ impl Database {
             .connection
             .prepare(
                 "SELECT sf.id, sf.path, sf.first_seen_at, sf.last_scan_status, sf.last_scan_error, \
-                 sf.last_scan_at, sf.last_successful_scan_at, sf.last_archive_count, sf.assigned_platform, \
+                 sf.last_scan_at, sf.last_successful_scan_at, sf.last_archive_count, sf.assigned_platform, sf.source_role, \
                  (SELECT COUNT(*) FROM archives a LEFT JOIN platform_assignments pa ON pa.archive_id = a.id \
                   WHERE a.source_folder_id = sf.id AND a.last_verified_missing_at IS NULL AND pa.platform IS NULL) \
                  FROM source_folders sf WHERE sf.removed_from_config_at IS NULL \
@@ -2561,6 +2718,7 @@ impl Database {
                 Ok(SourceFolderRecord {
                     id: row.get(0)?,
                     path: PathBuf::from(OsString::from_vec(path_bytes)),
+                    role: SourceRole::from_db_str(&row.get::<_, String>(9)?),
                     first_seen_at: row.get(2)?,
                     last_scan_status: status
                         .and_then(|status| SourceScanStatus::from_db_str(&status)),
@@ -2569,7 +2727,7 @@ impl Database {
                     last_successful_scan_at: row.get(6)?,
                     last_archive_count: row.get(7)?,
                     assigned_platform: row.get(8)?,
-                    unknown_archive_count: row.get(9)?,
+                    unknown_archive_count: row.get(10)?,
                 })
             })
             .map_err(|error| db_error("failed to list source folders", error))?
@@ -2594,6 +2752,26 @@ impl Database {
                 params![source_path.as_os_str().as_bytes(), platform],
             )
             .map_err(|error| db_error("failed to save source platform assignment", error))?;
+        if changed == 0 {
+            return Err(ArchiveFsError::Database(format!(
+                "source folder {} is not registered",
+                source_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Persists an explicit source role. This is metadata only in SR1: the
+    /// scan entry points intentionally do not consult it yet.
+    pub fn set_source_role(&mut self, source_path: &Path, role: SourceRole) -> Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE source_folders SET source_role = ?2 \
+                 WHERE path = ?1 AND removed_from_config_at IS NULL",
+                params![source_path.as_os_str().as_bytes(), role.as_db_str()],
+            )
+            .map_err(|error| db_error("failed to save source role", error))?;
         if changed == 0 {
             return Err(ArchiveFsError::Database(format!(
                 "source folder {} is not registered",

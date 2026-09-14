@@ -7,6 +7,7 @@ fn folder(id: i64, path: PathBuf) -> SourceFolderRecord {
     SourceFolderRecord {
         id,
         path,
+        role: Default::default(),
         first_seen_at: "now".into(),
         last_scan_status: None,
         last_scan_error: None,

@@ -1403,6 +1403,9 @@ pub(super) fn show_sources_page_with_mount_root(
                                         .unwrap_or_else(|| "No scan results yet".to_string()),
                                 );
                                 ui.end_row();
+                                ui.weak("Role:");
+                                ui.label(view.role.label());
+                                ui.end_row();
                                 ui.weak("Last scan:");
                                 ui.label(view.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
                                 ui.end_row();

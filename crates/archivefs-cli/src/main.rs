@@ -3499,6 +3499,7 @@ fn format_source_folder_views(views: &[SourceFolderView]) -> String {
     }
     for view in views {
         output.push_str(&format!("{}\n", view.path.display()));
+        output.push_str(&format!("  Role:             {}\n", view.role.label()));
         output.push_str(&format!(
             "  Id:               {}\n",
             view.id

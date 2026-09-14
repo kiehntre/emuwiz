@@ -1569,6 +1569,7 @@ fn cached_snapshot_with_completed_scan(archives: Vec<PersistedArchive>) -> Cache
 fn source_view_fixture(id: i64, path: &str, enabled: bool) -> SourceFolderView {
     SourceFolderView {
         path: PathBuf::from(path),
+        role: Default::default(),
         enabled,
         created_at: None,
         id: Some(id),
@@ -1907,6 +1908,7 @@ fn three_source_views() -> Vec<SourceFolderView> {
     vec![
         SourceFolderView {
             path: PathBuf::from("/home/davedap/Archives"),
+            role: Default::default(),
             enabled: true,
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
             id: Some(1),
@@ -1921,6 +1923,7 @@ fn three_source_views() -> Vec<SourceFolderView> {
         },
         SourceFolderView {
             path: PathBuf::from("/mnt/usbdrive/retro"),
+            role: Default::default(),
             enabled: true,
             created_at: None,
             id: Some(2),
@@ -1935,6 +1938,7 @@ fn three_source_views() -> Vec<SourceFolderView> {
         },
         SourceFolderView {
             path: PathBuf::from("/mnt/nvme2/collections"),
+            role: Default::default(),
             enabled: false,
             created_at: None,
             id: Some(3),

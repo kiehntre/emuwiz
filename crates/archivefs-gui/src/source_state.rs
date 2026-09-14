@@ -29,6 +29,7 @@ pub(crate) fn merge_configured_sources(
             .cloned()
             .map(|path| SourceFolderView {
                 path,
+                role: Default::default(),
                 enabled: true,
                 created_at: None,
                 id: None,
@@ -72,6 +73,7 @@ mod tests {
     fn catalogue_data_enriches_configured_sources() {
         let catalogue = SourceFolderView {
             path: PathBuf::from("/library"),
+            role: Default::default(),
             enabled: true,
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
             id: Some(7),

@@ -2876,6 +2876,7 @@ mod tests {
         SourceFolderRecord {
             id,
             path: path.to_path_buf(),
+            role: Default::default(),
             first_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_scan_status: None,
             last_scan_error: None,

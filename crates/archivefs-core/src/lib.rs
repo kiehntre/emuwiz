@@ -96,7 +96,7 @@ pub use database::{
     PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
     PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE,
     RecentScanAdditions, RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
-    ScanPersistSummary, ScanRunCounts, SourceFolderRecord, SourceScanStatus,
+    ScanPersistSummary, ScanRunCounts, SourceFolderRecord, SourceRole, SourceScanStatus,
     VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
     format_unix_timestamp_utc, latest_schema_version, pending_schema_migration_versions,
     persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
@@ -3129,6 +3129,7 @@ fn classify_scan_failure(error: &str) -> SourceAvailability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceFolderView {
     pub path: PathBuf,
+    pub role: SourceRole,
     pub enabled: bool,
     pub created_at: Option<String>,
     /// `None` only if this source has never been registered in the
@@ -3162,6 +3163,9 @@ pub fn build_source_folder_views(
             let last_scan_error = record.and_then(|record| record.last_scan_error.clone());
             SourceFolderView {
                 path: source.path.clone(),
+                role: record
+                    .map(|record| record.role)
+                    .unwrap_or_else(SourceRole::default),
                 enabled: source.enabled,
                 created_at: source.created_at.clone(),
                 id: record.map(|record| record.id),
@@ -14546,6 +14550,7 @@ mod tests {
     ) -> SourceFolderView {
         SourceFolderView {
             path: PathBuf::from(path),
+            role: Default::default(),
             enabled: !matches!(availability, SourceAvailability::Disabled),
             created_at: None,
             id: Some(1),
@@ -14612,6 +14617,7 @@ mod tests {
         let records = vec![SourceFolderRecord {
             id: 7,
             path: PathBuf::from("/data/archives"),
+            role: Default::default(),
             first_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_scan_status: None,
             last_scan_error: None,
