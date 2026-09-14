@@ -54,6 +54,8 @@ pub mod dragon_coco_tape;
 pub mod emulator_download;
 pub mod emulator_inventory;
 pub mod emulator_update;
+/// Manifest-backed ownership and side-by-side managed AppImage installs.
+pub mod managed_emulator_install;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
