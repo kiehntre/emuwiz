@@ -11,6 +11,15 @@ compressed, deleted, or moved. Researched against this repository at
 `4c71ffe7a9bc282bcb86e13367fa45f9a516479a` (`main`, "feat(publisher): add safe directory
 and symlink transactions").
 
+**Re-baseline note (important).** While this research was being written, `main` advanced
+independently (commits `bea685e`, `2fb2f05`, and later `c65a6c9`, `96c1224`), adding a
+verified disc-conversion subsystem, CHD identity/Redump bridges, and a `nod` (RVZ/WBFS)
+dependency. The **external** research (filesystem semantics, format documentation, competitor
+landscape) is unaffected, but every statement about *EmuWiz's own* code was **re-verified and
+rewritten against the revision this document lands on**, and section 1.1 records exactly which
+of this document's recommendations already exist in the tree. Where a claim is about EmuWiz's
+own code, the `file:line` citations below were checked at that revision, not at `4c71ffe`.
+
 Companion documents (already in this tree, and not contradicted here):
 
 - [`CHD_VERIFICATION_IMPLEMENTATION_RESEARCH.md`](CHD_VERIFICATION_IMPLEMENTATION_RESEARCH.md) —
@@ -108,6 +117,29 @@ Headline results:
     explicit queue, block-level deduplication of the user's filesystem, and GUI exactness
     the data cannot support.
 
+### 1.1 What already exists in EmuWiz at the re-baselined revision
+
+Several recommendations in this document are **already implemented** and are therefore
+deltas to extend, not new work. (All **CONCLUSION FROM SOURCE**.)
+
+| This document's recommendation | Status in the tree today |
+|---|---|
+| "Exit code 0 is not evidence of anything" (section 11.2) | **Already the design rule** of the existing conversion path: "Conversion is not considered successful when `chdman` exits successfully. The staged output must independently produce the same canonical optical fingerprint as the source" (`repair/optical_conversion.rs:1-6`) |
+| Never convert in place; stage, verify, then finalise (sections 11.2, 17-C2) | **Already implemented**: a unique `.emuwiz-chd-<pid>-<n>` staging directory, staged output, fingerprint comparison, then finalisation through the journaled Repair engine (`repair/optical_conversion.rs:305-348`) |
+| Independent, container-independent verification (sections 9–10) | **Already implemented for one narrow slice**: a canonical optical fingerprint over cooked 2048-byte sectors, explicitly not using container hashes or CHD header SHA-1s (`optical_fingerprint.rs:1-13`) |
+| Content-equivalent (class 2) review rather than byte-equality | **Already implemented for that slice**: `repair/optical_equivalent.rs` groups matching fingerprints and routes the CUE/BIN representation through the journaled Repair engine |
+| Never delete; quarantine instead (sections 14.8, 19) | **Already implemented**: duplicate quarantine moves only the redundant copy, never deletes, and `DeferredActionKind::DeleteDuplicate` "remains permanently non-executable" (`repair/quarantine.rs:1-9`); the conversion path offers `ChdConversionSourceMode::{KeepSource, QuarantineSource}` with an `optical-conversion` quarantine sub-directory (`repair/optical_conversion.rs:38-52`) |
+| Journal, recovery classification, history (sections 11, 17-C6) | **Already implemented**: `OperationKind::DiscConversion` with `OperationState` (`Planned`…`RollbackBlocked`, `Stale`) and `RecoveryClassification` (`SafeToResume`, `SafeToRollback`, `RequiresReview`, `Stale`, `Unrecoverable`) in `operation.rs:36-105` |
+| CHD read-only identity (section 15.2, item 1) | **Already implemented beyond the earlier plan**: `chd_identity.rs`, `chd_logical_media.rs`, `chd_redump.rs`, `dat/archive/chd.rs`, and an optional native GD-ROM specialist (`chd_optical_specialist.rs`, `chd-optical-specialist` feature) |
+| RVZ reading (section 15.2, item 4) | **Already implemented as read-only**: `nod` 1.4.4 with `compress-zstd`, used by `gamecube_wii_boot_evidence.rs` for real zstd RVZ and WBFS/ISO structure — **read only; no RVZ write path exists** |
+
+**What is therefore still genuinely missing** (and is what sections 15.2 and 17 should focus
+on): reflink as an explicit link mode and its probe; explicit `chdman` compression/hunk
+policy (the existing call passes neither, so it inherits chdman's per-command defaults —
+`repair/optical_conversion.rs:327-333`); coverage beyond one-file `MODE1/2048` CUE/BIN ↔
+single-track CHD (multi-track, GDI/GD-ROM, DVD/ISO, PSP); RVZ *write*; CSO/ZSO; savings
+estimation; the per-platform storage policy; and the section-11 removal-evidence gate.
+
 ---
 ## 2. Method, evidence base, and environment
 
@@ -149,25 +181,32 @@ This section exists so the recommendations are not generic. Everything below is
 
 | Surface | Current state | Where |
 |---|---|---|
-| Link modes | Exactly two: `PublisherLinkMode::Hardlink` and `PublisherLinkMode::Symlink`. No reflink, no copy, "no automatic fallback or copy mode" | `publisher_profile/execution.rs:5-7,27-31` |
+| Link modes | Exactly two: `PublisherLinkMode::Hardlink` and `PublisherLinkMode::Symlink`. No reflink, no copy, "no automatic fallback or copy mode" | `publisher_profile/execution.rs:7,28-31` |
 | Same-filesystem gate | `same_filesystem()` compares `st_dev`; returns `false` off-Unix | `publisher_profile/execution.rs:1062-1081` |
 | Hardlink refusal | Typed, fail-closed, with user-facing guidance to choose explicit SYMLINK mode | `publisher_profile/execution.rs:78-81,224-231,358-365` |
-| Transaction operations | `TransactionOperation::CreateHardlink` / `CreateSymlink` only; journaled, with identity re-check, confinement check, case-fold collision checks | `publisher_profile/execution.rs:404-415`; `dat/rename_apply/model.rs:267` |
+| Transaction operations | `TransactionOperation::CreateHardlink` / `CreateSymlink` only; journaled, with identity re-check, confinement check, case-fold collision checks | `publisher_profile/execution.rs:404-415`; `dat/rename_apply/model.rs:259,267` |
 | Planner default | Symlink. The planner's own comment states Hardlink stays "declared-but-unselected" because the evidence to select it automatically is insufficient | `publisher_profile/planner.rs:141-154` |
-| Declared-but-unused action kinds | `PublisherActionKind` already declares `Copy`, `DirectoryCreate`, `MetadataWrite`, `PlaylistCreate` — declared, not selected by any reviewed profile | `publisher_profile/model.rs:173-182` |
-| Executor scope | Operations act only on destination-side paths; sources are never moved | `publisher_profile/execution.rs:104-112` |
-| `.chd` identity | Explicitly `IdentityImageFormat::Deferred` — recognised, never opened | `game_identity.rs:513` |
-| `.chd` archive kind | Absent from `ArchiveKind::DirectGameImage` (`.iso`, `.gcm`, `.gcz`, `.rvz`, `.wbfs`, `.ciso` are present) | `lib.rs:3296-3327` |
-| `chdman` usage in repo | None anywhere | repo-wide search |
-| Subprocess abstraction | One generic argv-array runner (`run_command_os_with_timeout`), 30 s timeout, 64 KiB output cap — far too small for a CHD convert/verify pass | `lib.rs:7225-7283` |
-| Archive handling | Read-only *mounting* (ratarmount) and read-only inspection. **EmuWiz has no archive writer, no compressor, and no converter of any kind today.** | `README.md`; `ROADMAP.md` |
+| Declared-but-unused action kinds | `PublisherActionKind` declares `Hardlink`, `Symlink`, `Copy`, `DirectoryCreate`, `MetadataWrite`, `PlaylistCreate` — `Copy` is declared but never selected by any reviewed profile | `publisher_profile/model.rs:175-182` |
+| Executor scope | Operations act only on destination-side paths; sources are never moved | `publisher_profile/execution.rs:103-107` |
+| **Disc conversion (exists)** | **A verified, deliberately narrow CUE/BIN → CHD conversion already ships.** Staged output in a unique `.emuwiz-chd-<pid>-<n>` directory, `chdman createcd` invoked through the argv-array runner, then an **independent canonical-optical-fingerprint comparison**; only then is the result finalised through the journaled Repair engine. "Conversion is not considered successful when `chdman` exits successfully." Source handling is `KeepSource` or explicit `QuarantineSource` | `repair/optical_conversion.rs:1-6,38-52,305-348`; `repair/optical_conversion/tests.rs` |
+| Conversion scope today | One-file CUE whose single track is `MODE1/2048` ↔ a standalone CHD with exactly one `MODE1_RAW`/chdman `MODE1` data track and zero pregap. **No multi-track, no GD-ROM/GDI conversion, no DVD/ISO conversion, no PSP/RVZ/CSO conversion** | `optical_fingerprint.rs:1-13` |
+| Compression policy today | The `chdman` call passes **no `--compression` and no `--hunksize`**, so it inherits `createcd`'s per-command defaults (`cdlz,cdzl,cdfl`; 8-frame hunks) | `repair/optical_conversion.rs:327-333` |
+| `.chd` identity | Now first-class: `IdentityImageFormat::Chd`, with bounded CHD byte reads, a Dreamcast GD-ROM specialist path, a 3DO raw-track path, and a generic deferred arm for formats with no bounded reader | `game_identity.rs:1144-1151,5510-5560`; `chd_identity.rs`; `chd_logical_media.rs`; `chd_redump.rs`; `chd_optical_specialist.rs` |
+| `.chd` archive kind | Present in `ArchiveKind::DirectGameImage` handling; `DirectGameImage` is a first-class kind with conversion preflight references | `lib.rs:3752-3783,4053`; `dat/archive/chd.rs` |
+| `chdman` usage in repo | Invoked (argv array, `createcd`) from the conversion module; also referenced in comments as the provenance of test fixtures. `CHDMAN_TIMEOUT` is a 30 s constant | `repair/optical_conversion.rs:34,328` |
+| Subprocess abstraction | One generic argv-array runner (`run_command_os_with_timeout`), 30 s timeout, 64 KiB output cap — **still too small for a large CHD convert/verify pass**, and the conversion module currently reuses that 30 s default | `lib.rs:8408,8424-8428`; `repair/optical_conversion.rs:34` |
+| Archive handling | Read-only *mounting* (ratarmount) and read-only inspection. No archive writer. Conversion exists only for the optical CHD slice above | `README.md`; `ROADMAP.md`; `repair/optical_conversion.rs` |
+| GC/Wii disc structure | Read-only structural facts (game ID, disc header, partition table, FST, apploader, main.dol) via `nod` with `compress-zstd`, including real zstd RVZ and WBFS/ISO. **No Wii partition decryption, no RVZ write** | `gamecube_wii_boot_evidence.rs:24,52`; `Cargo.toml:116-136` |
+| Quarantine / never-delete discipline | Duplicate-content quarantine moves only the redundant copy; `DeferredActionKind::DeleteDuplicate` is permanently non-executable; conversion offers explicit source quarantine | `repair/quarantine.rs:1-9`; `repair/optical_conversion.rs:38-52` |
+| Receipts / recovery | `OperationKind::DiscConversion` plus `OperationState` and `RecoveryClassification` — a read-only projection layer over the workflow journals | `operation.rs:36-105` |
 | Reversibility discipline already present | Preview-before-apply, verify, rollback-or-refuse, no-clobber, "a rollback can refuse to act when a destination, backup, or journal no longer matches the verified state" | `README.md` (Current limitations) |
 | Prior CHD research | `chd-rs` (pure Rust, in-process, read-only header identity + bounded streaming integrity) recommended for P0; **any claim that a CHD's bytes equal a Redump BIN/CUE hash without reconstruction must stay unproven** | `docs/research/CHD_VERIFICATION_IMPLEMENTATION_RESEARCH.md:205,422` |
 
-**INFERENCE (important framing):** EmuWiz is currently a *consumer* of storage formats and
-a *linker* of files. Everything in sections 6–12 is therefore about creating a new,
-write-capable surface — which is exactly why sections 17 and 19 are deliberately narrow
-and phase-gated.
+**INFERENCE (framing, revised after re-baselining):** EmuWiz is no longer only a *consumer* of
+storage formats and a *linker* of files — it now owns a **verification-first conversion pipeline
+for one narrow optical slice**, plus read-only CHD/RVZ/WBFS structure readers. Everything in
+sections 6–12 should therefore be read as *"what the existing pipeline has to get right as it
+widens"*, and sections 17 and 19 are scoped accordingly.
 
 ## 4. Reflink vs hardlink vs symlink vs copy — what each one actually guarantees
 
@@ -892,9 +931,9 @@ now lives in a separate project.
 | 1G1R | Yes | Yes | Yes | Yes | No | No | **Yes** (deterministic, explainable election) |
 | Archive read | Yes (7z/zip/zstd) | Yes | Yes | Yes (7z/zip/sz/zstd) | Yes | Via server scan | **Yes, read-only mounts (zip/7z/rar)** |
 | Archive *write* | Yes (TZIP/7z/zstd) | Yes | Yes (TZIP/rvzstd) | Yes | Yes | No | **No** |
-| Conversion/compression | CHD (built-in) | CHD version check | No | CHD/RVZ/CSO/ZSO/WBFS | No | No | **No** |
-| CHD support | Yes | Partial | DAT-awareness only | Yes | Yes (`<disk>`) | No | **Deferred (recognised, never opened)** |
-| RVZ support | No | No | No | Yes | No | No | **No** |
+| Conversion/compression | CHD (built-in) | CHD version check | No | CHD/RVZ/CSO/ZSO/WBFS | No | No | **CHD: verified CUE/BIN→CHD for one narrow slice; no RVZ/CSO write** |
+| CHD support | Yes | Partial | DAT-awareness only | Yes | Yes (`<disk>`) | No | **Yes — read-only identity, Redump bridge, and verified CUE/BIN→CHD conversion for one narrow slice** |
+| RVZ support | No | No | No | Yes | No | No | **Read-only structure (via `nod`); no write** |
 | Hardlink publishing | Not found | No | **Yes (default)** | No | No | No | **Yes (explicit mode)** |
 | Reflink publishing | Not found | No | **Yes** | No | No | No | **No** |
 | Symlink publishing | Not found | No | Yes | No | No | No | **Yes (planner default)** |
@@ -1072,7 +1111,11 @@ For each important application: **what they do better**, **what EmuWiz already d
 
 - **Better than EmuWiz:** they *are* the format owners and will always know their formats better.
   `chdman` in particular is both the reference encoder and the reference verifier.
-- **EmuWiz does better:** nothing yet — it has no format handling at all.
+- **EmuWiz does better:** for the one slice it covers, it is already stricter than the tools
+  themselves — the existing CHD path refuses to treat `chdman`'s exit status as success and
+  requires an independent canonical-fingerprint match before finalising
+  (`repair/optical_conversion.rs:1-6`). What EmuWiz lacks is the *breadth* (multi-track, GD-ROM,
+  DVD/ISO, RVZ, CSO), not the discipline.
 - **Idea worth adopting:** **treat each tool as an oracle with a version, a capability probe, and
   a machine-readable result**, and cross-check the tool's own verification against EmuWiz's
   independent hash evidence (the "optional external oracle" pattern already proposed for CHD).
@@ -1091,7 +1134,8 @@ For each important application: **what they do better**, **what EmuWiz already d
    (sections 4–5).
 2. **Capability detection as a first-class, typed state** (tool present/absent/too-old, filesystem
    reflink yes/no, cross-filesystem yes/no) surfaced in plans and the GUI *before* anything is
-   written. Zero write risk, and immediately useful even with no converter present.
+   written. Zero write risk, and immediately useful even where no writer exists yet (which is the
+   current state for RVZ and CSO).
 3. **Source-identity journaling (V0) for every file EmuWiz is about to operate near** —
    dev/inode/size/mtime + SHA-256, captured before the operation. This is the precondition for
    *every* later safety claim (section 11), and it is pure bookkeeping.
@@ -1106,29 +1150,41 @@ For each important application: **what they do better**, **what EmuWiz already d
 
 ### 15.2 HIGH VALUE / NEEDS RESEARCH
 
-1. **CHD read-only identity + integrity for `.chd` files** — already researched and recommended in
-   this tree (`chd-rs`, in-process, bounded, no exec). Needs a fixture strategy and a DAT mapping
-   decision (`<disk>` parsing) before implementation.
-2. **Safe CHD *write* path (compression) with media-type detection** — high value, but requires
-   reliable CD-vs-DVD media detection, explicit hunk/codec selection, tool-version enforcement, and
-   a verification pipeline that can reconstruct and hash. Needs a prototype on legal synthetic
-   fixtures on a filesystem other than this host's.
-3. **Round-trip reconstruction for CD-family CHDs (V2/V3)** — the hardest correctness problem here
-   (track padding, pregap, subchannel, `.cue`/`.gdi` regeneration). Must be its own phase with its
-   own fixtures, per the prior CHD research's "separately phased, fail-closed" requirement.
-4. **RVZ read/convert (GameCube/Wii)** — high value for a large share of many libraries, but depends
-   on either `dolphin-tool` (absent on the research host) or the `nod` Rust crate, and on proving
-   byte-identity of ISO reconstruction on the user's actual discs (section 9).
+**Note:** items marked **[DONE]** were already implemented in the tree at the re-baselined
+revision (section 1.1) and are listed here only for completeness, with the remaining work stated.
+
+1. **CHD read-only identity + integrity for `.chd` files — [DONE]** (`chd_identity.rs`,
+   `chd_logical_media.rs`, `chd_redump.rs`, `dat/archive/chd.rs`, plus the optional GD-ROM
+   specialist). The remaining work is *differential*: the fingerprint slice in
+   `optical_fingerprint.rs` covers only one-file `MODE1/2048` CUE/BIN ↔ single-track CHD.
+2. **Explicit CHD compression/hunk policy** — highest-value small change in the existing
+   pipeline: the conversion currently passes neither `--compression` nor `--hunksize`, so the
+   codec choice and the ratio/random-access trade-off are invisible and unconditional
+   (`repair/optical_conversion.rs:327-333`; section 6.2 documents why relying on per-command
+   chdman defaults is unsafe). Needs a policy model, a minimum `chdman` version, and the warning
+   capture described in section 17-C2.
+3. **Widening the verified conversion slice** beyond one-file CUE/BIN ↔ single-track CHD:
+   multi-track CUE, GDI/GD-ROM, DVD/ISO (PS2), PSP. This is the hardest correctness problem here
+   (track padding, pregap, subchannel, `.cue`/`.gdi` regeneration, `createcd`-vs-`createdvd`
+   selection) and must be phased per media family with its own fixtures.
+4. **RVZ *write* (GameCube/Wii)** — reading already exists via `nod` (zstd RVZ, WBFS/ISO
+   structure). Writing needs either a `nod` write path that is audited for this use, or
+   `dolphin-tool` with an enforced minimum version, plus proof of ISO-reconstruction equality on
+   real discs (section 9.2, section 18 item 5).
 5. **Sparse-aware savings estimation** using `FIEMAP`/`SEEK_HOLE` and `st_blocks`, plus a
    sampled-trial estimator. Needs empirical work to avoid over-promising (section 12).
 6. **Platform storage policy matrix** (which format for which platform, given which
    emulator/frontend) — needs per-emulator verification (Flycast et al. are unverified) and a
    maintenance story for a matrix that will age.
+7. **Timeouts and output capture for conversion-grade tool runs** — the existing conversion
+   reuses the generic 30 s / 64 KiB runner (`repair/optical_conversion.rs:34`; `lib.rs:8424-8428`),
+   which cannot express a long conversion or preserve chdman's own warnings.
 
 ### 15.3 USEFUL LATER
 
-1. **Conversion history / rollback UI** on top of the journal — meaningful only once conversions
-   exist.
+1. **Conversion history / rollback UI** on top of the journal — the receipts/recovery projection
+   already exists (`operation.rs`), and conversions are already real, so this is now a UI-completion
+   item rather than a prerequisite.
 2. **Resumable/batched conversion queue** with per-item checkpoints — needed only once large
    batches are real.
 3. **PSP CSO/ZSO** — lower ratio benefit than CHD, version-sensitive emulator support, and
@@ -1259,6 +1315,13 @@ Each phase has a **hard safety boundary** — the thing that must not be crossed
 regardless of how useful it would be. Phases are ordered by *evidence dependency*, not by
 convenience: nothing writes until reading and verification are proven.
 
+**Status overlay at the re-baselined revision (section 1.1):** the tree already contains
+C1-like capability refusal (`ChdmanUnavailable`), C2's staging + independent verification +
+finalisation for **one narrow CUE/BIN ↔ CHD slice**, C3's *fingerprint-equivalence* check, and
+C6's operation receipts/recovery classification. The phases below therefore state **what
+remains**, and each keeps its hard boundary so that widening coverage cannot erode the existing
+guarantees.
+
 ### PHASE C1 — read-only conversion capability detection (no writes at all)
 
 **Goal:** EmuWiz can truthfully say what it *could* do, per file and per destination, without
@@ -1272,8 +1335,12 @@ touching anything.
 - Detect filesystem capability for the target directory: `st_dev` comparison (already exists) and
   a **reflink probe** (section 5.3).
 - Compute and display the **round-trip class** each candidate pair could achieve *if* the evidence
-  supports it (default: class 3, "not established").
-- Report the exact command line that *would* be run, without running it.
+  supports it (default: class 3, "not established"). *(Today the fingerprint comparison returns a
+  typed equivalence verdict for one slice; the class vocabulary in section 9 does not yet exist
+  as a user-facing label.)*
+- Report the exact command line that *would* be run, without running it. **Including the codec and
+  hunk/block-size arguments** — which the current conversion path does not pass at all
+  (`repair/optical_conversion.rs:327-333`).
 
 **Hard boundary:** read-only. No ioctl except the reflink probe's temporary file (which must be
 deleted, and must never be inside the user's library); no conversion, no metadata write, no
@@ -1284,30 +1351,46 @@ deleted, and must never be inside the user's library); no conversion, no metadat
 **Goal:** a user can compress a supported optical source to CHD, and EmuWiz can prove what
 happened.
 
+**Already present:** staging directory + fingerprint verification + journaled finalisation for
+one-file `MODE1/2048` CUE/BIN → single-track CHD, with `ChdmanUnavailable`/`VerificationFailed`
+typed refusals (`repair/optical_conversion.rs`).
+
+**Remaining work:**
+
 - Media-type-driven command selection (`createcd` vs `createdvd`), **with an explicit refusal if
-  the media type is not established**.
+  the media type is not established**. (Today only `createcd` is ever used.)
 - Explicit `--compression` and `--hunksize` — never rely on tool defaults (section 6.2 documents
-  their per-command divergence and the docs' own inconsistency).
-- **Write to a new file in a staging location on the same filesystem as the destination**, then
-  verify, then move into place. Never overwrite, never in place.
+  their per-command divergence and the docs' own inconsistency). **This is the smallest, highest
+  value change in the existing pipeline.**
 - Verification: V0 before, V1 after (`chdman verify`), and **capture stdout/stderr** so the
   subcode-omission warning (section 6.2) becomes a recorded finding instead of a lost line.
-  **NOTE:** the existing runner's 30 s timeout and 64 KiB output cap (`lib.rs:7225-7283`) are
-  unusable here — a conversion-grade runner is a prerequisite, not an implementation detail.
-- Record: source identity, tool name + version, complete argv, output size, output `st_blocks`,
-  elapsed time, verification levels, assigned class.
+  **NOTE:** the reused 30 s / 64 KiB runner (`repair/optical_conversion.rs:34`;
+  `lib.rs:8424-8428`) cannot express a long conversion or retain chdman's warnings — a
+  conversion-grade runner is a prerequisite, not an implementation detail.
+- Record: tool name + version, complete argv, output size, output `st_blocks`, elapsed time,
+  verification results, and the assigned class, alongside the source identity the pipeline
+  already captures.
 
 **Hard boundary:** never modify or delete the source; never write into the source's directory
 unless the user chose that destination; refuse rather than guess the media type; refuse if the
 tool version is below the documented minimum for the media (e.g. `chdman ≥ 0.264` for GD-ROM);
-no deletion, no source cleanup, no "reclaim space" action.
+no deletion, no source cleanup, no "reclaim space" action. Source replacement stays an *explicit*
+`QuarantineSource` choice, never a default.
 
 ### PHASE C3 — CHD decompression and round-trip verification
 
 **Goal:** prove the round trip before anyone is tempted to delete anything.
 
+**Already present:** an independent canonical-optical-fingerprint comparison
+(`optical_fingerprint.rs`) that does not trust container hashes or CHD header SHA-1 values, plus
+an equivalence-review adapter over it (`repair/optical_equivalent.rs`).
+
+**Remaining work:**
+
 - `extractcd`/`extractdvd` to a **fresh temporary directory**, then compare per-track /
-  per-sector / whole-file hashes against V0; compare normalised `.cue`/`.gdi`; compare topology.
+  per-sector / whole-file hashes against V0; compare normalised `.cue`/`.gdi`; compare topology —
+  i.e. add *byte-level reconstruction evidence* alongside the fingerprint verdict, so a class 1
+  claim becomes possible where it is true.
 - Assign the class (1 or 2) from the comparison and record, in machine-readable form, exactly
   which bytes differed and why for a class 2.
 - Where class 2 is unavoidable (CD padding, regenerated `.cue`), present it explicitly — never as
@@ -1320,15 +1403,22 @@ section-11 gate plus a separate, explicit decision.
 
 ### PHASE C4 — RVZ support (GameCube / Wii)
 
-- Prefer a **native Rust path** (`nod`-class library) if it can be audited; otherwise
-  `dolphin-tool` with an enforced minimum version. Either way: `zstd`, block size 128 KiB, level
-  ~5 as documented defaults, with the reason shown to the user.
+**Already present:** read-only structural reading of real zstd RVZ, WBFS and ISO via `nod`
+(`gamecube_wii_boot_evidence.rs`; `Cargo.toml:116-136`). **No write path exists.**
+
+**Remaining work:**
+
+- A **write path** — either an audited `nod` write use or `dolphin-tool` with an enforced minimum
+  version. Either way: `zstd`, block size 128 KiB, level ~5 as documented defaults, with the
+  reason shown to the user.
 - **Scrub is not offered as a conversion.** If the concept appears at all it is an explicitly
   labelled lossy *export* with its own warning, never part of the convert path.
 - Verification: Dolphin's integrity check *plus* reconstructed-ISO SHA-256 vs V0 (section 9.2).
 
 **Hard boundary:** media detection (GameCube vs Wii vs anything else); refuse when the source is
-already RVZ (no re-encode); refuse scrub inside a conversion; never touch the source.
+already RVZ (no re-encode); refuse scrub inside a conversion; never touch the source; never
+request Wii partition decryption (the crate deliberately has no keys,
+`Cargo.toml:119-120`).
 
 ### PHASE C5 — PSP CSO/ZSO
 
@@ -1342,6 +1432,11 @@ ZSO for a platform/frontend whose acceptance is unproven; never offer CSO for a 
 (it cannot represent one).
 
 ### PHASE C6 — conversion queue, storage policy, GUI, history
+
+**Already present:** operation receipts and recovery classification for disc conversions
+(`OperationKind::DiscConversion`, `OperationState`, `RecoveryClassification` in `operation.rs`).
+
+**Remaining work:**
 
 - A **visible, pausable queue** with per-item state showing: source, target, class, estimated
   range, tool version, disk space required, and the verification level passed. No background
@@ -1404,6 +1499,17 @@ hardware/filesystems before any code depends on it.
     the relative-symlink policy (section 15.1) can ship at all.
 12. **`du`/`df` behaviour of reflinked trees on btrfs and XFS** as users' tooling reports it —
     needed to word the section 16.4 footnote accurately rather than approximately.
+13. **The existing fingerprint slice against real Redump sources.** Does
+    `compare_optical_fingerprints` return `Equivalent` for real Redump-style CUE/BIN → CHD
+    conversions, including the final partial sector and any source with more than one track (which
+    the fingerprint deliberately does not support today)?
+14. **Adequacy of the current `CHDMAN_TIMEOUT`.** The conversion reuses a 30 s constant
+    (`repair/optical_conversion.rs:34`) while a CD-sized `createcd` run on a slow host or a large
+    disc may exceed it. Measure real conversion times per media family before widening coverage.
+15. **Which codec/hunk defaults are actually right per media.** The existing path passes neither
+    `--compression` nor `--hunksize`; before adding a policy, measure size and random-access cost
+    for `cdlz`/`cdzl`/`cdfl` and for a small set of hunk sizes on representative discs, so the
+    recommendation in section 6.2 is replaced by measured values.
 
 ---
 
@@ -1522,14 +1628,35 @@ EmuWiz must **not** build, in this area:
 
 ### 20.4 This repository (CONCLUSION FROM SOURCE)
 
-- `crates/archivefs-core/src/publisher_profile/execution.rs` (link modes, same-filesystem gate,
-  typed refusals, transaction operations, executor scope).
-- `crates/archivefs-core/src/publisher_profile/{model,planner}.rs` (action kinds, safety states,
-  planner default and its rationale).
-- `crates/archivefs-core/src/dat/rename_apply/model.rs` (`CreateHardlink`).
-- `crates/archivefs-core/src/lib.rs` (`ArchiveKind::DirectGameImage`, `command_available`,
-  `run_command_os_with_timeout` and its 30 s / 64 KiB limits).
-- `crates/archivefs-core/src/game_identity.rs` (`.chd` → `IdentityImageFormat::Deferred`).
+Cited at the revision this document lands on (see the re-baseline note above):
+
+- `crates/archivefs-core/src/publisher_profile/execution.rs` (link modes at `:7,28-31`;
+  same-filesystem gate `:1062-1081`; typed refusals `:78-81,224-231,358-365`; transaction
+  operations `:404-415`; executor scope comment `:103-107`).
+- `crates/archivefs-core/src/publisher_profile/{model,planner}.rs` (action kinds `:175-182`,
+  planner default and its rationale `:141-154`).
+- `crates/archivefs-core/src/dat/rename_apply/model.rs` (`CreateSymlink` `:259`,
+  `CreateHardlink` `:267`).
+- **Conversion**: `crates/archivefs-core/src/repair/optical_conversion.rs` (module rule `:1-6`,
+  staging/quarantine constants `:38-52`, `chdman createcd` invocation `:327-333`,
+  fingerprint verification and finalisation `:334-360`), `optical_conversion/tests.rs`.
+- **Verification / equivalence**: `crates/archivefs-core/src/optical_fingerprint.rs` (`:1-13`),
+  `repair/optical_equivalent.rs` (`:1-7`), `repair/exact_duplicate.rs`,
+  `repair/n64_equivalent.rs`.
+- **Repair engine**: `repair/mod.rs` (TRUTH → PROPOSAL → PREFLIGHT → PREVIEW → SAFE TRANSACTION →
+  REVERIFY/AUDIT; only same-filesystem `RenamePath`/`MovePath` executable),
+  `repair/{proposal,plan,preflight,execute,quarantine}.rs` ("never deletes anything";
+  `DeleteDuplicate` permanently non-executable).
+- **CHD**: `crates/archivefs-core/src/chd_identity.rs`, `chd_logical_media.rs`, `chd_redump.rs`,
+  `chd_optical_specialist.rs` (optional `chd-optical-specialist` feature via `opticaldiscs` /
+  `libchdman-rs`), `dat/archive/chd.rs`, `dat/disk_audit.rs`.
+- **GC/Wii**: `crates/archivefs-core/src/gamecube_wii_boot_evidence.rs` (`nod`),
+  `crates/archivefs-core/Cargo.toml:116-136`.
+- **Receipts/recovery**: `crates/archivefs-core/src/operation.rs:36-105`.
+- `crates/archivefs-core/src/lib.rs` (`command_available` `:8408`,
+  `run_command_os_with_timeout` `:8424-8430`, `ArchiveKind::DirectGameImage` `:3752-3783,4053`).
+- `crates/archivefs-core/src/game_identity.rs` (`.chd` dispatch and disc/CHD inspection
+  `:1144-1151,5510-5560`).
 - `crates/archivefs-core/src/{smd_normalization,n64_byte_order}.rs` (existing lossless
   normalisations, both directions).
 - `docs/research/CHD_VERIFICATION_IMPLEMENTATION_RESEARCH.md`,
@@ -1557,6 +1684,9 @@ to be tested rather than a verified result. Section 18 lists exactly what must b
 - No Rust production code, Publisher Profile code, Save Vault code, GUI, or converter code was
   modified. No user file was converted, compressed, decompressed, moved, hardlinked, reflinked, or
   deleted.
-- Implementation targets identified by this research (sections 15.1/15.2 and the phase boundaries in
-  section 17) are explicitly **not** implemented here and must be raised as separate tasks.
+- **Re-baselining:** `main` advanced during this research (see the re-baseline note at the top).
+  Every `file:line` citation about EmuWiz's own code was re-verified against the revision this
+  document lands on, and section 3 was rewritten rather than left describing a superseded tree.
+- Implementation targets identified by this research (sections 15.1/15.2 and the phase boundaries
+  in section 17) are explicitly **not** implemented here and must be raised as separate tasks.
 
