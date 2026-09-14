@@ -15,9 +15,8 @@
 //! then the legacy directories remain the active ones for existing users.
 //!
 //! The XDG base-directory layout mirrors what EmuWiz already used
-//! (`~/.config/archivefs`, `~/.local/share/archivefs`) rather than adopting
-//! the XDG environment variables, so an existing user's data is found at the
-//! exact same place it has always been.
+//! (`~/.config/archivefs`, `~/.local/share/archivefs`) while honoring explicit
+//! application roots and the standard XDG overrides for isolated invocations.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -32,6 +31,8 @@ pub const LEGACY_CONFIG_DIR_NAME: &str = "archivefs";
 pub const DATA_DIR_NAME: &str = "emuwiz";
 /// The legacy ArchiveFS data directory name under `~/.local/share`.
 pub const LEGACY_DATA_DIR_NAME: &str = "archivefs";
+pub const DATA_ROOT_OVERRIDE_ENV: &str = "EMUWIZ_DATA_HOME";
+pub const CONFIG_ROOT_OVERRIDE_ENV: &str = "EMUWIZ_CONFIG_HOME";
 
 fn home() -> Result<PathBuf> {
     env::var_os("HOME")
@@ -68,6 +69,20 @@ fn path_is_present(path: &Path) -> bool {
 }
 
 pub(crate) fn config_dir_in(home: &Path) -> PathBuf {
+    config_dir_in_with_roots(home, None, None)
+}
+
+pub(crate) fn config_dir_in_with_roots(
+    home: &Path,
+    explicit_root: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+) -> PathBuf {
+    if let Some(root) = explicit_root {
+        return root.to_path_buf();
+    }
+    if let Some(root) = xdg_config_home {
+        return root.join(CONFIG_DIR_NAME);
+    }
     choose_dir(
         &home.join(".config").join(CONFIG_DIR_NAME),
         &home.join(".config").join(LEGACY_CONFIG_DIR_NAME),
@@ -75,6 +90,23 @@ pub(crate) fn config_dir_in(home: &Path) -> PathBuf {
 }
 
 pub(crate) fn data_dir_in(home: &Path) -> PathBuf {
+    data_dir_in_with_roots(home, None, None)
+}
+
+/// Pure data-directory resolver. Explicit roots and XDG roots are returned
+/// directly and never consult legacy production directories. The fallback
+/// policy is only for the ordinary, unconfigured user path.
+pub(crate) fn data_dir_in_with_roots(
+    home: &Path,
+    explicit_root: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+) -> PathBuf {
+    if let Some(root) = explicit_root {
+        return root.to_path_buf();
+    }
+    if let Some(root) = xdg_data_home {
+        return root.join(DATA_DIR_NAME);
+    }
     choose_dir(
         &home.join(".local").join("share").join(DATA_DIR_NAME),
         &home.join(".local").join("share").join(LEGACY_DATA_DIR_NAME),
@@ -94,14 +126,48 @@ pub(crate) fn data_path_in(home: &Path, leaf: &str) -> PathBuf {
 /// directory first with the legacy ArchiveFS directory as fallback.
 pub fn config_dir() -> Result<PathBuf> {
     let home = home()?;
-    Ok(config_dir_in(&home))
+    let explicit_root = env::var_os(CONFIG_ROOT_OVERRIDE_ENV).map(PathBuf::from);
+    let xdg_config_home = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    if explicit_root
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+        || xdg_config_home
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(ArchiveFsError::Config(
+            "catalogue/config root override must be an absolute path".into(),
+        ));
+    }
+    Ok(config_dir_in_with_roots(
+        &home,
+        explicit_root.as_deref(),
+        xdg_config_home.as_deref(),
+    ))
 }
 
 /// The data directory root for the current user, resolving the EmuWiz
 /// directory first with the legacy ArchiveFS directory as fallback.
 pub fn data_dir() -> Result<PathBuf> {
     let home = home()?;
-    Ok(data_dir_in(&home))
+    let explicit_root = env::var_os(DATA_ROOT_OVERRIDE_ENV).map(PathBuf::from);
+    let xdg_data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    if explicit_root
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+        || xdg_data_home
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(ArchiveFsError::Config(
+            "catalogue/data root override must be an absolute path".into(),
+        ));
+    }
+    Ok(data_dir_in_with_roots(
+        &home,
+        explicit_root.as_deref(),
+        xdg_data_home.as_deref(),
+    ))
 }
 
 /// The path to one config file (e.g. `config.toml`) under the effective
@@ -200,6 +266,45 @@ mod tests {
         assert_eq!(
             data_path_in(&home, "library.sqlite3"),
             home.join(".local/share/emuwiz/library.sqlite3")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_and_xdg_roots_never_fall_back_to_legacy() {
+        let home = home_with("overrides", &[&[".local", "share", "archivefs"]]);
+        let explicit = home.join("isolated-data");
+        let xdg = home.join("xdg-data");
+
+        assert_eq!(
+            data_dir_in_with_roots(&home, Some(&explicit), None),
+            explicit
+        );
+        assert_eq!(
+            data_dir_in_with_roots(&home, None, Some(&xdg)),
+            xdg.join(DATA_DIR_NAME)
+        );
+        assert_ne!(
+            data_dir_in_with_roots(&home, Some(&explicit), None),
+            home.join(".local/share/archivefs")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_root_wins_over_xdg_and_legacy_paths() {
+        let home = home_with(
+            "precedence",
+            &[
+                &[".local", "share", "archivefs"],
+                &[".local", "share", "emuwiz"],
+            ],
+        );
+        let explicit = home.join("requested");
+        let xdg = home.join("xdg");
+        assert_eq!(
+            data_dir_in_with_roots(&home, Some(&explicit), Some(&xdg)),
+            explicit
         );
         let _ = std::fs::remove_dir_all(&home);
     }

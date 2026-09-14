@@ -69,13 +69,10 @@ pub use restore::{
 /// I/O and creates nothing - resolving the path and creating the database are
 /// deliberately separate operations (see [`Database::open_or_create`]).
 pub fn default_database_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Database("HOME is not set".to_string()))?;
-    Ok(crate::app_dirs::data_path_in(
-        Path::new(&home),
-        "library.sqlite3",
-    ))
+    // Resolve through the runtime app-directory policy so explicit and XDG
+    // alternate roots are honored. The pure `resolve_database_path` helper
+    // below remains the legacy/default-path test seam.
+    Ok(crate::app_dirs::data_dir()?.join("library.sqlite3"))
 }
 
 /// The logic behind [`default_database_path`], taking the already-resolved
