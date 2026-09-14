@@ -5013,10 +5013,11 @@ impl Database {
     fn reconcile_fully_reused_source(
         &mut self,
         scan_run_id: i64,
-        source_folder_id: i64,
-        source_root: &Path,
+        folder: &RegisteredSourceFolder,
         archives: &[Archive],
     ) -> Result<Option<ScanRunCounts>> {
+        let source_folder_id = folder.id;
+        let source_root = &folder.path;
         let started = std::time::Instant::now();
         let mut statement = self
             .connection
@@ -5080,6 +5081,7 @@ impl Database {
             }
             seen_ids.push(*archive_id);
             seen_paths.insert(key);
+            assign_platform_for_scanned_archive(self, folder, archive, *archive_id)?;
         }
 
         // A source can contain catalogue rows no longer present in the
@@ -7466,7 +7468,7 @@ fn scan_and_persist_folders_transaction(
             discovery.timings.re_inspected == 0 && non_archive_fingerprints.is_empty();
         let persisted = if fully_reused {
             database
-                .reconcile_fully_reused_source(scan_run_id, folder.id, &folder.path, &archives)?
+                .reconcile_fully_reused_source(scan_run_id, folder, &archives)?
                 .map(Ok)
                 .unwrap_or_else(|| persist_one_folder(database, scan_run_id, folder, &archives))
         } else {
@@ -7600,50 +7602,7 @@ fn persist_one_folder(
                 .and_then(system_time_to_unix_seconds),
         )?;
 
-        // Required precedence: manual > header identity > source assignment
-        // > folder alias > filename heuristic > unknown. `archive.identity.platform`/
-        // `platform_provenance` already resolved the heuristic/built-in
-        // tiers (in `detect_platform_with_provenance`, which has no
-        // database access and so cannot itself see custom aliases) - a
-        // custom alias match here unconditionally outranks whatever that
-        // already found. `assign_platform` still has the final say via
-        // `provenance_priority` (for example, never silently replacing a
-        // manual assignment).
-        let header_identity =
-            archive.identity.platform_provenance == Some(PlatformProvenance::HeaderIdentity);
-        let custom_alias_platform =
-            find_custom_platform_alias(database, &archive.path, &archive.identity.source_root)?;
-        let compatible_source_platform = folder
-            .assigned_platform
-            .as_deref()
-            .filter(|platform| source_assignment_is_compatible(archive, platform));
-        let (platform, source): (Option<String>, &str) = if header_identity {
-            (
-                archive.identity.platform.clone(),
-                PlatformProvenance::HeaderIdentity.as_source_str(),
-            )
-        } else if let Some(platform) = compatible_source_platform {
-            (
-                Some(platform.to_string()),
-                SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
-            )
-        } else {
-            match &custom_alias_platform {
-                Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
-                None => {
-                    database.retire_stale_custom_alias_assignment(outcome.archive_id)?;
-                    (
-                        archive.identity.platform.clone(),
-                        archive
-                            .identity
-                            .platform_provenance
-                            .map(PlatformProvenance::as_source_str)
-                            .unwrap_or("heuristic-path-detector"),
-                    )
-                }
-            }
-        };
-        database.assign_platform(outcome.archive_id, platform.as_deref(), source)?;
+        assign_platform_for_scanned_archive(database, folder, archive, outcome.archive_id)?;
 
         if archive.kind == ArchiveKind::DirectGameImage {
             let effective_platform = database.current_platform_for_archive(outcome.archive_id)?;
@@ -7666,6 +7625,63 @@ fn persist_one_folder(
         database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
 
     Ok(counts)
+}
+
+/// Applies the current platform-assignment precedence to one already-scanned
+/// archive. This is shared by the normal persistence path and the
+/// fingerprint-reused reconciliation path: mutable source assignments and
+/// custom aliases can change even when the archive bytes have not, so reused
+/// scans must still revisit this metadata-only decision.
+fn assign_platform_for_scanned_archive(
+    database: &mut Database,
+    folder: &RegisteredSourceFolder,
+    archive: &Archive,
+    archive_id: i64,
+) -> Result<()> {
+    // Required precedence: manual > header identity > source assignment
+    // > folder alias > filename heuristic > unknown. `archive.identity.platform`/
+    // `platform_provenance` already resolved the heuristic/built-in
+    // tiers (in `detect_platform_with_provenance`, which has no
+    // database access and so cannot itself see custom aliases) - a
+    // custom alias match here unconditionally outranks whatever that
+    // already found. `assign_platform` still has the final say via
+    // `provenance_priority` (for example, never silently replacing a
+    // manual assignment).
+    let header_identity =
+        archive.identity.platform_provenance == Some(PlatformProvenance::HeaderIdentity);
+    let custom_alias_platform =
+        find_custom_platform_alias(database, &archive.path, &archive.identity.source_root)?;
+    let compatible_source_platform = folder
+        .assigned_platform
+        .as_deref()
+        .filter(|platform| source_assignment_is_compatible(archive, platform));
+    let (platform, source): (Option<String>, &str) = if header_identity {
+        (
+            archive.identity.platform.clone(),
+            PlatformProvenance::HeaderIdentity.as_source_str(),
+        )
+    } else if let Some(platform) = compatible_source_platform {
+        (
+            Some(platform.to_string()),
+            SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
+        )
+    } else {
+        match &custom_alias_platform {
+            Some(platform) => (Some(platform.clone()), CUSTOM_FOLDER_ALIAS_SOURCE),
+            None => {
+                database.retire_stale_custom_alias_assignment(archive_id)?;
+                (
+                    archive.identity.platform.clone(),
+                    archive
+                        .identity
+                        .platform_provenance
+                        .map(PlatformProvenance::as_source_str)
+                        .unwrap_or("heuristic-path-detector"),
+                )
+            }
+        }
+    };
+    database.assign_platform(archive_id, platform.as_deref(), source)
 }
 
 /// Whether `platform` is a plausible assignment for `archive` at all.
