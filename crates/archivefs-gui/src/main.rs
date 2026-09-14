@@ -9579,7 +9579,10 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::EmulatorInventory {
-                    self.emulator_inventory_page.show(ui);
+                    let emulator_running = self.launch_dolphin.is_active()
+                        || self.launch_pcsx2.is_active()
+                        || self.launch_standalone.is_active();
+                    self.emulator_inventory_page.show(ui, emulator_running);
                     return;
                 }
 
