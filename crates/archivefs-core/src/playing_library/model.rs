@@ -32,9 +32,77 @@
 //! trusted policy field has been compared, the group is reported
 //! unresolved - no alphabetical fallback, no arbitrary pick.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::dat::dependency::DependencyState;
+
+/// The source-backed working state of an arcade machine.
+///
+/// This is deliberately not inferred from a title, filename, or popularity
+/// list. `Unknown` is never eligible for a working-clone fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArcadeWorkingStatus {
+    Working,
+    Imperfect,
+    NotWorking,
+    Unknown,
+}
+
+/// The typed policy mode selected for one Playing Library plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayingLibraryPolicyMode {
+    #[default]
+    Console1g1r,
+    Arcade,
+}
+
+/// Evidence required by the arcade election path.
+///
+/// The caller normally builds this from the existing `SetResolution` and
+/// dependency report. It is supplied through the arcade policy's evidence
+/// map; existing console callers leave that map empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeCandidateEvidence {
+    pub working_status: ArcadeWorkingStatus,
+    /// Whether direct set storage was proven complete by the existing audit.
+    pub storage_complete: bool,
+    pub dependency_state: DependencyState,
+    /// A negative result is trustworthy only when the source scan completed.
+    pub scan_complete: bool,
+}
+
+impl ArcadeCandidateEvidence {
+    pub const fn unknown() -> Self {
+        Self {
+            working_status: ArcadeWorkingStatus::Unknown,
+            storage_complete: false,
+            dependency_state: DependencyState::NotEvaluated,
+            scan_complete: false,
+        }
+    }
+
+    pub const fn eligible_storage(self) -> bool {
+        self.storage_complete
+            && self.scan_complete
+            && matches!(
+                self.dependency_state,
+                DependencyState::NotApplicable | DependencyState::Satisfied
+            )
+    }
+
+    pub const fn status_rank(self) -> Option<u8> {
+        match self.working_status {
+            ArcadeWorkingStatus::Working => Some(0),
+            ArcadeWorkingStatus::Imperfect => Some(1),
+            ArcadeWorkingStatus::NotWorking | ArcadeWorkingStatus::Unknown => None,
+        }
+    }
+}
 
 /// Which non-retail release classes can be excluded from election.
 ///
@@ -107,6 +175,15 @@ pub struct PlayingLibraryCandidate {
 /// policy elects nothing it cannot justify and excludes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlayingLibraryPolicy {
+    /// The default preserves the existing console election behavior. Arcade
+    /// must be selected explicitly and is only accepted for MAME/FBNeo DATs.
+    #[serde(default)]
+    pub mode: PlayingLibraryPolicyMode,
+    /// Source-backed arcade evidence keyed by `ParsedDat::games` index.
+    /// Console policies ignore this map; arcade policy treats absent entries
+    /// as unknown and therefore not eligible.
+    #[serde(default)]
+    pub arcade_evidence: BTreeMap<usize, ArcadeCandidateEvidence>,
     /// Preferred regions, most-preferred first (for example
     /// `["Europe", "USA", "Japan"]`). Matched case-insensitively against
     /// recognized provider region tokens parsed from the DAT entry name.

@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::dat::dependency::DependencyState;
 use crate::dat::model::{DatEcosystem, DatFormat, DatGameEntry, DatSource};
 
 fn game(name: &str, clone_of: Option<&str>) -> DatGameEntry {
@@ -40,6 +41,12 @@ fn synthetic_dat(games: Vec<DatGameEntry>) -> ParsedDat {
     }
 }
 
+fn synthetic_arcade_dat(games: Vec<DatGameEntry>, ecosystem: DatEcosystem) -> ParsedDat {
+    let mut dat = synthetic_dat(games);
+    dat.source.ecosystem = ecosystem;
+    dat
+}
+
 /// One verified archive per DAT entry, named after it, under `source`.
 fn auto_matches(dat_games: &[DatGameEntry], source: &Path) -> Vec<DatArchiveMatch> {
     dat_games
@@ -58,6 +65,25 @@ fn default_policy() -> PlayingLibraryPolicy {
         preferred_regions: vec!["Europe".into(), "USA".into(), "Japan".into()],
         prefer_newest_revision: true,
         excluded_release_classes: ReleaseClass::all().to_vec(),
+        ..PlayingLibraryPolicy::default()
+    }
+}
+
+fn arcade_evidence(status: ArcadeWorkingStatus) -> ArcadeCandidateEvidence {
+    ArcadeCandidateEvidence {
+        working_status: status,
+        storage_complete: true,
+        dependency_state: DependencyState::NotApplicable,
+        scan_complete: true,
+    }
+}
+
+fn arcade_policy(
+    evidence: impl IntoIterator<Item = (usize, ArcadeCandidateEvidence)>,
+) -> PlayingLibraryPolicy {
+    PlayingLibraryPolicy {
+        mode: PlayingLibraryPolicyMode::Arcade,
+        arcade_evidence: evidence.into_iter().collect(),
         ..PlayingLibraryPolicy::default()
     }
 }
@@ -978,4 +1004,309 @@ fn unknown_metadata_is_reported_as_unknown_not_inferred() {
     assert!(evidence.regions.is_empty());
     assert!(evidence.languages.is_empty());
     assert_eq!(evidence.revision, None);
+}
+
+#[test]
+fn arcade_parent_and_clone_statuses_are_ranked_explicitly() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(
+        vec![
+            game("Parent", None),
+            game("Working Clone", Some("Parent")),
+            game("Imperfect Parent", None),
+            game("Better Clone", Some("Imperfect Parent")),
+        ],
+        DatEcosystem::MAMEArcade,
+    );
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("playing"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (2, arcade_evidence(ArcadeWorkingStatus::Imperfect)),
+            (3, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert_eq!(elected_names(&plan), vec!["Parent", "Better Clone"]);
+}
+
+#[test]
+fn arcade_non_working_parent_gets_one_deterministic_working_clone() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(
+        vec![game("Parent", None), game("Clone", Some("Parent"))],
+        DatEcosystem::FBNeo,
+    );
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("playing"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::NotWorking)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert_eq!(elected_names(&plan), vec!["Clone"]);
+    assert!(plan.elected_games[0].explanation.steps[0].contains("parent is known not to work"));
+}
+
+#[test]
+fn arcade_unknown_parent_and_equal_clones_require_review() {
+    let temp = tempfile::tempdir().unwrap();
+    let unknown_dat = synthetic_arcade_dat(
+        vec![game("Parent", None), game("Clone", Some("Parent"))],
+        DatEcosystem::MAMEArcade,
+    );
+    let unknown = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &unknown_dat,
+        matches: auto_matches(&unknown_dat.games, temp.path()),
+        destination_root: temp.path().join("unknown"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Unknown)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert!(unknown.elected_games.is_empty());
+    assert!(unknown.unresolved_groups[0].reason.contains("unknown"));
+
+    let tie_dat = synthetic_arcade_dat(
+        vec![
+            game("Parent", None),
+            game("Clone One", Some("Parent")),
+            game("Clone Two", Some("Parent")),
+        ],
+        DatEcosystem::MAMEArcade,
+    );
+    let tie = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &tie_dat,
+        matches: auto_matches(&tie_dat.games, temp.path()),
+        destination_root: temp.path().join("tie"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::NotWorking)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (2, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert!(tie.elected_games.is_empty());
+    assert!(tie.unresolved_groups[0].reason.contains("multiple equally"));
+}
+
+#[test]
+fn arcade_dependency_and_partial_scan_evidence_never_produces_false_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(vec![game("Arcade", None)], DatEcosystem::MAMEArcade);
+    for dependency_state in [
+        DependencyState::Missing,
+        DependencyState::Ambiguous,
+        DependencyState::Cycle,
+        DependencyState::EvidenceUnavailable,
+    ] {
+        let plan = build_playing_library_plan(&PlayingLibraryRequest {
+            dat: &dat,
+            matches: auto_matches(&dat.games, temp.path()),
+            destination_root: temp.path().join(format!("{dependency_state:?}")),
+            policy: arcade_policy([(
+                0,
+                ArcadeCandidateEvidence {
+                    dependency_state,
+                    ..arcade_evidence(ArcadeWorkingStatus::Working)
+                },
+            )]),
+        })
+        .unwrap();
+        assert!(plan.elected_games.is_empty());
+    }
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("partial"),
+        policy: arcade_policy([(
+            0,
+            ArcadeCandidateEvidence {
+                scan_complete: false,
+                ..arcade_evidence(ArcadeWorkingStatus::Working)
+            },
+        )]),
+    })
+    .unwrap();
+    assert!(plan.elected_games.is_empty());
+}
+
+#[test]
+fn arcade_ambiguous_topology_is_reviewed_and_console_policy_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(
+        vec![game("A", Some("B")), game("B", Some("A"))],
+        DatEcosystem::MAMEArcade,
+    );
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("arcade"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert!(plan.elected_games.is_empty());
+    assert!(plan.unresolved_groups[0].reason.contains("topology"));
+
+    let console_dat = synthetic_dat(vec![game("Console", None)]);
+    let console = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &console_dat,
+        matches: auto_matches(&console_dat.games, temp.path()),
+        destination_root: temp.path().join("console"),
+        policy: PlayingLibraryPolicy::default(),
+    })
+    .unwrap();
+    assert_eq!(console.elected_games.len(), 1);
+}
+
+#[test]
+fn arcade_parent_and_working_clone_fallback_are_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(
+        vec![
+            game("parent", None),
+            game("clone-a", Some("parent")),
+            game("clone-b", Some("parent")),
+        ],
+        DatEcosystem::MAMEArcade,
+    );
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("tie"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::NotWorking)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (2, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert!(plan.elected_games.is_empty());
+    assert!(
+        plan.unresolved_groups[0]
+            .reason
+            .contains("equally eligible")
+    );
+
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("parent"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (2, arcade_evidence(ArcadeWorkingStatus::Imperfect)),
+        ]),
+    })
+    .unwrap();
+    assert_eq!(elected_names(&plan), vec!["parent"]);
+}
+
+#[test]
+fn arcade_imperfect_parent_yields_to_working_clone_but_unknown_parent_does_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(
+        vec![game("parent", None), game("clone", Some("parent"))],
+        DatEcosystem::FBNeo,
+    );
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("working"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Imperfect)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert_eq!(elected_names(&plan), vec!["clone"]);
+
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("unknown"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Unknown)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert!(plan.elected_games.is_empty());
+    assert!(plan.unresolved_groups[0].reason.contains("unknown"));
+}
+
+#[test]
+fn arcade_dependency_states_and_partial_scans_never_elect_ready() {
+    for dependency_state in [
+        DependencyState::Missing,
+        DependencyState::Ambiguous,
+        DependencyState::EvidenceUnavailable,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let dat = synthetic_arcade_dat(vec![game("game", None)], DatEcosystem::MAMEArcade);
+        let mut evidence = arcade_evidence(ArcadeWorkingStatus::Working);
+        evidence.dependency_state = dependency_state;
+        let plan = build_playing_library_plan(&PlayingLibraryRequest {
+            dat: &dat,
+            matches: auto_matches(&dat.games, temp.path()),
+            destination_root: temp.path().join("dependency"),
+            policy: arcade_policy([(0, evidence)]),
+        })
+        .unwrap();
+        assert!(plan.elected_games.is_empty());
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(vec![game("game", None)], DatEcosystem::MAMEArcade);
+    let mut evidence = arcade_evidence(ArcadeWorkingStatus::Working);
+    evidence.scan_complete = false;
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("partial"),
+        policy: arcade_policy([(0, evidence)]),
+    })
+    .unwrap();
+    assert!(plan.elected_games.is_empty());
+}
+
+#[test]
+fn arcade_broken_topology_is_reviewed_and_console_behavior_is_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let dat = synthetic_arcade_dat(
+        vec![game("a", Some("b")), game("b", Some("a"))],
+        DatEcosystem::MAMEArcade,
+    );
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &dat,
+        matches: auto_matches(&dat.games, temp.path()),
+        destination_root: temp.path().join("arcade"),
+        policy: arcade_policy([
+            (0, arcade_evidence(ArcadeWorkingStatus::Working)),
+            (1, arcade_evidence(ArcadeWorkingStatus::Working)),
+        ]),
+    })
+    .unwrap();
+    assert!(plan.elected_games.is_empty());
+    assert!(plan.unresolved_groups[0].reason.contains("cyclic"));
+
+    let console = synthetic_dat(vec![game("console", None)]);
+    let plan = build_playing_library_plan(&PlayingLibraryRequest {
+        dat: &console,
+        matches: auto_matches(&console.games, temp.path()),
+        destination_root: temp.path().join("console"),
+        policy: PlayingLibraryPolicy::default(),
+    })
+    .unwrap();
+    assert_eq!(plan.elected_games.len(), 1);
 }

@@ -35,16 +35,17 @@ pub mod verified_evidence_bridge;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::dat::dependency::DependencyState;
 use crate::dat::dependency::graph::{DependencyGraph, SetRef};
-use crate::dat::model::ParsedDat;
+use crate::dat::model::{DatEcosystem, ParsedDat};
 
 pub use apply_adapter::build_playing_library_transaction;
 pub use matching::match_loose_files_against_dat;
 pub use model::{
-    CandidateEvidenceSummary, DestinationConflict, ElectedGame, ElectionExplanation,
-    ExcludedCandidate, LinkedLibraryOperation, PlayingLibraryCandidate, PlayingLibraryPlan,
-    PlayingLibraryPolicy, RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber,
-    UnresolvedGroup,
+    ArcadeCandidateEvidence, ArcadeWorkingStatus, CandidateEvidenceSummary, DestinationConflict,
+    ElectedGame, ElectionExplanation, ExcludedCandidate, LinkedLibraryOperation,
+    PlayingLibraryCandidate, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryPolicyMode,
+    RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber, UnresolvedGroup,
 };
 pub use retrodeck_projection::{
     RetroDeckProjectedGame, RetroDeckProjectionPlan, RetroDeckVisibility,
@@ -125,6 +126,15 @@ pub fn build_playing_library_plan(
         }
     }
 
+    if request.policy.mode == PlayingLibraryPolicyMode::Arcade
+        && !matches!(
+            request.dat.source.ecosystem,
+            DatEcosystem::MAMEArcade | DatEcosystem::FBNeo
+        )
+    {
+        return Err("arcade Playing Library policy requires a MAME or FBNeo DAT".to_string());
+    }
+
     let graph = DependencyGraph::build(&request.dat.games);
     // Family root -> that family's matched archives, keyed by the resolved
     // root's declaration position so plan output is deterministic.
@@ -154,7 +164,11 @@ pub fn build_playing_library_plan(
         if members.len() == 1 {
             plan.singleton_families += 1;
         }
-        elect_family(request, *root_index, members, &mut plan);
+        if request.policy.mode == PlayingLibraryPolicyMode::Arcade {
+            elect_arcade_family(request, *root_index, members, &mut plan, &graph);
+        } else {
+            elect_family(request, *root_index, members, &mut plan);
+        }
     }
     mark_destination_conflicts(&mut plan);
     // A conflicted destination is reported, never proposed again: nothing in
@@ -212,6 +226,287 @@ fn resolve_family_root(graph: &DependencyGraph<'_>, start: usize) -> usize {
             _ => return current,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArcadeTopology {
+    Valid,
+    Review,
+}
+
+/// Arcade cannot silently turn a broken parent/clone declaration into a new
+/// family root. Console election retains its historical fail-closed family
+/// splitting behavior; arcade election reports the broken topology instead.
+fn arcade_topology(graph: &DependencyGraph<'_>, start: usize) -> ArcadeTopology {
+    let mut visited = BTreeSet::new();
+    let mut current = start;
+    loop {
+        if !visited.insert(current) || visited.len() > MAX_FAMILY_DEPTH {
+            return ArcadeTopology::Review;
+        }
+        let Some(reference) = graph
+            .game(current)
+            .clone_of
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return ArcadeTopology::Valid;
+        };
+        match graph.resolve_set(reference) {
+            SetRef::Unique(parent) => current = parent,
+            SetRef::Absent | SetRef::Duplicate => return ArcadeTopology::Review,
+        }
+    }
+}
+
+fn arcade_status_label(status: ArcadeWorkingStatus) -> &'static str {
+    match status {
+        ArcadeWorkingStatus::Working => "working",
+        ArcadeWorkingStatus::Imperfect => "imperfect",
+        ArcadeWorkingStatus::NotWorking => "not working",
+        ArcadeWorkingStatus::Unknown => "unknown",
+    }
+}
+
+fn arcade_dependency_label(state: DependencyState) -> &'static str {
+    match state {
+        DependencyState::NotApplicable => "no declared dependencies",
+        DependencyState::NotEvaluated => "dependency state not evaluated",
+        DependencyState::Satisfied => "dependencies complete",
+        DependencyState::Missing => "missing dependency",
+        DependencyState::Ambiguous => "ambiguous dependency",
+        DependencyState::Cycle => "cyclic dependency",
+        DependencyState::Contradictory => "contradictory dependency metadata",
+        DependencyState::Unsupported => "unsupported dependency structure",
+        DependencyState::EvidenceUnavailable => "dependency evidence unavailable",
+    }
+}
+
+fn arcade_candidate_eligible(evidence: ArcadeCandidateEvidence) -> bool {
+    evidence.eligible_storage() && evidence.status_rank().is_some()
+}
+
+/// Arcade election is intentionally a small policy layer over the existing
+/// family grouping and dependency evidence. It does not resolve topology or
+/// dependencies a second time.
+fn elect_arcade_family(
+    request: &PlayingLibraryRequest<'_>,
+    root_index: usize,
+    members: &[DatArchiveMatch],
+    plan: &mut PlayingLibraryPlan,
+    graph: &DependencyGraph<'_>,
+) {
+    if members
+        .iter()
+        .any(|member| arcade_topology(graph, member.dat_entry_index) == ArcadeTopology::Review)
+    {
+        plan.unresolved_groups.push(UnresolvedGroup {
+            family_root_name: request.dat.games[root_index].name.clone(),
+            tied_candidates: members
+                .iter()
+                .map(|member| request.dat.games[member.dat_entry_index].name.clone())
+                .collect(),
+            reason: "REVIEW_REQUIRED: parent/clone topology is ambiguous, missing, or cyclic"
+                .to_string(),
+        });
+        return;
+    }
+
+    let parent_position = members
+        .iter()
+        .position(|member| member.dat_entry_index == root_index);
+    let parent_evidence =
+        parent_position.map(|position| arcade_evidence(request, &members[position]));
+
+    // An unknown parent is not proof that the parent is unusable. Refuse to
+    // replace it with a clone until the caller supplies complete evidence.
+    if let Some(parent) = parent_evidence
+        && parent.working_status == ArcadeWorkingStatus::Unknown
+        && parent.scan_complete
+    {
+        finish_arcade_review(
+            request,
+            root_index,
+            members,
+            plan,
+            "REVIEW_REQUIRED: parent working status is unknown; a clone cannot replace it safely",
+        );
+        return;
+    }
+
+    let parent_is_eligible = parent_evidence.is_some_and(arcade_candidate_eligible);
+    let parent_fallback_allowed = parent_is_eligible
+        || match parent_evidence {
+            None => members
+                .iter()
+                .all(|member| arcade_evidence(request, member).scan_complete),
+            Some(parent) => {
+                parent.scan_complete
+                    && (parent.working_status == ArcadeWorkingStatus::NotWorking
+                        || !parent.eligible_storage())
+            }
+        };
+
+    let mut eligible: Vec<usize> = Vec::new();
+    for (position, member) in members.iter().enumerate() {
+        let evidence = arcade_evidence(request, member);
+        if arcade_candidate_eligible(evidence)
+            && (parent_is_eligible
+                || parent_position != Some(position)
+                || evidence.working_status == ArcadeWorkingStatus::Working)
+        {
+            eligible.push(position);
+        }
+    }
+
+    if !parent_fallback_allowed {
+        if let Some(parent) = parent_evidence
+            && !arcade_candidate_eligible(parent)
+            && parent.scan_complete
+        {
+            finish_arcade_review(
+                request,
+                root_index,
+                members,
+                plan,
+                "REVIEW_REQUIRED: parent is not proven working or structurally ineligible",
+            );
+        } else {
+            finish_arcade_review(
+                request,
+                root_index,
+                members,
+                plan,
+                "REVIEW_REQUIRED: complete arcade working/dependency evidence is unavailable",
+            );
+        }
+        return;
+    }
+
+    if eligible.is_empty() {
+        finish_arcade_review(
+            request,
+            root_index,
+            members,
+            plan,
+            "REVIEW_REQUIRED: no working or imperfect candidate has complete dependency evidence",
+        );
+        return;
+    }
+
+    // Status is the primary quality ordering. Parent preference breaks only
+    // equal-status ties; no filename or popularity fallback exists.
+    eligible.sort_by_key(|position| {
+        let evidence = arcade_evidence(request, &members[*position]);
+        (
+            evidence.status_rank().unwrap_or(u8::MAX),
+            if Some(*position) == parent_position {
+                0
+            } else {
+                1
+            },
+            members[*position].dat_entry_index,
+        )
+    });
+    let best_key = {
+        let position = eligible[0];
+        let evidence = arcade_evidence(request, &members[position]);
+        (
+            evidence.status_rank().unwrap_or(u8::MAX),
+            if Some(position) == parent_position {
+                0
+            } else {
+                1
+            },
+        )
+    };
+    let tied: Vec<usize> = eligible
+        .iter()
+        .copied()
+        .filter(|position| {
+            let evidence = arcade_evidence(request, &members[*position]);
+            (
+                evidence.status_rank().unwrap_or(u8::MAX),
+                if Some(*position) == parent_position {
+                    0
+                } else {
+                    1
+                },
+            ) == best_key
+        })
+        .collect();
+    if tied.len() > 1 {
+        finish_arcade_review(
+            request,
+            root_index,
+            members,
+            plan,
+            "REVIEW_REQUIRED: multiple equally eligible arcade candidates remain",
+        );
+        return;
+    }
+
+    let winner = eligible[0];
+    let winner_evidence = arcade_evidence(request, &members[winner]);
+    let mut reasons = vec![Vec::new(); members.len()];
+    for position in 0..members.len() {
+        if position == winner {
+            continue;
+        }
+        let evidence = arcade_evidence(request, &members[position]);
+        reasons[position].push(format!(
+            "{}; {}",
+            arcade_status_label(evidence.working_status),
+            arcade_dependency_label(evidence.dependency_state)
+        ));
+    }
+    let mut steps = Vec::new();
+    let winner_name = request.dat.games[members[winner].dat_entry_index]
+        .name
+        .clone();
+    if Some(winner) == parent_position {
+        steps.push("Parent selected: working and dependency-complete.".to_string());
+    } else if parent_evidence.is_some_and(|e| e.working_status == ArcadeWorkingStatus::NotWorking) {
+        steps.push(format!(
+            "Working clone selected because the parent is known not to work: {winner_name}."
+        ));
+    } else {
+        steps.push(format!(
+            "Arcade candidate selected with {} status and dependency-complete evidence: {winner_name}.",
+            arcade_status_label(winner_evidence.working_status)
+        ));
+    }
+    record_election(plan, request, root_index, members, winner, steps, &reasons);
+}
+
+fn arcade_evidence(
+    request: &PlayingLibraryRequest<'_>,
+    member: &DatArchiveMatch,
+) -> ArcadeCandidateEvidence {
+    request
+        .policy
+        .arcade_evidence
+        .get(&member.dat_entry_index)
+        .copied()
+        .unwrap_or_else(ArcadeCandidateEvidence::unknown)
+}
+
+fn finish_arcade_review(
+    request: &PlayingLibraryRequest<'_>,
+    root_index: usize,
+    members: &[DatArchiveMatch],
+    plan: &mut PlayingLibraryPlan,
+    reason: &str,
+) {
+    plan.unresolved_groups.push(UnresolvedGroup {
+        family_root_name: request.dat.games[root_index].name.clone(),
+        tied_candidates: members
+            .iter()
+            .map(|member| request.dat.games[member.dat_entry_index].name.clone())
+            .collect(),
+        reason: reason.to_string(),
+    });
 }
 
 /// One family's full election: class-exclusion filter, then the fixed tier

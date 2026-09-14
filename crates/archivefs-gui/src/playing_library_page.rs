@@ -383,6 +383,8 @@ impl PlayingLibraryPageState {
             excluded_release_classes.push(ReleaseClass::Sample);
         }
         PlayingLibraryPolicy {
+            mode: archivefs_core::playing_library::PlayingLibraryPolicyMode::Console1g1r,
+            arcade_evidence: std::collections::BTreeMap::new(),
             preferred_regions: split_preference_list(&self.preferred_regions_draft),
             preferred_languages: split_preference_list(&self.preferred_languages_draft),
             prefer_newest_revision: self.prefer_newest_revision,
