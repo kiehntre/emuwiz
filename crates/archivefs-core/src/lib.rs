@@ -176,6 +176,8 @@ pub mod publisher_profile;
 /// Generic, read-only contract for auditing and planning source-root changes.
 pub mod source_root_migration;
 
+/// Read-only conversion-tool capability inventory and per-item eligibility.
+pub mod storage_conversion;
 /// Read-only storage usage and future conversion-opportunity analysis.
 pub mod storage_health;
 

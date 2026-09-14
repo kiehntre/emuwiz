@@ -118,6 +118,33 @@ pub enum StorageObjectKind {
     Unreadable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConversionEligibility {
+    ConversionReady,
+    ToolMissing,
+    MediaTypeUnknown,
+    TopologyIncomplete,
+    FormatAlreadyEfficient,
+    RoundTripNotEstablished,
+    Unsupported,
+    ReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StorageConversionCapability {
+    pub eligibility: ConversionEligibility,
+    pub tool: Option<String>,
+    pub tool_path: Option<PathBuf>,
+    pub tool_version: Option<String>,
+    pub target_format: Option<StorageFormatClass>,
+    pub mode: Option<String>,
+    pub options: Vec<String>,
+    pub round_trip: StorageRoundTripClass,
+    pub verification_required: String,
+    pub savings_measurement: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StorageEstimate {
     pub kind: StorageEstimateKind,

@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use archivefs_core::PersistedArchive;
+use archivefs_core::storage_conversion::{
+    ConversionToolInventory, capability_for_item, probe_conversion_tools,
+};
 use archivefs_core::storage_health::{
     StorageHealthInput, StorageHealthReport, StorageOpportunityKind,
 };
@@ -12,6 +15,7 @@ use eframe::egui;
 pub(crate) struct StorageHealthPageState {
     report: Option<StorageHealthReport>,
     report_key: Option<Vec<(i64, Option<u64>, PathBuf)>>,
+    tool_inventory: Option<ConversionToolInventory>,
 }
 
 impl StorageHealthPageState {
@@ -51,9 +55,33 @@ impl StorageHealthPageState {
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, archives: &[PersistedArchive]) {
         self.ensure_report(archives);
+        if self.tool_inventory.is_none() {
+            self.tool_inventory = Some(probe_conversion_tools());
+        }
         ui.heading("Storage Health");
         ui.label("Read-only analysis of catalogue space usage and possible future compression candidates.");
         ui.small("No conversion, deletion, recompression, deduplication, move, or rename actions are available here.");
+        if let Some(inventory) = &self.tool_inventory {
+            ui.collapsing("Conversion tooling availability (read-only)", |ui| {
+                for tool in &inventory.tools {
+                    ui.label(format!(
+                        "{}: {:?} · {}",
+                        tool.name,
+                        tool.status,
+                        tool.path
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "not installed".into())
+                    ));
+                    if let Some(version) = &tool.version {
+                        ui.small(format!("Version: {version}"));
+                    }
+                    if !tool.capabilities.is_empty() {
+                        ui.small(format!("Capabilities: {}", tool.capabilities.join(", ")));
+                    }
+                }
+            });
+        }
         let Some(report) = self.report.as_ref() else {
             ui.label("Storage analysis is not available until the library catalogue is loaded.");
             return;
@@ -112,6 +140,19 @@ impl StorageHealthPageState {
                                 .unwrap_or_else(|| "unknown".into())
                         ));
                         ui.label(opportunity_text(item));
+                        if let Some(inventory) = &self.tool_inventory {
+                            let conversion = capability_for_item(item, inventory);
+                            ui.label(format!("Conversion capability: {:?}", conversion.eligibility));
+                            if let Some(tool) = conversion.tool.as_deref() {
+                                ui.small(format!("Tool: {tool} · target: {} · mode: {}", conversion.target_format.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into()), conversion.mode.as_deref().unwrap_or("unknown")));
+                                ui.small(format!("Options: {}", conversion.options.join("; ")));
+                                ui.small(format!("Round-trip: {}", conversion.round_trip));
+                                ui.small(format!("Verification required: {}", conversion.verification_required));
+                                ui.small(format!("Savings measurement: {}", conversion.savings_measurement));
+                            } else if conversion.eligibility == archivefs_core::storage_health::ConversionEligibility::ToolMissing {
+                                ui.small("The required conversion tool is not installed; nothing will be installed automatically.");
+                            }
+                        }
                         if let Some(target) = item.opportunity.target_format {
                             ui.small(format!("Future target: {target}"));
                         }
