@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::dat::archive::{ArchiveMemberEvidence, ArchivePassCompletion};
 use crate::dat::model::{DatChecksum, DatGameEntry, DatRomEntry, ParsedDat};
 use crate::identity_source::mame_listxml::ImportedMameListxmlSource;
 use crate::ready_to_play::ReadyToPlayState;
@@ -176,6 +177,169 @@ pub struct MameObservedDisk {
     pub set_name: String,
     pub name: Option<String>,
     pub sha1: Option<String>,
+}
+
+/// Completeness of facts already gathered by an existing scan/archive pass.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObservedEvidenceCompleteness {
+    Complete,
+    Partial,
+    NotGathered,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ObservedArcadeEvidenceSource {
+    pub source_id: String,
+    pub source_path: Option<PathBuf>,
+    pub relative_path: Option<PathBuf>,
+    pub listing_hash: Option<String>,
+    pub parser_version: Option<String>,
+    pub observed_size_bytes: Option<u64>,
+    pub observed_mtime_ns: Option<i128>,
+}
+
+/// Existing catalogue/archive/CHD facts projected into the A1 input shape.
+/// Constructing this value performs no filesystem access and no hashing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ObservedArcadeSetEvidence {
+    pub set_name: String,
+    pub observed_set_names: Vec<String>,
+    pub observed_roms: Vec<MameObservedRom>,
+    pub observed_disks: Vec<MameObservedDisk>,
+    pub sources: Vec<ObservedArcadeEvidenceSource>,
+    pub completeness: ObservedEvidenceCompleteness,
+    pub collection_provenance_known: bool,
+}
+
+impl ObservedArcadeSetEvidence {
+    pub fn new(set_name: impl Into<String>, completeness: ObservedEvidenceCompleteness) -> Self {
+        Self {
+            set_name: set_name.into(),
+            observed_set_names: Vec::new(),
+            observed_roms: Vec::new(),
+            observed_disks: Vec::new(),
+            sources: Vec::new(),
+            completeness,
+            collection_provenance_known: false,
+        }
+    }
+
+    /// Adapt an existing archive-member hash pass. A complete archive pass
+    /// with unhashable members remains partial; names and sizes are retained
+    /// but never promoted to cryptographic proof.
+    pub fn from_archive_pass(
+        set_name: impl Into<String>,
+        source_path: Option<PathBuf>,
+        relative_path: Option<PathBuf>,
+        listing_hash: Option<String>,
+        members: &[ArchiveMemberEvidence],
+        completion: &ArchivePassCompletion,
+        resolved_set_names: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let set_name = set_name.into();
+        let completeness = match completion {
+            ArchivePassCompletion::Complete
+                if members.iter().all(ArchiveMemberEvidence::is_hash_complete) =>
+            {
+                ObservedEvidenceCompleteness::Complete
+            }
+            ArchivePassCompletion::Complete | ArchivePassCompletion::Incomplete { .. } => {
+                ObservedEvidenceCompleteness::Partial
+            }
+        };
+        let observed_roms = members
+            .iter()
+            .filter(|member| !member.is_nested_archive)
+            .map(|member| {
+                let hashes = member.hashes.as_ref();
+                MameObservedRom {
+                    set_name: set_name.clone(),
+                    name: member.member_name_display.clone(),
+                    size_bytes: Some(member.logical_size),
+                    crc32: hashes.map(|hashes| hashes.crc32.clone()),
+                    sha1: hashes.map(|hashes| hashes.sha1.clone()),
+                }
+            })
+            .collect();
+        let mut result = Self::new(set_name, completeness);
+        result.observed_set_names = resolved_set_names.into_iter().collect();
+        result.observed_roms = observed_roms;
+        result.sources.push(ObservedArcadeEvidenceSource {
+            source_id: "archive_member_pass".into(),
+            source_path,
+            relative_path,
+            listing_hash,
+            parser_version: None,
+            observed_size_bytes: None,
+            observed_mtime_ns: None,
+        });
+        result
+    }
+
+    /// Feed gathered observations into the existing A1 engine.
+    pub fn audit(
+        &self,
+        mame: &InstalledMameEvidence,
+        expectation: MameSetExpectation,
+    ) -> MameSetCompatibility {
+        if matches!(
+            self.completeness,
+            ObservedEvidenceCompleteness::NotGathered | ObservedEvidenceCompleteness::Unknown
+        ) {
+            return result(
+                mame,
+                expectation,
+                MameSetCompatibilityState::Unknown,
+                vec![MameMismatch {
+                    reason: MameMismatchReason::EvidenceUnavailable,
+                    set_name: self.set_name.clone(),
+                    member_name: None,
+                    expected_size: None,
+                    observed_size: None,
+                    detail: "Existing archive/catalogue evidence was not gathered for this set"
+                        .into(),
+                }],
+                self.collection_provenance_known,
+            );
+        }
+        let mut compatibility = audit_mame_set(
+            mame,
+            expectation,
+            &self.observed_set_names,
+            &self.observed_roms,
+            &self.observed_disks,
+            self.collection_provenance_known,
+        );
+        if self.completeness == ObservedEvidenceCompleteness::Partial
+            && matches!(
+                compatibility.state,
+                MameSetCompatibilityState::Compatible
+                    | MameSetCompatibilityState::CompatibleWithWarnings
+            )
+        {
+            compatibility.state = MameSetCompatibilityState::Unknown;
+            compatibility.ready_to_play_state = Some(ReadyToPlayState::Unknown);
+            compatibility.mismatches.push(MameMismatch {
+                reason: MameMismatchReason::EvidenceUnavailable,
+                set_name: self.set_name.clone(),
+                member_name: None,
+                expected_size: None,
+                observed_size: None,
+                detail: "Only partial cached evidence was available; compatibility is not proven"
+                    .into(),
+            });
+        }
+        compatibility.mismatches.sort_by_key(|item| {
+            (
+                item.reason,
+                item.set_name.clone(),
+                item.member_name.clone().unwrap_or_default(),
+            )
+        });
+        compatibility
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -777,5 +941,52 @@ mod tests {
             expectation.dependencies.closure_set_names,
             vec!["child", "parent", "qsound"]
         );
+    }
+
+    #[test]
+    fn archive_bridge_preserves_hashes_and_complete_evidence() {
+        let member = ArchiveMemberEvidence {
+            archive_path: PathBuf::from("/roms/pacman.zip"),
+            member_name_raw: b"pacman.6e".to_vec(),
+            member_name_display: "pacman.6e".into(),
+            index: 0,
+            logical_size: 4,
+            is_nested_archive: false,
+            status: crate::dat::archive::ArchiveMemberStatus::HashComplete,
+            hashes: Some(crate::dat::archive::ArchiveMemberHashes {
+                crc32: "aaaaaaaa".into(),
+                md5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                sha1: "1111111111111111111111111111111111111111".into(),
+                sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            }),
+        };
+        let bridge = ObservedArcadeSetEvidence::from_archive_pass(
+            "pacman",
+            Some(PathBuf::from("/roms/pacman.zip")),
+            Some(PathBuf::from("pacman.zip")),
+            Some("listing".into()),
+            &[member],
+            &ArchivePassCompletion::Complete,
+            ["pacman".into()],
+        );
+        assert_eq!(bridge.completeness, ObservedEvidenceCompleteness::Complete);
+        assert_eq!(
+            bridge.roms[0].sha1.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        let result = bridge.audit(&mame(), MameSetExpectation::from_game(&game(None)));
+        assert_eq!(result.state, MameSetCompatibilityState::Compatible);
+    }
+
+    #[test]
+    fn partial_archive_evidence_cannot_be_promoted_to_compatible() {
+        let mut bridge =
+            ObservedArcadeSetEvidence::new("pacman", ObservedEvidenceCompleteness::Partial);
+        bridge.observed_set_names.push("pacman".into());
+        bridge.observed_roms.push(observed());
+        bridge.collection_provenance_known = true;
+        let result = bridge.audit(&mame(), MameSetExpectation::from_game(&game(None)));
+        assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+        assert_eq!(result.ready_to_play_state, Some(ReadyToPlayState::Unknown));
     }
 }
