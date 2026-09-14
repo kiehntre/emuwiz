@@ -1469,12 +1469,14 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 /// (see `database.rs`): 0006 (Wii identity), 0007 (Collection Discovery
 /// paging), 0008 (library DAT identities), 0009 (set-audit persistence),
 /// 0010 (verified identity facts), 0011 (named expected DAT inventory), and
-/// 0012 (expected-inventory metadata). This guard still proves Doctor itself
+/// 0012 (expected-inventory metadata), 0013 (scan fingerprints), 0014
+/// (ingestion fingerprint evidence), 0015 (discovery-detail reuse), 0016
+/// (non-archive fingerprints), and 0017 (source roles). This guard still proves Doctor itself
 /// introduced no migration of its own
 /// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 12] = [
+    const EXPECTED: [&str; 17] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1487,6 +1489,11 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0010_verified_identity_facts.sql"),
         include_str!("../migrations/0011_dat_expected_entries.sql"),
         include_str!("../migrations/0012_dat_expected_inventory_meta.sql"),
+        include_str!("../migrations/0013_scan_fingerprints.sql"),
+        include_str!("../migrations/0014_ingestion_fingerprint_evidence.sql"),
+        include_str!("../migrations/0015_discovery_detail_reuse.sql"),
+        include_str!("../migrations/0016_non_archive_fingerprints.sql"),
+        include_str!("../migrations/0017_source_roles.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
