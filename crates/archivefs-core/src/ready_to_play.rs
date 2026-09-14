@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_and_warning_states_are_pure_projections() {
+    fn unknown_evidence_is_not_promoted_to_ready_with_warnings() {
         let plan = plan(LaunchReadiness::Ready, None);
         let evidence = ReadyToPlayEvidence::from_launch_plan("game", &plan);
         assert_eq!(
@@ -494,7 +494,7 @@ mod tests {
         warning.emulator = EmulatorEvidenceState::Unknown;
         assert_eq!(
             project_ready_to_play(&warning).state,
-            ReadyToPlayState::ReadyWithWarnings
+            ReadyToPlayState::Unknown
         );
     }
 
@@ -510,7 +510,7 @@ mod tests {
         let mut evidence = ReadyToPlayEvidence::from_launch_plan("game", &plan);
         evidence.firmware = ReadinessEvidenceState::NotGathered;
         let result = project_ready_to_play(&evidence);
-        assert_eq!(result.state, ReadyToPlayState::Blocked);
+        assert_eq!(result.state, ReadyToPlayState::NeedsAttention);
         assert!(
             result
                 .reasons

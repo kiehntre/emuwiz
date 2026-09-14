@@ -156,6 +156,7 @@ mod tests {
             crc32: Some("12345678".into()),
             sha1: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
         });
+        evidence.observed_set_names.push("neogeo".into());
         evidence
     }
 
