@@ -60,6 +60,8 @@ pub mod oric_media;
 pub mod oric_tape;
 /// Optional, read-only RetroAchievements game metadata and bounded cache.
 pub mod retroachievements;
+/// Pure per-game launch-readiness projection over existing gathered evidence.
+pub mod ready_to_play;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
 /// Bounded PCM/WAV pulse evidence for tape recordings.
