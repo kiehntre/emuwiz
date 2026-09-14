@@ -98,6 +98,7 @@ pub use inspector::{
 
 pub mod archive_member_resolver;
 pub mod archive_workflow;
+pub mod memory_card_inventory;
 pub use archive_member_resolver::{
     ArchiveMemberResolution, MAX_PREPARE_CANDIDATES, MAX_PREPARE_MEMBER_COMPONENTS,
     MAX_PREPARE_MEMBER_PATH_BYTES, PreparedMemberCandidate, prepared_member_path,
