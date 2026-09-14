@@ -117,6 +117,7 @@ pub mod process_spawn;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
+pub mod retroarch_resource_projection;
 pub mod rmg_command;
 pub mod rmg_execution;
 pub mod rpcs3_command;
@@ -384,6 +385,12 @@ pub use resource_grants::{
 };
 pub use retroarch_command::{
     RetroArchCommand, RetroArchCommandPlan, RetroArchCommandSelection, build_retroarch_command_plan,
+};
+pub use retroarch_resource_projection::{
+    RetroArchBiosRequirement, RetroArchProjectionError, RetroArchProjectionReceipt,
+    RetroArchResourcePlan, RetroArchResourcePlanError, RetroArchResourceRequest,
+    cleanup_retroarch_projection, command_with_retroarch_resource_plan,
+    materialize_retroarch_resource_plan, plan_retroarch_resource_grants,
 };
 pub use rmg_command::{
     RMG_SUPPORTED_PLATFORM_ID, RmgCommand, RmgCommandPlan, RmgCommandSelection,
