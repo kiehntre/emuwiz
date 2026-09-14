@@ -9,9 +9,10 @@ use archivefs_core::emulator_inventory::{
     self, EmulatorInstallation, EmulatorInventory, InstallationType, InventoryEmulator,
 };
 use archivefs_core::emulator_update::{
-    self, HttpsUpdateDownloader, UpdateArtifact, UpdateExecutionEligibility, UpdateExecutionError,
-    UpdateExecutionPlan, UpdateJournal, UpdateReport, UpdateResult, UpdateStatus,
-    execute_staged_update, plan_staged_update, rollback_staged_update,
+    self, HttpsUpdateDownloader, OfficialMetadataProvider, UpdateArtifact,
+    UpdateExecutionEligibility, UpdateExecutionError, UpdateExecutionPlan, UpdateJournal,
+    UpdateReport, UpdateResult, UpdateStatus, execute_staged_update, plan_staged_update,
+    rollback_staged_update,
 };
 use archivefs_core::managed_emulator_install::{
     ManagedInstallHealth, ManagedInstallVersionRole, ManagedOwnershipState,
@@ -47,7 +48,7 @@ impl EmulatorInventoryPageState {
     }
 
     pub(crate) fn check_for_updates(&mut self) {
-        let Some(inventory) = &self.inventory else {
+        let Some(inventory) = self.inventory.clone() else {
             self.error = Some("Scan the inventory before checking metadata.".into());
             return;
         };
@@ -162,7 +163,7 @@ impl EmulatorInventoryPageState {
         if let Some(feedback) = &self.feedback {
             ui.label(feedback);
         }
-        let Some(inventory) = &self.inventory else {
+        let Some(inventory) = self.inventory.clone() else {
             ui.label("Inventory has not been scanned yet.");
             return;
         };
