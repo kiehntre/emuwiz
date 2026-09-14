@@ -1128,6 +1128,7 @@ mod tests {
         plan.actions.truncate(1);
         let target_root = dir.path().join("target");
         let target_path = target_root.join("mcpx_1.0.bin");
+        fs::create_dir(&target_root).unwrap();
         plan.requirements[0].target.path = Some(target_path.clone());
         if let BiosProjectionAction::CreateFileLink { target, .. } = &mut plan.actions[0] {
             target.path = Some(target_path);
