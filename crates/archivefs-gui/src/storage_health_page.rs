@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 
-use archivefs_core::PersistedArchive;
+use archivefs_core::archive_workflow::inventory_archive_tools;
 use archivefs_core::storage_conversion::{
-    ConversionToolInventory, capability_for_item, probe_conversion_tools,
+    capability_for_item, probe_conversion_tools, ConversionToolInventory,
 };
 use archivefs_core::storage_health::{
     StorageHealthInput, StorageHealthReport, StorageOpportunityKind,
 };
+use archivefs_core::PersistedArchive;
 use eframe::egui;
 
 #[derive(Default)]
@@ -61,6 +62,15 @@ impl StorageHealthPageState {
         ui.heading("Storage Health");
         ui.label("Read-only analysis of catalogue space usage and possible future compression candidates.");
         ui.small("No conversion, deletion, recompression, deduplication, move, or rename actions are available here.");
+        ui.collapsing("Archives (ZIP / 7Z / RAR)", |ui| {
+            ui.label("Archive pack/unpack execution remains explicit and source-preserving.");
+            ui.label("ZIP: inspect, create, and extract through staged verification.");
+            ui.label("7Z and RAR: tool inventory and review only until a trusted execution backend is proven.");
+            for tool in inventory_archive_tools().tools {
+                ui.small(format!("{}: {:?} · {}", tool.name, tool.status, tool.path.map(|p| p.display().to_string()).unwrap_or_else(|| "not installed".into())));
+            }
+            ui.small("No archive is selected or changed from this overview.");
+        });
         if let Some(inventory) = &self.tool_inventory {
             ui.collapsing("Conversion tooling availability (read-only)", |ui| {
                 for tool in &inventory.tools {
