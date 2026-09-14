@@ -159,6 +159,7 @@ mod cheatbase_page;
 mod emulator_download_page;
 mod emulator_setup;
 use emulator_setup::*;
+mod emulator_inventory_page;
 mod emulator_setup_overrides;
 mod emulator_setup_page;
 mod gamer_platform_shelf;
@@ -227,6 +228,7 @@ pub(crate) mod optical_conversion_page;
 pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
 mod platform_source_actions;
+pub(crate) mod storage_health_page;
 use platform_source_actions::*;
 pub(crate) mod playing_library_page;
 pub(crate) mod problems_repair_page;
@@ -2620,6 +2622,8 @@ enum MainView {
     /// "Repair" to convert a disc image. Reuses the exact same
     /// `OpticalConversionPageState` and backend the Repair tab used before.
     DiscConversion,
+    /// Read-only catalogue-backed storage usage and future conversion analysis.
+    StorageHealth,
     /// Read-only presentation of bounded tape analysis for the selected game.
     TapeInspector,
     /// Emulator Setup: the read-only emulator readiness / profile check.
@@ -2631,6 +2635,8 @@ enum MainView {
     /// Doctor scan's "Emulators" and "Emulator profiles" categories carry the
     /// per-emulator rows.
     EmulatorSetup,
+    /// Read-only inventory of installed emulator versions and channels.
+    EmulatorInventory,
     /// Curated, read-only collection view backed by the loaded catalogue and
     /// existing evidence/artwork state.
     Museum,
@@ -2713,7 +2719,7 @@ enum LibraryTab {
 /// provably converges on the same destination - see
 /// `major_workflows_are_reachable_from_home_sidebar_and_top_menu`. RomM is
 /// exposed under the "Sources" menu instead (it has no `MainView` of its own).
-const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 5] = [
+const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 7] = [
     (
         "Museum",
         "Browse your collection by platform: what EmuWiz knows about each system.",
@@ -2735,9 +2741,19 @@ const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 5] = [
         MainView::DiscConversion,
     ),
     (
+        "Storage Health",
+        "Inspect library space usage and conservative future compression opportunities.",
+        MainView::StorageHealth,
+    ),
+    (
         "Emulator Setup",
         "Read-only check of which emulators EmuWiz can find and their launch readiness.",
         MainView::EmulatorSetup,
+    ),
+    (
+        "Emulator Manager",
+        "Read-only inventory of installed emulator versions, channels, and locations.",
+        MainView::EmulatorInventory,
     ),
 ];
 
@@ -3204,8 +3220,10 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::RepairHistory => "Repair History",
         MainView::ExactDuplicateReview => "Duplicate Finder",
         MainView::DiscConversion => "Disc Conversion",
+        MainView::StorageHealth => "Storage Health",
         MainView::TapeInspector => "Tape Inspector",
         MainView::EmulatorSetup => "Emulator Setup",
+        MainView::EmulatorInventory => "Emulator Manager",
         MainView::Museum => "Museum",
         MainView::LibraryViewHistory => "Library View History",
         MainView::DatSources => "DAT Sources",
@@ -3244,8 +3262,10 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::IdentifyRename
         | MainView::RepairReview
         | MainView::DiscConversion
+        | MainView::StorageHealth
         | MainView::TapeInspector
         | MainView::EmulatorSetup
+        | MainView::EmulatorInventory
         | MainView::DatSources
         | MainView::MediaSets
         | MainView::Doctor
@@ -3297,6 +3317,7 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::Doctor
             | MainView::EmulatorSetup
             | MainView::DiscConversion
+            | MainView::StorageHealth
             | MainView::TapeInspector
             | MainView::HistoryLogs
             | MainView::Settings
@@ -3526,6 +3547,8 @@ struct ArchiveFsApp {
     emulator_setup_focus: Option<EmulatorSetupFocus>,
     /// Local presentation state for the candidate-first Emulator Setup page.
     emulator_setup_page: emulator_setup_page::EmulatorSetupPageState,
+    /// Read-only installed emulator version/channel inventory.
+    emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState,
     /// GUI-only per-emulator executable/configuration-folder overrides for
     /// Emulator Setup remediation controls; see
     /// `emulator_setup_overrides` for exactly which adapter/kind pairs are
@@ -3695,6 +3718,7 @@ struct ArchiveFsApp {
     /// `RepairReviewPageState::default()` starts with no plan loaded.
     exact_duplicate_review_page: Option<exact_duplicate_review_page::ExactDuplicateReviewPageState>,
     optical_conversion_page: Option<optical_conversion_page::OpticalConversionPageState>,
+    storage_health_page: storage_health_page::StorageHealthPageState,
     /// The Library View History page, loaded lazily on first visit:
     /// durable Library View apply/remove records, re-read from disk on
     /// every refresh. Distinct from `history` (`OperationHistory`) below,
@@ -4242,6 +4266,8 @@ impl ArchiveFsApp {
             retroarch_core_folder_rejected_pick: None,
             emulator_setup_focus: None,
             emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
+            emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState::default(),
+            storage_health_page: storage_health_page::StorageHealthPageState::default(),
             emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::load(),
             tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
             pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
@@ -9445,6 +9471,16 @@ impl ArchiveFsApp {
                     return;
                 }
 
+                if self.view == MainView::StorageHealth {
+                    if let Some(snapshot) = self.database_state.snapshot() {
+                        self.storage_health_page.show(ui, &snapshot.archives);
+                    } else {
+                        ui.heading("Storage Health");
+                        ui.label("Storage analysis is not available until the library catalogue is loaded.");
+                    }
+                    return;
+                }
+
                 if self.view == MainView::TapeInspector {
                     let selected_path = self.archive_context.focused.clone();
                     if let Some(path) = selected_path
@@ -9508,6 +9544,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::EmulatorSetup {
                     self.show_emulator_setup_page(ui, context);
+                    return;
+                }
+
+                if self.view == MainView::EmulatorInventory {
+                    self.emulator_inventory_page.show(ui);
                     return;
                 }
 

@@ -44,6 +44,7 @@ mod database;
 pub mod diagnostics;
 pub mod dragon_coco_tape;
 pub mod emulator_download;
+pub mod emulator_inventory;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
@@ -173,6 +174,9 @@ pub mod publisher_profile;
 
 /// Generic, read-only contract for auditing and planning source-root changes.
 pub mod source_root_migration;
+
+/// Read-only storage usage and future conversion-opportunity analysis.
+pub mod storage_health;
 
 /// Read-only projection of persisted source-folder/database state into the
 /// generic source-root migration planner.
