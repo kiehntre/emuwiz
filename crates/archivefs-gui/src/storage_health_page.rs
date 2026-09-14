@@ -65,7 +65,7 @@ impl StorageHealthPageState {
         ui.collapsing("Archives (ZIP / 7Z / RAR)", |ui| {
             ui.label("Archive pack/unpack execution remains explicit and source-preserving.");
             ui.label("ZIP: inspect, create, and extract through staged verification.");
-            ui.label("7Z and RAR: tool inventory and review only until a trusted execution backend is proven.");
+            ui.label("7Z and RAR: list-first inspection and staged extraction; encrypted, malformed, multipart, and unsafe archives remain blocked.");
             for tool in inventory_archive_tools().tools {
                 ui.small(format!("{}: {:?} · {}", tool.name, tool.status, tool.path.map(|p| p.display().to_string()).unwrap_or_else(|| "not installed".into())));
             }
