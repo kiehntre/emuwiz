@@ -765,7 +765,9 @@ fn result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dat::model::{DatGameEntry, DatRomEntry};
+    use crate::dat::model::{
+        DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource,
+    };
 
     fn mame() -> InstalledMameEvidence {
         InstalledMameEvidence::new(
@@ -931,7 +933,21 @@ mod tests {
             ..Default::default()
         };
         let dat = ParsedDat {
-            source: Default::default(),
+            source: DatSource {
+                format: DatFormat::Logiqx,
+                ecosystem: DatEcosystem::MAMEArcade,
+                file_path: "synthetic-mame.xml".into(),
+                name: Some("Synthetic MAME".into()),
+                description: None,
+                version: None,
+                author: None,
+                homepage: None,
+                clrmamepro_header: None,
+                entry_count: 3,
+                rom_count: 0,
+                parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
+            },
             games: vec![child, parent, device],
         };
         let expectation = MameExpectationIndex::new(&dat)
@@ -971,7 +987,7 @@ mod tests {
         );
         assert_eq!(bridge.completeness, ObservedEvidenceCompleteness::Complete);
         assert_eq!(
-            bridge.roms[0].sha1.as_deref(),
+            bridge.observed_roms[0].sha1.as_deref(),
             Some("1111111111111111111111111111111111111111")
         );
         let result = bridge.audit(&mame(), MameSetExpectation::from_game(&game(None)));
