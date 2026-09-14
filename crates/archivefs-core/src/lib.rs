@@ -59,6 +59,8 @@ pub mod managed_emulator_install;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+/// Conservative static input requirements projected from MAME metadata.
+pub mod mame_input_requirements;
 pub mod managed_appimage_bootstrap;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
