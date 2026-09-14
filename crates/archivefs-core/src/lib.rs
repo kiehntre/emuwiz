@@ -59,6 +59,9 @@ pub mod managed_emulator_install;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+/// Typed library presentation visibility, separate from source ownership and
+/// subsystem evidence availability.
+pub mod library_visibility;
 /// Conservative static input requirements projected from MAME metadata.
 pub mod mame_input_requirements;
 pub mod managed_appimage_bootstrap;
