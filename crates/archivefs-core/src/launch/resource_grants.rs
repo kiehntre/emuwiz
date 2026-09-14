@@ -383,7 +383,69 @@ mod tests {
         assert!(set.validate().is_ok());
         assert_eq!(
             set.grants.first().unwrap().presented_path.as_deref(),
-            Some(std::path::Path::new("/run/bios.bin"))
+            Some(std::path::Path::new("/run/card.mcr"))
+        );
+    }
+
+    #[test]
+    fn equivalent_grants_have_identical_order_independent_of_insertion_order() {
+        let grants = vec![
+            grant(
+                LaunchResourceRole::GameMedia,
+                Some("/games/zeta.chd"),
+                Some("/tmp/emuwiz/system/zeta.chd"),
+                LaunchResourceAccess::ReadOnly,
+                LaunchProjectionMethod::DirectPath,
+                LaunchResourceLifetime::Session,
+            ),
+            grant(
+                LaunchResourceRole::GameMedia,
+                Some("/games/alpha.chd"),
+                Some("/tmp/emuwiz/system/alpha.chd"),
+                LaunchResourceAccess::ReadOnly,
+                LaunchProjectionMethod::DirectPath,
+                LaunchResourceLifetime::Session,
+            ),
+            grant(
+                LaunchResourceRole::Config,
+                None,
+                Some("/tmp/emuwiz/config/launch.cfg"),
+                LaunchResourceAccess::CreateOnly,
+                LaunchProjectionMethod::GeneratedFile,
+                LaunchResourceLifetime::LaunchOnly,
+            ),
+            grant(
+                LaunchResourceRole::BiosFirmware,
+                Some("/bios/bios.bin"),
+                Some("/tmp/emuwiz/system/bios.bin"),
+                LaunchResourceAccess::ReadOnly,
+                LaunchProjectionMethod::SymlinkFile,
+                LaunchResourceLifetime::Session,
+            ),
+        ];
+
+        let ordered = |items: Vec<LaunchResourceGrant>| {
+            let mut set = LaunchResourceGrantSet::default();
+            for item in items {
+                set.try_insert(item).unwrap();
+            }
+            set.grants
+                .into_iter()
+                .map(|grant| grant.presented_path.unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let mut reversed = grants.clone();
+        reversed.reverse();
+        assert_eq!(ordered(grants.clone()), ordered(reversed));
+        assert_eq!(
+            ordered(grants),
+            vec![
+                PathBuf::from("/tmp/emuwiz/config/launch.cfg"),
+                PathBuf::from("/tmp/emuwiz/system/alpha.chd"),
+                PathBuf::from("/tmp/emuwiz/system/bios.bin"),
+                PathBuf::from("/tmp/emuwiz/system/zeta.chd"),
+            ]
         );
     }
 
