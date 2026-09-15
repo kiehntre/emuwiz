@@ -13,7 +13,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::archive_workflow::{self, ArchiveEligibility, ArchiveFormat, ArchivePlan};
-use crate::standalone_patch::{StandalonePatchInspection, inspect_standalone_patch};
+use crate::mod_package::SelectedGameForMod;
+use crate::standalone_patch::{
+    PatchCompatibility, StandalonePatchInspection, StandalonePatchMatch, inspect_standalone_patch,
+    match_patch_source,
+};
 
 pub const MAX_MOD_README_BYTES: u64 = 256 * 1024;
 pub const MAX_MOD_MANIFEST_BYTES: u64 = 256 * 1024;
@@ -61,6 +65,8 @@ pub struct ArchivedModPackageInspection {
     pub members: Vec<ArchivedModMember>,
     pub patch_selection: ArchivedPatchSelection,
     pub patches: Vec<StandalonePatchInspection>,
+    pub patch_matches: Vec<StandalonePatchMatch>,
+    pub compatibility: ArchivedModCompatibility,
     pub title: Option<String>,
     pub version: Option<String>,
     pub author: Option<String>,
@@ -68,8 +74,24 @@ pub struct ArchivedModPackageInspection {
     pub no_changes_made: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchivedModCompatibility {
+    Compatible,
+    Incompatible,
+    ReviewRequired,
+    Unknown,
+}
+
 pub fn inspect_archived_mod_package(
     path: impl AsRef<Path>,
+) -> Result<ArchivedModPackageInspection, String> {
+    inspect_archived_mod_package_for_game(path, None)
+}
+
+pub fn inspect_archived_mod_package_for_game(
+    path: impl AsRef<Path>,
+    selected_game: Option<&SelectedGameForMod>,
 ) -> Result<ArchivedModPackageInspection, String> {
     let path = path.as_ref().to_path_buf();
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
@@ -115,6 +137,12 @@ pub fn inspect_archived_mod_package(
         warnings.push("patch members are listed but their bytes were not extracted by the external archive adapter".into());
     }
     let (title, version, author) = read_readme_hints(&path, &plan)?;
+    let base_bytes = selected_game.and_then(|game| fs::read(&game.identity.archive_path).ok());
+    let patch_matches = patches
+        .iter()
+        .map(|patch| match_patch_source(patch, base_bytes.as_deref(), title.is_some()))
+        .collect::<Vec<_>>();
+    let compatibility = package_compatibility(plan.eligibility, &patch_matches);
     Ok(ArchivedModPackageInspection {
         package_path: path,
         package_sha256,
@@ -123,12 +151,52 @@ pub fn inspect_archived_mod_package(
         members,
         patch_selection,
         patches,
+        patch_matches,
+        compatibility,
         title,
         version,
         author,
         warnings,
         no_changes_made: true,
     })
+}
+
+fn package_compatibility(
+    eligibility: ArchiveEligibility,
+    matches: &[StandalonePatchMatch],
+) -> ArchivedModCompatibility {
+    if eligibility != ArchiveEligibility::Ready || matches.is_empty() {
+        return ArchivedModCompatibility::Unknown;
+    }
+    if matches
+        .iter()
+        .all(|m| m.compatibility == PatchCompatibility::Incompatible)
+    {
+        return ArchivedModCompatibility::Incompatible;
+    }
+    if matches
+        .iter()
+        .any(|m| m.compatibility == PatchCompatibility::Compatible)
+    {
+        return if matches
+            .iter()
+            .filter(|m| m.compatibility == PatchCompatibility::Compatible)
+            .count()
+            == 1
+        {
+            ArchivedModCompatibility::Compatible
+        } else {
+            ArchivedModCompatibility::ReviewRequired
+        };
+    }
+    if matches
+        .iter()
+        .any(|m| m.compatibility == PatchCompatibility::ReviewRequired)
+    {
+        ArchivedModCompatibility::ReviewRequired
+    } else {
+        ArchivedModCompatibility::Unknown
+    }
 }
 
 fn inspect_zip_patches(
@@ -239,4 +307,74 @@ fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn zip_fixture(members: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.zip");
+        let file = fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, bytes) in members {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn zip_projects_patch_readme_and_executable_without_mutation() {
+        let (dir, path) = zip_fixture(&[
+            ("README.md", b"Chrono Translation\n"),
+            ("patch.ips", b"PATCHEOF"),
+            ("tools/install.exe", b"MZ"),
+            ("nested/other.zip", b"PK\x03\x04"),
+        ]);
+        let before = fs::read(&path).unwrap();
+        let report = inspect_archived_mod_package(&path).unwrap();
+        assert_eq!(report.archive_format, ArchiveFormat::Zip);
+        assert_eq!(report.patch_selection, ArchivedPatchSelection::OnePatch);
+        assert_eq!(report.patches.len(), 1);
+        assert_eq!(
+            report.patches[0].format,
+            crate::standalone_patch::StandalonePatchFormat::Ips
+        );
+        assert_eq!(report.title.as_deref(), Some("Chrono Translation"));
+        assert!(
+            report
+                .members
+                .iter()
+                .any(|m| m.role == ArchivedModMemberRole::Executable)
+        );
+        assert!(
+            report
+                .members
+                .iter()
+                .any(|m| m.role == ArchivedModMemberRole::Archive)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(report.no_changes_made);
+        assert!(!dir.path().join("emuwiz-mod-inspect").exists());
+    }
+
+    #[test]
+    fn multiple_patches_are_review_required_and_ordered() {
+        let (_dir, path) = zip_fixture(&[("z.ips", b"PATCHEOF"), ("a.ips", b"PATCHEOF")]);
+        let report = inspect_archived_mod_package(&path).unwrap();
+        assert_eq!(
+            report.patch_selection,
+            ArchivedPatchSelection::MultiplePatchesReviewRequired
+        );
+        assert_eq!(report.members[0].path, "a.ips");
+        assert_eq!(report.members[1].path, "z.ips");
+        assert_eq!(report.patches.len(), 2);
+        assert_eq!(report.compatibility, ArchivedModCompatibility::Unknown);
+    }
 }
