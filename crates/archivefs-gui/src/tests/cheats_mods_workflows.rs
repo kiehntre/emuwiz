@@ -2835,9 +2835,9 @@ fn stale_catalogue_result_is_rejected_without_touching_library_state() {
             CheatSourceFetchStatus::Fetched,
         )))
         .unwrap();
-    app.catalogue_generation = 2;
+    app.catalogue_bsfree_ui.catalogue_generation = 2;
     let (_progress_sender, progress_receiver) = mpsc::channel();
-    app.catalogue_retrieval = Some(RunningCatalogueRetrieval {
+    app.catalogue_bsfree_ui.catalogue_retrieval = Some(RunningCatalogueRetrieval {
         generation: 1,
         source_id: "libretro-buildbot-cheats".into(),
         cancellation: CheatSourceCancellation::default(),
@@ -2847,8 +2847,8 @@ fn stale_catalogue_result_is_rejected_without_touching_library_state() {
         cancellation_requested: false,
     });
     app.poll_catalogue_manager(&egui::Context::default());
-    assert!(app.catalogue_retrieval.is_none());
-    assert!(app.catalogue_last_result.is_none());
+    assert!(app.catalogue_bsfree_ui.catalogue_retrieval.is_none());
+    assert!(app.catalogue_bsfree_ui.catalogue_last_result.is_none());
     assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     assert_eq!(
         app.archive_context.focused,

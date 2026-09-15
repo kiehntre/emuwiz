@@ -1,4 +1,5 @@
 use crate::*;
+use crate::romm_config::RommConfigDraft;
 
 impl ArchiveFsApp {
     /// Starts one RomM operation, or declines.

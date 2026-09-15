@@ -569,8 +569,8 @@ fn catalogue_status_load_needed_covers_sources_and_cheats_mods_only() {
 #[test]
 fn handle_catalogue_manager_action_review_then_confirm_requires_both_steps() {
     let mut app = app_for_operation_tests();
-    assert!(app.catalogue_review.is_none());
-    assert!(app.catalogue_retrieval.is_none());
+    assert!(app.catalogue_bsfree_ui.catalogue_review.is_none());
+    assert!(app.catalogue_bsfree_ui.catalogue_retrieval.is_none());
     let context = egui::Context::default();
 
     app.handle_catalogue_manager_action(
@@ -581,11 +581,11 @@ fn handle_catalogue_manager_action_review_then_confirm_requires_both_steps() {
         },
     );
     assert!(
-        app.catalogue_retrieval.is_none(),
+        app.catalogue_bsfree_ui.catalogue_retrieval.is_none(),
         "reviewing an update must never itself start network access"
     );
     assert_eq!(
-        app.catalogue_review
+        app.catalogue_bsfree_ui.catalogue_review
             .as_ref()
             .map(|review| &review.source_id),
         Some(&"libretro-buildbot-cheats".to_string())
@@ -593,11 +593,11 @@ fn handle_catalogue_manager_action_review_then_confirm_requires_both_steps() {
 
     app.handle_catalogue_manager_action(&context, CatalogueManagerAction::Confirm);
     assert!(
-        app.catalogue_retrieval.is_some(),
+        app.catalogue_bsfree_ui.catalogue_retrieval.is_some(),
         "confirming the reviewed action starts the retrieval"
     );
     assert!(
-        app.catalogue_review.is_none(),
+        app.catalogue_bsfree_ui.catalogue_review.is_none(),
         "the review is consumed once confirmed"
     );
 }
@@ -614,8 +614,8 @@ fn handle_catalogue_manager_action_cancel_review_clears_it_without_starting_retr
         },
     );
     app.handle_catalogue_manager_action(&context, CatalogueManagerAction::CancelReview);
-    assert!(app.catalogue_review.is_none());
-    assert!(app.catalogue_retrieval.is_none());
+    assert!(app.catalogue_bsfree_ui.catalogue_review.is_none());
+    assert!(app.catalogue_bsfree_ui.catalogue_retrieval.is_none());
 }
 
 fn dolphin_catalogue_fixture(fetched_at_unix_seconds: u64) -> DolphinCatalogue {
@@ -770,8 +770,8 @@ fn dolphin_catalogue_card_shows_ready_summary_and_flags_an_available_update() {
 #[test]
 fn handle_dolphin_catalogue_manager_action_review_then_confirm_requires_both_steps() {
     let mut app = app_for_operation_tests();
-    assert!(app.dolphin_catalogue_review.is_none());
-    assert!(app.dolphin_catalogue_retrieval.is_none());
+    assert!(app.catalogue_bsfree_ui.dolphin_catalogue_review.is_none());
+    assert!(app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_none());
     let context = egui::Context::default();
 
     app.handle_dolphin_catalogue_manager_action(
@@ -779,21 +779,21 @@ fn handle_dolphin_catalogue_manager_action_review_then_confirm_requires_both_ste
         DolphinCatalogueManagerAction::Review(DolphinCatalogueRetrievalKind::Download),
     );
     assert!(
-        app.dolphin_catalogue_retrieval.is_none(),
+        app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_none(),
         "reviewing a download must never itself start network access"
     );
     assert_eq!(
-        app.dolphin_catalogue_review,
+        app.catalogue_bsfree_ui.dolphin_catalogue_review,
         Some(DolphinCatalogueRetrievalKind::Download)
     );
 
     app.handle_dolphin_catalogue_manager_action(&context, DolphinCatalogueManagerAction::Confirm);
     assert!(
-        app.dolphin_catalogue_retrieval.is_some(),
+        app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_some(),
         "confirming the reviewed action starts the retrieval"
     );
     assert!(
-        app.dolphin_catalogue_review.is_none(),
+        app.catalogue_bsfree_ui.dolphin_catalogue_review.is_none(),
         "the review is consumed once confirmed"
     );
 }
@@ -810,22 +810,22 @@ fn handle_dolphin_catalogue_manager_action_cancel_review_clears_it_without_start
         &context,
         DolphinCatalogueManagerAction::CancelReview,
     );
-    assert!(app.dolphin_catalogue_review.is_none());
-    assert!(app.dolphin_catalogue_retrieval.is_none());
+    assert!(app.catalogue_bsfree_ui.dolphin_catalogue_review.is_none());
+    assert!(app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_none());
 }
 
 #[test]
 fn handle_dolphin_catalogue_manager_action_remove_requires_explicit_confirmation() {
     let mut app = app_for_operation_tests();
     let context = egui::Context::default();
-    assert!(!app.dolphin_catalogue_remove_confirm);
+    assert!(!app.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm);
 
     app.handle_dolphin_catalogue_manager_action(
         &context,
         DolphinCatalogueManagerAction::RequestRemove,
     );
     assert!(
-        app.dolphin_catalogue_remove_confirm,
+        app.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm,
         "removal must require a confirmation dialog before anything happens"
     );
 
@@ -833,7 +833,7 @@ fn handle_dolphin_catalogue_manager_action_remove_requires_explicit_confirmation
         &context,
         DolphinCatalogueManagerAction::CancelRemove,
     );
-    assert!(!app.dolphin_catalogue_remove_confirm);
+    assert!(!app.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm);
 }
 
 #[test]

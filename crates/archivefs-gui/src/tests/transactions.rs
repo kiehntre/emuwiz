@@ -20,7 +20,7 @@ mod romm_dispatch_tests {
 
     use super::*;
     use crate::romm_config::ConfigDialogRequest;
-    use crate::romm_source::{RommImportSummary, RommProgressEvent};
+    use crate::romm_source::{RommImportSummary, RommProgressEvent, RommSnapshot};
     use archivefs_core::identity_source::artwork::ArtworkCacheStats;
     use archivefs_core::identity_source::model::{IdentityImportCounts, IdentityProvider};
     use archivefs_core::identity_source::path_map::ProviderPathKind;

@@ -56,9 +56,9 @@ impl ArchiveFsApp {
         ui.add_space(theme::SECTION_GAP);
         if let Some(operation) = sources_page::show_bsfree_source_card(
             ui,
-            &self.bsfree_manager,
-            self.bsfree_operation.is_some(),
-            &mut self.bsfree_ui,
+            &self.catalogue_bsfree_ui.bsfree_manager,
+            self.catalogue_bsfree_ui.bsfree_operation.is_some(),
+            &mut self.catalogue_bsfree_ui.bsfree_ui,
             &mut self.clipboard,
         ) {
             self.start_bsfree_operation(context.clone(), operation);
@@ -70,11 +70,11 @@ impl ArchiveFsApp {
         context: egui::Context,
         operation: BsFreeOperation,
     ) {
-        if self.bsfree_operation.is_some() {
+        if self.catalogue_bsfree_ui.bsfree_operation.is_some() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.bsfree_operation = Some(RunningBsFreeOperation {
+        self.catalogue_bsfree_ui.bsfree_operation = Some(RunningBsFreeOperation {
             operation: operation.clone(),
             receiver,
         });
@@ -86,7 +86,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_bsfree_operation(&mut self, context: &egui::Context) {
-        let result = self.bsfree_operation.as_ref().and_then(|running| {
+        let result = self.catalogue_bsfree_ui.bsfree_operation.as_ref().and_then(|running| {
             running
                 .receiver
                 .try_recv()
@@ -96,14 +96,14 @@ impl ArchiveFsApp {
         let Some((operation, result)) = result else {
             return;
         };
-        self.bsfree_operation = None;
+        self.catalogue_bsfree_ui.bsfree_operation = None;
         match result {
             Ok(BsFreeOperationResult::Status(status)) => {
-                self.bsfree_manager = BsFreeManagerState::Ready(status);
+                self.catalogue_bsfree_ui.bsfree_manager = BsFreeManagerState::Ready(status);
             }
             Ok(BsFreeOperationResult::Removed) => {
-                self.bsfree_manager = BsFreeManagerState::NotLoaded;
-                self.bsfree_ui = BsFreeGuiState::default();
+                self.catalogue_bsfree_ui.bsfree_manager = BsFreeManagerState::NotLoaded;
+                self.catalogue_bsfree_ui.bsfree_ui = BsFreeGuiState::default();
                 self.feedback = Some(ActionFeedback {
                     succeeded: true,
                     message: "Removed EmuWiz's local BSFree source copy only.".to_string(),
@@ -113,23 +113,23 @@ impl ArchiveFsApp {
                 });
             }
             Ok(BsFreeOperationResult::Search(result)) => {
-                self.bsfree_ui.search_result = Some(Ok(result));
-                self.bsfree_ui.selected_game = None;
-                self.bsfree_ui.cheats = None;
+                self.catalogue_bsfree_ui.bsfree_ui.search_result = Some(Ok(result));
+                self.catalogue_bsfree_ui.bsfree_ui.selected_game = None;
+                self.catalogue_bsfree_ui.bsfree_ui.cheats = None;
             }
             Ok(BsFreeOperationResult::Systems(page)) => {
-                self.bsfree_ui.platforms = Some(Ok(page.rows));
+                self.catalogue_bsfree_ui.bsfree_ui.platforms = Some(Ok(page.rows));
             }
             Ok(BsFreeOperationResult::Game(game, cheats)) => {
-                self.bsfree_ui.selected_game = Some(game);
-                self.bsfree_ui.cheats = Some(Ok(cheats));
+                self.catalogue_bsfree_ui.bsfree_ui.selected_game = Some(game);
+                self.catalogue_bsfree_ui.bsfree_ui.cheats = Some(Ok(cheats));
             }
             Err(message) => match operation {
-                BsFreeOperation::LoadSystems => self.bsfree_ui.platforms = Some(Err(message)),
-                BsFreeOperation::Search(_) => self.bsfree_ui.search_result = Some(Err(message)),
-                BsFreeOperation::LoadGame { .. } => self.bsfree_ui.cheats = Some(Err(message)),
+                BsFreeOperation::LoadSystems => self.catalogue_bsfree_ui.bsfree_ui.platforms = Some(Err(message)),
+                BsFreeOperation::Search(_) => self.catalogue_bsfree_ui.bsfree_ui.search_result = Some(Err(message)),
+                BsFreeOperation::LoadGame { .. } => self.catalogue_bsfree_ui.bsfree_ui.cheats = Some(Err(message)),
                 BsFreeOperation::LoadStatus => {
-                    self.bsfree_manager = BsFreeManagerState::Failed(message)
+                    self.catalogue_bsfree_ui.bsfree_manager = BsFreeManagerState::Failed(message)
                 }
                 _ => {
                     self.feedback = Some(ActionFeedback {
@@ -147,13 +147,13 @@ impl ArchiveFsApp {
 
     pub(crate) fn start_dolphin_catalogue_status_load(&mut self, context: egui::Context) {
         if matches!(
-            self.dolphin_catalogue_manager,
+            self.catalogue_bsfree_ui.dolphin_catalogue_manager,
             DolphinCatalogueManagerState::Loading(_)
         ) {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.dolphin_catalogue_manager = DolphinCatalogueManagerState::Loading(receiver);
+        self.catalogue_bsfree_ui.dolphin_catalogue_manager = DolphinCatalogueManagerState::Loading(receiver);
         thread::spawn(move || {
             let result = default_dolphin_catalogue_cache_root().and_then(|root| {
                 let catalogue = match load_dolphin_catalogue(&root)? {
@@ -173,14 +173,14 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_dolphin_catalogue_retrieval(&mut self, context: egui::Context) {
-        if self.dolphin_catalogue_retrieval.is_some() {
+        if self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_some() {
             return;
         }
-        let Some(kind) = self.dolphin_catalogue_review.take() else {
+        let Some(kind) = self.catalogue_bsfree_ui.dolphin_catalogue_review.take() else {
             return;
         };
-        self.dolphin_catalogue_generation = self.dolphin_catalogue_generation.wrapping_add(1);
-        let generation = self.dolphin_catalogue_generation;
+        self.catalogue_bsfree_ui.dolphin_catalogue_generation = self.catalogue_bsfree_ui.dolphin_catalogue_generation.wrapping_add(1);
+        let generation = self.catalogue_bsfree_ui.dolphin_catalogue_generation;
         let cancellation = CheatSourceCancellation::default();
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
@@ -194,7 +194,7 @@ impl ArchiveFsApp {
                 dolphin_catalogue_retrieval_kind_verb(kind)
             ),
         ));
-        self.dolphin_catalogue_retrieval = Some(RunningDolphinCatalogueRetrieval {
+        self.catalogue_bsfree_ui.dolphin_catalogue_retrieval = Some(RunningDolphinCatalogueRetrieval {
             generation,
             kind,
             cancellation,
@@ -232,11 +232,11 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_dolphin_catalogue_update_check(&mut self, context: egui::Context) {
-        if self.dolphin_catalogue_update_check.is_some() {
+        if self.catalogue_bsfree_ui.dolphin_catalogue_update_check.is_some() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.dolphin_catalogue_update_check = Some(receiver);
+        self.catalogue_bsfree_ui.dolphin_catalogue_update_check = Some(receiver);
         thread::spawn(move || {
             let result = default_dolphin_catalogue_cache_root().and_then(|root| {
                 check_dolphin_catalogue_update_with_transport(
@@ -262,16 +262,16 @@ impl ArchiveFsApp {
                 self.start_dolphin_catalogue_status_load(context.clone());
             }
             DolphinCatalogueManagerAction::Review(kind) => {
-                self.dolphin_catalogue_review = Some(kind);
+                self.catalogue_bsfree_ui.dolphin_catalogue_review = Some(kind);
             }
             DolphinCatalogueManagerAction::Confirm => {
                 self.start_dolphin_catalogue_retrieval(context.clone());
             }
             DolphinCatalogueManagerAction::CancelReview => {
-                self.dolphin_catalogue_review = None;
+                self.catalogue_bsfree_ui.dolphin_catalogue_review = None;
             }
             DolphinCatalogueManagerAction::CancelRunning => {
-                if let Some(running) = self.dolphin_catalogue_retrieval.as_mut() {
+                if let Some(running) = self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.as_mut() {
                     running.cancellation.cancel();
                     running.cancellation_requested = true;
                 }
@@ -280,13 +280,13 @@ impl ArchiveFsApp {
                 self.start_dolphin_catalogue_update_check(context.clone());
             }
             DolphinCatalogueManagerAction::RequestRemove => {
-                self.dolphin_catalogue_remove_confirm = true;
+                self.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm = true;
             }
             DolphinCatalogueManagerAction::CancelRemove => {
-                self.dolphin_catalogue_remove_confirm = false;
+                self.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm = false;
             }
             DolphinCatalogueManagerAction::ConfirmRemove => {
-                self.dolphin_catalogue_remove_confirm = false;
+                self.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm = false;
                 let outcome = default_dolphin_catalogue_cache_root()
                     .and_then(|root| remove_dolphin_catalogue(&root));
                 self.history.record(HistoryEntry::new(
@@ -304,25 +304,25 @@ impl ArchiveFsApp {
                         Err(error) => format!("Dolphin cheat catalogue removal failed: {error}"),
                     },
                 ));
-                self.dolphin_catalogue_update_available = None;
+                self.catalogue_bsfree_ui.dolphin_catalogue_update_available = None;
                 self.start_dolphin_catalogue_status_load(context.clone());
             }
         }
     }
 
     pub(crate) fn poll_dolphin_catalogue_manager(&mut self, context: &egui::Context) {
-        if let DolphinCatalogueManagerState::Loading(receiver) = &self.dolphin_catalogue_manager {
+        if let DolphinCatalogueManagerState::Loading(receiver) = &self.catalogue_bsfree_ui.dolphin_catalogue_manager {
             match receiver.try_recv() {
                 Ok(Ok(snapshot)) => {
-                    self.dolphin_catalogue_manager =
+                    self.catalogue_bsfree_ui.dolphin_catalogue_manager =
                         DolphinCatalogueManagerState::Ready(Box::new(snapshot));
                 }
                 Ok(Err(error)) => {
-                    self.dolphin_catalogue_manager = DolphinCatalogueManagerState::Failed(error);
+                    self.catalogue_bsfree_ui.dolphin_catalogue_manager = DolphinCatalogueManagerState::Failed(error);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.dolphin_catalogue_manager =
+                    self.catalogue_bsfree_ui.dolphin_catalogue_manager =
                         DolphinCatalogueManagerState::Failed(DolphinCatalogueError {
                             kind: DolphinCatalogueErrorKind::CacheUnavailable,
                             detail: "catalogue status worker stopped unexpectedly".to_string(),
@@ -330,27 +330,28 @@ impl ArchiveFsApp {
                 }
             }
         }
-        if let Some(receiver) = &self.dolphin_catalogue_update_check {
+        if let Some(receiver) = &self.catalogue_bsfree_ui.dolphin_catalogue_update_check {
             match receiver.try_recv() {
                 Ok(result) => {
-                    self.dolphin_catalogue_update_available =
+                    self.catalogue_bsfree_ui.dolphin_catalogue_update_available =
                         Some(result.as_ref().is_ok_and(|check| check.update_available));
-                    self.dolphin_catalogue_update_check = None;
+                    self.catalogue_bsfree_ui.dolphin_catalogue_update_check = None;
                     self.start_dolphin_catalogue_status_load(context.clone());
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.dolphin_catalogue_update_available = Some(false);
-                    self.dolphin_catalogue_update_check = None;
+                    self.catalogue_bsfree_ui.dolphin_catalogue_update_available = Some(false);
+                    self.catalogue_bsfree_ui.dolphin_catalogue_update_check = None;
                 }
             }
         }
-        if let Some(running) = self.dolphin_catalogue_retrieval.as_mut() {
+        if let Some(running) = self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.as_mut() {
             for progress in running.progress_receiver.try_iter() {
                 running.progress = Some(progress);
             }
         }
         let result = self
+            .catalogue_bsfree_ui
             .dolphin_catalogue_retrieval
             .as_ref()
             .and_then(|running| {
@@ -363,8 +364,8 @@ impl ArchiveFsApp {
         let Some((generation, result)) = result else {
             return;
         };
-        self.dolphin_catalogue_retrieval = None;
-        if generation != self.dolphin_catalogue_generation {
+        self.catalogue_bsfree_ui.dolphin_catalogue_retrieval = None;
+        if generation != self.catalogue_bsfree_ui.dolphin_catalogue_generation {
             return;
         }
         match &result {
@@ -407,9 +408,9 @@ impl ArchiveFsApp {
                 ));
             }
         }
-        self.dolphin_catalogue_last_result = Some(result);
-        self.dolphin_catalogue_update_available = None;
-        self.dolphin_catalogue_manager = DolphinCatalogueManagerState::NotLoaded;
+        self.catalogue_bsfree_ui.dolphin_catalogue_last_result = Some(result);
+        self.catalogue_bsfree_ui.dolphin_catalogue_update_available = None;
+        self.catalogue_bsfree_ui.dolphin_catalogue_manager = DolphinCatalogueManagerState::NotLoaded;
         self.start_dolphin_catalogue_status_load(context.clone());
     }
 

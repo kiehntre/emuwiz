@@ -66,7 +66,7 @@ use archivefs_core::patch_manager::{
     CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
     DesktopBrowserLauncher, DeviceFormatCompatibility, DolphinCandidate, DolphinCatalogue,
     DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
-    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinCatalogueUpdateCheck,
+    DolphinCatalogueFetchResult, DolphinCatalogueLoad,
     DolphinDedupFinding, DolphinGameIniInventory, DolphinGeckoLookupResult,
     DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
     DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
@@ -146,6 +146,7 @@ mod administration_pages;
 mod archive_inspector_controller;
 mod cheats_mods;
 mod cheats_mods_preview;
+mod catalogue_bsfree_ui_state;
 #[allow(dead_code)]
 mod es_de_media_state;
 #[allow(dead_code)]
@@ -313,7 +314,7 @@ use crate::romm_config::{
 };
 use crate::romm_source::{
     RommCardRequest, RommOperation, RommOperationOutcome, RommProgress,
-    RommProgressEvent, RommSnapshot, VerifyRommSummary,
+    RommProgressEvent, VerifyRommSummary,
 };
 use activity_history::{
     ALL_ACTIVITY_ACTIONS, ALL_ACTIVITY_OUTCOMES, ActivityAction, ActivityOutcome, HISTORY_LIMIT,
@@ -1181,6 +1182,7 @@ use mount_operation_controller::{
     perform_archive_action, record_cleanup_finished_activity, record_cleanup_started_activity,
     run_unmount_with_cleanup,
 };
+use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
 
 #[derive(Debug)]
 enum BsFreeManagerState {
@@ -2280,9 +2282,7 @@ struct ArchiveFsApp {
     /// mount-root card. Set from the background `SetupAction::SetMountRoot`
     /// result; cleared when a new apply starts.
     mount_root_feedback: Option<sources_page::MountRootFeedback>,
-    bsfree_manager: BsFreeManagerState,
-    bsfree_operation: Option<RunningBsFreeOperation>,
-    bsfree_ui: BsFreeGuiState,
+    catalogue_bsfree_ui: CatalogueBsFreeUiState,
     /// Loaded once for GUI use. RomM rendering and cached browsing borrow this
     /// snapshot instead of reading `config.toml` on every frame.
     gui_config: GuiConfigSnapshot,
@@ -2336,28 +2336,6 @@ struct ArchiveFsApp {
     /// always an explicit action, never automatic.
     plan_preview: plan_preview_page::PlanPreviewState,
     plan_preview_generation: u64,
-    catalogue_manager: CatalogueManagerState,
-    catalogue_review: Option<CatalogueReview>,
-    catalogue_retrieval: Option<RunningCatalogueRetrieval>,
-    catalogue_generation: u64,
-    catalogue_last_result: Option<Result<CheatSourceFetchResult, CheatSourceError>>,
-    /// The Dolphin cheat catalogue's own status card - Cheats & Mods only,
-    /// separate from the RetroArch `catalogue_*` fields above (different
-    /// cache root, different data shape, and it must be visible without
-    /// visiting Sources).
-    dolphin_catalogue_manager: DolphinCatalogueManagerState,
-    dolphin_catalogue_review: Option<DolphinCatalogueRetrievalKind>,
-    dolphin_catalogue_retrieval: Option<RunningDolphinCatalogueRetrieval>,
-    dolphin_catalogue_generation: u64,
-    dolphin_catalogue_last_result:
-        Option<Result<DolphinCatalogueFetchResult, DolphinCatalogueError>>,
-    dolphin_catalogue_remove_confirm: bool,
-    /// `None` until the one automatic, quiet "Check for updates" this
-    /// session either completes or the user runs one manually - the
-    /// one-shot gate `dolphin_catalogue_update_check_needed` reads.
-    dolphin_catalogue_update_available: Option<bool>,
-    dolphin_catalogue_update_check:
-        Option<Receiver<Result<DolphinCatalogueUpdateCheck, DolphinCatalogueError>>>,
     /// The "Add Folder" dialog's open/closed state and its own fields -
     /// see `SourcesAddDialogState`.
     sources_add_dialog: Option<SourcesAddDialogState>,
@@ -2739,9 +2717,7 @@ impl ArchiveFsApp {
             source_action: None,
             mount_root_draft: None,
             mount_root_feedback: None,
-            bsfree_manager: BsFreeManagerState::NotLoaded,
-            bsfree_operation: None,
-            bsfree_ui: BsFreeGuiState::default(),
+            catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
             gui_config,
             romm_ui: RommUiState::default(),
             selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
@@ -2758,19 +2734,6 @@ impl ArchiveFsApp {
             scummvm_check_generation: 0,
             plan_preview: plan_preview_page::PlanPreviewState::Idle,
             plan_preview_generation: 0,
-            catalogue_manager: CatalogueManagerState::NotLoaded,
-            catalogue_review: None,
-            catalogue_retrieval: None,
-            catalogue_generation: 0,
-            catalogue_last_result: None,
-            dolphin_catalogue_manager: DolphinCatalogueManagerState::NotLoaded,
-            dolphin_catalogue_review: None,
-            dolphin_catalogue_retrieval: None,
-            dolphin_catalogue_generation: 0,
-            dolphin_catalogue_last_result: None,
-            dolphin_catalogue_remove_confirm: false,
-            dolphin_catalogue_update_available: None,
-            dolphin_catalogue_update_check: None,
             sources_add_dialog: None,
             gamer_view_pending_first_scan: None,
             gamer_view_scan_review_available: false,
@@ -3512,8 +3475,8 @@ impl ArchiveFsApp {
                 ui,
                 sources,
                 source_state.catalogue_available,
-                &self.catalogue_manager,
-                self.catalogue_retrieval.as_ref(),
+                &self.catalogue_bsfree_ui.catalogue_manager,
+                self.catalogue_bsfree_ui.catalogue_retrieval.as_ref(),
             );
             ui.add_space(theme::SECTION_GAP);
 
@@ -3609,10 +3572,10 @@ impl ArchiveFsApp {
                 );
                 show_retroarch_catalogue_manager(
                     ui,
-                    &self.catalogue_manager,
-                    self.catalogue_review.as_ref(),
-                    self.catalogue_retrieval.as_ref(),
-                    self.catalogue_last_result.as_ref(),
+                    &self.catalogue_bsfree_ui.catalogue_manager,
+                    self.catalogue_bsfree_ui.catalogue_review.as_ref(),
+                    self.catalogue_bsfree_ui.catalogue_retrieval.as_ref(),
+                    self.catalogue_bsfree_ui.catalogue_last_result.as_ref(),
                     &mut self.clipboard,
                 )
             },
@@ -3627,9 +3590,9 @@ impl ArchiveFsApp {
             widgets::collapsible_section(ui, "sources_bsfree", "BSFree source", false, |ui| {
                 show_bsfree_source_card(
                     ui,
-                    &self.bsfree_manager,
-                    self.bsfree_operation.is_some(),
-                    &mut self.bsfree_ui,
+                    &self.catalogue_bsfree_ui.bsfree_manager,
+                    self.catalogue_bsfree_ui.bsfree_operation.is_some(),
+                    &mut self.catalogue_bsfree_ui.bsfree_ui,
                     &mut self.clipboard,
                 )
             })
@@ -3926,11 +3889,11 @@ impl ArchiveFsApp {
     }
 
     fn start_catalogue_status_load(&mut self, context: egui::Context) {
-        if matches!(self.catalogue_manager, CatalogueManagerState::Loading(_)) {
+        if matches!(self.catalogue_bsfree_ui.catalogue_manager, CatalogueManagerState::Loading(_)) {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.catalogue_manager = CatalogueManagerState::Loading(receiver);
+        self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Loading(receiver);
         thread::spawn(move || {
             let result = default_cheat_source_cache_root()
                 .and_then(|root| list_retroarch_cheat_sources(&root));
@@ -3940,14 +3903,14 @@ impl ArchiveFsApp {
     }
 
     fn start_catalogue_retrieval(&mut self, context: egui::Context) {
-        if self.catalogue_retrieval.is_some() {
+        if self.catalogue_bsfree_ui.catalogue_retrieval.is_some() {
             return;
         }
-        let Some(review) = self.catalogue_review.take() else {
+        let Some(review) = self.catalogue_bsfree_ui.catalogue_review.take() else {
             return;
         };
-        self.catalogue_generation = self.catalogue_generation.wrapping_add(1);
-        let generation = self.catalogue_generation;
+        self.catalogue_bsfree_ui.catalogue_generation = self.catalogue_bsfree_ui.catalogue_generation.wrapping_add(1);
+        let generation = self.catalogue_bsfree_ui.catalogue_generation;
         let source_id = review.source_id;
         let force_refresh = review.kind == CatalogueRetrievalKind::Update;
         let cancellation = CheatSourceCancellation::default();
@@ -3963,7 +3926,7 @@ impl ArchiveFsApp {
                 review_kind = if force_refresh { "update" } else { "download" }
             ),
         ));
-        self.catalogue_retrieval = Some(RunningCatalogueRetrieval {
+        self.catalogue_bsfree_ui.catalogue_retrieval = Some(RunningCatalogueRetrieval {
             generation,
             source_id: source_id.clone(),
             cancellation,
@@ -4013,16 +3976,16 @@ impl ArchiveFsApp {
                 self.start_catalogue_status_load(context.clone());
             }
             CatalogueManagerAction::Review { source_id, kind } => {
-                self.catalogue_review = Some(CatalogueReview { source_id, kind });
+                self.catalogue_bsfree_ui.catalogue_review = Some(CatalogueReview { source_id, kind });
             }
             CatalogueManagerAction::Confirm => {
                 self.start_catalogue_retrieval(context.clone());
             }
             CatalogueManagerAction::CancelReview => {
-                self.catalogue_review = None;
+                self.catalogue_bsfree_ui.catalogue_review = None;
             }
             CatalogueManagerAction::CancelRunning => {
-                if let Some(running) = self.catalogue_retrieval.as_mut() {
+                if let Some(running) = self.catalogue_bsfree_ui.catalogue_retrieval.as_mut() {
                     running.cancellation.cancel();
                     running.cancellation_requested = true;
                 }
@@ -4031,13 +3994,13 @@ impl ArchiveFsApp {
     }
 
     fn poll_catalogue_manager(&mut self, context: &egui::Context) {
-        if let CatalogueManagerState::Loading(receiver) = &self.catalogue_manager {
+        if let CatalogueManagerState::Loading(receiver) = &self.catalogue_bsfree_ui.catalogue_manager {
             match receiver.try_recv() {
-                Ok(Ok(list)) => self.catalogue_manager = CatalogueManagerState::Ready(list),
-                Ok(Err(error)) => self.catalogue_manager = CatalogueManagerState::Failed(error),
+                Ok(Ok(list)) => self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Ready(list),
+                Ok(Err(error)) => self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Failed(error),
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.catalogue_manager = CatalogueManagerState::Failed(CheatSourceError {
+                    self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Failed(CheatSourceError {
                         schema_version:
                             archivefs_core::patch_manager::CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
                         stage: archivefs_core::patch_manager::CheatSourceErrorStage::Cache,
@@ -4048,12 +4011,12 @@ impl ArchiveFsApp {
                 }
             }
         }
-        if let Some(running) = self.catalogue_retrieval.as_mut() {
+        if let Some(running) = self.catalogue_bsfree_ui.catalogue_retrieval.as_mut() {
             for progress in running.progress_receiver.try_iter() {
                 running.progress = Some(progress);
             }
         }
-        let result = self.catalogue_retrieval.as_ref().and_then(|running| {
+        let result = self.catalogue_bsfree_ui.catalogue_retrieval.as_ref().and_then(|running| {
             running
                 .receiver
                 .try_recv()
@@ -4063,8 +4026,8 @@ impl ArchiveFsApp {
         let Some((generation, source_id, result)) = result else {
             return;
         };
-        self.catalogue_retrieval = None;
-        if generation != self.catalogue_generation {
+        self.catalogue_bsfree_ui.catalogue_retrieval = None;
+        if generation != self.catalogue_bsfree_ui.catalogue_generation {
             return;
         }
         match &result {
@@ -4125,8 +4088,8 @@ impl ArchiveFsApp {
                 ));
             }
         }
-        self.catalogue_last_result = Some(result);
-        self.catalogue_manager = CatalogueManagerState::NotLoaded;
+        self.catalogue_bsfree_ui.catalogue_last_result = Some(result);
+        self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::NotLoaded;
         self.start_catalogue_status_load(context.clone());
     }
 
@@ -4878,8 +4841,8 @@ impl ArchiveFsApp {
         if matches!(
             self.view,
             MainView::Sources | MainView::CheatsMods | MainView::CheatSources
-        ) && matches!(self.bsfree_manager, BsFreeManagerState::NotLoaded)
-            && self.bsfree_operation.is_none()
+        ) && matches!(self.catalogue_bsfree_ui.bsfree_manager, BsFreeManagerState::NotLoaded)
+            && self.catalogue_bsfree_ui.bsfree_operation.is_none()
         {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
         }
@@ -4901,10 +4864,10 @@ impl ArchiveFsApp {
         {
             self.start_dolphin_inventory(context.clone());
         }
-        if catalogue_status_load_needed(self.view, &self.catalogue_manager) {
+        if catalogue_status_load_needed(self.view, &self.catalogue_bsfree_ui.catalogue_manager) {
             self.start_catalogue_status_load(context.clone());
         }
-        if dolphin_catalogue_status_load_needed(self.view, &self.dolphin_catalogue_manager) {
+        if dolphin_catalogue_status_load_needed(self.view, &self.catalogue_bsfree_ui.dolphin_catalogue_manager) {
             self.start_dolphin_catalogue_status_load(context.clone());
         }
         // The one quiet, automatic "Check for updates" per session: only
@@ -4912,10 +4875,10 @@ impl ArchiveFsApp {
         // (`dolphin_catalogue_update_available` starts `None` and this is
         // the only place that can set it besides an explicit click).
         if self.view == MainView::CheatsMods
-            && self.dolphin_catalogue_update_available.is_none()
-            && self.dolphin_catalogue_update_check.is_none()
+            && self.catalogue_bsfree_ui.dolphin_catalogue_update_available.is_none()
+            && self.catalogue_bsfree_ui.dolphin_catalogue_update_check.is_none()
             && matches!(
-                &self.dolphin_catalogue_manager,
+                &self.catalogue_bsfree_ui.dolphin_catalogue_manager,
                 DolphinCatalogueManagerState::Ready(snapshot) if snapshot.catalogue.is_some()
             )
         {
@@ -6057,13 +6020,13 @@ impl ArchiveFsApp {
                             let dolphin_catalogue_action = dolphin_route.then(|| {
                                 let action = show_dolphin_catalogue_manager(
                                     ui,
-                                    &self.dolphin_catalogue_manager,
-                                    self.dolphin_catalogue_retrieval.as_ref(),
-                                    self.dolphin_catalogue_last_result.as_ref(),
+                                    &self.catalogue_bsfree_ui.dolphin_catalogue_manager,
+                                    self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.as_ref(),
+                                    self.catalogue_bsfree_ui.dolphin_catalogue_last_result.as_ref(),
                                     DolphinCatalogueCardContext {
-                                        review: self.dolphin_catalogue_review,
-                                        update_available: self.dolphin_catalogue_update_available,
-                                        remove_confirm: self.dolphin_catalogue_remove_confirm,
+                                        review: self.catalogue_bsfree_ui.dolphin_catalogue_review,
+                                        update_available: self.catalogue_bsfree_ui.dolphin_catalogue_update_available,
+                                        remove_confirm: self.catalogue_bsfree_ui.dolphin_catalogue_remove_confirm,
                                         now_unix_seconds,
                                     },
                                     &mut self.clipboard,
@@ -6099,7 +6062,7 @@ impl ArchiveFsApp {
                                 live,
                                 self.database_state.snapshot(),
                                 &self.history,
-                                busy || self.catalogue_retrieval.is_some(),
+                                busy || self.catalogue_bsfree_ui.catalogue_retrieval.is_some(),
                                 &mut self.clipboard,
                                 &mut self.dolphin_texture_mod,
                                 &mut self.local_mod_package,
@@ -6109,9 +6072,9 @@ impl ArchiveFsApp {
                             ui.add_space(theme::SECTION_GAP);
                             let bsfree_action = show_bsfree_game_browser(
                                 ui,
-                                &self.bsfree_manager,
-                                self.bsfree_operation.is_some(),
-                                &mut self.bsfree_ui,
+                                &self.catalogue_bsfree_ui.bsfree_manager,
+                                self.catalogue_bsfree_ui.bsfree_operation.is_some(),
+                                &mut self.catalogue_bsfree_ui.bsfree_ui,
                                 bsfree_context.as_ref(),
                             );
                             let catalogue_action = retroarch_route.then(|| {
@@ -6125,10 +6088,10 @@ impl ArchiveFsApp {
                                 );
                                 show_retroarch_catalogue_manager(
                                     ui,
-                                    &self.catalogue_manager,
-                                    self.catalogue_review.as_ref(),
-                                    self.catalogue_retrieval.as_ref(),
-                                    self.catalogue_last_result.as_ref(),
+                                    &self.catalogue_bsfree_ui.catalogue_manager,
+                                    self.catalogue_bsfree_ui.catalogue_review.as_ref(),
+                                    self.catalogue_bsfree_ui.catalogue_retrieval.as_ref(),
+                                    self.catalogue_bsfree_ui.catalogue_last_result.as_ref(),
                                     &mut self.clipboard,
                                 )
                             }).flatten();
