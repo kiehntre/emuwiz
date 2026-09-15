@@ -5,9 +5,12 @@
 //! attributes a complete card to one game.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const PS1_CARD_BYTES: usize = 128 * 1024;
 pub const PS1_SLOT_COUNT: usize = 15;
@@ -203,6 +206,395 @@ pub struct MemoryCardInventory {
     pub shared_container: bool,
     pub ps2_geometry: Option<Ps2Geometry>,
     pub ps2_inventory: Option<Ps2MemoryCardInventory>,
+}
+
+/// Immutable review evidence for exporting one PS2 regular file.
+///
+/// The card remains the preservation unit. This plan only authorises a new
+/// destination file and never represents a card or whole-save mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ps2FileExportPlan {
+    pub source_card_path: PathBuf,
+    pub source_card_sha256: String,
+    pub file_raw_entry_offset: u64,
+    pub raw_name: Vec<u8>,
+    pub display_name: String,
+    pub declared_size_bytes: u64,
+    pub chain: Vec<u32>,
+    pub cluster_data_bytes: u64,
+    pub destination: PathBuf,
+    pub overwrite: bool,
+    pub warnings: Vec<String>,
+    pub provenance: String,
+    geometry: Ps2Geometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ps2FileExportError {
+    InvalidPlan(String),
+    SourceChanged,
+    DestinationExists(PathBuf),
+    UnsafeDestination(PathBuf),
+    Io(String),
+}
+
+impl std::fmt::Display for Ps2FileExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPlan(detail) => {
+                write!(formatter, "invalid PS2 file export plan: {detail}")
+            }
+            Self::SourceChanged => write!(formatter, "PS2 memory-card source changed after review"),
+            Self::DestinationExists(path) => {
+                write!(
+                    formatter,
+                    "export destination already exists: {}",
+                    path.display()
+                )
+            }
+            Self::UnsafeDestination(path) => {
+                write!(
+                    formatter,
+                    "export destination is unsafe: {}",
+                    path.display()
+                )
+            }
+            Self::Io(detail) => write!(formatter, "PS2 file export I/O failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for Ps2FileExportError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ps2FileExportResult {
+    pub destination: PathBuf,
+    pub bytes_written: u64,
+    pub sha256: String,
+    pub source_card_path: PathBuf,
+    pub source_card_sha256: String,
+    pub provenance: String,
+}
+
+/// Builds an export plan from an already-inspected PS2 regular file.
+///
+/// The file's validated chain is copied into the plan; the planner does not
+/// rediscover the card filesystem or infer a destination filename.
+pub fn plan_ps2_file_export(
+    card: &MemoryCardInventory,
+    file: &Ps2SaveFile,
+    destination: &Path,
+) -> Result<Ps2FileExportPlan, Ps2FileExportError> {
+    let geometry = card
+        .ps2_geometry
+        .clone()
+        .ok_or_else(|| Ps2FileExportError::InvalidPlan("PS2 geometry is unavailable".into()))?;
+    if card.ps2_inventory.is_none() {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "PS2 filesystem inventory is unavailable".into(),
+        ));
+    }
+    if card.format != MemoryCardFormat::Ps2 || !card.shared_container {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "source is not a shared PS2 memory-card container".into(),
+        ));
+    }
+    if file.entry.kind != Ps2DirectoryEntryKind::RegularFile {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "only regular files can be exported".into(),
+        ));
+    }
+    if u64::from(file.entry.length) != file.declared_size_bytes {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "directory length and inventory length disagree".into(),
+        ));
+    }
+    if !file.entry.warnings.is_empty() {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "regular-file metadata has warnings".into(),
+        ));
+    }
+    let unsafe_chain_warning = file
+        .chain_health
+        .warnings
+        .iter()
+        .find(|warning| warning.kind != Ps2CorruptionKind::FileSizeExceedsChain);
+    if !file.chain_health.complete || unsafe_chain_warning.is_some() {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "the file FAT chain is not safe for exact reconstruction".into(),
+        ));
+    }
+    let cluster_data_bytes = ps2_cluster_bytes(&geometry) as u64;
+    let capacity = (file.chain_health.clusters.len() as u64)
+        .checked_mul(cluster_data_bytes)
+        .ok_or_else(|| Ps2FileExportError::InvalidPlan("chain capacity overflowed".into()))?;
+    if file.declared_size_bytes > capacity {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "declared file size exceeds the validated FAT chain".into(),
+        ));
+    }
+    validate_source_path(&card.path)?;
+    validate_destination_path(destination, &card.path)?;
+    let source_bytes = read_source_card(&card.path)?;
+    let source_card_sha256 = sha256_hex(&source_bytes);
+    Ok(Ps2FileExportPlan {
+        source_card_path: card.path.clone(),
+        source_card_sha256,
+        file_raw_entry_offset: file.entry.raw_entry_offset,
+        raw_name: file.entry.raw_name.clone(),
+        display_name: file.entry.display_name.clone(),
+        declared_size_bytes: file.declared_size_bytes,
+        chain: file.chain_health.clusters.clone(),
+        cluster_data_bytes,
+        destination: destination.to_path_buf(),
+        overwrite: false,
+        warnings: file
+            .chain_health
+            .warnings
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect(),
+        provenance: "PS2 memory-card directory entry and validated FAT chain; data pages only, spare/ECC excluded".into(),
+        geometry,
+    })
+}
+
+/// Applies one previously reviewed export plan using a read-only source and
+/// an owned temporary destination. Existing destination files are refused.
+pub fn apply_ps2_file_export(
+    plan: &Ps2FileExportPlan,
+) -> Result<Ps2FileExportResult, Ps2FileExportError> {
+    if plan.overwrite {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "overwrite is not supported for PS2 file export".into(),
+        ));
+    }
+    validate_source_path(&plan.source_card_path)?;
+    validate_destination_path(&plan.destination, &plan.source_card_path)?;
+    let source_bytes = read_source_card(&plan.source_card_path)?;
+    if sha256_hex(&source_bytes) != plan.source_card_sha256 {
+        return Err(Ps2FileExportError::SourceChanged);
+    }
+    let expected_clusters = if plan.declared_size_bytes == 0 {
+        0
+    } else {
+        plan.declared_size_bytes
+            .div_ceil(plan.cluster_data_bytes.max(1))
+    };
+    if (plan.chain.len() as u64) < expected_clusters {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "the reviewed FAT chain is too short".into(),
+        ));
+    }
+
+    let mut temporary = create_export_temporary(&plan.destination)?;
+    let result = (|| {
+        let mut remaining = plan.declared_size_bytes as usize;
+        let mut hasher = Sha256::new();
+        for &cluster in &plan.chain {
+            if remaining == 0 {
+                break;
+            }
+            let data =
+                ps2_relative_cluster(&source_bytes, &plan.geometry, cluster).ok_or_else(|| {
+                    Ps2FileExportError::InvalidPlan("FAT chain points outside card data".into())
+                })?;
+            let count = remaining.min(data.len());
+            temporary
+                .write_all(&data[..count])
+                .map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+            hasher.update(&data[..count]);
+            remaining -= count;
+        }
+        if remaining != 0 {
+            return Err(Ps2FileExportError::InvalidPlan(
+                "validated chain did not provide the declared logical length".into(),
+            ));
+        }
+        temporary
+            .sync_all()
+            .map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+        let bytes_written = temporary
+            .metadata()
+            .map_err(|error| Ps2FileExportError::Io(error.to_string()))?
+            .len();
+        if bytes_written != plan.declared_size_bytes {
+            return Err(Ps2FileExportError::Io(
+                "staged output length did not match the declared logical length".into(),
+            ));
+        }
+        let sha256 = hex_bytes(&hasher.finalize());
+        if fs::symlink_metadata(&plan.destination).is_ok() {
+            return Err(Ps2FileExportError::DestinationExists(
+                plan.destination.clone(),
+            ));
+        }
+        fs::hard_link(temporary.path(), &plan.destination)
+            .map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+        fs::remove_file(temporary.path())
+            .map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+        Ok(Ps2FileExportResult {
+            destination: plan.destination.clone(),
+            bytes_written,
+            sha256,
+            source_card_path: plan.source_card_path.clone(),
+            source_card_sha256: plan.source_card_sha256.clone(),
+            provenance: plan.provenance.clone(),
+        })
+    })();
+    result
+}
+
+static EXPORT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct ExportTemporary {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl ExportTemporary {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Write for ExportTemporary {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl ExportTemporary {
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+    fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+}
+
+impl Drop for ExportTemporary {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn create_export_temporary(destination: &Path) -> Result<ExportTemporary, Ps2FileExportError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Ps2FileExportError::UnsafeDestination(destination.to_path_buf()))?;
+    for _ in 0..32 {
+        let number = EXPORT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".emuwiz-ps2-export-{}-{number}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok(ExportTemporary { file, path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Ps2FileExportError::Io(error.to_string())),
+        }
+    }
+    Err(Ps2FileExportError::Io(
+        "could not allocate an owned temporary export path".into(),
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_bytes(&Sha256::digest(bytes))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(DIGITS[(byte >> 4) as usize] as char);
+        result.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
+fn validate_source_path(path: &Path) -> Result<(), Ps2FileExportError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+    if !path.is_absolute() || !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "source card is not an absolute regular file".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_destination_path(destination: &Path, source: &Path) -> Result<(), Ps2FileExportError> {
+    if !destination.is_absolute()
+        || destination.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || destination == source
+    {
+        return Err(Ps2FileExportError::UnsafeDestination(
+            destination.to_path_buf(),
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Ps2FileExportError::UnsafeDestination(destination.to_path_buf()))?;
+    if !parent.is_dir() {
+        return Err(Ps2FileExportError::UnsafeDestination(
+            destination.to_path_buf(),
+        ));
+    }
+    let mut current = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+    for component in parent.components() {
+        if matches!(component, std::path::Component::RootDir) {
+            continue;
+        }
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Ps2FileExportError::UnsafeDestination(
+                destination.to_path_buf(),
+            ));
+        }
+    }
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if metadata.file_type().is_symlink() || metadata.is_dir() || metadata.is_file() {
+            return Err(Ps2FileExportError::DestinationExists(
+                destination.to_path_buf(),
+            ));
+        }
+        return Err(Ps2FileExportError::DestinationExists(
+            destination.to_path_buf(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_source_card(path: &Path) -> Result<Vec<u8>, Ps2FileExportError> {
+    let safe = crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+        .map_err(|error| Ps2FileExportError::Io(format!("{error:?}")))?;
+    let file = safe.into_file();
+    let mut bytes = Vec::new();
+    file.take(PS2_MAX_CARD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Ps2FileExportError::Io(error.to_string()))?;
+    if bytes.len() > PS2_MAX_CARD_BYTES {
+        return Err(Ps2FileExportError::InvalidPlan(
+            "source card exceeds inspection bound".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn text(bytes: &[u8]) -> Option<String> {
@@ -1148,7 +1540,7 @@ mod tests {
         entry(&mut card, 2, 0, 0x8427, 3, 2, b".");
         entry(&mut card, 2, 1, 0xa426, 0, 0, b"..");
         entry(&mut card, 4, 0, 0x8497, 100, 3, b"icon.sys");
-        card[3 * 1024..3 * 1024 + 100].fill(0x5a);
+        card[(41 + 3) * 1024..(41 + 3) * 1024 + 100].fill(0x5a);
         card
     }
 
@@ -1212,12 +1604,11 @@ mod tests {
         let inv = inspect_memory_card(&path).unwrap();
         let ps2 = inv.ps2_inventory.unwrap();
         let file = &ps2.save_directories[0].files[0];
-        assert!(
-            file.chain_health
-                .warnings
-                .iter()
-                .any(|warning| warning.kind == Ps2CorruptionKind::FatLoop)
-        );
+        assert!(file
+            .chain_health
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == Ps2CorruptionKind::FatLoop));
 
         let mut bytes = ps2_inventory_fixture();
         let file_entry_offset = (41 + 4) * 1024;
@@ -1225,12 +1616,11 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let inv = inspect_memory_card(&path).unwrap();
         let file = &inv.ps2_inventory.unwrap().save_directories[0].files[0];
-        assert!(
-            file.chain_health
-                .warnings
-                .iter()
-                .any(|warning| warning.kind == Ps2CorruptionKind::FileSizeExceedsChain)
-        );
+        assert!(file
+            .chain_health
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == Ps2CorruptionKind::FileSizeExceedsChain));
     }
 
     #[test]
@@ -1246,15 +1636,166 @@ mod tests {
         let inv = inspect_memory_card(&path).unwrap();
         let root = &inv.ps2_inventory.unwrap().root_entries[2];
         assert_eq!(root.raw_name, vec![0xff; PS2_NAME_BYTES]);
-        assert!(
-            root.warnings
-                .iter()
-                .any(|warning| warning.kind == Ps2CorruptionKind::InvalidFilename)
-        );
-        assert!(
-            root.warnings
-                .iter()
-                .any(|warning| warning.kind == Ps2CorruptionKind::InvalidTimestamp)
-        );
+        assert!(root
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == Ps2CorruptionKind::InvalidFilename));
+        assert!(root
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == Ps2CorruptionKind::InvalidTimestamp));
+    }
+
+    #[test]
+    fn ps2_file_export_reconstructs_exact_bytes_and_leaves_card_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("Mcd001.ps2");
+        let before = ps2_inventory_fixture();
+        fs::write(&card_path, &before).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let file = &card.ps2_inventory.as_ref().unwrap().save_directories[0].files[0];
+        let destination = dir.path().join("icon.sys");
+        let plan = plan_ps2_file_export(&card, file, &destination).unwrap();
+        let result = apply_ps2_file_export(&plan).unwrap();
+        assert_eq!(result.bytes_written, 100);
+        assert_eq!(fs::read(&destination).unwrap(), vec![0x5a; 100]);
+        assert_eq!(result.sha256, sha256_hex(&[0x5a; 100]));
+        assert_eq!(fs::read(&card_path).unwrap(), before);
+    }
+
+    #[test]
+    fn ps2_file_export_reads_fragmented_chain_and_truncates_final_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("fragmented.ps2");
+        let mut bytes = ps2_inventory_fixture();
+        bytes[(41 + 3) * 1024..(41 + 3) * 1024 + 1024].fill(0x5a);
+        bytes[8 * 1024 + 3 * 4..8 * 1024 + 4 * 4].copy_from_slice(&0x8000_0005u32.to_le_bytes());
+        bytes[8 * 1024 + 5 * 4..8 * 1024 + 6 * 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        bytes[(41 + 5) * 1024..(41 + 5) * 1024 + 1024].fill(0x6b);
+        let file_entry_offset = (41 + 4) * 1024;
+        bytes[file_entry_offset + 4..file_entry_offset + 8].copy_from_slice(&1500u32.to_le_bytes());
+        fs::write(&card_path, &bytes).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let file = &card.ps2_inventory.as_ref().unwrap().save_directories[0].files[0];
+        assert_eq!(file.chain_health.clusters, vec![3, 5]);
+        let destination = dir.path().join("fragment.bin");
+        let plan = plan_ps2_file_export(&card, file, &destination).unwrap();
+        apply_ps2_file_export(&plan).unwrap();
+        let output = fs::read(&destination).unwrap();
+        assert_eq!(output.len(), 1500);
+        assert_eq!(&output[..1024], &[0x5a; 1024]);
+        assert_eq!(&output[1024..], &[0x6b; 476]);
+    }
+
+    #[test]
+    fn ps2_file_export_refuses_invalid_entries_and_existing_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("Mcd001.ps2");
+        fs::write(&card_path, ps2_inventory_fixture()).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let file = &card.ps2_inventory.as_ref().unwrap().save_directories[0].files[0];
+        let destination = dir.path().join("existing.bin");
+        fs::write(&destination, b"keep").unwrap();
+        assert!(matches!(
+            plan_ps2_file_export(&card, file, &destination),
+            Err(Ps2FileExportError::DestinationExists(_))
+        ));
+        assert!(matches!(
+            plan_ps2_file_export(&card, file, &card_path),
+            Err(Ps2FileExportError::UnsafeDestination(_))
+        ));
+        let mut invalid = file.clone();
+        invalid.chain_health.complete = false;
+        assert!(matches!(
+            plan_ps2_file_export(&card, &invalid, &dir.path().join("invalid.bin")),
+            Err(Ps2FileExportError::InvalidPlan(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ps2_file_export_refuses_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("Mcd001.ps2");
+        fs::write(&card_path, ps2_inventory_fixture()).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let file = &card.ps2_inventory.as_ref().unwrap().save_directories[0].files[0];
+        let real = dir.path().join("outside.bin");
+        fs::write(&real, b"keep").unwrap();
+        let link = dir.path().join("export.bin");
+        symlink(&real, &link).unwrap();
+        assert!(matches!(
+            plan_ps2_file_export(&card, file, &link),
+            Err(Ps2FileExportError::DestinationExists(_))
+        ));
+        assert_eq!(fs::read(&real).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn ps2_file_export_supports_a_valid_zero_length_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("empty.ps2");
+        let mut bytes = ps2_inventory_fixture();
+        let entry_offset = (41 + 4) * 1024;
+        bytes[entry_offset + 4..entry_offset + 8].copy_from_slice(&0u32.to_le_bytes());
+        bytes[entry_offset + 0x10..entry_offset + 0x14].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&card_path, &bytes).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let file = &card.ps2_inventory.as_ref().unwrap().save_directories[0].files[0];
+        assert!(file.chain_health.clusters.is_empty());
+        let destination = dir.path().join("empty.bin");
+        let plan = plan_ps2_file_export(&card, file, &destination).unwrap();
+        let result = apply_ps2_file_export(&plan).unwrap();
+        assert_eq!(result.bytes_written, 0);
+        assert!(fs::read(&destination).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ps2_file_export_excludes_spare_bytes_from_528_byte_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("spare.ps2");
+        let mut bytes = ps2_fixture(PS2_PHYSICAL_PAGE_BYTES);
+        let fat_offset = 8 * 2 * PS2_PHYSICAL_PAGE_BYTES;
+        bytes[fat_offset + 3 * 4..fat_offset + 4 * 4]
+            .copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let first_page = (41 + 3) * 2 * PS2_PHYSICAL_PAGE_BYTES;
+        bytes[first_page..first_page + PS2_PAGE_DATA_BYTES].fill(0x11);
+        bytes[first_page + PS2_PAGE_DATA_BYTES..first_page + PS2_PHYSICAL_PAGE_BYTES].fill(0xee);
+        let second_page = first_page + PS2_PHYSICAL_PAGE_BYTES;
+        bytes[second_page..second_page + PS2_PAGE_DATA_BYTES].fill(0x22);
+        bytes[second_page + PS2_PAGE_DATA_BYTES..second_page + PS2_PHYSICAL_PAGE_BYTES].fill(0xdd);
+        fs::write(&card_path, &bytes).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let file = Ps2SaveFile {
+            entry: Ps2DirectoryEntry {
+                raw_entry_offset: 0,
+                raw_mode: 0x8497,
+                kind: Ps2DirectoryEntryKind::RegularFile,
+                raw_name: b"raw.bin".to_vec(),
+                display_name: "raw.bin".into(),
+                length: 600,
+                start_cluster: 3,
+                parent_entry: 0,
+                attributes: 0,
+                created: None,
+                modified: None,
+                warnings: Vec::new(),
+            },
+            declared_size_bytes: 600,
+            chain_health: Ps2ClusterChainHealth {
+                clusters: vec![3],
+                complete: true,
+                warnings: Vec::new(),
+            },
+        };
+        let destination = dir.path().join("raw.bin");
+        let plan = plan_ps2_file_export(&card, &file, &destination).unwrap();
+        apply_ps2_file_export(&plan).unwrap();
+        let output = fs::read(&destination).unwrap();
+        assert_eq!(output.len(), 600);
+        assert_eq!(&output[..512], &[0x11; 512]);
+        assert_eq!(&output[512..], &[0x22; 88]);
     }
 }
