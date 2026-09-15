@@ -34,6 +34,10 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
+use archivefs_core::memory_card_inventory::{
+    MemoryCardHealth, MemoryCardInventory, Ps2ClusterChainHealth, Ps2DirectoryEntry,
+    Ps2InventoryWarning, Ps2SaveDirectory, Ps2SaveFile,
+};
 use archivefs_core::patch_manager::{
     Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2InstallationType,
     Pcsx2MemcardKind, Pcsx2ProfileDiscoveryRoots, Pcsx2SerialMapping, discover_pcsx2_profiles,
@@ -60,6 +64,7 @@ pub(crate) enum Pcsx2StatusOutcome {
     Found {
         profile: Pcsx2FoundProfile,
         inspection: Box<Pcsx2GameInspection>,
+        memory_cards: Vec<MemoryCardInventory>,
     },
 }
 
@@ -93,12 +98,21 @@ pub(crate) fn gather_pcsx2_status(
         emulator_serial: None,
     };
     let inspection = inspect_pcsx2_game(&profile, &request);
+    let memory_cards = inspection
+        .memcards
+        .iter()
+        .filter(|card| card.present)
+        .filter_map(|card| {
+            archivefs_core::memory_card_inventory::inspect_memory_card(&card.path).ok()
+        })
+        .collect();
     Pcsx2StatusOutcome::Found {
         profile: Pcsx2FoundProfile {
             configuration_path: profile.configuration_path,
             installation_type: profile.installation_type,
         },
         inspection: Box::new(inspection),
+        memory_cards,
     }
 }
 
@@ -210,6 +224,7 @@ fn show_outcome(
     let Pcsx2StatusOutcome::Found {
         profile,
         inspection,
+        memory_cards,
     } = outcome
     else {
         widgets::empty_state(
@@ -281,6 +296,7 @@ fn show_outcome(
         }
 
         if !advanced_mode {
+            show_memory_card_contents(ui, false, memory_cards);
             return;
         }
         widgets::technical_details(
@@ -332,10 +348,249 @@ fn show_outcome(
             },
         );
     });
+    show_memory_card_contents(ui, advanced_mode, memory_cards);
+}
+
+fn memory_card_health(health: MemoryCardHealth) -> (&'static str, widgets::StatusTone) {
+    match health {
+        MemoryCardHealth::Healthy => ("Healthy", widgets::StatusTone::Success),
+        MemoryCardHealth::StructuralWarning | MemoryCardHealth::CorruptionSuspected => {
+            ("Warning", widgets::StatusTone::Warning)
+        }
+        MemoryCardHealth::Malformed
+        | MemoryCardHealth::Truncated
+        | MemoryCardHealth::UnsupportedVariant
+        | MemoryCardHealth::OutOfRangeMetadata => {
+            ("Partially readable", widgets::StatusTone::Warning)
+        }
+        MemoryCardHealth::Unknown => ("Unknown", widgets::StatusTone::Pending),
+    }
+}
+
+fn chain_health_label(chain: &Ps2ClusterChainHealth) -> (&'static str, widgets::StatusTone) {
+    if chain.warnings.iter().any(|warning| {
+        matches!(
+            warning.kind,
+            archivefs_core::memory_card_inventory::Ps2CorruptionKind::FatLoop
+                | archivefs_core::memory_card_inventory::Ps2CorruptionKind::InvalidFatReference
+                | archivefs_core::memory_card_inventory::Ps2CorruptionKind::ClusterOutOfRange
+        )
+    }) {
+        ("Corrupt chain", widgets::StatusTone::Warning)
+    } else if !chain.complete || !chain.warnings.is_empty() {
+        ("Warning", widgets::StatusTone::Warning)
+    } else {
+        ("Healthy", widgets::StatusTone::Success)
+    }
+}
+
+fn timestamp_label(
+    timestamp: Option<&archivefs_core::memory_card_inventory::Ps2Timestamp>,
+) -> Option<String> {
+    timestamp.map(|value| {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.timezone
+        )
+    })
+}
+
+fn raw_name_label(entry: &Ps2DirectoryEntry) -> String {
+    let bytes = entry
+        .raw_name
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            0x20..=0x7e => (*byte as char).to_string(),
+            value => format!("\\x{value:02x}"),
+        })
+        .collect()
+}
+
+fn warning_lines<'a>(warnings: impl IntoIterator<Item = &'a Ps2InventoryWarning>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .map(|warning| warning.message.clone())
+        .collect()
+}
+
+fn save_size(directory: &Ps2SaveDirectory) -> u64 {
+    directory
+        .files
+        .iter()
+        .map(|file| file.declared_size_bytes)
+        .sum()
+}
+
+fn file_health(file: &Ps2SaveFile) -> (&'static str, widgets::StatusTone) {
+    chain_health_label(&file.chain_health)
+}
+
+fn show_memory_card_contents(
+    ui: &mut egui::Ui,
+    advanced_mode: bool,
+    memory_cards: &[MemoryCardInventory],
+) {
+    widgets::section_header(
+        ui,
+        "Memory Card Contents",
+        Some(
+            "Read-only inventory of shared PS2 memory-card containers. No individual save can be extracted, restored, repaired, or deleted here.",
+        ),
+    );
+    if memory_cards.is_empty() {
+        ui.label("No readable memory card was found for this PCSX2 profile.");
+        return;
+    }
+    for (card_index, card) in memory_cards.iter().enumerate() {
+        let (health, tone) = memory_card_health(card.health);
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("PS2 Memory Card");
+                widgets::status_badge(ui, health, tone);
+            });
+            ui.label(format!(
+                "{} save director{} · {} bytes · shared memory-card container",
+                card.ps2_inventory
+                    .as_ref()
+                    .map_or(0, |inventory| inventory.save_directories.len()),
+                if card
+                    .ps2_inventory
+                    .as_ref()
+                    .map_or(0, |inventory| inventory.save_directories.len())
+                    == 1
+                {
+                    "y"
+                } else {
+                    "ies"
+                },
+                card.card_size_bytes
+            ));
+            if let Some(geometry) = &card.ps2_geometry {
+                ui.label(format!(
+                    "Filesystem: PS2 v{} · {}",
+                    geometry.version.as_deref().unwrap_or("unknown"),
+                    match geometry.representation {
+                        archivefs_core::memory_card_inventory::Ps2PageRepresentation::RawDataOnly => "data-only pages",
+                        archivefs_core::memory_card_inventory::Ps2PageRepresentation::RawWithSpare => "pages with spare bytes",
+                        archivefs_core::memory_card_inventory::Ps2PageRepresentation::Unknown => "page representation unknown",
+                    }
+                ));
+            }
+            if !card.warnings.is_empty() {
+                widgets::banner(
+                    ui,
+                    "Card warning",
+                    &card.warnings.join(" "),
+                    widgets::StatusTone::Warning,
+                );
+            }
+            let Some(inventory) = &card.ps2_inventory else {
+                ui.label("The card structure was recognised, but its save directory could not be read safely.");
+                return;
+            };
+            let mut directories = inventory.save_directories.iter().collect::<Vec<_>>();
+            directories.sort_by_key(|directory| directory.entry.display_name.to_lowercase());
+            if directories.is_empty() {
+                ui.label("No saves found on this memory card.");
+            }
+            for (save_index, directory) in directories.into_iter().enumerate() {
+                let (save_health, save_tone) = if !directory.warnings.is_empty() {
+                    ("Warning", widgets::StatusTone::Warning)
+                } else {
+                    chain_health_label(&directory.chain_health)
+                };
+                let id = ("ps2_memory_card_save", card_index, save_index);
+                ui.push_id(id, |ui| {
+                    ui.collapsing(
+                        format!(
+                            "{} · {} file{} · {} bytes",
+                            directory.entry.display_name,
+                            directory.files.len(),
+                            if directory.files.len() == 1 { "" } else { "s" },
+                            save_size(directory)
+                        ),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                widgets::status_badge(ui, save_health, save_tone);
+                                if let Some(modified) = timestamp_label(directory.entry.modified.as_ref()) {
+                                    ui.label(format!("Modified: {modified}"));
+                                }
+                            });
+                            if directory.entry.display_name != raw_name_label(&directory.entry) {
+                                ui.label(format!("Raw directory name: {}", raw_name_label(&directory.entry)));
+                            }
+                            for file in &directory.files {
+                                let (file_health, file_tone) = file_health(file);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(&file.entry.display_name);
+                                    ui.label(format!("{} bytes", file.declared_size_bytes));
+                                    widgets::status_badge(ui, file_health, file_tone);
+                                    if let Some(modified) = timestamp_label(file.entry.modified.as_ref()) {
+                                        ui.label(modified);
+                                    }
+                                });
+                                if file.entry.display_name != raw_name_label(&file.entry) {
+                                    ui.weak(format!("Raw name: {}", raw_name_label(&file.entry)));
+                                }
+                                if !file.chain_health.warnings.is_empty() {
+                                    for warning in &file.chain_health.warnings {
+                                        ui.label(format!("Warning: {}", warning.message));
+                                    }
+                                }
+                            }
+                            for warning in warning_lines(directory.warnings.iter()) {
+                                ui.label(format!("Warning: {warning}"));
+                            }
+                            if advanced_mode {
+                                widgets::technical_details(ui, ("ps2_save_technical", &directory.entry.raw_entry_offset), |ui| {
+                                    ui.label(format!("Raw entry offset: {}", directory.entry.raw_entry_offset));
+                                    ui.label(format!("Start cluster: {}", directory.entry.start_cluster));
+                                    ui.label(format!("Chain length: {}", directory.chain_health.clusters.len()));
+                                    ui.label(format!("Raw mode: 0x{:08x}", directory.entry.raw_mode));
+                                    for file in &directory.files {
+                                        ui.label(format!("{}: raw offset {}, start cluster {}, chain length {}", file.entry.display_name, file.entry.raw_entry_offset, file.entry.start_cluster, file.chain_health.clusters.len()));
+                                    }
+                                });
+                            }
+                        },
+                    );
+                });
+            }
+            if advanced_mode {
+                widgets::technical_details(ui, ("ps2_card_technical", &card.path), |ui| {
+                    widgets::path_value(ui, "Card path", &card.path);
+                    ui.label(format!("Shared container: {}", card.shared_container));
+                    ui.label(format!("Root entries: {}", inventory.root_entries.len()));
+                    ui.label(format!(
+                        "Root chain length: {}",
+                        inventory.root_chain_health.clusters.len()
+                    ));
+                    for warning in &inventory.warnings {
+                        ui.label(format!("Warning: {}", warning.message));
+                    }
+                });
+            }
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use archivefs_core::memory_card_inventory::{
+        MemoryCardFormat, MemoryCardFormatConfidence, Ps2ClusterChainHealth, Ps2DirectoryEntryKind,
+        Ps2MemoryCardInventory, Ps2SaveDirectory, Ps2SaveFile,
+    };
     use archivefs_core::patch_manager::{
         Pcsx2BiosInfo, Pcsx2Config, Pcsx2ControllerInfo, Pcsx2Health, Pcsx2SaveStateInventory,
     };
@@ -385,6 +640,7 @@ mod tests {
                 installation_type: Pcsx2InstallationType::Native,
             },
             inspection: Box::new(inspection),
+            memory_cards: Vec::new(),
         }
     }
 
@@ -509,5 +765,111 @@ mod tests {
         let advanced = run_panel(true, None, &state);
         assert!(!rendered_text_contains(&gamer, "Technical details"));
         assert!(rendered_text_contains(&advanced, "Technical details"));
+    }
+
+    fn ps2_entry(name: &str, kind: Ps2DirectoryEntryKind, length: u32) -> Ps2DirectoryEntry {
+        Ps2DirectoryEntry {
+            raw_entry_offset: 512,
+            raw_mode: 0x20,
+            kind,
+            raw_name: name.as_bytes().to_vec(),
+            display_name: name.to_string(),
+            length,
+            start_cluster: 7,
+            parent_entry: 0,
+            attributes: 0,
+            created: None,
+            modified: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn sample_ps2_card() -> MemoryCardInventory {
+        let directory = Ps2SaveDirectory {
+            entry: ps2_entry("BASLUS-00000SAVE", Ps2DirectoryEntryKind::Directory, 0),
+            chain_health: Ps2ClusterChainHealth {
+                clusters: vec![7],
+                complete: true,
+                warnings: Vec::new(),
+            },
+            children: Vec::new(),
+            files: vec![Ps2SaveFile {
+                entry: ps2_entry("icon.sys", Ps2DirectoryEntryKind::RegularFile, 2048),
+                declared_size_bytes: 2048,
+                chain_health: Ps2ClusterChainHealth {
+                    clusters: vec![8],
+                    complete: true,
+                    warnings: Vec::new(),
+                },
+            }],
+            warnings: Vec::new(),
+        };
+        MemoryCardInventory {
+            path: PathBuf::from("/tmp/synthetic-card.ps2"),
+            format: MemoryCardFormat::Ps2,
+            format_confidence: MemoryCardFormatConfidence::ConfirmedFormat,
+            health: MemoryCardHealth::Healthy,
+            card_size_bytes: 8 * 1024 * 1024,
+            entries: Vec::new(),
+            used_blocks: None,
+            free_blocks: None,
+            warnings: Vec::new(),
+            shared_container: true,
+            ps2_geometry: None,
+            ps2_inventory: Some(Ps2MemoryCardInventory {
+                root_chain_health: Ps2ClusterChainHealth {
+                    clusters: vec![1],
+                    complete: true,
+                    warnings: Vec::new(),
+                },
+                root_entries: vec![directory.entry.clone()],
+                save_directories: vec![directory],
+                warnings: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn memory_card_contents_render_save_and_child_file_without_mutating_actions() {
+        let ctx = egui::Context::default();
+        let card = sample_ps2_card();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, true, std::slice::from_ref(&card));
+            });
+        });
+        assert!(rendered_text_contains(&output, "PS2 Memory Card"));
+        assert!(rendered_text_contains(&output, "BASLUS-00000SAVE"));
+        assert!(rendered_text_contains(&output, "icon.sys"));
+        assert!(rendered_text_contains(&output, "2048 bytes"));
+        assert!(rendered_text_contains(
+            &output,
+            "shared memory-card container"
+        ));
+        assert!(rendered_text_contains(&output, "Raw entry offset"));
+        assert!(!rendered_text_contains(&output, "Export Save"));
+        assert!(!rendered_text_contains(&output, "Repair"));
+        assert!(!rendered_text_contains(&output, "Delete Save"));
+    }
+
+    #[test]
+    fn empty_ps2_card_uses_a_neutral_empty_state() {
+        let mut card = sample_ps2_card();
+        card.ps2_inventory
+            .as_mut()
+            .unwrap()
+            .save_directories
+            .clear();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, false, std::slice::from_ref(&card));
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "No saves found on this memory card."
+        ));
+        assert!(!rendered_text_contains(&output, "error"));
     }
 }
