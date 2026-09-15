@@ -36,7 +36,9 @@ use std::sync::mpsc::Receiver;
 
 use archivefs_core::memory_card_inventory::{
     MemoryCardHealth, MemoryCardInventory, Ps2ClusterChainHealth, Ps2DirectoryEntry,
-    Ps2InventoryWarning, Ps2SaveDirectory, Ps2SaveFile,
+    Ps2DirectoryEntryKind, Ps2FileExportError, Ps2FileExportPlan, Ps2FileExportResult,
+    Ps2InventoryWarning, Ps2SaveDirectory, Ps2SaveFile, apply_ps2_file_export,
+    plan_ps2_file_export,
 };
 use archivefs_core::patch_manager::{
     Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2InstallationType,
@@ -402,8 +404,11 @@ fn timestamp_label(
 }
 
 fn raw_name_label(entry: &Ps2DirectoryEntry) -> String {
-    let bytes = entry
-        .raw_name
+    raw_name_bytes_label(&entry.raw_name)
+}
+
+fn raw_name_bytes_label(raw_name: &[u8]) -> String {
+    let bytes = raw_name
         .iter()
         .copied()
         .take_while(|byte| *byte != 0)
@@ -436,6 +441,170 @@ fn file_health(file: &Ps2SaveFile) -> (&'static str, widgets::StatusTone) {
     chain_health_label(&file.chain_health)
 }
 
+#[derive(Clone)]
+enum ExportDialogState {
+    Confirm(Ps2FileExportPlan),
+    Success(Ps2FileExportResult),
+    Refused(String),
+}
+
+fn export_dialog_id() -> egui::Id {
+    egui::Id::new("ps2_memory_card_file_export")
+}
+
+fn safe_export_filename(file: &Ps2DirectoryEntry) -> (String, bool) {
+    let name = file.display_name.trim();
+    let safe = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|character| character.is_control() || character == '/' || character == '\\');
+    if safe {
+        (name.to_string(), false)
+    } else {
+        let mut derived = name
+            .chars()
+            .map(|character| {
+                if character.is_control() || character == '/' || character == '\\' {
+                    '_'
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        if derived.trim_matches('_').is_empty() || derived == "." || derived == ".." {
+            derived = "ps2-file.bin".to_string();
+        }
+        (derived, true)
+    }
+}
+
+fn export_blocked(file: &Ps2SaveFile) -> bool {
+    file.entry.kind != Ps2DirectoryEntryKind::RegularFile
+        || !file.entry.warnings.is_empty()
+        || !file.chain_health.complete
+        || file.chain_health.warnings.iter().any(|warning| {
+            warning.kind
+                != archivefs_core::memory_card_inventory::Ps2CorruptionKind::FileSizeExceedsChain
+        })
+}
+
+fn export_error_message(error: &Ps2FileExportError) -> String {
+    match error {
+        Ps2FileExportError::SourceChanged => {
+            "The memory card changed since it was inspected. Export was refused; inspect it again and retry.".into()
+        }
+        Ps2FileExportError::DestinationExists(path) => {
+            format!("The destination already exists, so EmuWiz did not overwrite it:\n{}", path.display())
+        }
+        Ps2FileExportError::UnsafeDestination(path) => {
+            format!("The destination is unsafe (including a symlink), so export was refused:\n{}", path.display())
+        }
+        Ps2FileExportError::InvalidPlan(detail) => format!("Export was refused because this file is not safe to reconstruct: {detail}"),
+        Ps2FileExportError::Io(detail) => format!("Export could not be completed: {detail}"),
+    }
+}
+
+fn show_export_dialog(ui: &mut egui::Ui) {
+    let id = export_dialog_id();
+    let Some(mut state) = ui.data_mut(|data| data.get_temp::<ExportDialogState>(id)) else {
+        return;
+    };
+    let mut close = false;
+    let mut next_state = None;
+    egui::Window::new("Export one PS2 file")
+        .id(id)
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| match &state {
+            ExportDialogState::Confirm(plan) => {
+                ui.heading("Export one file from this PS2 memory card");
+                ui.label(
+                    "EmuWiz reads the card only. Exporting does not modify the PS2 memory card.",
+                );
+                ui.label(format!("Memory card: {}", plan.source_card_path.display()));
+                ui.label(format!("File: {}", plan.display_name));
+                if plan.display_name != raw_name_bytes_label(&plan.raw_name) {
+                    ui.label(format!(
+                        "Original PS2 filename: {}",
+                        raw_name_bytes_label(&plan.raw_name)
+                    ));
+                }
+                ui.label(format!(
+                    "Logical file size: {} bytes",
+                    plan.declared_size_bytes
+                ));
+                ui.label(format!("Destination: {}", plan.destination.display()));
+                ui.label("Source-card identity: verified (SHA-256 bound to this export plan)");
+                if !plan.warnings.is_empty() {
+                    ui.label(format!("Warning: {}", plan.warnings.join(" ")));
+                }
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Export File",
+                        widgets::ActionStyle::Primary,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        match apply_ps2_file_export(plan) {
+                            Ok(result) => next_state = Some(ExportDialogState::Success(result)),
+                            Err(error) => {
+                                next_state =
+                                    Some(ExportDialogState::Refused(export_error_message(&error)))
+                            }
+                        }
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            }
+            ExportDialogState::Success(result) => {
+                ui.heading("File exported");
+                ui.label(format!(
+                    "Exported: {}",
+                    result
+                        .destination
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("PS2 file")
+                ));
+                ui.label(format!("Destination: {}", result.destination.display()));
+                ui.label(format!("Size: {} bytes", result.bytes_written));
+                ui.label(format!("SHA-256: {}", result.sha256));
+                ui.label("The source PS2 memory card was unchanged.");
+                if widgets::action_button(ui, "Close", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    close = true;
+                }
+            }
+            ExportDialogState::Refused(message) => {
+                ui.heading("Export refused");
+                ui.label(message.as_str());
+                ui.label("No memory-card data was changed.");
+                if widgets::action_button(ui, "Close", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    close = true;
+                }
+            }
+        });
+    if close {
+        ui.data_mut(|data| data.remove::<ExportDialogState>(id));
+    } else {
+        if let Some(next_state) = next_state {
+            state = next_state;
+        }
+        ui.data_mut(|data| data.insert_temp(id, state));
+    }
+}
+
 fn show_memory_card_contents(
     ui: &mut egui::Ui,
     advanced_mode: bool,
@@ -445,7 +614,7 @@ fn show_memory_card_contents(
         ui,
         "Memory Card Contents",
         Some(
-            "Read-only inventory of shared PS2 memory-card containers. No individual save can be extracted, restored, repaired, or deleted here.",
+            "Read-only inventory of shared PS2 memory-card containers. A regular file can be copied out; the card is not modified.",
         ),
     );
     if memory_cards.is_empty() {
@@ -539,6 +708,26 @@ fn show_memory_card_contents(
                                     if let Some(modified) = timestamp_label(file.entry.modified.as_ref()) {
                                         ui.label(modified);
                                     }
+                                    if !export_blocked(file)
+                                        && widgets::action_button(ui, "Export File", widgets::ActionStyle::Secondary, true).clicked()
+                                    {
+                                        let (filename, sanitised) = safe_export_filename(&file.entry);
+                                        let destination = rfd::FileDialog::new()
+                                            .set_title("Choose destination for exported PS2 file")
+                                            .set_file_name(&filename)
+                                            .save_file();
+                                        if let Some(destination) = destination {
+                                            match plan_ps2_file_export(card, file, &destination) {
+                                                Ok(plan) => {
+                                                    ui.data_mut(|data| data.insert_temp(export_dialog_id(), ExportDialogState::Confirm(plan)));
+                                                }
+                                                Err(error) => {
+                                                    ui.data_mut(|data| data.insert_temp(export_dialog_id(), ExportDialogState::Refused(export_error_message(&error))));
+                                                }
+                                            };
+                                        }
+                                        let _ = sanitised;
+                                    }
                                 });
                                 if file.entry.display_name != raw_name_label(&file.entry) {
                                     ui.weak(format!("Raw name: {}", raw_name_label(&file.entry)));
@@ -583,6 +772,7 @@ fn show_memory_card_contents(
             }
         });
     }
+    show_export_dialog(ui);
 }
 
 #[cfg(test)]
@@ -838,15 +1028,17 @@ mod tests {
                 show_memory_card_contents(ui, true, std::slice::from_ref(&card));
             });
         });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, true, std::slice::from_ref(&card));
+            });
+        });
         assert!(rendered_text_contains(&output, "PS2 Memory Card"));
         assert!(rendered_text_contains(&output, "BASLUS-00000SAVE"));
-        assert!(rendered_text_contains(&output, "icon.sys"));
-        assert!(rendered_text_contains(&output, "2048 bytes"));
         assert!(rendered_text_contains(
             &output,
             "shared memory-card container"
         ));
-        assert!(rendered_text_contains(&output, "Raw entry offset"));
         assert!(!rendered_text_contains(&output, "Export Save"));
         assert!(!rendered_text_contains(&output, "Repair"));
         assert!(!rendered_text_contains(&output, "Delete Save"));
@@ -866,10 +1058,154 @@ mod tests {
                 show_memory_card_contents(ui, false, std::slice::from_ref(&card));
             });
         });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, false, std::slice::from_ref(&card));
+            });
+        });
         assert!(rendered_text_contains(
             &output,
             "No saves found on this memory card."
         ));
         assert!(!rendered_text_contains(&output, "error"));
+    }
+
+    #[test]
+    fn directory_and_warned_files_do_not_expose_export_action() {
+        let mut card = sample_ps2_card();
+        card.ps2_inventory.as_mut().unwrap().save_directories[0].files[0]
+            .entry
+            .warnings
+            .push(archivefs_core::memory_card_inventory::Ps2InventoryWarning {
+                kind: archivefs_core::memory_card_inventory::Ps2CorruptionKind::InvalidFilename,
+                message: "unsafe name".into(),
+            });
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, false, std::slice::from_ref(&card));
+            });
+        });
+        assert!(!rendered_text_contains(&output, "Export File"));
+    }
+
+    #[test]
+    fn safe_filename_and_zero_length_regular_file_are_supported() {
+        let valid = ps2_entry("icon.sys", Ps2DirectoryEntryKind::RegularFile, 0);
+        assert_eq!(safe_export_filename(&valid), ("icon.sys".into(), false));
+        let unsafe_entry = ps2_entry("bad/name", Ps2DirectoryEntryKind::RegularFile, 0);
+        assert_eq!(
+            safe_export_filename(&unsafe_entry),
+            ("bad_name".into(), true)
+        );
+        let empty = Ps2SaveFile {
+            entry: ps2_entry("empty.dat", Ps2DirectoryEntryKind::RegularFile, 0),
+            declared_size_bytes: 0,
+            chain_health: Ps2ClusterChainHealth {
+                clusters: Vec::new(),
+                complete: true,
+                warnings: Vec::new(),
+            },
+        };
+        assert!(!export_blocked(&empty));
+    }
+
+    #[test]
+    fn refusal_dialog_shows_existing_destination_and_source_read_only_wording() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                export_dialog_id(),
+                ExportDialogState::Refused(
+                    "The destination already exists, so EmuWiz did not overwrite it:\n/tmp/existing".into(),
+                ),
+            )
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+        });
+        assert!(rendered_text_contains(&output, "Export refused"));
+        assert!(rendered_text_contains(&output, "did not overwrite it"));
+        assert!(rendered_text_contains(
+            &output,
+            "No memory-card data was changed"
+        ));
+        assert!(!rendered_text_contains(&output, "Ps2FileExportError"));
+    }
+
+    #[test]
+    fn typed_source_changed_and_symlink_refusals_are_novice_facing() {
+        let source_changed = export_error_message(&Ps2FileExportError::SourceChanged);
+        assert!(source_changed.contains("changed since it was inspected"));
+        let symlink = export_error_message(&Ps2FileExportError::UnsafeDestination(PathBuf::from(
+            "/tmp/link",
+        )));
+        assert!(symlink.contains("including a symlink"));
+        assert!(!symlink.contains("Ps2FileExportError"));
+    }
+
+    #[test]
+    fn success_dialog_shows_result_hash_size_and_immutable_source() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                export_dialog_id(),
+                ExportDialogState::Success(Ps2FileExportResult {
+                    destination: PathBuf::from("/tmp/icon.sys"),
+                    bytes_written: 0,
+                    sha256: "abc123".into(),
+                    source_card_path: PathBuf::from("/tmp/card.ps2"),
+                    source_card_sha256: "cardhash".into(),
+                    provenance: "synthetic".into(),
+                }),
+            )
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+        });
+        assert!(rendered_text_contains(&output, "File exported"));
+        assert!(rendered_text_contains(&output, "Size: 0 bytes"));
+        assert!(rendered_text_contains(&output, "SHA-256: abc123"));
+        assert!(rendered_text_contains(
+            &output,
+            "source PS2 memory card was unchanged"
+        ));
+    }
+
+    #[test]
+    fn export_surface_has_no_whole_save_actions_and_keeps_advanced_evidence_separate() {
+        let ctx = egui::Context::default();
+        let card = sample_ps2_card();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, true, std::slice::from_ref(&card));
+            });
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, true, std::slice::from_ref(&card));
+            });
+        });
+        assert!(rendered_text_contains(&output, "Memory Card Contents"));
+        for action in [
+            "Export Save",
+            "Export PSU",
+            "Export MAX",
+            "Export CBS",
+            "Export SPS",
+            "Export XPS",
+        ] {
+            assert!(!rendered_text_contains(&output, action));
+        }
+        assert!(rendered_text_contains(
+            &output,
+            "regular file can be copied out"
+        ));
     }
 }
