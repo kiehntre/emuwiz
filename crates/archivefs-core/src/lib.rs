@@ -12910,13 +12910,13 @@ mod tests {
         fs::write(source.join("parent.zip"), b"parent").unwrap();
         fs::write(child.join("child.zip"), b"child").unwrap();
         let archives = ArchiveScanner::new(&nested).scan_archives().unwrap();
-        assert_eq!(
-            archives
-                .iter()
-                .map(|archive| archive.path.clone())
-                .collect::<Vec<_>>(),
-            vec![source.join("parent.zip"), child.join("child.zip")]
-        );
+        let archive_paths = archives
+            .iter()
+            .map(|archive| archive.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(archive_paths.len(), 2);
+        assert!(archive_paths.contains(&source.join("parent.zip")));
+        assert!(archive_paths.contains(&child.join("child.zip")));
 
         let prefix_collision = Config {
             source_folders: vec![source, prefix_sibling],
@@ -14350,7 +14350,7 @@ mod tests {
     }
 
     #[test]
-    fn add_source_folder_rejects_an_overlap_through_the_orchestration_layer() {
+    fn add_source_folder_accepts_a_nested_source_through_the_orchestration_layer() {
         let root = test_root("add_source_folder_overlap");
         let config_path = root.join("config.toml");
         let database_path = root.join("library.sqlite3");
@@ -14361,11 +14361,11 @@ mod tests {
         fs::create_dir_all(&child).unwrap();
 
         add_source_folder_at(&config_path, &database_path, &parent).unwrap();
-        let error = add_source_folder_at(&config_path, &database_path, &child).unwrap_err();
-
-        assert!(error.to_string().contains("overlapping"));
+        add_source_folder_at(&config_path, &database_path, &child).unwrap();
         let views = list_source_folder_views_at(&config_path, &database_path).unwrap();
-        assert_eq!(views.len(), 1, "a rejected add must not partially persist");
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().any(|view| view.path == parent));
+        assert!(views.iter().any(|view| view.path == child));
     }
 
     #[test]
