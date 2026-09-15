@@ -30,6 +30,8 @@ pub mod amiga_whdload_archive;
 pub mod arcade_mame_compatibility;
 /// Read-only impact projection for refreshed imported MAME authority.
 pub mod mame_authority_impact;
+/// Deterministic collection statistics over evaluated MAME evidence.
+pub mod mame_collection_stats;
 /// Read-only per-set compatibility against an explicitly pinned FBNeo source.
 pub mod arcade_fbneo_compatibility;
 /// Read-only orchestration of independent MAME and FBNeo compatibility results.
