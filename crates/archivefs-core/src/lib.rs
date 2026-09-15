@@ -32,6 +32,8 @@ pub mod arcade_mame_compatibility;
 pub mod arcade_fbneo_compatibility;
 /// Read-only orchestration of independent MAME and FBNeo compatibility results.
 pub mod arcade_compatibility;
+/// Deterministic emulator recommendation from existing arcade evidence.
+pub mod arcade_recommendation;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
