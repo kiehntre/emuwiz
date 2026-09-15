@@ -26,6 +26,9 @@ pub const PS2_DIRECTORY_ENTRY_BYTES: usize = 512;
 pub const PS2_NAME_BYTES: usize = 32;
 pub const PS2_MAX_DIRECTORY_DEPTH: usize = 8;
 pub const PS2_MAX_INVENTORY_ENTRIES: usize = 16_384;
+pub const PS2_PSU_CLUSTER_BYTES: u64 = 1024;
+pub const PS2_PSU_MAX_FILES: usize = PS2_MAX_INVENTORY_ENTRIES;
+pub const PS2_PSU_MAX_OUTPUT_BYTES: u64 = PS2_MAX_CARD_BYTES as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Ps2PageRepresentation {
@@ -274,6 +277,395 @@ pub struct Ps2FileExportResult {
     pub source_card_path: PathBuf,
     pub source_card_sha256: String,
     pub provenance: String,
+}
+
+/// Immutable review evidence for exporting one validated, single-level PS2
+/// save directory as an EMS/uLaunchELF PSU container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ps2PsuExportPlan {
+    pub source_card_path: PathBuf,
+    pub source_card_sha256: String,
+    pub save_raw_name: Vec<u8>,
+    pub save_display_name: String,
+    save_entry: Ps2DirectoryEntry,
+    pub files: Vec<Ps2SaveFile>,
+    pub destination: PathBuf,
+    pub expected_output_bytes: u64,
+    pub provenance: String,
+    geometry: Ps2Geometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ps2PsuExportError {
+    InvalidPlan(String),
+    SourceChanged,
+    DestinationExists(PathBuf),
+    UnsafeDestination(PathBuf),
+    Io(String),
+}
+
+impl std::fmt::Display for Ps2PsuExportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPlan(detail) => write!(formatter, "invalid PS2 PSU export plan: {detail}"),
+            Self::SourceChanged => write!(formatter, "PS2 memory-card source changed after review"),
+            Self::DestinationExists(path) => {
+                write!(
+                    formatter,
+                    "PSU export destination already exists: {}",
+                    path.display()
+                )
+            }
+            Self::UnsafeDestination(path) => {
+                write!(
+                    formatter,
+                    "PSU export destination is unsafe: {}",
+                    path.display()
+                )
+            }
+            Self::Io(detail) => write!(formatter, "PS2 PSU export I/O failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for Ps2PsuExportError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ps2PsuExportResult {
+    pub destination: PathBuf,
+    pub output_bytes: u64,
+    pub sha256: String,
+    pub file_count: usize,
+    pub source_card_path: PathBuf,
+    pub source_card_sha256: String,
+    pub provenance: String,
+}
+
+/// Builds a create-only PSU plan from one already-inspected save directory.
+/// PSU export is intentionally bounded to the direct regular files represented
+/// by the current inventory; nested directories and incomplete evidence fail.
+pub fn plan_ps2_psu_export(
+    card: &MemoryCardInventory,
+    save: &Ps2SaveDirectory,
+    destination: &Path,
+) -> Result<Ps2PsuExportPlan, Ps2PsuExportError> {
+    let geometry = card
+        .ps2_geometry
+        .clone()
+        .ok_or_else(|| Ps2PsuExportError::InvalidPlan("PS2 geometry is unavailable".into()))?;
+    if card.format != MemoryCardFormat::Ps2 || !card.shared_container {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "source is not a shared PS2 memory-card container".into(),
+        ));
+    }
+    if card.ps2_inventory.is_none() {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "source PS2 inventory is unavailable".into(),
+        ));
+    }
+    if !save.warnings.is_empty() || !save.entry.warnings.is_empty() {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "save directory metadata or structure has warnings".into(),
+        ));
+    }
+    if !save.chain_health.complete || !save.chain_health.warnings.is_empty() {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "save directory FAT chain is not complete".into(),
+        ));
+    }
+    if save
+        .children
+        .iter()
+        .any(|entry| entry.kind != Ps2DirectoryEntryKind::Unused)
+    {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "nested or non-file save entries are not supported by this PSU writer".into(),
+        ));
+    }
+    validate_psu_name(&save.entry.raw_name)?;
+    if save.entry.created.is_none() || save.entry.modified.is_none() {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU save directory timestamps are unavailable".into(),
+        ));
+    }
+    if save.files.len() > PS2_PSU_MAX_FILES {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "save contains too many files".into(),
+        ));
+    }
+    let mut expected_output_bytes =
+        (PS2_DIRECTORY_ENTRY_BYTES as u64)
+            .checked_mul((save.files.len() as u64).checked_add(3).ok_or_else(|| {
+                Ps2PsuExportError::InvalidPlan("PSU entry count overflowed".into())
+            })?)
+            .ok_or_else(|| Ps2PsuExportError::InvalidPlan("PSU header size overflowed".into()))?;
+    let mut names = HashSet::new();
+    for file in &save.files {
+        validate_psu_file(file)?;
+        let name = psu_name_bytes(&file.entry.raw_name)?;
+        if !names.insert(name.to_vec()) {
+            return Err(Ps2PsuExportError::InvalidPlan(
+                "PSU save contains duplicate file names".into(),
+            ));
+        }
+        let padded = file
+            .declared_size_bytes
+            .checked_add(PS2_PSU_CLUSTER_BYTES - 1)
+            .ok_or_else(|| Ps2PsuExportError::InvalidPlan("PSU file padding overflowed".into()))?
+            / PS2_PSU_CLUSTER_BYTES
+            * PS2_PSU_CLUSTER_BYTES;
+        expected_output_bytes = expected_output_bytes
+            .checked_add(padded)
+            .ok_or_else(|| Ps2PsuExportError::InvalidPlan("PSU output size overflowed".into()))?;
+    }
+    if expected_output_bytes > PS2_PSU_MAX_OUTPUT_BYTES {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU output exceeds the bounded export limit".into(),
+        ));
+    }
+    validate_source_path(&card.path).map_err(psu_error)?;
+    validate_destination_path(destination, &card.path).map_err(psu_error)?;
+    let source_card_sha256 = sha256_hex(&read_source_card(&card.path).map_err(psu_error)?);
+    Ok(Ps2PsuExportPlan {
+        source_card_path: card.path.clone(),
+        source_card_sha256,
+        save_raw_name: save.entry.raw_name.clone(),
+        save_display_name: save.entry.display_name.clone(),
+        save_entry: save.entry.clone(),
+        files: save.files.clone(),
+        destination: destination.to_path_buf(),
+        expected_output_bytes,
+        provenance: "PS2 validated save directory; PSU 512-byte entries, 1024-byte logical-file padding, data pages only".into(),
+        geometry,
+    })
+}
+
+/// Applies a reviewed PSU plan without modifying the source card.
+pub fn apply_ps2_psu_export(
+    plan: &Ps2PsuExportPlan,
+) -> Result<Ps2PsuExportResult, Ps2PsuExportError> {
+    validate_source_path(&plan.source_card_path).map_err(psu_error)?;
+    validate_destination_path(&plan.destination, &plan.source_card_path).map_err(psu_error)?;
+    let source_bytes = read_source_card(&plan.source_card_path).map_err(psu_error)?;
+    if sha256_hex(&source_bytes) != plan.source_card_sha256 {
+        return Err(Ps2PsuExportError::SourceChanged);
+    }
+    let mut temporary = create_export_temporary(&plan.destination).map_err(psu_error)?;
+    let result = (|| {
+        let file_count = plan.files.len();
+        write_psu_entry(
+            &mut temporary,
+            &plan.save_raw_name,
+            plan.save_entry.raw_mode,
+            (file_count as u32).checked_add(2).ok_or_else(|| {
+                Ps2PsuExportError::InvalidPlan("PSU entry count overflowed".into())
+            })?,
+            &plan.save_entry,
+            true,
+        )?;
+        write_psu_dot_entry(&mut temporary, b".", &plan.save_entry)?;
+        write_psu_dot_entry(&mut temporary, b"..", &plan.save_entry)?;
+        for file in &plan.files {
+            write_psu_entry(
+                &mut temporary,
+                &file.entry.raw_name,
+                file.entry.raw_mode,
+                file.declared_size_bytes as u32,
+                &file.entry,
+                false,
+            )?;
+            let mut remaining = file.declared_size_bytes;
+            for &cluster in &file.chain_health.clusters {
+                if remaining == 0 {
+                    break;
+                }
+                let data = ps2_relative_cluster(&source_bytes, &plan.geometry, cluster)
+                    .ok_or_else(|| {
+                        Ps2PsuExportError::InvalidPlan("FAT chain points outside card data".into())
+                    })?;
+                let count = remaining.min(data.len() as u64) as usize;
+                temporary
+                    .write_all(&data[..count])
+                    .map_err(|error| Ps2PsuExportError::Io(error.to_string()))?;
+                remaining -= count as u64;
+            }
+            if remaining != 0 {
+                return Err(Ps2PsuExportError::InvalidPlan(
+                    "validated chain did not provide the declared logical length".into(),
+                ));
+            }
+            let padding = (PS2_PSU_CLUSTER_BYTES
+                - (file.declared_size_bytes % PS2_PSU_CLUSTER_BYTES))
+                % PS2_PSU_CLUSTER_BYTES;
+            temporary
+                .write_all(&vec![0; padding as usize])
+                .map_err(|error| Ps2PsuExportError::Io(error.to_string()))?;
+        }
+        temporary
+            .sync_all()
+            .map_err(|error| Ps2PsuExportError::Io(error.to_string()))?;
+        let bytes_written = temporary
+            .metadata()
+            .map_err(|error| Ps2PsuExportError::Io(error.to_string()))?
+            .len();
+        if bytes_written != plan.expected_output_bytes {
+            return Err(Ps2PsuExportError::InvalidPlan(
+                "staged PSU length did not match the reviewed output size".into(),
+            ));
+        }
+        let output_sha256 = sha256_hex(&read_path(&temporary.path())?);
+        if sha256_hex(&read_source_card(&plan.source_card_path).map_err(psu_error)?)
+            != plan.source_card_sha256
+        {
+            return Err(Ps2PsuExportError::SourceChanged);
+        }
+        if fs::symlink_metadata(&plan.destination).is_ok() {
+            return Err(Ps2PsuExportError::DestinationExists(
+                plan.destination.clone(),
+            ));
+        }
+        fs::hard_link(temporary.path(), &plan.destination)
+            .map_err(|error| Ps2PsuExportError::Io(error.to_string()))?;
+        let final_bytes = read_path(&plan.destination)?;
+        if final_bytes.len() as u64 != bytes_written || sha256_hex(&final_bytes) != output_sha256 {
+            return Err(Ps2PsuExportError::Io(
+                "published PSU failed output verification".into(),
+            ));
+        }
+        if sha256_hex(&read_source_card(&plan.source_card_path).map_err(psu_error)?)
+            != plan.source_card_sha256
+        {
+            return Err(Ps2PsuExportError::SourceChanged);
+        }
+        fs::remove_file(temporary.path())
+            .map_err(|error| Ps2PsuExportError::Io(error.to_string()))?;
+        Ok(Ps2PsuExportResult {
+            destination: plan.destination.clone(),
+            output_bytes: bytes_written,
+            sha256: output_sha256,
+            file_count,
+            source_card_path: plan.source_card_path.clone(),
+            source_card_sha256: plan.source_card_sha256.clone(),
+            provenance: plan.provenance.clone(),
+        })
+    })();
+    result
+}
+
+fn psu_error(error: Ps2FileExportError) -> Ps2PsuExportError {
+    match error {
+        Ps2FileExportError::SourceChanged => Ps2PsuExportError::SourceChanged,
+        Ps2FileExportError::DestinationExists(path) => Ps2PsuExportError::DestinationExists(path),
+        Ps2FileExportError::UnsafeDestination(path) => Ps2PsuExportError::UnsafeDestination(path),
+        Ps2FileExportError::InvalidPlan(detail) => Ps2PsuExportError::InvalidPlan(detail),
+        Ps2FileExportError::Io(detail) => Ps2PsuExportError::Io(detail),
+    }
+}
+
+fn validate_psu_name(name: &[u8]) -> Result<(), Ps2PsuExportError> {
+    let name = psu_name_bytes(name)?;
+    if name.is_empty() || name.len() > PS2_NAME_BYTES {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU name is empty, too long, or contains NUL".into(),
+        ));
+    }
+    if name
+        .iter()
+        .any(|byte| *byte < 0x20 || *byte == b'/' || *byte == b'?' || *byte == b'*')
+    {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU name contains an unsupported character".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn psu_name_bytes(name: &[u8]) -> Result<&[u8], Ps2PsuExportError> {
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    if name[end..].iter().any(|byte| *byte != 0) {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU name has non-zero bytes after NUL".into(),
+        ));
+    }
+    Ok(&name[..end])
+}
+
+fn validate_psu_file(file: &Ps2SaveFile) -> Result<(), Ps2PsuExportError> {
+    if file.entry.kind != Ps2DirectoryEntryKind::RegularFile
+        || !file.entry.warnings.is_empty()
+        || !file.chain_health.complete
+        || !file.chain_health.warnings.is_empty()
+        || u64::from(file.entry.length) != file.declared_size_bytes
+        || file.declared_size_bytes > u32::MAX as u64
+        || file.entry.raw_mode > u16::MAX as u32
+    {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU member metadata or chain is unsafe".into(),
+        ));
+    }
+    validate_psu_name(&file.entry.raw_name)
+}
+
+fn write_psu_entry(
+    output: &mut ExportTemporary,
+    name: &[u8],
+    raw_mode: u32,
+    length: u32,
+    metadata: &Ps2DirectoryEntry,
+    directory: bool,
+) -> Result<(), Ps2PsuExportError> {
+    let name = psu_name_bytes(name)?;
+    validate_psu_name(name)?;
+    if raw_mode > u16::MAX as u32 {
+        return Err(Ps2PsuExportError::InvalidPlan(
+            "PSU mode exceeds u16".into(),
+        ));
+    }
+    let mut entry = [0u8; PS2_DIRECTORY_ENTRY_BYTES];
+    entry[0..2].copy_from_slice(&(raw_mode as u16).to_le_bytes());
+    entry[4..8].copy_from_slice(&length.to_le_bytes());
+    entry[8..16].copy_from_slice(
+        &metadata
+            .created
+            .as_ref()
+            .ok_or_else(|| {
+                Ps2PsuExportError::InvalidPlan("PSU creation timestamp is unavailable".into())
+            })?
+            .raw,
+    );
+    entry[0x18..0x20].copy_from_slice(
+        &metadata
+            .modified
+            .as_ref()
+            .ok_or_else(|| {
+                Ps2PsuExportError::InvalidPlan("PSU modification timestamp is unavailable".into())
+            })?
+            .raw,
+    );
+    entry[0x20..0x24].copy_from_slice(&metadata.attributes.to_le_bytes());
+    entry[0x40..0x40 + name.len()].copy_from_slice(name);
+    if directory {
+        entry[0x10..0x14].fill(0);
+        entry[0x14..0x18].fill(0);
+    }
+    output
+        .write_all(&entry)
+        .map_err(|error| Ps2PsuExportError::Io(error.to_string()))
+}
+
+fn write_psu_dot_entry(
+    output: &mut ExportTemporary,
+    name: &[u8],
+    metadata: &Ps2DirectoryEntry,
+) -> Result<(), Ps2PsuExportError> {
+    write_psu_entry(output, name, 0x8427, 0, metadata, true)
+}
+
+fn read_path(path: &Path) -> Result<Vec<u8>, Ps2PsuExportError> {
+    fs::read(path).map_err(|error| Ps2PsuExportError::Io(error.to_string()))
 }
 
 /// Builds an export plan from an already-inspected PS2 regular file.
@@ -1797,5 +2189,198 @@ mod tests {
         assert_eq!(output.len(), 600);
         assert_eq!(&output[..512], &[0x11; 512]);
         assert_eq!(&output[512..], &[0x22; 88]);
+    }
+
+    #[test]
+    fn ps2_psu_export_is_deterministic_and_preserves_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("Mcd001.ps2");
+        let before = ps2_inventory_fixture();
+        fs::write(&card_path, &before).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let save = &card.ps2_inventory.as_ref().unwrap().save_directories[0];
+        let first = dir.path().join("first.psu");
+        let second = dir.path().join("second.psu");
+        let first_plan = plan_ps2_psu_export(&card, save, &first).unwrap();
+        let second_plan = plan_ps2_psu_export(&card, save, &second).unwrap();
+        let first_result = apply_ps2_psu_export(&first_plan).unwrap();
+        let second_result = apply_ps2_psu_export(&second_plan).unwrap();
+        assert_eq!(first_result.file_count, 1);
+        assert_eq!(first_result.output_bytes, 4 * 512 + 1024);
+        assert_eq!(first_result.sha256, second_result.sha256);
+        assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        assert_eq!(fs::read(&card_path).unwrap(), before);
+
+        let output = fs::read(first).unwrap();
+        assert_eq!(&output[0x40..0x40 + 16], b"BASLUS-00001TEST");
+        assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 3);
+        assert_eq!(&output[1024 + 0x40..1024 + 0x40 + 1], b".");
+        assert_eq!(&output[1536 + 0x40..1536 + 0x40 + 8], b"icon.sys");
+        assert_eq!(&output[2048 + 100..3072], &[0; 924]);
+    }
+
+    #[test]
+    fn ps2_psu_export_handles_zero_length_and_fragmented_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("fragmented.ps2");
+        let mut bytes = ps2_inventory_fixture();
+        bytes[(41 + 3) * 1024..(41 + 3) * 1024 + 1024].fill(0x5a);
+        bytes[8 * 1024 + 3 * 4..8 * 1024 + 4 * 4].copy_from_slice(&0x8000_0005u32.to_le_bytes());
+        bytes[8 * 1024 + 5 * 4..8 * 1024 + 6 * 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        bytes[(41 + 5) * 1024..(41 + 5) * 1024 + 1024].fill(0x6b);
+        let file_entry_offset = (41 + 4) * 1024;
+        bytes[file_entry_offset + 4..file_entry_offset + 8].copy_from_slice(&1500u32.to_le_bytes());
+        fs::write(&card_path, &bytes).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let mut save = card.ps2_inventory.as_ref().unwrap().save_directories[0].clone();
+        assert_eq!(save.files[0].chain_health.clusters, vec![3, 5]);
+        let mut empty = save.files[0].clone();
+        empty.entry.raw_name = b"empty.bin".to_vec();
+        empty.entry.display_name = "empty.bin".into();
+        empty.entry.length = 0;
+        empty.declared_size_bytes = 0;
+        empty.entry.start_cluster = u32::MAX;
+        empty.chain_health.clusters.clear();
+        save.files.push(empty);
+        let destination = dir.path().join("save.psu");
+        let plan = plan_ps2_psu_export(&card, &save, &destination).unwrap();
+        let result = apply_ps2_psu_export(&plan).unwrap();
+        assert_eq!(result.file_count, 2);
+        assert_eq!(result.output_bytes, 5 * 512 + 2048);
+        let output = fs::read(destination).unwrap();
+        assert_eq!(&output[2560..2560 + 1024], &[0x5a; 1024]);
+        assert_eq!(&output[2560 + 1024..2560 + 1500], &[0x6b; 476]);
+    }
+
+    #[test]
+    fn ps2_psu_export_refuses_changed_source_and_unsafe_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("Mcd001.ps2");
+        fs::write(&card_path, ps2_inventory_fixture()).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let save = &card.ps2_inventory.as_ref().unwrap().save_directories[0];
+        let destination = dir.path().join("save.psu");
+        let plan = plan_ps2_psu_export(&card, save, &destination).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&card_path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(matches!(
+            apply_ps2_psu_export(&plan),
+            Err(Ps2PsuExportError::SourceChanged)
+        ));
+
+        let mut unsafe_save = save.clone();
+        unsafe_save.files[0].entry.raw_name = b"../escape".to_vec();
+        assert!(matches!(
+            plan_ps2_psu_export(&card, &unsafe_save, &dir.path().join("unsafe.psu")),
+            Err(Ps2PsuExportError::InvalidPlan(_))
+        ));
+    }
+
+    #[test]
+    fn ps2_psu_export_excludes_spare_bytes_and_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let card_path = dir.path().join("Mcd001.ps2");
+        let mut bytes = ps2_fixture(PS2_PHYSICAL_PAGE_BYTES);
+        let fat_offset = 8 * 2 * PS2_PHYSICAL_PAGE_BYTES;
+        bytes[fat_offset + 3 * 4..fat_offset + 4 * 4]
+            .copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let first_page = (41 + 3) * 2 * PS2_PHYSICAL_PAGE_BYTES;
+        bytes[first_page..first_page + PS2_PAGE_DATA_BYTES].fill(0x11);
+        bytes[first_page + PS2_PAGE_DATA_BYTES..first_page + PS2_PHYSICAL_PAGE_BYTES].fill(0xee);
+        let second_page = first_page + PS2_PHYSICAL_PAGE_BYTES;
+        bytes[second_page..second_page + PS2_PAGE_DATA_BYTES].fill(0x11);
+        bytes[second_page + PS2_PAGE_DATA_BYTES..second_page + PS2_PHYSICAL_PAGE_BYTES].fill(0xdd);
+        fs::write(&card_path, &bytes).unwrap();
+        let card = inspect_memory_card(&card_path).unwrap();
+        let save = Ps2SaveDirectory {
+            entry: Ps2DirectoryEntry {
+                raw_entry_offset: 0,
+                raw_mode: 0x8427,
+                kind: Ps2DirectoryEntryKind::Directory,
+                raw_name: b"SAVE".to_vec(),
+                display_name: "SAVE".into(),
+                length: 1,
+                start_cluster: 0,
+                parent_entry: 0,
+                attributes: 0,
+                created: Some(Ps2Timestamp {
+                    raw: [0, 38, 44, 12, 24, 6, 0xea, 0x07],
+                    year: 2026,
+                    month: 6,
+                    day: 24,
+                    hour: 12,
+                    minute: 44,
+                    second: 38,
+                    timezone: "JST (+09:00)",
+                }),
+                modified: Some(Ps2Timestamp {
+                    raw: [0, 39, 44, 12, 24, 6, 0xea, 0x07],
+                    year: 2026,
+                    month: 6,
+                    day: 24,
+                    hour: 12,
+                    minute: 44,
+                    second: 39,
+                    timezone: "JST (+09:00)",
+                }),
+                warnings: Vec::new(),
+            },
+            chain_health: Ps2ClusterChainHealth {
+                clusters: Vec::new(),
+                complete: true,
+                warnings: Vec::new(),
+            },
+            children: Vec::new(),
+            files: vec![Ps2SaveFile {
+                entry: Ps2DirectoryEntry {
+                    raw_entry_offset: 0,
+                    raw_mode: 0x8497,
+                    kind: Ps2DirectoryEntryKind::RegularFile,
+                    raw_name: b"raw.bin".to_vec(),
+                    display_name: "raw.bin".into(),
+                    length: 600,
+                    start_cluster: 3,
+                    parent_entry: 0,
+                    attributes: 0,
+                    created: save_timestamp(38),
+                    modified: save_timestamp(39),
+                    warnings: Vec::new(),
+                },
+                declared_size_bytes: 600,
+                chain_health: Ps2ClusterChainHealth {
+                    clusters: vec![3],
+                    complete: true,
+                    warnings: Vec::new(),
+                },
+            }],
+            warnings: Vec::new(),
+        };
+        let destination = dir.path().join("save.psu");
+        let plan = plan_ps2_psu_export(&card, &save, &destination).unwrap();
+        apply_ps2_psu_export(&plan).unwrap();
+        let output = fs::read(&destination).unwrap();
+        assert_eq!(&output[2048..2048 + 512], &[0x11; 512]);
+        assert_eq!(&output[2560..2560 + 88], &[0x11; 88]);
+        assert!(matches!(
+            plan_ps2_psu_export(&card, &save, &destination),
+            Err(Ps2PsuExportError::DestinationExists(_))
+        ));
+    }
+
+    fn save_timestamp(second: u8) -> Option<Ps2Timestamp> {
+        Some(Ps2Timestamp {
+            raw: [0, second, 44, 12, 24, 6, 0xea, 0x07],
+            year: 2026,
+            month: 6,
+            day: 24,
+            hour: 12,
+            minute: 44,
+            second,
+            timezone: "JST (+09:00)",
+        })
     }
 }
