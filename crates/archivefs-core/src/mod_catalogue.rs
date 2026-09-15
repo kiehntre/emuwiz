@@ -17,6 +17,9 @@ use crate::mod_package::{
     ModCanonicalPlatform, ModCompatibilityState, ModIdentityKind, SelectedGameForMod,
 };
 
+#[path = "ps3_device_probe.rs"]
+pub mod ps3_device_probe;
+
 pub const MAX_CATALOGUE_TEXT_BYTES: usize = 4096;
 pub const MAX_CATALOGUE_URL_BYTES: usize = 8192;
 pub const MAX_CATALOGUE_PAYLOADS: usize = 64;
