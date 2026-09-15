@@ -8738,10 +8738,9 @@ mod dat_coverage_section {
         let mut ui_state = DatSourcesPageUi::default();
         let output = render_with_details(&view, &mut ui_state);
         assert!(rendered_text_contains(&output, "Collection coverage"));
-        // Beginner wording, not raw "DAT".
         assert!(rendered_text_contains(
             &output,
-            "How much of each platform's catalogue"
+            "Per-source verification details"
         ));
     }
 }

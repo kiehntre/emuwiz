@@ -221,7 +221,7 @@ fn entry(load: CoverageLoad) -> SourceCoverageEntry {
 }
 
 #[test]
-fn a_complete_set_renders_a_positive_badge() {
+fn a_complete_set_renders_recorded_identity_coverage() {
     let mut coverage = base_canonical();
     coverage.complete_set = CompleteSetVerdict::Complete {
         extra_duplicate_archives: 7,
@@ -237,8 +237,10 @@ fn a_complete_set_renders_a_positive_badge() {
         &mut Some("no-intro-gba".to_string()),
         &mut BTreeSet::new(),
     );
-    assert!(rendered_text_contains(&output, "Full set ✓"));
-    assert!(rendered_text_contains(&output, "100.0% complete"));
+    assert!(rendered_text_contains(
+        &output,
+        "100.0% of expected identities have recorded matches"
+    ));
 }
 
 #[test]
@@ -252,10 +254,16 @@ fn a_missing_count_and_completion_come_from_the_core_percentage() {
         &mut Some("no-intro-gba".to_string()),
         &mut BTreeSet::new(),
     );
-    // 96.62 from the core, not owned/expected (1201/1243 = 96.6%) or
-    // verified/expected.
-    assert!(rendered_text_contains(&output, "96.6% complete"));
-    assert!(rendered_text_contains(&output, "Incomplete — 42 missing"));
+    // 96.62 from the core, explicitly described as recorded identity
+    // coverage rather than a complete-set claim.
+    assert!(rendered_text_contains(
+        &output,
+        "96.6% of expected identities have recorded matches"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Without verified identity (includes unresolved)"
+    ));
     assert!(rendered_text_contains(&output, "42"));
 }
 
@@ -277,7 +285,10 @@ fn owned_over_expected_never_shows_over_one_hundred_percent() {
         &mut Some("no-intro-gba".to_string()),
         &mut BTreeSet::new(),
     );
-    assert!(rendered_text_contains(&output, "100.0% complete"));
+    assert!(rendered_text_contains(
+        &output,
+        "100.0% of expected identities have recorded matches"
+    ));
     assert!(!rendered_text_contains(&output, "105"));
     assert!(!rendered_text_contains(&output, "400.0%"));
 }
@@ -309,7 +320,7 @@ fn an_unassigned_source_still_shows_verification_metrics_but_dashes_for_expected
     assert!(rendered_text_contains(&output, "—"));
     assert!(rendered_text_contains(
         &output,
-        "Full set cannot be determined"
+        "no explicit platform assignment"
     ));
     assert!(rendered_text_contains(
         &output,
@@ -366,7 +377,7 @@ fn duplicate_names_inventory_shows_counts_but_full_set_not_provable() {
     assert!(rendered_text_contains(&output, "1,243")); // expected still shown
     assert!(rendered_text_contains(
         &output,
-        "Full set cannot be determined"
+        "this DAT declared 4 duplicate <game> name(s)"
     ));
     assert!(!rendered_text_contains(&output, "Full set ✓"));
 }
