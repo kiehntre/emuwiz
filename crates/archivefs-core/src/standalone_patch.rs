@@ -15,6 +15,9 @@ pub const MAX_PATCH_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 1024 * 1024;
 pub const MAX_RECORDS: usize = 1_000_000;
 pub const MAX_DECLARED_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Applying is deliberately more conservative than inspection: the first
+/// implementation keeps the selected base and staged result bounded in RAM.
+pub const MAX_APPLY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +84,29 @@ pub struct DerivedPatchPlan {
     pub overwrite_existing: bool,
     pub confirmation_required: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StandalonePatchApplyPlan {
+    pub reviewed: DerivedPatchPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StandalonePatchApplyResult {
+    pub output_path: PathBuf,
+    pub output_size: u64,
+    pub output_sha256: String,
+    pub provenance: DerivedPatchProvenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DerivedPatchProvenance {
+    pub base_path: PathBuf,
+    pub base_sha256: String,
+    pub patch_path: PathBuf,
+    pub patch_sha256: String,
+    pub format: StandalonePatchFormat,
+    pub output_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,9 +235,9 @@ pub fn build_derived_patch_plan(
             "output is outside the approved derivative root or uses a symlink component".into(),
         ));
     }
-    if output.exists() && !output.is_file() {
+    if output.exists() {
         return Err(StandalonePatchError::UnsafeOutput(
-            "existing output is not a regular file".into(),
+            "destination already exists; overwrite is disabled".into(),
         ));
     }
     Ok(DerivedPatchPlan {
@@ -228,6 +254,383 @@ pub fn build_derived_patch_plan(
         confirmation_required: true,
         warnings: inspection.warnings.clone(),
     })
+}
+
+pub fn build_standalone_patch_apply_plan(
+    inspection: &StandalonePatchInspection,
+    base_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    approved_output_root: impl AsRef<Path>,
+) -> Result<StandalonePatchApplyPlan, StandalonePatchError> {
+    if !matches!(
+        inspection.format,
+        StandalonePatchFormat::Ips | StandalonePatchFormat::Bps | StandalonePatchFormat::Ups
+    ) {
+        return Err(StandalonePatchError::Unsupported(
+            "only IPS, BPS, and UPS application is enabled".into(),
+        ));
+    }
+    let base = fs::read(base_path.as_ref()).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    if base.len() as u64 > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    let plan = build_derived_patch_plan(
+        inspection,
+        base_path,
+        output_path,
+        approved_output_root,
+        Some(hex_digest(&base)),
+    )?;
+    Ok(StandalonePatchApplyPlan { reviewed: plan })
+}
+
+pub fn apply_standalone_patch(
+    plan: &StandalonePatchApplyPlan,
+) -> Result<StandalonePatchApplyResult, StandalonePatchError> {
+    let base =
+        fs::read(&plan.reviewed.base_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    if base.len() as u64 > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    let base_hash = hex_digest(&base);
+    if plan.reviewed.base_sha256.as_deref() != Some(base_hash.as_str()) {
+        return Err(StandalonePatchError::Malformed(
+            "base changed since review".into(),
+        ));
+    }
+    let inspection = inspect_standalone_patch(&plan.reviewed.patch_path)?;
+    if inspection.patch_sha256 != plan.reviewed.patch_sha256 {
+        return Err(StandalonePatchError::Malformed(
+            "patch changed since review".into(),
+        ));
+    }
+    let patch =
+        fs::read(&plan.reviewed.patch_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    if inspection
+        .source_crc32
+        .is_some_and(|expected| crc32(&base) != expected)
+    {
+        return Err(StandalonePatchError::Malformed(
+            "base CRC differs from reviewed patch source checksum".into(),
+        ));
+    }
+    let output = match inspection.format {
+        StandalonePatchFormat::Ips => apply_ips(&base, &patch)?,
+        StandalonePatchFormat::Bps => apply_bps(&base, &patch)?,
+        StandalonePatchFormat::Ups => apply_ups(&base, &patch)?,
+        _ => {
+            return Err(StandalonePatchError::Unsupported(
+                "format is inspection-only".into(),
+            ));
+        }
+    };
+    if output.len() as u64 > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    if inspection
+        .target_size
+        .is_some_and(|s| s != output.len() as u64)
+    {
+        return Err(StandalonePatchError::Malformed(
+            "output size differs from patch declaration".into(),
+        ));
+    }
+    if let Some(crc) = inspection.target_crc32 {
+        if crc32(&output) != crc {
+            return Err(StandalonePatchError::Malformed(
+                "output CRC mismatch".into(),
+            ));
+        }
+    }
+    let output_hash = hex_digest(&output);
+    let parent = plan
+        .reviewed
+        .output_path
+        .parent()
+        .ok_or_else(|| StandalonePatchError::UnsafeOutput("output has no parent".into()))?;
+    if !parent.is_dir()
+        || plan.reviewed.output_path.exists()
+        || !is_safe_child(parent, &plan.reviewed.output_path)
+    {
+        return Err(StandalonePatchError::UnsafeOutput(
+            "destination is unavailable or unsafe".into(),
+        ));
+    }
+    let stage = parent.join(format!(
+        ".emuwiz-derived-{}-{}",
+        std::process::id(),
+        patch.len()
+    ));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage)
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        file.write_all(&output)
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        fs::hard_link(&stage, &plan.reviewed.output_path)
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        fs::remove_file(&stage).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&stage);
+        return Err(error);
+    }
+    Ok(StandalonePatchApplyResult {
+        output_path: plan.reviewed.output_path.clone(),
+        output_size: output.len() as u64,
+        output_sha256: output_hash.clone(),
+        provenance: DerivedPatchProvenance {
+            base_path: plan.reviewed.base_path.clone(),
+            base_sha256: base_hash,
+            patch_path: plan.reviewed.patch_path.clone(),
+            patch_sha256: plan.reviewed.patch_sha256.clone(),
+            format: inspection.format,
+            output_sha256: output_hash,
+        },
+    })
+}
+
+fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
+    let mut out = base.to_vec();
+    let mut p = 5;
+    while p < patch.len() {
+        if patch[p..].starts_with(b"EOF") {
+            p += 3;
+            if patch.len() - p == 3 {
+                let n = ((patch[p] as usize) << 16)
+                    | ((patch[p + 1] as usize) << 8)
+                    | patch[p + 2] as usize;
+                if n as u64 > MAX_APPLY_BYTES {
+                    return Err(StandalonePatchError::TooLarge);
+                };
+                out.resize(n, 0)
+            } else if p != patch.len() {
+                return Err(StandalonePatchError::Malformed("IPS trailing bytes".into()));
+            }
+            return Ok(out);
+        }
+        if patch.len() - p < 5 {
+            return Err(StandalonePatchError::Malformed(
+                "IPS truncated record".into(),
+            ));
+        }
+        let at =
+            ((patch[p] as usize) << 16) | ((patch[p + 1] as usize) << 8) | patch[p + 2] as usize;
+        let size = u16::from_be_bytes([patch[p + 3], patch[p + 4]]) as usize;
+        p += 5;
+        let _n = if size == 0 {
+            if patch.len() - p < 3 {
+                return Err(StandalonePatchError::Malformed("IPS truncated RLE".into()));
+            }
+            let n = u16::from_be_bytes([patch[p], patch[p + 1]]) as usize;
+            p += 2;
+            if n == 0 {
+                return Err(StandalonePatchError::Malformed("IPS zero RLE".into()));
+            }
+            let value = patch[p];
+            p += 1;
+            if at.checked_add(n).is_none() {
+                return Err(StandalonePatchError::Malformed(
+                    "IPS offset overflow".into(),
+                ));
+            }
+            let end = at + n;
+            if end as u64 > MAX_APPLY_BYTES {
+                return Err(StandalonePatchError::TooLarge);
+            };
+            out.resize(end, 0);
+            for x in &mut out[at..end] {
+                *x = value
+            }
+            continue;
+        } else {
+            if patch.len() - p < size {
+                return Err(StandalonePatchError::Malformed("IPS truncated data".into()));
+            }
+            if at.checked_add(size).is_none() {
+                return Err(StandalonePatchError::Malformed(
+                    "IPS offset overflow".into(),
+                ));
+            }
+            let end = at + size;
+            if end as u64 > MAX_APPLY_BYTES {
+                return Err(StandalonePatchError::TooLarge);
+            };
+            out.resize(end, 0);
+            out[at..end].copy_from_slice(&patch[p..p + size]);
+            p += size;
+            continue;
+        };
+    }
+    Err(StandalonePatchError::Malformed("IPS missing EOF".into()))
+}
+
+fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
+    if patch.len() < 16 {
+        return Err(StandalonePatchError::Malformed("BPS truncated".into()));
+    }
+    let end = patch.len() - 12;
+    let mut p = 4;
+    let source = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+    let target = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+    let meta = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+    if source != base.len() as u64
+        || target > MAX_APPLY_BYTES
+        || meta as usize > end.saturating_sub(p)
+    {
+        return Err(StandalonePatchError::Malformed("BPS size mismatch".into()));
+    }
+    p += meta as usize;
+    let mut out = Vec::with_capacity(target as usize);
+    let mut sr = 0i64;
+    let mut tr = 0i64;
+    while p < end {
+        let a = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+        let n = (a >> 2)
+            .checked_add(1)
+            .ok_or_else(|| StandalonePatchError::Malformed("BPS length overflow".into()))?
+            as usize;
+        match a & 3 {
+            0 => {
+                if out.len() + n > base.len() {
+                    return Err(StandalonePatchError::Malformed(
+                        "BPS source read out of bounds".into(),
+                    ));
+                }
+                out.extend_from_slice(&base[out.len()..out.len() + n]);
+            }
+            1 => {
+                if p + n > end {
+                    return Err(StandalonePatchError::Malformed(
+                        "BPS target read truncated".into(),
+                    ));
+                }
+                out.extend_from_slice(&patch[p..p + n]);
+                p += n;
+            }
+            2 => {
+                let v = read_var(patch, &mut p)
+                    .map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+                let d = (v >> 1) as i64;
+                sr = if v & 1 == 0 {
+                    sr.checked_add(d)
+                } else {
+                    sr.checked_sub(d)
+                }
+                .ok_or_else(|| {
+                    StandalonePatchError::Malformed("BPS source offset overflow".into())
+                })?;
+                let at = usize::try_from(sr).map_err(|_| {
+                    StandalonePatchError::Malformed("BPS source offset negative".into())
+                })?;
+                if at.checked_add(n).is_none_or(|e| e > base.len()) {
+                    return Err(StandalonePatchError::Malformed(
+                        "BPS source copy out of bounds".into(),
+                    ));
+                }
+                out.extend_from_slice(&base[at..at + n]);
+            }
+            3 => {
+                let v = read_var(patch, &mut p)
+                    .map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+                let d = (v >> 1) as i64;
+                tr = if v & 1 == 0 {
+                    tr.checked_add(d)
+                } else {
+                    tr.checked_sub(d)
+                }
+                .ok_or_else(|| {
+                    StandalonePatchError::Malformed("BPS target offset overflow".into())
+                })?;
+                let at = usize::try_from(tr).map_err(|_| {
+                    StandalonePatchError::Malformed("BPS target offset negative".into())
+                })?;
+                if at >= out.len() {
+                    return Err(StandalonePatchError::Malformed(
+                        "BPS target copy out of bounds".into(),
+                    ));
+                }
+                for i in 0..n {
+                    let x = *out.get(at + i).ok_or_else(|| {
+                        StandalonePatchError::Malformed("BPS target copy out of bounds".into())
+                    })?;
+                    out.push(x)
+                }
+            }
+            _ => unreachable!(),
+        }
+        if out.len() as u64 > target {
+            return Err(StandalonePatchError::Malformed(
+                "BPS output exceeds target".into(),
+            ));
+        }
+    }
+    if out.len() as u64 != target {
+        return Err(StandalonePatchError::Malformed(
+            "BPS output size mismatch".into(),
+        ));
+    }
+    if crc32(&patch[..end + 8]) != u32::from_le_bytes(patch[end + 8..].try_into().unwrap()) {
+        return Err(StandalonePatchError::Malformed(
+            "BPS patch CRC mismatch".into(),
+        ));
+    }
+    Ok(out)
+}
+
+fn apply_ups(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
+    if patch.len() < 16 {
+        return Err(StandalonePatchError::Malformed("UPS truncated".into()));
+    }
+    let end = patch.len() - 12;
+    let mut p = 4;
+    let s = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+    let t = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
+    if s != base.len() as u64 || t > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::Malformed("UPS size mismatch".into()));
+    }
+    let mut out = vec![0; t as usize];
+    let initial = base.len().min(out.len());
+    out[..initial].copy_from_slice(&base[..initial]);
+    let mut at = 0usize;
+    while p < end {
+        let d = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?
+            as usize;
+        at = at
+            .checked_add(d)
+            .ok_or_else(|| StandalonePatchError::Malformed("UPS offset overflow".into()))?;
+        loop {
+            let x = *patch
+                .get(p)
+                .ok_or_else(|| StandalonePatchError::Malformed("UPS truncated XOR".into()))?;
+            p += 1;
+            if x == 0 {
+                at = at
+                    .checked_add(1)
+                    .ok_or_else(|| StandalonePatchError::Malformed("UPS offset overflow".into()))?;
+                break;
+            }
+            if at >= out.len() {
+                return Err(StandalonePatchError::Malformed(
+                    "UPS offset out of bounds".into(),
+                ));
+            }
+            out[at] ^= x;
+            at += 1;
+        }
+    }
+    if crc32(&patch[..end + 8]) != u32::from_le_bytes(patch[end + 8..].try_into().unwrap()) {
+        return Err(StandalonePatchError::Malformed(
+            "UPS patch CRC mismatch".into(),
+        ));
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
