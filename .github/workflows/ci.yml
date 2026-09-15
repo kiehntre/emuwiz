@@ -18,6 +18,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  repository-guardrails:
+    name: Repository guardrails
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Validate guard scripts
+        run: |
+          bash -n scripts/check-main-rs-boundary.sh
+          bash -n scripts/check-working-tree-scope.sh
+          bash -n scripts/task-preflight.sh
+          bash -n scripts/task-postcheck.sh
+      - name: Check main.rs boundary against PR base
+        run: scripts/check-main-rs-boundary.sh --base "${{ github.event.pull_request.base.sha }}"
+
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
