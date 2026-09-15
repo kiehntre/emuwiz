@@ -535,6 +535,9 @@ pub mod mod_package;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 
+/// Pure review projection for provider-neutral catalogue records.
+pub mod mod_catalogue_review;
+
 /// Read-only list-first inspection of archived local mod packages.
 pub mod archived_mod_package;
 
