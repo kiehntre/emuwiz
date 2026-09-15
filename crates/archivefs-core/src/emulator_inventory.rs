@@ -151,31 +151,29 @@ pub struct InventoryCandidate {
 }
 
 pub fn parse_version_output(output: &str) -> Option<String> {
-    let line = output
+    output
         .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
-    let mut token = line
-        .split_whitespace()
-        .find(|token| {
-            let token = token.trim_matches(|c: char| {
-                !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '_'
+        .flat_map(str::split_whitespace)
+        .find_map(|raw| {
+            let token = raw.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && !matches!(c, '.' | '-' | '+' | '_')
             });
-            token.chars().any(|c| c.is_ascii_digit()) && token.contains('.')
-                || token.chars().filter(|c| *c == '.').count() >= 1
-                    && token.chars().any(|c| c.is_ascii_digit())
-        })?
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '_')
-        .to_string();
-    if token.len() > 128 || !token.chars().any(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    if token.starts_with("version") {
-        token = token[7..]
-            .trim_matches(|c: char| c == ':' || c == '=')
-            .to_string();
-    }
-    (!token.is_empty()).then_some(token)
+            let normalized = token.strip_prefix(['v', 'V']).unwrap_or(token);
+            if token.len() > 128
+                || normalized.is_empty()
+                || !normalized.chars().any(|c| c.is_ascii_digit())
+                || !normalized
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            let valid = normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'));
+            valid.then(|| normalized.to_string())
+        })
 }
 
 pub fn parse_channel(output: &str) -> BuildChannel {
@@ -355,6 +353,16 @@ mod tests {
             Some("2509-1".into())
         );
         assert_eq!(parse_version_output("not a version"), None);
+        assert_eq!(
+            parse_version_output("RetroArch v1.20.4"),
+            Some("1.20.4".into())
+        );
+        assert_eq!(
+            parse_version_output("build 0.0.34-17000"),
+            Some("0.0.34-17000".into())
+        );
+        assert_eq!(parse_version_output("nightly abc123"), None);
+        assert_eq!(parse_version_output(""), None);
     }
     #[test]
     fn channel_is_evidence_based() {

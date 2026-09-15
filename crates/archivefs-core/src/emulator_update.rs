@@ -589,22 +589,127 @@ impl UpdateMetadataProvider for LocalMetadataProvider {
     }
 }
 
-/// Compare only versions whose numeric ordering is explicit.  This handles
-/// semantic versions, build numbers, and date/build strings without lexical
-/// comparison; revision-only identifiers intentionally remain unsupported.
-pub fn compare_versions(installed: &str, available: &str) -> Option<std::cmp::Ordering> {
-    fn numbers(value: &str) -> Option<Vec<u64>> {
-        let result: Vec<u64> = value
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .ok()?;
-        (!result.is_empty()).then_some(result)
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ComparableVersion {
+    Semver {
+        core: Vec<u64>,
+        prerelease: Option<(u8, u64)>,
+    },
+    NumericBuild(Vec<u64>),
+    DateBuild(Vec<u64>),
+}
+
+fn normalized_version(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let value = value.strip_prefix(['v', 'V']).unwrap_or(value);
+    (!value.is_empty()).then_some(value)
+}
+
+fn numeric_parts(value: &str, separator: char) -> Option<Vec<u64>> {
+    value
+        .split(separator)
+        .map(|part| (!part.is_empty()).then(|| part.parse().ok()).flatten())
+        .collect()
+}
+
+fn comparable_version(value: &str) -> Option<ComparableVersion> {
+    let value = normalized_version(value)?;
+    let date_parts = value.split_once('-');
+    if let Some((date, time)) = date_parts
+        && date.len() == 8
+        && time.len() == 6
+        && date.chars().all(|c| c.is_ascii_digit())
+        && time.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(ComparableVersion::DateBuild(numeric_parts(value, '-')?));
     }
-    let left = numbers(installed)?;
-    let right = numbers(available)?;
-    Some(left.cmp(&right))
+    if let Some((core, suffix)) = value.split_once('-') {
+        if core.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && suffix.chars().all(|c| c.is_ascii_digit())
+        {
+            let mut parts = numeric_parts(core, '.')?;
+            parts.push(suffix.parse().ok()?);
+            return Some(ComparableVersion::NumericBuild(parts));
+        }
+        let digit_start = suffix.find(|c: char| c.is_ascii_digit());
+        let (label, number) = digit_start
+            .map(|index| suffix.split_at(index))
+            .unwrap_or((suffix, "0"));
+        let rank = match label.to_ascii_lowercase().as_str() {
+            "dev" | "nightly" => 0,
+            "alpha" | "a" => 1,
+            "beta" | "b" => 2,
+            "rc" => 3,
+            _ => return None,
+        };
+        let core = numeric_parts(core, '.')?;
+        if core.len() < 2 || number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some(ComparableVersion::Semver {
+            core,
+            prerelease: Some((rank, number.parse().ok()?)),
+        });
+    }
+    if value.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        let core = numeric_parts(value, '.')?;
+        return (core.len() >= 2).then_some(ComparableVersion::Semver {
+            core,
+            prerelease: None,
+        });
+    }
+    None
+}
+
+fn compare_numeric_parts(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
+    let length = left.len().max(right.len());
+    (0..length)
+        .map(|index| {
+            (
+                left.get(index).copied().unwrap_or_default(),
+                right.get(index).copied().unwrap_or_default(),
+            )
+        })
+        .find_map(|(left, right)| (left != right).then_some(left.cmp(&right)))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Compare only versions whose scheme and ordering are explicit. Leading
+/// `v` is insignificant. Opaque labels and revision hashes remain unknown;
+/// no lexical ordering is used.
+pub fn compare_versions(installed: &str, available: &str) -> Option<std::cmp::Ordering> {
+    match (
+        comparable_version(installed)?,
+        comparable_version(available)?,
+    ) {
+        (
+            ComparableVersion::Semver {
+                core: left_core,
+                prerelease: left_pre,
+            },
+            ComparableVersion::Semver {
+                core: right_core,
+                prerelease: right_pre,
+            },
+        ) => {
+            let core_order = compare_numeric_parts(&left_core, &right_core);
+            Some(if core_order == std::cmp::Ordering::Equal {
+                match (left_pre, right_pre) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (Some(left), Some(right)) => left.cmp(&right),
+                }
+            } else {
+                core_order
+            })
+        }
+        (ComparableVersion::NumericBuild(left), ComparableVersion::NumericBuild(right))
+        | (ComparableVersion::DateBuild(left), ComparableVersion::DateBuild(right)) => {
+            Some(compare_numeric_parts(&left, &right))
+        }
+        _ => None,
+    }
 }
 
 pub fn compare_installation(
@@ -837,16 +942,45 @@ mod tests {
         );
         assert_eq!(
             compare_installation(
-                &install(
-                    Some("revision"),
-                    BuildChannel::Stable,
-                    InstallationType::Manual
-                ),
+                &opaque_install(),
                 Ok(metadata("nightly", BuildChannel::Stable))
             )
             .status,
             UpdateStatus::ComparisonUnsupported
         );
+    }
+
+    fn opaque_install() -> EmulatorInstallation {
+        let mut installation = install(Some("1.0"), BuildChannel::Stable, InstallationType::Manual);
+        installation.version = Some("abc123def".into());
+        installation
+    }
+
+    #[test]
+    fn version_comparison_is_scheme_aware_and_numeric() {
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_versions("1.9", "1.10"), Some(Ordering::Less));
+        assert_eq!(compare_versions("v1.20.4", "1.20.4"), Some(Ordering::Equal));
+        assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
+        assert_eq!(
+            compare_versions("1.0.0.03", "1.0.0.4"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.0.34-17000", "0.0.34-17001"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(compare_versions("2509-1", "2510-1"), Some(Ordering::Less));
+        assert_eq!(
+            compare_versions("1.2.0-alpha1", "1.2.0-beta1"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(compare_versions("1.2.0-rc1", "1.2.0"), Some(Ordering::Less));
+        assert_eq!(compare_versions("abc123", "def456"), None);
+        assert_eq!(compare_versions("1.2.3", "0.0.34-17000"), None);
+        assert_eq!(compare_versions("nightly", "1.2.3"), None);
+        assert_eq!(compare_versions("", "1.2.3"), None);
     }
     #[test]
     fn update_warns_about_save_states() {
