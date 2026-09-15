@@ -528,6 +528,9 @@ pub mod patch_manager;
 /// cheat/emulator patch manager: it never applies a change or creates history.
 pub mod mod_package;
 
+/// Read-only list-first inspection of archived local mod packages.
+pub mod archived_mod_package;
+
 /// Bounded, read-only inspection and immutable-base planning for standalone
 /// IPS/BPS/UPS/VCDIFF/PPF patch files. No patch application is performed.
 pub mod standalone_patch;
