@@ -102,7 +102,7 @@ pub enum ModCanonicalPlatform {
 }
 
 impl ModCanonicalPlatform {
-    fn identity_platform(self) -> IdentityPlatform {
+    pub(crate) fn identity_platform(self) -> IdentityPlatform {
         match self {
             Self::PlayStation3 => IdentityPlatform::PlayStation3,
             Self::PlayStation2 => IdentityPlatform::PlayStation2,
@@ -128,7 +128,7 @@ pub enum ModIdentityKind {
 }
 
 impl ModIdentityKind {
-    fn identity_kind(self) -> IdentityKind {
+    pub(crate) fn identity_kind(self) -> IdentityKind {
         match self {
             Self::Ps3TitleId => IdentityKind::Ps3TitleId,
             Self::Ps2Serial => IdentityKind::Ps2Serial,

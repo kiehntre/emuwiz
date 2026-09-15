@@ -28,6 +28,8 @@ pub mod amiga_disk;
 pub mod amiga_whdload_archive;
 /// Read-only per-set compatibility against pinned installed MAME evidence.
 pub mod arcade_mame_compatibility;
+/// Read-only impact projection for refreshed imported MAME authority.
+pub mod mame_authority_impact;
 /// Read-only per-set compatibility against an explicitly pinned FBNeo source.
 pub mod arcade_fbneo_compatibility;
 /// Read-only orchestration of independent MAME and FBNeo compatibility results.
@@ -529,6 +531,9 @@ pub mod patch_manager;
 /// game-mod package directories. This is intentionally separate from the
 /// cheat/emulator patch manager: it never applies a change or creates history.
 pub mod mod_package;
+
+/// Provider-neutral, metadata-only catalogue records for future mod sources.
+pub mod mod_catalogue;
 
 /// Read-only list-first inspection of archived local mod packages.
 pub mod archived_mod_package;
