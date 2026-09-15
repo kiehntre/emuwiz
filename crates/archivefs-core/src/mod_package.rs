@@ -46,13 +46,17 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::game_identity::{GameIdentityReport, IdentityKind, IdentityPlatform, IdentityStatus};
+use crate::game_identity::{
+    GameIdentityReport, IdentityImageFormat, IdentityKind, IdentityPlatform, IdentityProvenance,
+    IdentityStatus,
+};
 use crate::patch_manager::{
     PreviewAdapter, PreviewDestinationState, PreviewEligibility, PreviewMatchStrength,
     PreviewProposedAction, PreviewState, PreviewWarning, PreviewWarningKind, SharedPreviewEntry,
     SharedPreviewReport, SharedTransactionPlan, build_shared_transaction_plan,
     require_local_mod_package_verification,
 };
+use crate::ps3_disc_evidence::observe_ps3_directory;
 
 pub const LOCAL_MOD_PACKAGE_MANIFEST: &str = "emuwiz.mod.json";
 pub const LOCAL_MOD_PACKAGE_FORMAT_VERSION: u32 = 1;
@@ -88,6 +92,7 @@ pub struct LocalModPackageCandidateInspection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModCanonicalPlatform {
+    PlayStation3,
     PlayStation2,
     GameCube,
     Wii,
@@ -99,6 +104,7 @@ pub enum ModCanonicalPlatform {
 impl ModCanonicalPlatform {
     fn identity_platform(self) -> IdentityPlatform {
         match self {
+            Self::PlayStation3 => IdentityPlatform::PlayStation3,
             Self::PlayStation2 => IdentityPlatform::PlayStation2,
             Self::GameCube => IdentityPlatform::GameCube,
             Self::Wii => IdentityPlatform::Wii,
@@ -112,6 +118,7 @@ impl ModCanonicalPlatform {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModIdentityKind {
+    Ps3TitleId,
     Ps2Serial,
     Pcsx2ExecutableCrc,
     DolphinGameId,
@@ -123,6 +130,7 @@ pub enum ModIdentityKind {
 impl ModIdentityKind {
     fn identity_kind(self) -> IdentityKind {
         match self {
+            Self::Ps3TitleId => IdentityKind::Ps3TitleId,
             Self::Ps2Serial => IdentityKind::Ps2Serial,
             Self::Pcsx2ExecutableCrc => IdentityKind::Pcsx2ExecutableCrc,
             Self::DolphinGameId => IdentityKind::DolphinGameId,
@@ -181,6 +189,143 @@ pub struct ModCompatibilityResult {
     pub matching_identity: Option<ModIdentityRequirement>,
     pub region_matches: Option<bool>,
     pub revision_matches: Option<bool>,
+}
+
+/// Read-only native identity projected for selected-game mod matching. This
+/// is a view over existing identity evidence, not a second parser or identity
+/// authority. Optional SFO fields are descriptive metadata and never replace
+/// the verified Title ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NativeModIdentityEvidence {
+    pub source_path: PathBuf,
+    pub source_format: IdentityImageFormat,
+    pub platform: IdentityPlatform,
+    pub status: IdentityStatus,
+    pub verified_title_id: Option<String>,
+    pub optional_version: Option<String>,
+    pub optional_category: Option<String>,
+    pub optional_media_id: Option<String>,
+    pub provenance: Vec<IdentityProvenance>,
+    pub warnings: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
+/// Projects the native facts already gathered for a selected game. PS3
+/// directory metadata is read through the existing bounded `PARAM.SFO`
+/// observer only when the report identifies a PS3 directory; XEX identity is
+/// taken from the existing verified report evidence.
+pub fn project_selected_game_native_identity(
+    selected_game: &SelectedGameForMod,
+) -> NativeModIdentityEvidence {
+    let report = &selected_game.identity;
+    let title_kind = match report.platform {
+        IdentityPlatform::PlayStation3 => IdentityKind::Ps3TitleId,
+        IdentityPlatform::Xbox360 => IdentityKind::XexTitleId,
+        _ => IdentityKind::Platform,
+    };
+    let title_evidence: Vec<_> = report
+        .evidence
+        .iter()
+        .filter(|item| item.kind == title_kind)
+        .collect();
+    let verified_title_ids: BTreeSet<_> = title_evidence
+        .iter()
+        .filter(|item| item.status == IdentityStatus::Verified)
+        .filter_map(|item| item.value.as_deref())
+        .collect();
+    let mut conflicts = Vec::new();
+    if verified_title_ids.len() > 1 {
+        conflicts.push("multiple conflicting verified native Title IDs were observed".into());
+    }
+    if title_evidence
+        .iter()
+        .any(|item| item.status == IdentityStatus::Ambiguous)
+    {
+        conflicts.push("native Title ID evidence is marked ambiguous".into());
+    }
+    let verified_title_id = (verified_title_ids.len() == 1)
+        .then(|| verified_title_ids.iter().next().unwrap().to_string());
+    let status = if !conflicts.is_empty() {
+        IdentityStatus::Ambiguous
+    } else if verified_title_id.is_some() {
+        IdentityStatus::Verified
+    } else {
+        title_evidence
+            .first()
+            .map_or(IdentityStatus::Missing, |item| item.status)
+    };
+
+    let mut provenance: Vec<_> = title_evidence
+        .iter()
+        .map(|item| item.provenance.clone())
+        .collect();
+    provenance.sort_by(|left, right| {
+        left.archive_path
+            .cmp(&right.archive_path)
+            .then_with(|| left.member_path.cmp(&right.member_path))
+            .then_with(|| left.member_index.cmp(&right.member_index))
+            .then_with(|| left.method.cmp(&right.method))
+    });
+    provenance.dedup();
+
+    let mut warnings = report.warnings.clone();
+    let mut optional_version = None;
+    let mut optional_category = None;
+    if report.platform == IdentityPlatform::PlayStation3
+        && report.archive_path.is_dir()
+        && let Some(sfo) = observe_ps3_directory(&report.archive_path).layout.param_sfo
+    {
+        optional_version = sfo.get_text("APP_VER").map(str::to_owned);
+        optional_category = sfo.get_text("CATEGORY").map(str::to_owned);
+    }
+
+    let optional_media_id = if report.platform == IdentityPlatform::Xbox360 {
+        let media_ids: BTreeSet<_> = report
+            .evidence
+            .iter()
+            .filter(|item| {
+                item.kind == IdentityKind::XexMediaId && item.status == IdentityStatus::Verified
+            })
+            .filter_map(|item| item.value.as_deref())
+            .collect();
+        if media_ids.len() > 1 {
+            conflicts.push("multiple conflicting verified Xbox 360 Media IDs were observed".into());
+            None
+        } else {
+            media_ids.iter().next().and_then(|value| {
+                if *value == "00000000" {
+                    warnings.push("XEX Media ID is zero; Media ID matching remains unknown".into());
+                    None
+                } else {
+                    Some((*value).to_string())
+                }
+            })
+        }
+    } else {
+        None
+    };
+
+    warnings.sort();
+    warnings.dedup();
+    conflicts.sort();
+    conflicts.dedup();
+    NativeModIdentityEvidence {
+        source_path: report.archive_path.clone(),
+        source_format: report.format,
+        platform: report.platform,
+        status: if conflicts.is_empty() {
+            status
+        } else {
+            IdentityStatus::Ambiguous
+        },
+        verified_title_id,
+        optional_version,
+        optional_category,
+        optional_media_id,
+        provenance,
+        warnings,
+        conflicts,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1034,6 +1179,44 @@ fn assess_compatibility(
         plan.compatibility.state = ModCompatibilityState::Incompatible;
         return;
     }
+    // An XEX Title ID identifies the game family, while a Media ID binds a
+    // package to the particular disc/build.  When a manifest supplies both,
+    // a verified mismatch in either native fact must not be hidden by the
+    // alternative-identity matching below.  A missing Media ID remains an
+    // unknown optional refinement, so a matching Title ID can still provide
+    // the weaker compatibility evidence.
+    let xex_requirements: Vec<_> = package
+        .supported_game
+        .identities
+        .iter()
+        .filter(|required| {
+            matches!(
+                required.kind,
+                ModIdentityKind::XexTitleId | ModIdentityKind::XexMediaId
+            )
+        })
+        .collect();
+    let has_xex_title = xex_requirements
+        .iter()
+        .any(|required| required.kind == ModIdentityKind::XexTitleId);
+    let has_xex_media = xex_requirements
+        .iter()
+        .any(|required| required.kind == ModIdentityKind::XexMediaId);
+    if has_xex_title && has_xex_media {
+        for required in xex_requirements {
+            let verified = verified_identity_value(identity, required.kind.identity_kind());
+            if let Some(value) = verified {
+                if value != required.value {
+                    block(
+                        plan,
+                        ModPlanBlockerKind::GameIdentityMismatch,
+                        "selected game XEX identity does not match the package requirement",
+                    );
+                    return;
+                }
+            }
+        }
+    }
     let mut matched = None;
     let mut had_verified_value = false;
     for required in &package.supported_game.identities {
@@ -1619,6 +1802,173 @@ mod tests {
             nested_container_depth: 0,
             complete: true,
         }
+    }
+
+    fn synthetic_param_sfo(entries: &[(&str, &str)]) -> Vec<u8> {
+        let key_table_start = 20 + (entries.len() as u32 * 16);
+        let keys: Vec<_> = entries
+            .iter()
+            .map(|(key, _)| format!("{key}\0").into_bytes())
+            .collect();
+        let values: Vec<_> = entries
+            .iter()
+            .map(|(_, value)| format!("{value}\0").into_bytes())
+            .collect();
+        let data_table_start = key_table_start + keys.iter().map(Vec::len).sum::<usize>() as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x00, b'P', b'S', b'F']);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&key_table_start.to_le_bytes());
+        bytes.extend_from_slice(&data_table_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        let mut key_offset = 0_u16;
+        let mut data_offset = 0_u32;
+        for (index, value) in values.iter().enumerate() {
+            bytes.extend_from_slice(&key_offset.to_le_bytes());
+            bytes.extend_from_slice(&0x0204_u16.to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&data_offset.to_le_bytes());
+            data_offset += value.len() as u32;
+            key_offset += keys[index].len() as u16;
+        }
+        for key in &keys {
+            bytes.extend_from_slice(key);
+        }
+        for value in values {
+            bytes.extend_from_slice(&value);
+        }
+        bytes
+    }
+
+    #[test]
+    fn projects_ps3_title_and_bounded_sfo_metadata() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("PS3_GAME");
+        fs::create_dir_all(root.join("USRDIR")).unwrap();
+        fs::write(
+            root.join("PARAM.SFO"),
+            synthetic_param_sfo(&[
+                ("TITLE_ID", "BLUS30000"),
+                ("APP_VER", "01.02"),
+                ("CATEGORY", "DG"),
+            ]),
+        )
+        .unwrap();
+        let selected = SelectedGameForMod {
+            game_root: root.clone(),
+            identity: report(
+                root,
+                IdentityPlatform::PlayStation3,
+                vec![(
+                    IdentityKind::Ps3TitleId,
+                    IdentityStatus::Verified,
+                    "BLUS30000",
+                )],
+            ),
+        };
+        let projected = project_selected_game_native_identity(&selected);
+        assert_eq!(projected.verified_title_id.as_deref(), Some("BLUS30000"));
+        assert_eq!(projected.optional_version.as_deref(), Some("01.02"));
+        assert_eq!(projected.optional_category.as_deref(), Some("DG"));
+        assert_eq!(projected.status, IdentityStatus::Verified);
+    }
+
+    #[test]
+    fn projects_xbox_title_and_media_identity_from_existing_evidence() {
+        let selected = SelectedGameForMod {
+            game_root: PathBuf::from("/fixture/game"),
+            identity: report(
+                PathBuf::from("/fixture/default.xex"),
+                IdentityPlatform::Xbox360,
+                vec![
+                    (
+                        IdentityKind::XexTitleId,
+                        IdentityStatus::Verified,
+                        "584109D2",
+                    ),
+                    (
+                        IdentityKind::XexMediaId,
+                        IdentityStatus::Verified,
+                        "12345678",
+                    ),
+                ],
+            ),
+        };
+        let projected = project_selected_game_native_identity(&selected);
+        assert_eq!(projected.verified_title_id.as_deref(), Some("584109D2"));
+        assert_eq!(projected.optional_media_id.as_deref(), Some("12345678"));
+        assert!(projected.conflicts.is_empty());
+    }
+
+    #[test]
+    fn xex_media_mismatch_is_not_hidden_by_matching_title_id() {
+        let identity = report(
+            PathBuf::from("/fixture/default.xex"),
+            IdentityPlatform::Xbox360,
+            vec![
+                (
+                    IdentityKind::XexTitleId,
+                    IdentityStatus::Verified,
+                    "584109D2",
+                ),
+                (
+                    IdentityKind::XexMediaId,
+                    IdentityStatus::Verified,
+                    "12345678",
+                ),
+            ],
+        );
+        let package = LocalModPackageMetadata {
+            package_id: "xbox-mod".into(),
+            title: "Xbox mod".into(),
+            version: "1".into(),
+            author: None,
+            description: None,
+            supported_platform: ModCanonicalPlatform::Xbox360,
+            supported_game: ModSupportedGame {
+                identities: vec![
+                    ModIdentityRequirement {
+                        kind: ModIdentityKind::XexTitleId,
+                        value: "584109D2".into(),
+                    },
+                    ModIdentityRequirement {
+                        kind: ModIdentityKind::XexMediaId,
+                        value: "BADMEDIA".into(),
+                    },
+                ],
+                region: None,
+                revision: None,
+            },
+            provenance: ModPackageProvenance {
+                source: "synthetic fixture".into(),
+            },
+        };
+        let mut plan = LocalModPackagePlan {
+            selected_game: SelectedGameForModSummary {
+                game_root: PathBuf::from("/fixture/game"),
+                archive_path: identity.archive_path.clone(),
+                platform: identity.platform,
+            },
+            package_root: PathBuf::from("/fixture/package"),
+            manifest_path: PathBuf::from("/fixture/package/emuwiz.mod.json"),
+            package: Some(package.clone()),
+            compatibility: ModCompatibilityResult {
+                state: ModCompatibilityState::Unknown,
+                selected_platform: identity.platform,
+                package_platform: Some(package.supported_platform),
+                matching_identity: None,
+                region_matches: None,
+                revision_matches: None,
+            },
+            operations: Vec::new(),
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+            blockers: Vec::new(),
+            eligible_for_later_apply: false,
+        };
+        assess_compatibility(&identity, &package, &mut plan);
+        assert!(has_blocker(&plan, ModPlanBlockerKind::GameIdentityMismatch));
     }
 
     fn setup() -> (TempDir, LocalModPackageRequest, PathBuf) {
