@@ -37,8 +37,9 @@ use std::sync::mpsc::Receiver;
 use archivefs_core::memory_card_inventory::{
     MemoryCardHealth, MemoryCardInventory, Ps2ClusterChainHealth, Ps2DirectoryEntry,
     Ps2DirectoryEntryKind, Ps2FileExportError, Ps2FileExportPlan, Ps2FileExportResult,
-    Ps2InventoryWarning, Ps2SaveDirectory, Ps2SaveFile, apply_ps2_file_export,
-    plan_ps2_file_export,
+    Ps2InventoryWarning, Ps2PsuExportError, Ps2PsuExportPlan, Ps2PsuExportResult, Ps2SaveDirectory,
+    Ps2SaveFile, apply_ps2_file_export, apply_ps2_psu_export, plan_ps2_file_export,
+    plan_ps2_psu_export,
 };
 use archivefs_core::patch_manager::{
     Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2InstallationType,
@@ -448,8 +449,19 @@ enum ExportDialogState {
     Refused(String),
 }
 
+#[derive(Clone)]
+enum PsuExportDialogState {
+    Confirm(Ps2PsuExportPlan),
+    Success(Ps2PsuExportResult),
+    Refused(String),
+}
+
 fn export_dialog_id() -> egui::Id {
     egui::Id::new("ps2_memory_card_file_export")
+}
+
+fn psu_export_dialog_id() -> egui::Id {
+    egui::Id::new("ps2_memory_card_psu_export")
 }
 
 fn safe_export_filename(file: &Ps2DirectoryEntry) -> (String, bool) {
@@ -478,6 +490,128 @@ fn safe_export_filename(file: &Ps2DirectoryEntry) -> (String, bool) {
         }
         (derived, true)
     }
+}
+
+fn safe_psu_filename(directory: &Ps2DirectoryEntry) -> (String, bool) {
+    let (name, sanitised) = safe_export_filename(directory);
+    (format!("{name}.psu"), sanitised)
+}
+
+fn psu_export_blocked(directory: &Ps2SaveDirectory) -> bool {
+    directory.entry.kind != Ps2DirectoryEntryKind::Directory
+        || !directory.entry.warnings.is_empty()
+        || !directory.warnings.is_empty()
+        || !directory.chain_health.complete
+        || !directory.chain_health.warnings.is_empty()
+        || directory
+            .children
+            .iter()
+            .any(|entry| entry.kind != Ps2DirectoryEntryKind::Unused)
+        || directory.files.iter().any(|file| {
+            file.entry.kind != Ps2DirectoryEntryKind::RegularFile
+                || !file.entry.warnings.is_empty()
+                || !file.chain_health.complete
+                || !file.chain_health.warnings.is_empty()
+                || file.entry.created.is_none()
+                || file.entry.modified.is_none()
+        })
+}
+
+fn psu_export_error_message(error: &Ps2PsuExportError) -> String {
+    match error {
+        Ps2PsuExportError::SourceChanged => {
+            "The memory card changed since it was inspected. PSU export was refused; inspect it again and retry.".into()
+        }
+        Ps2PsuExportError::DestinationExists(path) => format!(
+            "The destination already exists, so EmuWiz did not overwrite it:\n{}",
+            path.display()
+        ),
+        Ps2PsuExportError::UnsafeDestination(path) => format!(
+            "The PSU destination is unsafe (including a symlink), so export was refused:\n{}",
+            path.display()
+        ),
+        Ps2PsuExportError::InvalidPlan(detail) => {
+            format!("PSU export was refused because this save is not safe: {detail}")
+        }
+        Ps2PsuExportError::Io(detail) => format!("PSU export could not be completed: {detail}"),
+    }
+}
+
+fn show_psu_export_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
+    let id = psu_export_dialog_id();
+    let Some(mut state) = ui.data_mut(|data| data.get_temp::<PsuExportDialogState>(id)) else {
+        return;
+    };
+    let mut close = false;
+    let mut next_state = None;
+    egui::Window::new("Export PS2 save as PSU")
+        .id(id)
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| match &state {
+            PsuExportDialogState::Confirm(plan) => {
+                ui.heading("Export this complete PS2 save as a PSU file");
+                ui.label("EmuWiz reads the card only. The original save and memory card remain unchanged.");
+                ui.label(format!("Memory card: {}", plan.source_card_path.display()));
+                ui.label(format!("Save directory: {}", plan.save_display_name));
+                if plan.save_display_name != raw_name_bytes_label(&plan.save_raw_name) {
+                    ui.label(format!("Original PS2 directory name: {}", raw_name_bytes_label(&plan.save_raw_name)));
+                }
+                ui.label(format!("Files: {}", plan.files.len()));
+                ui.label(format!("Total logical save size: {} bytes", save_size_from_files(&plan.files)));
+                ui.label("Format: PSU (PS2 save container)");
+                ui.label(format!("Destination: {}", plan.destination.display()));
+                ui.label("Source-card identity: verified (SHA-256 bound to this export plan)");
+                if advanced_mode {
+                    ui.label("Metadata: raw names, timestamps, modes, attributes, logical lengths, and card data-page bytes preserved.");
+                    for file in &plan.files {
+                        ui.label(format!("Member: {} ({} bytes)", file.entry.display_name, file.declared_size_bytes));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if widgets::action_button(ui, "Export Save as PSU", widgets::ActionStyle::Primary, true).clicked() {
+                        match apply_ps2_psu_export(plan) {
+                            Ok(result) => next_state = Some(PsuExportDialogState::Success(result)),
+                            Err(error) => next_state = Some(PsuExportDialogState::Refused(psu_export_error_message(&error))),
+                        }
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                        close = true;
+                    }
+                });
+            }
+            PsuExportDialogState::Success(result) => {
+                ui.heading("PS2 save exported as PSU");
+                ui.label(format!("Destination: {}", result.destination.display()));
+                ui.label(format!("Size: {} bytes", result.output_bytes));
+                ui.label(format!("SHA-256: {}", result.sha256));
+                ui.label(format!("Files: {}", result.file_count));
+                ui.label("The source PS2 memory card and original save were unchanged.");
+                if widgets::action_button(ui, "Close", widgets::ActionStyle::Secondary, true).clicked() {
+                    close = true;
+                }
+            }
+            PsuExportDialogState::Refused(message) => {
+                ui.heading("PSU export refused");
+                ui.label(message.as_str());
+                ui.label("No memory-card data was changed.");
+                if widgets::action_button(ui, "Close", widgets::ActionStyle::Secondary, true).clicked() {
+                    close = true;
+                }
+            }
+        });
+    if close {
+        ui.data_mut(|data| data.remove::<PsuExportDialogState>(id));
+    } else {
+        if let Some(next_state) = next_state {
+            state = next_state;
+        }
+        ui.data_mut(|data| data.insert_temp(id, state));
+    }
+}
+
+fn save_size_from_files(files: &[Ps2SaveFile]) -> u64 {
+    files.iter().map(|file| file.declared_size_bytes).sum()
 }
 
 fn export_blocked(file: &Ps2SaveFile) -> bool {
@@ -695,6 +829,23 @@ fn show_memory_card_contents(
                                 if let Some(modified) = timestamp_label(directory.entry.modified.as_ref()) {
                                     ui.label(format!("Modified: {modified}"));
                                 }
+                                if card.ps2_geometry.is_some()
+                                    && card.ps2_inventory.is_some()
+                                    && !psu_export_blocked(directory)
+                                    && widgets::action_button(ui, "Export Save as PSU", widgets::ActionStyle::Secondary, true).clicked()
+                                {
+                                    let (filename, _sanitised) = safe_psu_filename(&directory.entry);
+                                    let destination = rfd::FileDialog::new()
+                                        .set_title("Choose destination for exported PS2 save")
+                                        .set_file_name(&filename)
+                                        .save_file();
+                                    if let Some(destination) = destination {
+                                        let _ = match plan_ps2_psu_export(card, directory, &destination) {
+                                            Ok(plan) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Confirm(plan))),
+                                            Err(error) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Refused(psu_export_error_message(&error)))),
+                                        };
+                                    }
+                                };
                             });
                             if directory.entry.display_name != raw_name_label(&directory.entry) {
                                 ui.label(format!("Raw directory name: {}", raw_name_label(&directory.entry)));
@@ -773,6 +924,7 @@ fn show_memory_card_contents(
         });
     }
     show_export_dialog(ui);
+    show_psu_export_dialog(ui, advanced_mode);
 }
 
 #[cfg(test)]
@@ -1108,6 +1260,67 @@ mod tests {
             },
         };
         assert!(!export_blocked(&empty));
+    }
+
+    #[test]
+    fn valid_save_directory_is_eligible_for_psu_export_and_filename_is_deterministic() {
+        let mut card = sample_ps2_card();
+        let directory = &mut card.ps2_inventory.as_mut().unwrap().save_directories[0];
+        directory.entry.kind = Ps2DirectoryEntryKind::Directory;
+        directory.entry.created = Some(archivefs_core::memory_card_inventory::Ps2Timestamp {
+            raw: [0, 1, 2, 3, 4, 5, 0xea, 0x07],
+            year: 2026,
+            month: 5,
+            day: 4,
+            hour: 3,
+            minute: 2,
+            second: 1,
+            timezone: "JST (UTC+09:00)",
+        });
+        directory.entry.modified = directory.entry.created.clone();
+        directory.files[0].entry.created = directory.entry.created.clone();
+        directory.files[0].entry.modified = directory.entry.modified.clone();
+        assert!(!psu_export_blocked(directory));
+        assert_eq!(
+            safe_psu_filename(&directory.entry),
+            ("BASLUS-00000SAVE.psu".into(), false)
+        );
+    }
+
+    #[test]
+    fn psu_dialog_uses_immutable_source_wording_and_shows_result_facts() {
+        let result = PsuExportDialogState::Success(Ps2PsuExportResult {
+            destination: PathBuf::from("/tmp/save.psu"),
+            output_bytes: 2048,
+            sha256: "psuhash".into(),
+            file_count: 2,
+            source_card_path: PathBuf::from("/tmp/card.ps2"),
+            source_card_sha256: "cardhash".into(),
+            provenance: "synthetic".into(),
+        });
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(psu_export_dialog_id(), result));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_psu_export_dialog(ui, false));
+        });
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_psu_export_dialog(ui, false));
+        });
+        assert!(rendered_text_contains(&output, "exported as PSU"));
+        assert!(rendered_text_contains(&output, "Size: 2048 bytes"));
+        assert!(rendered_text_contains(&output, "SHA-256: psuhash"));
+        assert!(rendered_text_contains(
+            &output,
+            "source PS2 memory card and original save were unchanged"
+        ));
+    }
+
+    #[test]
+    fn psu_error_messages_are_plain_and_do_not_offer_other_formats() {
+        let message = psu_export_error_message(&Ps2PsuExportError::SourceChanged);
+        assert!(message.contains("changed since it was inspected"));
+        assert!(!message.contains("MAX"));
+        assert!(!message.contains("Ps2PsuExportError"));
     }
 
     #[test]
