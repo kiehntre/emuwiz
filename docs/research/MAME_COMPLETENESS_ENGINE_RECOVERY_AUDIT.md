@@ -500,3 +500,26 @@ input. Do not port the 4,491-line engine, its scanner, or its CLI before that
 decision gate.
 
 MAME COMPLETENESS RECOVERY AUDIT READY
+
+## 16. Final Retirement Review
+
+Retirement review date: 2026-09-15
+
+The preserved worktree was reviewed at head `6cb0971a109f72d17188795389f6a7fe3c4b6333`.
+The unique commits reviewed were `931798a` (the completeness engine) and
+`6cb0971` (the blocked real-collection audit).
+
+The product value recovered in current main is the authority-refresh impact
+projection, alternative complete-layout support, collection-wide completeness
+statistics, and the stronger dependency/partial-observation regression
+coverage. These are implemented against current DAT, dependency, compatibility,
+and evidence types rather than the preserved parallel authority model.
+
+The old authority importer, scanner, graph, completeness engine, state/reason
+vocabulary, and CLI were deliberately discarded as redundant or superseded.
+The blocked real-collection findings remain documentation only; they do not
+provide a missing production capability.
+
+Final decision: **A. RETIRE NOW**. No uniquely valuable product behavior
+remains only in the preserved worktree. The preserved worktree was clean and
+was removed with `git worktree remove`; Git worktree metadata was pruned.
