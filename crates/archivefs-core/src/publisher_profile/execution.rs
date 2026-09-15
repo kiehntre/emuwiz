@@ -50,6 +50,10 @@ pub struct PublisherDestinationRootIdentity {
     pub ino: u64,
     #[cfg(unix)]
     pub dev: u64,
+    #[cfg(unix)]
+    pub changed: i64,
+    #[cfg(unix)]
+    pub changed_nsec: i64,
 }
 
 /// Publisher-specific directory plan wrapped around the existing shared
@@ -60,6 +64,7 @@ pub struct PublisherTransaction {
     pub transaction: RenameTransaction,
     pub directories: Vec<PublisherDirectory>,
     pub link_mode: PublisherLinkMode,
+    pub destination_root: PathBuf,
     pub destination_root_identity: PublisherDestinationRootIdentity,
 }
 
@@ -419,6 +424,7 @@ pub fn build_publisher_transaction_with_policy(
         transaction,
         directories,
         link_mode,
+        destination_root: plan.destination_root.clone(),
         destination_root_identity,
     })
 }
@@ -432,7 +438,26 @@ pub fn apply_publisher_transaction(
     journal_dir: &Path,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<ApplyOutcome, ApplyError> {
-    let root = PathBuf::from(&publisher.transaction.source_scan_root);
+    let root = publisher.destination_root.clone();
+    if publisher.transaction.source_scan_root != root.to_string_lossy()
+        || publisher.transaction.entries.iter().any(|entry| {
+            !matches!(
+                &entry.operation,
+                TransactionOperation::CreateHardlink {
+                    destination_root,
+                    ..
+                } | TransactionOperation::CreateSymlink {
+                    destination_root,
+                    ..
+                } if destination_root == &root
+            )
+        })
+    {
+        return Err(ApplyError::HardConflicts(vec![(
+            root,
+            vec!["publisher transaction destination root is not the reviewed root".to_string()],
+        )]));
+    }
     let root_now = capture_destination_root_identity(&root).map_err(|error| {
         ApplyError::HardConflicts(vec![(
             root.clone(),
@@ -486,6 +511,10 @@ fn capture_destination_root_identity(
         ino: std::os::unix::fs::MetadataExt::ino(&metadata),
         #[cfg(unix)]
         dev: std::os::unix::fs::MetadataExt::dev(&metadata),
+        #[cfg(unix)]
+        changed: std::os::unix::fs::MetadataExt::ctime(&metadata),
+        #[cfg(unix)]
+        changed_nsec: std::os::unix::fs::MetadataExt::ctime_nsec(&metadata),
     })
 }
 
@@ -888,6 +917,84 @@ mod tests {
         .expect_err("changed destination root must block apply");
         assert!(matches!(error, ApplyError::HardConflicts(_)));
         assert!(!destination.join("roms").exists());
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_mode_blocks_destination_root_symlink_substitution_before_any_write() {
+        use crate::safe_read::TrustedRoots;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        let replacement = temp.path().join("replacement");
+        prepare_destination(&destination);
+        std::fs::create_dir(&replacement).unwrap();
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        let mut publisher =
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink).unwrap();
+        std::fs::remove_dir_all(&destination).unwrap();
+        std::os::unix::fs::symlink(&replacement, &destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+
+        let error = apply_publisher_transaction(
+            &mut publisher,
+            1,
+            TrustedRoots::from_paths([temp.path()]),
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .expect_err("destination root symlink substitution must block apply");
+
+        assert!(matches!(error, ApplyError::HardConflicts(_)));
+        assert!(!replacement.join("roms").exists());
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+    }
+
+    #[test]
+    fn apply_rejects_transaction_root_tampering_before_any_write() {
+        use crate::safe_read::TrustedRoots;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        let other = temp.path().join("other");
+        prepare_destination(&destination);
+        std::fs::create_dir(&other).unwrap();
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        let mut publisher =
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Symlink).unwrap();
+        publisher.transaction.source_scan_root = other.to_string_lossy().into_owned();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+
+        let error = apply_publisher_transaction(
+            &mut publisher,
+            1,
+            TrustedRoots::from_paths([temp.path()]),
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .expect_err("transaction root tampering must block apply");
+
+        assert!(matches!(error, ApplyError::HardConflicts(_)));
+        assert_eq!(
+            std::fs::read_dir(destination.join("roms/amiga"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!other.join("roms").exists());
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
     }
 
     #[cfg(unix)]
