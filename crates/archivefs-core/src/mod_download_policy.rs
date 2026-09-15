@@ -371,10 +371,19 @@ fn is_unsafe_literal(host: &str) -> bool {
     let Ok(address) = host.parse::<IpAddr>() else {
         return false;
     };
+    is_forbidden_resolved_address(address)
+}
+
+/// Returns whether a resolved address is forbidden for external payload fetches.
+/// This is shared by the pure literal check and the future transport resolver.
+pub fn is_forbidden_resolved_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => unsafe_ipv4(address),
         IpAddr::V6(address) => {
-            address.is_loopback()
+            address
+                .to_ipv4_mapped()
+                .is_some_and(|mapped| unsafe_ipv4(mapped))
+                || address.is_loopback()
                 || address.is_unspecified()
                 || address.is_unique_local()
                 || address.is_unicast_link_local()

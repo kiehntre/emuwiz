@@ -541,6 +541,8 @@ pub mod mod_catalogue;
 pub mod mod_catalogue_review;
 /// Pure, no-network policy validation for future external mod payload fetches.
 pub mod mod_download_policy;
+/// Bounded HTTPS transport for policy-approved external mod payloads.
+pub mod mod_download_transport;
 
 /// Read-only list-first inspection of archived local mod packages.
 pub mod archived_mod_package;
