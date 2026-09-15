@@ -1225,8 +1225,8 @@ fn doctor_page_groups_a_read_only_filesystem_under_filesystems() {
 fn gamer_view_ignores_advanced_view_state_filters_it_cannot_show_or_clear() {
     let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 3), ("SNES", 2)]);
     // Exactly what "Review missing" in the Health dashboard does.
-    app.library_filters.missing = true;
-    app.library_filters.platform = Some("Acorn Archimedes".to_string());
+    app.library_ui.library_filters.missing = true;
+    app.library_ui.library_filters.platform = Some("Acorn Archimedes".to_string());
 
     let ctx = egui::Context::default();
     let input = egui::RawInput {
@@ -1246,7 +1246,7 @@ fn gamer_view_ignores_advanced_view_state_filters_it_cannot_show_or_clear() {
     ));
     // The Advanced-View filter itself is preserved, not silently reset -
     // returning to Advanced View must find it exactly as it was left.
-    assert!(app.library_filters.missing);
+    assert!(app.library_ui.library_filters.missing);
 }
 
 /// The structural guarantee, stated directly: for every card the shelf
@@ -1359,7 +1359,7 @@ fn a_platform_missing_from_the_snapshot_falls_back_to_all() {
     let mut app = gamer_app_with_platforms(&[("SNES", 2)]);
     // `open_cheat_archive_picker` writes canonical adapter ids such as
     // this one straight into the shared filter.
-    app.library_filters.platform = Some("Xbox360".to_string());
+    app.library_ui.library_filters.platform = Some("Xbox360".to_string());
 
     let ctx = egui::Context::default();
     let input = egui::RawInput {
@@ -1369,7 +1369,7 @@ fn a_platform_missing_from_the_snapshot_falls_back_to_all() {
     let output = run_gamer_frames(&mut app, &ctx, input, 2);
 
     assert_eq!(
-        app.library_filters.platform, None,
+        app.library_ui.library_filters.platform, None,
         "a platform no card offers must fall back to All"
     );
     assert!(rendered_text_contains(&output, "Title0000"));
@@ -1414,7 +1414,7 @@ fn clicking_platform_cards_lists_and_then_switches_the_visible_games() {
     // Card 1 is the first named platform, in the shelf's own order.
     run_gamer_frames(&mut app, &ctx, click_at(screen, cards[1].center()), 1);
     assert_eq!(
-        app.library_filters.platform.as_deref(),
+        app.library_ui.library_filters.platform.as_deref(),
         Some("Acorn Archimedes")
     );
     let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 1);
@@ -1423,14 +1423,17 @@ fn clicking_platform_cards_lists_and_then_switches_the_visible_games() {
 
     // Switching without a restart recomputes the rows.
     run_gamer_frames(&mut app, &ctx, click_at(screen, cards[2].center()), 1);
-    assert_eq!(app.library_filters.platform.as_deref(), Some("SNES"));
+    assert_eq!(
+        app.library_ui.library_filters.platform.as_deref(),
+        Some("SNES")
+    );
     let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 1);
     assert!(rendered_text_contains(&output, "Title0002"));
     assert!(!rendered_text_contains(&output, "Title0000"));
 
     // Back to All.
     run_gamer_frames(&mut app, &ctx, click_at(screen, cards[0].center()), 1);
-    assert_eq!(app.library_filters.platform, None);
+    assert_eq!(app.library_ui.library_filters.platform, None);
     let output = run_gamer_frames(&mut app, &ctx, idle, 1);
     assert!(rendered_text_contains(&output, "Title0000"));
     assert!(rendered_text_contains(&output, "Title0002"));
@@ -1462,7 +1465,7 @@ fn platform_cards_activate_from_the_keyboard_exactly_as_from_the_mouse() {
             1,
         );
         assert_eq!(
-            app.library_filters.platform.as_deref(),
+            app.library_ui.library_filters.platform.as_deref(),
             Some("Acorn Archimedes")
         );
 
@@ -1479,7 +1482,7 @@ fn platform_cards_activate_from_the_keyboard_exactly_as_from_the_mouse() {
         }];
         run_gamer_frames(&mut app, &ctx, activated, 1);
         assert_eq!(
-            app.library_filters.platform.as_deref(),
+            app.library_ui.library_filters.platform.as_deref(),
             Some("SNES"),
             "{key:?} on a focused platform card must select it, as a click does"
         );
@@ -1493,7 +1496,7 @@ fn platform_cards_activate_from_the_keyboard_exactly_as_from_the_mouse() {
 #[test]
 fn a_library_reload_refreshes_the_visible_rows_without_a_restart() {
     let mut app = gamer_app_with_platforms(&[("SNES", 2)]);
-    app.library_filters.platform = Some("SNES".to_string());
+    app.library_ui.library_filters.platform = Some("SNES".to_string());
     let ctx = egui::Context::default();
     let idle = egui::RawInput {
         screen_rect: Some(gamer_screen()),
@@ -1516,7 +1519,7 @@ fn a_library_reload_refreshes_the_visible_rows_without_a_restart() {
     assert!(rendered_text_contains(&output, "BrandNewTitle"));
     assert!(!rendered_text_contains(&output, "Title0000"));
     assert_eq!(
-        app.library_filters.platform.as_deref(),
+        app.library_ui.library_filters.platform.as_deref(),
         Some("SNES"),
         "a selection the new snapshot still offers stays selected"
     );
@@ -1757,8 +1760,8 @@ fn a_platform_with_no_games_still_reports_an_honest_empty_state() {
     let mut app = gamer_app_with_platforms(&[("SNES", 1)]);
     // Force the list empty the only way that remains: a search nothing
     // satisfies, with a platform selected.
-    app.library_filters.platform = Some("SNES".to_string());
-    app.filter = "no-such-game-anywhere".to_string();
+    app.library_ui.library_filters.platform = Some("SNES".to_string());
+    app.library_ui.filter = "no-such-game-anywhere".to_string();
     let ctx = egui::Context::default();
     let idle = egui::RawInput {
         screen_rect: Some(gamer_screen()),

@@ -185,9 +185,9 @@ fn duplicate_review_sorting_is_deterministic_with_stable_tiebreakers() {
 #[test]
 fn duplicate_review_state_is_separate_from_library_state_and_activity() {
     let mut app = app_for_operation_tests();
-    app.filter = "ordinary search".to_string();
-    app.library_filters.missing = true;
-    app.sort_field = Some(SortField::State);
+    app.library_ui.filter = "ordinary search".to_string();
+    app.library_ui.library_filters.missing = true;
+    app.library_ui.sort_field = Some(SortField::State);
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
     let history_len = app.history.len();
 
@@ -196,9 +196,9 @@ fn duplicate_review_state_is_separate_from_library_state_and_activity() {
     app.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
     app.view = MainView::Library;
 
-    assert_eq!(app.filter, "ordinary search");
-    assert!(app.library_filters.missing);
-    assert_eq!(app.sort_field, Some(SortField::State));
+    assert_eq!(app.library_ui.filter, "ordinary search");
+    assert!(app.library_ui.library_filters.missing);
+    assert_eq!(app.library_ui.sort_field, Some(SortField::State));
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/library.zip"))
@@ -464,7 +464,7 @@ fn missing_removal_availability_requires_a_healthy_idle_database() {
     };
     assert!(app.missing_removal_action_available());
     let (_sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Remove {
             alias: "busy".to_string(),
         },
@@ -531,7 +531,7 @@ fn missing_removal_disabled_reason_prioritises_competing_work_and_selection() {
     assert_eq!(missing_removal_disabled_reason(None, 1, None), None);
 
     let (_sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Remove {
             alias: "busy".to_string(),
         },
@@ -561,9 +561,9 @@ fn successful_missing_removal_records_one_activity_and_refreshes_without_resetti
     };
     app.archive_context.selected.insert(path.clone());
     app.archive_context.focused = Some(path);
-    app.library_filters.missing = true;
-    app.sort_field = Some(SortField::ArchivePath);
-    app.sort_ascending = false;
+    app.library_ui.library_filters.missing = true;
+    app.library_ui.sort_field = Some(SortField::ArchivePath);
+    app.library_ui.sort_ascending = false;
     let (sender, receiver) = mpsc::channel();
     sender
         .send(Ok(MissingArchiveRemovalResult {
@@ -572,7 +572,7 @@ fn successful_missing_removal_records_one_activity_and_refreshes_without_resetti
             archive_ids: vec![1],
         }))
         .unwrap();
-    app.missing_removal = Some(RunningMissingRemoval {
+    app.library_ui.missing_removal = Some(RunningMissingRemoval {
         requested_paths: 1,
         receiver,
     });
@@ -584,9 +584,9 @@ fn successful_missing_removal_records_one_activity_and_refreshes_without_resetti
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].action, ActivityAction::CatalogueCleanup);
     assert!(entries[0].message.contains("No archive files were deleted"));
-    assert!(app.library_filters.missing);
-    assert_eq!(app.sort_field, Some(SortField::ArchivePath));
-    assert!(!app.sort_ascending);
+    assert!(app.library_ui.library_filters.missing);
+    assert_eq!(app.library_ui.sort_field, Some(SortField::ArchivePath));
+    assert!(!app.library_ui.sort_ascending);
 }
 
 #[test]
@@ -599,11 +599,11 @@ fn failed_missing_removal_preserves_selection_cached_rows_filters_and_sort() {
     };
     app.archive_context.selected.insert(path.clone());
     app.archive_context.focused = Some(path.clone());
-    app.library_filters.missing = true;
-    app.sort_field = Some(SortField::State);
+    app.library_ui.library_filters.missing = true;
+    app.library_ui.sort_field = Some(SortField::State);
     let (sender, receiver) = mpsc::channel();
     sender.send(Err("simulated failure".to_string())).unwrap();
-    app.missing_removal = Some(RunningMissingRemoval {
+    app.library_ui.missing_removal = Some(RunningMissingRemoval {
         requested_paths: 1,
         receiver,
     });
@@ -616,8 +616,8 @@ fn failed_missing_removal_preserves_selection_cached_rows_filters_and_sort() {
         [path.clone()].into_iter().collect()
     );
     assert_eq!(app.archive_context.focused, Some(path));
-    assert!(app.library_filters.missing);
-    assert_eq!(app.sort_field, Some(SortField::State));
+    assert!(app.library_ui.library_filters.missing);
+    assert_eq!(app.library_ui.sort_field, Some(SortField::State));
     assert_eq!(app.database_state.snapshot().unwrap().archives.len(), 1);
 }
 

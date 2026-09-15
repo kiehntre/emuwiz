@@ -1677,12 +1677,12 @@ fn platform_action_available_requires_no_running_action_or_database_load() {
     assert!(app.platform_action_available());
 
     let (_sender, receiver) = mpsc::channel();
-    app.platform_action = Some(RunningPlatformAction {
+    app.library_ui.platform_action = Some(RunningPlatformAction {
         archive_path: PathBuf::from("/roms/game.zip"),
         receiver,
     });
     assert!(!app.platform_action_available());
-    app.platform_action = None;
+    app.library_ui.platform_action = None;
 
     let (_sender, receiver) = mpsc::channel();
     app.database_state = DatabaseState::Loading {
@@ -1700,7 +1700,7 @@ fn poll_platform_action_success_refreshes_the_database_cache_asynchronously() {
     let mut app = app_for_operation_tests();
     let archive_path = PathBuf::from("/roms/n64/Luigis_Mansion.zip");
     let (sender, receiver) = mpsc::channel();
-    app.platform_action = Some(RunningPlatformAction {
+    app.library_ui.platform_action = Some(RunningPlatformAction {
         archive_path: archive_path.clone(),
         receiver,
     });
@@ -1715,7 +1715,7 @@ fn poll_platform_action_success_refreshes_the_database_cache_asynchronously() {
 
     app.poll_platform_action(&egui::Context::default());
 
-    assert!(app.platform_action.is_none());
+    assert!(app.library_ui.platform_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(feedback.succeeded);
     assert!(feedback.message.contains("N64 (folder_alias)"));
@@ -1750,7 +1750,7 @@ fn poll_platform_action_failure_preserves_the_cached_row_and_shows_the_error() {
     };
     let archive_path = PathBuf::from("/roms/mystery.zip");
     let (sender, receiver) = mpsc::channel();
-    app.platform_action = Some(RunningPlatformAction {
+    app.library_ui.platform_action = Some(RunningPlatformAction {
         archive_path: archive_path.clone(),
         receiver,
     });
@@ -1762,7 +1762,7 @@ fn poll_platform_action_failure_preserves_the_cached_row_and_shows_the_error() {
 
     app.poll_platform_action(&egui::Context::default());
 
-    assert!(app.platform_action.is_none());
+    assert!(app.library_ui.platform_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(!feedback.succeeded);
     assert!(
@@ -1802,7 +1802,7 @@ fn database_reload_removes_a_newly_known_row_from_the_unknown_only_filtered_list
     // exactly as poll_database_load's own other tests do (a
     // synthetic channel/message, not a real database path).
     let mut app = app_for_operation_tests();
-    app.library_filters.unknown_platform = true;
+    app.library_ui.library_filters.unknown_platform = true;
     let archive_path = PathBuf::from("/roms/mystery.zip");
     app.archive_context.focused = Some(archive_path.clone());
     let generation = app.database_generation;
@@ -1836,7 +1836,7 @@ fn database_reload_removes_a_newly_known_row_from_the_unknown_only_filtered_list
         "the row must now reflect the manual assignment"
     );
     assert!(
-        !app.library_filters.matches(&merged[0]),
+        !app.library_ui.library_filters.matches(&merged[0]),
         "it must no longer match Show unknown only"
     );
 
@@ -1863,7 +1863,7 @@ fn database_reload_removes_a_newly_known_row_from_the_unknown_only_filtered_list
 #[test]
 fn database_reload_adds_a_newly_unknown_row_when_a_manual_platform_is_cleared() {
     let mut app = app_for_operation_tests();
-    app.library_filters.unknown_platform = true;
+    app.library_ui.library_filters.unknown_platform = true;
     let archive_path = PathBuf::from("/roms/mystery.zip");
     let generation = app.database_generation;
     let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
@@ -1892,7 +1892,7 @@ fn database_reload_adds_a_newly_unknown_row_when_a_manual_platform_is_cleared() 
     assert_eq!(merged.len(), 1);
     assert!(merged[0].unknown_platform);
     assert!(
-        app.library_filters.matches(&merged[0]),
+        app.library_ui.library_filters.matches(&merged[0]),
         "clearing manual back to unknown must make the row match Show unknown only again"
     );
 }
@@ -1900,12 +1900,12 @@ fn database_reload_adds_a_newly_unknown_row_when_a_manual_platform_is_cleared() 
 #[test]
 fn filtered_rows_index_cache_is_recomputed_not_left_stale_after_a_database_reload() {
     let mut app = app_for_operation_tests();
-    app.filter = "mystery".to_string();
+    app.library_ui.filter = "mystery".to_string();
     // A deliberately stale/out-of-bounds cached index list, as if
     // left over from a previous, now-invalid merged row shape -
     // poll_database_load must never trust or reuse this without
     // recomputing it fresh against the new merge.
-    app.filtered_rows = Some(vec![0, 1, 2, 99]);
+    app.library_ui.filtered_rows = Some(vec![0, 1, 2, 99]);
     let generation = app.database_generation;
     let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
     app.database_state = DatabaseState::Loading {
@@ -1926,6 +1926,7 @@ fn filtered_rows_index_cache_is_recomputed_not_left_stale_after_a_database_reloa
     app.poll_database_load(&egui::Context::default());
 
     let recomputed = app
+        .library_ui
         .filtered_rows
         .as_ref()
         .expect("filtered_rows must be recomputed, not left stale");
@@ -1942,8 +1943,8 @@ fn toggling_show_unknown_only_performs_no_database_write_or_scan() {
     let generation_before = app.database_generation;
     let refresh_generation_before = app.refresh_generation;
 
-    app.library_filters.unknown_platform = true;
-    app.library_filters.unknown_platform = false;
+    app.library_ui.library_filters.unknown_platform = true;
+    app.library_ui.library_filters.unknown_platform = false;
 
     assert_eq!(
         app.database_generation, generation_before,
@@ -1964,9 +1965,9 @@ fn mount_action_availability_is_unaffected_by_library_filters() {
     let mut app = app_for_operation_tests();
     let busy_before = app.is_busy();
 
-    app.library_filters.unknown_platform = true;
-    app.library_filters.present = true;
-    app.library_filters.missing = true;
+    app.library_ui.library_filters.unknown_platform = true;
+    app.library_ui.library_filters.present = true;
+    app.library_ui.library_filters.missing = true;
 
     assert_eq!(
         app.is_busy(),

@@ -124,8 +124,8 @@ fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
                     ui,
                     Some(data),
                     GamerViewViewState {
-                        filter: &mut app.filter,
-                        library_filters: &mut app.library_filters,
+                        filter: &mut app.library_ui.filter,
+                        library_filters: &mut app.library_ui.library_filters,
                         archive_context: &mut app.archive_context,
                         screen: &mut app.gamer_view_screen,
                         busy: false,
@@ -228,8 +228,8 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                     ui,
                     Some(data),
                     GamerViewViewState {
-                        filter: &mut app.filter,
-                        library_filters: &mut app.library_filters,
+                        filter: &mut app.library_ui.filter,
+                        library_filters: &mut app.library_ui.library_filters,
                         archive_context: &mut app.archive_context,
                         screen: &mut app.gamer_view_screen,
                         busy: false,
@@ -339,8 +339,8 @@ fn render_gamer_card_with_launch_state(
                 ui,
                 Some(data),
                 GamerViewViewState {
-                    filter: &mut app.filter,
-                    library_filters: &mut app.library_filters,
+                    filter: &mut app.library_ui.filter,
+                    library_filters: &mut app.library_ui.library_filters,
                     archive_context: &mut app.archive_context,
                     screen: &mut app.gamer_view_screen,
                     busy: false,
@@ -564,8 +564,8 @@ fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
                     ui,
                     Some(data),
                     GamerViewViewState {
-                        filter: &mut app.filter,
-                        library_filters: &mut app.library_filters,
+                        filter: &mut app.library_ui.filter,
+                        library_filters: &mut app.library_ui.library_filters,
                         archive_context: &mut app.archive_context,
                         screen: &mut app.gamer_view_screen,
                         busy: false,

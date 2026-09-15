@@ -852,13 +852,13 @@ fn bulk_platform_action_available_requires_no_running_action_or_database_load() 
     assert!(app.bulk_platform_action_available());
 
     let (_sender, receiver) = mpsc::channel();
-    app.bulk_platform_action = Some(RunningBulkPlatformAction {
+    app.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
         kind: BulkPlatformActionKind::Clear,
         requested_paths: 2,
         receiver,
     });
     assert!(!app.bulk_platform_action_available());
-    app.bulk_platform_action = None;
+    app.library_ui.bulk_platform_action = None;
 
     let (_sender, receiver) = mpsc::channel();
     app.database_state = DatabaseState::Loading {
@@ -875,7 +875,7 @@ fn bulk_platform_action_available_requires_no_running_action_or_database_load() 
 fn single_and_bulk_platform_actions_are_mutually_exclusive() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.platform_action = Some(RunningPlatformAction {
+    app.library_ui.platform_action = Some(RunningPlatformAction {
         archive_path: PathBuf::from("/roms/a.zip"),
         receiver,
     });
@@ -885,9 +885,9 @@ fn single_and_bulk_platform_actions_are_mutually_exclusive() {
         "a running single-row platform action must block a new bulk one"
     );
 
-    app.platform_action = None;
+    app.library_ui.platform_action = None;
     let (_sender, receiver) = mpsc::channel();
-    app.bulk_platform_action = Some(RunningBulkPlatformAction {
+    app.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
         kind: BulkPlatformActionKind::Clear,
         requested_paths: 2,
         receiver,
@@ -903,7 +903,7 @@ fn single_and_bulk_platform_actions_are_mutually_exclusive() {
 fn bulk_platform_action_never_affects_is_busy_or_mount_availability() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.bulk_platform_action = Some(RunningBulkPlatformAction {
+    app.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
         kind: BulkPlatformActionKind::Set("GameCube".to_string()),
         requested_paths: 3,
         receiver,
@@ -924,7 +924,7 @@ fn bulk_platform_action_does_not_block_on_a_slow_background_worker() {
     // use of try_recv (not recv) never blocks the UI thread.
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.bulk_platform_action = Some(RunningBulkPlatformAction {
+    app.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
         kind: BulkPlatformActionKind::Clear,
         requested_paths: 5,
         receiver,
@@ -932,14 +932,14 @@ fn bulk_platform_action_does_not_block_on_a_slow_background_worker() {
 
     app.poll_bulk_platform_action(&egui::Context::default());
 
-    assert!(app.bulk_platform_action.is_some());
+    assert!(app.library_ui.bulk_platform_action.is_some());
 }
 
 #[test]
 fn poll_bulk_platform_action_success_refreshes_the_database_cache_asynchronously() {
     let mut app = app_for_operation_tests();
     let (sender, receiver) = mpsc::channel();
-    app.bulk_platform_action = Some(RunningBulkPlatformAction {
+    app.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
         kind: BulkPlatformActionKind::Set("GameCube".to_string()),
         requested_paths: 3,
         receiver,
@@ -958,7 +958,7 @@ fn poll_bulk_platform_action_success_refreshes_the_database_cache_asynchronously
 
     app.poll_bulk_platform_action(&egui::Context::default());
 
-    assert!(app.bulk_platform_action.is_none());
+    assert!(app.library_ui.bulk_platform_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(feedback.succeeded);
     assert!(feedback.message.contains("GameCube"));
@@ -994,7 +994,7 @@ fn poll_bulk_platform_action_failure_preserves_the_cached_row_and_selection() {
         .collect();
     app.archive_context.selected = selected.clone();
     let (sender, receiver) = mpsc::channel();
-    app.bulk_platform_action = Some(RunningBulkPlatformAction {
+    app.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
         kind: BulkPlatformActionKind::Set("GameCube".to_string()),
         requested_paths: 2,
         receiver,
@@ -1003,7 +1003,7 @@ fn poll_bulk_platform_action_failure_preserves_the_cached_row_and_selection() {
 
     app.poll_bulk_platform_action(&egui::Context::default());
 
-    assert!(app.bulk_platform_action.is_none());
+    assert!(app.library_ui.bulk_platform_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(!feedback.succeeded);
     assert!(feedback.message.contains("database is locked"));
@@ -1167,14 +1167,14 @@ fn alias_action_available_requires_no_running_action_or_database_load() {
     assert!(app.alias_action_available());
 
     let (_sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Remove {
             alias: "gc".to_string(),
         },
         receiver,
     });
     assert!(!app.alias_action_available());
-    app.alias_action = None;
+    app.library_ui.alias_action = None;
 
     let (_sender, receiver) = mpsc::channel();
     app.database_state = DatabaseState::Loading {
@@ -1191,14 +1191,14 @@ fn alias_action_available_requires_no_running_action_or_database_load() {
 fn start_alias_action_does_not_start_a_second_concurrent_action() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Add {
             alias: "gc".to_string(),
             platform: "GameCube".to_string(),
         },
         receiver,
     });
-    let first_action = app.alias_action.as_ref().unwrap().action.clone();
+    let first_action = app.library_ui.alias_action.as_ref().unwrap().action.clone();
 
     // A second alias action must not replace the first one's receiver
     // - mirrors start_operation_rejects_a_second_operation_without_replacing_the_receiver's
@@ -1211,16 +1211,19 @@ fn start_alias_action_does_not_start_a_second_concurrent_action() {
             alias: "wii".to_string(),
         },
     );
-    assert_eq!(app.alias_action.as_ref().unwrap().action, first_action);
+    assert_eq!(
+        app.library_ui.alias_action.as_ref().unwrap().action,
+        first_action
+    );
 }
 
 #[test]
 fn poll_alias_action_add_success_refreshes_the_cache_and_clears_the_input_fields() {
     let mut app = app_for_operation_tests();
-    app.new_alias_text = "gc".to_string();
-    app.new_alias_platform_choice = Some("GameCube".to_string());
+    app.library_ui.new_alias_text = "gc".to_string();
+    app.library_ui.new_alias_platform_choice = Some("GameCube".to_string());
     let (sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Add {
             alias: "gc".to_string(),
             platform: "GameCube".to_string(),
@@ -1231,7 +1234,7 @@ fn poll_alias_action_add_success_refreshes_the_cache_and_clears_the_input_fields
 
     app.poll_alias_action(&egui::Context::default());
 
-    assert!(app.alias_action.is_none());
+    assert!(app.library_ui.alias_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(feedback.succeeded);
     assert!(feedback.message.contains("gc"));
@@ -1243,8 +1246,8 @@ fn poll_alias_action_add_success_refreshes_the_cache_and_clears_the_input_fields
             .any(|entry| entry.outcome == ActivityOutcome::Completed
                 && entry.action == ActivityAction::PlatformAliasManagement)
     );
-    assert!(app.new_alias_text.is_empty());
-    assert!(app.new_alias_platform_choice.is_none());
+    assert!(app.library_ui.new_alias_text.is_empty());
+    assert!(app.library_ui.new_alias_platform_choice.is_none());
     // Asynchronous: only a new background database load is started,
     // never blocked on, and the live snapshot is untouched.
     assert!(app.database_state.is_loading());
@@ -1255,7 +1258,7 @@ fn poll_alias_action_add_success_refreshes_the_cache_and_clears_the_input_fields
 fn poll_alias_action_remove_success_refreshes_the_cache() {
     let mut app = app_for_operation_tests();
     let (sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Remove {
             alias: "gc".to_string(),
         },
@@ -1265,7 +1268,7 @@ fn poll_alias_action_remove_success_refreshes_the_cache() {
 
     app.poll_alias_action(&egui::Context::default());
 
-    assert!(app.alias_action.is_none());
+    assert!(app.library_ui.alias_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(feedback.succeeded);
     assert!(feedback.message.contains("gc"));
@@ -1289,10 +1292,10 @@ fn poll_alias_action_failure_preserves_the_cached_aliases_and_shows_the_error() 
         snapshot: Box::new(stale_snapshot.clone()),
         last_scan_summary: None,
     };
-    app.new_alias_text = "wii".to_string();
-    app.new_alias_platform_choice = Some("Wii".to_string());
+    app.library_ui.new_alias_text = "wii".to_string();
+    app.library_ui.new_alias_platform_choice = Some("Wii".to_string());
     let (sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Add {
             alias: "wii".to_string(),
             platform: "Wii".to_string(),
@@ -1305,7 +1308,7 @@ fn poll_alias_action_failure_preserves_the_cached_aliases_and_shows_the_error() 
 
     app.poll_alias_action(&egui::Context::default());
 
-    assert!(app.alias_action.is_none());
+    assert!(app.library_ui.alias_action.is_none());
     let feedback = app.feedback.as_ref().unwrap();
     assert!(!feedback.succeeded);
     assert!(feedback.message.contains("already exists"));
@@ -1318,8 +1321,11 @@ fn poll_alias_action_failure_preserves_the_cached_aliases_and_shows_the_error() 
     // A failed add must not clear the input fields (the user should
     // be able to see/correct what they typed) and must not touch the
     // cached snapshot or trigger a database reload.
-    assert_eq!(app.new_alias_text, "wii");
-    assert_eq!(app.new_alias_platform_choice, Some("Wii".to_string()));
+    assert_eq!(app.library_ui.new_alias_text, "wii");
+    assert_eq!(
+        app.library_ui.new_alias_platform_choice,
+        Some("Wii".to_string())
+    );
     match &app.database_state {
         DatabaseState::Ready { snapshot, .. } => {
             assert_eq!(snapshot.platform_aliases, stale_snapshot.platform_aliases);
@@ -1339,7 +1345,7 @@ fn alias_action_is_independent_of_is_busy_and_mount_action_availability() {
     // running alias action must not disable mount/unmount actions.
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.alias_action = Some(RunningAliasAction {
+    app.library_ui.alias_action = Some(RunningAliasAction {
         action: AliasAction::Remove {
             alias: "gc".to_string(),
         },
@@ -2118,9 +2124,9 @@ fn changing_dashboard_filters_and_sort_does_not_rebuild_the_cached_report() {
 #[test]
 fn health_dashboard_state_is_separate_from_library_state_and_activity() {
     let mut app = app_for_operation_tests();
-    app.filter = "ordinary search".to_string();
-    app.library_filters.missing = true;
-    app.sort_field = Some(SortField::State);
+    app.library_ui.filter = "ordinary search".to_string();
+    app.library_ui.library_filters.missing = true;
+    app.library_ui.sort_field = Some(SortField::State);
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/library.zip")].into_iter().collect();
     app.selected_duplicate_archive = Some(PathBuf::from("/backup/Other.7z"));
@@ -2134,9 +2140,9 @@ fn health_dashboard_state_is_separate_from_library_state_and_activity() {
     app.selected_health_issue = Some(PathBuf::from("/roms/health-issue.zip"));
     app.view = MainView::Library;
 
-    assert_eq!(app.filter, "ordinary search");
-    assert!(app.library_filters.missing);
-    assert_eq!(app.sort_field, Some(SortField::State));
+    assert_eq!(app.library_ui.filter, "ordinary search");
+    assert!(app.library_ui.library_filters.missing);
+    assert_eq!(app.library_ui.sort_field, Some(SortField::State));
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/library.zip"))
@@ -2161,11 +2167,11 @@ fn health_dashboard_state_is_separate_from_library_state_and_activity() {
 #[test]
 fn sources_and_tools_overlay_navigation_never_touches_library_state_or_activity() {
     let mut app = app_for_operation_tests();
-    app.filter = "ordinary search".to_string();
-    app.library_filters.missing = true;
-    app.sort_field = Some(SortField::State);
+    app.library_ui.filter = "ordinary search".to_string();
+    app.library_ui.library_filters.missing = true;
+    app.library_ui.sort_field = Some(SortField::State);
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
-    app.library_source_filter = Some(Some(PathBuf::from("/home/davedap/Archives")));
+    app.library_ui.library_source_filter = Some(Some(PathBuf::from("/home/davedap/Archives")));
     let history_len = app.history.len();
 
     app.view = MainView::Sources;
@@ -2176,15 +2182,15 @@ fn sources_and_tools_overlay_navigation_never_touches_library_state_or_activity(
     app.tools_overlay = ToolsOverlay::None;
     app.view = MainView::Library;
 
-    assert_eq!(app.filter, "ordinary search");
-    assert!(app.library_filters.missing);
-    assert_eq!(app.sort_field, Some(SortField::State));
+    assert_eq!(app.library_ui.filter, "ordinary search");
+    assert!(app.library_ui.library_filters.missing);
+    assert_eq!(app.library_ui.sort_field, Some(SortField::State));
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/library.zip"))
     );
     assert_eq!(
-        app.library_source_filter,
+        app.library_ui.library_source_filter,
         Some(Some(PathBuf::from("/home/davedap/Archives")))
     );
     assert_eq!(

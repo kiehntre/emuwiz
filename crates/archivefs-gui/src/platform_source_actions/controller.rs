@@ -11,10 +11,10 @@ impl ArchiveFsApp {
     /// touches `is_busy()`/mount safety - platform assignment is
     /// metadata-only and deliberately independent of it.
     pub(crate) fn platform_action_available(&self) -> bool {
-        self.platform_action.is_none()
-            && self.bulk_platform_action.is_none()
-            && self.alias_action.is_none()
-            && self.missing_removal.is_none()
+        self.library_ui.platform_action.is_none()
+            && self.library_ui.bulk_platform_action.is_none()
+            && self.library_ui.alias_action.is_none()
+            && self.library_ui.missing_removal.is_none()
             && self.source_action.is_none()
             && self.library_view_action.is_none()
             && !self.database_state.is_loading()
@@ -46,7 +46,7 @@ impl ArchiveFsApp {
                 PlatformAction::Clear => "Clearing manual platform.".to_string(),
             },
         ));
-        self.platform_action = Some(RunningPlatformAction {
+        self.library_ui.platform_action = Some(RunningPlatformAction {
             archive_path: archive_path.clone(),
             receiver,
         });
@@ -59,17 +59,21 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_platform_action(&mut self, context: &egui::Context) {
-        let result = self.platform_action.as_ref().and_then(|running| {
-            running
-                .receiver
-                .try_recv()
-                .ok()
-                .map(|result| (running.archive_path.clone(), result))
-        });
+        let result = self
+            .library_ui
+            .platform_action
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.archive_path.clone(), result))
+            });
         let Some((archive_path, result)) = result else {
             return;
         };
-        self.platform_action = None;
+        self.library_ui.platform_action = None;
         match result {
             Ok(change) => {
                 let message = format!(
@@ -148,7 +152,7 @@ impl ArchiveFsApp {
                 }
             },
         ));
-        self.bulk_platform_action = Some(RunningBulkPlatformAction {
+        self.library_ui.bulk_platform_action = Some(RunningBulkPlatformAction {
             kind: kind.clone(),
             requested_paths,
             receiver,
@@ -170,17 +174,21 @@ impl ArchiveFsApp {
     /// not here, since the reload is itself asynchronous and has not
     /// necessarily completed yet when this returns.
     pub(crate) fn poll_bulk_platform_action(&mut self, context: &egui::Context) {
-        let result = self.bulk_platform_action.as_ref().and_then(|running| {
-            running
-                .receiver
-                .try_recv()
-                .ok()
-                .map(|result| (running.kind.clone(), running.requested_paths, result))
-        });
+        let result = self
+            .library_ui
+            .bulk_platform_action
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.kind.clone(), running.requested_paths, result))
+            });
         let Some((kind, requested_paths, result)) = result else {
             return;
         };
-        self.bulk_platform_action = None;
+        self.library_ui.bulk_platform_action = None;
         match result {
             Ok(outcome) => {
                 let action_word = match &kind {
@@ -247,10 +255,10 @@ impl ArchiveFsApp {
     /// safety - alias management is metadata-only and deliberately
     /// independent of it, exactly like platform assignment.
     pub(crate) fn alias_action_available(&self) -> bool {
-        self.alias_action.is_none()
-            && self.platform_action.is_none()
-            && self.bulk_platform_action.is_none()
-            && self.missing_removal.is_none()
+        self.library_ui.alias_action.is_none()
+            && self.library_ui.platform_action.is_none()
+            && self.library_ui.bulk_platform_action.is_none()
+            && self.library_ui.missing_removal.is_none()
             && self.source_action.is_none()
             && self.library_view_action.is_none()
             && !self.database_state.is_loading()
@@ -272,7 +280,7 @@ impl ArchiveFsApp {
                 AliasAction::Remove { alias } => format!("Removing platform alias '{alias}'."),
             },
         ));
-        self.alias_action = Some(RunningAliasAction {
+        self.library_ui.alias_action = Some(RunningAliasAction {
             action: action.clone(),
             receiver,
         });
@@ -290,7 +298,7 @@ impl ArchiveFsApp {
     /// panel is ready for the next alias; a successful remove leaves
     /// them untouched (there is nothing to clear).
     pub(crate) fn poll_alias_action(&mut self, context: &egui::Context) {
-        let result = self.alias_action.as_ref().and_then(|running| {
+        let result = self.library_ui.alias_action.as_ref().and_then(|running| {
             running
                 .receiver
                 .try_recv()
@@ -300,7 +308,7 @@ impl ArchiveFsApp {
         let Some((action, result)) = result else {
             return;
         };
-        self.alias_action = None;
+        self.library_ui.alias_action = None;
         match result {
             Ok(()) => {
                 let message = match &action {
@@ -329,8 +337,8 @@ impl ArchiveFsApp {
                     more_information: None,
                 });
                 if matches!(action, AliasAction::Add { .. }) {
-                    self.new_alias_text.clear();
-                    self.new_alias_platform_choice = None;
+                    self.library_ui.new_alias_text.clear();
+                    self.library_ui.new_alias_platform_choice = None;
                 }
                 self.start_database_action(context.clone(), false);
             }
@@ -363,10 +371,10 @@ impl ArchiveFsApp {
     /// checks, once updated).
     pub(crate) fn source_action_available(&self) -> bool {
         self.source_action.is_none()
-            && self.alias_action.is_none()
-            && self.platform_action.is_none()
-            && self.bulk_platform_action.is_none()
-            && self.missing_removal.is_none()
+            && self.library_ui.alias_action.is_none()
+            && self.library_ui.platform_action.is_none()
+            && self.library_ui.bulk_platform_action.is_none()
+            && self.library_ui.missing_removal.is_none()
             && self.library_view_action.is_none()
             && !self.database_state.is_loading()
     }

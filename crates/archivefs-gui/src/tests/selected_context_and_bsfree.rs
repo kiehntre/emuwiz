@@ -2857,7 +2857,7 @@ fn searching_does_not_show_the_previous_records_cover() {
         .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
 
-    app.filter = "archivefs-featured-g00004".to_string();
+    app.library_ui.filter = "archivefs-featured-g00004".to_string();
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 2);
     assert!(
         !matches!(

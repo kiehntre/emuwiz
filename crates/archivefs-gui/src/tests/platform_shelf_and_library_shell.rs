@@ -851,8 +851,8 @@ fn selected_archive_and_filters_survive_a_library_tab_switch() {
     let mut app = app_for_operation_tests();
     app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
-    app.filter = "mario".to_string();
-    app.library_filters.missing = true;
+    app.library_ui.filter = "mario".to_string();
+    app.library_ui.library_filters.missing = true;
     app.health_filters.category = HealthIssueFilter::UnknownPlatform;
     app.duplicate_filters.platform = Some("SNES".to_string());
 
@@ -872,11 +872,11 @@ fn selected_archive_and_filters_survive_a_library_tab_switch() {
     );
     assert_eq!(app.archive_context.selected.len(), 1);
     assert_eq!(
-        app.filter, "mario",
+        app.library_ui.filter, "mario",
         "the Library free-text filter must survive switching tabs"
     );
     assert!(
-        app.library_filters.missing,
+        app.library_ui.library_filters.missing,
         "Library row filters must survive switching tabs"
     );
     assert_eq!(
@@ -1088,10 +1088,10 @@ fn migrated_navigation_sites_preserve_their_own_side_effects_alongside_the_tab_s
     // library_filters.missing write it always had).
     let mut app = app_for_operation_tests();
     app.navigate_to_library_tab(LibraryTab::Archives);
-    app.library_filters.missing = true;
+    app.library_ui.library_filters.missing = true;
     assert_eq!(app.view, MainView::Library);
     assert_eq!(app.library_tab, LibraryTab::Archives);
-    assert!(app.library_filters.missing);
+    assert!(app.library_ui.library_filters.missing);
 
     // Mirrors AppOperationRequest::ShowInLibraryViews's exact
     // dispatch lines.
@@ -3276,7 +3276,10 @@ fn fitted_cards_still_select_their_platform() {
     run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
     let cards = gamer_shelf_geometry(&ctx).cards;
     run_gamer_frames(&mut app, &ctx, click_at(screen, cards[2].center()), 1);
-    assert_eq!(app.library_filters.platform.as_deref(), Some("SNES"));
+    assert_eq!(
+        app.library_ui.library_filters.platform.as_deref(),
+        Some("SNES")
+    );
     let output = run_gamer_frames(&mut app, &ctx, idle, 1);
     assert!(rendered_text_contains(&output, "Title0002"));
 }
@@ -3353,7 +3356,7 @@ fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
         "/mount",
         vec![selected, hidden],
     )));
-    app.library_filters.platform = Some("GameCube".to_string());
+    app.library_ui.library_filters.platform = Some("GameCube".to_string());
     app.archive_context.select_only(selected_path.clone());
     app.custom_platform_artwork_directory = Some(temp.clone());
 
@@ -3370,7 +3373,10 @@ fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
 
     assert!(rendered_text_contains(&output, "Selected Game Title"));
     assert!(!rendered_text_contains(&output, "Filtered Out Title"));
-    assert_eq!(app.library_filters.platform.as_deref(), Some("GameCube"));
+    assert_eq!(
+        app.library_ui.library_filters.platform.as_deref(),
+        Some("GameCube")
+    );
     assert_eq!(
         app.archive_context.focused.as_deref(),
         Some(selected_path.as_path())
@@ -3426,7 +3432,7 @@ fn platform_all_selection_clears_multi_selection_consistently_with_named_and_unk
     app.view = MainView::Library;
     app.library_tab = LibraryTab::Archives;
     app.ui_mode = GuiMode::AdvancedView;
-    app.library_filters.platform = Some("GameCube".to_string());
+    app.library_ui.library_filters.platform = Some("GameCube".to_string());
     app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
 

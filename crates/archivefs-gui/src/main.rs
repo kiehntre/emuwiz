@@ -188,6 +188,8 @@ use library_view_controller::{
     library_view_form_profile, library_view_selections_side_by_side, library_view_submit_blocker,
     load_library_views, run_library_view_action, start_library_view_worker,
 };
+mod library_ui_state;
+use library_ui_state::LibraryUiState;
 mod database_load;
 mod live_library_controller;
 mod setup_controller;
@@ -1922,8 +1924,7 @@ fn load_default_gui_config() -> Result<Config, String> {
 
 struct ArchiveFsApp {
     state: LoadState,
-    filter: String,
-    filtered_rows: Option<Vec<usize>>,
+    library_ui: LibraryUiState,
     /// The sole owner of primary archive identity across Library, Selected,
     /// Mount, and Cheats & Mods. Mount state remains derived from live
     /// records and is intentionally not stored here.
@@ -2205,29 +2206,8 @@ struct ArchiveFsApp {
     /// above, this is never consumed/cleared by a reload; it stays visible
     /// on the Sources page until superseded by a newer Sources-page scan.
     sources_last_scan: Option<SourcesLastScan>,
-    library_filters: LibraryRowFilters,
-    /// The Library platform strip's search box - see
-    /// `LoadedViewState::library_platform_query`.
-    library_platform_query: String,
-    platform_action: Option<RunningPlatformAction>,
-    platform_choice: Option<String>,
-    platform_custom_text: String,
-    alias_action: Option<RunningAliasAction>,
-    missing_removal: Option<RunningMissingRemoval>,
-    confirm_remove_missing: Option<Vec<PathBuf>>,
-    new_alias_text: String,
-    new_alias_platform_choice: Option<String>,
-    bulk_platform_action: Option<RunningBulkPlatformAction>,
-    bulk_platform_choice: Option<String>,
-    sort_field: Option<SortField>,
-    sort_ascending: bool,
-    /// The library table's vertical `ScrollArea` offset as of the end of
-    /// the last frame - tracked here (rather than trusted to egui's own
-    /// persisted-by-`Id` scroll state) so keyboard focus movement can read
-    /// last frame's position *before* deciding whether this frame needs to
-    /// override it to bring the newly-focused row into view. See
-    /// `compute_scroll_offset_for_focus`.
-    library_scroll_offset: f32,
+    /// The library table's vertical scroll offset and other Library-only
+    /// presentation/action state live in `library_ui`.
     duplicate_filters: DuplicateReviewFilters,
     duplicate_sort_field: DuplicateSortField,
     duplicate_sort_ascending: bool,
@@ -2462,11 +2442,6 @@ struct ArchiveFsApp {
     /// The Library Views page's Preview details filter - see
     /// `LibraryViewPlanFilter`.
     library_view_plan_filter: LibraryViewPlanFilter,
-    library_source_filter: Option<Option<PathBuf>>,
-    /// The Library table's current Archive path / Mount path column
-    /// widths - see `LibraryColumnWidths`. Platform and State are not
-    /// resizable and have no equivalent field.
-    library_column_widths: LibraryColumnWidths,
     /// The Archive Inspector overlay's state for whichever archive it was
     /// last opened for, if any - `None` means it has never been opened
     /// this session. Independent of `tools_overlay`: closing the overlay
@@ -2674,11 +2649,8 @@ impl ArchiveFsApp {
             media_sets_page: media_sets_page::MediaSetsPageState::default(),
             quick_rename_mode: false,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
-            library_filters: LibraryRowFilters::default(),
-            library_platform_query: String::new(),
-            filter: String::new(),
-            filtered_rows: None,
             archive_context: ArchiveContext::default(),
+            library_ui: LibraryUiState::default(),
             operation: None,
             mount_all: None,
             unmount_all: None,
@@ -2762,19 +2734,6 @@ impl ArchiveFsApp {
             snapshot_stale: false,
             refresh_generation: generation,
             snapshot_generation: None,
-            platform_action: None,
-            platform_choice: None,
-            platform_custom_text: String::new(),
-            alias_action: None,
-            missing_removal: None,
-            confirm_remove_missing: None,
-            new_alias_text: String::new(),
-            new_alias_platform_choice: None,
-            bulk_platform_action: None,
-            bulk_platform_choice: None,
-            sort_field: None,
-            sort_ascending: true,
-            library_scroll_offset: 0.0,
             duplicate_filters: DuplicateReviewFilters::initial(),
             duplicate_sort_field: DuplicateSortField::Title,
             duplicate_sort_ascending: true,
@@ -2854,8 +2813,6 @@ impl ArchiveFsApp {
             library_view_remove_dialog: None,
             library_view_focus_archive: None,
             library_view_plan_filter: LibraryViewPlanFilter::default(),
-            library_source_filter: None,
-            library_column_widths: LibraryColumnWidths::default(),
             archive_inspector: None,
             archive_inspector_generation: RefreshGeneration::INITIAL,
             archive_preparation: ArchivePreparationState::default(),
@@ -2913,7 +2870,7 @@ impl ArchiveFsApp {
 
     fn navigate_to_missing_catalogue_review(&mut self) {
         self.navigate_to_library_tab(LibraryTab::Archives);
-        administration_pages::set_missing_review_mode(&mut self.library_filters, true);
+        administration_pages::set_missing_review_mode(&mut self.library_ui.library_filters, true);
         self.archive_context.clear_selection();
     }
 
@@ -3068,7 +3025,8 @@ impl ArchiveFsApp {
         };
         match result {
             LiveLibraryPoll::Completed { merged_rows } => {
-                self.filtered_rows = matching_row_indices(&merged_rows, &self.filter);
+                self.library_ui.filtered_rows =
+                    matching_row_indices(&merged_rows, &self.library_ui.filter);
                 self.prune_selection(&merged_rows);
                 self.refresh_error = None;
                 self.snapshot_stale = false;
@@ -3103,7 +3061,7 @@ impl ArchiveFsApp {
     /// read-only reload). Never blocks the UI thread - mirrors
     /// `refresh`/`start_load` exactly.
     fn start_database_action(&mut self, context: egui::Context, run_scan_first: bool) {
-        if self.missing_removal.is_some() || self.database_state.is_loading() {
+        if self.library_ui.missing_removal.is_some() || self.database_state.is_loading() {
             return;
         }
         self.database_generation = self.database_generation.next();
@@ -3268,7 +3226,7 @@ impl ArchiveFsApp {
         if let LoadState::Ready(data) = &self.state {
             let merged =
                 build_display_rows(&data.records, &data.rows, self.database_state.snapshot());
-            self.filtered_rows = matching_row_indices(&merged, &self.filter);
+            self.library_ui.filtered_rows = matching_row_indices(&merged, &self.library_ui.filter);
             self.prune_selection(&merged);
         }
     }
@@ -3660,7 +3618,7 @@ impl ArchiveFsApp {
                 }
                 SourcesPageAction::ViewInLibrary(path) => {
                     self.navigate_to_library_tab(LibraryTab::Archives);
-                    self.library_source_filter = Some(Some(path));
+                    self.library_ui.library_source_filter = Some(Some(path));
                 }
             }
         }
@@ -4208,10 +4166,10 @@ impl ArchiveFsApp {
     fn library_view_action_available(&self) -> bool {
         self.library_view_action.is_none()
             && self.source_action.is_none()
-            && self.alias_action.is_none()
-            && self.platform_action.is_none()
-            && self.bulk_platform_action.is_none()
-            && self.missing_removal.is_none()
+            && self.library_ui.alias_action.is_none()
+            && self.library_ui.platform_action.is_none()
+            && self.library_ui.bulk_platform_action.is_none()
+            && self.library_ui.missing_removal.is_none()
             && !self.database_state.is_loading()
     }
 
@@ -4348,10 +4306,10 @@ impl ArchiveFsApp {
     }
 
     fn missing_removal_action_available(&self) -> bool {
-        self.missing_removal.is_none()
-            && self.platform_action.is_none()
-            && self.bulk_platform_action.is_none()
-            && self.alias_action.is_none()
+        self.library_ui.missing_removal.is_none()
+            && self.library_ui.platform_action.is_none()
+            && self.library_ui.bulk_platform_action.is_none()
+            && self.library_ui.alias_action.is_none()
             && self.source_action.is_none()
             && self.library_view_action.is_none()
             && matches!(self.database_state, DatabaseState::Ready { .. })
@@ -4373,10 +4331,10 @@ impl ArchiveFsApp {
                     .to_string(),
             ),
             DatabaseState::Ready { .. } => {
-                if self.missing_removal.is_some()
-                    || self.platform_action.is_some()
-                    || self.bulk_platform_action.is_some()
-                    || self.alias_action.is_some()
+                if self.library_ui.missing_removal.is_some()
+                    || self.library_ui.platform_action.is_some()
+                    || self.library_ui.bulk_platform_action.is_some()
+                    || self.library_ui.alias_action.is_some()
                     || self.source_action.is_some()
                     || self.library_view_action.is_some()
                 {
@@ -4394,7 +4352,7 @@ impl ArchiveFsApp {
         }
         let requested_paths = archive_paths.len();
         let (sender, receiver) = mpsc::channel();
-        self.missing_removal = Some(RunningMissingRemoval {
+        self.library_ui.missing_removal = Some(RunningMissingRemoval {
             requested_paths,
             receiver,
         });
@@ -4406,17 +4364,21 @@ impl ArchiveFsApp {
     }
 
     fn poll_missing_removal(&mut self, context: &egui::Context) {
-        let result = self.missing_removal.as_ref().and_then(|running| {
-            running
-                .receiver
-                .try_recv()
-                .ok()
-                .map(|result| (running.requested_paths, result))
-        });
+        let result = self
+            .library_ui
+            .missing_removal
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.requested_paths, result))
+            });
         let Some((requested_paths, result)) = result else {
             return;
         };
-        self.missing_removal = None;
+        self.library_ui.missing_removal = None;
         match result {
             Ok(result) => {
                 let message = format!(
@@ -5430,9 +5392,9 @@ impl ArchiveFsApp {
                             if let Some(action) = show_platform_aliases_panel(
                                 ui,
                                 cached_aliases,
-                                &mut self.new_alias_text,
-                                &mut self.new_alias_platform_choice,
-                                self.alias_action.is_some(),
+                                &mut self.library_ui.new_alias_text,
+                                &mut self.library_ui.new_alias_platform_choice,
+                                self.library_ui.alias_action.is_some(),
                                 &mut self.clipboard,
                             ) {
                                 self.start_alias_action(context.clone(), action);
@@ -5632,8 +5594,8 @@ impl ArchiveFsApp {
                         ui,
                         data,
                         GamerViewViewState {
-                            filter: &mut self.filter,
-                            library_filters: &mut self.library_filters,
+                            filter: &mut self.library_ui.filter,
+                            library_filters: &mut self.library_ui.library_filters,
                             archive_context: &mut self.archive_context,
                             screen: &mut self.gamer_view_screen,
                             busy: archive_actions_blocked,
@@ -6563,7 +6525,7 @@ impl ArchiveFsApp {
                             context,
                             picker,
                             &picker_rows,
-                            &mut self.library_filters.platform,
+                            &mut self.library_ui.library_filters.platform,
                             &mut self.clipboard,
                         )
                     });
@@ -6627,7 +6589,7 @@ impl ArchiveFsApp {
                         MountPageViewState {
                             queue: &mut self.mount_queue,
                             search: &mut self.mount_search,
-                            platform: &mut self.library_filters.platform,
+                            platform: &mut self.library_ui.library_filters.platform,
                             confirm: &mut self.confirm_mount_queue,
                             busy: archive_actions_blocked,
                             block_reason: archive_action_block_reason,
@@ -7105,7 +7067,7 @@ impl ArchiveFsApp {
                                 ui.spacing().interact_size.y,
                             );
                             let horizontal_spacing = ui.spacing().item_spacing.x;
-                            let preview_widths = self.library_column_widths.as_array();
+                            let preview_widths = self.library_ui.library_column_widths.as_array();
                             egui::ScrollArea::horizontal()
                                 .id_salt("cache_preview_horizontal")
                                 .auto_shrink([false, false])
@@ -7118,7 +7080,7 @@ impl ArchiveFsApp {
                                     // state of its own to wire up (it disappears
                                     // the moment the live snapshot loads) - the
                                     // headers render inertly, unsorted. Still
-                                    // resizable (shares `self.library_column_widths`
+                                    // resizable (shares `self.library_ui.library_column_widths`
                                     // with the real table) so a resize made here
                                     // is not lost once the live snapshot loads.
                                     let _ = show_header_row(
@@ -7128,7 +7090,7 @@ impl ArchiveFsApp {
                                         row_height,
                                         None,
                                         true,
-                                        &mut self.library_column_widths,
+                                        &mut self.library_ui.library_column_widths,
                                     );
                                     ui.separator();
                                     let body_height = ui.available_height().max(row_height);
@@ -7192,8 +7154,8 @@ impl ArchiveFsApp {
                             ui,
                             data,
                             LoadedViewState {
-                                filter: &mut self.filter,
-                                filtered_rows: &mut self.filtered_rows,
+                                filter: &mut self.library_ui.filter,
+                                filtered_rows: &mut self.library_ui.filtered_rows,
                                 selected_archive: &mut self.archive_context.focused,
                                 operation: self.operation.as_ref(),
                                 busy: archive_actions_blocked,
@@ -7229,28 +7191,28 @@ impl ArchiveFsApp {
                                 unmount_all_result: self.unmount_all_result.as_ref(),
                                 history: &mut self.history,
                                 cached: self.database_state.snapshot(),
-                                library_filters: &mut self.library_filters,
-                                platform_choice: &mut self.platform_choice,
-                                platform_custom_text: &mut self.platform_custom_text,
-                                platform_busy: self.platform_action.is_some(),
+                                library_filters: &mut self.library_ui.library_filters,
+                                platform_choice: &mut self.library_ui.platform_choice,
+                                platform_custom_text: &mut self.library_ui.platform_custom_text,
+                                platform_busy: self.library_ui.platform_action.is_some(),
                                 retroarch_profiles: &self.retroarch_profiles,
                                 selected_evidence: &self.selected_evidence,
                                 selected_archives: &mut self.archive_context.selected,
-                                bulk_platform_choice: &mut self.bulk_platform_choice,
-                                bulk_platform_busy: self.bulk_platform_action.is_some(),
+                                bulk_platform_choice: &mut self.library_ui.bulk_platform_choice,
+                                bulk_platform_busy: self.library_ui.bulk_platform_action.is_some(),
                                 missing_removal_available,
                                 missing_removal_unavailable_reason,
-                                missing_removal_busy: self.missing_removal.is_some(),
-                                confirm_remove_missing: &mut self.confirm_remove_missing,
+                                missing_removal_busy: self.library_ui.missing_removal.is_some(),
+                                confirm_remove_missing: &mut self.library_ui.confirm_remove_missing,
                                 missing_removal_typed_count: &mut self.missing_removal_typed_count,
-                                sort_field: &mut self.sort_field,
-                                sort_ascending: &mut self.sort_ascending,
-                                library_scroll_offset: &mut self.library_scroll_offset,
+                                sort_field: &mut self.library_ui.sort_field,
+                                sort_ascending: &mut self.library_ui.sort_ascending,
+                                library_scroll_offset: &mut self.library_ui.library_scroll_offset,
                                 clipboard: &mut self.clipboard,
                                 select_all_visible_requested: &mut self
                                     .select_all_visible_requested,
-                                library_source_filter: &mut self.library_source_filter,
-                                library_column_widths: &mut self.library_column_widths,
+                                library_source_filter: &mut self.library_ui.library_source_filter,
+                                library_column_widths: &mut self.library_ui.library_column_widths,
                                 library_views_configured: !self.library_views.is_empty(),
                                 library_view_last_plan: self.library_view_last_plan.as_ref(),
                                 recent_scan: if self.library_tab == LibraryTab::RecentlyFound {
@@ -7261,7 +7223,7 @@ impl ArchiveFsApp {
                                     None
                                 },
                                 recent_view: self.library_tab == LibraryTab::RecentlyFound,
-                                library_platform_query: &mut self.library_platform_query,
+                                library_platform_query: &mut self.library_ui.library_platform_query,
                             },
                         );
                         if self.library_tab == LibraryTab::Archives

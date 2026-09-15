@@ -2383,9 +2383,9 @@ impl ArchiveFsApp {
                         .or_else(|| Some("GameCube".to_string())),
                     CheatEmulatorAdapter::Xenia => Some("Xbox360".to_string()),
                     CheatEmulatorAdapter::Pcsx2 => Some("PS2".to_string()),
-                    _ => self.library_filters.platform.clone(),
+                    _ => self.library_ui.library_filters.platform.clone(),
                 });
-        self.library_filters.platform = adapter_platform.clone();
+        self.library_ui.library_filters.platform = adapter_platform.clone();
         self.cheat_archive_picker = Some(CheatArchivePickerState::for_current(
             self.cheat_workflow
                 .as_ref()
