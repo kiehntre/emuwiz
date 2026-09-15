@@ -4,15 +4,261 @@
 //! Extracted verbatim from `main.rs` (2026-08-22, GUI extraction Phase B).
 //!
 //! `MainView`/`ToolsOverlay` themselves, the top-level render dispatch that
-//! calls [`show_primary_navigation`], and the app-wide MainView metadata
-//! functions physically adjacent to this code in the old `main.rs`
-//! (`main_view_title`, `main_view_content_width`, `main_view_uses_page_scroll`,
-//! `catalogue_status_load_needed`) all stay in `main.rs` - they are
-//! consulted well beyond sidebar rendering (page headers, layout, scroll
-//! policy), so moving them here would make this module reach back into
-//! app-shell concerns rather than the reverse.
+//! calls [`show_primary_navigation`], and feature-specific app coordination
+//! stay in `main.rs`; this module owns the pure route and presentation policy
+//! shared by those callers.
 
 use super::*;
+
+pub(crate) fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
+    match card {
+        home_page::HomeCard::BuildLibrary | home_page::HomeCard::RomM => MainView::Sources,
+        home_page::HomeCard::BrowseGames => MainView::Library,
+        home_page::HomeCard::DuplicateReview => MainView::ExactDuplicateReview,
+        home_page::HomeCard::ConvertDiscs => MainView::DiscConversion,
+        home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
+        home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
+        home_page::HomeCard::QuickRename => MainView::IdentifyRename,
+        home_page::HomeCard::CheatSources => MainView::CheatSources,
+        home_page::HomeCard::DatSources => MainView::DatSources,
+        home_page::HomeCard::CheckSetup => MainView::EmulatorSetup,
+        home_page::HomeCard::Settings => MainView::Settings,
+        home_page::HomeCard::CheckProblems => MainView::Doctor,
+    }
+}
+
+pub(crate) fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
+    match tab {
+        LibraryTab::Archives => MainView::Library,
+        LibraryTab::Health => MainView::Health,
+        LibraryTab::Duplicates => MainView::Duplicates,
+        LibraryTab::Views => MainView::LibraryViews,
+        LibraryTab::RecentlyFound => MainView::RecentlyFound,
+    }
+}
+
+pub(crate) fn library_tab_for_main_view(view: MainView) -> Option<LibraryTab> {
+    match view {
+        MainView::Library => Some(LibraryTab::Archives),
+        MainView::Health => Some(LibraryTab::Health),
+        MainView::Duplicates => Some(LibraryTab::Duplicates),
+        MainView::LibraryViews => Some(LibraryTab::Views),
+        MainView::RecentlyFound => Some(LibraryTab::RecentlyFound),
+        _ => None,
+    }
+}
+
+pub(crate) fn library_tab_label(tab: LibraryTab) -> &'static str {
+    match tab {
+        LibraryTab::Archives => "Archives",
+        LibraryTab::Health => "Health",
+        LibraryTab::Duplicates => "Duplicates",
+        LibraryTab::Views => "Views",
+        LibraryTab::RecentlyFound => "Recently Found",
+    }
+}
+
+pub(crate) fn main_view_for_problems_repair_tab(tab: ProblemsRepairTab) -> MainView {
+    match tab {
+        ProblemsRepairTab::Overview => MainView::Problems,
+        ProblemsRepairTab::Diagnostics => MainView::Doctor,
+        ProblemsRepairTab::Repair => MainView::RepairReview,
+    }
+}
+
+pub(crate) fn problems_repair_tab_for_main_view(view: MainView) -> Option<ProblemsRepairTab> {
+    match view {
+        MainView::Problems => Some(ProblemsRepairTab::Overview),
+        MainView::Doctor => Some(ProblemsRepairTab::Diagnostics),
+        MainView::RepairReview | MainView::RepairHistory => Some(ProblemsRepairTab::Repair),
+        _ => None,
+    }
+}
+
+pub(crate) fn main_view_for_sources_tab(tab: SourcesTab) -> MainView {
+    match tab {
+        SourcesTab::Libraries => MainView::Sources,
+        SourcesTab::Dats => MainView::DatSources,
+        SourcesTab::Cheats => MainView::CheatSources,
+        SourcesTab::Discovery => MainView::SourcesDiscovery,
+    }
+}
+
+pub(crate) fn sources_tab_for_main_view(view: MainView) -> Option<SourcesTab> {
+    match view {
+        MainView::Sources => Some(SourcesTab::Libraries),
+        MainView::DatSources => Some(SourcesTab::Dats),
+        MainView::CheatSources => Some(SourcesTab::Cheats),
+        MainView::SourcesDiscovery => Some(SourcesTab::Discovery),
+        _ => None,
+    }
+}
+
+pub(crate) fn sources_tab_label(tab: SourcesTab) -> &'static str {
+    match tab {
+        SourcesTab::Libraries => "Libraries",
+        SourcesTab::Dats => "DATs",
+        SourcesTab::Cheats => "Cheats",
+        SourcesTab::Discovery => "Discovery",
+    }
+}
+
+pub(crate) const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 7] = [
+    (
+        "Museum",
+        "Browse your collection by platform: what EmuWiz knows about each system.",
+        MainView::Museum,
+    ),
+    (
+        "Duplicate Finder",
+        "Find identical or equivalent copies and quarantine the extras.",
+        MainView::ExactDuplicateReview,
+    ),
+    (
+        "Tape Inspector",
+        "Inspect supported cassette and tape-image structure without modifying the source.",
+        MainView::TapeInspector,
+    ),
+    (
+        "Disc Conversion",
+        "Convert supported CUE/BIN disc images to fingerprint-verified CHD.",
+        MainView::DiscConversion,
+    ),
+    (
+        "Storage Health",
+        "Inspect library space usage and conservative future compression opportunities.",
+        MainView::StorageHealth,
+    ),
+    (
+        "Emulator Setup",
+        "Read-only check of which emulators EmuWiz can find and their launch readiness.",
+        MainView::EmulatorSetup,
+    ),
+    (
+        "Emulator Manager",
+        "Read-only inventory of installed emulator versions, channels, and locations.",
+        MainView::EmulatorInventory,
+    ),
+];
+
+pub(crate) const GAMER_MENU_LABEL: &str = "Menu";
+pub(crate) const GAMER_MENU_ADD_FOLDER_LABEL: &str = "Add another game folder";
+pub(crate) const GAMER_MENU_SCAN_LABEL: &str = "Scan for new games";
+pub(crate) const GAMER_MENU_SETUP_LABEL: &str = "Emulator Setup";
+pub(crate) const GAMER_MENU_ADVANCED_LABEL: &str = "Advanced View";
+
+pub(crate) fn main_view_title(view: MainView) -> &'static str {
+    match view {
+        MainView::Home => "Home",
+        MainView::NeedsAttention => "Needs Attention",
+        MainView::Library => "Library",
+        MainView::ReadyToPlay => "Ready-to-Play",
+        MainView::RecentlyFound => "Recently Found",
+        MainView::Health => "Health",
+        MainView::Duplicates => "Duplicates",
+        MainView::Sources => "Sources",
+        MainView::SourcesDiscovery => "Collection Discovery",
+        MainView::LibraryViews => "Library Views",
+        MainView::Mount => "Mount",
+        MainView::Selected => "Selected",
+        MainView::CheatsMods => "Cheats & Mods",
+        MainView::CheatSources => "Cheat Sources",
+        MainView::CanonicalOrganisation => "Library organisation",
+        MainView::PublisherProfiles => "Publisher / Frontend Library",
+        MainView::IdentifyRename => "Identify & Rename",
+        MainView::RepairReview => "Repair Review",
+        MainView::RepairHistory => "Repair History",
+        MainView::ExactDuplicateReview => "Duplicate Finder",
+        MainView::DiscConversion => "Disc Conversion",
+        MainView::StorageHealth => "Storage Health",
+        MainView::TapeInspector => "Tape Inspector",
+        MainView::EmulatorSetup => "Emulator Setup",
+        MainView::EmulatorInventory => "Emulator Manager",
+        MainView::BiosProjection => "BIOS / Firmware",
+        MainView::Museum => "Museum",
+        MainView::LibraryViewHistory => "Library View History",
+        MainView::DatSources => "DAT Sources",
+        MainView::MediaSets => "Media Sets",
+        MainView::ActiveMounts => "Active Mounts",
+        MainView::Problems => "Problems & Repair",
+        MainView::Doctor => "Doctor",
+        MainView::HistoryLogs => "History & Logs",
+        MainView::Settings => "Settings",
+        MainView::About => "About",
+    }
+}
+
+pub(crate) fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
+    match view {
+        MainView::Home
+        | MainView::NeedsAttention
+        | MainView::Mount
+        | MainView::Selected
+        | MainView::CheatsMods
+        | MainView::Library
+        | MainView::ReadyToPlay
+        | MainView::RecentlyFound
+        | MainView::Health
+        | MainView::Duplicates
+        | MainView::Sources
+        | MainView::SourcesDiscovery
+        | MainView::LibraryViews
+        | MainView::HistoryLogs
+        | MainView::RepairHistory
+        | MainView::ExactDuplicateReview
+        | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
+        MainView::Museum => ui_layout::ContentWidth::Wide,
+        MainView::CheatSources
+        | MainView::CanonicalOrganisation
+        | MainView::PublisherProfiles
+        | MainView::IdentifyRename
+        | MainView::RepairReview
+        | MainView::DiscConversion
+        | MainView::StorageHealth
+        | MainView::TapeInspector
+        | MainView::EmulatorSetup
+        | MainView::EmulatorInventory
+        | MainView::BiosProjection
+        | MainView::DatSources
+        | MainView::MediaSets
+        | MainView::Doctor
+        | MainView::Settings
+        | MainView::About
+        | MainView::ActiveMounts => ui_layout::ContentWidth::Normal,
+        MainView::Problems => ui_layout::ContentWidth::Wide,
+    }
+}
+
+pub(crate) fn main_view_uses_page_scroll(view: MainView) -> bool {
+    matches!(
+        view,
+        MainView::Home
+            | MainView::NeedsAttention
+            | MainView::Selected
+            | MainView::Sources
+            | MainView::SourcesDiscovery
+            | MainView::CheatSources
+            | MainView::DatSources
+            | MainView::MediaSets
+            | MainView::IdentifyRename
+            | MainView::Problems
+            | MainView::Doctor
+            | MainView::EmulatorSetup
+            | MainView::DiscConversion
+            | MainView::StorageHealth
+            | MainView::TapeInspector
+            | MainView::HistoryLogs
+            | MainView::Settings
+            | MainView::About
+            | MainView::RepairHistory
+            | MainView::ExactDuplicateReview
+            | MainView::LibraryViewHistory
+            | MainView::ReadyToPlay
+            | MainView::CanonicalOrganisation
+            | MainView::PublisherProfiles
+            | MainView::BiosProjection
+    )
+}
 
 // Consulted only by the navigation/reachability test suite now that the
 // 0.8.1 sidebar consolidation stopped rendering this flat list directly

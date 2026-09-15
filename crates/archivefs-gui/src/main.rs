@@ -178,7 +178,18 @@ use emulator_setup_focus::*;
 mod library_view;
 use library_view::*;
 mod navigation;
-use navigation::*;
+#[allow(unused_imports)]
+use navigation::{
+    ADVANCED_NAV_GROUPS, GAMER_MENU_ADD_FOLDER_LABEL, GAMER_MENU_ADVANCED_LABEL, GAMER_MENU_LABEL,
+    GAMER_MENU_SCAN_LABEL, GAMER_MENU_SETUP_LABEL, NavClick, NavEntry, NavGroup,
+    PRIMARY_NAVIGATION_DESTINATIONS, TOOLS_MENU_WORKFLOWS, library_tab_for_main_view,
+    library_tab_label, main_view_content_width, main_view_for_home_card, main_view_for_library_tab,
+    main_view_for_problems_repair_tab, main_view_for_sources_tab, main_view_title,
+    main_view_uses_page_scroll, nav_overlay, nav_quick_rename, nav_romm, nav_view,
+    navigation_destination_enabled, navigation_destination_selected,
+    problems_repair_tab_for_main_view, show_primary_navigation, sources_tab_for_main_view,
+    sources_tab_label,
+};
 mod selected_game_panel;
 use selected_game_panel::*;
 mod dat_identity_panel;
@@ -2378,57 +2389,6 @@ enum LibraryTab {
     RecentlyFound,
 }
 
-/// The major task-oriented workflows the top menu bar's "Tools" menu
-/// exposes, as `(label, hover, destination)`. The menu renders directly from
-/// this so the label and `MainView` a test asserts are exactly the ones the
-/// menu uses, and so every entry point (Home card, sidebar, this menu)
-/// provably converges on the same destination - see
-/// `major_workflows_are_reachable_from_home_sidebar_and_top_menu`. RomM is
-/// exposed under the "Sources" menu instead (it has no `MainView` of its own).
-const TOOLS_MENU_WORKFLOWS: [(&str, &str, MainView); 7] = [
-    (
-        "Museum",
-        "Browse your collection by platform: what EmuWiz knows about each system.",
-        MainView::Museum,
-    ),
-    (
-        "Duplicate Finder",
-        "Find identical or equivalent copies and quarantine the extras.",
-        MainView::ExactDuplicateReview,
-    ),
-    (
-        "Tape Inspector",
-        "Inspect supported cassette and tape-image structure without modifying the source.",
-        MainView::TapeInspector,
-    ),
-    (
-        "Disc Conversion",
-        "Convert supported CUE/BIN disc images to fingerprint-verified CHD.",
-        MainView::DiscConversion,
-    ),
-    (
-        "Storage Health",
-        "Inspect library space usage and conservative future compression opportunities.",
-        MainView::StorageHealth,
-    ),
-    (
-        "Emulator Setup",
-        "Read-only check of which emulators EmuWiz can find and their launch readiness.",
-        MainView::EmulatorSetup,
-    ),
-    (
-        "Emulator Manager",
-        "Read-only inventory of installed emulator versions, channels, and locations.",
-        MainView::EmulatorInventory,
-    ),
-];
-
-const GAMER_MENU_LABEL: &str = "Menu";
-const GAMER_MENU_ADD_FOLDER_LABEL: &str = "Add another game folder";
-const GAMER_MENU_SCAN_LABEL: &str = "Scan for new games";
-const GAMER_MENU_SETUP_LABEL: &str = "Emulator Setup";
-const GAMER_MENU_ADVANCED_LABEL: &str = "Advanced View";
-
 /// Compresses `DoctorScanState` into the `home_page::SetupCheckSummary` the
 /// Home "Set up emulators" card shows. The card's action opens Problems &
 /// Repair -> Diagnostics, which renders this exact `doctor_scan` state, so
@@ -2463,15 +2423,6 @@ fn setup_check_summary(state: &DoctorScanState) -> home_page::SetupCheckSummary 
     }
 }
 
-/// The `MainView` destination that currently renders `tab`'s content -
-/// the inverse of `library_tab_for_main_view`. Used by
-/// `ArchiveFsApp::navigate_to_library_tab`.
-/// Which `MainView` a Home card's action leads to. A pure mapping,
-/// separate from `show_home_page`'s rendering, so every card's
-/// destination is directly assertable without a frame buffer. `BuildLibrary`
-/// and `RomM` both land on Sources - there is no dedicated RomM `MainView`,
-/// since RomM is a card embedded on the Sources page, not its own
-/// `MainView`.
 ///
 /// Projects the already-loaded catalogue into the small collection summary
 /// Museum's platform grid consumes. This is deliberately an in-memory
@@ -2519,74 +2470,6 @@ fn home_library_snapshot(snapshot: &CachedLibrarySnapshot) -> home_page::HomeLib
     }
 }
 
-/// destination.
-fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
-    match card {
-        home_page::HomeCard::BuildLibrary => MainView::Sources,
-        // The RomM provider card (connect / browse records) lives on the
-        // Sources page's Libraries tab - the same subsystem its
-        // `romm_snapshot` readiness badge reports on. It is *not* the
-        // whole-collection Playing Library planner.
-        home_page::HomeCard::RomM => MainView::Sources,
-        home_page::HomeCard::BrowseGames => MainView::Library,
-        // First-class Duplicate Finder destination (not the read-only
-        // DAT-relative Library duplicates tab, and no longer a Repair
-        // sub-page).
-        home_page::HomeCard::DuplicateReview => MainView::ExactDuplicateReview,
-        // First-class Disc Conversion destination - no "Repair" framing.
-        home_page::HomeCard::ConvertDiscs => MainView::DiscConversion,
-        home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
-        home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
-        home_page::HomeCard::QuickRename => MainView::IdentifyRename,
-        home_page::HomeCard::CheatSources => MainView::CheatSources,
-        home_page::HomeCard::DatSources => MainView::DatSources,
-        // "Set up emulators" - the dedicated Emulator Setup destination,
-        // backed by the same `doctor_scan` state its badge summarises.
-        home_page::HomeCard::CheckSetup => MainView::EmulatorSetup,
-        home_page::HomeCard::Settings => MainView::Settings,
-        // The config-disappeared banner's own action button - the existing
-        // Diagnostics destination is what can actually explain a missing
-        // configuration, via a fresh check.
-        home_page::HomeCard::CheckProblems => MainView::Doctor,
-    }
-}
-
-fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
-    match tab {
-        LibraryTab::Archives => MainView::Library,
-        LibraryTab::Health => MainView::Health,
-        LibraryTab::Duplicates => MainView::Duplicates,
-        LibraryTab::Views => MainView::LibraryViews,
-        LibraryTab::RecentlyFound => MainView::RecentlyFound,
-    }
-}
-
-/// Which `LibraryTab` (if any) `view` corresponds to.
-fn library_tab_for_main_view(view: MainView) -> Option<LibraryTab> {
-    match view {
-        MainView::Library => Some(LibraryTab::Archives),
-        MainView::Health => Some(LibraryTab::Health),
-        MainView::Duplicates => Some(LibraryTab::Duplicates),
-        MainView::LibraryViews => Some(LibraryTab::Views),
-        MainView::RecentlyFound => Some(LibraryTab::RecentlyFound),
-        _ => None,
-    }
-}
-
-/// The label the Library tab selector shows for `tab` - the one shared
-/// source of truth `show_primary_navigation`'s Library button and the
-/// unified Library shell's `tab_row` both read, so the two can never
-/// drift apart.
-fn library_tab_label(tab: LibraryTab) -> &'static str {
-    match tab {
-        LibraryTab::Archives => "Archives",
-        LibraryTab::Health => "Health",
-        LibraryTab::Duplicates => "Duplicates",
-        LibraryTab::Views => "Views",
-        LibraryTab::RecentlyFound => "Recently Found",
-    }
-}
-
 /// The three tabs of the consolidated "Problems & Repair" destination -
 /// see `MainView::Problems`'s doc comment and `problems_repair_page`'s
 /// module doc. Mirrors `LibraryTab` exactly: `ArchiveFsApp::view` remains
@@ -2602,36 +2485,6 @@ enum ProblemsRepairTab {
     Repair,
 }
 
-/// The `MainView` destination that currently renders `tab`'s content - the
-/// inverse of `problems_repair_tab_for_main_view`. Used by
-/// `ArchiveFsApp::navigate_to_problems_repair_tab`. `Repair` lands on
-/// `RepairReview` (the primary review/apply action); `RepairHistory`
-/// remains reachable from inside that same tab's content (both are
-/// rendered together - see `ArchiveFsApp::show_problems_repair_page`),
-/// exactly like `Repair`/`History` are two lenses over one destination.
-fn main_view_for_problems_repair_tab(tab: ProblemsRepairTab) -> MainView {
-    match tab {
-        ProblemsRepairTab::Overview => MainView::Problems,
-        ProblemsRepairTab::Diagnostics => MainView::Doctor,
-        ProblemsRepairTab::Repair => MainView::RepairReview,
-    }
-}
-
-/// Which `ProblemsRepairTab` (if any) `view` corresponds to.
-///
-/// `MainView::ExactDuplicateReview` is deliberately absent since 0.8.1's
-/// "core workflows directly discoverable" pass: Duplicate Finder is a
-/// first-class destination now, not a Repair tab, so it renders standalone
-/// (no Repair Review / Repair History framing).
-fn problems_repair_tab_for_main_view(view: MainView) -> Option<ProblemsRepairTab> {
-    match view {
-        MainView::Problems => Some(ProblemsRepairTab::Overview),
-        MainView::Doctor => Some(ProblemsRepairTab::Diagnostics),
-        MainView::RepairReview | MainView::RepairHistory => Some(ProblemsRepairTab::Repair),
-        _ => None,
-    }
-}
-
 /// The four tabs of the consolidated "Sources" destination - see
 /// `MainView::Sources`'s sibling variants below and `sources_page`'s module
 /// doc. Mirrors `LibraryTab`/`ProblemsRepairTab` exactly: `ArchiveFsApp::view`
@@ -2645,39 +2498,6 @@ enum SourcesTab {
     Dats,
     Cheats,
     Discovery,
-}
-
-/// The `MainView` destination that currently renders `tab`'s content - the
-/// inverse of `sources_tab_for_main_view`. Used by
-/// `ArchiveFsApp::navigate_to_sources_tab`.
-fn main_view_for_sources_tab(tab: SourcesTab) -> MainView {
-    match tab {
-        SourcesTab::Libraries => MainView::Sources,
-        SourcesTab::Dats => MainView::DatSources,
-        SourcesTab::Cheats => MainView::CheatSources,
-        SourcesTab::Discovery => MainView::SourcesDiscovery,
-    }
-}
-
-/// Which `SourcesTab` (if any) `view` corresponds to.
-fn sources_tab_for_main_view(view: MainView) -> Option<SourcesTab> {
-    match view {
-        MainView::Sources => Some(SourcesTab::Libraries),
-        MainView::DatSources => Some(SourcesTab::Dats),
-        MainView::CheatSources => Some(SourcesTab::Cheats),
-        MainView::SourcesDiscovery => Some(SourcesTab::Discovery),
-        _ => None,
-    }
-}
-
-/// The label the Sources tab selector shows for `tab`.
-fn sources_tab_label(tab: SourcesTab) -> &'static str {
-    match tab {
-        SourcesTab::Libraries => "Libraries",
-        SourcesTab::Dats => "DATs",
-        SourcesTab::Cheats => "Cheats",
-        SourcesTab::Discovery => "Discovery",
-    }
 }
 
 /// The unified Library shell's chrome: the shared "Library" heading and
@@ -2862,162 +2682,6 @@ const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
 fn catalogue_status_load_needed(view: MainView, catalogue_manager: &CatalogueManagerState) -> bool {
     matches!(view, MainView::Sources | MainView::CheatsMods)
         && matches!(catalogue_manager, CatalogueManagerState::NotLoaded)
-}
-
-fn main_view_title(view: MainView) -> &'static str {
-    match view {
-        MainView::Home => "Home",
-        MainView::NeedsAttention => "Needs Attention",
-        MainView::Library => "Library",
-        MainView::ReadyToPlay => "Ready-to-Play",
-        MainView::RecentlyFound => "Recently Found",
-        MainView::Health => "Health",
-        MainView::Duplicates => "Duplicates",
-        MainView::Sources => "Sources",
-        MainView::SourcesDiscovery => "Collection Discovery",
-        MainView::LibraryViews => "Library Views",
-        MainView::Mount => "Mount",
-        MainView::Selected => "Selected",
-        MainView::CheatsMods => "Cheats & Mods",
-        MainView::CheatSources => "Cheat Sources",
-        MainView::CanonicalOrganisation => "Library organisation",
-        MainView::PublisherProfiles => "Publisher / Frontend Library",
-        MainView::IdentifyRename => "Identify & Rename",
-        MainView::RepairReview => "Repair Review",
-        MainView::RepairHistory => "Repair History",
-        MainView::ExactDuplicateReview => "Duplicate Finder",
-        MainView::DiscConversion => "Disc Conversion",
-        MainView::StorageHealth => "Storage Health",
-        MainView::TapeInspector => "Tape Inspector",
-        MainView::EmulatorSetup => "Emulator Setup",
-        MainView::EmulatorInventory => "Emulator Manager",
-        MainView::BiosProjection => "BIOS / Firmware",
-        MainView::Museum => "Museum",
-        MainView::LibraryViewHistory => "Library View History",
-        MainView::DatSources => "DAT Sources",
-        MainView::MediaSets => "Media Sets",
-        MainView::ActiveMounts => "Active Mounts",
-        MainView::Problems => "Problems & Repair",
-        MainView::Doctor => "Doctor",
-        MainView::HistoryLogs => "History & Logs",
-        MainView::Settings => "Settings",
-        MainView::About => "About",
-    }
-}
-
-fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
-    match view {
-        MainView::Home
-        | MainView::NeedsAttention
-        | MainView::Mount
-        | MainView::Selected
-        | MainView::CheatsMods
-        | MainView::Library
-        | MainView::ReadyToPlay
-        | MainView::RecentlyFound
-        | MainView::Health
-        | MainView::Duplicates
-        | MainView::Sources
-        | MainView::SourcesDiscovery
-        | MainView::LibraryViews
-        | MainView::HistoryLogs
-        | MainView::RepairHistory
-        | MainView::ExactDuplicateReview
-        | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
-        MainView::Museum => ui_layout::ContentWidth::Wide,
-        MainView::CheatSources
-        | MainView::CanonicalOrganisation
-        | MainView::PublisherProfiles
-        | MainView::IdentifyRename
-        | MainView::RepairReview
-        | MainView::DiscConversion
-        | MainView::StorageHealth
-        | MainView::TapeInspector
-        | MainView::EmulatorSetup
-        | MainView::EmulatorInventory
-        | MainView::BiosProjection
-        | MainView::DatSources
-        | MainView::MediaSets
-        | MainView::Doctor
-        | MainView::Settings
-        | MainView::About
-        | MainView::ActiveMounts => ui_layout::ContentWidth::Normal,
-        MainView::Problems => ui_layout::ContentWidth::Wide,
-    }
-}
-
-/// Whether `view`'s content should be wrapped in the outer page-level
-/// `ScrollArea` (`ui_layout::page`'s `scrollable` argument), rather than
-/// managing its own scrolling internally.
-///
-/// # The unified Library shell's scrolling rule
-///
-/// All five Library-related destinations (`Library`, `Health`,
-/// `Duplicates`, `LibraryViews`) are `false` here - no outer page scroll.
-/// Three of them (Library's archive table, Health's issue list,
-/// Duplicates' group list) already manage their own internal
-/// `ScrollArea`, sized to fill the available height; wrapping them in a
-/// second, outer scroll area would produce nested double scrollbars and
-/// fight their own height calculations. `LibraryViews` used to be `true`
-/// (the only Library-related destination that was): auditing its body
-/// found its two variable-length lists (the view definitions themselves,
-/// and a selected view's plan-entry details) are *already* each wrapped
-/// in their own bounded `egui::ScrollArea` (`max_height` 320.0 and 240.0
-/// respectively - see `show_library_views_page`), and everything else on
-/// the page (heading, "Add View" button, the Add/Edit/Remove dialogs,
-/// which are separate `egui::Window`s with their own scroll areas) is
-/// short, fixed-height content that was never actually at risk of
-/// overflowing. So flipping it to `false` - the smallest change that
-/// makes the shell's scroll behaviour consistent across all five tabs,
-/// with the tab row always pinned above whichever scroll area (if any) a
-/// tab owns - loses no reachable content and does not clip anything.
-fn main_view_uses_page_scroll(view: MainView) -> bool {
-    matches!(
-        view,
-        MainView::Home
-            | MainView::NeedsAttention
-            | MainView::Selected
-            | MainView::Sources
-            | MainView::SourcesDiscovery
-            | MainView::CheatSources
-            | MainView::DatSources
-            | MainView::MediaSets
-            | MainView::IdentifyRename
-            | MainView::Problems
-            | MainView::Doctor
-            | MainView::EmulatorSetup
-            | MainView::DiscConversion
-            | MainView::StorageHealth
-            | MainView::TapeInspector
-            | MainView::HistoryLogs
-            | MainView::Settings
-            | MainView::About
-            // Repair History renders a plain top-down list of transaction
-            // cards with no internal `ScrollArea` of its own (unlike
-            // Library/Health/Duplicates/LibraryViews, which each manage
-            // their own bounded scroll region) - it needs the shared outer
-            // page scroll or content past the viewport is simply clipped
-            // with no way to reach it.
-            | MainView::RepairHistory
-            // Exact Duplicate Review renders the same shape of plain
-            // top-down group-card list as Repair History, with no
-            // internal `ScrollArea` of its own.
-            | MainView::ExactDuplicateReview
-            // Library View History renders the same shape of plain
-            // top-down record-card list as Repair History, with no
-            // internal `ScrollArea` of its own.
-            | MainView::LibraryViewHistory
-            | MainView::ReadyToPlay
-            // Library Organisation's plan/preview results list has the same
-            // shape as Repair History: a plain top-down list of entry rows
-            // with no `ScrollArea` of its own. Without the shared page
-            // scroll, a generated preview of any real size extends below
-            // the window with no way to reach the rest of it or the footer
-            // controls.
-            | MainView::CanonicalOrganisation
-            | MainView::PublisherProfiles
-            | MainView::BiosProjection
-    )
 }
 
 /// Maps a RomM `ProviderState` to the three-bucket readiness Home shows,
